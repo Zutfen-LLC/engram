@@ -62,7 +62,7 @@ observed → proposed → active → recalled → confirmed/stale → superseded
 | `proposed`, `active`, `disputed`, `rejected`, `archived` | **State** (`review_status`) | Column on memory_items |
 | `observed` | **Event** | Recorded in item_events (event_type='observed') |
 | `recalled` | **Derived flag** | `last_recalled_at IS NOT NULL` |
-| `confirmed` | **Derived flag** | `human_verified = TRUE` |
+| `confirmed` | **Derived flag** | `verified_at IS NOT NULL` (human_verified is a convenience alias for this) |
 | `stale` | **Derived flag** | Computed from `last_verified_at` (or `valid_from` if never verified): `COALESCE(last_verified_at, valid_from) < now() - stale_after_interval`. Measures whether a memory is unconfirmed, not whether it's unused. `last_recalled_at` feeds only the usage/decay side of recall scoring. NULL `last_recalled_at` does NOT exempt an item from staleness — a never-recalled item is still subject to the staleness check against `valid_from`. |
 | `invalidated` | **Derived flag** | `valid_to IS NOT NULL AND superseded_by IS NULL` |
 | `superseded` | **Derived flag** | `superseded_by IS NOT NULL` |
@@ -83,12 +83,21 @@ Agents can freely write `proposed` memories. Only `active` memories enter the de
 
 Without auto-promotion, the proposed queue grows unboundedly while the working set stays frozen — agents write all day but their knowledge never reaches recall. Auto-promotion makes human review exception handling, not the pipeline.
 
-**Auto-promotion conditions** (all must be met, tenant-configurable, **on by default** with conservative thresholds):
+**Auto-promotion conditions** (tenant-configurable, **on by default** with conservative thresholds). An item promotes if it meets EITHER path:
+
+**Path A — Confidence + age (default):**
 - `review_status = 'proposed'`
 - `memory_confidence >= auto_promote_confidence_threshold` (default 0.7)
 - No unresolved conflicts (`conflict_resolution_status IS NULL OR = 'accepted'`). In Phase 1A (before conflict detection exists), this is vacuously true — all proposed items are eligible for promotion.
 - Age >= `auto_promote_min_age_hours` (default 72 hours unchallenged)
 - No dispute event in `item_events` from another principal
+
+**Path B — Usage-validated (quorum):**
+- `review_status = 'proposed'`
+- 2+ distinct non-author principals have marked the item "useful" via `/v1/feedback`
+- No dispute events
+
+Usage-validated promotion means a memory that multiple agents independently found useful has earned activation — a stronger signal than aging quietly.
 
 A background job (or lazy check on recall) promotes eligible items to `active`. The promotion is logged in `item_events`.
 
@@ -126,7 +135,9 @@ Source trust is calculated from both `source_type` and the principal's type. `me
 | `sync_turn` | `agent` | inferred | 0.4 | 0.4 | `proposed` |
 | `pre_compress` | `agent` | inferred | 0.3 | 0.3 | `proposed` |
 
-Note: `sync_turn` and `pre_compress` have confidence below the 0.7 auto-promotion threshold — they stay `proposed` until an LLM classification (1B) or human review raises their confidence, or the quorum feedback mechanism adjusts importance over time. This is intentional: chatty low-confidence sources should not auto-promote without some signal that the memory is actually useful.
+Note: `sync_turn` and `pre_compress` have confidence below the 0.7 auto-promotion threshold — they stay `proposed` until an LLM classification (1B) or human review raises their confidence, or a quorum of 2+ distinct non-author agents marks the item "useful" via `/v1/feedback` (usage-validated promotion — a memory multiple agents independently found useful has earned activation more honestly than one that aged 72 hours quietly). This is intentional: chatty low-confidence sources should not auto-promote without some signal that the memory is actually useful.
+
+**Phase 1A phasing note:** In practice, the frozen-queue concern is resolved by sequencing — Phase 1A's only writers are imports and manual user actions (both default `active`), since agent write paths (`sync_turn`, `pre_compress`) arrive with engram-hooks in Phase 2, by which point Phase 1B's LLM classification refines confidence above the gate. The auto-promotion machinery is ready for when agent writers come online.
 
 All defaults are tenant-configurable via the `tenant_config` table.
 
@@ -193,8 +204,8 @@ Each memory item has:
 - **Subject** — what this memory is ABOUT (subject_type, subject_id, subject_name), separate from who wrote it
 - **Scope** — tenant + workspace + principal
 - **Visibility** — private / workspace / tenant / public
-- **Trust** — review_status, memory_confidence, source_trust, human_verified, verified_by, verified_at, review_notes
-- **Recall signals** — importance, pinned, last_recalled_at, recall_count, startup_recall_count, last_confirmed_at, last_verified_at
+- **Trust** — review_status, memory_confidence, source_trust, verified_by, verified_at, review_notes (human_verified is a derived convenience: `verified_at IS NOT NULL`)
+- **Recall signals** — importance, pinned, last_recalled_at, recall_count, startup_recall_count, last_verified_at
 - **Provenance** — source_type, source_session, source_uri, extracted_by_model, extraction_confidence
 - **Conflict tracking** — conflicts_with_item_id, conflict_type, conflict_resolution_status
 - **Privacy** — sensitivity (normal/sensitive/restricted)
@@ -247,6 +258,7 @@ See `migrations/001_init.sql` for the canonical DDL. Key design decisions:
 - **Unique dedup index** on `(tenant_id, workspace_id, principal_id, content_hash) WHERE valid_to IS NULL AND review_status != 'rejected'` with `NULLS NOT DISTINCT` (Postgres 15+). Makes remember idempotent for retries within scope, including tenant-level memories with NULL workspace_id.
 - **Row Level Security** on all tenant-scoped tables. Application uses `SET LOCAL` inside each transaction (pool-safe for PgBouncer); Postgres enforces isolation even when application code is wrong. RLS is enabled on: memory_items, memory_embeddings (denormalized tenant_id), kg_triples, tunnels, item_events, classification_rules, recall_logs, workspace_members, api_keys, tenant_config, deletion_events, feedback_events, workspaces, principals. Semantic search queries filter on embeddings.tenant_id BEFORE joining to memory_items, which is the query to load-test first.
 - **HNSW with iterative_scan** — requires pgvector 0.8+. Set `hnsw.iterative_scan = strict` at query time to handle filtered (tenant-scoped) queries without recall degradation.
+- **Security-invoker views** — `active_memories` and `cca_ledger` use `WITH (security_invoker = true)` so RLS policies apply through the view. Without this, Postgres views are security-definer by default and can bypass RLS. Requires Postgres 15+ (already required for `NULLS NOT DISTINCT`).
 
 ### KG visibility
 

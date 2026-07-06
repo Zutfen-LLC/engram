@@ -98,7 +98,6 @@ CREATE TABLE memory_items (
     pinned          BOOLEAN DEFAULT FALSE,   -- bypass: included first in startup recall
     last_recalled_at TIMESTAMPTZ,
     recall_count    INTEGER DEFAULT 0,
-    last_confirmed_at TIMESTAMPTZ,            -- last time marked useful via /v1/feedback
     startup_recall_count INTEGER DEFAULT 0,  -- times recalled in startup mode (for anti-feedback penalty)
     last_verified_at TIMESTAMPTZ,             -- last time human-verified or conflict-resolved (staleness anchor)
 
@@ -355,6 +354,7 @@ CREATE TABLE feedback_events (
     item_id         UUID NOT NULL REFERENCES memory_items(id) ON DELETE CASCADE,
     principal_id    UUID NOT NULL REFERENCES principals(id),
     verdict         TEXT NOT NULL,                -- useful | noise
+    recall_log_id   UUID REFERENCES recall_logs(id) ON DELETE SET NULL,  -- links feedback to the recall that surfaced the item
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK (verdict IN ('useful', 'noise'))
 );
@@ -421,12 +421,14 @@ CREATE INDEX idx_wsmembers_principal ON workspace_members(principal_id);
 -- ============ Views ============
 
 -- Active memory items (reviewed and trusted — enters deterministic recall)
-CREATE VIEW active_memories AS
+-- security_invoker = true so RLS policies apply through the view
+CREATE VIEW active_memories WITH (security_invoker = true) AS
 SELECT * FROM memory_items
 WHERE review_status = 'active' AND valid_to IS NULL;
 
 -- CCA ledger projection
-CREATE VIEW cca_ledger AS
+-- security_invoker = true so RLS policies apply through the view
+CREATE VIEW cca_ledger WITH (security_invoker = true) AS
 SELECT
     id, tenant_id, workspace_id, principal_id,
     content, kind, wing, room, visibility,

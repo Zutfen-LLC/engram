@@ -5,8 +5,8 @@
     "local_path": "/home/zutfen/code/engram",
     "description": "Engram \u2014 trustable institutional memory for multi-agent AI teams. Postgres+pgvector service, FastAPI, multi-tenant, with review states, provenance, conflict detection, and scoped recall.",
     "design_doc": "docs/design.md",
-    "design_version": "v2.2 (schema completeness, 2026-07-06)",
-    "current_state": "v0.1.0 skeleton with v2.2 schema (feedback_events table, default memory_confidence per source_type, composite FK on embeddings for tenant consistency, DeletionEvent + FeedbackEvent ORM models). 15 tables, all RLS-protected. Migration SQL, ORM models, FastAPI app factory, route stubs, Docker Compose exist. No endpoint is functional yet.",
+    "design_version": "v2.2 (schema completeness + final hygiene, 2026-07-06)",
+    "current_state": "v0.1.0 skeleton with v2.2 schema (security_invoker views, feedback_events with recall_log_id, composite FK on embeddings, usage-validated promotion path, verification field cleanup). 15 tables, all RLS-protected. ORM models match migration. Migration SQL, FastAPI app factory, route stubs, Docker Compose exist. No endpoint is functional yet.",
     "conventions": {
       "branch_prefix": "feat/",
       "python": ">=3.11",
@@ -167,7 +167,8 @@
           "external_id/external_source stored if provided (for imports)",
           "embedding is null (deferred to T05); a placeholder row in memory_embeddings may be created with status='pending'",
           "Returns {id, status: created|deduped|superseded, review_status, memory_confidence}",
-          "source_trust and review_status computed from (source_type, principal.type) \u2014 manual from user = 0.9/active, manual from agent = 0.6/proposed"
+          "source_trust and review_status computed from (source_type, principal.type) \u2014 manual from user = 0.9/active, manual from agent = 0.6/proposed",
+          "memory_confidence computed from tenant_config confidence_* defaults matching source_type: manual/user=0.9, manual/agent=0.5, import/migration=0.8, extraction=0.5, sync_turn=0.4, pre_compress=0.3. This is critical for auto-promotion to work in Phase 1A without LLM classification."
         ],
         "context_notes": "Create engram/safety.py with the secret-pattern denylist (regex patterns for AWS keys, GitHub tokens, generic API keys, passwords). The source_trust and review_status defaults are defined in design.md Section 4 (Trust Model) \u2014 encode them as a lookup table. The unique index idx_memitems_dedup will raise IntegrityError on duplicate \u2014 catch it and return status='deduped'. For supersession: if kind is 'preference' or 'invariant' (singleton semantics), and a new item with same family key is written, mark old item's valid_to + superseded_by. The RememberRequest model in memory.py needs updating to include the new fields (subject_type, subject_id, subject_name, importance, sensitivity, external_id, external_source). The source_trust/review_status defaults now depend on BOTH source_type and principal.type. Encode the lookup table from design.md Section 4 (Source trust defaults). This prevents a random agent calling /remember manually from getting the same trust as a user. Source trust and review_status defaults come from the tenant_config table, not hardcoded constants. The remember endpoint should read the active tenant_config to determine defaults."
       },

@@ -10,6 +10,7 @@ from sqlalchemy import (
     Boolean,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
@@ -104,7 +105,7 @@ class MemoryItem(Base):
 
     # Content
     content: Mapped[str] = mapped_column(Text, nullable=False)
-    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    content_hash: Mapped[str] = mapped_column(Text, nullable=False)
     kind: Mapped[str] = mapped_column(String(50), nullable=False)
     wing: Mapped[str | None] = mapped_column(Text, nullable=True)
     room: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -131,7 +132,6 @@ class MemoryItem(Base):
     pinned: Mapped[bool] = mapped_column(Boolean, default=False)
     last_recalled_at: Mapped[datetime | None] = mapped_column(nullable=True)
     recall_count: Mapped[int] = mapped_column(Integer, default=0)
-    last_confirmed_at: Mapped[datetime | None] = mapped_column(nullable=True)
     startup_recall_count: Mapped[int] = mapped_column(Integer, default=0)
     last_verified_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
@@ -177,11 +177,16 @@ class MemoryEmbedding(Base):
     """Embeddings stored separately to support multiple models and re-embedding."""
 
     __tablename__ = "memory_embeddings"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["memory_item_id", "tenant_id"],
+            ["memory_items.id", "memory_items.tenant_id"],
+            ondelete="CASCADE",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    memory_item_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("memory_items.id", ondelete="CASCADE"), nullable=False
-    )
+    memory_item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
     )
@@ -377,7 +382,7 @@ class DeletionEvent(Base):
         UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
     )
     deleted_item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
-    deleted_content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    deleted_content_hash: Mapped[str] = mapped_column(Text, nullable=False)
     deleted_by_principal_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("principals.id"), nullable=True
     )
@@ -401,4 +406,7 @@ class FeedbackEvent(Base):
         UUID(as_uuid=True), ForeignKey("principals.id"), nullable=False
     )
     verdict: Mapped[str] = mapped_column(String(10), nullable=False)  # useful | noise
+    recall_log_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("recall_logs.id", ondelete="SET NULL"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(server_default=text("now()"), nullable=False)
