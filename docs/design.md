@@ -41,14 +41,21 @@ These decisions are made and should not be relitigated without strong reason.
 
 7. **The memory model concepts are the product, not the storage.** Wings/rooms/drawers, knowledge graph triples, tunnels, and agent diaries are Engram's product vocabulary. They survive any backend change.
 
-8. **The classification/routing intelligence stays client-side.** Engram does not decide what to remember. The agent (or its memory-routing layer) decides what to promote to Engram. Engram stores, retrieves, and organizes — it does not editorialize.
+8. **Classification intelligence is a service feature; lifecycle hooks are client-side.** The service provides content classification (what kind? what wing/room? is this worth keeping?) as an optional endpoint. Lifecycle hooks (when to extract, when to promote, volatile recall) stay client-side because they are framework-specific — the service cannot know when an agent's context window is being compressed. A companion library wires the two together for specific agent frameworks.
 
 ---
 
 ## 3. What Is NOT in Engram
 
-- **Memory classification / routing logic.** The LLM-based extraction, write-boundary guards, volatile recall, and promotion heuristics that zutfen_memory implements are agent-side concerns. They ship as a reference implementation / companion library, not as part of the memory service.
+**Lifecycle hooks (framework-specific):**
+- **Pre-compression extraction.** The service cannot know when an agent's context window is being compressed — that's an in-process event. The companion library handles this.
+- **Turn/session boundary detection.** When a conversation turn ends or a session completes are agent-runtime events. The service has no visibility into them.
 - **Volatile/ephemeral recall.** Pre-compression capture buffers stay local to the agent (14-day retention, file-backed). They are write-buffers, not canonical stores. They don't need centralization.
+- **Promotion gates.** Confidence thresholds, source-type allowlists, and veto patterns are configurable per-framework in the companion library. The service provides classification confidence; the client decides whether to act on it.
+
+**What IS in Engram (classification intelligence):**
+- **Content classification.** Given raw text, the service can suggest kind, wing, room, and visibility. This is an LLM-backed endpoint with a rule-based fallback. Tenant-configurable classification rules ship with Zutfen's tuned rules as the default baseline.
+- **Auto-classification on remember.** When a client omits kind/wing/room, the service classifies before storing. Explicit values from the client always take precedence.
 - **Agent configuration, skills, prompts.** Those are declarative artifacts that belong in version control (git), not in a memory service.
 - **Secrets, auth tokens, machine-specific config.** Always local to the machine.
 
@@ -204,6 +211,22 @@ CREATE TABLE api_keys (
     revoked_at      TIMESTAMPTZ
 );
 
+-- ============ Classification config ============
+
+CREATE TABLE classification_rules (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id       UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    name            TEXT NOT NULL,
+    rule_type       TEXT NOT NULL,       -- keyword_kind | keyword_wing | regex_skip | llm_hint
+    pattern         TEXT NOT NULL,       -- keyword string, regex pattern, or hint text
+    target_kind     TEXT,                -- if matched, suggest this kind
+    target_wing     TEXT,                -- if matched, suggest this wing
+    target_room     TEXT,                -- if matched, suggest this room
+    priority        INTEGER NOT NULL DEFAULT 100,  -- lower = checked first
+    enabled         BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- ============ Recall audit ============
 
 CREATE TABLE recall_logs (
@@ -271,6 +294,21 @@ WHERE kind IN ('doctrine', 'decision', 'invariant', 'preference')
 | POST | `/v1/items/{id}/supersede` | Mark superseded + write replacement |
 | POST | `/v1/items/{id}/invalidate` | Mark invalid (set valid_to) |
 
+### Classification
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/v1/classify` | Classify raw text: suggest kind, wing, room, visibility. LLM-backed with rule fallback. |
+| GET | `/v1/classification/rules` | List tenant's classification rules |
+| POST | `/v1/classification/rules` | Create/update a classification rule |
+| DELETE | `/v1/classification/rules/{id}` | Delete a rule |
+
+**Classification behavior:**
+- `POST /v1/classify` accepts raw text + optional context (source_type, conversation excerpt). Returns `{suggested_kind, suggested_wing, suggested_room, suggested_visibility, confidence, reason, rules_matched}`.
+- Confidence ranges 0.0–1.0. Below a tenant-configurable threshold (default 0.5), the service returns `confidence: low` and the client should apply its own judgment or prompt the user.
+- `POST /v1/remember` calls classify() internally when kind/wing/room are omitted. Explicit client values always override.
+- Rule-based fallback: if no LLM is configured (`ENGRAM_CLASSIFICATION_PROVIDER=none`), classification uses only the tenant's keyword/regex rules. This is fully functional without an LLM key.
+
 ### Knowledge graph
 
 | Method | Path | Description |
@@ -320,12 +358,14 @@ engram/
 │   ├── auth.py                ← API key auth
 │   ├── embeddings.py          ← embedding generation + pgvector ops
 │   ├── canonicalize.py        ← content hashing, dedup, supersession logic
+│   ├── classification.py      ← content classification (LLM + rule-based)
 │   ├── recall.py              ← startup/semantic recall selection logic
 │   └── api/
 │       ├── __init__.py
 │       ├── app.py             ← FastAPI app factory
 │       └── routes/
 │           ├── memory.py      ← remember/recall/search/items
+│           ├── classify.py    ← classification endpoint + rule CRUD
 │           ├── kg.py          ← knowledge graph endpoints
 │           ├── taxonomy.py    ← taxonomy/tunnels
 │           ├── diary.py
@@ -378,8 +418,9 @@ This is what makes multi-agent work.
 ## 10. Phased Delivery
 
 ### Phase 1 — Core service for Zutfen dogfooding
-- Postgres schema + migrations
-- REST API (remember, recall, search, KG, export)
+- Postgres schema + migrations (including classification_rules table)
+- REST API (remember, recall, search, classify, KG, export)
+- Classification engine (LLM-backed + rule-based fallback, Zutfen-tuned default rules)
 - Python SDK
 - Migration importers (dry-run)
 - Docker Compose deployment
@@ -396,7 +437,7 @@ This is what makes multi-agent work.
 - Naming, docs, README, examples
 - Multi-framework quickstarts (LangChain, CrewAI, plain Python)
 - Auth hardening (API keys → OAuth/org model for hosted)
-- Reference implementation of classification/routing as companion package
+- Companion library (engram-hooks) packaging the Hermes lifecycle hooks — pre_compress, sync_turn, session_end — wired to the service's classify endpoint
 - Helm chart / cloud deployment artifacts
 
 ---
@@ -411,6 +452,7 @@ This is what makes multi-agent work.
 | Relationships | No | No | Yes (graph) | **Yes (KG + tunnels)** |
 | Temporal validity | No | No | Yes | **Yes (valid_from/valid_to)** |
 | Audit trail | No | Partial | No | **Yes (append-first, provenance)** |
+| Smart classification | Basic extraction | No | No | **LLM-backed + rule-based, tenant-configurable** |
 | Self-hostable | Yes | Yes | Yes | **Yes (Docker Compose)** |
 
-Engram's wedge: structured organizational memory for agent teams, not just flat per-agent recall.
+Engram's wedge: structured organizational memory for agent teams, with smart classification — not just flat per-agent recall.

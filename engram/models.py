@@ -203,3 +203,26 @@ class RecallLog(Base):
     created_at: Mapped[datetime] = mapped_column(
         server_default=text("now()"), nullable=False
     )
+
+
+class ClassificationRule(Base):
+    """Tenant-configurable rules for content classification (kind, wing, room)."""
+
+    __tablename__ = "classification_rules"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    rule_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    # keyword_kind | keyword_wing | regex_skip | llm_hint
+    pattern: Mapped[str] = mapped_column(Text, nullable=False)
+    target_kind: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    target_wing: Mapped[str | None] = mapped_column(Text, nullable=True)
+    target_room: Mapped[str | None] = mapped_column(Text, nullable=True)
+    priority: Mapped[int] = mapped_column(default=100, nullable=False)
+    enabled: Mapped[bool] = mapped_column(default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        server_default=text("now()"), nullable=False
+    )

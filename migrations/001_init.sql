@@ -115,7 +115,23 @@ CREATE TABLE api_keys (
     revoked_at      TIMESTAMPTZ
 );
 
--- ============ Recall Audit ============
+-- ============ Classification config ============
+
+CREATE TABLE classification_rules (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id       UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    name            TEXT NOT NULL,
+    rule_type       TEXT NOT NULL,       -- keyword_kind | keyword_wing | regex_skip | llm_hint
+    pattern         TEXT NOT NULL,       -- keyword string, regex pattern, or hint text
+    target_kind     TEXT,                -- if matched, suggest this kind
+    target_wing     TEXT,                -- if matched, suggest this wing
+    target_room     TEXT,                -- if matched, suggest this room
+    priority        INTEGER NOT NULL DEFAULT 100,  -- lower = checked first
+    enabled         BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ============ Recall audit ============
 
 CREATE TABLE recall_logs (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -155,6 +171,9 @@ CREATE INDEX idx_tunnels_wing   ON tunnels(tenant_id, source_wing);
 -- API keys
 CREATE INDEX idx_apikeys_hash   ON api_keys(key_hash) WHERE revoked_at IS NULL;
 
+-- Classification rules
+CREATE INDEX idx_classrules_tenant ON classification_rules(tenant_id, enabled, priority);
+
 -- ============ Views ============
 
 -- CCA ledger projection: active doctrine/decision/invariant/preference items.
@@ -184,3 +203,22 @@ ON CONFLICT (tenant_id, slug) DO NOTHING;
 INSERT INTO principals (tenant_id, name, type)
 SELECT id, 'admin', 'user' FROM tenants WHERE slug = 'default'
 ON CONFLICT (tenant_id, name) DO NOTHING;
+
+-- ============ Seed: default classification rules (Zutfen-tuned baseline) ============
+-- These are the shipped defaults, informed by the zutfen_memory classification work.
+-- Tenants can override, disable, or add rules via the /v1/classification/rules API.
+
+INSERT INTO classification_rules (tenant_id, name, rule_type, pattern, target_kind, priority)
+SELECT t.id, r.name, r.rule_type, r.pattern, r.target_kind, r.priority
+FROM tenants t, (VALUES
+    -- Skip patterns: content that should never be remembered
+    ('skip_tool_output',      'regex_skip', '\b(passed|failed|ok|done)\b',                        NULL, 10),
+    ('skip_single_token',     'regex_skip', '^.{1,15}$',                                            NULL, 10),
+    -- Kind inference: keyword → kind
+    ('kind_doctrine',         'keyword_kind', 'doctrine|invariant|must|should|always|never',     'doctrine', 50),
+    ('kind_decision',         'keyword_kind', 'decided|decision|chose|we will|going to',         'decision', 50),
+    ('kind_preference',       'keyword_kind', 'prefers|wants|likes|dislikes|convention',         'preference', 50),
+    ('kind_observation',      'keyword_kind', 'observed|noticed|error|failed|warning',           'observation', 60)
+) AS r(name, rule_type, pattern, target_kind, priority)
+WHERE t.slug = 'default'
+ON CONFLICT DO NOTHING;

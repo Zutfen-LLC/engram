@@ -26,6 +26,12 @@ class Settings(BaseSettings):
     embedding_provider: str = "none"
     openai_api_key: str | None = None
 
+    # Classification
+    # Provider: "openai", "local", or "none" (rule-based fallback only)
+    classification_provider: str = "none"
+    classification_model: str = "gpt-4o-mini"
+    classification_confidence_threshold: float = 0.5
+
     # Auth
     # When false, auth is skipped (dev mode). Production must set True.
     auth_enabled: bool = False
