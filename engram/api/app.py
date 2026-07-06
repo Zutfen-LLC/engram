@@ -24,11 +24,12 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    from engram.api.routes import memory, classify, kg, taxonomy, diary, export, health
+    from engram.api.routes import memory, classify, review, kg, taxonomy, diary, export, health
 
     app.include_router(health.router, tags=["health"])
     app.include_router(memory.router, prefix="/v1", tags=["memory"])
     app.include_router(classify.router, prefix="/v1", tags=["classification"])
+    app.include_router(review.router, prefix="/v1", tags=["review"])
     app.include_router(kg.router, prefix="/v1", tags=["knowledge-graph"])
     app.include_router(taxonomy.router, prefix="/v1", tags=["taxonomy"])
     app.include_router(diary.router, prefix="/v1", tags=["diary"])

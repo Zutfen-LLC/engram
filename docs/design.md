@@ -1,320 +1,230 @@
 # Engram — Design Document
 
-**Status:** Locked (v1, 2026-07-06)
-**Product:** Shared structured memory layer for multi-agent AI teams
+**Status:** Locked (v2, 2026-07-06 — trust model revision)
+**Product:** Trustable institutional memory for multi-agent AI teams
 
 ---
 
 ## 1. What Engram Is
 
-Engram is a standalone memory service that gives teams of AI agents a shared, structured, durable brain. It is not a flat key-value memory store — it is an organized knowledge system with taxonomy, relationships, temporal validity, and per-agent scoping.
+Engram is a standalone memory service that gives teams of AI agents a shared, structured, durable, and **trustable** brain. It's not a flat key-value memory store — it's an institutional memory system with taxonomy, relationships, temporal validity, review states, provenance, and conflict detection.
 
 The name comes from neuroscience: an **engram** is the physical trace a memory leaves in brain tissue — the literal substrate of stored memory.
 
-### Origin
+### Product thesis
 
-Engram is the successor to MemPalace (ChromaDB-backed, single-instance) and the Zutfen CCA ledger (JSON-in-git). It absorbs both models into a unified Postgres-native service designed for multi-agent, multi-device, multi-tenant use from day one.
+The hard problem in agent memory is not "can we store and recall facts?" — that's solved. The hard problem is: **can agents and humans trust what is stored, know why it was stored, know whether it is still true, and safely act on it?**
+
+Engram is designed as a trust system, not just a storage system.
 
 ### Target users
 
 - **Self-hosted (Phase 1):** Zutfen LLC's own agent fleet across Hermes profiles
-- **Open source (Phase 3):** Any team running multiple AI agents (LangChain, CrewAI, AutoGen, custom)
+- **Open source (Phase 3):** Any team running multiple AI agents
 - **Hosted (future):** Managed Engram Cloud for teams that don't want to self-host
 
 ---
 
 ## 2. Architectural Principles (Locked)
 
-These decisions are made and should not be relitigated without strong reason.
+1. **Standalone service, not agent-coupled.** Engram is its own process, its own repo, its own deployment. Agent frameworks are clients.
 
-1. **Standalone service, not agent-coupled.** Engram is its own process, its own repo, its own deployment. Agent frameworks are clients. No agent framework is special — not even Hermes.
+2. **Postgres + pgvector as the single storage backend.** No storage abstraction layer. YAGNI until real demand for alternatives.
 
-2. **Postgres + pgvector as the single storage backend.** No storage abstraction layer. YAGNI until real demand for alternatives. Postgres gives us transactions, multi-writer concurrency, relational queries, and vector search in one system.
+3. **Multi-tenant from day one.** Every table has `tenant_id`. Row Level Security enforces isolation at the database level — one forgotten WHERE clause cannot cause a cross-tenant leak.
 
-3. **Multi-tenant from day one.** Every table has `tenant_id`. The cost is one column + one WHERE clause. The benefit is zero-friction hosted product later. Single-tenant self-hosted is just the hosted product with one tenant.
+4. **REST core, MCP/SDK as thin wrappers.** The service exposes a clean HTTP API. MCP is one client adapter. Any framework can adopt it.
 
-4. **REST core, MCP/SDK as thin wrappers.** The service exposes a clean HTTP API. MCP is one client adapter. Python SDK is another. Any framework can adopt it.
+5. **Content is append-first; metadata changes are audited.** Memory content is never UPDATEd. Supersession/invalidation marks old rows. Metadata changes (wing, room, visibility, review_status) are recorded in `item_events` for full audit trail.
 
-5. **Append-first data model.** Every memory write is an INSERT, never an UPDATE. Supersession/invalidation marks old rows with `valid_to` / `superseded_by`. This gives full audit trail, replay, and time-travel queries.
+6. **Profile/workspace scoping is first-class.** Memory items belong to a tenant + workspace + principal. Visibility levels and workspace membership control access.
 
-6. **Profile/workspace scoping is first-class.** Memory items belong to a tenant + workspace + principal. Visibility levels control cross-agent sharing.
+7. **The memory model concepts are the product, not the storage.** Wings/rooms/drawers, knowledge graph triples, tunnels, and agent diaries are Engram's product vocabulary.
 
-7. **The memory model concepts are the product, not the storage.** Wings/rooms/drawers, knowledge graph triples, tunnels, and agent diaries are Engram's product vocabulary. They survive any backend change.
+8. **Classification intelligence is a service feature; lifecycle hooks are client-side.** The service provides content classification (what kind? what wing/room?) as an endpoint. Lifecycle hooks (when to extract, when to promote) stay client-side because they are framework-specific.
 
-8. **Classification intelligence is a service feature; lifecycle hooks are client-side.** The service provides content classification (what kind? what wing/room? is this worth keeping?) as an optional endpoint. Lifecycle hooks (when to extract, when to promote, volatile recall) stay client-side because they are framework-specific — the service cannot know when an agent's context window is being compressed. A companion library wires the two together for specific agent frameworks.
+9. **Trust is a product feature, not an implementation detail.** Review states, provenance, confidence, conflict detection, and recall explanations are core to the product — they elevate Engram from "memory store" to "trustable institutional memory."
 
 ---
 
-## 3. What Is NOT in Engram
+## 3. Memory Lifecycle
+
+Every memory item moves through a lifecycle:
+
+```
+observed → proposed → active → recalled → confirmed/stale → superseded/invalidated/archived
+```
+
+| State | Meaning | Enters startup recall? |
+|---|---|---|
+| `proposed` | Written by agent, not yet reviewed | No |
+| `active` | Reviewed and trusted | Yes |
+| `disputed` | Flagged as potentially wrong | No |
+| `rejected` | Reviewed and rejected (kept for audit) | No |
+| `archived` | Old/superseded, excluded from default recall | No |
+
+Agents can freely write `proposed` memories. Only `active` memories enter the deterministic startup recall set. High-trust sources (explicit user instruction, verified imports) can write directly to `active`.
+
+---
+
+## 4. Trust Model
+
+### Confidence layers
+
+| Field | What it means | Example |
+|---|---|---|
+| `source_trust` | Trust in where this came from | User said it = 0.9; agent guessed = 0.4 |
+| `memory_confidence` | Overall confidence this memory is accurate | Verified fact = 0.95; LLM inference = 0.6 |
+| `extraction_confidence` | Confidence of the extraction process | Direct quote = 0.9; LLM summary = 0.5 |
+| `human_verified` | A human has confirmed this is true | Boolean |
+
+### Source trust defaults
+
+| Source type | Default source_trust | Default review_status |
+|---|---|---|
+| `manual` (user explicitly said "remember") | 0.9 | `active` |
+| `import` / `migration` (from trusted ledger) | 0.8 | `active` |
+| `extraction` (LLM-derived from conversation) | 0.5 | `proposed` |
+| `sync_turn` (auto-extracted per turn) | 0.4 | `proposed` |
+| `pre_compress` (pre-compression capture) | 0.3 | `proposed` |
+
+### Recall ranking formula
+
+Startup recall uses a scoring formula to order items within the budget:
+
+```
+score = (importance * 0.25)
+      + (source_trust * 0.20)
+      + (memory_confidence * 0.20)
+      + (recency_bonus * 0.15)
+      + (human_verified_bonus * 0.10)
+      + (pinned_bonus * 0.10)
+```
+
+Where:
+- `recency_bonus` = decay function based on `last_recalled_at` (recently recalled = relevant)
+- `human_verified_bonus` = 1.0 if verified, 0.0 otherwise
+- `pinned_bonus` = 1.0 if pinned, 0.0 otherwise
+
+Pinned items are always included in startup recall if active, regardless of budget (they get their bytes first, then the scorer fills the remainder).
+
+---
+
+## 5. What Is NOT in Engram
 
 **Lifecycle hooks (framework-specific):**
-- **Pre-compression extraction.** The service cannot know when an agent's context window is being compressed — that's an in-process event. The companion library handles this.
-- **Turn/session boundary detection.** When a conversation turn ends or a session completes are agent-runtime events. The service has no visibility into them.
-- **Volatile/ephemeral recall.** Pre-compression capture buffers stay local to the agent (14-day retention, file-backed). They are write-buffers, not canonical stores. They don't need centralization.
-- **Promotion gates.** Confidence thresholds, source-type allowlists, and veto patterns are configurable per-framework in the companion library. The service provides classification confidence; the client decides whether to act on it.
+- Pre-compression extraction, turn/session boundary detection, volatile recall. These require in-process visibility the service cannot have. They live in the companion library (engram-hooks).
 
 **What IS in Engram (classification intelligence):**
-- **Content classification.** Given raw text, the service can suggest kind, wing, room, and visibility. This is an LLM-backed endpoint with a rule-based fallback. Tenant-configurable classification rules ship with Zutfen's tuned rules as the default baseline.
-- **Auto-classification on remember.** When a client omits kind/wing/room, the service classifies before storing. Explicit values from the client always take precedence.
-- **Agent configuration, skills, prompts.** Those are declarative artifacts that belong in version control (git), not in a memory service.
-- **Secrets, auth tokens, machine-specific config.** Always local to the machine.
+- Content classification (`POST /v1/classify`). LLM-backed with rule-based fallback. Tenant-configurable rules.
+- Auto-classification on remember. When kind/wing/room are omitted, the service classifies before storing.
+
+**Also NOT in Engram:**
+- Agent configuration, skills, prompts (belong in version control)
+- Secrets, auth tokens, machine-specific config (always local)
 
 ---
 
-## 4. Memory Model
-
-Engram absorbs MemPalace's vocabulary into a unified relational model.
+## 6. Memory Model
 
 ### Core concept: the memory item
 
-A **memory item** is the fundamental unit. It absorbs what MemPalace called "drawers" and what CCA called "ledger entries." Every piece of stored knowledge is a memory item.
-
 Each memory item has:
-- **Content** — the verbatim text of the memory
-- **Kind** — what type of memory it is (fact, preference, doctrine, decision, invariant, observation, diary_entry)
-- **Taxonomy** — optional wing + room (user-defined organization, inheriting MemPalace's abstraction-layer model)
-- **Scope** — tenant + workspace + principal ownership
-- **Visibility** — private (agent-only) / workspace (shared) / tenant (global)
-- **Temporal validity** — valid_from, valid_to (null = currently true)
-- **Provenance** — who wrote it, when, from what source type
-- **Embedding** — vector for semantic search
+- **Content** — verbatim text + content_hash for dedup
+- **Kind** — fact, preference, doctrine, decision, invariant, observation, diary_entry
+- **Taxonomy** — optional wing + room
+- **Subject** — what this memory is ABOUT (subject_type, subject_id, subject_name), separate from who wrote it
+- **Scope** — tenant + workspace + principal
+- **Visibility** — private / workspace / tenant / public
+- **Trust** — review_status, memory_confidence, source_trust, human_verified
+- **Recall signals** — importance, pinned, last_recalled_at, recall_count
+- **Provenance** — source_type, source_uri, extracted_by_model, extraction_confidence
+- **Conflict tracking** — conflicts_with_item_id, conflict_type, resolution_status
+- **Temporal validity** — valid_from, valid_to, superseded_by
 
-### Derived concepts
+### MemPalace succession
 
 | MemPalace concept | Engram representation |
 |---|---|
-| Wing | `wing` field on memory_items (free text, user-defined taxonomy) |
+| Wing | `wing` field on memory_items |
 | Room | `room` field on memory_items |
-| Drawer | A memory_item (they are the same thing) |
-| Knowledge graph fact | Row in `kg_triples` (subject-predicate-object + temporal validity) |
-| Tunnel | Row in `tunnels` (cross-wing/room link) |
-| Agent diary entry | memory_item with kind='diary_entry', scoped to principal |
-| CCA ledger entry | memory_item with kind IN ('doctrine','decision','invariant','preference') |
-
-The CCA ledger export is a **view** over memory_items — no separate table. The git-export workflow queries this view and renders JSON for human review.
+| Drawer | A memory_item |
+| Knowledge graph fact | Row in `kg_triples` (with visibility inherited from source_item_id) |
+| Tunnel | Row in `tunnels` |
+| Agent diary entry | memory_item with kind='diary_entry' |
+| CCA ledger entry | memory_item with kind IN (doctrine, decision, invariant, preference) |
 
 ---
 
-## 5. Postgres Schema
+## 7. Postgres Schema
 
-### Core tables
+See `migrations/001_init.sql` for the canonical DDL. Key design decisions:
 
-```sql
--- Enable extensions
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-CREATE EXTENSION IF NOT EXISTS "pgcrypto";
-CREATE EXTENSION IF NOT EXISTS vector;
+### Tables (12 total)
 
--- ============ Identity & scoping ============
+| Table | Purpose |
+|---|---|
+| `tenants` | Multi-tenant root |
+| `workspaces` | Project/team scoping within a tenant |
+| `principals` | Agents and users that write memories |
+| `workspace_members` | Role-based workspace membership (owner/admin/member/viewer) |
+| `memory_items` | The core: all memories with trust, provenance, review state |
+| `memory_embeddings` | Embeddings stored separately (supports multiple models, re-embedding) |
+| `kg_triples` | Knowledge graph facts with visibility and review state |
+| `tunnels` | Cross-wing/room links |
+| `item_events` | Audit trail for metadata mutations (content stays append-first) |
+| `classification_rules` | Tenant-configurable classification rules |
+| `api_keys` | Authentication credentials |
+| `recall_logs` | Recall audit with item_ids for feedback loops |
 
-CREATE TABLE tenants (
-    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    name        TEXT NOT NULL,
-    slug        TEXT NOT NULL UNIQUE,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+### Key schema decisions
 
-CREATE TABLE workspaces (
-    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    tenant_id   UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-    name        TEXT NOT NULL,
-    slug        TEXT NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE(tenant_id, slug)
-);
+- **Check constraints** on all enum-like fields (kind, visibility, review_status, source_type, sensitivity, conflict_type) to prevent taxonomy drift.
+- **Full-text search** via `content_tsv TSVECTOR` column with auto-update trigger + GIN index. Essential for keyword search on IDs, paths, names.
+- **Separate embeddings table** keyed by `(memory_item_id, embedding_model)`. A model change is new rows, not a migration. Old vectors remain queryable during re-embedding.
+- **Unique dedup index** on `(tenant_id, workspace_id, principal_id, content_hash) WHERE valid_to IS NULL AND review_status != 'rejected'`. Makes remember idempotent for retries.
+- **Row Level Security** on all tenant-scoped tables. Application sets `app.tenant_id` per session; Postgres enforces isolation even if application code is wrong.
+- **HNSW with iterative_scan** — requires pgvector 0.8+. Set `hnsw.iterative_scan = strict` at query time to handle filtered (tenant-scoped) queries without recall degradation.
 
-CREATE TABLE principals (
-    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    tenant_id   UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-    name        TEXT NOT NULL,          -- e.g. "orchestrator", "support-agent"
-    type        TEXT NOT NULL DEFAULT 'agent',  -- agent | user
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE(tenant_id, name)
-);
+### KG visibility
 
--- ============ Memory items (the core) ============
-
-CREATE TABLE memory_items (
-    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    tenant_id       UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-    workspace_id    UUID REFERENCES workspaces(id) ON DELETE SET NULL,
-    principal_id    UUID NOT NULL REFERENCES principals(id),
-
-    -- Content
-    content         TEXT NOT NULL,
-    content_hash    TEXT NOT NULL,       -- SHA-256 of canonicalized content, for dedup
-    kind            TEXT NOT NULL,       -- fact|preference|doctrine|decision|invariant|observation|diary_entry
-    wing            TEXT,                -- user-defined taxonomy (optional)
-    room            TEXT,
-
-    -- Scoping
-    visibility      TEXT NOT NULL DEFAULT 'workspace',  -- private|workspace|tenant|public
-
-    -- Provenance
-    source_type     TEXT NOT NULL DEFAULT 'manual',  -- manual|sync_turn|pre_compress|session_end|import|migration
-    source_session  TEXT,
-
-    -- Semantic
-    embedding       vector(1536),        -- configurable dimension; pgvector HNSW index
-
-    -- Temporal validity (append-first model)
-    valid_from      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    valid_to        TIMESTAMPTZ,         -- NULL = currently valid
-    superseded_by   UUID REFERENCES memory_items(id),
-
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
--- ============ Knowledge graph ============
-
-CREATE TABLE kg_triples (
-    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    tenant_id       UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-    workspace_id    UUID REFERENCES workspaces(id) ON DELETE SET NULL,
-    subject         TEXT NOT NULL,
-    predicate       TEXT NOT NULL,
-    object          TEXT NOT NULL,
-    valid_from      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    valid_to        TIMESTAMPTZ,
-    source_item_id  UUID REFERENCES memory_items(id) ON DELETE SET NULL,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
--- ============ Tunnels (cross-domain links) ============
-
-CREATE TABLE tunnels (
-    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    tenant_id       UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-    source_wing     TEXT NOT NULL,
-    source_room     TEXT NOT NULL,
-    target_wing     TEXT NOT NULL,
-    target_room     TEXT NOT NULL,
-    label           TEXT,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
--- ============ Agent diaries ============
-
--- Diaries are memory_items with kind='diary_entry'.
--- No separate table needed; scoped by principal_id.
-
--- ============ Auth ============
-
-CREATE TABLE api_keys (
-    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    tenant_id       UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-    principal_id    UUID REFERENCES principals(id),
-    key_hash        TEXT NOT NULL,       -- bcrypt/argon2 hash
-    scopes          TEXT[] NOT NULL DEFAULT '{read,write}',
-    label           TEXT,                -- human-readable name
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    revoked_at      TIMESTAMPTZ
-);
-
--- ============ Classification config ============
-
-CREATE TABLE classification_rules (
-    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    tenant_id       UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-    name            TEXT NOT NULL,
-    rule_type       TEXT NOT NULL,       -- keyword_kind | keyword_wing | regex_skip | llm_hint
-    pattern         TEXT NOT NULL,       -- keyword string, regex pattern, or hint text
-    target_kind     TEXT,                -- if matched, suggest this kind
-    target_wing     TEXT,                -- if matched, suggest this wing
-    target_room     TEXT,                -- if matched, suggest this room
-    priority        INTEGER NOT NULL DEFAULT 100,  -- lower = checked first
-    enabled         BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
--- ============ Recall audit ============
-
-CREATE TABLE recall_logs (
-    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    tenant_id       UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-    principal_id    UUID NOT NULL REFERENCES principals(id),
-    mode            TEXT NOT NULL,       -- startup|semantic|keyword
-    query           TEXT,
-    item_ids        UUID[],
-    byte_budget     INTEGER,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-```
-
-### Indexes
-
-```sql
--- Memory items: scoped lookups
-CREATE INDEX idx_memitems_tenant_workspace ON memory_items(tenant_id, workspace_id);
-CREATE INDEX idx_memitems_taxonomi        ON memory_items(tenant_id, wing, room);
-CREATE INDEX idx_memitems_kind            ON memory_items(tenant_id, kind);
-CREATE INDEX idx_memitems_active           ON memory_items(tenant_id, valid_to) WHERE valid_to IS NULL;
-CREATE INDEX idx_memitems_hash             ON memory_items(tenant_id, content_hash);
-CREATE INDEX idx_memitems_principal        ON memory_items(tenant_id, principal_id);
-
--- Semantic search (HNSW for high-recall approximate NN)
-CREATE INDEX idx_memitems_embedding ON memory_items
-    USING hnsw (embedding vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64);
-
--- Knowledge graph
-CREATE INDEX idx_kg_subject     ON kg_triples(tenant_id, subject);
-CREATE INDEX idx_kg_predicate   ON kg_triples(tenant_id, predicate);
-CREATE INDEX idx_kg_active      ON kg_triples(tenant_id, valid_to) WHERE valid_to IS NULL;
-```
-
-### CCA view (ledger export projection)
-
-```sql
-CREATE VIEW cca_ledger AS
-SELECT
-    id, tenant_id, workspace_id, principal_id,
-    content, kind, wing, room, visibility,
-    source_type, source_session,
-    valid_from, valid_to, superseded_by, created_at
-FROM memory_items
-WHERE kind IN ('doctrine', 'decision', 'invariant', 'preference')
-  AND valid_to IS NULL;
-```
+KG triples inherit visibility from their `source_item_id` at query time. A private memory item that spawns a triple does NOT leak that knowledge — querying the KG checks the source item's visibility against the caller's scope.
 
 ---
 
-## 6. API Surface (REST)
+## 8. API Surface (REST)
 
 ### Memory operations
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/v1/remember` | Write a memory item (dedup, supersession, canonicalization) |
-| POST | `/v1/recall` | Bounded recall: `mode=startup` (deterministic working set) or `mode=semantic` (query-based) |
-| POST | `/v1/search` | Keyword, semantic, or hybrid search |
-| GET | `/v1/items` | List items with filters (workspace, kind, wing, principal, status) |
-| GET | `/v1/items/{id}` | Full detail with provenance, evidence, linked KG facts |
-| PATCH | `/v1/items/{id}` | Update metadata (wing, room, visibility) — not content |
+| POST | `/v1/remember` | Write a memory item (dedup, supersession, auto-classify, conflict check) |
+| POST | `/v1/recall` | Bounded recall: startup (deterministic) or semantic (query-based) |
+| POST | `/v1/search` | Keyword (FTS), semantic (pgvector), or hybrid search |
+| GET | `/v1/items` | List items with filters (cursor pagination) |
+| GET | `/v1/items/{id}` | Full detail with provenance, events, linked KG facts |
+| PATCH | `/v1/items/{id}` | Update metadata (creates item_event, never touches content) |
 | POST | `/v1/items/{id}/supersede` | Mark superseded + write replacement |
-| POST | `/v1/items/{id}/invalidate` | Mark invalid (set valid_to) |
+| POST | `/v1/items/{id}/invalidate` | Mark invalid |
+| POST | `/v1/items/{id}/review` | Change review_status (proposed → active, dispute, etc.) |
+| POST | `/v1/items/{id}/verify` | Mark human-verified |
+| POST | `/v1/feedback` | Mark recalled items as useful/noise (recall scoring feedback loop) |
 
 ### Classification
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/v1/classify` | Classify raw text: suggest kind, wing, room, visibility. LLM-backed with rule fallback. |
-| GET | `/v1/classification/rules` | List tenant's classification rules |
-| POST | `/v1/classification/rules` | Create/update a classification rule |
+| POST | `/v1/classify` | Classify raw text: suggest kind, wing, room, confidence |
+| GET | `/v1/classification/rules` | List tenant rules |
+| POST | `/v1/classification/rules` | Create/update a rule |
 | DELETE | `/v1/classification/rules/{id}` | Delete a rule |
-
-**Classification behavior:**
-- `POST /v1/classify` accepts raw text + optional context (source_type, conversation excerpt). Returns `{suggested_kind, suggested_wing, suggested_room, suggested_visibility, confidence, reason, rules_matched}`.
-- Confidence ranges 0.0–1.0. Below a tenant-configurable threshold (default 0.5), the service returns `confidence: low` and the client should apply its own judgment or prompt the user.
-- `POST /v1/remember` calls classify() internally when kind/wing/room are omitted. Explicit client values always override.
-- Rule-based fallback: if no LLM is configured (`ENGRAM_CLASSIFICATION_PROVIDER=none`), classification uses only the tenant's keyword/regex rules. This is fully functional without an LLM key.
 
 ### Knowledge graph
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/v1/kg` | Add triple |
-| GET | `/v1/kg/query` | Query by entity (subject/object/predicate), with temporal filter |
+| POST | `/v1/kg` | Add triple (visibility inherited from source item) |
+| GET | `/v1/kg/query` | Query by entity, with temporal + visibility filtering |
 | POST | `/v1/kg/invalidate` | Mark triple invalid |
 | GET | `/v1/kg/timeline` | Chronological timeline for an entity |
 
@@ -330,129 +240,198 @@ WHERE kind IN ('doctrine', 'decision', 'invariant', 'preference')
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/v1/diary` | Write diary entry (creates memory_item kind=diary_entry) |
+| POST | `/v1/diary` | Write diary entry (kind=diary_entry, visibility=private) |
 | GET | `/v1/diary/{principal}` | Read diary entries |
+
+### Review & governance
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v1/review/queue` | Items awaiting review (proposed status) |
+| GET | `/v1/review/conflicts` | Items with unresolved conflicts |
+| POST | `/v1/items/{id}/resolve-conflict` | Resolve a conflict (accept/reject/merge) |
 
 ### Export & operations
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/v1/export/cca` | Export CCA ledger as JSON (for git-tracked review) |
+| GET | `/v1/export/cca` | Export CCA ledger as JSON (git-friendly) |
 | GET | `/health` | Liveness |
-| GET | `/ready` | Readiness (DB connectivity check) |
+| GET | `/ready` | Readiness (DB check) |
 
 ---
 
-## 7. Repo Structure
+## 9. Recall Policy
+
+### Startup recall
+
+Deterministic, bounded working set for session initialization.
+
+**Eligibility:** `review_status = 'active' AND valid_to IS NULL`, filtered by caller's visibility scope.
+
+**Ordering:** Scored by the recall ranking formula (Section 4). Pinned items included first.
+
+**Budget:** Accepts `byte_budget` or `token_budget` (approximated as bytes/4). Default from config.
+
+**Output:** `working_set` (rendered text), `item_count`, `byte_count`, `omitted_count`, plus per-item `reasons` array explaining why each item was included.
+
+### Semantic recall
+
+Query-vector matches filtered by visibility scope, scored by cosine similarity + kind weight + recency.
+
+### Why-recalled explanations
+
+Every recalled item includes a `reasons` array:
+```json
+{
+  "score": 0.87,
+  "reasons": ["matched workspace", "kind=invariant", "human verified", "semantic similarity 0.78", "pinned"],
+  "warnings": ["not confirmed in 90 days"]
+}
+```
+
+---
+
+## 10. Conflict Handling
+
+### Detection at write time
+
+When `POST /v1/remember` writes a new item, it runs a semantic similarity check against active items in the same scope. Above a threshold, the classifier is asked: "does this contradict, refine, or duplicate?"
+
+- **duplicate** → auto-dedup (existing behavior)
+- **refine** → auto-supersede (mark old, write new)
+- **contradict** → flag conflict, set `conflicts_with_item_id`, `conflict_type='contradiction'`, `conflict_resolution_status='unresolved'`
+
+### Resolution
+
+Conflicts surface in `GET /v1/review/conflicts`. Resolution via `POST /v1/items/{id}/resolve-conflict` sets the resolution status and optionally invalidates the loser.
+
+---
+
+## 11. Privacy & Safety
+
+- **Sensitivity field** on every memory item: `normal`, `sensitive`, `restricted`.
+- **Secret-pattern denylist**: pre-write check blocks content matching common secret patterns (API keys, tokens, passwords).
+- **PII-risk classification**: optional LLM check flags content likely containing PII.
+- **Hard-delete support**: `DELETE /v1/items/{id}` physically removes (for GDPR/hosted future). Logged in item_events.
+- **Read audit**: sensitive reads are logged to recall_logs.
+
+---
+
+## 12. Repo Structure
 
 ```
 engram/
-├── README.md
 ├── docs/
-│   └── design.md              ← this document
-├── engram/                    ← Python package (the service)
+│   ├── design.md
+│   └── backlog.json
+├── engram/
 │   ├── __init__.py
-│   ├── config.py              ← env/config management
-│   ├── db.py                  ← SQLAlchemy session, connection pool
-│   ├── models.py              ← ORM models
-│   ├── auth.py                ← API key auth
-│   ├── embeddings.py          ← embedding generation + pgvector ops
-│   ├── canonicalize.py        ← content hashing, dedup, supersession logic
-│   ├── classification.py      ← content classification (LLM + rule-based)
-│   ├── recall.py              ← startup/semantic recall selection logic
+│   ├── config.py
+│   ├── db.py
+│   ├── models.py
+│   ├── auth.py
+│   ├── embeddings.py
+│   ├── canonicalize.py
+│   ├── classification.py
+│   ├── recall.py
+│   ├── conflicts.py            ← write-time conflict detection
 │   └── api/
-│       ├── __init__.py
-│       ├── app.py             ← FastAPI app factory
+│       ├── app.py
 │       └── routes/
-│           ├── memory.py      ← remember/recall/search/items
-│           ├── classify.py    ← classification endpoint + rule CRUD
-│           ├── kg.py          ← knowledge graph endpoints
-│           ├── taxonomy.py    ← taxonomy/tunnels
+│           ├── memory.py
+│           ├── classify.py
+│           ├── review.py       ← review queue + conflict resolution
+│           ├── kg.py
+│           ├── taxonomy.py
 │           ├── diary.py
-│           └── export.py      ← CCA export
+│           └── export.py
 ├── migrations/
-│   └── 001_init.sql           ← raw DDL
-├── sdk/
-│   └── engram-client/         ← Python SDK (thin HTTP client)
-│       └── ...
-├── scripts/
-│   ├── import_mempalace.py    ← migrate from ChromaDB
-│   ├── import_cca.py          ← migrate from JSON ledger
-│   └── export_cca.py          ← render ledger to git-friendly JSON
+│   └── 001_init.sql
+├── sdk/engram-client/
 ├── adapters/
-│   └── mcp-server/            ← MCP adapter (for Hermes + other MCP clients)
-├── docker-compose.yml         ← self-hosted: engram + postgres
+│   ├── mcp-server/
+│   └── engram-hooks/           ← Hermes lifecycle hooks companion library
+├── scripts/
+├── docker-compose.yml
 ├── Dockerfile
 └── pyproject.toml
 ```
 
 ---
 
-## 8. Visibility & Scoping Model
+## 13. Phased Delivery
 
-This is what makes multi-agent work.
-
-| Visibility | Who can read | Use case |
-|---|---|---|
-| `private` | Only the principal that wrote it | Agent's own working notes, diary |
-| `workspace` | Any principal in the same workspace | Shared project knowledge (default) |
-| `tenant` | Any principal in the tenant | Cross-project org knowledge |
-| `public` | Any authenticated caller (future: unauthenticated) | Shared/public knowledge base |
-
-**Recall semantics:**
-- `mode=startup` returns: the principal's active private items + workspace-shared active items + tenant-global active items, bounded by byte/item budget, deterministic ordering.
-- `mode=semantic` returns: items matching the query vector, filtered by the caller's visibility scope.
-
----
-
-## 9. Hosting (Zutfen self-hosted Phase 1)
-
-- Dedicated VM on Proxmox (host TBD — pm01 or pm03 candidate)
-- Docker Compose: Engram service + Postgres 16 with pgvector
-- Reachable over Tailscale only
-- Per-profile API keys with scoped principals
-- Nightly `pg_dump` backup
-
----
-
-## 10. Phased Delivery
-
-### Phase 1 — Core service for Zutfen dogfooding
-- Postgres schema + migrations (including classification_rules table)
-- REST API (remember, recall, search, classify, KG, export)
-- Classification engine (LLM-backed + rule-based fallback, Zutfen-tuned default rules)
-- Python SDK
-- Migration importers (dry-run)
+### Phase 1A — Canonical memory MVP
+- Schema with trust fields, review states, FTS, RLS
+- `remember`, `recall` (startup mode), `search` (keyword + basic semantic)
+- `items` CRUD with cursor pagination
+- CCA export
+- Import CCA only
 - Docker Compose deployment
-- Bootstrap Zutfen tenant + workspaces + principals
-- Migrate existing MemPalace + CCA data
+- Rule-based classification only (no LLM yet)
+- **No KG, no LLM classification, no conflict detection yet**
+
+### Phase 1B — Trust and classification
+- LLM-backed classification
+- Review workflow (propose → activate → dispute → resolve)
+- Conflict detection at write time
+- Recall explanations ("why recalled")
+- Semantic search with HNSW iterative_scan
+- Import MemPalace
+- Feedback endpoint for usage-informed recall scoring
+
+### Phase 1C — Graph and navigation
+- KG triples (with visibility inheritance)
+- Tunnels
+- Taxonomy browser
+- Diary views
+- Memory hygiene tools (stale detection, archival)
 
 ### Phase 2 — Hermes integration
 - MCP adapter (replaces MemPalace MCP server)
-- zutfen_memory routing layer → writes to Engram instead of files/ChromaDB
+- engram-hooks companion library (lifecycle hooks calling classify + remember)
 - Hermes config integration
 - Retire MemPalace ChromaDB + CCA JSON files
 
 ### Phase 3 — Open source readiness
 - Naming, docs, README, examples
-- Multi-framework quickstarts (LangChain, CrewAI, plain Python)
-- Auth hardening (API keys → OAuth/org model for hosted)
-- Companion library (engram-hooks) packaging the Hermes lifecycle hooks — pre_compress, sync_turn, session_end — wired to the service's classify endpoint
+- Multi-framework quickstarts
+- Auth hardening (OAuth/org model for hosted)
+- Admin console (review queue, conflict queue, recall logs)
 - Helm chart / cloud deployment artifacts
 
 ---
 
-## 11. Differentiation
+## 14. Differentiation
 
-| Feature | mem0 | Letta/MemGPT | Zep | **Engram** |
+| Feature | mem0 | Letta/MemGPT | Zep/Graphiti | **Engram** |
 |---|---|---|---|---|
 | Storage | Vector DB | SQLite/Postgres | Graph+vector | **Postgres+pgvector** |
 | Memory model | Flat facts | Agent-scoped blocks | Temporal graph | **Structured taxonomy + KG + diary** |
-| Multi-agent | Per-agent | Per-agent session | Per-user | **Multi-tenant, workspace-scoped, visibility levels** |
-| Relationships | No | No | Yes (graph) | **Yes (KG + tunnels)** |
+| Multi-agent scoping | Per-agent | Per-agent session | Per-user | **Multi-tenant, workspace-scoped, visibility levels + RLS** |
 | Temporal validity | No | No | Yes | **Yes (valid_from/valid_to)** |
-| Audit trail | No | Partial | No | **Yes (append-first, provenance)** |
-| Smart classification | Basic extraction | No | No | **LLM-backed + rule-based, tenant-configurable** |
+| Review / trust states | No | No | No | **Yes (proposed/active/disputed/rejected/archived)** |
+| Conflict detection | Basic (dedup on write) | No | Partial | **Yes (contradiction detection, resolution workflow)** |
+| Classification | Basic extraction | No | No | **LLM + rule-based, tenant-configurable, no-LLM fallback** |
+| Provenance | Minimal | Minimal | Partial | **Source trust, extraction model, verification tracking** |
+| Recall explanations | No | No | No | **Yes ("why recalled" reasons array)** |
 | Self-hostable | Yes | Yes | Yes | **Yes (Docker Compose)** |
 
-Engram's wedge: structured organizational memory for agent teams, with smart classification — not just flat per-agent recall.
+**Engram's wedge:** Trustable institutional memory for agent teams — with review states, provenance, conflict detection, and scoped recall. Not just "store and retrieve," but "know what to trust and why."
+
+---
+
+## 15. Vocabulary
+
+Engram keeps MemPalace's evocative vocabulary. For external audiences, the docs and README provide plain-language equivalents:
+
+| Engram term | Plain-language equivalent |
+|---|---|
+| Wing | Domain / category |
+| Room | Subcategory |
+| Drawer / memory item | Memory |
+| Tunnel | Cross-category link |
+| Diary | Agent-private journal |
+| Doctrine | Standing instruction / operating rule |
+| Invariant | Must-remain-true constraint |
