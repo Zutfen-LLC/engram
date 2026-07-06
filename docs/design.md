@@ -1,6 +1,6 @@
 # Engram — Design Document
 
-**Status:** Locked (v2.1, 2026-07-06 — spec hygiene + edge cases)
+**Status:** Locked (v2.2, 2026-07-06 — schema completeness)
 **Product:** Trustable institutional memory for multi-agent AI teams
 
 ---
@@ -90,8 +90,6 @@ Without auto-promotion, the proposed queue grows unboundedly while the working s
 - Age >= `auto_promote_min_age_hours` (default 72 hours unchallenged)
 - No dispute event in `item_events` from another principal
 
-Rationale for on-by-default: without auto-promotion, the proposed queue grows unboundedly while the working set stays frozen. The conservative thresholds (0.7 confidence, 72h age) prevent premature promotion. High-governance tenants can opt out via tenant_config.
-
 A background job (or lazy check on recall) promotes eligible items to `active`. The promotion is logged in `item_events`.
 
 **Disputed high-stakes items:** When a `doctrine` or `invariant` is disputed, it does NOT silently vanish from startup recall. Disputed items of kind `doctrine` or `invariant` stay in startup recall with `warnings: ['disputed — pending resolution']` until resolved. Disputed items of other kinds are excluded from startup recall (standard behavior). This prevents an agent's operating constraints from silently shrinking.
@@ -115,18 +113,22 @@ Semantic recall (`mode=semantic`) returns both `active` and `proposed` items, bu
 
 ### Source trust defaults
 
-Source trust is calculated from both `source_type` and the principal's type. This prevents a random agent calling `/remember` manually from getting the same trust as a user saying "remember this."
+Source trust is calculated from both `source_type` and the principal's type. `memory_confidence` defaults track `source_trust` defaults so auto-promotion works in Phase 1A without LLM classification. LLM classification (1B) refines `memory_confidence` per-item; in 1A, the defaults below are used.
 
-| source_type | principal.type | Authority | Default source_trust | Default review_status |
-|---|---|---|---|---|
-| `manual` | `user` | explicit_user | 0.9 | `active` |
-| `manual` | `agent` | trusted_agent | 0.6 | `proposed` |
-| `manual` | `admin` | explicit_user | 0.9 | `active` |
-| `import` | `system` | trusted_import | 0.8 | `active` |
-| `migration` | `system` | trusted_import | 0.8 | `active` |
-| `extraction` | `agent` | inferred | 0.5 | `proposed` |
-| `sync_turn` | `agent` | inferred | 0.4 | `proposed` |
-| `pre_compress` | `agent` | inferred | 0.3 | `proposed` |
+| source_type | principal.type | Authority | Default source_trust | Default memory_confidence | Default review_status |
+|---|---|---|---|---|---|
+| `manual` | `user` | explicit_user | 0.9 | 0.9 | `active` |
+| `manual` | `agent` | trusted_agent | 0.6 | 0.5 | `proposed` |
+| `manual` | `admin` | explicit_user | 0.9 | 0.9 | `active` |
+| `import` | `system` | trusted_import | 0.8 | 0.8 | `active` |
+| `migration` | `system` | trusted_import | 0.8 | 0.8 | `active` |
+| `extraction` | `agent` | inferred | 0.5 | 0.5 | `proposed` |
+| `sync_turn` | `agent` | inferred | 0.4 | 0.4 | `proposed` |
+| `pre_compress` | `agent` | inferred | 0.3 | 0.3 | `proposed` |
+
+Note: `sync_turn` and `pre_compress` have confidence below the 0.7 auto-promotion threshold — they stay `proposed` until an LLM classification (1B) or human review raises their confidence, or the quorum feedback mechanism adjusts importance over time. This is intentional: chatty low-confidence sources should not auto-promote without some signal that the memory is actually useful.
+
+All defaults are tenant-configurable via the `tenant_config` table.
 
 **Authority hierarchy** (used in conflict resolution): `explicit_user > trusted_import > trusted_agent > untrusted_agent > inferred`
 
@@ -191,10 +193,12 @@ Each memory item has:
 - **Subject** — what this memory is ABOUT (subject_type, subject_id, subject_name), separate from who wrote it
 - **Scope** — tenant + workspace + principal
 - **Visibility** — private / workspace / tenant / public
-- **Trust** — review_status, memory_confidence, source_trust, human_verified
-- **Recall signals** — importance, pinned, last_recalled_at, recall_count
-- **Provenance** — source_type, source_uri, extracted_by_model, extraction_confidence
-- **Conflict tracking** — conflicts_with_item_id, conflict_type, resolution_status
+- **Trust** — review_status, memory_confidence, source_trust, human_verified, verified_by, verified_at, review_notes
+- **Recall signals** — importance, pinned, last_recalled_at, recall_count, startup_recall_count, last_confirmed_at, last_verified_at
+- **Provenance** — source_type, source_session, source_uri, extracted_by_model, extraction_confidence
+- **Conflict tracking** — conflicts_with_item_id, conflict_type, conflict_resolution_status
+- **Privacy** — sensitivity (normal/sensitive/restricted)
+- **External linkage** — external_id, external_source
 - **Temporal validity** — valid_from, valid_to, superseded_by
 
 ### MemPalace succession
@@ -215,7 +219,7 @@ Each memory item has:
 
 See `migrations/001_init.sql` for the canonical DDL. Key design decisions:
 
-### Tables (14 total)
+### Tables (15 total)
 
 | Table | Purpose |
 |---|---|
@@ -232,15 +236,16 @@ See `migrations/001_init.sql` for the canonical DDL. Key design decisions:
 | `api_keys` | Authentication credentials |
 | `recall_logs` | Recall audit with item_ids, scoring_version, config_version for feedback loops and reproducibility |
 | `deletion_events` | Tombstone records for hard-deleted items (GDPR/hosted) |
+| `feedback_events` | Per-item feedback (useful/noise) from principals — drives penalty resets, importance, quorum |
 | `tenant_config` | Versioned tenant-configurable trust defaults, scoring weights, recall policy |
 
 ### Key schema decisions
 
 - **Check constraints** on all enum-like fields (kind, visibility, review_status, source_type, sensitivity, conflict_type) to prevent taxonomy drift.
 - **Full-text search** via `content_tsv TSVECTOR GENERATED ALWAYS AS (to_tsvector('english', coalesce(content, ''))) STORED` + GIN index. A generated column is used instead of a trigger — it's simpler, cannot drift, and requires no plpgsql function. Essential for keyword search on IDs, paths, names.
-- **Separate embeddings table** keyed by `(memory_item_id, embedding_model)` with denormalized `tenant_id` for RLS. A model change is new rows, not a migration. Old vectors remain queryable during re-embedding. The denormalized tenant_id enables RLS policy enforcement directly on the embeddings table, allowing tenant filtering BEFORE the join to memory_items — critical for HNSW + iterative_scan performance.
+- **Separate embeddings table** keyed by `(memory_item_id, embedding_model)` with denormalized `tenant_id` for RLS. A composite FK `(memory_item_id, tenant_id) → memory_items(id, tenant_id)` enforces that the denormalized tenant_id always matches the parent item — this is a multi-tenant safety boundary enforced at the database level. A model change is new rows, not a migration. Old vectors remain queryable during re-embedding. The denormalized tenant_id enables RLS policy enforcement directly on the embeddings table, allowing tenant filtering BEFORE the join to memory_items — critical for HNSW + iterative_scan performance.
 - **Unique dedup index** on `(tenant_id, workspace_id, principal_id, content_hash) WHERE valid_to IS NULL AND review_status != 'rejected'` with `NULLS NOT DISTINCT` (Postgres 15+). Makes remember idempotent for retries within scope, including tenant-level memories with NULL workspace_id.
-- **Row Level Security** on all tenant-scoped tables. Application uses `SET LOCAL` inside each transaction (pool-safe for PgBouncer); Postgres enforces isolation even when application code is wrong. RLS is enabled on: memory_items, memory_embeddings (denormalized tenant_id), kg_triples, tunnels, item_events, classification_rules, recall_logs, workspace_members, api_keys, tenant_config, deletion_events, workspaces, principals. Semantic search queries filter on embeddings.tenant_id BEFORE joining to memory_items, which is the query to load-test first.
+- **Row Level Security** on all tenant-scoped tables. Application uses `SET LOCAL` inside each transaction (pool-safe for PgBouncer); Postgres enforces isolation even when application code is wrong. RLS is enabled on: memory_items, memory_embeddings (denormalized tenant_id), kg_triples, tunnels, item_events, classification_rules, recall_logs, workspace_members, api_keys, tenant_config, deletion_events, feedback_events, workspaces, principals. Semantic search queries filter on embeddings.tenant_id BEFORE joining to memory_items, which is the query to load-test first.
 - **HNSW with iterative_scan** — requires pgvector 0.8+. Set `hnsw.iterative_scan = strict` at query time to handle filtered (tenant-scoped) queries without recall degradation.
 
 ### KG visibility

@@ -164,24 +164,30 @@ CREATE TABLE memory_items (
         conflict_resolution_status IS NULL OR conflict_resolution_status IN (
             'unresolved', 'accepted', 'rejected', 'merged'
         )
-    )
+    ),
+    -- Composite uniqueness for embedding FK consistency
+    UNIQUE(id, tenant_id)
 );
 
 -- Full-text search uses a GENERATED column (content_tsv), no trigger needed.
 -- The GIN index on content_tsv is created in the indexes section below.
 
 -- ============ Embeddings (separate table — supports multiple models) ============
+-- Uses a composite FK to memory_items(id, tenant_id) to enforce that the
+-- denormalized tenant_id always matches the parent item's tenant_id.
 
 CREATE TABLE memory_embeddings (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    memory_item_id  UUID NOT NULL REFERENCES memory_items(id) ON DELETE CASCADE,
-    tenant_id       UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,  -- denormalized for RLS + pre-join filter
+    memory_item_id  UUID NOT NULL,
+    tenant_id       UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     embedding_model TEXT NOT NULL,           -- e.g. 'text-embedding-3-small'
     embedding_dim   INTEGER NOT NULL,        -- dimension count
     embedding       vector(1536),            -- current default; column type fixed at 1536
     embedded_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     embedding_status TEXT NOT NULL DEFAULT 'complete',  -- complete | failed | stale
 
+    -- Composite FK: tenant_id must match the memory_item's tenant_id
+    FOREIGN KEY (memory_item_id, tenant_id) REFERENCES memory_items(id, tenant_id) ON DELETE CASCADE,
     UNIQUE(memory_item_id, embedding_model)
 );
 
@@ -283,6 +289,13 @@ CREATE TABLE tenant_config (
     trust_extraction            REAL NOT NULL DEFAULT 0.5,
     trust_sync_turn             REAL NOT NULL DEFAULT 0.4,
     trust_pre_compress          REAL NOT NULL DEFAULT 0.3,
+    -- Default memory_confidence per source_type (enables auto-promotion in 1A without LLM)
+    confidence_manual_user      REAL NOT NULL DEFAULT 0.9,
+    confidence_manual_agent     REAL NOT NULL DEFAULT 0.5,
+    confidence_import           REAL NOT NULL DEFAULT 0.8,
+    confidence_extraction       REAL NOT NULL DEFAULT 0.5,
+    confidence_sync_turn        REAL NOT NULL DEFAULT 0.4,
+    confidence_pre_compress     REAL NOT NULL DEFAULT 0.3,
     active                      BOOLEAN NOT NULL DEFAULT TRUE,  -- only one active config per tenant
     created_at                  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -330,6 +343,20 @@ CREATE TABLE deletion_events (
     deleted_by_principal_id UUID REFERENCES principals(id),
     reason                  TEXT,
     deleted_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ============ Feedback events ============
+-- Records per-item feedback from principals. Drives penalty resets,
+-- importance adjustment, and the multi-agent quorum rule.
+
+CREATE TABLE feedback_events (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id       UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    item_id         UUID NOT NULL REFERENCES memory_items(id) ON DELETE CASCADE,
+    principal_id    UUID NOT NULL REFERENCES principals(id),
+    verdict         TEXT NOT NULL,                -- useful | noise
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (verdict IN ('useful', 'noise'))
 );
 
 -- ============ Indexes ============
@@ -383,6 +410,10 @@ CREATE INDEX idx_apikeys_hash   ON api_keys(key_hash) WHERE revoked_at IS NULL;
 -- Classification rules
 CREATE INDEX idx_classrules_tenant ON classification_rules(tenant_id, enabled, priority);
 
+-- Feedback events
+CREATE INDEX idx_feedback_item    ON feedback_events(tenant_id, item_id, created_at);
+CREATE INDEX idx_feedback_principal ON feedback_events(tenant_id, principal_id);
+
 -- Workspace membership
 CREATE INDEX idx_wsmembers_ws      ON workspace_members(workspace_id);
 CREATE INDEX idx_wsmembers_principal ON workspace_members(principal_id);
@@ -423,6 +454,7 @@ ALTER TABLE workspace_members ENABLE ROW LEVEL SECURITY;
 ALTER TABLE api_keys ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tenant_config ENABLE ROW LEVEL SECURITY;
 ALTER TABLE deletion_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE feedback_events ENABLE ROW LEVEL SECURITY;
 
 -- NOTE: workspaces and principals are implicitly protected — they are parents
 -- referenced by RLS-protected children. Direct cross-tenant reads of these
@@ -478,6 +510,9 @@ CREATE POLICY tenant_isolation_tenantconfig ON tenant_config
     USING (tenant_id::text = current_setting('app.tenant_id', true));
 
 CREATE POLICY tenant_isolation_deletion ON deletion_events
+    USING (tenant_id::text = current_setting('app.tenant_id', true));
+
+CREATE POLICY tenant_isolation_feedback ON feedback_events
     USING (tenant_id::text = current_setting('app.tenant_id', true));
 
 CREATE POLICY tenant_isolation_workspaces ON workspaces

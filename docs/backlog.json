@@ -5,8 +5,8 @@
     "local_path": "/home/zutfen/code/engram",
     "description": "Engram \u2014 trustable institutional memory for multi-agent AI teams. Postgres+pgvector service, FastAPI, multi-tenant, with review states, provenance, conflict detection, and scoped recall.",
     "design_doc": "docs/design.md",
-    "design_version": "v2 (trust model revision, 2026-07-06)",
-    "current_state": "v0.1.0 skeleton with v2.1 schema (auto-promotion on by default, embeddings have denormalized tenant_id for RLS, penalty floor + quorum reset, write-path cost escape valve). 14 tables, all RLS-protected. Migration SQL, ORM models, FastAPI app factory, route stubs, Docker Compose exist. No endpoint is functional yet.",
+    "design_version": "v2.2 (schema completeness, 2026-07-06)",
+    "current_state": "v0.1.0 skeleton with v2.2 schema (feedback_events table, default memory_confidence per source_type, composite FK on embeddings for tenant consistency, DeletionEvent + FeedbackEvent ORM models). 15 tables, all RLS-protected. Migration SQL, ORM models, FastAPI app factory, route stubs, Docker Compose exist. No endpoint is functional yet.",
     "conventions": {
       "branch_prefix": "feat/",
       "python": ">=3.11",
@@ -90,7 +90,7 @@
         "estimated_complexity": "low",
         "dependencies": [],
         "branch": "feat/verify-schema-v2",
-        "description": "Stand up Docker Compose, confirm migrations/001_init.sql (v2) applies without errors. The schema now has 12 tables, CHECK constraints, RLS policies, FTS trigger, and seeded data. Verify health/ready endpoints and RLS session context.",
+        "description": "Stand up Docker Compose, confirm migrations/001_init.sql (v2) applies without errors. The schema now has 15 tables, CHECK constraints, RLS policies, FTS generated column, and seeded data. Verify health/ready endpoints and RLS session context.",
         "files_to_touch": [
           "migrations/001_init.sql",
           "docker-compose.yml",
@@ -101,9 +101,9 @@
         ],
         "acceptance_criteria": [
           "docker compose up -d succeeds without errors",
-          "All 14 tables exist: tenants, workspaces, principals, workspace_members, memory_items, memory_embeddings, kg_triples, tunnels, item_events, classification_rules, api_keys, recall_logs, deletion_events, tenant_config",
+          "All 15 tables exist: tenants, workspaces, principals, workspace_members, memory_items, memory_embeddings, kg_triples, tunnels, item_events, classification_rules, api_keys, recall_logs, deletion_events, tenant_config, feedback_events",
           "CHECK constraints are active (try inserting invalid kind/visibility/review_status and confirm rejection)",
-          "RLS enabled on all tenant-scoped tables including memory_embeddings (denormalized tenant_id for pre-join filtering): memory_items, memory_embeddings, kg_triples, tunnels, item_events, classification_rules, recall_logs, workspace_members, api_keys, tenant_config, deletion_events, workspaces, principals.",
+          "RLS enabled on all tenant-scoped tables including memory_embeddings (denormalized tenant_id for pre-join filtering): memory_items, memory_embeddings, kg_triples, tunnels, item_events, classification_rules, recall_logs, workspace_members, api_keys, tenant_config, deletion_events, feedback_events, workspaces, principals.",
           "FTS generated column works: INSERT a memory_item, verify content_tsv is auto-populated (no trigger needed \u2014 it's a GENERATED ALWAYS AS column)",
           "pgvector extension is active with version >= 0.8 (check SELECT extversion FROM pg_extension WHERE extname='vector')",
           "Seed data exists: default tenant, general workspace, admin principal, workspace membership, 6 classification rules",

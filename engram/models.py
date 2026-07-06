@@ -337,7 +337,7 @@ class TenantConfig(Base):
     weight_verified: Mapped[float] = mapped_column(Float, default=0.10)
 
     # Auto-promotion
-    auto_promote_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    auto_promote_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     auto_promote_confidence_threshold: Mapped[float] = mapped_column(Float, default=0.7)
     auto_promote_min_age_hours: Mapped[int] = mapped_column(Integer, default=72)
 
@@ -355,5 +355,50 @@ class TenantConfig(Base):
     trust_sync_turn: Mapped[float] = mapped_column(Float, default=0.4)
     trust_pre_compress: Mapped[float] = mapped_column(Float, default=0.3)
 
+    # Default memory_confidence per source_type (enables auto-promotion in 1A without LLM)
+    confidence_manual_user: Mapped[float] = mapped_column(Float, default=0.9)
+    confidence_manual_agent: Mapped[float] = mapped_column(Float, default=0.5)
+    confidence_import: Mapped[float] = mapped_column(Float, default=0.8)
+    confidence_extraction: Mapped[float] = mapped_column(Float, default=0.5)
+    confidence_sync_turn: Mapped[float] = mapped_column(Float, default=0.4)
+    confidence_pre_compress: Mapped[float] = mapped_column(Float, default=0.3)
+
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=text("now()"), nullable=False)
+
+
+class DeletionEvent(Base):
+    """Tombstone record for hard-deleted items. FK-safe (deleted_item_id is NOT a FK)."""
+
+    __tablename__ = "deletion_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    deleted_item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    deleted_content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    deleted_by_principal_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("principals.id"), nullable=True
+    )
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    deleted_at: Mapped[datetime] = mapped_column(server_default=text("now()"), nullable=False)
+
+
+class FeedbackEvent(Base):
+    """Records feedback on recalled items. Drives penalty resets, importance adjustment, quorum."""
+
+    __tablename__ = "feedback_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("memory_items.id", ondelete="CASCADE"), nullable=False
+    )
+    principal_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("principals.id"), nullable=False
+    )
+    verdict: Mapped[str] = mapped_column(String(10), nullable=False)  # useful | noise
     created_at: Mapped[datetime] = mapped_column(server_default=text("now()"), nullable=False)
