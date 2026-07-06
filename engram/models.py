@@ -131,6 +131,8 @@ class MemoryItem(Base):
     pinned: Mapped[bool] = mapped_column(Boolean, default=False)
     last_recalled_at: Mapped[datetime | None] = mapped_column(nullable=True)
     recall_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_confirmed_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    startup_recall_count: Mapped[int] = mapped_column(Integer, default=0)
 
     # Provenance (expanded)
     source_type: Mapped[str] = mapped_column(String(50), default="manual")

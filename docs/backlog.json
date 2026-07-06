@@ -3,7 +3,7 @@
     "project": "engram",
     "repo": "https://github.com/Zutfen-LLC/engram",
     "local_path": "/home/zutfen/code/engram",
-    "description": "Engram — trustable institutional memory for multi-agent AI teams. Postgres+pgvector service, FastAPI, multi-tenant, with review states, provenance, conflict detection, and scoped recall.",
+    "description": "Engram \u2014 trustable institutional memory for multi-agent AI teams. Postgres+pgvector service, FastAPI, multi-tenant, with review states, provenance, conflict detection, and scoped recall.",
     "design_doc": "docs/design.md",
     "design_version": "v2 (trust model revision, 2026-07-06)",
     "current_state": "v0.1.0 skeleton with v2 schema (trust fields, review states, RLS, FTS, separate embeddings table, item_events audit). Migration SQL, ORM models, FastAPI app factory, route stubs (NotImplementedError), Docker Compose, test scaffolding exist. No endpoint is functional yet.",
@@ -30,31 +30,55 @@
         "id": "M1A",
         "name": "Canonical memory MVP",
         "description": "The minimum that makes Engram usable: schema verified, remember with trust fields, startup recall with scoring, keyword+semantic search, item CRUD, CCA export, CCA import, Docker deployment. No KG, no LLM classification, no conflict detection.",
-        "task_ids": ["T01", "T02", "T03", "T04", "T05", "T06", "T07"]
+        "task_ids": [
+          "T01",
+          "T02",
+          "T03",
+          "T04",
+          "T05",
+          "T06",
+          "T07"
+        ]
       },
       {
         "id": "M1B",
         "name": "Trust and classification",
         "description": "LLM-backed classification, review workflow, conflict detection, recall explanations, feedback endpoint, MemPalace import.",
-        "task_ids": ["T08", "T09", "T10", "T11", "T12"]
+        "task_ids": [
+          "T08",
+          "T09",
+          "T10",
+          "T11",
+          "T12"
+        ]
       },
       {
         "id": "M1C",
         "name": "Graph and navigation",
         "description": "KG triples with visibility inheritance, tunnels, taxonomy browser, diary, memory hygiene.",
-        "task_ids": ["T13", "T14", "T15"]
+        "task_ids": [
+          "T13",
+          "T14",
+          "T15"
+        ]
       },
       {
         "id": "M2",
         "name": "Hermes integration",
         "description": "SDK, MCP adapter, engram-hooks companion library, retire old stores.",
-        "task_ids": ["T16", "T17", "T18"]
+        "task_ids": [
+          "T16",
+          "T17",
+          "T18"
+        ]
       },
       {
         "id": "M3",
         "name": "Deployment + ops",
         "description": "Provision Proxmox VM, deploy, verify over Tailscale.",
-        "task_ids": ["T19"]
+        "task_ids": [
+          "T19"
+        ]
       }
     ],
     "tasks": [
@@ -67,18 +91,25 @@
         "dependencies": [],
         "branch": "feat/verify-schema-v2",
         "description": "Stand up Docker Compose, confirm migrations/001_init.sql (v2) applies without errors. The schema now has 12 tables, CHECK constraints, RLS policies, FTS trigger, and seeded data. Verify health/ready endpoints and RLS session context.",
-        "files_to_touch": ["migrations/001_init.sql", "docker-compose.yml", "Dockerfile", "engram/api/routes/health.py", "engram/db.py", "engram/config.py"],
+        "files_to_touch": [
+          "migrations/001_init.sql",
+          "docker-compose.yml",
+          "Dockerfile",
+          "engram/api/routes/health.py",
+          "engram/db.py",
+          "engram/config.py"
+        ],
         "acceptance_criteria": [
           "docker compose up -d succeeds without errors",
-          "All 12 tables exist: tenants, workspaces, principals, workspace_members, memory_items, memory_embeddings, kg_triples, tunnels, item_events, classification_rules, api_keys, recall_logs",
+          "All 13 tables exist: tenants, workspaces, principals, workspace_members, memory_items, memory_embeddings, kg_triples, tunnels, item_events, classification_rules, deletion_events, api_keys, recall_logs",
           "CHECK constraints are active (try inserting invalid kind/visibility/review_status and confirm rejection)",
-          "RLS policies are active: INSERT a memory_item without setting app.tenant_id → should fail or be invisible",
+          "RLS policies are active: INSERT a memory_item without setting app.tenant_id \u2192 should fail or be invisible",
           "FTS trigger works: INSERT a memory_item, verify content_tsv is populated",
           "pgvector extension is active with version >= 0.8 (check SELECT extversion FROM pg_extension WHERE extname='vector')",
           "Seed data exists: default tenant, general workspace, admin principal, workspace membership, 6 classification rules",
           "GET /health returns ok, GET /ready returns ready with database connected"
         ],
-        "context_notes": "The db.py get_session dependency must set app.tenant_id and app.principal_id via SET LOCAL at the start of each session, based on the authenticated principal. For Phase 1A with auth disabled, it should set the default tenant/admin. The pgvector/pgvector:pg16 Docker image includes pgvector but verify the version — iterative_scan requires 0.8+. The RLS policies reference current_setting('app.tenant_id', true) — test that this works correctly with SET LOCAL."
+        "context_notes": "The db.py get_session dependency must set app.tenant_id and app.principal_id via SET LOCAL at the start of each session, based on the authenticated principal. For Phase 1A with auth disabled, it should set the default tenant/admin. The pgvector/pgvector:pg16 Docker image includes pgvector but verify the version \u2014 iterative_scan requires 0.8+. The RLS policies reference current_setting('app.tenant_id', true) \u2014 test that this works correctly with SET LOCAL."
       },
       {
         "id": "T02",
@@ -86,10 +117,15 @@
         "milestone": "M1A",
         "priority": "blocker",
         "estimated_complexity": "low",
-        "dependencies": ["T01"],
+        "dependencies": [
+          "T01"
+        ],
         "branch": "feat/canonicalize-and-hash",
         "description": "Create the canonicalization module. Same as before but now the hash is used in the unique dedup index idx_memitems_dedup scoped to (tenant, workspace, principal).",
-        "files_to_touch": ["engram/canonicalize.py", "tests/test_canonicalize.py"],
+        "files_to_touch": [
+          "engram/canonicalize.py",
+          "tests/test_canonicalize.py"
+        ],
         "acceptance_criteria": [
           "engram/canonicalize.py exports canonicalize(content: str) -> str and content_hash(canonical: str) -> str",
           "canonicalize() strips leading/trailing whitespace, collapses internal whitespace, lowercases",
@@ -101,40 +137,55 @@
       },
       {
         "id": "T03",
-        "title": "Implement POST /v1/remember — the canonical write path with trust fields",
+        "title": "Implement POST /v1/remember \u2014 the canonical write path with trust fields",
         "milestone": "M1A",
         "priority": "blocker",
         "estimated_complexity": "high",
-        "dependencies": ["T01", "T02"],
+        "dependencies": [
+          "T01",
+          "T02"
+        ],
         "branch": "feat/remember-write-path",
-        "description": "Implement the remember endpoint with the full trust model: content canonicalization, dedup via unique index, review_status assignment based on source_type, source_trust defaults, sensitivity check (secret denylist), and embedding generation (deferred to T05). This is the most important endpoint — it's where the trust model lives.",
-        "files_to_touch": ["engram/api/routes/memory.py", "engram/embeddings.py", "engram/safety.py", "tests/test_remember.py"],
+        "description": "Implement the remember endpoint with the full trust model: content canonicalization, dedup via unique index, review_status assignment based on source_type, source_trust defaults, sensitivity check (secret denylist), and embedding generation (deferred to T05). This is the most important endpoint \u2014 it's where the trust model lives.",
+        "files_to_touch": [
+          "engram/api/routes/memory.py",
+          "engram/embeddings.py",
+          "engram/safety.py",
+          "tests/test_remember.py"
+        ],
         "acceptance_criteria": [
           "POST /v1/remember creates a memory_item with all trust fields populated",
-          "source_type='manual' (user explicitly said remember) → review_status='active', source_trust=0.9",
-          "source_type='extraction' or 'sync_turn' → review_status='proposed', source_trust=0.4-0.5",
-          "source_type='import' or 'migration' → review_status='active', source_trust=0.8",
-          "Dedup: same (tenant, workspace, principal, content_hash) with valid_to IS NULL → returns status='deduped', no new row",
+          "source_type='manual' (user explicitly said remember) \u2192 review_status='active', source_trust=0.9",
+          "source_type='extraction' or 'sync_turn' \u2192 review_status='proposed', source_trust=0.4-0.5",
+          "source_type='import' or 'migration' \u2192 review_status='active', source_trust=0.8",
+          "Dedup: same (tenant, workspace, principal, content_hash) with valid_to IS NULL \u2192 returns status='deduped', no new row",
           "Dedup respects review_status: a rejected item doesn't block re-creation",
           "content_hash is computed via canonicalize module",
           "subject_type/subject_id/subject_name stored if provided",
           "sensitivity defaults to 'normal'; secret-pattern denylist blocks content matching API key/token patterns (return 422)",
           "external_id/external_source stored if provided (for imports)",
           "embedding is null (deferred to T05); a placeholder row in memory_embeddings may be created with status='pending'",
-          "Returns {id, status: created|deduped|superseded, review_status, memory_confidence}"
+          "Returns {id, status: created|deduped|superseded, review_status, memory_confidence}",
+          "source_trust and review_status computed from (source_type, principal.type) \u2014 manual from user = 0.9/active, manual from agent = 0.6/proposed"
         ],
-        "context_notes": "Create engram/safety.py with the secret-pattern denylist (regex patterns for AWS keys, GitHub tokens, generic API keys, passwords). The source_trust and review_status defaults are defined in design.md Section 4 (Trust Model) — encode them as a lookup table. The unique index idx_memitems_dedup will raise IntegrityError on duplicate — catch it and return status='deduped'. For supersession: if kind is 'preference' or 'invariant' (singleton semantics), and a new item with same family key is written, mark old item's valid_to + superseded_by. The RememberRequest model in memory.py needs updating to include the new fields (subject_type, subject_id, subject_name, importance, sensitivity, external_id, external_source)."
+        "context_notes": "Create engram/safety.py with the secret-pattern denylist (regex patterns for AWS keys, GitHub tokens, generic API keys, passwords). The source_trust and review_status defaults are defined in design.md Section 4 (Trust Model) \u2014 encode them as a lookup table. The unique index idx_memitems_dedup will raise IntegrityError on duplicate \u2014 catch it and return status='deduped'. For supersession: if kind is 'preference' or 'invariant' (singleton semantics), and a new item with same family key is written, mark old item's valid_to + superseded_by. The RememberRequest model in memory.py needs updating to include the new fields (subject_type, subject_id, subject_name, importance, sensitivity, external_id, external_source). The source_trust/review_status defaults now depend on BOTH source_type and principal.type. Encode the lookup table from design.md Section 4 (Source trust defaults). This prevents a random agent calling /remember manually from getting the same trust as a user."
       },
       {
         "id": "T04",
-        "title": "Implement POST /v1/recall — startup mode with scoring and explanations",
+        "title": "Implement POST /v1/recall \u2014 startup mode with scoring and explanations",
         "milestone": "M1A",
         "priority": "blocker",
         "estimated_complexity": "high",
-        "dependencies": ["T03"],
+        "dependencies": [
+          "T03"
+        ],
         "branch": "feat/recall-startup",
         "description": "Implement startup recall with the full scoring formula from design.md Section 4. Returns active items ordered by score, bounded by budget, with per-item 'reasons' explaining why each was included.",
-        "files_to_touch": ["engram/api/routes/memory.py", "engram/recall.py", "tests/test_recall.py"],
+        "files_to_touch": [
+          "engram/api/routes/memory.py",
+          "engram/recall.py",
+          "tests/test_recall.py"
+        ],
         "acceptance_criteria": [
           "POST /v1/recall with mode='startup' returns active items (review_status='active', valid_to IS NULL)",
           "Items scored by formula: importance*0.25 + source_trust*0.20 + memory_confidence*0.20 + recency*0.15 + verified*0.10 + pinned*0.10",
@@ -144,9 +195,11 @@
           "Each item includes 'reasons' array: ['kind=invariant', 'human verified', 'pinned', etc.]",
           "recall_logs entry written with item_ids for feedback loop",
           "recall_count incremented and last_recalled_at updated on returned items",
-          "Deterministic: same corpus + same budget = same output"
+          "Deterministic: same corpus + same budget = same output",
+          "Pinned items capped at max_pinned_tokens (config, default 2048); excess dropped with pinned_omitted_count in response",
+          "Anti-feedback loop: startup_recall_count tracked; after threshold (default 5) without positive feedback, recency bonus reduced by penalty_factor"
         ],
-        "context_notes": "Create engram/recall.py with the scoring as a pure function for testability. The recency_bonus should be a decay function — something like max(0, 1 - days_since_last_recall/30). The reasons array should be human-readable strings explaining the score components. The RecallRequest/RecallResponse models in memory.py need updating to include token_budget and the per-item reasons. IMPORTANT: only review_status='active' items enter startup recall — proposed items do not. This is the trust gate."
+        "context_notes": "Create engram/recall.py with the scoring as a pure function for testability. The recency_bonus should be a decay function \u2014 something like max(0, 1 - days_since_last_recall/30). The reasons array should be human-readable strings explaining the score components. The RecallRequest/RecallResponse models in memory.py need updating to include token_budget and the per-item reasons. IMPORTANT: only review_status='active' items enter startup recall \u2014 proposed items do not. This is the trust gate."
       },
       {
         "id": "T05",
@@ -154,10 +207,16 @@
         "milestone": "M1A",
         "priority": "high",
         "estimated_complexity": "medium",
-        "dependencies": ["T03"],
+        "dependencies": [
+          "T03"
+        ],
         "branch": "feat/embeddings-and-search",
         "description": "Implement the embedding generation pipeline (writing to memory_embeddings table) and the search endpoint with three modes. Keyword uses FTS (content_tsv + GIN index), semantic uses pgvector with iterative_scan, hybrid combines both.",
-        "files_to_touch": ["engram/embeddings.py", "engram/api/routes/memory.py", "tests/test_search.py"],
+        "files_to_touch": [
+          "engram/embeddings.py",
+          "engram/api/routes/memory.py",
+          "tests/test_search.py"
+        ],
         "acceptance_criteria": [
           "When embedding_provider != 'none', new memory items get an embedding row in memory_embeddings with embedding_model='text-embedding-3-small'",
           "Embedding model and dimension are tracked in the row (not assumed)",
@@ -168,7 +227,7 @@
           "Search respects visibility scoping via RLS",
           "If no embeddings exist, semantic search returns empty results with helpful message"
         ],
-        "context_notes": "The memory_embeddings table is separate from memory_items — the search query must JOIN them. For pgvector queries: MemoryEmbedding.embedding.cosine_distance(query_vector) or raw SQL. CRITICAL: set hnsw.iterative_scan=strict at query time (SET LOCAL hnsw.iterative_scan = strict) to handle tenant-filtered queries without recall degradation. The openai package needs to be added to dependencies if not present. text-embedding-3-small produces 1536-dim vectors matching the vector(1536) column."
+        "context_notes": "The memory_embeddings table is separate from memory_items \u2014 the search query must JOIN them. For pgvector queries: MemoryEmbedding.embedding.cosine_distance(query_vector) or raw SQL. CRITICAL: set hnsw.iterative_scan=strict at query time (SET LOCAL hnsw.iterative_scan = strict) to handle tenant-filtered queries without recall degradation. The openai package needs to be added to dependencies if not present. text-embedding-3-small produces 1536-dim vectors matching the vector(1536) column."
       },
       {
         "id": "T06",
@@ -176,12 +235,18 @@
         "milestone": "M1A",
         "priority": "high",
         "estimated_complexity": "medium",
-        "dependencies": ["T03"],
+        "dependencies": [
+          "T03"
+        ],
         "branch": "feat/item-crud-and-review",
         "description": "Implement item listing (cursor pagination), detail view, PATCH metadata (with item_events audit), supersede, invalidate, review status change, and verify endpoints.",
-        "files_to_touch": ["engram/api/routes/memory.py", "engram/api/routes/review.py", "tests/test_items.py"],
+        "files_to_touch": [
+          "engram/api/routes/memory.py",
+          "engram/api/routes/review.py",
+          "tests/test_items.py"
+        ],
         "acceptance_criteria": [
-          "GET /v1/items uses cursor pagination (not offset) — cursor is the last item's created_at + id",
+          "GET /v1/items uses cursor pagination (not offset) \u2014 cursor is the last item's created_at + id",
           "GET /v1/items/{id} returns full detail including item_events history and linked KG facts (if any)",
           "PATCH /v1/items/{id} updates metadata (wing, room, visibility, importance, pinned), writes an item_event row, THEN updates the column",
           "PATCH returns the updated item + the event record",
@@ -191,7 +256,7 @@
           "POST /v1/items/{id}/verify sets human_verified=True, verified_by, verified_at, writes item_event",
           "404 for non-existent IDs"
         ],
-        "context_notes": "Create engram/api/routes/review.py for the review/verify/conflict endpoints. The PATCH endpoint is the key append-first reconciliation: content is never touched, but metadata changes are legitimate operational updates that must be audited. The item_events table captures: event_type, field_name, old_value, new_value, actor, reason. Cursor pagination: use (created_at, id) compound cursor for stable ordering. The review endpoint is the trust gate — moving from proposed to active is the human/automated review action."
+        "context_notes": "Create engram/api/routes/review.py for the review/verify/conflict endpoints. The PATCH endpoint is the key append-first reconciliation: content is never touched, but metadata changes are legitimate operational updates that must be audited. The item_events table captures: event_type, field_name, old_value, new_value, actor, reason. Cursor pagination: use (created_at, id) compound cursor for stable ordering. The review endpoint is the trust gate \u2014 moving from proposed to active is the human/automated review action."
       },
       {
         "id": "T07",
@@ -199,10 +264,17 @@
         "milestone": "M1A",
         "priority": "medium",
         "estimated_complexity": "low",
-        "dependencies": ["T03", "T06"],
+        "dependencies": [
+          "T03",
+          "T06"
+        ],
         "branch": "feat/cca-export-import",
         "description": "Export the CCA ledger view to git-friendly JSON, and import existing CCA JSON ledger into Engram.",
-        "files_to_touch": ["engram/api/routes/export.py", "scripts/import_cca.py", "tests/test_export.py"],
+        "files_to_touch": [
+          "engram/api/routes/export.py",
+          "scripts/import_cca.py",
+          "tests/test_export.py"
+        ],
         "acceptance_criteria": [
           "GET /v1/export/cca returns JSON matching cca_lite_memory_packet@v1 format",
           "Only active items (valid_to IS NULL) with kind IN (doctrine, decision, invariant, preference) included",
@@ -213,7 +285,7 @@
           "captured_at timestamps preserved as valid_from",
           "content_hash from CCA used for dedup detection"
         ],
-        "context_notes": "Reference: /home/zutfen/code/cca-repo/docs/cca-lite/hermes-memory.json. ~40 reviewed entries. The importer should use the REST API (httpx), not direct DB access. Kind mapping: 'decision'→'decision', 'invariant'→'invariant', 'operational_fact'→'fact', 'preference'→'preference'."
+        "context_notes": "Reference: /home/zutfen/code/cca-repo/docs/cca-lite/hermes-memory.json. ~40 reviewed entries. The importer should use the REST API (httpx), not direct DB access. Kind mapping: 'decision'\u2192'decision', 'invariant'\u2192'invariant', 'operational_fact'\u2192'fact', 'preference'\u2192'preference'."
       },
       {
         "id": "T08",
@@ -221,10 +293,17 @@
         "milestone": "M1B",
         "priority": "high",
         "estimated_complexity": "medium",
-        "dependencies": ["T03"],
+        "dependencies": [
+          "T03"
+        ],
         "branch": "feat/llm-classification",
         "description": "Complete the classification engine with LLM enrichment. When provider='openai', an LLM call refines rule-based classification with semantic understanding. Wire auto-classification into remember when kind is omitted.",
-        "files_to_touch": ["engram/classification.py", "engram/api/routes/classify.py", "engram/api/routes/memory.py", "tests/test_classification.py"],
+        "files_to_touch": [
+          "engram/classification.py",
+          "engram/api/routes/classify.py",
+          "engram/api/routes/memory.py",
+          "tests/test_classification.py"
+        ],
         "acceptance_criteria": [
           "POST /v1/classify returns suggested_kind, suggested_wing, suggested_room, confidence, reason, rules_matched",
           "Rule-based classification works without LLM (provider='none')",
@@ -241,20 +320,28 @@
         "milestone": "M1B",
         "priority": "high",
         "estimated_complexity": "medium",
-        "dependencies": ["T03", "T05"],
+        "dependencies": [
+          "T03",
+          "T05"
+        ],
         "branch": "feat/conflict-detection",
         "description": "On remember, run semantic similarity check against active items in scope. Above threshold, ask classifier: contradict, refine, or duplicate? Flag conflicts, auto-supersede refinements, auto-dedup duplicates.",
-        "files_to_touch": ["engram/conflicts.py", "engram/api/routes/memory.py", "engram/api/routes/review.py", "tests/test_conflicts.py"],
+        "files_to_touch": [
+          "engram/conflicts.py",
+          "engram/api/routes/memory.py",
+          "engram/api/routes/review.py",
+          "tests/test_conflicts.py"
+        ],
         "acceptance_criteria": [
           "POST /v1/remember checks for semantic similarity against active items in same (tenant, workspace, kind)",
           "If cosine similarity > 0.85: classifier determines duplicate/refine/contradict",
-          "duplicate → auto-dedup (return existing item)",
-          "refine → auto-supersede (mark old, write new, link via superseded_by)",
-          "contradict → flag conflict: set conflicts_with_item_id, conflict_type='contradiction', conflict_resolution_status='unresolved', review_status='proposed'",
+          "duplicate \u2192 auto-dedup (return existing item)",
+          "refine \u2192 auto-supersede (mark old, write new, link via superseded_by)",
+          "contradict \u2192 flag conflict: set conflicts_with_item_id, conflict_type='contradiction', conflict_resolution_status='unresolved', review_status='proposed'",
           "GET /v1/review/conflicts lists items with unresolved conflicts",
           "POST /v1/items/{id}/resolve-conflict accepts resolution (accept/reject/merge), sets conflict_resolution_status, writes item_event"
         ],
-        "context_notes": "Create engram/conflicts.py. The similarity check uses the same embeddings from T05 — requires embeddings to be populated. If embedding_provider='none', conflict detection is skipped (can't do semantic comparison). The classifier prompt for contradict/refine/duplicate should include both the old and new content. Conflict detection is a major differentiator — it turns temporal validity from passive bookkeeping into active hygiene."
+        "context_notes": "Create engram/conflicts.py. The similarity check uses the same embeddings from T05 \u2014 requires embeddings to be populated. If embedding_provider='none', conflict detection is skipped (can't do semantic comparison). The classifier prompt for contradict/refine/duplicate should include both the old and new content. Conflict detection is a major differentiator \u2014 it turns temporal validity from passive bookkeeping into active hygiene."
       },
       {
         "id": "T10",
@@ -262,10 +349,16 @@
         "milestone": "M1B",
         "priority": "medium",
         "estimated_complexity": "low",
-        "dependencies": ["T04"],
+        "dependencies": [
+          "T04"
+        ],
         "branch": "feat/recall-explanations",
         "description": "Enhance recall responses with per-item 'reasons' and 'warnings', and add POST /v1/feedback for marking recalled items as useful/noise to feed back into recall scoring.",
-        "files_to_touch": ["engram/recall.py", "engram/api/routes/memory.py", "tests/test_recall_feedback.py"],
+        "files_to_touch": [
+          "engram/recall.py",
+          "engram/api/routes/memory.py",
+          "tests/test_recall_feedback.py"
+        ],
         "acceptance_criteria": [
           "Recall response items include 'reasons' array explaining score components",
           "Recall response items include 'warnings' array (e.g., 'not confirmed in 90 days', 'low confidence')",
@@ -273,7 +366,7 @@
           "Useful feedback incrementally raises importance (capped at 0.95); noise lowers it (floor at 0.1)",
           "Feedback is logged"
         ],
-        "context_notes": "The reasons array was designed into T04 but this task fleshes out the warning system and the feedback loop. Warnings: items not recalled in 90 days, items with memory_confidence < 0.5, items with unresolved conflicts. The feedback endpoint closes the loop that recall_logs started — items that get recalled and marked useful earn priority."
+        "context_notes": "The reasons array was designed into T04 but this task fleshes out the warning system and the feedback loop. Warnings: items not recalled in 90 days, items with memory_confidence < 0.5, items with unresolved conflicts. The feedback endpoint closes the loop that recall_logs started \u2014 items that get recalled and marked useful earn priority."
       },
       {
         "id": "T11",
@@ -281,10 +374,15 @@
         "milestone": "M1B",
         "priority": "medium",
         "estimated_complexity": "medium",
-        "dependencies": ["T03", "T06"],
+        "dependencies": [
+          "T03",
+          "T06"
+        ],
         "branch": "feat/import-mempalace",
         "description": "Import drawers from MemPalace ChromaDB into Engram. Dry-run first.",
-        "files_to_touch": ["scripts/import_mempalace.py"],
+        "files_to_touch": [
+          "scripts/import_mempalace.py"
+        ],
         "acceptance_criteria": [
           "Reads --palace path (ChromaDB dir) and --engram-url",
           "Dry-run: reports count by wing/room, duplicates, manual review items",
@@ -292,7 +390,7 @@
           "Wing/room preserved, kind inferred",
           "KG triples and tunnels imported via /v1/kg and /v1/tunnels"
         ],
-        "context_notes": "MemPalace store at ~/.mempalace/palace/. ~800-900 drawers. Use chromadb Python package to read. Use REST API for writing. Kind inference: 'doctrine'/'decision' in source_file → kind='doctrine', diary → 'diary_entry', else 'fact'."
+        "context_notes": "MemPalace store at ~/.mempalace/palace/. ~800-900 drawers. Use chromadb Python package to read. Use REST API for writing. Kind inference: 'doctrine'/'decision' in source_file \u2192 kind='doctrine', diary \u2192 'diary_entry', else 'fact'."
       },
       {
         "id": "T12",
@@ -300,13 +398,20 @@
         "milestone": "M1B",
         "priority": "high",
         "estimated_complexity": "medium",
-        "dependencies": ["T01"],
+        "dependencies": [
+          "T01"
+        ],
         "branch": "feat/auth-and-membership",
         "description": "API key auth middleware, workspace membership enforcement, and admin endpoints for tenant/workspace/principal management.",
-        "files_to_touch": ["engram/auth.py", "engram/api/app.py", "engram/api/routes/admin.py", "tests/test_auth.py"],
+        "files_to_touch": [
+          "engram/auth.py",
+          "engram/api/app.py",
+          "engram/api/routes/admin.py",
+          "tests/test_auth.py"
+        ],
         "acceptance_criteria": [
-          "ENGRAM_AUTH_ENABLED=false → bypass auth, use default tenant/admin",
-          "ENGRAM_AUTH_ENABLED=true → Bearer token required, resolves to tenant + principal",
+          "ENGRAM_AUTH_ENABLED=false \u2192 bypass auth, use default tenant/admin",
+          "ENGRAM_AUTH_ENABLED=true \u2192 Bearer token required, resolves to tenant + principal",
           "API keys stored hashed (bcrypt), scopes enforced (read/write/admin/export)",
           "Workspace membership checked for workspace-scoped queries",
           "POST /v1/admin/tenants, /v1/admin/workspaces, /v1/admin/principals, /v1/admin/api-keys",
@@ -321,10 +426,15 @@
         "milestone": "M1C",
         "priority": "medium",
         "estimated_complexity": "medium",
-        "dependencies": ["T03"],
+        "dependencies": [
+          "T03"
+        ],
         "branch": "feat/kg-endpoints",
-        "description": "Implement KG add/query/invalidate/timeline. Visibility inherited from source_item_id at query time — a triple spawned from a private item is only visible to that principal.",
-        "files_to_touch": ["engram/api/routes/kg.py", "tests/test_kg.py"],
+        "description": "Implement KG add/query/invalidate/timeline. Visibility inherited from source_item_id at query time \u2014 a triple spawned from a private item is only visible to that principal.",
+        "files_to_touch": [
+          "engram/api/routes/kg.py",
+          "tests/test_kg.py"
+        ],
         "acceptance_criteria": [
           "POST /v1/kg creates triple, links to source_item_id if provided",
           "GET /v1/kg/query checks source_item visibility: if source item is private, triple only visible to owning principal",
@@ -341,12 +451,18 @@
         "milestone": "M1C",
         "priority": "low",
         "estimated_complexity": "low",
-        "dependencies": ["T03"],
+        "dependencies": [
+          "T03"
+        ],
         "branch": "feat/taxonomy-tunnels-diary",
-        "description": "Taxonomy browser (wing→room→count), tunnel CRUD, diary write/read.",
-        "files_to_touch": ["engram/api/routes/taxonomy.py", "engram/api/routes/diary.py", "tests/test_taxonomy.py"],
+        "description": "Taxonomy browser (wing\u2192room\u2192count), tunnel CRUD, diary write/read.",
+        "files_to_touch": [
+          "engram/api/routes/taxonomy.py",
+          "engram/api/routes/diary.py",
+          "tests/test_taxonomy.py"
+        ],
         "acceptance_criteria": [
-          "GET /v1/taxonomy returns nested wing→room→item_count (active items only)",
+          "GET /v1/taxonomy returns nested wing\u2192room\u2192item_count (active items only)",
           "GET/POST /v1/tunnels for cross-wing links",
           "POST /v1/diary creates memory_item kind='diary_entry', visibility='private'",
           "GET /v1/diary/{principal} returns diary entries"
@@ -359,16 +475,21 @@
         "milestone": "M1C",
         "priority": "low",
         "estimated_complexity": "low",
-        "dependencies": ["T04"],
+        "dependencies": [
+          "T04"
+        ],
         "branch": "feat/memory-hygiene",
         "description": "Endpoints for detecting stale memories (not recalled in N days), bulk archival, and hygiene reports.",
-        "files_to_touch": ["engram/api/routes/review.py", "tests/test_hygiene.py"],
+        "files_to_touch": [
+          "engram/api/routes/review.py",
+          "tests/test_hygiene.py"
+        ],
         "acceptance_criteria": [
           "GET /v1/review/stale?days=90 returns active items not recalled in N days",
           "POST /v1/items/bulk-archive accepts item_ids, sets review_status='archived'",
           "GET /v1/review/stats returns counts by review_status, kind, confidence buckets"
         ],
-        "context_notes": "Stale detection uses last_recalled_at. Archival excludes items from default recall without invalidating them (they're still true, just not actively useful). This addresses the diary/observation bloat concern — append-first plus no decay means recall degrades over time without hygiene."
+        "context_notes": "Stale detection uses last_recalled_at. Archival excludes items from default recall without invalidating them (they're still true, just not actively useful). This addresses the diary/observation bloat concern \u2014 append-first plus no decay means recall degrades over time without hygiene."
       },
       {
         "id": "T16",
@@ -376,10 +497,21 @@
         "milestone": "M2",
         "priority": "medium",
         "estimated_complexity": "medium",
-        "dependencies": ["T03", "T04", "T05", "T08"],
+        "dependencies": [
+          "T03",
+          "T04",
+          "T05",
+          "T08"
+        ],
         "branch": "feat/python-sdk",
         "description": "Thin async Python SDK wrapping the REST API.",
-        "files_to_touch": ["sdk/engram-client/pyproject.toml", "sdk/engram-client/engram_client/__init__.py", "sdk/engram-client/engram_client/client.py", "sdk/engram-client/engram_client/models.py", "sdk/engram-client/tests/test_client.py"],
+        "files_to_touch": [
+          "sdk/engram-client/pyproject.toml",
+          "sdk/engram-client/engram_client/__init__.py",
+          "sdk/engram-client/engram_client/client.py",
+          "sdk/engram-client/engram_client/models.py",
+          "sdk/engram-client/tests/test_client.py"
+        ],
         "acceptance_criteria": [
           "EngramClient(base_url, api_key) with async methods: remember, recall, search, classify, kg_add, kg_query, diary_write",
           "Context manager support",
@@ -393,10 +525,16 @@
         "milestone": "M2",
         "priority": "medium",
         "estimated_complexity": "medium",
-        "dependencies": ["T16"],
+        "dependencies": [
+          "T16"
+        ],
         "branch": "feat/mcp-adapter",
         "description": "MCP server exposing Engram tools. Replaces MemPalace MCP server.",
-        "files_to_touch": ["adapters/mcp-server/server.py", "adapters/mcp-server/pyproject.toml", "adapters/mcp-server/README.md"],
+        "files_to_touch": [
+          "adapters/mcp-server/server.py",
+          "adapters/mcp-server/pyproject.toml",
+          "adapters/mcp-server/README.md"
+        ],
         "acceptance_criteria": [
           "Tools: engram_remember, engram_recall, engram_search, engram_classify, engram_kg_query, engram_kg_add, engram_diary_write",
           "Config via ENGRAM_BASE_URL, ENGRAM_API_KEY env vars",
@@ -410,14 +548,25 @@
         "milestone": "M2",
         "priority": "medium",
         "estimated_complexity": "medium",
-        "dependencies": ["T16", "T08"],
+        "dependencies": [
+          "T16",
+          "T08"
+        ],
         "branch": "feat/engram-hooks",
         "description": "Package the Hermes lifecycle hooks (pre_compress, sync_turn, session_end, write-boundary guards) as a standalone library calling Engram's classify + remember. Successor to zutfen_memory plugin.",
-        "files_to_touch": ["adapters/engram-hooks/pyproject.toml", "adapters/engram-hooks/engram_hooks/__init__.py", "adapters/engram-hooks/engram_hooks/hooks.py", "adapters/engram-hooks/engram_hooks/guards.py", "adapters/engram-hooks/engram_hooks/volatile.py", "adapters/engram-hooks/engram_hooks/config.py", "adapters/engram-hooks/README.md"],
+        "files_to_touch": [
+          "adapters/engram-hooks/pyproject.toml",
+          "adapters/engram-hooks/engram_hooks/__init__.py",
+          "adapters/engram-hooks/engram_hooks/hooks.py",
+          "adapters/engram-hooks/engram_hooks/guards.py",
+          "adapters/engram-hooks/engram_hooks/volatile.py",
+          "adapters/engram-hooks/engram_hooks/config.py",
+          "adapters/engram-hooks/README.md"
+        ],
         "acceptance_criteria": [
           "pre_compress, sync_turn, session_end hooks extract facts, classify via Engram, route by confidence",
           "Write-boundary guard blocks ambiguous/ephemeral candidates",
-          "Promotion gates: low-confidence → volatile, high-confidence → remember as proposed",
+          "Promotion gates: low-confidence \u2192 volatile, high-confidence \u2192 remember as proposed",
           "Volatile recall: local file-backed, 14-day retention, 2000-entry cap",
           "Config maps Hermes lifecycle events to hooks"
         ],
@@ -429,10 +578,18 @@
         "milestone": "M3",
         "priority": "medium",
         "estimated_complexity": "medium",
-        "dependencies": ["T01", "T12"],
+        "dependencies": [
+          "T01",
+          "T12"
+        ],
         "branch": "feat/deployment",
         "description": "Provision dedicated VM, deploy via Docker Compose, verify over Tailscale.",
-        "files_to_touch": ["deploy/proxmox-vm-provision.sh", "deploy/cloud-init.yml", "deploy/backup.sh", "docs/deployment.md"],
+        "files_to_touch": [
+          "deploy/proxmox-vm-provision.sh",
+          "deploy/cloud-init.yml",
+          "deploy/backup.sh",
+          "docs/deployment.md"
+        ],
         "acceptance_criteria": [
           "VM on Proxmox (4 vCPU, 8GB RAM, 50GB disk)",
           "Docker Compose up succeeds, schema migrates",
@@ -446,36 +603,103 @@
     ],
     "dependency_graph": {
       "T01": [],
-      "T02": ["T01"],
-      "T03": ["T01", "T02"],
-      "T04": ["T03"],
-      "T05": ["T03"],
-      "T06": ["T03"],
-      "T07": ["T03", "T06"],
-      "T08": ["T03"],
-      "T09": ["T03", "T05"],
-      "T10": ["T04"],
-      "T11": ["T03", "T06"],
-      "T12": ["T01"],
-      "T13": ["T03"],
-      "T14": ["T03"],
-      "T15": ["T04"],
-      "T16": ["T03", "T04", "T05", "T08"],
-      "T17": ["T16"],
-      "T18": ["T16", "T08"],
-      "T19": ["T01", "T12"]
+      "T02": [
+        "T01"
+      ],
+      "T03": [
+        "T01",
+        "T02"
+      ],
+      "T04": [
+        "T03"
+      ],
+      "T05": [
+        "T03"
+      ],
+      "T06": [
+        "T03"
+      ],
+      "T07": [
+        "T03",
+        "T06"
+      ],
+      "T08": [
+        "T03"
+      ],
+      "T09": [
+        "T03",
+        "T05"
+      ],
+      "T10": [
+        "T04"
+      ],
+      "T11": [
+        "T03",
+        "T06"
+      ],
+      "T12": [
+        "T01"
+      ],
+      "T13": [
+        "T03"
+      ],
+      "T14": [
+        "T03"
+      ],
+      "T15": [
+        "T04"
+      ],
+      "T16": [
+        "T03",
+        "T04",
+        "T05",
+        "T08"
+      ],
+      "T17": [
+        "T16"
+      ],
+      "T18": [
+        "T16",
+        "T08"
+      ],
+      "T19": [
+        "T01",
+        "T12"
+      ]
     },
     "parallelizable_groups": [
       {
         "description": "After T01+T02+T03 land, these proceed in parallel:",
-        "tasks": ["T04", "T05", "T06", "T08", "T12", "T13", "T14"]
+        "tasks": [
+          "T04",
+          "T05",
+          "T06",
+          "T08",
+          "T12",
+          "T13",
+          "T14"
+        ]
       },
       {
         "description": "After M1A is complete:",
-        "tasks": ["T08", "T09", "T10", "T11", "T15"]
+        "tasks": [
+          "T08",
+          "T09",
+          "T10",
+          "T11",
+          "T15"
+        ]
       }
     ],
-    "critical_path": ["T01", "T02", "T03", "T04", "T08", "T16", "T17"],
-    "critical_path_note": "T01→T02→T03 is the serial bottleneck. After T03, work fans out. T04 (recall) and T08 (classification) are both on the critical path because the SDK (T16) depends on both. T16→T17 is the integration path. T18 (engram-hooks) can proceed in parallel with T17 once T16+T08 land."
+    "critical_path": [
+      "T01",
+      "T02",
+      "T03",
+      "T04",
+      "T08",
+      "T16",
+      "T17"
+    ],
+    "critical_path_note": "T01\u2192T02\u2192T03 is the serial bottleneck. After T03, work fans out. T04 (recall) and T08 (classification) are both on the critical path because the SDK (T16) depends on both. T16\u2192T17 is the integration path. T18 (engram-hooks) can proceed in parallel with T17 once T16+T08 land."
   }
 }

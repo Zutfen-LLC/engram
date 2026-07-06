@@ -96,6 +96,8 @@ CREATE TABLE memory_items (
     pinned          BOOLEAN DEFAULT FALSE,   -- always included in startup recall if active
     last_recalled_at TIMESTAMPTZ,
     recall_count    INTEGER DEFAULT 0,
+    last_confirmed_at TIMESTAMPTZ,            -- last time marked useful via /v1/feedback
+    startup_recall_count INTEGER DEFAULT 0,  -- times recalled in startup mode (for anti-feedback penalty)
 
     -- Provenance (expanded)
     source_type     TEXT NOT NULL DEFAULT 'manual',
@@ -274,6 +276,20 @@ CREATE TABLE recall_logs (
     byte_budget     INTEGER,
     token_budget    INTEGER,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ============ Deletion audit (tombstone for GDPR/hosted) ============
+-- Separate from item_events because physical DELETE breaks FK references.
+-- Stores enough to prove deletion occurred without storing deleted content.
+
+CREATE TABLE deletion_events (
+    id                      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id               UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    deleted_item_id         UUID NOT NULL,        -- NOT a FK — the item is gone
+    deleted_content_hash    TEXT NOT NULL,         -- proves which content was deleted
+    deleted_by_principal_id UUID REFERENCES principals(id),
+    reason                  TEXT,
+    deleted_at              TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- ============ Indexes ============

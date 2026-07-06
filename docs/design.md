@@ -49,11 +49,25 @@ Engram is designed as a trust system, not just a storage system.
 
 ## 3. Memory Lifecycle
 
-Every memory item moves through a lifecycle:
+Every memory item has a simple state machine (`review_status`) plus derived signals from other columns and an event log. The lifecycle diagram shows the full trajectory, but only `review_status` is a stored state:
 
 ```
 observed → proposed → active → recalled → confirmed/stale → superseded/invalidated/archived
 ```
+
+**What is a state, event, or derived flag:**
+
+| Concept | Type | Where it lives |
+|---|---|---|
+| `proposed`, `active`, `disputed`, `rejected`, `archived` | **State** (`review_status`) | Column on memory_items |
+| `observed` | **Event** | Recorded in item_events (event_type='observed') |
+| `recalled` | **Derived flag** | `last_recalled_at IS NOT NULL` |
+| `confirmed` | **Derived flag** | `human_verified = TRUE` |
+| `stale` | **Derived flag** | Computed: `last_recalled_at < now() - stale_after_interval` |
+| `invalidated` | **Derived flag** | `valid_to IS NOT NULL AND superseded_by IS NULL` |
+| `superseded` | **Derived flag** | `superseded_by IS NOT NULL` |
+
+This keeps the state machine simple (5 stored states) while the full lifecycle is reconstructable from columns + events.
 
 | State | Meaning | Enters startup recall? |
 |---|---|---|
@@ -80,13 +94,20 @@ Agents can freely write `proposed` memories. Only `active` memories enter the de
 
 ### Source trust defaults
 
-| Source type | Default source_trust | Default review_status |
-|---|---|---|
-| `manual` (user explicitly said "remember") | 0.9 | `active` |
-| `import` / `migration` (from trusted ledger) | 0.8 | `active` |
-| `extraction` (LLM-derived from conversation) | 0.5 | `proposed` |
-| `sync_turn` (auto-extracted per turn) | 0.4 | `proposed` |
-| `pre_compress` (pre-compression capture) | 0.3 | `proposed` |
+Source trust is calculated from both `source_type` and the principal's type. This prevents a random agent calling `/remember` manually from getting the same trust as a user saying "remember this."
+
+| source_type | principal.type | Authority | Default source_trust | Default review_status |
+|---|---|---|---|---|
+| `manual` | `user` | explicit_user | 0.9 | `active` |
+| `manual` | `agent` | trusted_agent | 0.6 | `proposed` |
+| `manual` | `admin` | explicit_user | 0.9 | `active` |
+| `import` | `system` | trusted_import | 0.8 | `active` |
+| `migration` | `system` | trusted_import | 0.8 | `active` |
+| `extraction` | `agent` | inferred | 0.5 | `proposed` |
+| `sync_turn` | `agent` | inferred | 0.4 | `proposed` |
+| `pre_compress` | `agent` | inferred | 0.3 | `proposed` |
+
+**Authority hierarchy** (used in conflict resolution): `explicit_user > trusted_import > trusted_agent > untrusted_agent > inferred`
 
 ### Recall ranking formula
 
@@ -106,7 +127,9 @@ Where:
 - `human_verified_bonus` = 1.0 if verified, 0.0 otherwise
 - `pinned_bonus` = 1.0 if pinned, 0.0 otherwise
 
-Pinned items are always included in startup recall if active, regardless of budget (they get their bytes first, then the scorer fills the remainder).
+**Pinned items ceiling:** Pinned active items are included first, but cannot exceed a configured hard ceiling (`max_pinned_bytes` or `max_pinned_tokens`, default 2048 tokens). If pinned items exceed the ceiling, they are ordered by importance × source_trust and the excess is dropped. The recall response includes `pinned_omitted_count` so the caller knows pinned memories were truncated. This preserves the bounded-recall guarantee even if someone pins too much.
+
+**Anti-feedback-loop guardrail:** `recency_bonus` rewards recent recall for semantic continuity, but a `repeated_startup_penalty` applies when an item has been recalled in startup mode N times (default 5) without positive feedback via `POST /v1/feedback`. The penalty reduces the recency component by 0.5× per excess recall, preventing the same memories from permanently dominating startup recall. Positive feedback (marked useful) resets the penalty counter.
 
 ---
 
@@ -160,7 +183,7 @@ Each memory item has:
 
 See `migrations/001_init.sql` for the canonical DDL. Key design decisions:
 
-### Tables (12 total)
+### Tables (13 total)
 
 | Table | Purpose |
 |---|---|
@@ -176,6 +199,7 @@ See `migrations/001_init.sql` for the canonical DDL. Key design decisions:
 | `classification_rules` | Tenant-configurable classification rules |
 | `api_keys` | Authentication credentials |
 | `recall_logs` | Recall audit with item_ids for feedback loops |
+| `deletion_events` | Tombstone records for hard-deleted items (GDPR/hosted) |
 
 ### Key schema decisions
 
@@ -189,6 +213,8 @@ See `migrations/001_init.sql` for the canonical DDL. Key design decisions:
 ### KG visibility
 
 KG triples inherit visibility from their `source_item_id` at query time. A private memory item that spawns a triple does NOT leak that knowledge — querying the KG checks the source item's visibility against the caller's scope.
+
+**Source-less triple policy:** Every KG triple must be traceable to a memory item. If `POST /v1/kg` is called without `source_item_id`, the endpoint auto-creates a system-generated backing memory item (kind='fact', source_type='extraction', review_status='proposed', visibility='workspace') and links the triple to it. This ensures every triple has a visibility source and an audit trail. Manual triples without provenance are never allowed — they must go through the backing item.
 
 ---
 
@@ -223,7 +249,7 @@ KG triples inherit visibility from their `source_item_id` at query time. A priva
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/v1/kg` | Add triple (visibility inherited from source item) |
+| POST | `/v1/kg` | Add triple (requires source_item_id; auto-creates backing item if none provided) |
 | GET | `/v1/kg/query` | Query by entity, with temporal + visibility filtering |
 | POST | `/v1/kg/invalidate` | Mark triple invalid |
 | GET | `/v1/kg/timeline` | Chronological timeline for an entity |
@@ -298,9 +324,21 @@ Every recalled item includes a `reasons` array:
 
 When `POST /v1/remember` writes a new item, it runs a semantic similarity check against active items in the same scope. Above a threshold, the classifier is asked: "does this contradict, refine, or duplicate?"
 
-- **duplicate** → auto-dedup (existing behavior)
-- **refine** → auto-supersede (mark old, write new)
+- **duplicate** → auto-dedup (return existing item)
+- **refine** → conditional supersession (see below)
 - **contradict** → flag conflict, set `conflicts_with_item_id`, `conflict_type='contradiction'`, `conflict_resolution_status='unresolved'`
+
+### Refine supersession rules
+
+Auto-supersession on "refine" is **conditional**, not automatic:
+
+| Condition | Action |
+|---|---|
+| New item has high source_trust AND classifier confidence ≥ 0.8 | Auto-supersede (mark old, write new) |
+| New item has medium confidence OR source_trust mismatch | Proposed supersession: write new as `proposed`, link via `conflicts_with_item_id` with `conflict_type='stale'`, require review |
+| New item is from a lower-authority source than old | Never auto-supersede. Flag as `conflict_type='scope_overlap'` for manual review |
+
+Authority hierarchy: `explicit_user > trusted_import > trusted_agent > untrusted_agent > inferred`. A lower-authority source can never silently replace a higher-authority memory.
 
 ### Resolution
 
@@ -313,7 +351,7 @@ Conflicts surface in `GET /v1/review/conflicts`. Resolution via `POST /v1/items/
 - **Sensitivity field** on every memory item: `normal`, `sensitive`, `restricted`.
 - **Secret-pattern denylist**: pre-write check blocks content matching common secret patterns (API keys, tokens, passwords).
 - **PII-risk classification**: optional LLM check flags content likely containing PII.
-- **Hard-delete support**: `DELETE /v1/items/{id}` physically removes (for GDPR/hosted future). Logged in item_events.
+- **Hard-delete support**: `DELETE /v1/items/{id}` physically removes the item. Because `item_events` has a FK to `memory_items`, physical deletion would break the audit trail. Instead, a `deletion_events` table captures tombstone metadata (deleted_item_id, content_hash, deleted_by, reason, deleted_at) WITHOUT storing the deleted content. This proves deletion occurred for GDPR compliance without orphaning FK references.
 - **Read audit**: sensitive reads are logged to recall_logs.
 
 ---
