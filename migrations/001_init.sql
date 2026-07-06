@@ -64,7 +64,9 @@ CREATE TABLE memory_items (
     -- Content
     content         TEXT NOT NULL,
     content_hash    TEXT NOT NULL,       -- SHA-256 of canonicalized content
-    content_tsv     TSVECTOR,            -- full-text search vector (auto-generated)
+    content_tsv     TSVECTOR GENERATED ALWAYS AS (
+        to_tsvector('english', coalesce(content, ''))
+    ) STORED,                             -- full-text search vector (auto-generated)
     kind            TEXT NOT NULL,
     wing            TEXT,
     room            TEXT,
@@ -165,10 +167,8 @@ CREATE TABLE memory_items (
     )
 );
 
--- Full-text search vector (auto-update on insert/update of content)
-CREATE TRIGGER trg_memitems_tsv
-    BEFORE INSERT OR UPDATE OF content ON memory_items
-    FOR EACH ROW EXECUTE FUNCTION to_tsvector('english', NEW.content);
+-- Full-text search uses a GENERATED column (content_tsv), no trigger needed.
+-- The GIN index on content_tsv is created in the indexes section below.
 
 -- ============ Embeddings (separate table — supports multiple models) ============
 
@@ -347,7 +347,10 @@ CREATE INDEX idx_memitems_external         ON memory_items(tenant_id, external_s
 
 -- Dedup unique constraint: one active item per (tenant, workspace, principal, content_hash)
 -- This makes remember idempotent for retries within scope.
+-- NULLS NOT DISTINCT ensures tenant-level memories (workspace_id IS NULL) dedup correctly.
+-- Requires PostgreSQL 15+ (pgvector/pgvector:pg16 image satisfies this).
 CREATE UNIQUE INDEX idx_memitems_dedup ON memory_items(tenant_id, workspace_id, principal_id, content_hash)
+    NULLS NOT DISTINCT
     WHERE valid_to IS NULL AND review_status != 'rejected';
 
 -- Full-text search (GIN index on the tsvector column)
@@ -416,6 +419,20 @@ ALTER TABLE item_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE classification_rules ENABLE ROW LEVEL SECURITY;
 ALTER TABLE recall_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE workspace_members ENABLE ROW LEVEL SECURITY;
+ALTER TABLE api_keys ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tenant_config ENABLE ROW LEVEL SECURITY;
+ALTER TABLE deletion_events ENABLE ROW LEVEL SECURITY;
+
+-- NOTE: workspaces and principals are implicitly protected — they are parents
+-- referenced by RLS-protected children. Direct cross-tenant reads of these
+-- tables are low-risk (they contain only names/slug/type), but for completeness:
+ALTER TABLE workspaces ENABLE ROW LEVEL SECURITY;
+ALTER TABLE principals ENABLE ROW LEVEL SECURITY;
+
+-- NOTE: memory_embeddings is NOT RLS-protected because it has no tenant_id.
+-- All embedding queries MUST join through memory_items (which IS RLS-protected).
+-- Direct tenant access to memory_embeddings is never exposed via the API.
+-- This is a service-internal table.
 
 CREATE POLICY tenant_isolation_memitems ON memory_items
     USING (tenant_id::text = current_setting('app.tenant_id', true));
@@ -449,6 +466,21 @@ CREATE POLICY tenant_isolation_wsmembers ON workspace_members
               AND workspaces.tenant_id::text = current_setting('app.tenant_id', true)
         )
     );
+
+CREATE POLICY tenant_isolation_apikeys ON api_keys
+    USING (tenant_id::text = current_setting('app.tenant_id', true));
+
+CREATE POLICY tenant_isolation_tenantconfig ON tenant_config
+    USING (tenant_id::text = current_setting('app.tenant_id', true));
+
+CREATE POLICY tenant_isolation_deletion ON deletion_events
+    USING (tenant_id::text = current_setting('app.tenant_id', true));
+
+CREATE POLICY tenant_isolation_workspaces ON workspaces
+    USING (tenant_id::text = current_setting('app.tenant_id', true));
+
+CREATE POLICY tenant_isolation_principals ON principals
+    USING (tenant_id::text = current_setting('app.tenant_id', true));
 
 -- ============ Seed: default tenant ============
 

@@ -103,11 +103,12 @@
           "docker compose up -d succeeds without errors",
           "All 14 tables exist: tenants, workspaces, principals, workspace_members, memory_items, memory_embeddings, kg_triples, tunnels, item_events, classification_rules, api_keys, recall_logs, deletion_events, tenant_config",
           "CHECK constraints are active (try inserting invalid kind/visibility/review_status and confirm rejection)",
-          "RLS policies are active: INSERT a memory_item without setting app.tenant_id \u2192 should fail or be invisible",
-          "FTS trigger works: INSERT a memory_item, verify content_tsv is populated",
+          "RLS enabled on all tenant-scoped tables: memory_items, kg_triples, tunnels, item_events, classification_rules, recall_logs, workspace_members, api_keys, tenant_config, deletion_events, workspaces, principals. memory_embeddings has NO RLS (service-internal, no tenant_id \u2014 all queries must join through memory_items).",
+          "FTS generated column works: INSERT a memory_item, verify content_tsv is auto-populated (no trigger needed \u2014 it's a GENERATED ALWAYS AS column)",
           "pgvector extension is active with version >= 0.8 (check SELECT extversion FROM pg_extension WHERE extname='vector')",
           "Seed data exists: default tenant, general workspace, admin principal, workspace membership, 6 classification rules",
-          "GET /health returns ok, GET /ready returns ready with database connected"
+          "GET /health returns ok, GET /ready returns ready with database connected",
+          "Dedup NULLS NOT DISTINCT works: insert two items with same content_hash and workspace_id=NULL \u2192 second insert should dedup/fail (NULLs treated as equal, not distinct)"
         ],
         "context_notes": "The db.py get_session dependency must set app.tenant_id and app.principal_id via SET LOCAL at the start of each session, based on the authenticated principal. For Phase 1A with auth disabled, it should set the default tenant/admin. The pgvector/pgvector:pg16 Docker image includes pgvector but verify the version \u2014 iterative_scan requires 0.8+. The RLS policies reference current_setting('app.tenant_id', true) \u2014 test that this works correctly with SET LOCAL."
       },
@@ -188,8 +189,8 @@
         ],
         "acceptance_criteria": [
           "POST /v1/recall with mode='startup' returns active items (review_status='active', valid_to IS NULL)",
-          "Items scored by formula: importance*0.25 + source_trust*0.20 + memory_confidence*0.20 + recency*0.15 + verified*0.10 + pinned*0.10",
-          "Pinned items always included first (regardless of score), then scorer fills remainder of budget",
+          "Items scored by formula: importance*0.30 + source_trust*0.25 + memory_confidence*0.20 + recency*0.15 + verified*0.10. Pinned items are NOT in the formula \u2014 they are a pure bypass.",
+          "Pinned active items are a pure BYPASS (not scored): included first up to max_pinned_tokens ceiling, excess dropped by importance*source_trust. Response includes pinned_omitted_count.",
           "byte_budget or token_budget enforced (token approximated as bytes/4)",
           "working_set rendered as compact text (one line per item)",
           "Each item includes 'reasons' array: ['kind=invariant', 'human verified', 'pinned', etc.]",
@@ -339,7 +340,7 @@
           "POST /v1/remember checks for semantic similarity against active items in same (tenant, workspace, kind)",
           "If cosine similarity > 0.85: classifier determines duplicate/refine/contradict",
           "duplicate \u2192 auto-dedup (return existing item)",
-          "refine \u2192 auto-supersede (mark old, write new, link via superseded_by)",
+          "refine \u2192 conditional supersession based on authority hierarchy: high source_trust + classifier confidence >= 0.8 \u2192 auto-supersede; medium confidence OR source_trust mismatch \u2192 proposed supersession requiring review; lower authority than old item \u2192 never auto-supersede, flag for manual review",
           "contradict \u2192 flag conflict: set conflicts_with_item_id, conflict_type='contradiction', conflict_resolution_status='unresolved', review_status='proposed'",
           "GET /v1/review/conflicts lists items with unresolved conflicts",
           "POST /v1/items/{id}/resolve-conflict accepts resolution (accept/reject/merge), sets conflict_resolution_status, writes item_event"
@@ -445,7 +446,11 @@
           "GET /v1/kg/query supports entity, direction, as_of, predicate filters",
           "GET /v1/kg/timeline returns chronological facts",
           "POST /v1/kg/invalidate marks valid_to",
-          "All queries RLS-scoped to tenant"
+          "All queries RLS-scoped to tenant",
+          "POST /v1/kg without source_item_id auto-creates a backing memory item (kind='fact', source_type='extraction', review_status='proposed')",
+          "Direct creation of a source-less triple via the API is impossible \u2014 the endpoint always ensures a backing item",
+          "Hard-deleting a source memory item cascades: dependent KG triples are invalidated (valid_to = now()) and recorded in deletion_events tombstone",
+          "KG queries return proposed-backed triples with a trust annotation (not hidden)"
         ],
         "context_notes": "The visibility inheritance is the fix for Claude's headline finding. At query time, JOIN kg_triples to memory_items on source_item_id and check visibility. Triples without a source_item_id default to workspace visibility. This prevents the KG from being a side-channel around the visibility model."
       },

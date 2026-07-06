@@ -228,10 +228,10 @@ See `migrations/001_init.sql` for the canonical DDL. Key design decisions:
 ### Key schema decisions
 
 - **Check constraints** on all enum-like fields (kind, visibility, review_status, source_type, sensitivity, conflict_type) to prevent taxonomy drift.
-- **Full-text search** via `content_tsv TSVECTOR` column with auto-update trigger + GIN index. Essential for keyword search on IDs, paths, names.
+- **Full-text search** via `content_tsv TSVECTOR GENERATED ALWAYS AS (to_tsvector('english', coalesce(content, ''))) STORED` + GIN index. A generated column is used instead of a trigger — it's simpler, cannot drift, and requires no plpgsql function. Essential for keyword search on IDs, paths, names.
 - **Separate embeddings table** keyed by `(memory_item_id, embedding_model)`. A model change is new rows, not a migration. Old vectors remain queryable during re-embedding.
-- **Unique dedup index** on `(tenant_id, workspace_id, principal_id, content_hash) WHERE valid_to IS NULL AND review_status != 'rejected'`. Makes remember idempotent for retries.
-- **Row Level Security** on all tenant-scoped tables. Application sets `app.tenant_id` per session; Postgres enforces isolation even when application code is wrong. **IMPORTANT:** Use `SET LOCAL` inside each transaction, not `SET` per session. Under transaction-mode connection pooling (PgBouncer et al.), session-level GUCs leak across tenants sharing a pooled connection. `SET LOCAL` scopes the GUC to the current transaction, making it pool-safe.
+- **Unique dedup index** on `(tenant_id, workspace_id, principal_id, content_hash) WHERE valid_to IS NULL AND review_status != 'rejected'` with `NULLS NOT DISTINCT` (Postgres 15+). Makes remember idempotent for retries within scope, including tenant-level memories with NULL workspace_id.
+- **Row Level Security** on all tenant-scoped tables. Application uses `SET LOCAL` inside each transaction (pool-safe for PgBouncer); Postgres enforces isolation even when application code is wrong. RLS is enabled on: memory_items, kg_triples, tunnels, item_events, classification_rules, recall_logs, workspace_members, api_keys, tenant_config, deletion_events, workspaces, principals. `memory_embeddings` is NOT RLS-protected (no tenant_id column) — it is service-internal and all embedding queries must join through memory_items, which IS RLS-protected. Direct tenant access to memory_embeddings is never exposed via the API.
 - **HNSW with iterative_scan** — requires pgvector 0.8+. Set `hnsw.iterative_scan = strict` at query time to handle filtered (tenant-scoped) queries without recall degradation.
 
 ### KG visibility
