@@ -1,0 +1,528 @@
+{
+  "backlog": {
+    "project": "engram",
+    "repo": "https://github.com/Zutfen-LLC/engram",
+    "local_path": "/home/zutfen/code/engram",
+    "description": "Engram — shared structured memory for multi-agent AI teams. Postgres+pgvector service, FastAPI, multi-tenant.",
+    "design_doc": "docs/design.md",
+    "current_state": "v0.1.0 skeleton pushed to main (commit 61caf05). Schema migration, ORM models, FastAPI app factory, route stubs (NotImplementedError), Docker Compose, and test scaffolding exist. No endpoint is functional yet.",
+    "conventions": {
+      "branch_prefix": "feat/",
+      "python": ">=3.11",
+      "test_framework": "pytest + pytest-asyncio (asyncio_mode=auto in pyproject.toml)",
+      "linting": "ruff (E,F,I,UP,B,SIM rules, line-length=100)",
+      "type_checking": "mypy --strict",
+      "orm": "SQLAlchemy 2.0 async with asyncpg",
+      "api_framework": "FastAPI with Pydantic v2 models",
+      "db_session_dependency": "engram.db:get_session (yields AsyncSession)",
+      "models_location": "engram/models.py (all ORM models, Base class)",
+      "config": "engram.config:settings (pydantic-settings, env prefix ENGRAM_)",
+      "all_endpoints_are_stubs": "Every route handler in engram/api/routes/ currently raises NotImplementedError. Tasks replace stubs with real implementations.",
+      "commit_style": "conventional commits (feat:, fix:, test:, docs:, refactor:)",
+      "pr_per_task": "true — one branch, one PR per task. Do not bundle unrelated changes."
+    },
+    "milestones": [
+      {
+        "id": "M1",
+        "name": "Functional MVP — remember, recall, search",
+        "description": "The minimum that makes Engram usable: you can write a memory, recall it at startup, and search for it. Everything else builds on these.",
+        "task_ids": ["T01", "T02", "T03", "T04", "T05"]
+      },
+      {
+        "id": "M2",
+        "name": "Full API surface — KG, items, taxonomy, diary, export",
+        "description": "Complete the remaining REST endpoints so the service has feature parity with the design doc.",
+        "task_ids": ["T06", "T07", "T08", "T09", "T10"]
+      },
+      {
+        "id": "M3",
+        "name": "Auth + multi-tenancy",
+        "description": "API key authentication, tenant/workspace/principal management, and scoped queries.",
+        "task_ids": ["T11", "T12"]
+      },
+      {
+        "id": "M4",
+        "name": "Migration tooling",
+        "description": "Dry-run-first importers for existing MemPalace ChromaDB and CCA JSON data.",
+        "task_ids": ["T13", "T14"]
+      },
+      {
+        "id": "M5",
+        "name": "SDK + adapters",
+        "description": "Python SDK client and MCP server adapter for agent framework integration.",
+        "task_ids": ["T15", "T16"]
+      },
+      {
+        "id": "M6",
+        "name": "Deployment + ops",
+        "description": "Provision the production VM, deploy, verify over Tailscale.",
+        "task_ids": ["T17"]
+      }
+    ],
+    "tasks": [
+      {
+        "id": "T01",
+        "title": "Verify schema applies cleanly and health/ready endpoints work",
+        "milestone": "M1",
+        "priority": "blocker",
+        "estimated_complexity": "low",
+        "dependencies": [],
+        "branch": "feat/verify-schema-and-health",
+        "description": "Stand up the Docker Compose stack locally, confirm migrations/001_init.sql applies without errors, confirm /health returns 200 and /ready returns 200 with database connected. Fix any issues found in the SQL, Dockerfile, or docker-compose.yml.",
+        "files_to_touch": [
+          "migrations/001_init.sql",
+          "docker-compose.yml",
+          "Dockerfile",
+          "engram/api/routes/health.py",
+          "engram/db.py",
+          "engram/config.py"
+        ],
+        "acceptance_criteria": [
+          "docker compose up -d succeeds without errors",
+          "docker compose exec postgres psql -U engram -c '\\dt' shows all 8 tables",
+          "GET /health returns {\"status\":\"ok\"}",
+          "GET /ready returns {\"status\":\"ready\",\"database\":\"connected\"}",
+          "pgvector extension is active: SELECT extversion FROM pg_extension WHERE extname='vector' returns a version",
+          "The seed tenant (slug='default'), workspace (slug='general'), and principal (name='admin') exist in the DB"
+        ],
+        "context_notes": "The Dockerfile currently does pip install . which copies pyproject.toml and installs deps, then copies the engram/ package. The docker-compose mounts migrations/ into postgres's docker-entrypoint-initdb.d so 001_init.sql runs automatically on first boot. If the migration has SQL errors (e.g., self-referencing FK on memory_items.superseded_by, or vector type not available), fix them. The ready endpoint in health.py already has a working DB check via SELECT 1 — verify it actually connects using the async session."
+      },
+      {
+        "id": "T02",
+        "title": "Implement content canonicalization and hashing utilities",
+        "milestone": "M1",
+        "priority": "blocker",
+        "estimated_complexity": "low",
+        "dependencies": ["T01"],
+        "branch": "feat/canonicalize-and-hash",
+        "description": "Create the canonicalization module that normalizes memory content before hashing and dedup. This is a prerequisite for the remember endpoint (T03) and is tested independently.",
+        "files_to_touch": [
+          "engram/canonicalize.py (new file)",
+          "tests/test_canonicalize.py (new file)"
+        ],
+        "acceptance_criteria": [
+          "engram/canonicalize.py exports: canonicalize(content: str) -> str and content_hash(canonical: str) -> str",
+          "canonicalize() strips leading/trailing whitespace, normalizes internal whitespace (collapse multiple spaces/newlines to single space), lowercases, strips common wrapper patterns (quotes, brackets)",
+          "content_hash() returns 'sha256:' + hex digest of the canonicalized content",
+          "Two semantically identical strings with different whitespace/casing produce the same hash",
+          "Two different strings produce different hashes",
+          "All tests pass with pytest"
+        ],
+        "context_notes": "This module is pure functions with no DB or async dependencies — easy to unit test. The hash format must match what's stored in memory_items.content_hash. Look at the CCA ledger format in the existing zutfen codebase for prior art: /home/zutfen/code/cca-repo/docs/cca-lite/hermes-memory.json uses 'sha256:<hex>' format. The canonicalization rules should be conservative — only normalize things that are clearly cosmetic (whitespace, casing). Do not attempt semantic normalization."
+      },
+      {
+        "id": "T03",
+        "title": "Implement POST /v1/remember — the canonical write path",
+        "milestone": "M1",
+        "priority": "blocker",
+        "estimated_complexity": "medium",
+        "dependencies": ["T01", "T02"],
+        "branch": "feat/remember-write-path",
+        "description": "Replace the NotImplementedError stub in engram/api/routes/memory.py with a real implementation of POST /v1/remember. This is the first endpoint that actually stores data. It must handle content canonicalization, SHA-256 dedup detection, family-key supersession (for singleton kinds like preferences), provenance recording, and optional embedding generation.",
+        "files_to_touch": [
+          "engram/api/routes/memory.py",
+          "engram/embeddings.py (new file — embedding generation abstraction)",
+          "tests/test_remember.py (new file)"
+        ],
+        "acceptance_criteria": [
+          "POST /v1/remember with valid content creates a memory_item row and returns {id, status:'created'}",
+          "Same content sent twice (different request) returns {status:'deduped', deduped_existing_id: <uuid>} — no duplicate row created",
+          "Same content with different kind creates separate items (dedup is per-kind within tenant+workspace)",
+          "visibility field defaults to 'workspace' and is stored correctly",
+          "source_type and source_session are stored for provenance",
+          "wing/room are stored if provided, null if not",
+          "valid_from is set to now(), valid_to is null (active)",
+          "embedding is generated if ENGRAM_EMBEDDING_PROVIDER != 'none', otherwise null (deferred)",
+          "Invalid kind value returns 422 (Pydantic validation handles this if kind is an enum/Literal)",
+          "Returns 500 with clear error if DB write fails",
+          "Test uses an in-memory or test DB (see context_notes for test setup pattern)"
+        ],
+        "context_notes": "The request/response models (RememberRequest, RememberResponse) already exist in memory.py — use them. For embedding generation, create engram/embeddings.py with an abstraction: a function get_embedding(text: str) -> list[float] | None that checks settings.embedding_provider and either calls the configured provider or returns None. Start with provider='none' returning None — the OpenAI provider is implemented in T05. For the DB session, use the get_session dependency from engram.db. For supersession logic: if kind is 'preference' or 'invariant' (singleton semantics within a workspace+wing+room), and a new item with the same family key is written, mark the old item's valid_to=now() and superseded_by=new_id. For tests, use a fixture that creates a test database (or uses SQLite with aiosqlite for fast tests — note pgvector won't work with SQLite, so embedding tests should mock the embedding function). The acceptance test must create a tenant/workspace/principal first (use the seeded 'default' tenant from migration 001)."
+      },
+      {
+        "id": "T04",
+        "title": "Implement POST /v1/recall — startup mode (deterministic bounded working set)",
+        "milestone": "M1",
+        "priority": "blocker",
+        "estimated_complexity": "medium",
+        "dependencies": ["T03"],
+        "branch": "feat/recall-startup",
+        "description": "Implement recall with mode='startup' — the deterministic, bounded query that returns a compact working set of active memories for session initialization. This is what makes Engram feel like a 'shared brain' at agent startup.",
+        "files_to_touch": [
+          "engram/api/routes/memory.py",
+          "engram/recall.py (new file — selection logic)",
+          "tests/test_recall.py (new file)"
+        ],
+        "acceptance_criteria": [
+          "POST /v1/recall with {mode:'startup'} returns active items (valid_to IS NULL) for the default tenant+workspace",
+          "Returned items are ordered deterministically: preferences first, then invariants, then decisions, then doctrine, then facts, then observations; within each kind, by created_at descending",
+          "byte_budget (default from settings.recall_byte_budget=4096) is enforced: items are added until adding the next would exceed the budget, then remaining items are counted in omitted_count",
+          "item_budget (default from settings.recall_item_budget=50) is also enforced — whichever limit hits first",
+          "working_set field contains a rendered text string of the selected items (compact format: one line per item, 'kind: content')",
+          "item_count and byte_count reflect the actual returned items",
+          "workspace filter works: items from other workspaces are excluded when workspace is specified",
+          "Private items from other principals are excluded (visibility scoping)",
+          "Log the recall operation to recall_logs table (principal, mode, item_ids, byte_budget)"
+        ],
+        "context_notes": "Create engram/recall.py with the selection logic as a pure function that takes a list of candidate items + budgets and returns the selected subset + omitted count — this makes it unit-testable without a DB. The route handler in memory.py calls this function with query results. The RecallRequest and RecallResponse models already exist in memory.py. The deterministic ordering is critical — same corpus must produce same working set every time. Do NOT implement mode='semantic' yet — that requires embeddings (T05) and is a separate concern. The rendered working_set format should be compact but parseable — it's injected into agent prompts at startup. Look at how the current Hermes MEMORY.md section is formatted for prior art on what a startup memory payload looks like."
+      },
+      {
+        "id": "T05",
+        "title": "Implement embedding generation (OpenAI provider) and POST /v1/search",
+        "milestone": "M1",
+        "priority": "high",
+        "estimated_complexity": "medium",
+        "dependencies": ["T03"],
+        "branch": "feat/embeddings-and-search",
+        "description": "Complete the embedding abstraction in engram/embeddings.py with a real OpenAI provider, then implement POST /v1/search with three modes: keyword (ILIKE), semantic (pgvector cosine distance), and hybrid (BM25-style keyword boost + semantic). Also wire embeddings into the remember path so new items get vectors.",
+        "files_to_touch": [
+          "engram/embeddings.py",
+          "engram/api/routes/memory.py",
+          "tests/test_search.py (new file)"
+        ],
+        "acceptance_criteria": [
+          "engram/embeddings.py: when settings.embedding_provider='openai' and key is set, get_embedding(text) returns a 1536-dim vector via OpenAI embeddings API",
+          "When provider='none' or key is missing, get_embedding returns None (graceful degradation)",
+          "POST /v1/search with mode='keyword' does ILIKE search on content field, returns ranked results",
+          "POST /v1/search with mode='semantic' uses pgvector cosine distance (<=>) ordering, returns nearest matches",
+          "POST /v1/search with mode='hybrid' combines keyword + semantic results with simple score fusion",
+          "limit parameter is enforced (default 10)",
+          "wing/room/kind filters work when provided",
+          "Only active items (valid_to IS NULL) are returned by default",
+          "Search respects visibility scoping (no cross-tenant leaks)",
+          "If no embeddings exist (provider was 'none' when items were written), semantic search returns empty results with a helpful message, not an error"
+        ],
+        "context_notes": "Use the openai Python package (add to dependencies in pyproject.toml if not present — it's likely already pulled in by something, but check). The OpenAI embedding model should be text-embedding-3-small (1536 dimensions, matching the vector(1536) column in the schema). For the hybrid mode, a simple approach: get keyword results (ILIKE, ranked by occurrence), get semantic results (cosine distance), merge with reciprocal rank fusion (score = 1/(60+rank_keyword) + 1/(60+rank_semantic)). The HNSW index on memory_items.embedding is already in the migration. For pgvector queries in SQLAlchemy, use: MemoryItem.embedding.cosine_distance(query_vector) or raw SQL text('embedding <=> :vec'). Tests for semantic search require a real Postgres with pgvector — use the Docker Compose stack for integration tests, or mock the embedding function and test the query construction separately."
+      },
+      {
+        "id": "T06",
+        "title": "Implement knowledge graph endpoints (add, query, invalidate, timeline)",
+        "milestone": "M2",
+        "priority": "medium",
+        "estimated_complexity": "medium",
+        "dependencies": ["T01"],
+        "branch": "feat/kg-endpoints",
+        "description": "Replace the stubs in engram/api/routes/kg.py with real implementations. The KG stores subject-predicate-object triples with temporal validity (valid_from/valid_to), enabling entity relationship queries and historical timelines.",
+        "files_to_touch": [
+          "engram/api/routes/kg.py",
+          "tests/test_kg.py (new file)"
+        ],
+        "acceptance_criteria": [
+          "POST /v1/kg creates a kg_triple row with subject, predicate, object, valid_from=now(), valid_to=null",
+          "GET /v1/kg/query?entity=X returns all triples where X is subject or object (direction param controls: outgoing, incoming, both)",
+          "GET /v1/kg/query?entity=X&as_of=2026-01-01 filters to only facts valid at that timestamp (valid_from <= as_of AND (valid_to IS NULL OR valid_to > as_of))",
+          "GET /v1/kg/query?entity=X&predicate=loves filters by predicate type",
+          "POST /v1/kg/invalidate marks a triple's valid_to=now() (marks it as no longer true)",
+          "GET /v1/kg/timeline?entity=X returns chronological list of all facts involving X, ordered by valid_from",
+          "GET /v1/kg/timeline (no entity) returns full timeline (paginated)",
+          "All queries are scoped to tenant_id",
+          "source_item_id links a triple to its originating memory_item when applicable"
+        ],
+        "context_notes": "The KgTriple model is in engram/models.py. The request models (KgAddRequest) already exist in kg.py. Add proper Pydantic response models. The temporal query pattern (valid_from <= as_of AND (valid_to IS NULL OR valid_to > as_of)) is the core of time-travel queries — test it carefully. For the timeline endpoint, return both active and invalidated facts so the user sees the full history. This is the direct successor to MemPalace's knowledge graph — see the mempalace-setup skill for the original tool surface (kg_add, kg_query, kg_invalidate, kg_timeline)."
+      },
+      {
+        "id": "T07",
+        "title": "Implement item CRUD endpoints (list, get detail, patch, supersede, invalidate)",
+        "milestone": "M2",
+        "priority": "medium",
+        "estimated_complexity": "low",
+        "dependencies": ["T03"],
+        "branch": "feat/item-crud",
+        "description": "Implement the item management endpoints in engram/api/routes/memory.py. These provide operational visibility into the memory store — listing, inspecting, and managing the lifecycle of memory items.",
+        "files_to_touch": [
+          "engram/api/routes/memory.py",
+          "tests/test_items.py (new file)"
+        ],
+        "acceptance_criteria": [
+          "GET /v1/items returns paginated list with filters: workspace, kind, wing, room, active_only (default true), limit (default 50), offset",
+          "GET /v1/items/{id} returns full item detail including all fields",
+          "GET /v1/items/{id} includes linked KG facts (triples where source_item_id = this item) in the response",
+          "PATCH /v1/items/{id} updates metadata only (wing, room, visibility) — content is never modified (append-first principle)",
+          "POST /v1/items/{id}/supersede creates a new item, marks the old one's valid_to and superseded_by, returns both IDs",
+          "POST /v1/items/{id}/invalidate sets valid_to=now() without creating a replacement",
+          "404 returned for non-existent item IDs",
+          "All responses scoped to tenant_id (no cross-tenant access)"
+        ],
+        "context_notes": "The stubs and some request/response patterns already exist in memory.py. The supersede endpoint is important — it's how corrections work (append-first: never UPDATE content, always create new + mark old). The get_item endpoint should join KG triples in the response so a user can see 'this memory item spawned these facts.' Add proper Pydantic response models for item detail."
+      },
+      {
+        "id": "T08",
+        "title": "Implement taxonomy and tunnel endpoints",
+        "milestone": "M2",
+        "priority": "medium",
+        "estimated_complexity": "low",
+        "dependencies": ["T01"],
+        "branch": "feat/taxonomy-tunnels",
+        "description": "Implement GET /v1/taxonomy (wing→room→item count hierarchy) and tunnel CRUD (list, create) in engram/api/routes/taxonomy.py. These enable navigation of the memory store's organizational structure.",
+        "files_to_touch": [
+          "engram/api/routes/taxonomy.py",
+          "tests/test_taxonomy.py (new file)"
+        ],
+        "acceptance_criteria": [
+          "GET /v1/taxonomy returns a nested structure: [{wing, rooms: [{room, item_count}]}] for the tenant, only counting active items",
+          "GET /v1/tunnels returns all tunnels for the tenant, optionally filtered by wing (source or target)",
+          "POST /v1/tunnels creates a tunnel linking source_wing/source_room to target_wing/target_room with an optional label",
+          "Duplicate tunnel detection (same source+target) returns the existing tunnel rather than creating a duplicate"
+        ],
+        "context_notes": "The taxonomy endpoint is a GROUP BY query (wing, room) with COUNT, formatted into a nested structure. Tunnels are cross-domain links — they're metadata about how different parts of the taxonomy relate to each other (e.g., 'wing_hosts/proxmox connects to wing_services/ops-supervisor'). This is the successor to MemPalace's tunnel system."
+      },
+      {
+        "id": "T09",
+        "title": "Implement diary endpoints",
+        "milestone": "M2",
+        "priority": "low",
+        "estimated_complexity": "low",
+        "dependencies": ["T03"],
+        "branch": "feat/diary-endpoints",
+        "description": "Implement POST /v1/diary and GET /v1/diary/{principal} in engram/api/routes/diary.py. Diaries are memory_items with kind='diary_entry', scoped to a principal. They're the agent's personal journal.",
+        "files_to_touch": [
+          "engram/api/routes/diary.py",
+          "tests/test_diary.py (new file)"
+        ],
+        "acceptance_criteria": [
+          "POST /v1/diary creates a memory_item with kind='diary_entry', visibility='private' (default), wing='wing_agent' (default), room='diary'",
+          "POST /v1/diary accepts entry text (AAAK compressed format or free text), principal name, optional topic",
+          "The principal is resolved by name within the tenant; if not found, create it (auto-registration)",
+          "GET /v1/diary/{principal} returns diary entries for that principal, ordered by created_at descending, with a limit param (default 10)",
+          "Diary entries are always visibility='private' — they're only readable by the owning principal"
+        ],
+        "context_notes": "Diaries are not a separate table — they're memory_items with kind='diary_entry'. The endpoint is a thin wrapper around the remember logic with locked defaults (kind, visibility, wing, room). AAAK is a compressed diary format used by MemPalace — the endpoint should accept it as-is without parsing (it's just text). See the mempalace-setup skill for AAAK examples."
+      },
+      {
+        "id": "T10",
+        "title": "Implement CCA ledger export endpoint",
+        "milestone": "M2",
+        "priority": "medium",
+        "estimated_complexity": "low",
+        "dependencies": ["T07"],
+        "branch": "feat/cca-export",
+        "description": "Implement GET /v1/export/cca in engram/api/routes/export.py. This projects active doctrine/decision/invariant/preference items into a git-friendly JSON format compatible with the existing Zutfen CCA ledger format, enabling human review via PRs.",
+        "files_to_touch": [
+          "engram/api/routes/export.py",
+          "tests/test_export.py (new file)"
+        ],
+        "acceptance_criteria": [
+          "GET /v1/export/cca returns JSON matching the cca_lite_memory_packet@v1 format (see context_notes for reference)",
+          "Only active items (valid_to IS NULL) with kind IN (doctrine, decision, invariant, preference) are included",
+          "Output includes the same metadata fields as the existing CCA format: id, kind, text, source, invocation_mode, captured_at, canonical_text, content_hash",
+          "The output is valid JSON that could be committed to a git repo",
+          "A workspace filter is supported (default: all workspaces in tenant)"
+        ],
+        "context_notes": "Reference the existing CCA format at /home/zutfen/code/cca-repo/docs/cca-lite/hermes-memory.json — it has a specific structure with 'kind': 'cca_lite_memory_packet@v1', 'meta', 'purpose', 'routing_policy', and 'entries' array. The export should match this format closely. The cca_ledger VIEW in the migration already filters to the right kinds — use it or replicate the query. The purpose of this endpoint is to generate a git-trackable artifact for human review — the DB is canonical, the export is a projection."
+      },
+      {
+        "id": "T11",
+        "title": "Implement API key authentication middleware",
+        "milestone": "M3",
+        "priority": "high",
+        "estimated_complexity": "medium",
+        "dependencies": ["T01"],
+        "branch": "feat/api-key-auth",
+        "description": "Implement API key authentication for the Engram service. When ENGRAM_AUTH_ENABLED=true, all requests must include a valid API key in the Authorization header (Bearer token). The key resolves to a tenant + principal, which scopes all queries.",
+        "files_to_touch": [
+          "engram/auth.py (new or expand existing)",
+          "engram/api/app.py (add middleware/dependency)",
+          "engram/api/routes/health.py (exclude from auth)",
+          "tests/test_auth.py (new file)"
+        ],
+        "acceptance_criteria": [
+          "When ENGRAM_AUTH_ENABLED=false (default), auth is bypassed and requests use the default tenant/admin principal (current behavior)",
+          "When ENGRAM_AUTH_ENABLED=true, requests without a valid Bearer token return 401",
+          "API keys are stored hashed (bcrypt) in api_keys table — never store plaintext",
+          "A key resolves to a tenant_id + principal_id, which is injected into the request context and used by all queries",
+          "Key scopes are enforced: 'read' scope cannot access POST/PUT/DELETE endpoints, 'write' scope can",
+          "Health endpoints (/health, /ready) are always accessible without auth",
+          "A CLI command or script exists to generate a new API key: prints the plaintext key once, stores the hash"
+        ],
+        "context_notes": "Use FastAPI's Dependency system — create a get_current_principal dependency that reads the Authorization header, validates the key, and returns the tenant_id + principal_id. When auth is disabled, it returns the default tenant/admin. The key format should be 'eng_<random>' (prefixed for identification). For key generation, bcrypt with a reasonable cost factor (12). The scopes field on api_keys is TEXT[] — check 'write' in scopes for mutating endpoints. A bootstrap problem: how to create the first API key? Options: a CLI command (engram create-key --tenant default --principal admin --scopes read,write) or an env var that seeds a key on first boot. Implement the CLI command approach."
+      },
+      {
+        "id": "T12",
+        "title": "Implement tenant/workspace/principal management endpoints",
+        "milestone": "M3",
+        "priority": "medium",
+        "estimated_complexity": "medium",
+        "dependencies": ["T11"],
+        "branch": "feat/tenant-management",
+        "description": "Implement admin endpoints for creating and managing tenants, workspaces, and principals. These are needed for multi-tenant setup and for registering new agents.",
+        "files_to_touch": [
+          "engram/api/routes/admin.py (new file)",
+          "engram/api/app.py (register new router)",
+          "tests/test_admin.py (new file)"
+        ],
+        "acceptance_criteria": [
+          "POST /v1/admin/tenants creates a tenant (name, slug) — requires admin scope",
+          "POST /v1/admin/workspaces creates a workspace under a tenant (name, slug)",
+          "POST /v1/admin/principals creates a principal (name, type=agent|user) under a tenant",
+          "GET /v1/admin/tenants lists tenants (admin scope only)",
+          "POST /v1/admin/api-keys generates a new API key for a principal, returns the plaintext key once",
+          "All admin endpoints require 'admin' scope (not just 'write')",
+          "Slug uniqueness is enforced (tenant slugs globally unique, workspace slugs unique within tenant)"
+        ],
+        "context_notes": "These endpoints are gated behind admin scope — regular agents can't create tenants. The API key generation from T11 lives here as a proper endpoint (in addition to the CLI command). Principals auto-creation on diary write (T09) is a separate convenience path; this is the explicit management path."
+      },
+      {
+        "id": "T13",
+        "title": "Implement MemPalace ChromaDB importer (dry-run first)",
+        "milestone": "M4",
+        "priority": "medium",
+        "estimated_complexity": "medium",
+        "dependencies": ["T03", "T07"],
+        "branch": "feat/import-mempalace",
+        "description": "Create scripts/import_mempalace.py that reads drawers from an existing MemPalace ChromaDB store and imports them into Engram. Defaults to dry-run mode (reports what would be imported without writing). --apply flag performs the actual import.",
+        "files_to_touch": [
+          "scripts/import_mempalace.py (new file)",
+          "scripts/requirements-import.txt (new file — importer-specific deps like chromadb client)"
+        ],
+        "acceptance_criteria": [
+          "Script reads a --palace path (ChromaDB directory) and --engram-url (Engram API base URL)",
+          "Dry-run mode (default): prints a summary report showing count of drawers by wing/room, detected duplicates against existing Engram items, and any items that need manual review",
+          "Dry-run report includes a mapping table: MemPalace drawer_id → proposed Engram memory_item fields (kind, wing, room, content preview)",
+          "--apply mode: imports each drawer as a memory_item via POST /v1/remember, with source_type='migration'",
+          "Wing/room mapping from MemPalace is preserved directly (MemPalace wing → Engram wing field)",
+          "Kind inference: drawers with source_file containing 'doctrine' or 'decision' get kind='doctrine', diary entries get kind='diary_entry', everything else defaults to kind='fact'",
+          "Duplicate detection: if content_hash matches an existing item, skip and report",
+          "KG triples and tunnels from MemPalace are also imported (via /v1/kg and /v1/tunnels endpoints)",
+          "Progress reporting during --apply (every 100 items)"
+        ],
+        "context_notes": "MemPalace ChromaDB store is at ~/.mempalace/palace/ on the current machine. The chromadb Python package can read it directly. Each drawer has: content, wing, room, drawer_id, created_at, source_file, metadata. The script should use the Engram REST API (via httpx) rather than direct DB access — this validates the API surface and works remotely. Run this first in dry-run against the real MemPalace store to see what would migrate. There are approximately 800-900 drawers currently. See the mempalace-setup skill for the ChromaDB data model details."
+      },
+      {
+        "id": "T14",
+        "title": "Implement CCA JSON ledger importer (dry-run first)",
+        "milestone": "M4",
+        "priority": "medium",
+        "estimated_complexity": "low",
+        "dependencies": ["T03", "T07"],
+        "branch": "feat/import-cca",
+        "description": "Create scripts/import_cca.py that reads a Zutfen CCA JSON ledger file and imports entries into Engram. Defaults to dry-run. This migrates the existing git-tracked doctrine into the canonical store.",
+        "files_to_touch": [
+          "scripts/import_cca.py (new file)"
+        ],
+        "acceptance_criteria": [
+          "Script reads --cca-file (path to hermes-memory.json) and --engram-url",
+          "Dry-run mode: prints count of entries by kind, detected duplicates, entries to skip",
+          "--apply mode: imports each entry via POST /v1/remember with source_type='migration'",
+          "Kind mapping from CCA format: 'decision' → 'decision', 'invariant' → 'invariant', 'operational_fact' → 'fact', 'preference' → 'preference'",
+          "The 'kind' field in CCA entries maps directly to Engram kind where possible; unknown kinds default to 'fact'",
+          "content_hash from CCA entries is compared against existing items for dedup",
+          "captured_at timestamps are preserved as valid_from in Engram (historical backfill)",
+          "Provenance is preserved: source='manual_tool' or original source is mapped to source_type"
+        ],
+        "context_notes": "Reference file: /home/zutfen/code/cca-repo/docs/cca-lite/hermes-memory.json — this is the live CCA ledger. It has ~40 reviewed entries currently (after cleanup). The format is cca_lite_memory_packet@v1 with an 'entries' array. Each entry has: id, kind, text, source, session_id, invocation_mode, captured_at, canonical_text, content_hash. The canonical_text field is the normalized version — use it for dedup against Engram's content_hash. The captured_at field should become valid_from in Engram (backdating the memory to when it was originally captured)."
+      },
+      {
+        "id": "T15",
+        "title": "Build Python SDK client (engram-client)",
+        "milestone": "M5",
+        "priority": "medium",
+        "estimated_complexity": "medium",
+        "dependencies": ["T03", "T04", "T05"],
+        "branch": "feat/python-sdk",
+        "description": "Build a thin Python SDK client in sdk/engram-client/ that wraps the Engram REST API. This is what agent frameworks import to talk to Engram.",
+        "files_to_touch": [
+          "sdk/engram-client/pyproject.toml (new)",
+          "sdk/engram-client/engram_client/__init__.py (new)",
+          "sdk/engram-client/engram_client/client.py (new — main client class)",
+          "sdk/engram-client/engram_client/models.py (new — Pydantic models matching API)",
+          "sdk/engram-client/tests/test_client.py (new)"
+        ],
+        "acceptance_criteria": [
+          "EngramClient(base_url, api_key) initializes and validates connection via /health",
+          "client.remember(content, kind=..., wing=..., room=...) returns RememberResponse",
+          "client.recall(mode='startup') returns RecallResponse",
+          "client.search(query, mode='hybrid') returns SearchResponse",
+          "client.kg_add(subject, predicate, object) creates a triple",
+          "client.kg_query(entity) returns relationships",
+          "All methods are async (use httpx.AsyncClient)",
+          "Client handles connection errors gracefully with clear exceptions",
+          "Context manager support: async with EngramClient(...) as client: ...",
+          "PyPI-ready pyproject.toml with proper metadata (name: engram-client)"
+        ],
+        "context_notes": "This is a separate package from the service — it lives in sdk/engram-client/ and has its own pyproject.toml. It should depend only on httpx and pydantic (minimal deps). The models in models.py should mirror the API's request/response schemas but don't need to be identical (client can have convenience methods like client.remember() that build the request internally). This SDK is what the MCP adapter (T16) and the Hermes integration will use."
+      },
+      {
+        "id": "T16",
+        "title": "Build MCP server adapter",
+        "milestone": "M5",
+        "priority": "medium",
+        "estimated_complexity": "medium",
+        "dependencies": ["T15"],
+        "branch": "feat/mcp-adapter",
+        "description": "Build an MCP server adapter in adapters/mcp-server/ that exposes Engram as an MCP tool provider. This is how Hermes (and other MCP-compatible agents) discover and call Engram tools.",
+        "files_to_touch": [
+          "adapters/mcp-server/server.py (new)",
+          "adapters/mcp-server/pyproject.toml (new)",
+          "adapters/mcp-server/README.md (new — config instructions)"
+        ],
+        "acceptance_criteria": [
+          "MCP server starts and registers tools: engram_remember, engram_recall, engram_search, engram_kg_query, engram_kg_add, engram_diary_write",
+          "Each tool maps to the corresponding Engram API endpoint via the Python SDK",
+          "Server is configured via env vars: ENGRAM_BASE_URL, ENGRAM_API_KEY",
+          "Tool schemas are well-documented (description, parameter descriptions)",
+          "Server can be started standalone: python -m engram_mcp or via config in Hermes mcp_servers section",
+          "README includes Hermes config example showing how to register the MCP server"
+        ],
+        "context_notes": "This replaces the existing MemPalace MCP server. The tool names should be prefixed with 'engram_' for clarity in agent contexts. Use the Python SDK (T15) as the client — the MCP adapter is a thin layer that translates MCP tool calls into SDK method calls. The existing Hermes MemPalace MCP config lives in ~/.hermes/config.yaml under mcp_servers.mempalace — the new config will be similar but points to the Engram MCP adapter. See the mempalace-setup skill for the MCP config format and the tool surface it replaces."
+      },
+      {
+        "id": "T17",
+        "title": "Provision Proxmox VM and deploy Engram service",
+        "milestone": "M6",
+        "priority": "medium",
+        "estimated_complexity": "medium",
+        "dependencies": ["T01", "T11"],
+        "branch": "feat/deployment",
+        "description": "Provision a dedicated VM on Proxmox for the Engram service, deploy via Docker Compose, and verify accessibility over Tailscale. This is the production deployment for Zutfen dogfooding.",
+        "files_to_touch": [
+          "deploy/proxmox-vm-provision.sh (new — VM creation script)",
+          "deploy/cloud-init.yml (new — VM bootstrap config)",
+          "deploy/backup.sh (new — nightly pg_dump cron)",
+          "docs/deployment.md (new — deployment runbook)"
+        ],
+        "acceptance_criteria": [
+          "VM created on a Proxmox host (pm01 or pm03) with adequate resources (4 vCPU, 8GB RAM, 50GB disk)",
+          "Docker + Docker Compose installed on the VM",
+          "Engram repo cloned and docker compose up -d succeeds",
+          "Schema migration applies cleanly on fresh DB",
+          "Service is accessible over Tailscale: curl http://<tailscale-ip>:8000/health returns ok",
+          "Nightly pg_dump backup is configured via cron",
+          "Bootstrap API key created via CLI and recorded securely",
+          "docs/deployment.md documents the full provisioning + deploy process"
+        ],
+        "context_notes": "Use the proxmox-vm-provisioning skill for VM creation patterns — the user prefers SSH bootstrap where Hermes generates keys locally. The VM should be on the Tailscale network. Resource sizing: Postgres with pgvector HNSW indexes needs RAM for the index (rough estimate: 4GB for ~100K items with 1536-dim vectors). 8GB RAM is a safe starting point. The backup script should do pg_dump to a local path, with rotation (keep 7 daily, 4 weekly). This VM becomes the single source of truth for all Zutfen agent memory — it should be treated as production."
+      }
+    ],
+    "dependency_graph": {
+      "T01": [],
+      "T02": ["T01"],
+      "T03": ["T01", "T02"],
+      "T04": ["T03"],
+      "T05": ["T03"],
+      "T06": ["T01"],
+      "T07": ["T03"],
+      "T08": ["T01"],
+      "T09": ["T03"],
+      "T10": ["T07"],
+      "T11": ["T01"],
+      "T12": ["T11"],
+      "T13": ["T03", "T07"],
+      "T14": ["T03", "T07"],
+      "T15": ["T03", "T04", "T05"],
+      "T16": ["T15"],
+      "T17": ["T01", "T11"]
+    },
+    "parallelizable_groups": [
+      {
+        "description": "After T01 + T02 + T03 land, these can proceed in parallel:",
+        "tasks": ["T04", "T05", "T06", "T07", "T08", "T09", "T11"]
+      },
+      {
+        "description": "After the full API surface (M1+M2) is done:",
+        "tasks": ["T10", "T12", "T13", "T14", "T15", "T17"]
+      }
+    ],
+    "critical_path": ["T01", "T02", "T03", "T04", "T15", "T16"],
+    "critical_path_note": "T01→T02→T03 is the serial bottleneck (schema→canonicalize→remember). After T03, work fans out. T04→T15→T16 is the path to a usable integration: recall makes it useful, SDK makes it accessible, MCP adapter connects it to Hermes."
+  }
+}
