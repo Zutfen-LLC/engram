@@ -22,8 +22,9 @@
       "pr_per_task": "one branch, one PR per task. Do not bundle unrelated changes.",
       "rls_note": "The application must set app.tenant_id and app.principal_id per DB session via SET LOCAL. The get_session dependency should do this based on the authenticated principal.",
       "check_constraints": "All enum-like fields (kind, visibility, review_status, source_type, sensitivity, conflict_type) have CHECK constraints in the DB. Pydantic models should use Literal types to validate before the DB does.",
-      "dedup_scope": "Dedup is (tenant_id, workspace_id, principal_id, content_hash) WHERE valid_to IS NULL AND review_status != 'rejected'. Enforced by unique index idx_memitems_dedup.",
-      "append_first": "Content is never UPDATEd. Metadata changes (wing, room, visibility, review_status) go through PATCH which writes to item_events audit table then updates the column. Content changes require supersession (new row + mark old)."
+      "dedup_scope": "Dedup is (tenant_id, workspace_id, principal_id, content_hash) WHERE valid_to IS NULL AND review_status != 'rejected', with NULLS NOT DISTINCT (Postgres 15+) so NULL workspace_id items dedup correctly. Enforced by unique index idx_memitems_dedup.",
+      "append_first": "Content is never UPDATEd. Metadata changes (wing, room, visibility, review_status) go through PATCH which writes to item_events audit table then updates the column. Content changes require supersession (new row + mark old).",
+      "security_invoker_views": "active_memories and cca_ledger views use WITH (security_invoker = true) so RLS policies apply through the view. App code can query these views safely."
     },
     "milestones": [
       {
@@ -108,9 +109,11 @@
           "pgvector extension is active with version >= 0.8 (check SELECT extversion FROM pg_extension WHERE extname='vector')",
           "Seed data exists: default tenant, general workspace, admin principal, workspace membership, 6 classification rules",
           "GET /health returns ok, GET /ready returns ready with database connected",
-          "Dedup NULLS NOT DISTINCT works: insert two items with same content_hash and workspace_id=NULL \u2192 second insert should dedup/fail (NULLs treated as equal, not distinct)"
+          "Dedup NULLS NOT DISTINCT works: insert two items with same content_hash and workspace_id=NULL \u2192 second insert should dedup/fail (NULLs treated as equal, not distinct)",
+          "Security-invoker views: active_memories and cca_ledger use WITH (security_invoker = true). Verify RLS applies through the view by querying as different tenants.",
+          "Composite FK on memory_embeddings: INSERT an embedding with mismatched tenant_id (different from memory_items.tenant_id) \u2192 should fail with FK violation"
         ],
-        "context_notes": "The db.py get_session dependency must set app.tenant_id and app.principal_id via SET LOCAL at the start of each session, based on the authenticated principal. For Phase 1A with auth disabled, it should set the default tenant/admin. The pgvector/pgvector:pg16 Docker image includes pgvector but verify the version \u2014 iterative_scan requires 0.8+. The RLS policies reference current_setting('app.tenant_id', true) \u2014 test that this works correctly with SET LOCAL."
+        "context_notes": "The db.py get_session dependency must set app.tenant_id and app.principal_id via SET LOCAL at the start of each session, based on the authenticated principal. For Phase 1A with auth disabled, it should set the default tenant/admin. The pgvector/pgvector:pg16 Docker image includes pgvector but verify the version \u2014 iterative_scan requires 0.8+. The RLS policies reference current_setting('app.tenant_id', true) \u2014 test that this works correctly with SET LOCAL. The active_memories and cca_ledger views use WITH (security_invoker = true) \u2014 test that RLS policies apply through them, not just on base tables. The composite FK on memory_embeddings (memory_item_id, tenant_id) \u2192 memory_items(id, tenant_id) means an embedding with a mismatched tenant_id will be rejected at the DB level."
       },
       {
         "id": "T02",
@@ -232,7 +235,7 @@
           "Search respects visibility scoping via RLS",
           "If no embeddings exist, semantic search returns empty results with helpful message"
         ],
-        "context_notes": "The memory_embeddings table is separate from memory_items \u2014 the search query must JOIN them. For pgvector queries: MemoryEmbedding.embedding.cosine_distance(query_vector) or raw SQL. CRITICAL: set hnsw.iterative_scan=strict at query time (SET LOCAL hnsw.iterative_scan = strict) to handle tenant-filtered queries without recall degradation. The openai package needs to be added to dependencies if not present. text-embedding-3-small produces 1536-dim vectors matching the vector(1536) column."
+        "context_notes": "The memory_embeddings table is separate from memory_items \u2014 the search query must JOIN them. For pgvector queries: MemoryEmbedding.embedding.cosine_distance(query_vector) or raw SQL. CRITICAL: set hnsw.iterative_scan=strict at query time (SET LOCAL hnsw.iterative_scan = strict) to handle tenant-filtered queries without recall degradation. The openai package needs to be added to dependencies if not present. text-embedding-3-small produces 1536-dim vectors matching the vector(1536) column. When writing embeddings, the tenant_id must match the memory_item's tenant_id \u2014 enforced by composite FK. The embedding write should read tenant_id from the parent item, not from the request."
       },
       {
         "id": "T06",
@@ -372,7 +375,7 @@
           "Feedback is logged",
           "Feedback authority weighting: user feedback resets penalty + adjusts importance; agent feedback on own memories has zero penalty-reset weight; agent feedback on other agent's memories is partial weight only"
         ],
-        "context_notes": "The reasons array was designed into T04 but this task fleshes out the warning system and the feedback loop. Warnings: items not recalled in 90 days, items with memory_confidence < 0.5, items with unresolved conflicts. The feedback endpoint closes the loop that recall_logs started \u2014 items that get recalled and marked useful earn priority. CRITICAL: agents cannot self-entrench by marking their own recalled items 'useful'. Only user/admin feedback resets the startup_recall_count penalty counter."
+        "context_notes": "The reasons array was designed into T04 but this task fleshes out the warning system and the feedback loop. Warnings: items not recalled in 90 days, items with memory_confidence < 0.5, items with unresolved conflicts. The feedback endpoint closes the loop that recall_logs started \u2014 items that get recalled and marked useful earn priority. CRITICAL: agents cannot self-entrench by marking their own recalled items 'useful'. Only user/admin feedback resets the startup_recall_count penalty counter. feedback_events now has recall_log_id \u2014 the endpoint should accept and store the recall_log_id from the recall response that surfaced the item, enabling full traceability."
       },
       {
         "id": "T11",
