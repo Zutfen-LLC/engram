@@ -8,6 +8,7 @@ Skeleton — implementation in Phase 1B (T09).
 
 from __future__ import annotations
 
+from typing import Any
 from uuid import UUID
 
 
@@ -17,7 +18,7 @@ async def detect_conflict(
     tenant_id: UUID,
     workspace_id: UUID | None,
     kind: str,
-) -> dict | None:
+) -> dict[str, Any] | None:
     """Check for conflicts against existing active items.
 
     Returns None if no conflict, or:

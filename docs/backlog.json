@@ -6,7 +6,7 @@
     "description": "Engram \u2014 trustable institutional memory for multi-agent AI teams. Postgres+pgvector service, FastAPI, multi-tenant, with review states, provenance, conflict detection, and scoped recall.",
     "design_doc": "docs/design.md",
     "design_version": "v2.2 (schema completeness + final hygiene, 2026-07-06)",
-    "current_state": "v0.1.0 skeleton with v2.2 schema (security_invoker views, feedback_events with recall_log_id, composite FK on embeddings, usage-validated promotion path, verification field cleanup). 15 tables, all RLS-protected. ORM models match migration. Migration SQL, FastAPI app factory, route stubs, Docker Compose exist. No endpoint is functional yet.",
+    "current_state": "v0.1.0 skeleton with v2.2 schema (security_invoker views, feedback_events with recall_log_id, composite FK on embeddings, usage-validated promotion path, verification field cleanup). 15 tables, all RLS-protected. ORM models match migration. Migration SQL, FastAPI app factory, route stubs, Docker Compose exist. No endpoint is functional yet. CI workflow (.github/workflows/ci.yml) and AGENTS.md added; lint/type baseline green (ruff + mypy --strict + pytest all pass on skeleton stubs).",
     "conventions": {
       "branch_prefix": "feat/",
       "python": ">=3.11",
@@ -98,7 +98,9 @@
           "Dockerfile",
           "engram/api/routes/health.py",
           "engram/db.py",
-          "engram/config.py"
+          "engram/config.py",
+          ".github/workflows/ci.yml",
+          "AGENTS.md"
         ],
         "acceptance_criteria": [
           "docker compose up -d succeeds without errors",
@@ -111,7 +113,10 @@
           "GET /health returns ok, GET /ready returns ready with database connected",
           "Dedup NULLS NOT DISTINCT works: insert two items with same content_hash and workspace_id=NULL \u2192 second insert should dedup/fail (NULLs treated as equal, not distinct)",
           "Security-invoker views: active_memories and cca_ledger use WITH (security_invoker = true). Verify RLS applies through the view by querying as different tenants.",
-          "Composite FK on memory_embeddings: INSERT an embedding with mismatched tenant_id (different from memory_items.tenant_id) \u2192 should fail with FK violation"
+          "Composite FK on memory_embeddings: INSERT an embedding with mismatched tenant_id (different from memory_items.tenant_id) \u2192 should fail with FK violation",
+          "CI workflow exists (.github/workflows/ci.yml) with ruff + mypy --strict + pytest + compose-validate jobs",
+          "AGENTS.md exists with project conventions for coding agents",
+          "Lint baseline is green: ruff check . passes, mypy --strict passes, pytest passes (skeleton stubs annotated with response_model=None + NoReturn)"
         ],
         "context_notes": "The db.py get_session dependency must set app.tenant_id and app.principal_id via SET LOCAL at the start of each session, based on the authenticated principal. For Phase 1A with auth disabled, it should set the default tenant/admin. The pgvector/pgvector:pg16 Docker image includes pgvector but verify the version \u2014 iterative_scan requires 0.8+. The RLS policies reference current_setting('app.tenant_id', true) \u2014 test that this works correctly with SET LOCAL. The active_memories and cca_ledger views use WITH (security_invoker = true) \u2014 test that RLS policies apply through them, not just on base tables. The composite FK on memory_embeddings (memory_item_id, tenant_id) \u2192 memory_items(id, tenant_id) means an embedding with a mismatched tenant_id will be rejected at the DB level."
       },
@@ -150,7 +155,7 @@
           "T02"
         ],
         "branch": "feat/remember-write-path",
-        "description": "Implement the remember endpoint with the full trust model: content canonicalization, dedup via unique index, review_status assignment based on source_type, source_trust defaults, sensitivity check (secret denylist), and embedding generation (deferred to T05). This is the most important endpoint \u2014 it's where the trust model lives.",
+        "description": "Implement the remember endpoint with the full trust model: content canonicalization, dedup via unique index, review_status assignment based on source_type, source_trust defaults, sensitivity check (wire existing engram/safety.py secret denylist into the write path), and embedding generation (deferred to T05). This is the most important endpoint \u2014 it's where the trust model lives. NOTE: engram/safety.py already exists with the secret-pattern denylist implemented \u2014 wire it in, don't recreate it.",
         "files_to_touch": [
           "engram/api/routes/memory.py",
           "engram/embeddings.py",
@@ -713,6 +718,12 @@
       "T16",
       "T17"
     ],
-    "critical_path_note": "T01\u2192T02\u2192T03 is the serial bottleneck. After T03, work fans out. T04 (recall) and T08 (classification) are both on the critical path because the SDK (T16) depends on both. T16\u2192T17 is the integration path. T18 (engram-hooks) can proceed in parallel with T17 once T16+T08 land."
+    "critical_path_note": "T01\u2192T02\u2192T03 is the serial bottleneck. After T03, work fans out. T04 (recall) and T08 (classification) are both on the critical path because the SDK (T16) depends on both. T16\u2192T17 is the integration path. T18 (engram-hooks) can proceed in parallel with T17 once T16+T08 land.",
+    "dispatch_state": {
+      "repo_dispatch_ready": true,
+      "ci_gates": ["ruff check .", "mypy engram/", "pytest -q", "docker compose config -q"],
+      "next_dispatchable": ["T01"],
+      "notes": "T01 is the only task with no dependencies and is fully dispatch-ready. All 19 tasks have branch names, acceptance criteria, and context notes. After T01 lands, T02 unblocks; after T02, T03 unblocks; after T03 the graph fans out to T04/T05/T06/T08/T12/T13/T14. The serial bottleneck is T01\u2192T02\u2192T03. Repo has CI, AGENTS.md, green lint baseline."
+    }
   }
 }

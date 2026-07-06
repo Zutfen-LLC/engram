@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from engram.config import settings
-
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Startup: could warm connection pool, check DB readiness
     yield
     # Shutdown: clean up resources
@@ -24,7 +23,7 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    from engram.api.routes import memory, classify, review, kg, taxonomy, diary, export, health
+    from engram.api.routes import classify, diary, export, health, kg, memory, review, taxonomy
 
     app.include_router(health.router, tags=["health"])
     app.include_router(memory.router, prefix="/v1", tags=["memory"])

@@ -5,7 +5,7 @@ This is a skeleton — implementation in Phase 1 PR 4-5.
 
 from __future__ import annotations
 
-from datetime import datetime
+from typing import Any, NoReturn
 from uuid import UUID
 
 from fastapi import APIRouter
@@ -26,7 +26,7 @@ class RememberRequest(BaseModel):
     visibility: str = "workspace"
     source_type: str = "manual"
     source_session: str | None = None
-    metadata: dict = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class RememberResponse(BaseModel):
@@ -49,7 +49,7 @@ class RecallResponse(BaseModel):
     item_count: int
     byte_count: int
     omitted_count: int
-    items: list[dict] = Field(default_factory=list)
+    items: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class SearchRequest(BaseModel):
@@ -62,35 +62,35 @@ class SearchRequest(BaseModel):
 
 
 class SearchResponse(BaseModel):
-    results: list[dict]
+    results: list[dict[str, Any]]
     total: int
 
 
 # ---- Endpoints (stubs) ----
 
 
-@router.post("/remember", response_model=RememberResponse)
-async def remember(req: RememberRequest):
+@router.post("/remember", response_model=None)
+async def remember(req: RememberRequest) -> NoReturn:
     """Write a memory item with dedup and supersession."""
     # TODO: implement canonicalization, dedup, supersession, embedding
     raise NotImplementedError("remember not yet implemented")
 
 
-@router.post("/recall", response_model=RecallResponse)
-async def recall(req: RecallRequest):
+@router.post("/recall", response_model=None)
+async def recall(req: RecallRequest) -> NoReturn:
     """Bounded recall: deterministic startup set or semantic query."""
     # TODO: implement startup/semantic recall with budget enforcement
     raise NotImplementedError("recall not yet implemented")
 
 
-@router.post("/search", response_model=SearchResponse)
-async def search(req: SearchRequest):
+@router.post("/search", response_model=None)
+async def search(req: SearchRequest) -> NoReturn:
     """Keyword, semantic, or hybrid search."""
     # TODO: implement keyword (ILIKE), semantic (pgvector), hybrid search
     raise NotImplementedError("search not yet implemented")
 
 
-@router.get("/items")
+@router.get("/items", response_model=None)
 async def list_items(
     workspace: str | None = None,
     kind: str | None = None,
@@ -99,32 +99,32 @@ async def list_items(
     active_only: bool = True,
     limit: int = 50,
     offset: int = 0,
-):
+) -> NoReturn:
     """List items with filters."""
     # TODO: implement filtered query
     raise NotImplementedError("list_items not yet implemented")
 
 
-@router.get("/items/{item_id}")
-async def get_item(item_id: UUID):
+@router.get("/items/{item_id}", response_model=None)
+async def get_item(item_id: UUID) -> NoReturn:
     """Full detail with provenance and linked KG facts."""
     # TODO: implement detail query
     raise NotImplementedError("get_item not yet implemented")
 
 
-@router.patch("/items/{item_id}")
-async def update_item_metadata(item_id: UUID):
+@router.patch("/items/{item_id}", response_model=None)
+async def update_item_metadata(item_id: UUID) -> NoReturn:
     """Update metadata (wing, room, visibility) — not content."""
     raise NotImplementedError("update_item not yet implemented")
 
 
-@router.post("/items/{item_id}/supersede")
-async def supersede_item(item_id: UUID):
+@router.post("/items/{item_id}/supersede", response_model=None)
+async def supersede_item(item_id: UUID) -> NoReturn:
     """Mark superseded + write replacement."""
     raise NotImplementedError("supersede_item not yet implemented")
 
 
-@router.post("/items/{item_id}/invalidate")
-async def invalidate_item(item_id: UUID):
+@router.post("/items/{item_id}/invalidate", response_model=None)
+async def invalidate_item(item_id: UUID) -> NoReturn:
     """Mark invalid (set valid_to)."""
     raise NotImplementedError("invalidate_item not yet implemented")

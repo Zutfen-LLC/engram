@@ -6,6 +6,8 @@ Skeleton — implementation in Phase 1.
 
 from __future__ import annotations
 
+from typing import NoReturn
+
 from fastapi import APIRouter
 from pydantic import BaseModel
 
@@ -18,13 +20,13 @@ class DiaryWrite(BaseModel):
     topic: str | None = None
 
 
-@router.post("/diary")
-async def write_diary(req: DiaryWrite):
+@router.post("/diary", response_model=None)
+async def write_diary(req: DiaryWrite) -> NoReturn:
     """Write a diary entry."""
     raise NotImplementedError
 
 
-@router.get("/diary/{principal}")
-async def read_diary(principal: str, limit: int = 10):
+@router.get("/diary/{principal}", response_model=None)
+async def read_diary(principal: str, limit: int = 10) -> NoReturn:
     """Read diary entries for a principal."""
     raise NotImplementedError

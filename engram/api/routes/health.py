@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,21 +13,21 @@ router = APIRouter()
 
 
 @router.get("/health")
-async def health():
+async def health() -> dict[str, str]:
     """Liveness probe."""
     return {"status": "ok"}
 
 
-@router.get("/ready")
-async def readiness(session: AsyncSession = Depends(get_session)):
+@router.get("/ready", response_model=None)
+async def readiness(
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> dict[str, str] | JSONResponse:
     """Readiness probe — checks DB connectivity."""
     try:
         result = await session.execute(text("SELECT 1"))
         result.scalar()
         return {"status": "ready", "database": "connected"}
     except Exception as e:
-        from fastapi.responses import JSONResponse
-
         return JSONResponse(
             status_code=503,
             content={"status": "not_ready", "database": str(e)},

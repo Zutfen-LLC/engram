@@ -5,6 +5,8 @@ Skeleton — implementation in Phase 1 PR 5+.
 
 from __future__ import annotations
 
+from typing import NoReturn
+
 from fastapi import APIRouter
 from pydantic import BaseModel
 
@@ -19,19 +21,19 @@ class TunnelCreate(BaseModel):
     label: str | None = None
 
 
-@router.get("/taxonomy")
-async def get_taxonomy():
+@router.get("/taxonomy", response_model=None)
+async def get_taxonomy() -> NoReturn:
     """Wing → room → item count hierarchy."""
     raise NotImplementedError
 
 
-@router.get("/tunnels")
-async def list_tunnels(wing: str | None = None):
+@router.get("/tunnels", response_model=None)
+async def list_tunnels(wing: str | None = None) -> NoReturn:
     """List cross-wing links."""
     raise NotImplementedError
 
 
-@router.post("/tunnels")
-async def create_tunnel(req: TunnelCreate):
+@router.post("/tunnels", response_model=None)
+async def create_tunnel(req: TunnelCreate) -> NoReturn:
     """Create a tunnel."""
     raise NotImplementedError

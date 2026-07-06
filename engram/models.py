@@ -11,11 +11,9 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     ForeignKeyConstraint,
-    Index,
     Integer,
     String,
     Text,
-    func,
     text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, UUID
@@ -324,7 +322,10 @@ class RecallLog(Base):
 
 
 class TenantConfig(Base):
-    """Tenant-configurable trust defaults, scoring weights, and recall policy. Versioned for audit."""
+    """Tenant-configurable trust defaults, scoring weights, and recall policy.
+
+    Versioned for audit reproducibility — recall_logs records config_version.
+    """
 
     __tablename__ = "tenant_config"
 

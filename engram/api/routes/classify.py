@@ -5,6 +5,8 @@ Skeleton — implementation in Phase 1 PR (T18).
 
 from __future__ import annotations
 
+from typing import NoReturn
+
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
@@ -37,8 +39,8 @@ class RuleCreate(BaseModel):
     priority: int = 100
 
 
-@router.post("/classify", response_model=ClassifyResponse)
-async def classify(req: ClassifyRequest):
+@router.post("/classify", response_model=None)
+async def classify(req: ClassifyRequest) -> NoReturn:
     """Classify raw text: suggest kind, wing, room, visibility.
 
     Uses LLM if configured, otherwise falls back to tenant's rule-based classification.
@@ -47,19 +49,19 @@ async def classify(req: ClassifyRequest):
     raise NotImplementedError("classify not yet implemented")
 
 
-@router.get("/classification/rules")
-async def list_rules():
+@router.get("/classification/rules", response_model=None)
+async def list_rules() -> NoReturn:
     """List tenant's classification rules."""
     raise NotImplementedError
 
 
-@router.post("/classification/rules")
-async def create_rule(req: RuleCreate):
+@router.post("/classification/rules", response_model=None)
+async def create_rule(req: RuleCreate) -> NoReturn:
     """Create or update a classification rule."""
     raise NotImplementedError
 
 
-@router.delete("/classification/rules/{rule_id}")
-async def delete_rule(rule_id: str):
+@router.delete("/classification/rules/{rule_id}", response_model=None)
+async def delete_rule(rule_id: str) -> NoReturn:
     """Delete a classification rule."""
     raise NotImplementedError

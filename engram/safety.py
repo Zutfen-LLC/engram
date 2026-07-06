@@ -6,6 +6,7 @@ Skeleton — implementation in Phase 1A (T03).
 from __future__ import annotations
 
 import re
+from typing import Any
 
 # Common secret patterns — content matching these should be blocked.
 SECRET_PATTERNS = [
@@ -26,7 +27,7 @@ SECRET_PATTERNS = [
 ]
 
 
-def detect_secrets(content: str) -> list[dict]:
+def detect_secrets(content: str) -> list[dict[str, Any]]:
     """Check content for secret patterns.
 
     Returns list of matches: [{pattern_name, match_start, match_end}].
