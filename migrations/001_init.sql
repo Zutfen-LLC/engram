@@ -175,6 +175,7 @@ CREATE TABLE memory_items (
 CREATE TABLE memory_embeddings (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     memory_item_id  UUID NOT NULL REFERENCES memory_items(id) ON DELETE CASCADE,
+    tenant_id       UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,  -- denormalized for RLS + pre-join filter
     embedding_model TEXT NOT NULL,           -- e.g. 'text-embedding-3-small'
     embedding_dim   INTEGER NOT NULL,        -- dimension count
     embedding       vector(1536),            -- current default; column type fixed at 1536
@@ -267,7 +268,7 @@ CREATE TABLE tenant_config (
     weight_recency              REAL NOT NULL DEFAULT 0.15,
     weight_verified             REAL NOT NULL DEFAULT 0.10,
     -- Auto-promotion
-    auto_promote_enabled        BOOLEAN NOT NULL DEFAULT FALSE,
+    auto_promote_enabled        BOOLEAN NOT NULL DEFAULT TRUE,
     auto_promote_confidence_threshold REAL NOT NULL DEFAULT 0.7,
     auto_promote_min_age_hours  INTEGER NOT NULL DEFAULT 72,
     -- Recall limits
@@ -429,10 +430,13 @@ ALTER TABLE deletion_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE workspaces ENABLE ROW LEVEL SECURITY;
 ALTER TABLE principals ENABLE ROW LEVEL SECURITY;
 
--- NOTE: memory_embeddings is NOT RLS-protected because it has no tenant_id.
--- All embedding queries MUST join through memory_items (which IS RLS-protected).
--- Direct tenant access to memory_embeddings is never exposed via the API.
--- This is a service-internal table.
+-- memory_embeddings has denormalized tenant_id so RLS can apply directly.
+-- This enables tenant filtering BEFORE the join to memory_items, which is
+-- critical for HNSW query performance with iterative_scan.
+ALTER TABLE memory_embeddings ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation_embeddings ON memory_embeddings
+    USING (tenant_id::text = current_setting('app.tenant_id', true));
 
 CREATE POLICY tenant_isolation_memitems ON memory_items
     USING (tenant_id::text = current_setting('app.tenant_id', true));

@@ -6,7 +6,7 @@
     "description": "Engram \u2014 trustable institutional memory for multi-agent AI teams. Postgres+pgvector service, FastAPI, multi-tenant, with review states, provenance, conflict detection, and scoped recall.",
     "design_doc": "docs/design.md",
     "design_version": "v2 (trust model revision, 2026-07-06)",
-    "current_state": "v0.1.0 skeleton with v2 schema (trust fields, review states, RLS, FTS, separate embeddings table, item_events audit). Migration SQL, ORM models, FastAPI app factory, route stubs (NotImplementedError), Docker Compose, test scaffolding exist. No endpoint is functional yet.",
+    "current_state": "v0.1.0 skeleton with v2.1 schema (auto-promotion on by default, embeddings have denormalized tenant_id for RLS, penalty floor + quorum reset, write-path cost escape valve). 14 tables, all RLS-protected. Migration SQL, ORM models, FastAPI app factory, route stubs, Docker Compose exist. No endpoint is functional yet.",
     "conventions": {
       "branch_prefix": "feat/",
       "python": ">=3.11",
@@ -103,7 +103,7 @@
           "docker compose up -d succeeds without errors",
           "All 14 tables exist: tenants, workspaces, principals, workspace_members, memory_items, memory_embeddings, kg_triples, tunnels, item_events, classification_rules, api_keys, recall_logs, deletion_events, tenant_config",
           "CHECK constraints are active (try inserting invalid kind/visibility/review_status and confirm rejection)",
-          "RLS enabled on all tenant-scoped tables: memory_items, kg_triples, tunnels, item_events, classification_rules, recall_logs, workspace_members, api_keys, tenant_config, deletion_events, workspaces, principals. memory_embeddings has NO RLS (service-internal, no tenant_id \u2014 all queries must join through memory_items).",
+          "RLS enabled on all tenant-scoped tables including memory_embeddings (denormalized tenant_id for pre-join filtering): memory_items, memory_embeddings, kg_triples, tunnels, item_events, classification_rules, recall_logs, workspace_members, api_keys, tenant_config, deletion_events, workspaces, principals.",
           "FTS generated column works: INSERT a memory_item, verify content_tsv is auto-populated (no trigger needed \u2014 it's a GENERATED ALWAYS AS column)",
           "pgvector extension is active with version >= 0.8 (check SELECT extversion FROM pg_extension WHERE extname='vector')",
           "Seed data exists: default tenant, general workspace, admin principal, workspace membership, 6 classification rules",

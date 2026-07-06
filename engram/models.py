@@ -182,6 +182,9 @@ class MemoryEmbedding(Base):
     memory_item_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("memory_items.id", ondelete="CASCADE"), nullable=False
     )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
     embedding_model: Mapped[str] = mapped_column(Text, nullable=False)
     embedding_dim: Mapped[int] = mapped_column(Integer, nullable=False)
     embedding: Mapped[list[float] | None] = mapped_column(

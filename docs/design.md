@@ -1,6 +1,6 @@
 # Engram — Design Document
 
-**Status:** Locked (v2, 2026-07-06 — trust model revision)
+**Status:** Locked (v2.1, 2026-07-06 — spec hygiene + edge cases)
 **Product:** Trustable institutional memory for multi-agent AI teams
 
 ---
@@ -83,12 +83,14 @@ Agents can freely write `proposed` memories. Only `active` memories enter the de
 
 Without auto-promotion, the proposed queue grows unboundedly while the working set stays frozen — agents write all day but their knowledge never reaches recall. Auto-promotion makes human review exception handling, not the pipeline.
 
-**Auto-promotion conditions** (all must be met, tenant-configurable, off by default):
+**Auto-promotion conditions** (all must be met, tenant-configurable, **on by default** with conservative thresholds):
 - `review_status = 'proposed'`
 - `memory_confidence >= auto_promote_confidence_threshold` (default 0.7)
-- No unresolved conflicts (`conflict_resolution_status IS NULL OR = 'accepted'`)
+- No unresolved conflicts (`conflict_resolution_status IS NULL OR = 'accepted'`). In Phase 1A (before conflict detection exists), this is vacuously true — all proposed items are eligible for promotion.
 - Age >= `auto_promote_min_age_hours` (default 72 hours unchallenged)
-- No `disputed` flag from another principal
+- No dispute event in `item_events` from another principal
+
+Rationale for on-by-default: without auto-promotion, the proposed queue grows unboundedly while the working set stays frozen. The conservative thresholds (0.7 confidence, 72h age) prevent premature promotion. High-governance tenants can opt out via tenant_config.
 
 A background job (or lazy check on recall) promotes eligible items to `active`. The promotion is logged in `item_events`.
 
@@ -148,11 +150,18 @@ Where:
 
 **Anti-feedback-loop guardrail:** `recency_bonus` rewards recent recall for semantic continuity, but a `repeated_startup_penalty` applies when an item has been recalled in startup mode N times (default 5) without positive feedback via `POST /v1/feedback`. The penalty reduces the recency component by 0.5× per excess recall, preventing the same memories from permanently dominating startup recall.
 
+**Penalty safeguards** (prevent over-punishment in autonomous fleets where humans rarely review):
+- **Floor:** The penalty cannot reduce the recency component below 0.1 (an invariant recalled 500 times should never score below a random observation).
+- **Multi-agent quorum:** Feedback from 2+ distinct non-author agents counts as a partial penalty reset (0.5× weight), not just user/admin feedback. This prevents penalty accumulation on load-bearing memories in fleets where humans review rarely.
+- **Pinned exemption:** Pinned items bypass scoring entirely, so the penalty counter does not apply to them.
+
 **Feedback authority weighting:** To prevent agents from self-entrenching their own memories, feedback is weighted by principal authority:
 - `user` feedback: full weight (resets penalty counter, adjusts importance)
 - `agent` feedback on own memories: zero weight on penalty reset (an agent marking its own recalled items "useful" does NOT reset the penalty)
-- `agent` feedback on another agent's memories: partial weight (0.5×) on importance, does not reset penalty
-- Only `user` or `admin` feedback resets the `startup_recall_count` penalty counter
+- `agent` feedback on another agent's memories: partial weight (0.5×) on importance. 2+ distinct non-author agents together count as a partial reset (quorum, see above).
+- Only `user` or `admin` feedback fully resets the `startup_recall_count` penalty counter
+
+**Write-path cost escape valve:** If the trust machinery's per-`remember` cost (dedup check + classification + conflict similarity check) proves too expensive for chatty sources like `sync_turn`, a fast-path exists: low-trust proposed writes (source_trust < 0.5) defer the conflict similarity check to promotion time instead of write time. This is a tenant-configurable flag (`conflict_check_on_write`, default true). This is a planned option, not a Phase 1A deliverable.
 
 ---
 
@@ -229,9 +238,9 @@ See `migrations/001_init.sql` for the canonical DDL. Key design decisions:
 
 - **Check constraints** on all enum-like fields (kind, visibility, review_status, source_type, sensitivity, conflict_type) to prevent taxonomy drift.
 - **Full-text search** via `content_tsv TSVECTOR GENERATED ALWAYS AS (to_tsvector('english', coalesce(content, ''))) STORED` + GIN index. A generated column is used instead of a trigger — it's simpler, cannot drift, and requires no plpgsql function. Essential for keyword search on IDs, paths, names.
-- **Separate embeddings table** keyed by `(memory_item_id, embedding_model)`. A model change is new rows, not a migration. Old vectors remain queryable during re-embedding.
+- **Separate embeddings table** keyed by `(memory_item_id, embedding_model)` with denormalized `tenant_id` for RLS. A model change is new rows, not a migration. Old vectors remain queryable during re-embedding. The denormalized tenant_id enables RLS policy enforcement directly on the embeddings table, allowing tenant filtering BEFORE the join to memory_items — critical for HNSW + iterative_scan performance.
 - **Unique dedup index** on `(tenant_id, workspace_id, principal_id, content_hash) WHERE valid_to IS NULL AND review_status != 'rejected'` with `NULLS NOT DISTINCT` (Postgres 15+). Makes remember idempotent for retries within scope, including tenant-level memories with NULL workspace_id.
-- **Row Level Security** on all tenant-scoped tables. Application uses `SET LOCAL` inside each transaction (pool-safe for PgBouncer); Postgres enforces isolation even when application code is wrong. RLS is enabled on: memory_items, kg_triples, tunnels, item_events, classification_rules, recall_logs, workspace_members, api_keys, tenant_config, deletion_events, workspaces, principals. `memory_embeddings` is NOT RLS-protected (no tenant_id column) — it is service-internal and all embedding queries must join through memory_items, which IS RLS-protected. Direct tenant access to memory_embeddings is never exposed via the API.
+- **Row Level Security** on all tenant-scoped tables. Application uses `SET LOCAL` inside each transaction (pool-safe for PgBouncer); Postgres enforces isolation even when application code is wrong. RLS is enabled on: memory_items, memory_embeddings (denormalized tenant_id), kg_triples, tunnels, item_events, classification_rules, recall_logs, workspace_members, api_keys, tenant_config, deletion_events, workspaces, principals. Semantic search queries filter on embeddings.tenant_id BEFORE joining to memory_items, which is the query to load-test first.
 - **HNSW with iterative_scan** — requires pgvector 0.8+. Set `hnsw.iterative_scan = strict` at query time to handle filtered (tenant-scoped) queries without recall degradation.
 
 ### KG visibility
@@ -387,7 +396,7 @@ Conflicts surface in `GET /v1/review/conflicts`. Resolution via `POST /v1/items/
 - **Sensitivity field** on every memory item: `normal`, `sensitive`, `restricted`.
 - **Secret-pattern denylist**: pre-write check blocks content matching common secret patterns (API keys, tokens, passwords).
 - **PII-risk classification**: optional LLM check flags content likely containing PII.
-- **Hard-delete support**: `DELETE /v1/items/{id}` physically removes the item. Because `item_events` has a FK to `memory_items`, physical deletion would break the audit trail. Instead, a `deletion_events` table captures tombstone metadata (deleted_item_id, content_hash, deleted_by, reason, deleted_at) WITHOUT storing the deleted content. This proves deletion occurred for GDPR compliance without orphaning FK references. **Cascade behavior:** Hard-deleting an item that is `source_item_id` for KG triples cascades: those triples are invalidated (`valid_to = now()`) or deleted, and recorded in the tombstone. Hard-deleting an item in a `superseded_by` chain nullifies the FK (`ON DELETE SET NULL` is the column constraint), so supersession chains don't break — the chain simply loses the deleted node.
+- **Hard-delete support**: `DELETE /v1/items/{id}` physically removes the item. Because `item_events` has a FK to `memory_items`, physical deletion would break the audit trail. Instead, a `deletion_events` table captures tombstone metadata (deleted_item_id, content_hash, deleted_by, reason, deleted_at) WITHOUT storing the deleted content. This proves deletion occurred for GDPR compliance without orphaning FK references. **Cascade behavior:** Hard-deleting an item that is `source_item_id` for KG triples cascades: those triples are invalidated (`valid_to = now()`) or deleted, and recorded in the tombstone. Hard-deleting an item in a `superseded_by` chain nullifies the FK (`ON DELETE SET NULL` is the column constraint), so supersession chains don't break — the chain simply loses the deleted node. Note: this means a predecessor whose successor was hard-deleted changes from "superseded" to "invalidated" in derived lifecycle queries (its `valid_to` is still set, so it does not resurrect). The tombstone preserves the original audit trail.
 - **Read audit**: sensitive reads are logged to recall_logs.
 
 ---

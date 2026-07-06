@@ -40,9 +40,14 @@ class Settings(BaseSettings):
     recall_byte_budget: int = 4096
     recall_item_budget: int = 50
     max_pinned_tokens: int = 2048             # hard ceiling for pinned items in startup recall
-    stale_after_days: int = 90                # items not recalled in N days are "stale"
+    stale_after_days: int = 90                # items not verified in N days are "stale"
     startup_recall_penalty_threshold: int = 5  # penalize after N startup recalls without feedback
     startup_recall_penalty_factor: float = 0.5  # reduce recency bonus by this per excess recall
+    startup_recall_penalty_floor: float = 0.1   # recency component minimum (never zero)
+    quorum_reset_agent_count: int = 2           # N distinct non-author agents for partial penalty reset
+
+    # Write-path cost control
+    conflict_check_on_write: bool = True       # if False, low-trust writes defer conflict check to promotion
 
 
 settings = Settings()
