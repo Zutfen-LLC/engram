@@ -93,11 +93,12 @@ CREATE TABLE memory_items (
 
     -- Recall ranking
     importance      REAL DEFAULT 0.5,        -- 0.0-1.0, affects recall ordering
-    pinned          BOOLEAN DEFAULT FALSE,   -- always included in startup recall if active
+    pinned          BOOLEAN DEFAULT FALSE,   -- bypass: included first in startup recall
     last_recalled_at TIMESTAMPTZ,
     recall_count    INTEGER DEFAULT 0,
     last_confirmed_at TIMESTAMPTZ,            -- last time marked useful via /v1/feedback
     startup_recall_count INTEGER DEFAULT 0,  -- times recalled in startup mode (for anti-feedback penalty)
+    last_verified_at TIMESTAMPTZ,             -- last time human-verified or conflict-resolved (staleness anchor)
 
     -- Provenance (expanded)
     source_type     TEXT NOT NULL DEFAULT 'manual',
@@ -251,6 +252,42 @@ CREATE TABLE classification_rules (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- ============ Tenant trust/recall config (versioned) ============
+-- Stores tenant-configurable trust defaults, scoring weights, and recall policy.
+-- Versioned for audit reproducibility — recall_logs references config_version.
+
+CREATE TABLE tenant_config (
+    id                          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id                   UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    config_version              TEXT NOT NULL DEFAULT 'v1',
+    -- Scoring weights (must sum to 1.0 for the non-bypass components)
+    weight_importance           REAL NOT NULL DEFAULT 0.30,
+    weight_source_trust         REAL NOT NULL DEFAULT 0.25,
+    weight_memory_confidence    REAL NOT NULL DEFAULT 0.20,
+    weight_recency              REAL NOT NULL DEFAULT 0.15,
+    weight_verified             REAL NOT NULL DEFAULT 0.10,
+    -- Auto-promotion
+    auto_promote_enabled        BOOLEAN NOT NULL DEFAULT FALSE,
+    auto_promote_confidence_threshold REAL NOT NULL DEFAULT 0.7,
+    auto_promote_min_age_hours  INTEGER NOT NULL DEFAULT 72,
+    -- Recall limits
+    max_pinned_tokens           INTEGER NOT NULL DEFAULT 2048,
+    stale_after_days            INTEGER NOT NULL DEFAULT 90,
+    startup_recall_penalty_threshold INTEGER NOT NULL DEFAULT 5,
+    startup_recall_penalty_factor    REAL NOT NULL DEFAULT 0.5,
+    -- Source trust defaults (overridable per tenant)
+    trust_manual_user           REAL NOT NULL DEFAULT 0.9,
+    trust_manual_agent          REAL NOT NULL DEFAULT 0.6,
+    trust_import                REAL NOT NULL DEFAULT 0.8,
+    trust_extraction            REAL NOT NULL DEFAULT 0.5,
+    trust_sync_turn             REAL NOT NULL DEFAULT 0.4,
+    trust_pre_compress          REAL NOT NULL DEFAULT 0.3,
+    active                      BOOLEAN NOT NULL DEFAULT TRUE,  -- only one active config per tenant
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX idx_tenant_config_active ON tenant_config(tenant_id) WHERE active = TRUE;
+
 -- ============ Auth ============
 
 CREATE TABLE api_keys (
@@ -275,6 +312,8 @@ CREATE TABLE recall_logs (
     item_ids        UUID[],
     byte_budget     INTEGER,
     token_budget    INTEGER,
+    scoring_version TEXT NOT NULL DEFAULT 'v1',  -- formula version for audit reproducibility
+    config_version  TEXT NOT NULL DEFAULT 'v1',  -- tenant config version at recall time
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -447,4 +486,10 @@ FROM tenants t, (VALUES
     ('kind_observation',      'keyword_kind', 'observed|noticed|error|failed|warning',           'observation', 60)
 ) AS r(name, rule_type, pattern, target_kind, priority)
 WHERE t.slug = 'default'
+ON CONFLICT DO NOTHING;
+
+-- ============ Seed: default tenant config ============
+
+INSERT INTO tenant_config (tenant_id, config_version, active)
+SELECT id, 'v1', TRUE FROM tenants WHERE slug = 'default'
 ON CONFLICT DO NOTHING;

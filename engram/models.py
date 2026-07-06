@@ -133,6 +133,7 @@ class MemoryItem(Base):
     recall_count: Mapped[int] = mapped_column(Integer, default=0)
     last_confirmed_at: Mapped[datetime | None] = mapped_column(nullable=True)
     startup_recall_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_verified_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
     # Provenance (expanded)
     source_type: Mapped[str] = mapped_column(String(50), default="manual")
@@ -293,6 +294,8 @@ class ApiKey(Base):
 
 
 class RecallLog(Base):
+    """Audit record of recall operations."""
+
     __tablename__ = "recall_logs"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -307,4 +310,47 @@ class RecallLog(Base):
     item_ids: Mapped[list[str] | None] = mapped_column(ARRAY(Text), nullable=True)
     byte_budget: Mapped[int | None] = mapped_column(nullable=True)
     token_budget: Mapped[int | None] = mapped_column(nullable=True)
+    scoring_version: Mapped[str] = mapped_column(String(20), default="v1")
+    config_version: Mapped[str] = mapped_column(String(20), default="v1")
+    created_at: Mapped[datetime] = mapped_column(server_default=text("now()"), nullable=False)
+
+
+class TenantConfig(Base):
+    """Tenant-configurable trust defaults, scoring weights, and recall policy. Versioned for audit."""
+
+    __tablename__ = "tenant_config"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    config_version: Mapped[str] = mapped_column(String(50), default="v1")
+
+    # Scoring weights
+    weight_importance: Mapped[float] = mapped_column(Float, default=0.30)
+    weight_source_trust: Mapped[float] = mapped_column(Float, default=0.25)
+    weight_memory_confidence: Mapped[float] = mapped_column(Float, default=0.20)
+    weight_recency: Mapped[float] = mapped_column(Float, default=0.15)
+    weight_verified: Mapped[float] = mapped_column(Float, default=0.10)
+
+    # Auto-promotion
+    auto_promote_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    auto_promote_confidence_threshold: Mapped[float] = mapped_column(Float, default=0.7)
+    auto_promote_min_age_hours: Mapped[int] = mapped_column(Integer, default=72)
+
+    # Recall limits
+    max_pinned_tokens: Mapped[int] = mapped_column(Integer, default=2048)
+    stale_after_days: Mapped[int] = mapped_column(Integer, default=90)
+    startup_recall_penalty_threshold: Mapped[int] = mapped_column(Integer, default=5)
+    startup_recall_penalty_factor: Mapped[float] = mapped_column(Float, default=0.5)
+
+    # Source trust defaults
+    trust_manual_user: Mapped[float] = mapped_column(Float, default=0.9)
+    trust_manual_agent: Mapped[float] = mapped_column(Float, default=0.6)
+    trust_import: Mapped[float] = mapped_column(Float, default=0.8)
+    trust_extraction: Mapped[float] = mapped_column(Float, default=0.5)
+    trust_sync_turn: Mapped[float] = mapped_column(Float, default=0.4)
+    trust_pre_compress: Mapped[float] = mapped_column(Float, default=0.3)
+
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(server_default=text("now()"), nullable=False)

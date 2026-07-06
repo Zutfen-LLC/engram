@@ -63,21 +63,40 @@ observed → proposed → active → recalled → confirmed/stale → superseded
 | `observed` | **Event** | Recorded in item_events (event_type='observed') |
 | `recalled` | **Derived flag** | `last_recalled_at IS NOT NULL` |
 | `confirmed` | **Derived flag** | `human_verified = TRUE` |
-| `stale` | **Derived flag** | Computed: `last_recalled_at < now() - stale_after_interval` |
+| `stale` | **Derived flag** | Computed from `last_verified_at` (or `valid_from` if never verified): `COALESCE(last_verified_at, valid_from) < now() - stale_after_interval`. Measures whether a memory is unconfirmed, not whether it's unused. `last_recalled_at` feeds only the usage/decay side of recall scoring. NULL `last_recalled_at` does NOT exempt an item from staleness — a never-recalled item is still subject to the staleness check against `valid_from`. |
 | `invalidated` | **Derived flag** | `valid_to IS NOT NULL AND superseded_by IS NULL` |
 | `superseded` | **Derived flag** | `superseded_by IS NOT NULL` |
 
 This keeps the state machine simple (5 stored states) while the full lifecycle is reconstructable from columns + events.
 
-| State | Meaning | Enters startup recall? |
-|---|---|---|
-| `proposed` | Written by agent, not yet reviewed | No |
-| `active` | Reviewed and trusted | Yes |
-| `disputed` | Flagged as potentially wrong | No |
-| `rejected` | Reviewed and rejected (kept for audit) | No |
-| `archived` | Old/superseded, excluded from default recall | No |
+| State | Meaning | Enters startup recall? | Enters semantic recall? |
+|---|---|---|---|
+| `proposed` | Written by agent, not yet reviewed | No (auto-promotes per policy below) | Yes (tagged with warnings) |
+| `active` | Reviewed and trusted | Yes | Yes |
+| `disputed` | Flagged as potentially wrong | Conditional (see below) | Yes (tagged with warnings) |
+| `rejected` | Reviewed and rejected (kept for audit) | No | No |
+| `archived` | Old/superseded, excluded from default recall | No | No (unless explicitly requested) |
 
 Agents can freely write `proposed` memories. Only `active` memories enter the deterministic startup recall set. High-trust sources (explicit user instruction, verified imports) can write directly to `active`.
+
+### Auto-promotion policy
+
+Without auto-promotion, the proposed queue grows unboundedly while the working set stays frozen — agents write all day but their knowledge never reaches recall. Auto-promotion makes human review exception handling, not the pipeline.
+
+**Auto-promotion conditions** (all must be met, tenant-configurable, off by default):
+- `review_status = 'proposed'`
+- `memory_confidence >= auto_promote_confidence_threshold` (default 0.7)
+- No unresolved conflicts (`conflict_resolution_status IS NULL OR = 'accepted'`)
+- Age >= `auto_promote_min_age_hours` (default 72 hours unchallenged)
+- No `disputed` flag from another principal
+
+A background job (or lazy check on recall) promotes eligible items to `active`. The promotion is logged in `item_events`.
+
+**Disputed high-stakes items:** When a `doctrine` or `invariant` is disputed, it does NOT silently vanish from startup recall. Disputed items of kind `doctrine` or `invariant` stay in startup recall with `warnings: ['disputed — pending resolution']` until resolved. Disputed items of other kinds are excluded from startup recall (standard behavior). This prevents an agent's operating constraints from silently shrinking.
+
+### Semantic recall includes proposed
+
+Semantic recall (`mode=semantic`) returns both `active` and `proposed` items, but proposed items include `warnings: ['unreviewed']`. This allows agents to rediscover their own observations. `rejected` and `archived` items are never returned unless explicitly requested via a `include_archived` parameter.
 
 ---
 
@@ -114,22 +133,26 @@ Source trust is calculated from both `source_type` and the principal's type. Thi
 Startup recall uses a scoring formula to order items within the budget:
 
 ```
-score = (importance * 0.25)
-      + (source_trust * 0.20)
+score = (importance * 0.30)
+      + (source_trust * 0.25)
       + (memory_confidence * 0.20)
       + (recency_bonus * 0.15)
       + (human_verified_bonus * 0.10)
-      + (pinned_bonus * 0.10)
 ```
 
 Where:
 - `recency_bonus` = decay function based on `last_recalled_at` (recently recalled = relevant)
 - `human_verified_bonus` = 1.0 if verified, 0.0 otherwise
-- `pinned_bonus` = 1.0 if pinned, 0.0 otherwise
 
-**Pinned items ceiling:** Pinned active items are included first, but cannot exceed a configured hard ceiling (`max_pinned_bytes` or `max_pinned_tokens`, default 2048 tokens). If pinned items exceed the ceiling, they are ordered by importance × source_trust and the excess is dropped. The recall response includes `pinned_omitted_count` so the caller knows pinned memories were truncated. This preserves the bounded-recall guarantee even if someone pins too much.
+**Pinning is a pure bypass, not a score component.** Pinned items are not scored by the formula — they're inserted first, outside the scoring pipeline. The previous `pinned_bonus * 0.10` weight has been redistributed (importance +0.05, source_trust +0.05). The bypass mechanism: pinned active items are included first, capped at `max_pinned_tokens` (default 2048). Excess pinned items are ordered by importance × source_trust and dropped; `pinned_omitted_count` in the response tells the caller truncation occurred. After pinned items consume their budget, the scorer fills the remainder.
 
-**Anti-feedback-loop guardrail:** `recency_bonus` rewards recent recall for semantic continuity, but a `repeated_startup_penalty` applies when an item has been recalled in startup mode N times (default 5) without positive feedback via `POST /v1/feedback`. The penalty reduces the recency component by 0.5× per excess recall, preventing the same memories from permanently dominating startup recall. Positive feedback (marked useful) resets the penalty counter.
+**Anti-feedback-loop guardrail:** `recency_bonus` rewards recent recall for semantic continuity, but a `repeated_startup_penalty` applies when an item has been recalled in startup mode N times (default 5) without positive feedback via `POST /v1/feedback`. The penalty reduces the recency component by 0.5× per excess recall, preventing the same memories from permanently dominating startup recall.
+
+**Feedback authority weighting:** To prevent agents from self-entrenching their own memories, feedback is weighted by principal authority:
+- `user` feedback: full weight (resets penalty counter, adjusts importance)
+- `agent` feedback on own memories: zero weight on penalty reset (an agent marking its own recalled items "useful" does NOT reset the penalty)
+- `agent` feedback on another agent's memories: partial weight (0.5×) on importance, does not reset penalty
+- Only `user` or `admin` feedback resets the `startup_recall_count` penalty counter
 
 ---
 
@@ -183,7 +206,7 @@ Each memory item has:
 
 See `migrations/001_init.sql` for the canonical DDL. Key design decisions:
 
-### Tables (13 total)
+### Tables (14 total)
 
 | Table | Purpose |
 |---|---|
@@ -198,8 +221,9 @@ See `migrations/001_init.sql` for the canonical DDL. Key design decisions:
 | `item_events` | Audit trail for metadata mutations (content stays append-first) |
 | `classification_rules` | Tenant-configurable classification rules |
 | `api_keys` | Authentication credentials |
-| `recall_logs` | Recall audit with item_ids for feedback loops |
+| `recall_logs` | Recall audit with item_ids, scoring_version, config_version for feedback loops and reproducibility |
 | `deletion_events` | Tombstone records for hard-deleted items (GDPR/hosted) |
+| `tenant_config` | Versioned tenant-configurable trust defaults, scoring weights, recall policy |
 
 ### Key schema decisions
 
@@ -207,7 +231,7 @@ See `migrations/001_init.sql` for the canonical DDL. Key design decisions:
 - **Full-text search** via `content_tsv TSVECTOR` column with auto-update trigger + GIN index. Essential for keyword search on IDs, paths, names.
 - **Separate embeddings table** keyed by `(memory_item_id, embedding_model)`. A model change is new rows, not a migration. Old vectors remain queryable during re-embedding.
 - **Unique dedup index** on `(tenant_id, workspace_id, principal_id, content_hash) WHERE valid_to IS NULL AND review_status != 'rejected'`. Makes remember idempotent for retries.
-- **Row Level Security** on all tenant-scoped tables. Application sets `app.tenant_id` per session; Postgres enforces isolation even if application code is wrong.
+- **Row Level Security** on all tenant-scoped tables. Application sets `app.tenant_id` per session; Postgres enforces isolation even when application code is wrong. **IMPORTANT:** Use `SET LOCAL` inside each transaction, not `SET` per session. Under transaction-mode connection pooling (PgBouncer et al.), session-level GUCs leak across tenants sharing a pooled connection. `SET LOCAL` scopes the GUC to the current transaction, making it pool-safe.
 - **HNSW with iterative_scan** — requires pgvector 0.8+. Set `hnsw.iterative_scan = strict` at query time to handle filtered (tenant-scoped) queries without recall degradation.
 
 ### KG visibility
@@ -291,15 +315,17 @@ KG triples inherit visibility from their `source_item_id` at query time. A priva
 
 ### Startup recall
 
-Deterministic, bounded working set for session initialization.
+Bounded working set for session initialization. 
 
-**Eligibility:** `review_status = 'active' AND valid_to IS NULL`, filtered by caller's visibility scope.
+**Determinism contract:** Startup recall is "deterministic given state" — same corpus + same item states + same config version = same output. It is NOT "deterministic across time" because recall mutates state (last_recalled_at, recall_count) which feeds the scoring formula. For audit reproducibility, `recall_logs` records `scoring_version` and `config_version` so any past recall can be replayed.
+
+**Eligibility:** `review_status = 'active' AND valid_to IS NULL`, filtered by caller's visibility scope. (Disputed doctrine/invariant items are included with warnings per Section 3.)
 
 **Ordering:** Scored by the recall ranking formula (Section 4). Pinned items included first.
 
 **Budget:** Accepts `byte_budget` or `token_budget` (approximated as bytes/4). Default from config.
 
-**Output:** `working_set` (rendered text), `item_count`, `byte_count`, `omitted_count`, plus per-item `reasons` array explaining why each item was included.
+**Output:** `working_set` (rendered text), `item_count`, `byte_count`, `omitted_count`, `pinned_omitted_count`, `scoring_version`, `config_version`, plus per-item `reasons` array explaining why each item was included.
 
 ### Semantic recall
 
@@ -340,6 +366,16 @@ Auto-supersession on "refine" is **conditional**, not automatic:
 
 Authority hierarchy: `explicit_user > trusted_import > trusted_agent > untrusted_agent > inferred`. A lower-authority source can never silently replace a higher-authority memory.
 
+**1:N conflict limitation (v1):** `conflicts_with_item_id` is a single column, meaning an item can directly conflict with one other item. Three agents writing mutually contradictory versions can't be fully represented in v1 — only pairwise conflicts are tracked. A `memory_conflicts` join table is the eventual solution for multi-way conflicts; for 1B, the single-column approach covers the common case (new vs existing). Document this as a known v1 limitation.
+
+### Tenant-configurable trust constants
+
+All trust defaults and formula weights are tenant-configurable, not hardcoded:
+- Source trust defaults (the table above) are defaults overridable via tenant config
+- Scoring formula weights are versioned and stored in tenant config
+- `recall_logs` records `scoring_version` and `config_version` for full audit reproducibility — any past recall can be replayed with the config that produced it
+- This allows A/B testing different scoring policies and rolling forward/backward without losing auditability
+
 ### Resolution
 
 Conflicts surface in `GET /v1/review/conflicts`. Resolution via `POST /v1/items/{id}/resolve-conflict` sets the resolution status and optionally invalidates the loser.
@@ -351,7 +387,7 @@ Conflicts surface in `GET /v1/review/conflicts`. Resolution via `POST /v1/items/
 - **Sensitivity field** on every memory item: `normal`, `sensitive`, `restricted`.
 - **Secret-pattern denylist**: pre-write check blocks content matching common secret patterns (API keys, tokens, passwords).
 - **PII-risk classification**: optional LLM check flags content likely containing PII.
-- **Hard-delete support**: `DELETE /v1/items/{id}` physically removes the item. Because `item_events` has a FK to `memory_items`, physical deletion would break the audit trail. Instead, a `deletion_events` table captures tombstone metadata (deleted_item_id, content_hash, deleted_by, reason, deleted_at) WITHOUT storing the deleted content. This proves deletion occurred for GDPR compliance without orphaning FK references.
+- **Hard-delete support**: `DELETE /v1/items/{id}` physically removes the item. Because `item_events` has a FK to `memory_items`, physical deletion would break the audit trail. Instead, a `deletion_events` table captures tombstone metadata (deleted_item_id, content_hash, deleted_by, reason, deleted_at) WITHOUT storing the deleted content. This proves deletion occurred for GDPR compliance without orphaning FK references. **Cascade behavior:** Hard-deleting an item that is `source_item_id` for KG triples cascades: those triples are invalidated (`valid_to = now()`) or deleted, and recorded in the tombstone. Hard-deleting an item in a `superseded_by` chain nullifies the FK (`ON DELETE SET NULL` is the column constraint), so supersession chains don't break — the chain simply loses the deleted node.
 - **Read audit**: sensitive reads are logged to recall_logs.
 
 ---
