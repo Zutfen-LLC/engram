@@ -5,6 +5,7 @@ This is a skeleton — implementation in Phase 1 PR 4-5.
 
 from __future__ import annotations
 
+import json
 from typing import Any, Literal, NoReturn
 from uuid import UUID
 
@@ -15,10 +16,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.canonicalize import canonicalize, content_hash
+from engram.classification import ClassificationResult
+from engram.classification import classify as classify_memory
 from engram.config import settings
 from engram.db import get_session
 from engram.embeddings import create_embedding_placeholder, generate_embedding
-from engram.models import MemoryEmbedding, MemoryItem, Principal, TenantConfig, Workspace
+from engram.models import ItemEvent, MemoryEmbedding, MemoryItem, Principal, TenantConfig, Workspace
 from engram.safety import has_secrets
 
 router = APIRouter()
@@ -40,7 +43,7 @@ SensitivityKind = Literal["normal", "sensitive", "confidential"]
 
 class RememberRequest(BaseModel):
     content: str
-    kind: str = "fact"  # fact|preference|doctrine|decision|invariant|observation|diary_entry
+    kind: str | None = None  # fact|preference|doctrine|decision|invariant|observation|diary_entry
     wing: str | None = None
     room: str | None = None
     workspace: str | None = None
@@ -452,6 +455,18 @@ async def remember(
     principal_id, principal_type = await _resolve_principal(session, tenant_id)
     workspace_id = await _resolve_workspace_id(session, tenant_id, req.workspace)
 
+    kind = req.kind
+    wing = req.wing
+    room = req.room
+    classification_result: ClassificationResult | None = None
+    if kind is None:
+        classification_result = await classify_memory(req.content, tenant_id, session)
+        kind = classification_result.suggested_kind
+        if wing is None:
+            wing = classification_result.suggested_wing
+        if room is None:
+            room = classification_result.suggested_room
+
     # 4. Trust defaults from tenant_config.
     source_trust, memory_confidence, review_status = await _resolve_trust_defaults(
         session, tenant_id, req.source_type, principal_type
@@ -463,7 +478,7 @@ async def remember(
         tenant_id,
         workspace_id,
         principal_id,
-        req.kind,
+        kind,
         req.subject_type,
         req.subject_id,
     )
@@ -475,9 +490,9 @@ async def remember(
         principal_id=str(principal_id),
         content=req.content,
         content_hash=chash,
-        kind=req.kind,
-        wing=req.wing,
-        room=req.room,
+        kind=kind,
+        wing=wing,
+        room=room,
         subject_type=req.subject_type,
         subject_id=req.subject_id,
         subject_name=req.subject_name,
@@ -524,6 +539,37 @@ async def remember(
             memory_confidence=memory_confidence,
             deduped_existing_id=existing_id,
         )
+
+    provider = "caller" if classification_result is None else classification_result.provenance.get(
+        "provider", "rule"
+    )
+    provenance_payload: dict[str, Any] = {
+        "source": "explicit_kind" if classification_result is None else "auto_classified",
+        "kind": kind,
+        "wing": wing,
+        "room": room,
+        "provider": provider,
+    }
+    if classification_result is not None:
+        classification_dump = classification_result.model_dump(exclude={"provenance"})
+        provenance_payload["classification"] = classification_dump
+        provenance_payload["classification_provenance"] = classification_result.provenance
+        provenance_payload["reason"] = classification_result.reason
+    if classification_result is None:
+        reason = "explicit kind override"
+    else:
+        reason = classification_result.reason
+    session.add(
+        ItemEvent(
+            item_id=item.id,
+            event_type="classification",
+            field_name="kind",
+            old_value=None,
+            new_value=json.dumps(provenance_payload, sort_keys=True),
+            actor_principal_id=principal_id,
+            reason=reason,
+        )
+    )
 
     # 8. If supersession applies, mark the old item.
     if superseded_id is not None:
