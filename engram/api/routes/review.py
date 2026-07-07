@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, NoReturn
 from uuid import UUID
 
@@ -15,6 +15,7 @@ from engram.api.routes.memory import (
     _insert_item_event,
     _now_dt,
     _require_item,
+    _resolve_workspace_id,
 )
 from engram.db import get_session
 from engram.models import ItemEvent, MemoryItem
@@ -59,6 +60,48 @@ class ConflictResolutionResponse(BaseModel):
     id: UUID
     conflict_resolution_status: str
     resolved_at: datetime | None = None
+
+
+class StaleItem(BaseModel):
+    id: UUID
+    content: str
+    kind: str
+    wing: str | None = None
+    room: str | None = None
+    review_status: str
+    importance: float
+    memory_confidence: float
+    last_recalled_at: datetime | None = None
+    recall_count: int
+    created_at: datetime
+    valid_from: datetime
+    last_verified_at: datetime | None = None
+
+
+class StaleListResponse(BaseModel):
+    items: list[StaleItem]
+    total: int
+    days: int
+
+
+class BulkArchiveRequest(BaseModel):
+    item_ids: list[UUID]
+    reason: str | None = None
+    actor_principal_id: UUID | None = None
+
+
+class BulkArchiveResponse(BaseModel):
+    archived: list[UUID]
+    archived_count: int
+    skipped: list[UUID]
+    skipped_count: int
+
+
+class ReviewStatsResponse(BaseModel):
+    by_review_status: dict[str, int]
+    by_kind: dict[str, int]
+    by_confidence: dict[str, int]
+    total: int
 
 
 async def _resolve_tenant_id(session: AsyncSession) -> UUID:
@@ -120,16 +163,117 @@ async def conflict_queue(
     return ConflictListResponse(items=items, total=len(items))
 
 
-@router.get("/review/stale", response_model=None)
-async def stale_items(days: int = 90) -> NoReturn:
-    """Active items not recalled in N days."""
-    raise NotImplementedError
+@router.get("/review/stale", response_model=StaleListResponse)
+async def stale_items(
+    days: int = 90,
+    workspace: str | None = None,
+    kind: str | None = None,
+    limit: int = 100,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> StaleListResponse:
+    """Active items not recalled in N days.
+
+    An item counts as stale when ``COALESCE(last_recalled_at, valid_from)`` is
+    older than ``days`` ago. A never-recalled item is measured from
+    ``valid_from`` — a NULL ``last_recalled_at`` does not exempt it. Only
+    ``active`` items that are not invalidated or superseded are considered.
+    """
+    if days < 0:
+        raise HTTPException(status_code=422, detail="days must be non-negative")
+    tenant_id = await _resolve_tenant_id(session)
+    limit = max(1, min(limit, 500))
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+
+    clauses = [
+        "tenant_id = :tenant_id",
+        "review_status = 'active'",
+        "valid_to IS NULL",
+        "superseded_by IS NULL",
+        "COALESCE(last_recalled_at, valid_from) < :cutoff",
+    ]
+    params: dict[str, Any] = {"tenant_id": str(tenant_id), "cutoff": cutoff, "limit": limit}
+    if workspace is not None:
+        ws_id = await _resolve_workspace_id(session, tenant_id, workspace)
+        clauses.append("workspace_id = :workspace_id")
+        params["workspace_id"] = str(ws_id)
+    if kind is not None:
+        clauses.append("kind = :kind")
+        params["kind"] = kind
+    sql = (
+        "SELECT id, content, kind, wing, room, review_status, importance, "
+        "memory_confidence, last_recalled_at, recall_count, created_at, "
+        "valid_from, last_verified_at "
+        "FROM memory_items WHERE "
+        + " AND ".join(clauses)
+        + " ORDER BY COALESCE(last_recalled_at, valid_from) ASC, created_at ASC "
+        "LIMIT :limit"
+    )
+    rows = (await session.execute(text(sql), params)).mappings().all()
+    items = [StaleItem(**dict(row)) for row in rows]
+    return StaleListResponse(items=items, total=len(items), days=days)
 
 
-@router.get("/review/stats", response_model=None)
-async def review_stats() -> NoReturn:
-    """Counts by review_status, kind, confidence buckets."""
-    raise NotImplementedError
+@router.get("/review/stats", response_model=ReviewStatsResponse)
+async def review_stats(
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> ReviewStatsResponse:
+    """Hygiene report: counts by review_status, kind, and confidence buckets.
+
+    Counts only current memories (``valid_to IS NULL``). Confidence buckets:
+    low (< 0.4), medium (0.4–< 0.7), high (>= 0.7).
+    """
+    tenant_id = await _resolve_tenant_id(session)
+    params = {"tenant_id": str(tenant_id)}
+
+    status_rows = (
+        await session.execute(
+            text(
+                "SELECT review_status, count(*) FROM memory_items "
+                "WHERE tenant_id = :tenant_id AND valid_to IS NULL "
+                "GROUP BY review_status"
+            ),
+            params,
+        )
+    ).all()
+    by_review_status: dict[str, int] = {str(row[0]): int(row[1]) for row in status_rows}
+
+    kind_rows = (
+        await session.execute(
+            text(
+                "SELECT kind, count(*) FROM memory_items "
+                "WHERE tenant_id = :tenant_id AND valid_to IS NULL "
+                "GROUP BY kind"
+            ),
+            params,
+        )
+    ).all()
+    by_kind: dict[str, int] = {str(row[0]): int(row[1]) for row in kind_rows}
+
+    conf_rows = (
+        await session.execute(
+            text(
+                "SELECT CASE "
+                "WHEN memory_confidence < 0.4 THEN 'low' "
+                "WHEN memory_confidence < 0.7 THEN 'medium' "
+                "ELSE 'high' END AS bucket, count(*) "
+                "FROM memory_items "
+                "WHERE tenant_id = :tenant_id AND valid_to IS NULL "
+                "GROUP BY bucket"
+            ),
+            params,
+        )
+    ).all()
+    by_confidence: dict[str, int] = {"low": 0, "medium": 0, "high": 0}
+    for row in conf_rows:
+        by_confidence[str(row[0])] = int(row[1])
+
+    total = sum(by_review_status.values())
+    return ReviewStatsResponse(
+        by_review_status=by_review_status,
+        by_kind=by_kind,
+        by_confidence=by_confidence,
+        total=total,
+    )
 
 
 @router.post("/items/{item_id}/review", response_model=None)
@@ -261,8 +405,84 @@ async def resolve_conflict(
     )
 
 
-@router.post("/items/bulk-archive", response_model=None)
-async def bulk_archive(item_ids: list[UUID]) -> NoReturn:
-    """Archive multiple items (set review_status='archived')."""
-    raise NotImplementedError
+@router.post("/items/bulk-archive", response_model=BulkArchiveResponse)
+async def bulk_archive(
+    req: BulkArchiveRequest,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> BulkArchiveResponse:
+    """Archive multiple items: set review_status='archived'.
+
+    Writes an ``item_events`` audit row per changed item, then updates the
+    column. Items already in a terminal state (``archived``/``rejected``) and
+    items not found in the caller's tenant are skipped. Archival excludes
+    items from default recall without invalidating them (they're still true,
+    just not actively useful).
+    """
+    tenant_id = await _resolve_tenant_id(session)
+    requested = list(dict.fromkeys(req.item_ids))  # de-dup, preserve order
+    if not requested:
+        return BulkArchiveResponse(
+            archived=[], archived_count=0, skipped=[], skipped_count=0
+        )
+
+    fetch_placeholders: list[str] = []
+    fetch_params: dict[str, Any] = {"tenant_id": str(tenant_id)}
+    for i, item_id in enumerate(requested):
+        fetch_placeholders.append(f":id{i}")
+        fetch_params[f"id{i}"] = str(item_id)
+    fetch_sql = text(
+        "SELECT id, review_status, principal_id FROM memory_items "
+        "WHERE tenant_id = :tenant_id AND "
+        f"CAST(id AS TEXT) IN ({', '.join(fetch_placeholders)})"
+    )
+    rows = (await session.execute(fetch_sql, fetch_params)).all()
+    found: dict[str, tuple[str, object]] = {
+        str(row[0]): (str(row[1]), row[2]) for row in rows
+    }
+
+    to_archive: list[UUID] = []
+    skipped: list[UUID] = []
+    for item_id in requested:
+        entry = found.get(str(item_id))
+        if entry is None or entry[0] in ("archived", "rejected"):
+            skipped.append(item_id)
+        else:
+            to_archive.append(item_id)
+
+    for item_id in to_archive:
+        old_status, principal_id = found[str(item_id)]
+        actor = req.actor_principal_id or UUID(str(principal_id))
+        await _insert_item_event(
+            session,
+            item_id=item_id,
+            event_type="review_change",
+            field_name="review_status",
+            old_value=old_status,
+            new_value="archived",
+            actor_principal_id=actor,
+            reason=req.reason,
+        )
+
+    if to_archive:
+        update_placeholders: list[str] = []
+        update_params: dict[str, Any] = {"tenant_id": str(tenant_id)}
+        for i, item_id in enumerate(to_archive):
+            update_placeholders.append(f":uid{i}")
+            update_params[f"uid{i}"] = str(item_id)
+        await session.execute(
+            text(
+                "UPDATE memory_items SET review_status = 'archived' "
+                "WHERE tenant_id = :tenant_id AND "
+                f"CAST(id AS TEXT) IN ({', '.join(update_placeholders)})"
+            ),
+            update_params,
+        )
+
+    await session.commit()
+    return BulkArchiveResponse(
+        archived=to_archive,
+        archived_count=len(to_archive),
+        skipped=skipped,
+        skipped_count=len(skipped),
+    )
 
