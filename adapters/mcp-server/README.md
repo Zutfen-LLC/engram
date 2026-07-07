@@ -110,7 +110,7 @@ Persist a memory item. Returns `{id, status, review_status, memory_confidence}`.
 | `visibility` | `private` \| `workspace` \| `tenant` | no | `workspace` |
 | `source_type` | `manual` \| `import` \| `migration` \| `extraction` \| `sync_turn` \| `pre_compress` | no | `manual` |
 | `importance` | float | no | `0.5` |
-| `sensitivity` | `normal` \| `sensitive` \| `confidential` | no | `normal` |
+| `sensitivity` | `normal` \| `sensitive` \| `restricted` | no | `normal` |
 | `subject_type`, `subject_id`, `subject_name` | string | no | Optional provenance subject. |
 | `external_id`, `external_source` | string | no | For imports. |
 

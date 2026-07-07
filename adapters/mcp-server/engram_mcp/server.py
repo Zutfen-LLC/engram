@@ -27,7 +27,7 @@ from starlette.requests import Request
 # Named Literal aliases so tool signatures surface as enums in MCP client schemas
 # rather than bare free-form strings.
 SourceType = Literal["manual", "import", "migration", "extraction", "sync_turn", "pre_compress"]
-Sensitivity = Literal["normal", "sensitive", "confidential"]
+Sensitivity = Literal["normal", "sensitive", "restricted"]
 Visibility = Literal["private", "workspace", "tenant"]
 SearchMode = Literal["keyword", "semantic", "hybrid"]
 RecallMode = Literal["startup", "semantic"]

@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 SourceKind = Literal[
     "manual", "import", "migration", "extraction", "sync_turn", "pre_compress"
 ]
-SensitivityKind = Literal["normal", "sensitive", "confidential"]
+SensitivityKind = Literal["normal", "sensitive", "restricted"]
 SearchMode = Literal["keyword", "semantic", "hybrid"]
 
 
