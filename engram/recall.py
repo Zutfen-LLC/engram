@@ -19,9 +19,10 @@ from engram.models import MemoryItem, RecallLog, TenantConfig
 class ScoreResult:
     """Score and human-readable reasons for a single item."""
 
-    def __init__(self, score: float, reasons: list[str]) -> None:
+    def __init__(self, score: float, reasons: list[str], warnings: list[str] | None = None) -> None:
         self.score = score
         self.reasons = reasons
+        self.warnings = warnings or []
 
 
 def score_item(
@@ -97,7 +98,24 @@ def score_item(
         reasons.append("human_verified")
     score += verified_bonus * w_verified
 
-    return ScoreResult(round(score, 4), reasons)
+    # Warnings
+    warnings: list[str] = []
+    stale_after_days = (
+        config.stale_after_days
+        if config is not None
+        else settings.stale_after_days
+    )
+    last_verified = item.last_verified_at or item.valid_from
+    if last_verified is not None:
+        days_since_verified = (now - last_verified).total_seconds() / 86400
+        if days_since_verified > stale_after_days:
+            warnings.append(f"not confirmed in {stale_after_days} days")
+    if item.memory_confidence < 0.5:
+        warnings.append("low confidence")
+    if item.conflict_resolution_status == "unresolved":
+        warnings.append("unresolved conflicts")
+
+    return ScoreResult(round(score, 4), reasons, warnings)
 
 
 async def _get_tenant_config(
@@ -248,7 +266,7 @@ async def execute_startup_recall(
     scored_with_results = []
     for item in scored_items:
         result = score_item(item, config, now)
-        scored_with_results.append((item, result.score, result.reasons))
+        scored_with_results.append((item, result.score, result.reasons, result.warnings))
 
     # Sort by score descending
     scored_with_results.sort(key=lambda x: x[1], reverse=True)
@@ -269,26 +287,28 @@ async def execute_startup_recall(
         effective_token_budget = None
 
     budgeted_items = _enforce_budget(
-        [(i, s) for i, s, _ in scored_with_results],
+        [(i, s) for i, s, _, _ in scored_with_results],
         effective_budget,
         effective_token_budget,
     )
-    # Reattach reasons
-    item_to_reasons = {id(i): r for i, _, r in scored_with_results}
+    # Reattach reasons and warnings
+    item_to_reasons = {id(i): r for i, _, r, _ in scored_with_results}
+    item_to_warnings = {id(i): w for i, _, _, w in scored_with_results}
     scored_with_reasons = [
-        (i, s, item_to_reasons.get(id(i), [])) for i, s in budgeted_items
+        (i, s, item_to_reasons.get(id(i), []), item_to_warnings.get(id(i), []))
+        for i, s in budgeted_items
     ]
 
     # 5. Build response
-    all_items: list[tuple[MemoryItem, float | None, list[str]]] = (
-        [(i, None, []) for i in pinned_items]
-        + [(i, s, r) for i, s, r in scored_with_reasons]
+    all_items: list[tuple[MemoryItem, float | None, list[str], list[str]]] = (
+        [(i, None, [], []) for i in pinned_items]
+        + [(i, s, r, w) for i, s, r, w in scored_with_reasons]
     )
 
     working_set_lines = []
     response_items = []
 
-    for item, score, reasons in all_items:
+    for item, score, reasons, warnings in all_items:
         line = f"[{item.kind}] {item.content}"
         working_set_lines.append(line)
 
@@ -298,6 +318,7 @@ async def execute_startup_recall(
             "content": item.content,
             "score": score,
             "reasons": reasons if reasons else [],
+            "warnings": warnings if warnings else [],
             "pinned": item.pinned,
             "importance": item.importance,
             "source_trust": item.source_trust,
@@ -308,7 +329,7 @@ async def execute_startup_recall(
 
     working_set = "\n".join(working_set_lines)
     item_count = len(all_items)
-    byte_count = sum(len(i.content.encode()) for i, _, _ in all_items)
+    byte_count = sum(len(i.content.encode()) for i, _, _, _ in all_items)
 
     # 6. Write recall_logs
     scoring_version = "v1"
@@ -320,14 +341,14 @@ async def execute_startup_recall(
         mode="startup",
         byte_budget=byte_budget,
         token_budget=token_budget,
-        item_ids=[str(i.id) for i, _, _ in all_items],
+        item_ids=[str(i.id) for i, _, _, _ in all_items],
         scoring_version=scoring_version,
         config_version=config_version,
     )
     session.add(recall_log)
 
     # 7. Update recall_count and last_recalled_at
-    item_ids = [i.id for i, _, _ in all_items]
+    item_ids = [i.id for i, _, _, _ in all_items]
     await session.execute(
         update(MemoryItem)
         .where(MemoryItem.id.in_(item_ids))
@@ -347,4 +368,7 @@ async def execute_startup_recall(
         "pinned_omitted_count": pinned_omitted,
         "omitted_count": max(0, len(items) - item_count),
         "items": response_items,
+        "scoring_version": scoring_version,
+        "config_version": config_version,
+        "recall_log_id": str(recall_log.id),
     }
