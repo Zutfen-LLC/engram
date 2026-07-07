@@ -76,6 +76,7 @@ class RecallRequest(BaseModel):
     query: str | None = None
     workspace: str | None = None
     byte_budget: int | None = None
+    token_budget: int | None = None
     item_budget: int | None = None
 
 
@@ -83,6 +84,7 @@ class RecallResponse(BaseModel):
     working_set: str
     item_count: int
     byte_count: int
+    pinned_omitted_count: int = 0
     omitted_count: int
     items: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -305,9 +307,9 @@ async def remember(
 
     # 6. Build the memory item.
     item = MemoryItem(
-        tenant_id=tenant_id,
+        tenant_id=str(tenant_id),
         workspace_id=workspace_id,
-        principal_id=principal_id,
+        principal_id=str(principal_id),
         content=req.content,
         content_hash=chash,
         kind=req.kind,
@@ -385,11 +387,44 @@ async def remember(
     )
 
 
-@router.post("/recall", response_model=None)
-async def recall(req: RecallRequest) -> NoReturn:
+@router.post("/recall", response_model=RecallResponse)
+async def recall(
+    req: RecallRequest,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> RecallResponse:
     """Bounded recall: deterministic startup set or semantic query."""
-    # TODO: implement startup/semantic recall with budget enforcement
-    raise NotImplementedError("recall not yet implemented")
+
+    # Determine mode
+    if req.mode != "startup":
+        raise HTTPException(
+            status_code=422,
+            detail=f"mode={req.mode!r} not yet implemented (only 'startup' supported)",
+        )
+
+    # Resolve RLS context
+    tenant_id = await _resolve_tenant_id(session)
+    principal_id, _ = await _resolve_principal(session, tenant_id)
+
+    # Execute startup recall
+    from engram.recall import execute_startup_recall
+
+    result = await execute_startup_recall(
+        session=session,
+        tenant_id=str(tenant_id),
+        principal_id=str(principal_id),
+        workspace=req.workspace,
+        byte_budget=req.byte_budget,
+        token_budget=req.token_budget,
+    )
+
+    return RecallResponse(
+        working_set=result["working_set"],
+        item_count=result["item_count"],
+        byte_count=result["byte_count"],
+        pinned_omitted_count=result["pinned_omitted_count"],
+        omitted_count=result["omitted_count"],
+        items=result["items"],
+    )
 
 
 @router.post("/search", response_model=None)
