@@ -8,6 +8,7 @@ from datetime import datetime
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     Boolean,
+    DateTime,
     Float,
     ForeignKey,
     ForeignKeyConstraint,
@@ -32,7 +33,9 @@ class Tenant(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(Text, nullable=False)
     slug: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(server_default=text("now()"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
 
     workspaces: Mapped[list[Workspace]] = relationship(back_populates="tenant")
     principals: Mapped[list[Principal]] = relationship(back_populates="tenant")
@@ -47,7 +50,9 @@ class Workspace(Base):
     )
     name: Mapped[str] = mapped_column(Text, nullable=False)
     slug: Mapped[str] = mapped_column(String(255), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(server_default=text("now()"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
 
     tenant: Mapped[Tenant] = relationship(back_populates="workspaces")
     members: Mapped[list[WorkspaceMember]] = relationship(back_populates="workspace")
@@ -62,7 +67,9 @@ class Principal(Base):
     )
     name: Mapped[str] = mapped_column(Text, nullable=False)
     type: Mapped[str] = mapped_column(String(50), default="agent")
-    created_at: Mapped[datetime] = mapped_column(server_default=text("now()"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
 
     tenant: Mapped[Tenant] = relationship(back_populates="principals")
 
@@ -80,7 +87,9 @@ class WorkspaceMember(Base):
         UUID(as_uuid=True), ForeignKey("principals.id", ondelete="CASCADE"), nullable=False
     )
     role: Mapped[str] = mapped_column(String(50), default="member")
-    created_at: Mapped[datetime] = mapped_column(server_default=text("now()"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
 
     workspace: Mapped[Workspace] = relationship(back_populates="members")
 
@@ -122,16 +131,20 @@ class MemoryItem(Base):
     source_trust: Mapped[float] = mapped_column(Float, default=0.5)
     human_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     verified_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
-    verified_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     review_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Recall ranking
     importance: Mapped[float] = mapped_column(Float, default=0.5)
     pinned: Mapped[bool] = mapped_column(Boolean, default=False)
-    last_recalled_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_recalled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     recall_count: Mapped[int] = mapped_column(Integer, default=0)
     startup_recall_count: Mapped[int] = mapped_column(Integer, default=0)
-    last_verified_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # Provenance (expanded)
     source_type: Mapped[str] = mapped_column(String(50), default="manual")
@@ -149,7 +162,9 @@ class MemoryItem(Base):
     conflict_resolved_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("principals.id"), nullable=True
     )
-    conflict_resolved_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    conflict_resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # Privacy
     sensitivity: Mapped[str] = mapped_column(String(20), default="normal")
@@ -159,13 +174,17 @@ class MemoryItem(Base):
     external_source: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Temporal validity
-    valid_from: Mapped[datetime] = mapped_column(server_default=text("now()"), nullable=False)
-    valid_to: Mapped[datetime | None] = mapped_column(nullable=True)
+    valid_from: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     superseded_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("memory_items.id"), nullable=True
     )
 
-    created_at: Mapped[datetime] = mapped_column(server_default=text("now()"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
 
     embeddings: Mapped[list[MemoryEmbedding]] = relationship(back_populates="memory_item")
     events: Mapped[list[ItemEvent]] = relationship(back_populates="item")
@@ -193,7 +212,9 @@ class MemoryEmbedding(Base):
     embedding: Mapped[list[float] | None] = mapped_column(
         Vector(settings.embedding_dim), nullable=True
     )
-    embedded_at: Mapped[datetime] = mapped_column(server_default=text("now()"), nullable=False)
+    embedded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
     embedding_status: Mapped[str] = mapped_column(String(20), default="complete")
 
     memory_item: Mapped[MemoryItem] = relationship(back_populates="embeddings")
@@ -217,14 +238,18 @@ class KgTriple(Base):
     subject: Mapped[str] = mapped_column(Text, nullable=False)
     predicate: Mapped[str] = mapped_column(Text, nullable=False)
     object: Mapped[str] = mapped_column(Text, nullable=False)
-    valid_from: Mapped[datetime] = mapped_column(server_default=text("now()"), nullable=False)
-    valid_to: Mapped[datetime | None] = mapped_column(nullable=True)
+    valid_from: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     source_item_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("memory_items.id", ondelete="SET NULL"), nullable=True
     )
     confidence: Mapped[float] = mapped_column(Float, default=0.5)
     review_status: Mapped[str] = mapped_column(String(20), default="proposed")
-    created_at: Mapped[datetime] = mapped_column(server_default=text("now()"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
 
 
 class Tunnel(Base):
@@ -239,7 +264,9 @@ class Tunnel(Base):
     target_wing: Mapped[str] = mapped_column(Text, nullable=False)
     target_room: Mapped[str | None] = mapped_column(Text, nullable=True)
     label: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(server_default=text("now()"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
 
 
 class ItemEvent(Base):
@@ -259,7 +286,9 @@ class ItemEvent(Base):
         UUID(as_uuid=True), ForeignKey("principals.id"), nullable=True
     )
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(server_default=text("now()"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
 
     item: Mapped[MemoryItem] = relationship(back_populates="events")
 
@@ -279,7 +308,9 @@ class ClassificationRule(Base):
     target_room: Mapped[str | None] = mapped_column(Text, nullable=True)
     priority: Mapped[int] = mapped_column(Integer, default=100)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(server_default=text("now()"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
 
 
 class ApiKey(Base):
@@ -295,8 +326,10 @@ class ApiKey(Base):
     key_hash: Mapped[str] = mapped_column(Text, nullable=False)
     scopes: Mapped[list[str]] = mapped_column(ARRAY(String), default=["read", "write"])
     label: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(server_default=text("now()"), nullable=False)
-    revoked_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class RecallLog(Base):
@@ -313,12 +346,16 @@ class RecallLog(Base):
     )
     mode: Mapped[str] = mapped_column(String(20), nullable=False)
     query: Mapped[str | None] = mapped_column(Text, nullable=True)
-    item_ids: Mapped[list[str] | None] = mapped_column(ARRAY(Text), nullable=True)
+    item_ids: Mapped[list[uuid.UUID] | None] = mapped_column(
+        ARRAY(UUID(as_uuid=True)), nullable=True
+    )
     byte_budget: Mapped[int | None] = mapped_column(nullable=True)
     token_budget: Mapped[int | None] = mapped_column(nullable=True)
     scoring_version: Mapped[str] = mapped_column(String(20), default="v1")
     config_version: Mapped[str] = mapped_column(String(20), default="v1")
-    created_at: Mapped[datetime] = mapped_column(server_default=text("now()"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
 
 
 class TenantConfig(Base):
@@ -370,7 +407,9 @@ class TenantConfig(Base):
     confidence_pre_compress: Mapped[float] = mapped_column(Float, default=0.3)
 
     active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(server_default=text("now()"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
 
 
 class DeletionEvent(Base):
@@ -410,4 +449,6 @@ class FeedbackEvent(Base):
     recall_log_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("recall_logs.id", ondelete="SET NULL"), nullable=True
     )
-    created_at: Mapped[datetime] = mapped_column(server_default=text("now()"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )

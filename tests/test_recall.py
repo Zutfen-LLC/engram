@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -46,10 +46,10 @@ def _make_item(**overrides: Any) -> MemoryItem:
         "sensitivity": "normal",
         "external_id": None,
         "external_source": None,
-        "valid_from": datetime.utcnow(),
+        "valid_from": datetime.now(UTC),
         "valid_to": None,
         "superseded_by": None,
-        "created_at": datetime.utcnow(),
+        "created_at": datetime.now(UTC),
         "wing": None,
         "room": None,
         "subject_type": None,
@@ -91,7 +91,7 @@ def _make_config(**overrides: Any) -> TenantConfig:
         "confidence_sync_turn": 0.4,
         "confidence_pre_compress": 0.3,
         "active": True,
-        "created_at": datetime.utcnow(),
+        "created_at": datetime.now(UTC),
     }
     defaults.update(overrides)
     return TenantConfig(**defaults)
@@ -105,10 +105,10 @@ class TestScoreItem:
             source_trust=0.8,
             memory_confidence=0.7,
             human_verified=True,
-            last_recalled_at=datetime.utcnow() - timedelta(days=5),
+            last_recalled_at=datetime.now(UTC) - timedelta(days=5),
         )
         config = _make_config()
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         result = score_item(item, config, now)
         assert result.score > 0.0
         assert "human_verified" in result.reasons
@@ -116,13 +116,13 @@ class TestScoreItem:
     def test_unverified_no_bonus(self) -> None:
         item = _make_item(human_verified=False)
         config = _make_config()
-        result = score_item(item, config, datetime.utcnow())
+        result = score_item(item, config, datetime.now(UTC))
         assert "human_verified" not in result.reasons
 
     def test_no_recency_when_never_recalled(self) -> None:
         item = _make_item(last_recalled_at=None)
         config = _make_config()
-        result = score_item(item, config, datetime.utcnow())
+        result = score_item(item, config, datetime.now(UTC))
         assert any("recency=0" in r for r in result.reasons)
 
 
@@ -155,7 +155,7 @@ class TestDeterminism:
         """Same items + same config = same scores."""
         items = [_make_item(importance=0.7), _make_item(importance=0.3)]
         config = _make_config()
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         results1 = [score_item(i, config, now) for i in items]
         results2 = [score_item(i, config, now) for i in items]
         assert [r.score for r in results1] == [r.score for r in results2]
