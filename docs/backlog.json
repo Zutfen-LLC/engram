@@ -586,9 +586,19 @@
           "Write-boundary guard blocks ambiguous/ephemeral candidates",
           "Promotion gates: low-confidence \u2192 volatile, high-confidence \u2192 remember as proposed",
           "Volatile recall: local file-backed, 14-day retention, 2000-entry cap",
-          "Config maps Hermes lifecycle events to hooks"
+          "Config maps Hermes lifecycle events to hooks",
+          "Plugin detects whether prepare_memory_write exists on MemoryProvider ABC at load time",
+          "If hook exists: uses it natively (upstream PR accepted)",
+          "If hook missing: applies runtime monkey-patch to MemoryManager/tool dispatch, logs clear warning with PR link",
+          "Plugin works with stock Hermes (no fork required, no source file editing)"
         ],
-        "context_notes": "Direct successor to zutfen_memory. The skill at ~/.hermes/skills/software-development/zutfen-memory-routing/ is the spec. Classification is delegated to Engram (T08); lifecycle decisions stay here. The volatile layer stays local. The write-boundary guard must actively reject (return {handled: True}), not passthrough (return None)."
+        "context_notes": "Direct successor to zutfen_memory. The skill at ~/.hermes/skills/software-development/zutfen-memory-routing/ is the spec. Classification is delegated to Engram (T08); lifecycle decisions stay here. The volatile layer stays local. The write-boundary guard must actively reject (return {handled: True}), not passthrough (return None). UPSTREAM DEPENDENCY: The prepare_memory_write hook is not in stock Hermes. PR #59898 (https://github.com/NousResearch/hermes-agent/pull/59898) adds it. While the PR is pending, engram-hooks must include a runtime compatibility shim that monkey-patches the memory tool dispatch to check prepare_memory_write before native writes. The shim should be ~20 lines, detect the hook's presence, and log clearly when patching. This makes Engram work with any Hermes version. Issue #39492 in the Hermes repo confirms community demand for this capability.",
+        "upstream_dependency": {
+          "pr": "https://github.com/NousResearch/hermes-agent/pull/59898",
+          "description": "engram-hooks depends on prepare_memory_write existing on the MemoryProvider ABC. This hook does not exist in stock Hermes as of 2026-07-06. PR #59898 adds it.",
+          "status": "pending_review",
+          "fallback": "Runtime monkey-patch: engram-hooks detects whether prepare_memory_write exists on MemoryProvider ABC. If not, it patches the two call sites (tool_executor.py and agent_runtime_helpers.py memory() tool dispatch) at plugin load time with a clear log message pointing to the upstream PR."
+        }
       },
       {
         "id": "T19",
@@ -721,8 +731,15 @@
     "critical_path_note": "T01\u2192T02\u2192T03 is the serial bottleneck. After T03, work fans out. T04 (recall) and T08 (classification) are both on the critical path because the SDK (T16) depends on both. T16\u2192T17 is the integration path. T18 (engram-hooks) can proceed in parallel with T17 once T16+T08 land.",
     "dispatch_state": {
       "repo_dispatch_ready": true,
-      "ci_gates": ["ruff check .", "mypy engram/", "pytest -q", "docker compose config -q"],
-      "next_dispatchable": ["T01"],
+      "ci_gates": [
+        "ruff check .",
+        "mypy engram/",
+        "pytest -q",
+        "docker compose config -q"
+      ],
+      "next_dispatchable": [
+        "T01"
+      ],
       "notes": "T01 is the only task with no dependencies and is fully dispatch-ready. All 19 tasks have branch names, acceptance criteria, and context notes. After T01 lands, T02 unblocks; after T02, T03 unblocks; after T03 the graph fans out to T04/T05/T06/T08/T12/T13/T14. The serial bottleneck is T01\u2192T02\u2192T03. Repo has CI, AGENTS.md, green lint baseline."
     }
   }
