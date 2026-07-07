@@ -21,7 +21,8 @@ FROM base AS ci
 
 RUN pip install --no-cache-dir \
     -e ".[dev]" \
-    -e "./sdk/engram-client[dev]" \
-    -e "./adapters/mcp-server[dev]"
+    -e "./sdk/engram-client[dev]" && \
+    cd /app/adapters/mcp-server && \
+    pip install --no-cache-dir -e ".[dev]"
 
 CMD ["python", "scripts/run_ci.py"]
