@@ -6,6 +6,9 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from sqlalchemy.exc import DataError, IntegrityError
+
+from engram.api.errors import data_error_handler, integrity_error_handler
 
 
 @asynccontextmanager
@@ -22,6 +25,9 @@ def create_app() -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+
+    app.add_exception_handler(IntegrityError, integrity_error_handler)
+    app.add_exception_handler(DataError, data_error_handler)
 
     from engram.api.routes import (
         admin,

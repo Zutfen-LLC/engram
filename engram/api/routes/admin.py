@@ -10,10 +10,9 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.auth import (
@@ -102,14 +101,7 @@ async def create_tenant(
 ) -> TenantOut:
     tenant = Tenant(name=body.name, slug=body.slug, created_at=datetime.now(UTC))
     session.add(tenant)
-    try:
-        await session.commit()
-    except IntegrityError:
-        await session.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Tenant slug '{body.slug}' already exists",
-        ) from None
+    await session.commit()
     await session.refresh(tenant)
     return TenantOut(id=tenant.id, name=tenant.name, slug=tenant.slug)
 
@@ -129,14 +121,7 @@ async def create_workspace(
         created_at=datetime.now(UTC),
     )
     session.add(ws)
-    try:
-        await session.commit()
-    except IntegrityError:
-        await session.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Workspace could not be created (bad tenant_id or duplicate slug)",
-        ) from None
+    await session.commit()
     await session.refresh(ws)
     return WorkspaceOut(
         id=ws.id, tenant_id=ws.tenant_id, name=ws.name, slug=ws.slug
@@ -158,14 +143,7 @@ async def create_principal(
         created_at=datetime.now(UTC),
     )
     session.add(principal)
-    try:
-        await session.commit()
-    except IntegrityError:
-        await session.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Principal could not be created (bad tenant_id?)",
-        ) from None
+    await session.commit()
     await session.refresh(principal)
     return PrincipalOut(
         id=principal.id,
@@ -195,14 +173,7 @@ async def create_api_key(
         created_at=datetime.now(UTC),
     )
     session.add(api_key)
-    try:
-        await session.commit()
-    except IntegrityError:
-        await session.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="API key could not be created (bad tenant_id/principal_id?)",
-        ) from None
+    await session.commit()
     await session.refresh(api_key)
     return ApiKeyOut(
         id=api_key.id,
