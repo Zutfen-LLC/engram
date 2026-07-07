@@ -50,11 +50,11 @@ async def _get_test_session() -> AsyncSession:
             .one()
         )
         await session.execute(
-            sa_text("SELECT set_config(app.tenant_id, :tid, true)"),
+            sa_text("SELECT set_config('app.tenant_id', :tid, true)"),
             {"tid": row["tenant_id"]},
         )
         await session.execute(
-            sa_text("SELECT set_config(app.principal_id, :pid, true)"),
+            sa_text("SELECT set_config('app.principal_id', :pid, true)"),
             {"pid": row["principal_id"]},
         )
         yield session

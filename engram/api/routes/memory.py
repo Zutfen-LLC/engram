@@ -345,7 +345,7 @@ async def _semantic_search(
     query_embedding: list[float],
     limit: int,
 ) -> list[dict[str, Any]]:
-    await session.execute(text("SET LOCAL hnsw.iterative_scan = strict"))
+    await session.execute(text("SET LOCAL hnsw.iterative_scan = strict_order"))
     distance = MemoryEmbedding.embedding.cosine_distance(query_embedding)
     stmt = (
         select(
@@ -471,6 +471,8 @@ async def remember(
     source_trust, memory_confidence, review_status = await _resolve_trust_defaults(
         session, tenant_id, req.source_type, principal_type
     )
+    if classification_result is not None and classification_result.suggested_kind == "decision":
+        review_status = "proposed"
 
     # 5. Supersession check for singleton kinds.
     superseded_id = await _check_supersession(
