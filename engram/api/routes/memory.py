@@ -553,13 +553,11 @@ async def remember(
             dedup_stmt = dedup_stmt.where(MemoryItem.workspace_id == workspace_id)
         existing_id = (await session.execute(dedup_stmt)).scalar_one_or_none()
         if existing_id is None:
-            # Not a dedup — a CHECK/enum constraint rejected the request shape
-            # (e.g. an invalid sensitivity value that slipped past Pydantic).
-            # Surface this as a clean validation error, not a raw DB 500.
-            raise HTTPException(
-                status_code=422,
-                detail="request rejected by database constraint: invalid field value",
-            ) from None
+            # Not a dedup — some other constraint rejected the request shape
+            # (e.g. a CHECK/enum value or FK reference that slipped past
+            # Pydantic). Re-raise so the centralized DB-error handler
+            # classifies it by SQLSTATE into the right 4xx/5xx.
+            raise
         return RememberResponse(
             id=existing_id,
             status="deduped",

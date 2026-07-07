@@ -318,6 +318,7 @@ async def test_diary_write_success() -> None:
         (401, EngramAuthError),
         (403, EngramAuthError),
         (404, EngramNotFoundError),
+        (409, EngramClientError),
         (422, EngramValidationError),
         (500, EngramServerError),
         (503, EngramServerError),
@@ -332,6 +333,33 @@ async def test_typed_errors(status: int, exc_type: type[EngramHTTPError]) -> Non
     assert isinstance(exc_info.value, EngramError)
     assert exc_info.value.status_code == status
     assert exc_info.value.detail == f"boom {status}"
+
+
+@pytest.mark.parametrize(
+    ("status", "exc_type"),
+    [
+        (404, EngramNotFoundError),
+        (409, EngramClientError),
+        (422, EngramValidationError),
+    ],
+)
+async def test_typed_errors_with_structured_detail(
+    status: int, exc_type: type[EngramHTTPError]
+) -> None:
+    """BL-003: the API's DB-constraint-mapped error body is a ``detail``
+    object (``{message, code, constraint}``), not a plain string — the SDK
+    must classify purely on status code and pass the object through as-is."""
+    structured_detail = {
+        "message": "request rejected by database constraint (check_violation): chk_kind",
+        "code": "check_violation",
+        "constraint": "chk_kind",
+    }
+    rec = _Recorder(status_code=status, payload={"detail": structured_detail})
+    async with _client(rec) as client:
+        with pytest.raises(exc_type) as exc_info:
+            await client.remember("x")
+    assert exc_info.value.status_code == status
+    assert exc_info.value.detail == structured_detail
 
 
 async def test_error_non_json_body() -> None:

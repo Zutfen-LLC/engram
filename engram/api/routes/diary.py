@@ -13,6 +13,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.canonicalize import canonicalize, content_hash
@@ -155,7 +156,7 @@ async def write_diary(
 
     try:
         await session.flush()
-    except Exception:
+    except IntegrityError:
         await session.rollback()
         existing = (
             await session.execute(
@@ -175,6 +176,8 @@ async def write_diary(
                 review_status=existing.review_status,
                 principal_id=existing.principal_id,
             )
+        # Not a dedup — re-raise so the centralized DB-error handler
+        # classifies the underlying constraint failure.
         raise
 
     await session.commit()
