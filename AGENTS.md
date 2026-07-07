@@ -50,12 +50,22 @@ Guidelines for AI coding agents working on Engram.
 ## Verification checklist (run before claiming done)
 
 ```
-ruff check .
-mypy engram/
-pytest -q
+make check
 ```
 
-All three must pass with zero errors. If you add a new dependency, add it to `pyproject.toml` `[project.dependencies]` (or `[project.optional-dependencies] dev` for test-only).
+This runs all three checks via the Makefile targets: `lint` (ruff), `typecheck` (mypy), `test` (pytest). All three must pass with zero errors.
+
+If you add a new dependency, add it to `pyproject.toml` `[project.dependencies]` (or `[project.optional-dependencies] dev` for test-only).
+
+### Local pre-commit hook
+
+A pre-commit hook is set up to run `make check` automatically before each commit. To install it after cloning:
+
+```bash
+bash scripts/setup-hooks.sh
+```
+
+The hook blocks commits when any check fails, keeping `main` clean.
 
 ## PR conventions
 
