@@ -50,7 +50,7 @@ _ACTIVE_SOURCES = {"manual", "import", "migration"}
 
 SourceKind = Literal["manual", "import", "migration", "extraction", "sync_turn", "pre_compress"]
 PrincipalKind = Literal["user", "agent", "system", "admin"]
-SensitivityKind = Literal["normal", "sensitive", "confidential"]
+SensitivityKind = Literal["normal", "sensitive", "restricted"]
 
 
 class RememberRequest(BaseModel):
@@ -553,8 +553,13 @@ async def remember(
             dedup_stmt = dedup_stmt.where(MemoryItem.workspace_id == workspace_id)
         existing_id = (await session.execute(dedup_stmt)).scalar_one_or_none()
         if existing_id is None:
-            # Not a dedup — re-raise the original integrity error.
-            raise
+            # Not a dedup — a CHECK/enum constraint rejected the request shape
+            # (e.g. an invalid sensitivity value that slipped past Pydantic).
+            # Surface this as a clean validation error, not a raw DB 500.
+            raise HTTPException(
+                status_code=422,
+                detail="request rejected by database constraint: invalid field value",
+            ) from None
         return RememberResponse(
             id=existing_id,
             status="deduped",

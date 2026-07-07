@@ -444,3 +444,35 @@ async def test_sensitivity_field_accepted(client):
     )
     assert response.status_code == 201
     assert response.json()["status"] == "created"
+
+
+async def test_sensitivity_restricted_accepted(client):
+    """sensitivity='restricted' is the correct product vocabulary and succeeds."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    response = await client.post(
+        "/v1/remember",
+        json={
+            "content": "Restricted content test",
+            "source_type": "manual",
+            "sensitivity": "restricted",
+        },
+    )
+    assert response.status_code == 201
+    assert response.json()["status"] == "created"
+
+
+async def test_sensitivity_confidential_rejected_with_422(client):
+    """sensitivity='confidential' is not a valid value — Pydantic must reject it
+    with a 422 before the request ever reaches the database CHECK constraint."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    response = await client.post(
+        "/v1/remember",
+        json={
+            "content": "Confidential content test",
+            "source_type": "manual",
+            "sensitivity": "confidential",
+        },
+    )
+    assert response.status_code == 422
