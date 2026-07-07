@@ -1,0 +1,27 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: engram
+      POSTGRES_USER: engram
+      POSTGRES_PASSWORD: engram
+    volumes:
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U engram -d engram"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  engram-test:
+    build:
+      context: .
+      target: ci
+    environment:
+      ENGRAM_DATABASE_URL: postgresql+asyncpg://engram:engram@postgres:5432/engram
+      ENGRAM_AUTH_ENABLED: "false"
+      ENGRAM_EMBEDDING_PROVIDER: none
+      PYTHONUNBUFFERED: "1"
+    depends_on:
+      postgres:
+        condition: service_healthy
