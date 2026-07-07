@@ -24,6 +24,9 @@ ENV/
 *.swo
 *~
 
+# zcode
+.zcode
+
 # Environment / secrets
 .env
 .env.*
