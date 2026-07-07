@@ -10,14 +10,15 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select, text, update
+from sqlalchemy import and_, func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.canonicalize import canonicalize, content_hash
+from engram.config import settings
 from engram.db import get_session
-from engram.embeddings import create_embedding_placeholder
-from engram.models import MemoryItem, Principal, TenantConfig, Workspace
+from engram.embeddings import create_embedding_placeholder, generate_embedding
+from engram.models import MemoryEmbedding, MemoryItem, Principal, TenantConfig, Workspace
 from engram.safety import has_secrets
 
 router = APIRouter()
@@ -91,8 +92,8 @@ class RecallResponse(BaseModel):
 
 class SearchRequest(BaseModel):
     query: str
-    mode: str = "hybrid"  # keyword | semantic | hybrid
-    limit: int = 10
+    mode: Literal["keyword", "semantic", "hybrid"] = "hybrid"
+    limit: int = Field(default=10, ge=1, le=100)
     wing: str | None = None
     room: str | None = None
     kind: str | None = None
@@ -101,6 +102,7 @@ class SearchRequest(BaseModel):
 class SearchResponse(BaseModel):
     results: list[dict[str, Any]]
     total: int
+    message: str | None = None
 
 
 # ---- Trust model helpers ----
@@ -204,9 +206,7 @@ async def _resolve_principal(
         raise HTTPException(status_code=403, detail="no principal context")
     principal_id = UUID(pid_str)
 
-    result = await session.execute(
-        select(Principal.type).where(Principal.id == principal_id)
-    )
+    result = await session.execute(select(Principal.type).where(Principal.id == principal_id))
     ptype = result.scalar_one_or_none()
     if ptype is None:
         raise HTTPException(status_code=403, detail="principal not found")
@@ -262,6 +262,169 @@ async def _check_supersession(
 
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
+
+
+_SEARCH_HELPFUL_MESSAGE = (
+    "No embeddings are available yet. Write memories with embedding_provider != 'none' "
+    "to enable semantic search."
+)
+_RRF_K = 60
+
+
+def _search_result_row(
+    row: Any,
+    *,
+    mode: str,
+    score: float,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "id": str(row["id"]),
+        "content": row["content"],
+        "kind": row["kind"],
+        "review_status": row["review_status"],
+        "valid_to": row["valid_to"],
+        "score": float(score),
+        "mode": mode,
+    }
+    if extra is not None:
+        result.update(extra)
+    return result
+
+
+async def _keyword_search(session: AsyncSession, query: str, limit: int) -> list[dict[str, Any]]:
+    stmt = text(
+        """
+        SELECT
+            mi.id,
+            mi.content,
+            mi.kind,
+            mi.review_status,
+            mi.valid_to,
+            ts_rank_cd(mi.content_tsv, plainto_tsquery('english', :query)) AS score
+        FROM memory_items mi
+        WHERE mi.review_status = 'active'
+          AND mi.valid_to IS NULL
+          AND mi.content_tsv @@ plainto_tsquery('english', :query)
+        ORDER BY score DESC, mi.created_at DESC
+        LIMIT :limit
+        """
+    )
+    rows = (await session.execute(stmt, {"query": query, "limit": limit})).mappings().all()
+    return [
+        _search_result_row(row, mode="keyword", score=float(row["score"] or 0.0)) for row in rows
+    ]
+
+
+async def _semantic_candidate_count(session: AsyncSession) -> int:
+    stmt = (
+        select(func.count())
+        .select_from(MemoryEmbedding)
+        .join(
+            MemoryItem,
+            and_(
+                MemoryItem.id == MemoryEmbedding.memory_item_id,
+                MemoryItem.tenant_id == MemoryEmbedding.tenant_id,
+            ),
+        )
+        .where(
+            MemoryEmbedding.embedding_model == "text-embedding-3-small",
+            MemoryEmbedding.embedding.is_not(None),
+            MemoryItem.review_status == "active",
+            MemoryItem.valid_to.is_(None),
+        )
+    )
+    return int((await session.execute(stmt)).scalar_one())
+
+
+async def _semantic_search(
+    session: AsyncSession,
+    query_embedding: list[float],
+    limit: int,
+) -> list[dict[str, Any]]:
+    await session.execute(text("SET LOCAL hnsw.iterative_scan = strict"))
+    distance = MemoryEmbedding.embedding.cosine_distance(query_embedding)
+    stmt = (
+        select(
+            MemoryItem.id.label("id"),
+            MemoryItem.content.label("content"),
+            MemoryItem.kind.label("kind"),
+            MemoryItem.review_status.label("review_status"),
+            MemoryItem.valid_to.label("valid_to"),
+            MemoryEmbedding.embedding_model.label("embedding_model"),
+            MemoryEmbedding.embedding_dim.label("embedding_dim"),
+            distance.label("distance"),
+        )
+        .select_from(MemoryEmbedding)
+        .join(
+            MemoryItem,
+            and_(
+                MemoryItem.id == MemoryEmbedding.memory_item_id,
+                MemoryItem.tenant_id == MemoryEmbedding.tenant_id,
+            ),
+        )
+        .where(
+            MemoryEmbedding.embedding_model == "text-embedding-3-small",
+            MemoryEmbedding.embedding.is_not(None),
+            MemoryItem.review_status == "active",
+            MemoryItem.valid_to.is_(None),
+        )
+        .order_by(distance.asc(), MemoryItem.created_at.desc())
+        .limit(limit)
+    )
+    rows = (await session.execute(stmt)).mappings().all()
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        distance_value = float(row["distance"] or 0.0)
+        results.append(
+            _search_result_row(
+                row,
+                mode="semantic",
+                score=1.0 - distance_value,
+                extra={
+                    "distance": distance_value,
+                    "embedding_model": row["embedding_model"],
+                    "embedding_dim": row["embedding_dim"],
+                },
+            )
+        )
+    return results
+
+
+def _rrf_fuse(
+    keyword_results: list[dict[str, Any]],
+    semantic_results: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    fused: dict[str, dict[str, Any]] = {}
+    for rank, result in enumerate(keyword_results, start=1):
+        entry = fused.setdefault(result["id"], dict(result))
+        entry["score"] = float(entry.get("score", 0.0)) + 1.0 / (_RRF_K + rank)
+        entry["keyword_rank"] = rank
+        entry.setdefault("semantic_rank", None)
+        entry["mode"] = "hybrid"
+    for rank, result in enumerate(semantic_results, start=1):
+        entry = fused.setdefault(result["id"], dict(result))
+        entry["score"] = float(entry.get("score", 0.0)) + 1.0 / (_RRF_K + rank)
+        entry["semantic_rank"] = rank
+        entry.setdefault("keyword_rank", None)
+        entry["mode"] = "hybrid"
+        if "distance" not in entry and "distance" in result:
+            entry["distance"] = result["distance"]
+        if "embedding_model" not in entry and "embedding_model" in result:
+            entry["embedding_model"] = result["embedding_model"]
+        if "embedding_dim" not in entry and "embedding_dim" in result:
+            entry["embedding_dim"] = result["embedding_dim"]
+    return sorted(
+        fused.values(),
+        key=lambda item: (
+            -float(item["score"]),
+            item.get("keyword_rank") or 1000000000,
+            item.get("semantic_rank") or 1000000000,
+            item["content"],
+        ),
+    )[:limit]
 
 
 # ---- Endpoints ----
@@ -373,8 +536,14 @@ async def remember(
             )
         )
 
-    # 9. Create embedding placeholder (deferred to T05).
-    await create_embedding_placeholder(session, item.id, tenant_id)
+    # 9. Create embedding row when embeddings are enabled.
+    if settings.embedding_provider != "none":
+        embedding_row = await create_embedding_placeholder(session, item.id, tenant_id)
+        embedding = await generate_embedding(req.content)
+        if embedding is not None:
+            embedding_row.embedding = embedding
+            embedding_row.embedding_dim = len(embedding)
+            embedding_row.embedding_status = "ready"
 
     await session.commit()
 
@@ -427,11 +596,41 @@ async def recall(
     )
 
 
-@router.post("/search", response_model=None)
-async def search(req: SearchRequest) -> NoReturn:
+@router.post("/search", response_model=SearchResponse)
+async def search(
+    req: SearchRequest,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> SearchResponse:
     """Keyword, semantic, or hybrid search."""
-    # TODO: implement keyword (ILIKE), semantic (pgvector), hybrid search
-    raise NotImplementedError("search not yet implemented")
+    limit = req.limit
+    mode = req.mode
+
+    if mode == "keyword":
+        results = await _keyword_search(session, req.query, limit)
+        return SearchResponse(results=results, total=len(results))
+
+    query_embedding = await generate_embedding(req.query)
+    semantic_count = await _semantic_candidate_count(session)
+
+    if mode == "semantic":
+        if query_embedding is None or semantic_count == 0:
+            return SearchResponse(results=[], total=0, message=_SEARCH_HELPFUL_MESSAGE)
+        results = await _semantic_search(session, query_embedding, limit)
+        if not results:
+            return SearchResponse(results=[], total=0, message=_SEARCH_HELPFUL_MESSAGE)
+        return SearchResponse(results=results, total=len(results))
+
+    keyword_results = await _keyword_search(session, req.query, max(limit * 5, limit))
+    if query_embedding is None or semantic_count == 0:
+        return SearchResponse(
+            results=keyword_results[:limit],
+            total=min(len(keyword_results), limit),
+            message=_SEARCH_HELPFUL_MESSAGE,
+        )
+
+    semantic_results = await _semantic_search(session, query_embedding, max(limit * 5, limit))
+    results = _rrf_fuse(keyword_results, semantic_results, limit=limit)
+    return SearchResponse(results=results, total=len(results))
 
 
 @router.get("/items", response_model=None)

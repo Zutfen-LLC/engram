@@ -1,8 +1,4 @@
-"""Embedding management — placeholder creation deferred to T05.
-
-In Phase 1A the embedding provider is ``none``; we insert a pending row so
-T05 can pick it up and backfill the vector asynchronously.
-"""
+"""Embedding management for memory_items."""
 
 from __future__ import annotations
 
@@ -13,9 +9,26 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from engram.config import settings
 from engram.models import MemoryEmbedding
 
-# Model name used for placeholder rows. T05 will replace this with the real
-# provider's model identifier when it backfills the vector.
-_PLACEHOLDER_MODEL = "pending"
+_EMBEDDING_MODEL = "text-embedding-3-small"
+
+
+async def generate_embedding(text: str) -> list[float] | None:
+    """Generate an embedding vector for ``text`` or return ``None`` when disabled."""
+    if settings.embedding_provider == "none":
+        return None
+    if settings.embedding_provider != "openai":
+        raise ValueError(f"unsupported embedding provider: {settings.embedding_provider!r}")
+
+    try:
+        from openai import AsyncOpenAI
+    except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
+        raise RuntimeError(
+            "openai package is required when ENGRAM_EMBEDDING_PROVIDER=openai"
+        ) from exc
+
+    client = AsyncOpenAI(api_key=settings.openai_api_key)
+    response = await client.embeddings.create(model=_EMBEDDING_MODEL, input=text)
+    return [float(value) for value in response.data[0].embedding]
 
 
 async def create_embedding_placeholder(
@@ -23,14 +36,11 @@ async def create_embedding_placeholder(
     memory_item_id: uuid.UUID,
     tenant_id: uuid.UUID,
 ) -> MemoryEmbedding:
-    """Insert a ``memory_embeddings`` row with ``embedding_status='pending'``.
-
-    The vector column stays NULL — T05 fills it via the configured provider.
-    """
+    """Insert a pending memory_embeddings row to be updated once the vector is ready."""
     placeholder = MemoryEmbedding(
         memory_item_id=memory_item_id,
         tenant_id=tenant_id,
-        embedding_model=_PLACEHOLDER_MODEL,
+        embedding_model=_EMBEDDING_MODEL,
         embedding_dim=settings.embedding_dim,
         embedding=None,
         embedding_status="pending",
