@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal, NoReturn
+from typing import Any, Literal, NoReturn
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -11,6 +11,11 @@ from pydantic import BaseModel
 from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from engram.api.routes.memory import (
+    _insert_item_event,
+    _now_dt,
+    _require_item,
+)
 from engram.db import get_session
 from engram.models import ItemEvent, MemoryItem
 
@@ -21,6 +26,12 @@ class ReviewChangeRequest(BaseModel):
     review_status: str  # proposed | active | disputed | rejected | archived
     reason: str | None = None
     review_notes: str | None = None
+    actor_principal_id: UUID | None = None
+
+
+class VerifyRequest(BaseModel):
+    verified_by: UUID | None = None
+    reason: str | None = None
 
 
 class ConflictResolution(BaseModel):
@@ -122,15 +133,74 @@ async def review_stats() -> NoReturn:
 
 
 @router.post("/items/{item_id}/review", response_model=None)
-async def change_review_status(item_id: UUID, req: ReviewChangeRequest) -> NoReturn:
-    """Change review_status (proposed → active, dispute, etc.). Writes item_event."""
-    raise NotImplementedError
+async def change_review_status(
+    item_id: UUID,
+    req: ReviewChangeRequest,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> dict[str, Any]:
+    """Change review_status (proposed -> active, dispute, etc.). Writes item_event."""
+    item = await _require_item(session, item_id)
+    actor = req.actor_principal_id or UUID(str(item["principal_id"]))
+    event = await _insert_item_event(
+        session,
+        item_id=item_id,
+        event_type="review_change",
+        field_name="review_status",
+        old_value=item.get("review_status"),
+        new_value=req.review_status,
+        actor_principal_id=actor,
+        reason=req.reason,
+    )
+    assignments = ["review_status = :review_status"]
+    params: dict[str, Any] = {"review_status": req.review_status, "item_id": str(item_id)}
+    if req.review_notes is not None:
+        assignments.append("review_notes = :review_notes")
+        params["review_notes"] = req.review_notes
+    await session.execute(
+        text(f"UPDATE memory_items SET {', '.join(assignments)} WHERE id = :item_id"),
+        params,
+    )
+    updated = await _require_item(session, item_id)
+    await session.commit()
+    return {"item": updated, "event": event}
 
 
 @router.post("/items/{item_id}/verify", response_model=None)
-async def verify_item(item_id: UUID) -> NoReturn:
+async def verify_item(
+    item_id: UUID,
+    req: VerifyRequest | None = None,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> dict[str, Any]:
     """Mark item as human-verified."""
-    raise NotImplementedError
+    item = await _require_item(session, item_id)
+    now = _now_dt()
+    verified_by = req.verified_by if req and req.verified_by else UUID(str(item["principal_id"]))
+    reason = req.reason if req else None
+    event = await _insert_item_event(
+        session,
+        item_id=item_id,
+        event_type="verify",
+        field_name="human_verified",
+        old_value=item.get("human_verified"),
+        new_value=True,
+        actor_principal_id=verified_by,
+        reason=reason,
+    )
+    await session.execute(
+        text(
+            "UPDATE memory_items SET human_verified = 1, verified_by = :verified_by, "
+            "verified_at = :verified_at, last_verified_at = :last_verified_at WHERE id = :item_id"
+        ),
+        {
+            "verified_by": str(verified_by),
+            "verified_at": now.isoformat(),
+            "last_verified_at": now.isoformat(),
+            "item_id": str(item_id),
+        },
+    )
+    updated = await _require_item(session, item_id)
+    await session.commit()
+    return {"item": updated, "event": event}
 
 
 @router.post("/items/{item_id}/resolve-conflict", response_model=ConflictResolutionResponse)
@@ -195,3 +265,4 @@ async def resolve_conflict(
 async def bulk_archive(item_ids: list[UUID]) -> NoReturn:
     """Archive multiple items (set review_status='archived')."""
     raise NotImplementedError
+

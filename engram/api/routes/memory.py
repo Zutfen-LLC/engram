@@ -5,13 +5,16 @@ This is a skeleton — implementation in Phase 1 PR 4-5.
 
 from __future__ import annotations
 
+import base64
 import json
-from typing import Any, Literal, NoReturn
+import uuid
+from datetime import UTC, datetime
+from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, func, select, text, update
+from sqlalchemy import and_, func, insert, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -765,6 +768,131 @@ async def search(
     return SearchResponse(results=results, total=len(results))
 
 
+class ItemMetadataPatchRequest(BaseModel):
+    wing: str | None = None
+    room: str | None = None
+    visibility: str | None = None
+    importance: float | None = None
+    pinned: bool | None = None
+    actor_principal_id: UUID | None = None
+    reason: str | None = None
+
+
+class MutationAuditRequest(BaseModel):
+    actor_principal_id: UUID | None = None
+    reason: str | None = None
+
+
+MUTATION_FIELDS = ("wing", "room", "visibility", "importance", "pinned")
+
+
+def _now_dt() -> datetime:
+    return datetime.now(UTC)
+
+
+def _row_to_dict(row: Any) -> dict[str, Any]:
+    if row is None:
+        return {}
+    mapping = getattr(row, "_mapping", row)
+    data = dict(mapping)
+    for key in ("human_verified", "pinned"):
+        value = data.get(key)
+        if isinstance(value, int):
+            data[key] = bool(value)
+    return data
+
+
+def _stringify(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, datetime):
+        return value.astimezone(UTC).isoformat()
+    return str(value)
+
+
+def _encode_cursor(item: dict[str, Any]) -> str:
+    payload = {
+        "created_at": _stringify(item["created_at"]),
+        "id": _stringify(item["id"]),
+    }
+    data = json.dumps(payload, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
+def _decode_cursor(cursor: str) -> tuple[str, str]:
+    padding = "=" * (-len(cursor) % 4)
+    data = base64.urlsafe_b64decode((cursor + padding).encode()).decode()
+    payload = json.loads(data)
+    created_at = payload.get("created_at")
+    item_id = payload.get("id")
+    if not isinstance(created_at, str) or not isinstance(item_id, str):
+        raise ValueError("invalid cursor")
+    return created_at, item_id
+
+
+async def _fetch_item(session: AsyncSession, item_id: UUID) -> dict[str, Any] | None:
+    result = await session.execute(
+        text("SELECT * FROM memory_items WHERE id = :item_id OR id = :item_id_hex"),
+        {"item_id": str(item_id), "item_id_hex": item_id.hex},
+    )
+    row = result.mappings().first()
+    return _row_to_dict(row) if row else None
+
+
+async def _fetch_events(session: AsyncSession, item_id: UUID) -> list[dict[str, Any]]:
+    result = await session.execute(
+        text("SELECT * FROM item_events WHERE item_id = :item_id ORDER BY created_at ASC, id ASC"),
+        {"item_id": str(item_id)},
+    )
+    return [dict(row) for row in result.mappings().all()]
+
+
+async def _fetch_kg_facts(session: AsyncSession, item_id: UUID) -> list[dict[str, Any]]:
+    result = await session.execute(
+        text(
+            "SELECT * FROM kg_triples WHERE source_item_id = :item_id "
+            "ORDER BY created_at ASC, id ASC"
+        ),
+        {"item_id": str(item_id)},
+    )
+    return [dict(row) for row in result.mappings().all()]
+
+
+async def _insert_item_event(
+    session: AsyncSession,
+    *,
+    item_id: UUID,
+    event_type: str,
+    field_name: str | None,
+    old_value: Any,
+    new_value: Any,
+    actor_principal_id: UUID | None,
+    reason: str | None,
+) -> dict[str, Any]:
+    event = {
+        "id": uuid.uuid4(),
+        "item_id": item_id,
+        "event_type": event_type,
+        "field_name": field_name,
+        "old_value": _stringify(old_value),
+        "new_value": _stringify(new_value),
+        "actor_principal_id": actor_principal_id,
+        "reason": reason,
+        "created_at": _now_dt(),
+    }
+    await session.execute(insert(ItemEvent).values(**event))
+    return event
+
+
+async def _require_item(session: AsyncSession, item_id: UUID) -> dict[str, Any]:
+    item = await _fetch_item(session, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Item not found")
+    return item
+
+
 @router.get("/items", response_model=None)
 async def list_items(
     workspace: str | None = None,
@@ -773,33 +901,201 @@ async def list_items(
     room: str | None = None,
     active_only: bool = True,
     limit: int = 50,
-    offset: int = 0,
-) -> NoReturn:
-    """List items with filters."""
-    # TODO: implement filtered query
-    raise NotImplementedError("list_items not yet implemented")
+    cursor: str | None = None,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> dict[str, Any]:
+    """List items with stable cursor pagination."""
+    limit = max(1, min(limit, 100))
+    clauses: list[str] = []
+    params: dict[str, Any] = {"limit": limit + 1}
+    if workspace is not None:
+        clauses.append(
+            "workspace_id IN (SELECT id FROM workspaces "
+            "WHERE slug = :workspace OR name = :workspace)"
+        )
+        params["workspace"] = workspace
+    if kind is not None:
+        clauses.append("kind = :kind")
+        params["kind"] = kind
+    if wing is not None:
+        clauses.append("wing = :wing")
+        params["wing"] = wing
+    if room is not None:
+        clauses.append("room = :room")
+        params["room"] = room
+    if active_only:
+        clauses.append("review_status = 'active' AND valid_to IS NULL AND superseded_by IS NULL")
+    if cursor is not None:
+        try:
+            created_at, item_id = _decode_cursor(cursor)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid cursor") from exc
+        clauses.append(
+            "(created_at < :cursor_created_at OR "
+            "(created_at = :cursor_created_at AND id < :cursor_id))"
+        )
+        params["cursor_created_at"] = created_at
+        params["cursor_id"] = item_id
+    sql = "SELECT * FROM memory_items"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY created_at DESC, id DESC LIMIT :limit"
+    result = await session.execute(text(sql), params)
+    rows = [_row_to_dict(row) for row in result.mappings().all()]
+    page = rows[:limit]
+    next_cursor = _encode_cursor(page[-1]) if len(rows) > limit and page else None
+    return {
+        "items": page,
+        "count": len(page),
+        "next_cursor": next_cursor,
+        "cursor": next_cursor,
+    }
 
 
 @router.get("/items/{item_id}", response_model=None)
-async def get_item(item_id: UUID) -> NoReturn:
+async def get_item(
+    item_id: UUID,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> dict[str, Any]:
     """Full detail with provenance and linked KG facts."""
-    # TODO: implement detail query
-    raise NotImplementedError("get_item not yet implemented")
+    item = await _require_item(session, item_id)
+    events = await _fetch_events(session, item_id)
+    kg_facts = await _fetch_kg_facts(session, item_id)
+    return {
+        "item": item,
+        "events": events,
+        "item_events": events,
+        "kg_facts": kg_facts,
+        "linked_kg_facts": kg_facts,
+    }
 
 
 @router.patch("/items/{item_id}", response_model=None)
-async def update_item_metadata(item_id: UUID) -> NoReturn:
-    """Update metadata (wing, room, visibility) — not content."""
-    raise NotImplementedError("update_item not yet implemented")
+async def update_item_metadata(
+    item_id: UUID,
+    req: ItemMetadataPatchRequest,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> dict[str, Any]:
+    """Update metadata (wing, room, visibility, importance, pinned) — not content."""
+    item = await _require_item(session, item_id)
+    actor = req.actor_principal_id or UUID(str(item["principal_id"]))
+    changes: list[dict[str, Any]] = []
+    for field in MUTATION_FIELDS:
+        new_value = getattr(req, field)
+        if new_value is None:
+            continue
+        old_value = item.get(field)
+        if old_value == new_value:
+            continue
+        changes.append({"field": field, "old": old_value, "new": new_value})
+
+    events: list[dict[str, Any]] = []
+    for change in changes:
+        event = await _insert_item_event(
+            session,
+            item_id=item_id,
+            event_type="metadata_patch",
+            field_name=change["field"],
+            old_value=change["old"],
+            new_value=change["new"],
+            actor_principal_id=actor,
+            reason=req.reason,
+        )
+        await session.execute(
+            text(f"UPDATE memory_items SET {change['field']} = :value WHERE id = :item_id"),
+            {"value": change["new"], "item_id": str(item_id)},
+        )
+        events.append(event)
+    updated = await _require_item(session, item_id)
+    await session.commit()
+    return {"item": updated, "event": events[0] if events else None, "events": events}
 
 
 @router.post("/items/{item_id}/supersede", response_model=None)
-async def supersede_item(item_id: UUID) -> NoReturn:
+async def supersede_item(
+    item_id: UUID,
+    req: MutationAuditRequest | None = None,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> dict[str, Any]:
     """Mark superseded + write replacement."""
-    raise NotImplementedError("supersede_item not yet implemented")
+    item = await _require_item(session, item_id)
+    now = _now_dt()
+    new_id = uuid.uuid4()
+    replacement = dict(item)
+    replacement.update(
+        {
+            "id": new_id,
+            "valid_from": now,
+            "valid_to": None,
+            "superseded_by": None,
+            "created_at": now,
+        }
+    )
+    for key in (
+        "tenant_id",
+        "workspace_id",
+        "principal_id",
+        "verified_by",
+        "conflicts_with_item_id",
+        "conflict_resolved_by",
+    ):
+        if replacement.get(key) is not None:
+            replacement[key] = UUID(str(replacement[key]))
+    actor = req.actor_principal_id if req and req.actor_principal_id else UUID(
+        str(item["principal_id"])
+    )
+    reason = req.reason if req else None
+    await session.execute(insert(MemoryItem).values(**replacement))
+    event = await _insert_item_event(
+        session,
+        item_id=item_id,
+        event_type="supersede",
+        field_name="superseded_by",
+        old_value=item.get("superseded_by"),
+        new_value=new_id,
+        actor_principal_id=actor,
+        reason=reason,
+    )
+    await session.execute(
+        text(
+            "UPDATE memory_items SET valid_to = :valid_to, superseded_by = :superseded_by "
+            "WHERE id = :item_id"
+        ),
+        {"valid_to": now.isoformat(), "superseded_by": str(new_id), "item_id": str(item_id)},
+    )
+    old_item = await _require_item(session, item_id)
+    new_item = await _require_item(session, new_id)
+    await session.commit()
+    return {"old_item": old_item, "new_item": new_item, "event": event}
 
 
 @router.post("/items/{item_id}/invalidate", response_model=None)
-async def invalidate_item(item_id: UUID) -> NoReturn:
+async def invalidate_item(
+    item_id: UUID,
+    req: MutationAuditRequest | None = None,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> dict[str, Any]:
     """Mark invalid (set valid_to)."""
-    raise NotImplementedError("invalidate_item not yet implemented")
+    item = await _require_item(session, item_id)
+    now = _now_dt()
+    actor = req.actor_principal_id if req and req.actor_principal_id else UUID(
+        str(item["principal_id"])
+    )
+    reason = req.reason if req else None
+    event = await _insert_item_event(
+        session,
+        item_id=item_id,
+        event_type="invalidate",
+        field_name="valid_to",
+        old_value=item.get("valid_to"),
+        new_value=now,
+        actor_principal_id=actor,
+        reason=reason,
+    )
+    await session.execute(
+        text("UPDATE memory_items SET valid_to = :valid_to WHERE id = :item_id"),
+        {"valid_to": now.isoformat(), "item_id": str(item_id)},
+    )
+    updated = await _require_item(session, item_id)
+    await session.commit()
+    return {"item": updated, "event": event}
