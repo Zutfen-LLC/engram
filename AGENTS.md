@@ -55,6 +55,8 @@ make check
 
 This runs all three checks via the Makefile targets: `lint` (ruff), `typecheck` (mypy), `test` (pytest). All three must pass with zero errors.
 
+CI additionally runs the Docker Compose real-DB path in `docker-compose.ci.yml`, which verifies migrations against `pgvector/pgvector:pg16` and runs root service tests plus explicit SDK and MCP adapter coverage inside containers.
+
 If you add a new dependency, add it to `pyproject.toml` `[project.dependencies]` (or `[project.optional-dependencies] dev` for test-only).
 
 ### Local pre-commit hook
