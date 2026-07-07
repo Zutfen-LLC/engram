@@ -19,6 +19,7 @@ from engram.canonicalize import canonicalize, content_hash
 from engram.classification import ClassificationResult
 from engram.classification import classify as classify_memory
 from engram.config import settings
+from engram.conflicts import ConflictAction, ConflictResult, detect_conflicts
 from engram.db import get_session
 from engram.embeddings import create_embedding_placeholder, generate_embedding
 from engram.models import ItemEvent, MemoryEmbedding, MemoryItem, Principal, TenantConfig, Workspace
@@ -592,6 +593,89 @@ async def remember(
             embedding_row.embedding = embedding
             embedding_row.embedding_dim = len(embedding)
             embedding_row.embedding_status = "ready"
+
+    # 10. Conflict detection (semantic similarity + classifier).
+    # Only runs when embeddings are available — skipped cleanly otherwise.
+    conflict_result: ConflictResult | None = None
+    if settings.embedding_provider != "none" and settings.conflict_check_on_write:
+        await session.flush()
+        conflict_result = await detect_conflicts(item, session)
+
+    if conflict_result is not None:
+        action = conflict_result.action
+        if action is ConflictAction.DEDUP:
+            await session.rollback()
+            return RememberResponse(
+                id=conflict_result.existing_item_id,
+                status="deduped",
+                review_status=review_status,
+                memory_confidence=memory_confidence,
+                deduped_existing_id=conflict_result.existing_item_id,
+            )
+        if action is ConflictAction.AUTO_SUPERSEDE:
+            await session.execute(
+                update(MemoryItem)
+                .where(MemoryItem.id == conflict_result.existing_item_id)
+                .values(
+                    valid_to=func.now(),
+                    superseded_by=item.id,
+                )
+            )
+            session.add(
+                ItemEvent(
+                    item_id=item.id,
+                    event_type="conflict_detected",
+                    field_name="conflicts_with_item_id",
+                    old_value=None,
+                    new_value=json.dumps(
+                        {
+                            "verdict": conflict_result.verdict.value,
+                            "action": action.value,
+                            "similarity": conflict_result.similarity,
+                            "existing_item_id": str(conflict_result.existing_item_id),
+                            "reason": conflict_result.reason,
+                        },
+                        sort_keys=True,
+                    ),
+                    actor_principal_id=principal_id,
+                    reason=conflict_result.reason,
+                )
+            )
+            await session.commit()
+            return RememberResponse(
+                id=item.id,
+                status="superseded",
+                review_status=review_status,
+                memory_confidence=memory_confidence,
+                superseded_id=conflict_result.existing_item_id,
+            )
+        # FLAG_CONTRADICTION, PROPOSED_SUPERSEDE, FLAG_SCOPE_OVERLAP:
+        # mark the item with conflict metadata and write an event.
+        item.conflicts_with_item_id = conflict_result.existing_item_id
+        item.conflict_type = conflict_result.conflict_type
+        item.conflict_resolution_status = "unresolved"
+        item.review_status = "proposed"
+        session.add(
+            ItemEvent(
+                item_id=item.id,
+                event_type="conflict_detected",
+                field_name="conflicts_with_item_id",
+                old_value=None,
+                new_value=json.dumps(
+                    {
+                        "verdict": conflict_result.verdict.value,
+                        "action": action.value,
+                        "conflict_type": conflict_result.conflict_type,
+                        "similarity": conflict_result.similarity,
+                        "existing_item_id": str(conflict_result.existing_item_id),
+                        "reason": conflict_result.reason,
+                    },
+                    sort_keys=True,
+                ),
+                actor_principal_id=principal_id,
+                reason=conflict_result.reason,
+            )
+        )
 
     await session.commit()
 
