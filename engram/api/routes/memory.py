@@ -25,7 +25,15 @@ from engram.config import settings
 from engram.conflicts import ConflictAction, ConflictResult, detect_conflicts
 from engram.db import get_session
 from engram.embeddings import create_embedding_placeholder, generate_embedding
-from engram.models import ItemEvent, MemoryEmbedding, MemoryItem, Principal, TenantConfig, Workspace
+from engram.models import (
+    FeedbackEvent,
+    ItemEvent,
+    MemoryEmbedding,
+    MemoryItem,
+    Principal,
+    TenantConfig,
+    Workspace,
+)
 from engram.safety import has_secrets
 
 router = APIRouter()
@@ -95,6 +103,9 @@ class RecallResponse(BaseModel):
     pinned_omitted_count: int = 0
     omitted_count: int
     items: list[dict[str, Any]] = Field(default_factory=list)
+    scoring_version: str = "v1"
+    config_version: str = "v1"
+    recall_log_id: str | None = None
 
 
 class SearchRequest(BaseModel):
@@ -110,6 +121,12 @@ class SearchResponse(BaseModel):
     results: list[dict[str, Any]]
     total: int
     message: str | None = None
+
+
+class FeedbackRequest(BaseModel):
+    item_id: UUID
+    feedback: Literal["useful", "noise"]
+    recall_log_id: UUID | None = None
 
 
 # ---- Trust model helpers ----
@@ -728,6 +745,9 @@ async def recall(
         pinned_omitted_count=result["pinned_omitted_count"],
         omitted_count=result["omitted_count"],
         items=result["items"],
+        scoring_version=result.get("scoring_version", "v1"),
+        config_version=result.get("config_version", "v1"),
+        recall_log_id=result.get("recall_log_id"),
     )
 
 
@@ -766,6 +786,97 @@ async def search(
     semantic_results = await _semantic_search(session, query_embedding, max(limit * 5, limit))
     results = _rrf_fuse(keyword_results, semantic_results, limit=limit)
     return SearchResponse(results=results, total=len(results))
+
+
+@router.post("/feedback", response_model=None, status_code=201)
+async def feedback(
+    req: FeedbackRequest,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> dict[str, Any]:
+    """Record feedback on a recalled item.
+
+    Useful feedback incrementally raises importance (capped at 0.95);
+    noise lowers it (floor at 0.1). Feedback authority weighting:
+    - user/admin: full weight (resets penalty counter, adjusts importance)
+    - agent on own memories: zero penalty-reset weight
+    - agent on other agent's memories: partial weight (0.5x) on importance
+    """
+    tenant_id = await _resolve_tenant_id(session)
+    principal_id, principal_type = await _resolve_principal(session, tenant_id)
+
+    # Verify the item exists
+    item = await _fetch_item(session, req.item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    # Determine authority
+    is_own_memory = str(item["principal_id"]) == str(principal_id)
+    is_user_or_admin = principal_type in ("user", "admin")
+
+    # Log the feedback event
+    session.add(
+        FeedbackEvent(
+            tenant_id=tenant_id,
+            item_id=req.item_id,
+            principal_id=principal_id,
+            verdict=req.feedback,
+            recall_log_id=req.recall_log_id,
+        )
+    )
+
+    if req.feedback == "useful":
+        if is_user_or_admin:
+            # Full weight: reset penalty counter, raise importance
+            await session.execute(
+                update(MemoryItem)
+                .where(MemoryItem.id == req.item_id)
+                .values(
+                    startup_recall_count=0,
+                    importance=func.least(
+                        func.greatest(item["importance"] + 0.05, 0.1), 0.95
+                    ),
+                )
+            )
+        elif not is_own_memory:
+            # Agent on another agent's memory: partial weight (0.5x)
+            await session.execute(
+                update(MemoryItem)
+                .where(MemoryItem.id == req.item_id)
+                .values(
+                    importance=func.least(
+                        func.greatest(item["importance"] + 0.025, 0.1), 0.95
+                    ),
+                )
+            )
+        # Agent on own memory: no-op for importance/penalty
+    else:  # noise
+        if is_user_or_admin:
+            # Full weight: lower importance
+            await session.execute(
+                update(MemoryItem)
+                .where(MemoryItem.id == req.item_id)
+                .values(
+                    importance=func.least(
+                        func.greatest(item["importance"] - 0.1, 0.1), 0.95
+                    ),
+                )
+            )
+        elif not is_own_memory:
+            # Agent on another agent's memory: partial weight
+            await session.execute(
+                update(MemoryItem)
+                .where(MemoryItem.id == req.item_id)
+                .values(
+                    importance=func.least(
+                        func.greatest(item["importance"] - 0.05, 0.1), 0.95
+                    ),
+                )
+            )
+        # Agent on own memory: no-op for importance
+
+    await session.commit()
+
+    return {"status": "recorded", "feedback": req.feedback, "item_id": str(req.item_id)}
 
 
 class ItemMetadataPatchRequest(BaseModel):
