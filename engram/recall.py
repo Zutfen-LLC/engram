@@ -6,7 +6,7 @@ Startup recall is deterministic given state — same corpus + config = same outp
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select, text, update
@@ -237,7 +237,7 @@ async def execute_startup_recall(
     6. Increment recall_count, update last_recalled_at
     7. Return working_set + items with reasons
     """
-    now = datetime.utcnow()
+    now = datetime.now(UTC)
     config = await _get_tenant_config(session, tenant_id)
 
     # Resolve workspace_id if provided
@@ -341,7 +341,7 @@ async def execute_startup_recall(
         mode="startup",
         byte_budget=byte_budget,
         token_budget=token_budget,
-        item_ids=[str(i.id) for i, _, _, _ in all_items],
+        item_ids=[i.id for i, _, _, _ in all_items],
         scoring_version=scoring_version,
         config_version=config_version,
     )

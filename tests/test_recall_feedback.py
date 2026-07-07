@@ -156,12 +156,16 @@ async def test_feedback_noise_lowers_importance(client):
 
 
 async def test_feedback_accepts_recall_log_id(client):
-    """Feedback endpoint accepts and stores recall_log_id."""
+    """Feedback endpoint accepts and stores recall_log_id from a real recall run."""
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     item = await _create_item(client, "Feedback recall log test")
     item_id = item["id"]
-    recall_log_id = str(uuid.uuid4())
+    # Issue a real recall so a recall_logs row exists, then reference it.
+    recall_resp = await client.post("/v1/recall", json={"mode": "startup"})
+    assert recall_resp.status_code == 200
+    recall_log_id = recall_resp.json().get("recall_log_id")
+    assert recall_log_id, "recall response should include recall_log_id"
     resp = await client.post(
         "/v1/feedback",
         json={"item_id": item_id, "feedback": "useful", "recall_log_id": recall_log_id},
