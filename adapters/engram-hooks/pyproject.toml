@@ -15,8 +15,11 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    # Sibling SDK — path is relative to this pyproject.toml.
-    "engram-client @ file:../../sdk/engram-client",
+    # The local-dev bootstrap installs the sibling SDK into the same venv first.
+    # Keep the runtime dependency as a normal package name so editable installs of
+    # this adapter do not depend on a fragile relative file URL during wheel metadata
+    # generation.
+    "engram-client>=0.1.0",
     "pydantic>=2.0",
 ]
 

@@ -17,18 +17,19 @@ PYTHON="$ROOT/.venv/bin/python"
 
 uv pip install --python "$PYTHON" -e "$ROOT/sdk/engram-client"
 uv pip install --python "$PYTHON" -e "$ROOT/adapters/mcp-server"
+uv pip install --python "$PYTHON" -e "$ROOT/adapters/engram-hooks"
 
 "$PYTHON" - <<'PY'
 import importlib.util
 import sys
 
 missing = [
-    name for name in ("engram_client", "engram_mcp")
+    name for name in ("engram_client", "engram_mcp", "engram_hooks")
     if importlib.util.find_spec(name) is None
 ]
 if missing:
     raise SystemExit(f"bootstrap failed; missing imports: {', '.join(missing)}")
-print("✓ Local Python dev bootstrap complete: engram_client and engram_mcp are importable")
+print("✓ Local Python dev bootstrap complete: engram_client, engram_mcp, and engram_hooks are importable")
 PY
 
 cat <<'EOF'
@@ -36,4 +37,5 @@ cat <<'EOF'
 Examples:
   .venv/bin/python -m engram_mcp
   .venv/bin/engram-mcp
+  .venv/bin/python -c 'import engram_hooks'
 EOF
