@@ -91,6 +91,79 @@ mcp_servers:
 For a remote deployment, point `ENGRAM_BASE_URL` at the public URL and use an
 API key issued by the Engram admin endpoints.
 
+## Smoke testing & verification
+
+The adapter ships with a layered test suite under `tests/`:
+
+* **Unit tests** (`test_registration.py`, `test_config.py`, `test_forwarding.py`)
+  verify tool registration, JSON-schema enums (e.g. `sensitivity='restricted'`,
+  recall `mode='semantic'`), config/startup failures, and that each tool
+  forwards the expected request shape to the SDK. These run with **no network
+  and no database**.
+* **Integration tests** (`test_integration.py`) start a real Engram uvicorn
+  service against a live PostgreSQL and drive full
+  `MCP → SDK → HTTP → FastAPI → DB` round trips (`engram_remember →
+  engram_recall → engram_search` and `engram_kg_add → engram_kg_query`) plus
+  failure paths (unreachable service, validation 422). These **skip
+  automatically** when no database is reachable.
+
+### Run the full suite
+
+From the repository root (with the repo venv active):
+
+```bash
+pytest -q adapters/mcp-server/tests
+```
+
+### Integration round trips against local Compose
+
+The integration tests spin up their own in-process Engram server, so they only
+need a reachable database:
+
+```bash
+docker compose up -d                                   # start PostgreSQL + Engram
+pytest -q adapters/mcp-server/tests/test_integration.py
+```
+
+Auth must be disabled (`ENGRAM_AUTH_ENABLED=false`, the Compose default). The
+tests bind an ephemeral loopback port, so there is no conflict with the Compose
+service on `:8000`.
+
+> In CI these run inside the Compose stack with `ENGRAM_FAIL_ON_DB_SKIP=1`, so a
+> DB-backed skip (e.g. a broken round trip) fails the build instead of passing
+> silently.
+
+### Manual smoke against a running Engram
+
+The most direct manual check is a programmatic one-off against any running
+Engram instance — this is exactly what the integration tests do internally:
+
+```python
+import asyncio
+
+from engram_mcp import build_server
+from mcp.shared.memory import create_connected_server_and_client_session
+
+
+async def main() -> None:
+    # Reads ENGRAM_BASE_URL / ENGRAM_API_KEY from the environment.
+    server = build_server()
+    async with create_connected_server_and_client_session(server) as session:
+        await session.call_tool("engram_remember", {"content": "smoke check"})
+        print(await session.call_tool("engram_recall", {"mode": "startup"}))
+        print(await session.call_tool("engram_search", {"query": "smoke"}))
+
+
+asyncio.run(main())
+```
+
+```bash
+docker compose up -d                       # start Engram (auth disabled)
+ENGRAM_BASE_URL=http://localhost:8000 python smoke.py
+```
+
+For an auth-enabled deployment, also export `ENGRAM_API_KEY`.
+
 ## Tool signatures
 
 Each tool mirrors the corresponding SDK method. The parameters below are the

@@ -79,19 +79,35 @@ def _client(ctx: ToolCtx) -> engram_client.EngramClient:
     return state.client
 
 
-def build_server() -> FastMCP:
+def build_server(
+    client: engram_client.EngramClient | None = None,
+) -> FastMCP[EngramState]:
     """Construct the FastMCP server with all Engram tools registered.
 
     A single :class:`~engram_client.EngramClient` is created in the lifespan
     context so tool calls reuse one HTTP connection pool for the server's
     lifetime rather than opening one per call.
+
+    Pass ``client`` to inject a pre-built SDK client (used by tests). When
+    injected the lifespan neither constructs nor closes a client — the caller
+    owns it — and ``ENGRAM_*`` environment config is not read, so no
+    ``ENGRAM_BASE_URL`` is required.
     """
-    base_url, api_key, timeout = _config()
+    injected = client is not None
+    base_url: str = ""
+    api_key: str | None = None
+    timeout = _DEFAULT_TIMEOUT
+    if not injected:
+        base_url, api_key, timeout = _config()
 
     @asynccontextmanager
     async def lifespan(_server: FastMCP) -> AsyncIterator[EngramState]:
-        async with engram_client.EngramClient(base_url, api_key, timeout=timeout) as client:
+        if client is not None:
+            # Injected (test) path: caller owns the client, so don't close it.
             yield EngramState(client=client)
+        else:
+            async with engram_client.EngramClient(base_url, api_key, timeout=timeout) as created:
+                yield EngramState(client=created)
 
     mcp = FastMCP[EngramState](
         name="engram",
