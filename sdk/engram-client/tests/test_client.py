@@ -178,6 +178,64 @@ async def test_recall_success() -> None:
     assert "query" not in body
 
 
+async def test_recall_semantic_mode_sends_query() -> None:
+    """BL-004: recall(mode='semantic', query='...') reaches the API with both
+    fields in the body and parses a RecallResponse (including the new optional
+    ``message`` field)."""
+    rec = _Recorder(
+        payload={
+            "working_set": "- [fact] semantic target",
+            "item_count": 1,
+            "byte_count": 40,
+            "omitted_count": 0,
+            "items": [
+                {
+                    "id": ITEM_ID,
+                    "kind": "fact",
+                    "content": "semantic target",
+                    "score": 0.92,
+                    "reasons": ["semantic similarity 0.92"],
+                    "warnings": [],
+                }
+            ],
+            "recall_log_id": OTHER_ID,
+            "scoring_version": "semantic-v1",
+            "message": None,
+        },
+    )
+    async with _client(rec) as client:
+        resp = await client.recall(mode="semantic", query="semantic query", item_budget=5)
+    assert isinstance(resp, RecallResponse)
+    assert resp.scoring_version == "semantic-v1"
+    assert resp.message is None
+    assert resp.items[0]["reasons"] == ["semantic similarity 0.92"]
+    assert rec.request is not None
+    body = _body(rec.request)
+    assert body["mode"] == "semantic"
+    assert body["query"] == "semantic query"
+    assert body["item_budget"] == 5
+
+
+async def test_recall_semantic_message_field_parsed() -> None:
+    """The new ``message`` field survives response_model validation."""
+    rec = _Recorder(
+        payload={
+            "working_set": "",
+            "item_count": 0,
+            "byte_count": 0,
+            "omitted_count": 0,
+            "items": [],
+            "recall_log_id": OTHER_ID,
+            "message": "No embeddings are available yet.",
+        },
+    )
+    async with _client(rec) as client:
+        resp = await client.recall(mode="semantic", query="x")
+    assert isinstance(resp, RecallResponse)
+    assert resp.item_count == 0
+    assert resp.message == "No embeddings are available yet."
+
+
 # ---- search ----
 
 
