@@ -34,18 +34,22 @@ from engram.db import get_session
 
 
 @pytest.fixture
-async def db():
-    """Per-test NullPool engine + session factory, disposed after the test.
+def db():
+    """Per-test NullPool session factory.
 
-    Creating a fresh engine per test guarantees asyncpg connections are bound
-    to THIS test's event loop and torn down before the next test's loop starts.
+    ``create_async_engine`` is synchronous, so a SYNC fixture creates the engine
+    without touching any event loop. The first real asyncpg connection then
+    happens lazily inside the test body's own loop — which is what keeps
+    asyncpg's protocol bound to the same loop the test runs on. (An async
+    fixture would create+connect on the fixture's loop, which pytest-asyncio
+    may run on a different loop than the function-scoped test.)
+
+    Engines are not explicitly disposed; NullPool closes each connection on
+    release and the process exits after the suite. Mirrors the module-global
+    engine pattern in test_remember.py / test_semantic_recall.py.
     """
     engine = create_async_engine(settings.database_url, poolclass=NullPool)
-    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    try:
-        yield factory
-    finally:
-        await engine.dispose()
+    return async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
 async def _db_ok(db: async_sessionmaker[AsyncSession]) -> bool:
