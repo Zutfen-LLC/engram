@@ -39,7 +39,9 @@ services:
     restart: unless-stopped
 
   engram-service:
-    build: .
+    build:
+      context: .
+      target: runtime
     container_name: engram-service
     environment:
       ENGRAM_DATABASE_URL: postgresql+asyncpg://engram:${POSTGRES_PASSWORD:-engram}@postgres:5432/${POSTGRES_DB:-engram}
