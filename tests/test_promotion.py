@@ -32,10 +32,34 @@ from engram.config import settings
 from engram.db import get_session
 from engram.promotion import auto_promote_proposed_memories
 
+# Module-global engine/factory, recreated per test by the ``_fresh_engine`` autouse
+# fixture. pytest-asyncio runs each test on its own event loop; asyncpg binds a
+# connection's protocol to the loop where it was created. If a single engine
+# spans many tests (and thus many loops), a protocol bound to an earlier loop can
+# be reused by a later test on a different loop → "Future attached to a different
+# loop". Recreating the engine per test sidesteps this entirely.
 _test_engine = create_async_engine(settings.database_url, poolclass=NullPool)
-_test_session_factory = async_sessionmaker(
+_test_session_factory: async_sessionmaker[AsyncSession] = async_sessionmaker(
     _test_engine, class_=AsyncSession, expire_on_commit=False
 )
+
+
+@pytest.fixture(autouse=True)
+async def _fresh_engine():
+    """Give each test a brand-new NullPool engine on its own loop.
+
+    Disposes the previous engine (closing any lingering asyncpg protocols) and
+    builds a fresh one + session factory. Without this, later tests in this
+    module hit cross-loop asyncpg errors once the shared engine has been used
+    across several per-function event loops.
+    """
+    global _test_engine, _test_session_factory
+    _test_engine = create_async_engine(settings.database_url, poolclass=NullPool)
+    _test_session_factory = async_sessionmaker(
+        _test_engine, class_=AsyncSession, expire_on_commit=False
+    )
+    yield
+    await _test_engine.dispose()
 
 
 async def _db_ok() -> bool:
