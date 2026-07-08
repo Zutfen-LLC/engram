@@ -274,210 +274,13 @@ async def _insert_item(
     )
 
 
-async def _insert_event(
-    session: AsyncSession,
-    *,
-    item_id: str,
-    event_type: str,
-    field_name: str | None,
-    old_value: str | None,
-    new_value: str | None,
-    actor_principal_id: str | None,
-    reason: str | None,
-    created_at: str,
-) -> None:
-    await session.execute(
-        text(
-            "INSERT INTO item_events (id, item_id, event_type, field_name, old_value, new_value, "
-            "actor_principal_id, reason, created_at) VALUES ("
-            ":id, :item_id, :event_type, :field_name, :old_value, :new_value, :actor_principal_id, "
-            ":reason, :created_at)"
-        ),
-        {
-            "id": str(uuid4()),
-            "item_id": item_id,
-            "event_type": event_type,
-            "field_name": field_name,
-            "old_value": old_value,
-            "new_value": new_value,
-            "actor_principal_id": actor_principal_id,
-            "reason": reason,
-            "created_at": created_at,
-        },
-    )
-
-
-@pytest.mark.asyncio
-async def test_items_cursor_pagination_and_filters(client, session_factory):
-    async with session_factory() as session:
-        base = await _seed_base(session, created_at="2026-01-01T00:00:00+00:00")
-        beta_workspace_id = str(uuid4())
-        await session.execute(
-            text(
-                "INSERT INTO workspaces (id, tenant_id, name, slug, created_at) "
-                "VALUES (:id, :tenant_id, :name, :slug, :created_at)"
-            ),
-            {
-                "id": beta_workspace_id,
-                "tenant_id": base["tenant_id"],
-                "name": "Beta",
-                "slug": "beta",
-                "created_at": "2026-01-01T00:00:00+00:00",
-            },
-        )
-        await _insert_item(
-            session,
-            tenant_id=base["tenant_id"],
-            workspace_id=base["workspace_id"],
-            principal_id=base["principal_id"],
-            item_id=str(uuid4()),
-            content="older",
-            wing="west",
-            room="hall",
-            created_at="2026-01-01T01:00:00+00:00",
-        )
-        await _insert_item(
-            session,
-            tenant_id=base["tenant_id"],
-            workspace_id=base["workspace_id"],
-            principal_id=base["principal_id"],
-            item_id=str(uuid4()),
-            content="middle",
-            wing="east",
-            room="lobby",
-            created_at="2026-01-01T02:00:00+00:00",
-        )
-        await _insert_item(
-            session,
-            tenant_id=base["tenant_id"],
-            workspace_id=base["workspace_id"],
-            principal_id=base["principal_id"],
-            item_id=str(uuid4()),
-            content="newest",
-            wing="east",
-            room="lobby",
-            importance=0.9,
-            pinned=True,
-            created_at="2026-01-01T03:00:00+00:00",
-        )
-        await _insert_item(
-            session,
-            tenant_id=base["tenant_id"],
-            workspace_id=base["workspace_id"],
-            principal_id=base["principal_id"],
-            item_id=str(uuid4()),
-            content="proposed",
-            review_status="proposed",
-            created_at="2026-01-01T04:00:00+00:00",
-        )
-        await _insert_item(
-            session,
-            tenant_id=base["tenant_id"],
-            workspace_id=beta_workspace_id,
-            principal_id=base["principal_id"],
-            item_id=str(uuid4()),
-            content="beta item",
-            wing="east",
-            room="lobby",
-            review_status="proposed",
-            created_at="2026-01-01T05:00:00+00:00",
-        )
-        await session.commit()
-
-    first = await client.get("/v1/items", params={"limit": 2})
-    assert first.status_code == 200
-    first_payload = first.json()
-    assert [item["content"] for item in first_payload["items"]] == ["newest", "middle"]
-    assert first_payload["next_cursor"]
-
-    async with session_factory() as session:
-        later_base = await _seed_base(session, created_at='2026-01-01T00:00:00+00:00')
-        await _insert_item(
-            session,
-            tenant_id=later_base['tenant_id'],
-            workspace_id=later_base['workspace_id'],
-            principal_id=later_base['principal_id'],
-            item_id=str(uuid4()),
-            content="inserted later",
-            wing="east",
-            room="lobby",
-            created_at="2026-01-01T06:00:00+00:00",
-        )
-        await session.commit()
-
-    second = await client.get("/v1/items", params={"limit": 2, "cursor": first_payload["next_cursor"]})
-    assert second.status_code == 200
-    assert [item["content"] for item in second.json()["items"]] == ["older"]
-
-    filtered = await client.get(
-        "/v1/items",
-        params={"workspace": "alpha", "kind": "fact", "wing": "east", "room": "lobby", "limit": 10},
-    )
-    assert filtered.status_code == 200
-    contents = [item["content"] for item in filtered.json()["items"]]
-    assert "proposed" not in contents
-    assert all(item['workspace_id'] != beta_workspace_id for item in filtered.json()['items'])
-    assert all(item["wing"] == "east" and item["room"] == "lobby" for item in filtered.json()["items"])
-
-
-@pytest.mark.asyncio
-async def test_get_item_detail_includes_events_and_kg(client, session_factory):
-    async with session_factory() as session:
-        base = await _seed_base(session, created_at="2026-01-01T00:00:00+00:00")
-        item_id = str(uuid4())
-        await _insert_item(
-            session,
-            tenant_id=base["tenant_id"],
-            workspace_id=base["workspace_id"],
-            principal_id=base["principal_id"],
-            item_id=item_id,
-            content="detail",
-            wing="north",
-            room="shelf",
-            created_at="2026-01-01T01:00:00+00:00",
-        )
-        await _insert_event(
-            session,
-            item_id=item_id,
-            event_type="metadata_patch",
-            field_name="wing",
-            old_value="south",
-            new_value="north",
-            actor_principal_id=base["principal_id"],
-            reason="retag",
-            created_at="2026-01-01T01:30:00+00:00",
-        )
-        await session.execute(
-            text(
-                "INSERT INTO kg_triples (id, tenant_id, workspace_id, principal_id, subject, predicate, object, "
-                "valid_from, valid_to, source_item_id, confidence, review_status, created_at) VALUES ("
-                ":id, :tenant_id, :workspace_id, :principal_id, :subject, :predicate, :object, "
-                ":valid_from, :valid_to, :source_item_id, :confidence, :review_status, :created_at)"
-            ),
-            {
-                "id": str(uuid4()),
-                "tenant_id": base["tenant_id"],
-                "workspace_id": base["workspace_id"],
-                "principal_id": base["principal_id"],
-                "subject": "engram",
-                "predicate": "relates_to",
-                "object": "memory",
-                "valid_from": "2026-01-01T02:00:00+00:00",
-                "valid_to": None,
-                "source_item_id": item_id,
-                "confidence": 0.9,
-                "review_status": "active",
-                "created_at": "2026-01-01T02:00:00+00:00",
-            },
-        )
-        await session.commit()
-
-    response = await client.get(f"/v1/items/{item_id}")
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["item"]["content"] == "detail"
-    assert len(payload["item_events"]) == 1
-    assert len(payload["linked_kg_facts"]) == 1
+# NOTE: GET /v1/items and GET /v1/items/{item_id} now resolve tenant/principal
+# from RLS context (`current_setting('app.tenant_id'/'app.principal_id')`) to
+# enforce read eligibility (engram.memory_access) — a function this SQLite
+# fixture doesn't provide. Their pagination/filter/detail/404 coverage lives in
+# tests/test_item_read_eligibility.py (Postgres-backed) alongside the broader
+# eligibility test matrix. The mutation endpoints below don't call that
+# resolver, so they're unaffected and stay on this lightweight SQLite fixture.
 
 
 @pytest.mark.asyncio
@@ -574,8 +377,9 @@ async def test_patch_supersede_review_verify_and_404s(client, session_factory):
     assert verify_payload["event"]["event_type"] == "verify"
 
     missing = str(uuid4())
+    # GET is excluded here — it now requires RLS tenant/principal context
+    # (engram.memory_access), covered in test_item_read_eligibility.py instead.
     for method, path, body in [
-        ("get", f"/v1/items/{missing}", None),
         ("patch", f"/v1/items/{missing}", {"wing": "x"}),
         ("post", f"/v1/items/{missing}/supersede", {}),
         ("post", f"/v1/items/{missing}/invalidate", {}),

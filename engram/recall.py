@@ -10,12 +10,13 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select, text, update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram import semantic
 from engram.config import settings
 from engram.embeddings import generate_embedding
+from engram.memory_access import eligibility_expression, resolve_workspace_scope
 from engram.models import MemoryItem, RecallLog, TenantConfig
 
 
@@ -138,16 +139,21 @@ async def _get_tenant_config(
 async def _fetch_active_items(
     session: AsyncSession,
     tenant_id: str,
+    principal_id: str,
     workspace_id: str | None,
 ) -> list[MemoryItem]:
     """Fetch active, non-expired items for startup recall.
 
     Only review_status='active' and valid_to IS NULL enter startup recall.
+    Also enforces the shared tenant/visibility eligibility predicate so a
+    principal never sees another principal's private memory, or workspace
+    memory from a workspace they aren't a member of.
     """
     stmt = select(MemoryItem).where(
         MemoryItem.tenant_id == tenant_id,
         MemoryItem.review_status == "active",
         MemoryItem.valid_to.is_(None),
+        eligibility_expression(principal_id),
     )
     if workspace_id is not None:
         stmt = stmt.where(MemoryItem.workspace_id == workspace_id)
@@ -243,19 +249,18 @@ async def execute_startup_recall(
     now = datetime.now(UTC)
     config = await _get_tenant_config(session, tenant_id)
 
-    # Resolve workspace_id if provided
-    workspace_id = None
-    if workspace is not None:
-        ws_result = await session.execute(
-            text(
-                "SELECT id FROM workspaces WHERE tenant_id = :tid AND slug = :slug"
-            ),
-            {"tid": tenant_id, "slug": workspace},
-        )
-        workspace_id = ws_result.scalar_one_or_none()
+    # Resolve workspace_id if provided. An explicit workspace request that
+    # doesn't resolve, or where the caller isn't a member, must not fall back
+    # to an unscoped read — it yields zero items instead.
+    workspace_id, workspace_accessible = await resolve_workspace_scope(
+        session, tenant_id=tenant_id, principal_id=principal_id, workspace=workspace
+    )
 
     # 1. Fetch active items
-    items = await _fetch_active_items(session, tenant_id, workspace_id)
+    if workspace is not None and not workspace_accessible:
+        items: list[MemoryItem] = []
+    else:
+        items = await _fetch_active_items(session, tenant_id, principal_id, workspace_id)
 
     # 2. Separate pinned
     max_pinned = (
@@ -458,13 +463,27 @@ async def execute_semantic_recall(
     now = datetime.now(UTC)
     config = await _get_tenant_config(session, tenant_id)
 
+    # Resolve workspace_id if provided. An explicit workspace request that
+    # doesn't resolve, or where the caller isn't a member, must not fall back
+    # to an unscoped read — it yields zero candidates instead.
+    workspace_id, workspace_accessible = await resolve_workspace_scope(
+        session, tenant_id=tenant_id, principal_id=principal_id, workspace=workspace
+    )
+
     # 1. Generate the query embedding. This is the single place the query
     #    vector is produced; the shared semantic.search() never embeds.
     query_embedding = await generate_embedding(query)
 
-    candidate_total = await semantic.candidate_count(
-        session, review_statuses=_SEMANTIC_REVIEW_STATUSES
-    )
+    if workspace is not None and not workspace_accessible:
+        candidate_total = 0
+    else:
+        candidate_total = await semantic.candidate_count(
+            session,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            workspace_id=workspace_id,
+            review_statuses=_SEMANTIC_REVIEW_STATUSES,
+        )
 
     if query_embedding is None or candidate_total == 0:
         # Empty, non-error response. Still log the attempt for auditability.
@@ -495,27 +514,32 @@ async def execute_semantic_recall(
             "message": _NO_EMBEDDINGS_MESSAGE,
         }
 
-    # 2. Retrieve nearest candidates by cosine similarity.
-    #    RLS scopes results to the caller's tenant; an explicit workspace slug
-    #    would narrow further but semantic.search is tenant-scoped today, so
-    #    we accept the workspace param for API parity without filtering yet.
-    _ = workspace
+    # 2. Retrieve nearest candidates by cosine similarity, scoped to the
+    #    caller's tenant/principal/workspace eligibility (engram.memory_access).
     item_limit = item_budget if item_budget is not None else settings.recall_item_budget
     fetch_limit = min(item_limit * _SEMANTIC_OVERFETCH, _SEMANTIC_OVERFETCH_CAP)
     candidates = await semantic.search(
         session,
         query_embedding,
         fetch_limit,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        workspace_id=workspace_id,
         review_statuses=_SEMANTIC_REVIEW_STATUSES,
     )
 
     # 4. Enrich candidates with full MemoryItem trust fields (pinned,
     #    importance, source_trust, memory_confidence, human_verified).
+    #    Ids already passed the eligibility-filtered search above; the
+    #    tenant_id filter here is cheap defense in depth.
     candidate_ids = [UUID(c["id"]) for c in candidates]
     item_by_id: dict[UUID, MemoryItem] = {}
     if candidate_ids:
         rows = await session.execute(
-            select(MemoryItem).where(MemoryItem.id.in_(candidate_ids))
+            select(MemoryItem).where(
+                MemoryItem.id.in_(candidate_ids),
+                MemoryItem.tenant_id == tenant_id,
+            )
         )
         item_by_id = {item.id: item for item in rows.scalars().all()}
 
