@@ -3,12 +3,11 @@
 None of these tests require a real Hermes checkout or a live Engram server:
 
 * Guard / detection / shim tests build a **fake Hermes** package tree in
-  ``sys.modules`` that mirrors the module layout ``engram_hooks.hooks``
-  targets (``hermes_agent.memory.provider.MemoryProvider``,
-  ``hermes_agent.tools.tool_executor.memory``,
-  ``hermes_agent.runtime.agent_runtime_helpers.memory``). This lets us
-  exercise "hook present" vs. "hook absent, patch these dispatch sites" vs.
-  "Hermes present but API drifted" deterministically in CI.
+  ``sys.modules`` that mirrors the module layouts ``engram_hooks.hooks``
+  targets (historical ``hermes_agent.*`` and current local-install
+  ``agent.*`` paths). This lets us exercise "hook present" vs. "hook absent,
+  patch these dispatch sites" vs. "Hermes present but API drifted"
+  deterministically in CI.
 * Lifecycle-hook tests construct :class:`~engram_hooks.HooksConfig` with no
   ``ENGRAM_BASE_URL``, so ``LifecycleHooks`` degrades to volatile-only mode —
   no network, no mocked SDK client needed for guard/routing behavior.
@@ -36,6 +35,10 @@ _FAKE_MODULE_NAMES = (
     "hermes_agent.tools.tool_executor",
     "hermes_agent.runtime",
     "hermes_agent.runtime.agent_runtime_helpers",
+    "agent",
+    "agent.memory_provider",
+    "agent.tool_executor",
+    "agent.agent_runtime_helpers",
 )
 
 
@@ -73,21 +76,37 @@ class RecordingMemory:
 
 
 def _install_fake_hermes(
-    *, hook_present: bool, with_dispatch_sites: bool = True
+    *,
+    hook_present: bool,
+    with_dispatch_sites: bool = True,
+    layout: str = "hermes_agent",
 ) -> dict[str, Any]:
-    """Build and register the fake ``hermes_agent`` package tree.
+    """Build and register the fake Hermes package tree.
 
     Returns a dict with the constructed pieces (``provider_cls``,
     ``tool_executor``, ``agent_runtime_helpers``, ``memory_fns``) so tests can
     assert against them directly.
     """
-    root = types.ModuleType("hermes_agent")
-    memory_pkg = types.ModuleType("hermes_agent.memory")
-    provider_mod = types.ModuleType("hermes_agent.memory.provider")
-    tools_pkg = types.ModuleType("hermes_agent.tools")
-    tool_executor_mod = types.ModuleType("hermes_agent.tools.tool_executor")
-    runtime_pkg = types.ModuleType("hermes_agent.runtime")
-    agent_runtime_helpers_mod = types.ModuleType("hermes_agent.runtime.agent_runtime_helpers")
+    if layout == "hermes_agent":
+        root = types.ModuleType("hermes_agent")
+        memory_pkg = types.ModuleType("hermes_agent.memory")
+        provider_mod = types.ModuleType("hermes_agent.memory.provider")
+        tools_pkg = types.ModuleType("hermes_agent.tools")
+        tool_executor_mod = types.ModuleType("hermes_agent.tools.tool_executor")
+        runtime_pkg = types.ModuleType("hermes_agent.runtime")
+        agent_runtime_helpers_mod = types.ModuleType("hermes_agent.runtime.agent_runtime_helpers")
+        provider_module_name = "hermes_agent.memory.provider"
+    elif layout == "agent":
+        root = types.ModuleType("agent")
+        memory_pkg = None
+        provider_mod = types.ModuleType("agent.memory_provider")
+        tools_pkg = None
+        tool_executor_mod = types.ModuleType("agent.tool_executor")
+        runtime_pkg = None
+        agent_runtime_helpers_mod = types.ModuleType("agent.agent_runtime_helpers")
+        provider_module_name = "agent.memory_provider"
+    else:
+        raise ValueError(f"unknown fake Hermes layout: {layout}")
 
     if hook_present:
 
@@ -104,7 +123,7 @@ def _install_fake_hermes(
     # actually executes); force it to the fake module's dotted name so
     # detect_prepare_memory_write()'s `f"{cls.__module__}.{cls.__qualname__}"`
     # matches what it would report for a real Hermes install.
-    MemoryProvider.__module__ = "hermes_agent.memory.provider"
+    MemoryProvider.__module__ = provider_module_name
     MemoryProvider.__qualname__ = "MemoryProvider"
     provider_mod.MemoryProvider = MemoryProvider  # type: ignore[attr-defined]
 
@@ -124,7 +143,8 @@ def _install_fake_hermes(
         runtime_pkg,
         agent_runtime_helpers_mod,
     ):
-        sys.modules[mod.__name__] = mod
+        if mod is not None:
+            sys.modules[mod.__name__] = mod
 
     return {
         "provider_cls": MemoryProvider,
@@ -152,6 +172,18 @@ def fake_hermes_no_dispatch_sites() -> dict[str, Any]:
     models upstream API drift where our patch targets no longer exist.
     """
     return _install_fake_hermes(hook_present=False, with_dispatch_sites=False)
+
+
+@pytest.fixture
+def fake_current_hermes_native() -> dict[str, Any]:
+    """Fake current local Hermes layout with native prepare_memory_write present."""
+    return _install_fake_hermes(hook_present=True, layout="agent")
+
+
+@pytest.fixture
+def fake_current_hermes_shim_needed() -> dict[str, Any]:
+    """Fake current local Hermes layout with hook absent and patchable dispatch sites."""
+    return _install_fake_hermes(hook_present=False, layout="agent")
 
 
 @pytest.fixture

@@ -56,6 +56,9 @@ _UPSTREAM_PR_URL = "https://github.com/NousResearch/hermes-agent/pull/59898"
 _HERMES_DISPATCH_MODULES = (
     "hermes_agent.tools.tool_executor",
     "hermes_agent.runtime.agent_runtime_helpers",
+    # Current Hermes tree / package layout in local installs.
+    "agent.tool_executor",
+    "agent.agent_runtime_helpers",
 )
 # Attribute names the memory() dispatch may live under across Hermes versions.
 _MEMORY_DISPATCH_ATTRS = ("memory", "execute_memory_tool", "call_memory")
@@ -458,6 +461,8 @@ def _find_memory_provider() -> type:
         ("hermes_agent.memory.provider", "MemoryProvider"),
         ("hermes_agent.providers.memory", "MemoryProvider"),
         ("hermes_agent.memory", "MemoryProvider"),
+        # Current Hermes tree / package layout in local installs.
+        ("agent.memory_provider", "MemoryProvider"),
     ):
         try:
             mod = __import__(mod_path, fromlist=[attr])

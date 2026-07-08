@@ -37,3 +37,13 @@ def test_detect_reports_hook_missing(fake_hermes_shim_needed: dict[str, Any]) ->
     assert result["hook_present"] is False
     assert result["provider"] == "hermes_agent.memory.provider.MemoryProvider"
     assert result["error"] is None
+
+
+def test_detect_reports_current_layout_native_hook_present(
+    fake_current_hermes_native: dict[str, Any],
+) -> None:
+    result = detect_prepare_memory_write()
+    assert result["hermes_present"] is True
+    assert result["hook_present"] is True
+    assert result["provider"] == "agent.memory_provider.MemoryProvider"
+    assert result["error"] is None
