@@ -33,6 +33,7 @@ ENV/
 # Environment / secrets
 .env
 .env.*
+!.env.example
 *.local
 secrets/
 

@@ -68,3 +68,8 @@ testpaths = ["tests"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
+
+# asyncpg ships no type stubs / py.typed marker.
+[[tool.mypy.overrides]]
+module = "asyncpg"
+ignore_missing_imports = true
