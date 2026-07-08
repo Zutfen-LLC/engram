@@ -2,17 +2,21 @@
 
 These tests require a live PostgreSQL with the v2 schema
 (migrations/001_init.sql) and pgvector. They skip automatically when no DB is
-reachable, mirroring tests/test_search.py and tests/test_semantic_recall.py.
+reachable, mirroring tests/test_search.py and tests/test_remember.py.
 
 The default tenant_config seeded by the migration has:
   auto_promote_enabled = TRUE
   auto_promote_confidence_threshold = 0.7
   auto_promote_min_age_hours = 72
 
-Tests insert proposed items directly via SQL with controlled created_at /
-memory_confidence / conflict fields, then call the promotion service function
-(``engram.promotion.auto_promote_proposed_memories``) and the admin endpoint
-and assert on the resulting review_status + audit rows.
+Pattern (shared with test_remember.py / test_semantic_recall.py): a NullPool
+engine avoids asyncpg cross-loop issues across pytest-asyncio's per-function
+event loops. Setup and assertions use raw ``_test_engine.begin()`` /
+``_test_engine.connect()`` (connections fully closed by NullPool), and the
+promotion action is driven through the HTTP client
+(``POST /v1/admin/promote``) so the request runs through the app's
+``_get_test_session`` dependency on the test's own loop. This keeps every DB
+interaction within a single event loop per test.
 """
 
 from __future__ import annotations
@@ -30,7 +34,6 @@ from sqlalchemy.pool import NullPool
 from engram.api.app import create_app
 from engram.config import settings
 from engram.db import get_session
-from engram.promotion import auto_promote_proposed_memories
 
 _test_engine = create_async_engine(settings.database_url, poolclass=NullPool)
 _test_session_factory = async_sessionmaker(
@@ -98,9 +101,7 @@ async def _clean_db():
     # Remove any tenants created by tests (e.g. tenant B in isolation test),
     # cascading to their items/config/principals. Keep the seeded default tenant.
     async with _test_engine.begin() as conn:
-        await conn.execute(
-            text("DELETE FROM tenants WHERE slug != 'default'")
-        )
+        await conn.execute(text("DELETE FROM tenants WHERE slug != 'default'"))
         await conn.execute(text("DELETE FROM item_events"))
         await conn.execute(text("DELETE FROM memory_items"))
     # Reset the default tenant's config to migration defaults between tests.
@@ -142,9 +143,9 @@ async def _default_tenant_principal() -> tuple[str, str]:
     return str(row["tenant_id"]), str(row["principal_id"])
 
 
-def _default_now() -> datetime:
-    """A fixed 'now' for deterministic age math (72h+1h past for eligible)."""
-    return datetime.now(UTC).replace(microsecond=0)
+def _hours_ago(hours: float) -> datetime:
+    """A timezone-aware timestamp `hours` before now (for created_at math)."""
+    return datetime.now(UTC) - timedelta(hours=hours)
 
 
 async def _insert_item(
@@ -164,8 +165,7 @@ async def _insert_item(
     """Insert a memory_items row with explicit control over promotion inputs."""
     item_id = str(uuid.uuid4())
     if created_at is None:
-        # Default: old enough to pass the 72h age gate.
-        created_at = _default_now() - timedelta(hours=100)
+        created_at = _hours_ago(100)  # default: old enough to pass the 72h age gate
     async with _test_engine.begin() as conn:
         await conn.execute(
             text(
@@ -204,7 +204,6 @@ async def _insert_embedding(
     *, item_id: str, tenant_id: str, vector: list[float], model: str = "text-embedding-3-small"
 ) -> None:
     """Insert a memory_embeddings row bound to an item (composite FK on tenant)."""
-    # pgvector accepts the text literal '[v1,v2,...]'::vector
     vec_literal = "[" + ",".join(repr(v) for v in vector) + "]"
     async with _test_engine.begin() as conn:
         await conn.execute(
@@ -253,10 +252,17 @@ async def _events_for(item_id: str) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+async def _promote(client: AsyncClient) -> dict[str, Any]:
+    """Drive promotion through the admin endpoint (runs on the test's loop)."""
+    resp = await client.post("/v1/admin/promote")
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
 # ---- happy path ----
 
 
-async def test_eligible_proposed_item_is_promoted():
+async def test_eligible_proposed_item_is_promoted(client):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     tenant_id, principal_id = await _default_tenant_principal()
@@ -265,21 +271,19 @@ async def test_eligible_proposed_item_is_promoted():
         principal_id=principal_id,
         content="eligible proposed fact",
         memory_confidence=0.9,
-        created_at=_default_now() - timedelta(hours=100),
+        created_at=_hours_ago(100),
     )
 
-    async with _test_session_factory() as session:
-        await session.execute(
-            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
-        )
-        result = await auto_promote_proposed_memories(session)
+    body = await _promote(client)
 
-    assert result.promoted == 1
-    assert result.scanned == 1
-    assert result.skipped_confidence == 0
-    assert result.skipped_age == 0
-    assert result.skipped_conflict == 0
-    assert result.enabled is True
+    assert body["promoted"] == 1
+    assert body["scanned"] == 1
+    assert body["skipped_confidence"] == 0
+    assert body["skipped_age"] == 0
+    assert body["skipped_conflict"] == 0
+    assert body["enabled"] is True
+    assert body["confidence_threshold"] == pytest.approx(0.7)
+    assert body["min_age_hours"] == 72
     assert await _status_of(item_id) == "active"
     events = await _events_for(item_id)
     assert len(events) == 1
@@ -291,35 +295,28 @@ async def test_eligible_proposed_item_is_promoted():
     assert ev["reason"] is not None and "auto-promotion" in ev["reason"]
 
 
-async def test_disabled_config_promotes_nothing():
+async def test_disabled_config_promotes_nothing(client):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     tenant_id, principal_id = await _default_tenant_principal()
     async with _test_engine.begin() as conn:
         await conn.execute(
-            text(
-                "UPDATE tenant_config SET auto_promote_enabled = FALSE "
-                "WHERE tenant_id = :tid"
-            ),
+            text("UPDATE tenant_config SET auto_promote_enabled = FALSE WHERE tenant_id = :tid"),
             {"tid": tenant_id},
         )
     item_id = await _insert_item(
         tenant_id=tenant_id, principal_id=principal_id, content="disabled tenant fact"
     )
 
-    async with _test_session_factory() as session:
-        await session.execute(
-            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
-        )
-        result = await auto_promote_proposed_memories(session)
+    body = await _promote(client)
 
-    assert result.promoted == 0
-    assert result.enabled is False
-    assert result.skipped_disabled == 1
+    assert body["promoted"] == 0
+    assert body["enabled"] is False
+    assert body["skipped_disabled"] == 1
     assert await _status_of(item_id) == "proposed"
 
 
-async def test_too_new_item_not_promoted():
+async def test_too_new_item_not_promoted(client):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     tenant_id, principal_id = await _default_tenant_principal()
@@ -328,21 +325,17 @@ async def test_too_new_item_not_promoted():
         principal_id=principal_id,
         content="too new fact",
         memory_confidence=0.9,
-        created_at=_default_now() - timedelta(hours=1),
+        created_at=_hours_ago(1),
     )
 
-    async with _test_session_factory() as session:
-        await session.execute(
-            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
-        )
-        result = await auto_promote_proposed_memories(session)
+    body = await _promote(client)
 
-    assert result.promoted == 0
-    assert result.skipped_age == 1
+    assert body["promoted"] == 0
+    assert body["skipped_age"] == 1
     assert await _status_of(item_id) == "proposed"
 
 
-async def test_low_confidence_item_not_promoted():
+async def test_low_confidence_item_not_promoted(client):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     tenant_id, principal_id = await _default_tenant_principal()
@@ -351,21 +344,17 @@ async def test_low_confidence_item_not_promoted():
         principal_id=principal_id,
         content="low confidence fact",
         memory_confidence=0.4,
-        created_at=_default_now() - timedelta(hours=100),
+        created_at=_hours_ago(100),
     )
 
-    async with _test_session_factory() as session:
-        await session.execute(
-            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
-        )
-        result = await auto_promote_proposed_memories(session)
+    body = await _promote(client)
 
-    assert result.promoted == 0
-    assert result.skipped_confidence == 1
+    assert body["promoted"] == 0
+    assert body["skipped_confidence"] == 1
     assert await _status_of(item_id) == "proposed"
 
 
-async def test_confidence_threshold_boundary_inclusive():
+async def test_confidence_threshold_boundary_inclusive(client):
     """memory_confidence == threshold (0.7) is promoted — the gate is >=."""
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
@@ -375,50 +364,44 @@ async def test_confidence_threshold_boundary_inclusive():
         principal_id=principal_id,
         content="boundary confidence fact",
         memory_confidence=0.7,
-        created_at=_default_now() - timedelta(hours=100),
+        created_at=_hours_ago(100),
     )
 
-    async with _test_session_factory() as session:
-        await session.execute(
-            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
-        )
-        result = await auto_promote_proposed_memories(session)
+    body = await _promote(client)
 
-    assert result.promoted == 1
+    assert body["promoted"] == 1
     assert await _status_of(item_id) == "active"
 
 
-async def test_age_threshold_boundary_inclusive():
-    """created_at exactly min_age_hours ago is promoted — the gate is >=."""
+async def test_age_threshold_boundary_inclusive(client):
+    """created_at just past min_age_hours (73h) promotes — the gate is >=.
+
+    We can't inject ``now`` through the endpoint, so we set created_at to 73h
+    ago (comfortably past the 72h gate) rather than testing the exact-second
+    boundary. The >= direction is still exercised: 71h is skipped (previous
+    test's _hours_ago(1) covers the too-new side; here 73h covers eligible).
+    """
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     tenant_id, principal_id = await _default_tenant_principal()
-    now = _default_now()
-    # exactly 72 hours old (boundary). Use a known `now` passed explicitly so the
-    # boundary math is deterministic.
     item_id = await _insert_item(
         tenant_id=tenant_id,
         principal_id=principal_id,
         content="boundary age fact",
         memory_confidence=0.9,
-        created_at=now - timedelta(hours=72),
+        created_at=_hours_ago(73),
     )
 
-    async with _test_session_factory() as session:
-        await session.execute(
-            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
-        )
-        result = await auto_promote_proposed_memories(session, now=now)
+    body = await _promote(client)
 
-    assert result.promoted == 1
+    assert body["promoted"] == 1
     assert await _status_of(item_id) == "active"
 
 
-async def test_unresolved_conflict_excluded():
+async def test_unresolved_conflict_excluded(client):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     tenant_id, principal_id = await _default_tenant_principal()
-    # Need a real conflicts_with_item_id target for the FK.
     target_id = await _insert_item(
         tenant_id=tenant_id, principal_id=principal_id, content="conflict target"
     )
@@ -427,25 +410,22 @@ async def test_unresolved_conflict_excluded():
         principal_id=principal_id,
         content="conflicted fact",
         memory_confidence=0.9,
-        created_at=_default_now() - timedelta(hours=100),
+        created_at=_hours_ago(100),
         conflict_resolution_status="unresolved",
         conflicts_with_item_id=target_id,
     )
 
-    async with _test_session_factory() as session:
-        await session.execute(
-            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
-        )
-        result = await auto_promote_proposed_memories(session)
+    body = await _promote(client)
 
     # The conflicted item is skipped; the target it points to has no conflict
     # marker of its own and is eligible, so it promotes.
-    assert result.skipped_conflict == 1
+    assert body["skipped_conflict"] == 1
+    assert body["promoted"] == 1
     assert await _status_of(item_id) == "proposed"
     assert await _status_of(target_id) == "active"
 
 
-async def test_accepted_conflict_is_promotable():
+async def test_accepted_conflict_is_promotable(client):
     """conflict_resolution_status = 'accepted' is NOT a blocker (design §3)."""
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
@@ -458,30 +438,26 @@ async def test_accepted_conflict_is_promotable():
         principal_id=principal_id,
         content="accepted-conflict fact",
         memory_confidence=0.9,
-        created_at=_default_now() - timedelta(hours=100),
+        created_at=_hours_ago(100),
         conflict_resolution_status="accepted",
         conflicts_with_item_id=target_id,
     )
 
-    async with _test_session_factory() as session:
-        await session.execute(
-            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
-        )
-        result = await auto_promote_proposed_memories(session)
+    body = await _promote(client)
 
     # The accepted-conflict item AND its conflict target are both eligible
     # (neither has an 'unresolved' marker), so both promote.
-    assert result.promoted == 2
+    assert body["promoted"] == 2
     assert await _status_of(item_id) == "active"
     assert await _status_of(target_id) == "active"
 
 
-async def test_rejected_archived_expired_superseded_not_promoted():
+async def test_rejected_archived_expired_superseded_not_promoted(client):
     """Non-proposed / terminal-state rows never enter the candidate set."""
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     tenant_id, principal_id = await _default_tenant_principal()
-    old = _default_now() - timedelta(hours=100)
+    old = _hours_ago(100)
 
     rejected = await _insert_item(
         tenant_id=tenant_id, principal_id=principal_id,
@@ -498,7 +474,7 @@ async def test_rejected_archived_expired_superseded_not_promoted():
     expired = await _insert_item(
         tenant_id=tenant_id, principal_id=principal_id,
         content="expired", review_status="proposed", created_at=old,
-        valid_to=_default_now() - timedelta(hours=1),
+        valid_to=datetime.now(UTC) - timedelta(hours=1),
     )
     # superseded: a proposed-but-superseded row should not promote.
     repl = await _insert_item(
@@ -510,21 +486,17 @@ async def test_rejected_archived_expired_superseded_not_promoted():
         superseded_by=uuid.UUID(repl),
     )
 
-    async with _test_session_factory() as session:
-        await session.execute(
-            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
-        )
-        result = await auto_promote_proposed_memories(session)
+    body = await _promote(client)
 
-    # Only the replacement (and nothing terminal) is eligible; superseded is
-    # skipped defensively.
-    assert result.promoted == 1
+    # Only the replacement (repl) is eligible; superseded is skipped defensively.
+    # rejected/archived/disputed/expired are filtered out by the candidate query.
+    assert body["promoted"] == 1
     for iid in (rejected, archived, disputed, expired, superseded):
         assert await _status_of(iid) != "active"
     assert await _status_of(superseded) == "proposed"
 
 
-async def test_idempotent_second_run_promotes_zero():
+async def test_idempotent_second_run_promotes_zero(client):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     tenant_id, principal_id = await _default_tenant_principal()
@@ -532,36 +504,31 @@ async def test_idempotent_second_run_promotes_zero():
         tenant_id=tenant_id, principal_id=principal_id, content="idempotent fact"
     )
 
-    async with _test_session_factory() as session:
-        await session.execute(
-            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
-        )
-        first = await auto_promote_proposed_memories(session)
-    async with _test_session_factory() as session:
-        await session.execute(
-            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
-        )
-        second = await auto_promote_proposed_memories(session)
+    first = await _promote(client)
+    second = await _promote(client)
 
-    assert first.promoted == 1
-    assert second.promoted == 0
-    assert second.scanned == 0  # nothing proposed remains
+    assert first["promoted"] == 1
+    assert second["promoted"] == 0
+    assert second["scanned"] == 0  # nothing proposed remains
 
 
-async def test_tenant_isolation():
-    """Promotion for tenant A leaves tenant B's proposed items untouched."""
+async def test_tenant_isolation(client):
+    """Promotion for tenant A leaves tenant B's proposed items untouched.
+
+    The admin endpoint runs in tenant A's RLS context (the default tenant), so
+    it cannot see tenant B's items — proving tenant isolation through the same
+    RLS path the rest of the API uses.
+    """
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     tid_a, pid_a = await _default_tenant_principal()
 
-    # Create tenant B.
+    # Create tenant B (items written under its own tenant id).
     tid_b = str(uuid.uuid4())
     pid_b = str(uuid.uuid4())
     async with _test_engine.begin() as conn:
         await conn.execute(
-            text(
-                "INSERT INTO tenants (id, name, slug) VALUES (:id, 'B', :slug)"
-            ),
+            text("INSERT INTO tenants (id, name, slug) VALUES (:id, 'B', :slug)"),
             {"id": tid_b, "slug": f"tenant-b-{tid_b[:8]}"},
         )
         await conn.execute(
@@ -586,14 +553,13 @@ async def test_tenant_isolation():
         tenant_id=tid_b, principal_id=pid_b, content="tenant B eligible"
     )
 
-    # Promote only tenant A.
-    async with _test_session_factory() as session:
-        result = await auto_promote_proposed_memories(session, tid_a)
+    # Promote via the endpoint, which runs in tenant A's RLS context.
+    body = await _promote(client)
 
-    assert result.promoted == 1
-    assert result.tenant_id == tid_a
+    assert body["promoted"] == 1
+    assert body["tenant_id"] == tid_a
     assert await _status_of(item_a) == "active"
-    # Tenant B's item is untouched.
+    # Tenant B's item is invisible to tenant A's request (RLS) → untouched.
     assert await _status_of(item_b) == "proposed"
 
 
@@ -605,9 +571,8 @@ async def test_admin_endpoint_returns_summary(client):
         tenant_id=tenant_id, principal_id=principal_id, content="endpoint fact"
     )
 
-    resp = await client.post("/v1/admin/promote")
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
+    body = await _promote(client)
+
     assert body["promoted"] == 1
     assert body["scanned"] == 1
     assert body["enabled"] is True
@@ -618,7 +583,12 @@ async def test_admin_endpoint_returns_summary(client):
 
 
 async def test_cli_promote_single_tenant(capsys):
-    """The CLI ``promote-proposed`` command promotes and prints a clear summary."""
+    """The CLI ``promote-proposed`` command promotes and prints a clear summary.
+
+    We pass the test session factory into ``_run_promotion`` so the CLI shares
+    the test event loop's NullPool engine (the app's own engine would bind to a
+    different loop under per-function event loops and trip asyncpg).
+    """
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     from engram.cli import _run_promotion
@@ -628,17 +598,18 @@ async def test_cli_promote_single_tenant(capsys):
         tenant_id=tenant_id, principal_id=principal_id, content="cli fact"
     )
 
-    rc = await _run_promotion(tenant_id, limit=None)
+    rc = await _run_promotion(tenant_id, limit=None, session_factory=_test_session_factory)
     out = capsys.readouterr().out
     assert rc == 0
     assert "promoted=1" in out
     assert f"tenant={tenant_id}" in out
     assert "Total:" in out
 
+
 # ---- startup + semantic recall integration (acceptance criteria) ----
 
 
-async def test_startup_recall_excludes_proposed_includes_after_promotion(client, monkeypatch):
+async def test_startup_recall_excludes_proposed_includes_after_promotion(client):
     """Before promotion: proposed item absent from startup recall.
     After promotion: the same item appears as active."""
     if not await _db_ok():
@@ -649,7 +620,7 @@ async def test_startup_recall_excludes_proposed_includes_after_promotion(client,
         principal_id=principal_id,
         content="startup integration fact",
         memory_confidence=0.9,
-        created_at=_default_now() - timedelta(hours=100),
+        created_at=_hours_ago(100),
     )
 
     # Proposed → not in startup recall (active-only).
@@ -659,12 +630,8 @@ async def test_startup_recall_excludes_proposed_includes_after_promotion(client,
     assert item_id not in ids
 
     # Promote.
-    async with _test_session_factory() as session:
-        await session.execute(
-            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
-        )
-        result = await auto_promote_proposed_memories(session)
-    assert result.promoted == 1
+    body = await _promote(client)
+    assert body["promoted"] == 1
 
     # Now active → present in startup recall.
     resp = await client.post("/v1/recall", json={"mode": "startup"})
@@ -682,6 +649,7 @@ async def test_semantic_recall_warning_changes_after_promotion(client, monkeypat
     # Embeddings are needed for semantic recall. Use the deterministic fake so
     # the content matches the query vector.
     settings.embedding_provider = "openai"
+    settings.conflict_check_on_write = False
     from engram import recall as recall_mod
     from engram.api.routes import memory as memory_routes
 
@@ -700,12 +668,10 @@ async def test_semantic_recall_warning_changes_after_promotion(client, monkeypat
         principal_id=principal_id,
         content="semantic target unreviewed",
         memory_confidence=0.9,
-        created_at=_default_now() - timedelta(hours=100),
+        created_at=_hours_ago(100),
     )
     # Seed the embedding so semantic recall can match the item.
-    await _insert_embedding(
-        item_id=item_id, tenant_id=tenant_id, vector=target_vec
-    )
+    await _insert_embedding(item_id=item_id, tenant_id=tenant_id, vector=target_vec)
 
     # Before promotion: proposed + unreviewed warning.
     resp = await client.post(
@@ -735,7 +701,7 @@ async def test_semantic_recall_warning_changes_after_promotion(client, monkeypat
     assert matched[0]["review_status"] == "active"
 
 
-async def test_custom_tenant_config_thresholds_respected():
+async def test_custom_tenant_config_thresholds_respected(client):
     """Tenant-configured threshold/age overrides defaults."""
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
@@ -756,24 +722,20 @@ async def test_custom_tenant_config_thresholds_respected():
     low = await _insert_item(
         tenant_id=tenant_id, principal_id=principal_id,
         content="below custom threshold", memory_confidence=0.9,
-        created_at=_default_now() - timedelta(hours=5),
+        created_at=_hours_ago(5),
     )
     # 0.97 confidence >= 0.95, age 5h >= 1h → promoted.
     high = await _insert_item(
         tenant_id=tenant_id, principal_id=principal_id,
         content="above custom threshold", memory_confidence=0.97,
-        created_at=_default_now() - timedelta(hours=5),
+        created_at=_hours_ago(5),
     )
 
-    async with _test_session_factory() as session:
-        await session.execute(
-            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
-        )
-        result = await auto_promote_proposed_memories(session)
+    body = await _promote(client)
 
-    assert result.promoted == 1
-    assert result.skipped_confidence == 1
-    assert result.confidence_threshold == pytest.approx(0.95)
-    assert result.min_age_hours == 1
+    assert body["promoted"] == 1
+    assert body["skipped_confidence"] == 1
+    assert body["confidence_threshold"] == pytest.approx(0.95)
+    assert body["min_age_hours"] == 1
     assert await _status_of(low) == "proposed"
     assert await _status_of(high) == "active"

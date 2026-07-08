@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from typing import Any
 
 from engram import __version__
 
@@ -68,20 +69,30 @@ def main() -> None:
         parser.print_help()
 
 
-async def _run_promotion(tenant_id: str | None, limit: int | None) -> int:
+async def _run_promotion(
+    tenant_id: str | None,
+    limit: int | None,
+    session_factory: Any | None = None,
+) -> int:
     """Run Path A auto-promotion and print a per-tenant summary.
 
     Returns 0 on success. Connecting as the table-owning role (default ``engram``)
     bypasses RLS so every tenant is scanned; the service still filters by an
     explicit ``tenant_id`` so results are correct under RLS too.
+
+    ``session_factory`` defaults to the app's ``engram.db.async_session_factory``;
+    tests pass their own NullPool factory so the CLI shares the test event loop's
+    engine (avoiding asyncpg cross-loop connection issues).
     """
     from sqlalchemy import select
 
-    from engram.db import async_session_factory
+    from engram.db import async_session_factory as _default_factory
     from engram.models import Tenant
     from engram.promotion import auto_promote_proposed_memories, summarize
 
-    async with async_session_factory() as session:
+    factory = session_factory if session_factory is not None else _default_factory
+
+    async with factory() as session:
         if tenant_id is not None:
             tenant_ids: list[str] = [tenant_id]
         else:
