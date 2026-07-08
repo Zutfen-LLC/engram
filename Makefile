@@ -1,4 +1,4 @@
-.PHONY: lint typecheck test check
+.PHONY: lint typecheck test check setup-python-dev
 
 # Use virtual environment executables
 VENV_BIN = .venv/bin
@@ -14,3 +14,6 @@ test:
 
 check: lint typecheck test
 	@echo "All checks passed!"
+
+setup-python-dev:
+	bash scripts/setup-python-dev.sh

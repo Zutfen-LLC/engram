@@ -21,15 +21,38 @@ All tool names are prefixed with `engram_`.
 
 ## Install
 
-From the repository root:
+For a raw local repo checkout, bootstrap the repo venv so both sibling packages
+(the SDK and the MCP adapter) are installed and importable without `PYTHONPATH`:
 
 ```bash
-pip install -e adapters/mcp-server
+bash scripts/setup-python-dev.sh
+# or: make setup-python-dev
 ```
 
-This pulls in the sibling Engram SDK (`sdk/engram-client`) via a path dependency,
-the `mcp` package, `httpx`, and `pydantic`. It installs the `engram-mcp` console
-script.
+This runs `uv sync --extra dev`, then installs both editable local packages into
+`./.venv`:
+
+- `sdk/engram-client`
+- `adapters/mcp-server`
+
+After that, both of these work from the repo venv:
+
+```bash
+.venv/bin/python -m engram_mcp
+.venv/bin/engram-mcp
+```
+
+If you only want the adapter install commands explicitly, run:
+
+```bash
+uv pip install --python .venv/bin/python \
+  -e sdk/engram-client \
+  -e adapters/mcp-server
+```
+
+The order matters: the local SDK must be installed into the venv before the
+adapter so the adapter's `engram-client>=0.1.0` runtime dependency is already
+satisfied from the repo checkout.
 
 ## Configuration
 

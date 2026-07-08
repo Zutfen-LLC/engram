@@ -18,3 +18,14 @@ Imports entries from a Zutfen CCA JSON ledger file.
 ```bash
 python scripts/import_cca.py --cca-file /path/to/hermes-memory.json --engram-url http://localhost:8000
 ```
+
+## setup-python-dev.sh
+
+Bootstraps the repo's `./.venv` for local Python development, then installs the
+editable sibling SDK and MCP adapter packages so they are importable without
+setting `PYTHONPATH`.
+
+```bash
+bash scripts/setup-python-dev.sh
+# or: make setup-python-dev
+```
