@@ -67,13 +67,21 @@ search — embeddings are the service's job.
 From the repository root:
 
 ```bash
-pip install -e adapters/engram-hooks
+# preferred local-dev bootstrap (installs sibling SDK + both adapters into ./.venv)
+bash scripts/setup-python-dev.sh
+
+# direct adapter install if the sibling SDK is already installed in the target env
+uv pip install --python .venv/bin/python -e adapters/engram-hooks
 ```
 
-This pulls in the sibling Engram SDK (`sdk/engram-client`) via a path dependency,
-plus `pydantic`. `httpx` comes transitively via the SDK. Hermes itself is **not**
-a dependency — the plugin loads on stock Hermes (or with no Hermes installed at
-all, for testing).
+`engram-hooks` depends on `engram-client`, but the repo's canonical dev flow is
+to install the sibling SDK into the same environment first via
+`scripts/setup-python-dev.sh`. The adapter metadata deliberately uses the normal
+package dependency name (`engram-client>=0.1.0`) instead of a relative `file:`
+URL so editable installs do not fail during wheel metadata generation.
+
+Hermes itself is **not** a dependency — the plugin loads on stock Hermes (or
+with no Hermes installed at all, for testing).
 
 ## Configuration
 

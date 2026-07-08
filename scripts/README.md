@@ -52,7 +52,7 @@ original `captured_at` preserved as `valid_from`.
 ## setup-python-dev.sh
 
 Bootstraps the repo's `./.venv` for local Python development, then installs the
-editable sibling SDK and MCP adapter packages so they are importable without
+editable sibling SDK plus both adapter packages so they are importable without
 setting `PYTHONPATH`.
 
 ```bash

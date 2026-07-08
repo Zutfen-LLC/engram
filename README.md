@@ -114,8 +114,9 @@ See `docs/design.md` for the full architecture.
 
 ## Local Python development setup
 
-If you want the repo's `.venv` to be able to import the sibling SDK and MCP
-adapter directly (so `python -m engram_mcp` works without setting `PYTHONPATH`),
+If you want the repo's `.venv` to be able to import the sibling SDK plus both
+adapters directly (so `python -m engram_mcp` and `import engram_hooks` work
+without setting `PYTHONPATH`),
 run:
 
 ```bash
@@ -127,12 +128,14 @@ This bootstraps `./.venv`, then installs these editable local packages into it:
 
 - `sdk/engram-client`
 - `adapters/mcp-server`
+- `adapters/engram-hooks`
 
 After that, these commands work from the repo checkout:
 
 ```bash
 .venv/bin/python -m engram_mcp
 .venv/bin/engram-mcp
+.venv/bin/python -c 'import engram_hooks'
 ```
 
 ## Key Concepts
