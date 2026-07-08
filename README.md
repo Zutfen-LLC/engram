@@ -278,46 +278,103 @@ Engram uses evocative naming drawn from memory palace traditions.
 
 ## Status
 
-**Phase 1A — Canonical memory MVP**
+Engram's MVP is **implemented and dogfood-deployed** — not a skeleton or a plan.
+The canonical memory service, the full trust workflow, and the agent adapters
+all exist and are exercised by a live, network-verified deployment.
 
-* [x] Postgres schema + migrations
-* [x] Row Level Security foundation
-* [x] Full-text search foundation
-* [x] pgvector embedding storage foundation
-* [x] FastAPI service skeleton
-* [x] Docker Compose deployment
-* [ ] Functional endpoints: remember, recall, search, items, export
-* [ ] CCA import
-* [ ] Python SDK
+> **What "verified" means here:** implemented = code exists and is unit/integration
+> tested (CI runs the full suite against Postgres 16 + pgvector 0.8);
+> dogfood-verified = exercised against the running deployment recorded in
+> [`docs/ops/dogfood-verification.md`](docs/ops/dogfood-verification.md);
+> deferred = explicitly post-MVP (see `docs/plans/engram-mvp-backlog.md`).
 
-Phase 1B adds LLM classification, review workflow, and conflict detection.
+### MVP capability matrix
 
-Phase 1C adds knowledge graph, tunnels, taxonomy browser, and deeper recall tooling.
+| Capability                                                              | Implemented | Dogfood-verified |
+| ----------------------------------------------------------------------- | :---------: | :--------------: |
+| Schema + migrations (15 tables), RLS, FTS, pgvector storage            |     yes     |       yes        |
+| `POST /v1/remember` (trust fields, dedup, supersession, secret guard)   |     yes     |       yes        |
+| Startup recall (scoring, pinned bypass, anti-feedback loop, reasons)    |     yes     |       yes        |
+| Semantic recall (`mode=semantic`, proposed items tagged `unreviewed`)   |     yes     |   over FTS\*     |
+| Keyword / semantic / hybrid search                                      |     yes     |   over FTS\*     |
+| Item CRUD, PATCH with audited `item_events`, review/verify/supersede    |     yes     |       yes        |
+| Write-time conflict detection + resolution                             |     yes     |       yes        |
+| Feedback endpoint + recall explanations + warnings                      |     yes     |       yes        |
+| Knowledge graph (visibility inheritance), taxonomy, tunnels, diary      |     yes     |       yes        |
+| Memory hygiene (stale detection, bulk-archive, stats)                   |     yes     |       —          |
+| LLM + rule-based classification                                         |     yes     |       —          |
+| Auto-promotion — Path A (age + confidence + no conflict)                |     yes     |       —          |
+| CCA export + importers (CCA, MemPalace — dry-run/apply)                 |     yes     |       —          |
+| API-key auth + admin endpoints (scopes, bootstrap flow)                 |     yes     |       yes        |
+| Python SDK (async client over REST)                                     |     yes     |       yes        |
+| MCP adapter (stdio, all tools)                                          |     yes     |       yes        |
+| Embedding backfill (`engram backfill-embeddings`)                       |     yes     |    mocked only   |
+| Deployment artifacts (Compose, `.env.example`, backup, `init-db`)       |     yes     |       yes        |
+| **Dogfood deployment** (auth-enabled, network-reachable, backed up)     |     yes     |       yes        |
 
-Phase 2 integrates Engram with Hermes and agent lifecycle hooks.
+\* Semantic/vector recall and search are implemented and tested, but the
+dogfood deployment runs with `ENGRAM_EMBEDDING_PROVIDER=none` (intentionally
+disabled for initial dogfooding). Keyword/FTS recall and search are verified
+live over the network. The live OpenAI embedding path has **not** been
+recorded-verified yet — see `docs/embeddings.md`.
 
-Phase 3 prepares Engram for broader open-source release.
+### Explicitly deferred (post-MVP)
+
+These are intentionally out of scope for the MVP and tracked in
+`docs/plans/engram-mvp-backlog.md`:
+
+* **Production data migration runs** (CCA + MemPalace `--apply` against the live
+  instance) — BL-011. The importers are built; only the operational import is pending.
+* **engram-hooks / Hermes automatic lifecycle capture** — BL-012. The companion
+  library is written, but Hermes lifecycle integration is not yet verified
+  end-to-end. Explicit MCP-driven dogfooding works today; *automatic* memory
+  capture is post-MVP.
+* Auto-promotion **Path B** (usage-validated quorum).
+* Hard delete + `deletion_events` tombstones + KG cascade.
+* PII-risk classification and sensitive-read audit logging.
+* Admin list/update/delete + console; multi-way conflict table.
+* Local (non-OpenAI) embedding provider; Helm/cloud artifacts.
+* Phase 3 open-source packaging hardening.
+
+## Dogfooding
+
+Engram runs on a dedicated VM ("`engram01`"), reachable over a Tailscale mesh,
+with auth enabled, a bootstrap API key issued, nightly `pg_dump` backups, and a
+restore smoke test. The full sanitized verification record — deployment,
+network health, authenticated remember→recall round trips, MCP adapter smoke,
+backup/restore — lives in
+[`docs/ops/dogfood-verification.md`](docs/ops/dogfood-verification.md).
+
+The dogfood interface is the **MCP adapter**: agents call `engram_remember`,
+`engram_recall`, and `engram_search` over stdio against the deployed instance.
+See [`adapters/mcp-server/README.md`](adapters/mcp-server/README.md) for setup
+and the Hermes config example.
+
+> Hostnames, IPs, and API keys are deliberately omitted from the public repo.
+> Operators hold the real values in a secret manager.
 
 ## Roadmap
 
-Engram is being built in layers:
+Engram is being built in layers. The first four are largely landed; layer five
+(open-source readiness) is the active frontier.
 
-1. **Canonical memory MVP**
+1. **Canonical memory MVP** — *done.*
    Durable storage, core schema, REST foundation, recall primitives, import/export.
-
-2. **Trustable memory workflow**
-   Classification, review states, promotion, disputes, conflict detection, and provenance.
-
-3. **Rich memory topology**
+2. **Trustable memory workflow** — *done.*
+   Classification, review states, promotion (Path A), disputes, conflict detection, provenance.
+3. **Rich memory topology** — *done.*
    Knowledge graph, tunnels, taxonomy browser, and relationship-aware recall.
+4. **Agent integration** — *SDK and MCP done and verified; Hermes automatic
+   lifecycle capture (`engram-hooks`) written but unverified (post-MVP).*
+   MCP, SDK, startup + semantic recall, and pre-compression/sync-turn capture
+   (the latter awaiting engram-hooks verification).
+5. **Open-source readiness** — *in progress.*
+   Documentation pass, examples, deployment hardening, security review, and
+   hosted-service preparation.
 
-4. **Agent integration**
-   MCP, SDK, Hermes integration, lifecycle hooks, startup recall, semantic recall, and pre-compression memory capture.
-
-5. **Open-source readiness**
-   Documentation, examples, deployment hardening, security review, and hosted-service preparation.
-
-See `docs/design.md` for the full design document and `docs/backlog.json` for the implementation roadmap.
+See [`docs/design.md`](docs/design.md) for the full design document and
+[`docs/plans/engram-mvp-backlog.md`](docs/plans/engram-mvp-backlog.md) for the
+execution backlog and post-MVP work.
 
 ## License
 
