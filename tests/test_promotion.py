@@ -205,33 +205,6 @@ async def _insert_item(
     return item_id
 
 
-async def _insert_embedding(
-    *, item_id: str, tenant_id: str, vector: list[float], model: str = "text-embedding-3-small"
-) -> None:
-    """Insert a memory_embeddings row bound to an item (composite FK on tenant)."""
-    # pgvector accepts the text literal '[v1,v2,...]'::vector
-    vec_literal = "[" + ",".join(repr(v) for v in vector) + "]"
-    async with _test_session_factory() as session:
-        await session.execute(
-            text(
-                "INSERT INTO memory_embeddings "
-                "(id, memory_item_id, tenant_id, embedding_model, embedding_dim, "
-                "embedding, embedded_at, embedding_status) VALUES ("
-                ":id, :item_id, :tenant_id, :model, :dim, "
-                "CAST(:vec AS vector), now(), 'complete')"
-            ),
-            {
-                "id": str(uuid.uuid4()),
-                "item_id": item_id,
-                "tenant_id": tenant_id,
-                "model": model,
-                "dim": len(vector),
-                "vec": vec_literal,
-            },
-        )
-        await session.commit()
-
-
 async def _status_of(item_id: str) -> str:
     async with _test_session_factory() as session:
         return str(
@@ -608,10 +581,24 @@ async def test_tenant_isolation():
 async def test_admin_endpoint_returns_summary(client):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
-    tenant_id, principal_id = await _default_tenant_principal()
-    await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id, content="endpoint fact"
+    # Write a proposed item via the write path (client-first establishes the
+    # engine's connection on the request loop), then make it promotion-eligible
+    # via a session-after-client tweak (the pattern test_semantic_recall uses).
+    create = await client.post(
+        "/v1/remember",
+        json={"content": "endpoint fact", "source_type": "extraction"},
     )
+    assert create.status_code == 201, create.text
+    item_id = create.json()["id"]
+    async with _test_session_factory() as session:
+        await session.execute(
+            text(
+                "UPDATE memory_items SET memory_confidence = 0.9, "
+                "created_at = :old WHERE id = :id"
+            ),
+            {"old": _default_now() - timedelta(hours=100), "id": item_id},
+        )
+        await session.commit()
 
     resp = await client.post("/v1/admin/promote")
     assert resp.status_code == 200, resp.text
@@ -687,11 +674,11 @@ async def test_semantic_recall_warning_changes_after_promotion(client, monkeypat
     """Proposed item shows warnings=['unreviewed']; after promotion (active) no warning."""
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
-    tenant_id, principal_id = await _default_tenant_principal()
 
     # Embeddings are needed for semantic recall. Use the deterministic fake so
     # the content matches the query vector.
     settings.embedding_provider = "openai"
+    settings.conflict_check_on_write = False
     from engram import recall as recall_mod
     from engram.api.routes import memory as memory_routes
 
@@ -705,17 +692,25 @@ async def test_semantic_recall_warning_changes_after_promotion(client, monkeypat
     monkeypatch.setattr(recall_mod, "generate_embedding", fake_embedding)
     monkeypatch.setattr(memory_routes, "generate_embedding", fake_embedding)
 
-    item_id = await _insert_item(
-        tenant_id=tenant_id,
-        principal_id=principal_id,
-        content="semantic target unreviewed",
-        memory_confidence=0.9,
-        created_at=_default_now() - timedelta(hours=100),
+    # Write the item via the client so the engine's first connection lands on the
+    # request loop (mirrors test_semantic_recall). The write path also creates
+    # the embedding via the monkeypatched fake.
+    create = await client.post(
+        "/v1/remember",
+        json={"content": "semantic target unreviewed", "source_type": "extraction"},
     )
-    # Seed the embedding so semantic recall can match the item.
-    await _insert_embedding(
-        item_id=item_id, tenant_id=tenant_id, vector=target_vec
-    )
+    assert create.status_code == 201, create.text
+    item_id = create.json()["id"]
+    # Tweak to promotion-eligible (session-after-client is the proven-safe order).
+    async with _test_session_factory() as session:
+        await session.execute(
+            text(
+                "UPDATE memory_items SET memory_confidence = 0.9, "
+                "created_at = :old WHERE id = :id"
+            ),
+            {"old": _default_now() - timedelta(hours=100), "id": item_id},
+        )
+        await session.commit()
 
     # Before promotion: proposed + unreviewed warning.
     resp = await client.post(
