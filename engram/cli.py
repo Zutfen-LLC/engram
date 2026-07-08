@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from engram import __version__
@@ -16,13 +18,75 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("serve", help="Start the Engram API server")
-    sub.add_parser("init-db", help="Run database migrations")
+
+    init_parser = sub.add_parser(
+        "init-db",
+        help="Apply pending database migrations (idempotent). Tracks applied "
+        "migrations in a schema_migrations table. Use --baseline to record an "
+        "already-bootstrapped database (e.g. one created by Docker's first-boot "
+        "initdb) without re-running its migrations.",
+    )
+    init_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Database URL to migrate. Defaults to ENGRAM_DATABASE_URL. "
+        "Accepts postgresql+asyncpg:// or postgresql:// schemes.",
+    )
+    init_parser.add_argument(
+        "--baseline",
+        nargs="?",
+        const="all",
+        default=None,
+        metavar="UPTO",
+        help="Record migration files as applied WITHOUT executing them. Use once "
+        "on a database bootstrapped via Docker initdb.d or a manual 'psql -f', "
+        "so future migrations apply cleanly. With no value, baselines ALL current "
+        "files (assumes the DB already reflects every one of them). To avoid "
+        "masking a migration that shipped after the bootstrap, pass an explicit "
+        "cutoff filename, e.g. --baseline 002_backfill_indexes.sql (records that "
+        "file and everything before it).",
+    )
+    init_parser.add_argument(
+        "--migrations-dir",
+        default=None,
+        help="Directory of *.sql migration files (default: bundled migrations/).",
+    )
 
     key_parser = sub.add_parser(
         "generate-key", help="Generate a new API key and its bcrypt hash"
     )
     key_parser.add_argument(
         "--label", default=None, help="Optional label for the key"
+    )
+
+    bootstrap_parser = sub.add_parser(
+        "bootstrap-key",
+        help="Create the FIRST API key for the seeded default/admin principal. "
+        "Solves the chicken-and-egg first-key problem without hand-written SQL. "
+        "Prints the plaintext key exactly once; only a hash is stored.",
+    )
+    bootstrap_parser.add_argument(
+        "--label",
+        default="bootstrap",
+        help="Label for the bootstrap key (default: 'bootstrap').",
+    )
+    bootstrap_parser.add_argument(
+        "--scopes",
+        default="read,write,admin,export",
+        help="Comma-separated scopes for the bootstrap key "
+        "(default: read,write,admin,export).",
+    )
+    bootstrap_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Database URL. Defaults to ENGRAM_DATABASE_URL.",
+    )
+    bootstrap_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow creating an additional key even when a non-revoked key "
+        "already exists for the seeded admin principal. Without --force the "
+        "command refuses (idempotent guard against accidental duplicate keys).",
     )
 
     promote_parser = sub.add_parser(
@@ -93,7 +157,19 @@ def main() -> None:
 
         uvicorn.run("engram.api.app:app", host="0.0.0.0", port=8000, reload=False)
     elif args.command == "init-db":
-        print("Run migrations: psql -f migrations/001_init.sql")
+        from engram.config import settings
+
+        db_url = args.database_url or settings.database_url
+        migrations_dir = Path(args.migrations_dir) if args.migrations_dir else None
+        raise SystemExit(
+            asyncio.run(
+                _run_init_db(
+                    db_url,
+                    baseline=args.baseline,
+                    migrations_dir=migrations_dir,
+                )
+            )
+        )
     elif args.command == "generate-key":
         from engram.auth import generate_api_key, hash_api_key
 
@@ -107,6 +183,17 @@ def main() -> None:
             "Store the key_hash in the api_keys table. The plaintext key is "
             "shown only once.",
             file=sys.stderr,
+        )
+    elif args.command == "bootstrap-key":
+        from engram.config import settings
+
+        db_url = args.database_url or settings.database_url
+        raise SystemExit(
+            asyncio.run(
+                _run_bootstrap_key(
+                    db_url, label=args.label, scopes=args.scopes, force=args.force
+                )
+            )
         )
     elif args.command == "promote-proposed":
         raise SystemExit(asyncio.run(_run_promotion(args.tenant, args.limit)))
@@ -134,6 +221,315 @@ def main() -> None:
         )
     else:
         parser.print_help()
+
+
+# --- init-db ---------------------------------------------------------------
+
+
+def select_baseline_targets(all_names: list[str], baseline: str) -> list[str]:
+    """Return the migration filenames a ``--baseline`` run should record.
+
+    ``baseline="all"`` returns every name. An explicit cutoff filename returns
+    that file and everything before it (in sorted order), so a migration that
+    shipped after the external bootstrap is NOT recorded as applied. Raises
+    ``ValueError`` if the cutoff is not found in ``all_names``.
+    """
+    if baseline == "all":
+        return list(all_names)
+    if baseline not in all_names:
+        raise ValueError(
+            f"--baseline cutoff {baseline!r} not found in migrations "
+            f"({', '.join(all_names)})"
+        )
+    index = all_names.index(baseline)
+    return list(all_names[: index + 1])
+
+
+async def _run_init_db(
+    database_url: str,
+    *,
+    baseline: str | None = None,
+    migrations_dir: Path | None = None,
+) -> int:
+    """Apply pending migrations against ``database_url``.
+
+    Idempotent: applied migrations are recorded in a ``schema_migrations`` table
+    and skipped on subsequent runs.
+
+    ``baseline`` records migration files as applied WITHOUT executing them — for
+    databases bootstrapped out-of-band (Docker's first-boot ``initdb.d`` or a
+    manual ``psql -f``). It accepts either ``"all"`` (record every current file,
+    with a warning that this assumes the DB already reflects all of them) or a
+    specific cutoff filename (record that file and everything before it). The
+    cutoff avoids masking a migration that shipped after the external bootstrap.
+
+    Connects as the configured DB role (the table owner), which bypasses RLS so
+    DDL and seed inserts apply. Returns 0 on success, non-zero on error.
+    """
+    import asyncpg
+
+    from engram.migrations import (
+        SCHEMA_MIGRATIONS_DDL,
+        discover_migrations,
+        migration_filename,
+        normalize_asyncpg_url,
+    )
+
+    directory = migrations_dir if migrations_dir is not None else None
+    dsn = normalize_asyncpg_url(database_url)
+    conn = await asyncpg.connect(dsn)
+    try:
+        await conn.execute(SCHEMA_MIGRATIONS_DDL)
+        applied = {
+            row["filename"]
+            for row in await conn.fetch("SELECT filename FROM schema_migrations")
+        }
+        files = discover_migrations(directory) if directory is not None else discover_migrations()
+        names = [migration_filename(f) for f in files]
+
+        if baseline is not None:
+            # Resolve which files to baseline (see select_baseline_targets).
+            try:
+                to_baseline_names = select_baseline_targets(names, baseline)
+            except ValueError as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
+                return 2
+
+            untracked_names = [n for n in to_baseline_names if n not in applied]
+            if not untracked_names:
+                print(f"All {len(to_baseline_names)} requested migration(s) already tracked.")
+                return 0
+
+            if baseline == "all":
+                print(
+                    "WARNING: --baseline with no cutoff records ALL current "
+                    "migration files as applied WITHOUT running them.",
+                    file=sys.stderr,
+                )
+                print(
+                    "This assumes the database already reflects every file below. "
+                    "If any shipped AFTER your database was bootstrapped, do NOT "
+                    "baseline it — apply it with 'engram init-db' instead. To "
+                    "baseline up to a specific file, pass --baseline <filename>.",
+                    file=sys.stderr,
+                )
+            async with conn.transaction():
+                for n in untracked_names:
+                    await conn.execute(
+                        "INSERT INTO schema_migrations (filename) VALUES ($1) "
+                        "ON CONFLICT (filename) DO NOTHING",
+                        n,
+                    )
+            for n in untracked_names:
+                print(f"baselined: {n}  (recorded as applied, NOT executed)")
+            print(
+                f"Baselined {len(untracked_names)} migration(s). Future runs will "
+                "apply only newer migrations.",
+            )
+            return 0
+
+        pending = [f for f in files if migration_filename(f) not in applied]
+
+        # Guard: schema already present but nothing tracked -> was bootstrapped
+        # externally. Refuse to blindly re-run CREATE TABLE (would error) and
+        # point the operator at --baseline.
+        if not applied:
+            core_exists = await conn.fetchval(
+                "SELECT to_regclass('public.memory_items') IS NOT NULL"
+            )
+            if core_exists:
+                print(
+                    "ERROR: the 'memory_items' table already exists but no "
+                    "migrations are tracked.",
+                    file=sys.stderr,
+                )
+                print(
+                    "This database was likely bootstrapped via Docker's "
+                    "docker-entrypoint-initdb.d (first boot on an empty volume) "
+                    "or a manual 'psql -f migrations/...'.",
+                    file=sys.stderr,
+                )
+                print(
+                    "Run 'engram init-db --baseline' once to record the current "
+                    "migrations as applied, then re-run 'engram init-db' to apply "
+                    "any newer migrations.",
+                    file=sys.stderr,
+                )
+                return 1
+
+        if not pending:
+            print(f"Database is up to date ({len(applied)} migration(s) applied).")
+            return 0
+
+        for f in pending:
+            sql = f.read_text(encoding="utf-8")
+            fname = migration_filename(f)
+            print(f"applying: {fname}")
+            async with conn.transaction():
+                await conn.execute(sql)
+                await conn.execute(
+                    "INSERT INTO schema_migrations (filename) VALUES ($1) "
+                    "ON CONFLICT (filename) DO NOTHING",
+                    fname,
+                )
+        print(f"Applied {len(pending)} migration(s). Database is up to date.")
+        return 0
+    finally:
+        await conn.close()
+
+
+# --- bootstrap-key ---------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BootstrapKeyMaterial:
+    """Pure key material produced for a bootstrap key (no DB state)."""
+
+    plaintext: str
+    key_hash: str
+    scopes: tuple[str, ...]
+    label: str | None
+
+
+def parse_scopes(raw: str) -> list[str]:
+    """Parse a comma-separated scope string into a validated, de-duplicated list.
+
+    Raises ``ValueError`` if any scope is unknown or the list is empty. The set
+    of valid scopes mirrors :data:`engram.auth.VALID_SCOPES`.
+    """
+    from engram.auth import VALID_SCOPES
+
+    scopes = [s.strip() for s in raw.split(",") if s.strip()]
+    if not scopes:
+        raise ValueError("at least one scope is required")
+    invalid = [s for s in scopes if s not in VALID_SCOPES]
+    if invalid:
+        raise ValueError(f"unknown scope(s): {', '.join(invalid)}")
+    # de-duplicate while preserving order
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for s in scopes:
+        if s not in seen:
+            seen.add(s)
+            ordered.append(s)
+    return ordered
+
+
+def make_bootstrap_key(label: str | None, scopes: list[str]) -> BootstrapKeyMaterial:
+    """Generate plaintext + bcrypt hash for a bootstrap key (pure, no DB)."""
+    from engram.auth import generate_api_key, hash_api_key
+
+    plaintext = generate_api_key()
+    key_hash = hash_api_key(plaintext)
+    return BootstrapKeyMaterial(
+        plaintext=plaintext,
+        key_hash=key_hash,
+        scopes=tuple(scopes),
+        label=label,
+    )
+
+
+async def _run_bootstrap_key(
+    database_url: str, *, label: str, scopes: str, force: bool = False
+) -> int:
+    """Create the first API key for the seeded default/admin principal.
+
+    Connects as the table-owning DB role (bypasses RLS) to insert the key for
+    the seeded admin principal. Prints the plaintext key exactly once. Returns
+    0 on success, non-zero if the seed principal is missing.
+
+    Idempotency guard: refuses to create a key when a non-revoked key already
+    exists for the seed principal unless ``force=True``. This prevents accidental
+    duplicate admin keys from re-runs (the command is meant to create the FIRST
+    key) while still allowing an explicit override.
+    """
+    import asyncpg
+
+    from engram.db import _DEFAULT_PRINCIPAL_NAME, _DEFAULT_TENANT_SLUG
+    from engram.migrations import normalize_asyncpg_url
+
+    try:
+        scope_list = parse_scopes(scopes)
+    except ValueError as exc:
+        print(f"ERROR: invalid --scopes: {exc}", file=sys.stderr)
+        return 2
+
+    material = make_bootstrap_key(label, scope_list)
+    dsn = normalize_asyncpg_url(database_url)
+    conn = await asyncpg.connect(dsn)
+    try:
+        row = await conn.fetchrow(
+            "SELECT CAST(t.id AS TEXT) AS tenant_id, "
+            "       CAST(p.id AS TEXT) AS principal_id "
+            "FROM tenants t "
+            "JOIN principals p "
+            "  ON p.tenant_id = t.id AND p.name = $1 "
+            "WHERE t.slug = $2",
+            _DEFAULT_PRINCIPAL_NAME,
+            _DEFAULT_TENANT_SLUG,
+        )
+        if row is None:
+            print(
+                "ERROR: the seeded default/admin principal was not found.",
+                file=sys.stderr,
+            )
+            print(
+                "Apply the schema first with 'engram init-db' (or let Docker's "
+                "first-boot initdb.d run on an empty volume).",
+                file=sys.stderr,
+            )
+            return 1
+
+        existing = await conn.fetchval(
+            "SELECT COUNT(*) FROM api_keys "
+            "WHERE principal_id = $1::uuid AND revoked_at IS NULL",
+            row["principal_id"],
+        )
+        if existing and not force:
+            print(
+                f"ERROR: {existing} non-revoked API key(s) already exist for the "
+                f"seeded {_DEFAULT_PRINCIPAL_NAME!r} principal.",
+                file=sys.stderr,
+            )
+            print(
+                "bootstrap-key is meant to create the FIRST key. To create an "
+                "additional key anyway, re-run with --force. To manage further "
+                "keys, use the admin API (POST /v1/admin/api-keys).",
+                file=sys.stderr,
+            )
+            return 1
+
+        key_id = await conn.fetchval(
+            "INSERT INTO api_keys "
+            "  (tenant_id, principal_id, key_hash, scopes, label, created_at) "
+            "VALUES ($1::uuid, $2::uuid, $3, $4, $5, now()) "
+            "RETURNING CAST(id AS TEXT)",
+            row["tenant_id"],
+            row["principal_id"],
+            material.key_hash,
+            list(material.scopes),
+            material.label,
+        )
+    finally:
+        await conn.close()
+
+    # Print the plaintext key exactly once with a loud warning.
+    print("========================================================")
+    print("  BOOTSTRAP API KEY — shown only once. Save it now.")
+    print("========================================================")
+    print(f"key:          {material.plaintext}")
+    print(f"label:        {material.label}")
+    print(f"scopes:       {', '.join(material.scopes)}")
+    print(f"key_id:       {key_id}")
+    print(f"tenant_id:    {row['tenant_id']}")
+    print(f"principal_id: {row['principal_id']}")
+    print()
+    print(
+        "Store this key securely. Only a bcrypt hash is persisted. To revoke or "
+        "rotate, see docs/deployment.md (Auth > Rotate or revoke a key).",
+        file=sys.stderr,
+    )
+    return 0
 
 
 async def _run_promotion(

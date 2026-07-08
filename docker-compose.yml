@@ -1,13 +1,22 @@
 # Engram — self-hosted deployment
 #
-# Usage:
-#   1. Copy .env.example to .env and set passwords
+# Quickstart:
+#   1. cp .env.example .env   # then edit .env (set POSTGRES_PASSWORD, etc.)
 #   2. docker compose up -d
-#   3. Apply migrations: docker compose exec engram-service psql ...
-#      (or use the init-db script once available)
+#   3. docker compose exec engram-service engram bootstrap-key   # first API key
 #
 # The service is reachable at http://localhost:8000
-# Over Tailscale, use the host's Tailscale IP instead of localhost.
+#
+# --- Migration behavior ----------------------------------------------------
+# Postgres's docker-entrypoint-initdb.d runs the bundled migrations in
+# ./migrations ONLY on FIRST BOOT, i.e. when the data volume is empty. It does
+# NOT run on subsequent starts. To apply NEW migrations to an existing database
+# (upgrades), run the explicit migration command:
+#     docker compose exec engram-service engram init-db
+# For a database that was already bootstrapped by first-boot initdb, baseline it
+# once so future migrations are tracked:
+#     docker compose exec engram-service engram init-db --baseline
+# See docs/deployment.md (Upgrades & migrations) for the full procedure.
 
 services:
   postgres:
@@ -23,7 +32,7 @@ services:
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-engram}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-engram} -d ${POSTGRES_DB:-engram}"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -45,6 +54,21 @@ services:
         condition: service_healthy
     ports:
       - "8000:8000"
+    # Compose healthcheck probes liveness (/health, DB-free). We deliberately
+    # do NOT probe /ready here: a transient Postgres outage (e.g. maintenance)
+    # would otherwise mark the container unhealthy and trigger pointless restart
+    # loops. DB + RLS + pgvector readiness is asserted at startup via depends_on
+    # and by operators calling /ready directly.
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - >-
+          python -c "import sys,urllib.request as u;
+          sys.exit(0 if u.urlopen('http://localhost:8000/health',timeout=5).status==200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     restart: unless-stopped
 
 volumes:

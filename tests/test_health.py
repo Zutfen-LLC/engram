@@ -45,15 +45,23 @@ async def test_health(client):
 
 
 async def test_ready_requires_db(client):
-    """GET /ready confirms DB connected AND RLS context set.
+    """GET /ready confirms DB connected, RLS context set, and pgvector >= 0.8.
 
     Skipped when no DB is present (CI); run with ``docker compose up`` to
     exercise. The /ready dependency chain runs get_session, which SET LOCALs
     app.tenant_id/app.principal_id from seed data before the handler runs, so a
-    200 here proves both DB connectivity and a resolvable RLS context.
+    200 here proves DB connectivity, a resolvable RLS context, AND a sufficient
+    pgvector extension version.
     """
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     response = await client.get("/ready")
     assert response.status_code == 200
-    assert response.json() == {"status": "ready", "database": "connected"}
+    body = response.json()
+    assert body["status"] == "ready"
+    assert body["database"] == "connected"
+    # pgvector version is reported and must satisfy the minimum (>= 0.8).
+    assert "pgvector" in body
+    from engram.api.routes.health import pgvector_version_satisfies
+
+    assert pgvector_version_satisfies(body["pgvector"])

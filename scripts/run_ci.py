@@ -30,7 +30,9 @@ def _run(*args: str, env: dict[str, str] | None = None) -> None:
 
 
 async def _verify_database() -> None:
-    url = os.environ["ENGRAM_DATABASE_URL"].replace("postgresql+asyncpg://", "postgresql://", 1)
+    from engram.migrations import normalize_asyncpg_url
+
+    url = normalize_asyncpg_url(os.environ["ENGRAM_DATABASE_URL"])
     conn = await asyncpg.connect(url)
     try:
         version = await conn.fetchval(
