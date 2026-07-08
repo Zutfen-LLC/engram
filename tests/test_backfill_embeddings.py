@@ -156,8 +156,10 @@ async def _insert_embedding_row(
 ) -> str:
     """Insert a memory_embeddings row with explicit status/vector control."""
     emb_id = str(uuid.uuid4())
-    vec_sql = ":vec" if with_vector else "NULL"
-    # pgvector accepts the '[1.0,0.0,...]' text literal cast to vector.
+    # Use CAST(:vec AS vector) rather than ":vec::vector": the adjacent "::"
+    # after the named bind confuses the asyncpg dialect (it leaves the param
+    # unconverted → syntax error). pgvector accepts the text literal cast.
+    vec_sql = "CAST(:vec AS vector)" if with_vector else "NULL"
     vec_literal = "[" + ",".join(f"{v:.1f}" for v in _VEC_OK) + "]" if with_vector else None
     async with _test_session_factory() as session:
         await session.execute(
@@ -167,7 +169,7 @@ async def _insert_embedding_row(
                 f"embedding, embedding_status, embedded_at"
                 f") VALUES ("
                 ":id, :memory_item_id, :tenant_id, :model, 1536, "
-                f"{vec_sql}::vector, :status, now()"
+                f"{vec_sql}, :status, now()"
                 ")"
             ),
             {
