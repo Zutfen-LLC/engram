@@ -76,6 +76,26 @@ def test_hook_missing_patches_both_dispatch_sites(
     assert getattr(agent_runtime_helpers.memory, _SHIM_MARKER, False) is True
 
 
+def test_current_layout_hook_missing_patches_both_dispatch_sites(
+    fake_current_hermes_shim_needed: dict[str, Any], tmp_path
+) -> None:
+    hooks = LifecycleHooks(_config(volatile_path=str(tmp_path / "v.jsonl")))
+    status = install_compat_shim(hooks)
+
+    assert status.native_hook_available is False
+    assert status.compat_shim_installed is True
+    assert status.automatic_capture_active is True
+    assert set(status.patched_modules) == {
+        "agent.tool_executor",
+        "agent.agent_runtime_helpers",
+    }
+
+    tool_executor = fake_current_hermes_shim_needed["tool_executor"]
+    agent_runtime_helpers = fake_current_hermes_shim_needed["agent_runtime_helpers"]
+    assert getattr(tool_executor.memory, _SHIM_MARKER, False) is True
+    assert getattr(agent_runtime_helpers.memory, _SHIM_MARKER, False) is True
+
+
 def test_guard_reject_short_circuits_original_writer(
     fake_hermes_shim_needed: dict[str, Any], tmp_path
 ) -> None:
