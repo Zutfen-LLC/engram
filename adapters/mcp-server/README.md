@@ -58,6 +58,14 @@ For development, you can also run the module directly:
 python -m engram_mcp
 ```
 
+This package also exposes the underlying server module entrypoint, so both forms
+below are valid when a client wants an explicit module target:
+
+```bash
+python -m engram_mcp
+python -m engram_mcp.server
+```
+
 ## Hermes configuration
 
 Hermes registers MCP servers in `~/.hermes/config.yaml` under the top-level

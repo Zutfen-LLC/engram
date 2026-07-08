@@ -6,6 +6,8 @@ unset, with an actionable message — not silently at the first tool call.
 
 from __future__ import annotations
 
+import runpy
+
 import pytest
 
 from engram_mcp import server
@@ -66,3 +68,18 @@ def test_injected_client_skips_env_config(
     # No RuntimeError: the injected client means env config is bypassed.
     mcp = build_server(client=mock_client)
     assert mcp is not None
+
+
+def test_python_m_engram_mcp_dispatches_to_server_main(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``python -m engram_mcp`` must delegate to the real server entrypoint."""
+    called: list[str] = []
+
+    def fake_main() -> None:
+        called.append("main")
+
+    monkeypatch.setattr(server, "main", fake_main)
+    runpy.run_module("engram_mcp", run_name="__main__", alter_sys=True)
+
+    assert called == ["main"]
