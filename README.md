@@ -112,6 +112,29 @@ and troubleshooting — see **[`docs/deployment.md`](docs/deployment.md)**.
 
 See `docs/design.md` for the full architecture.
 
+## Local Python development setup
+
+If you want the repo's `.venv` to be able to import the sibling SDK and MCP
+adapter directly (so `python -m engram_mcp` works without setting `PYTHONPATH`),
+run:
+
+```bash
+bash scripts/setup-python-dev.sh
+# or: make setup-python-dev
+```
+
+This bootstraps `./.venv`, then installs these editable local packages into it:
+
+- `sdk/engram-client`
+- `adapters/mcp-server`
+
+After that, these commands work from the repo checkout:
+
+```bash
+.venv/bin/python -m engram_mcp
+.venv/bin/engram-mcp
+```
+
 ## Key Concepts
 
 ### Memory Lifecycle
