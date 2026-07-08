@@ -77,8 +77,11 @@ def main() -> int:
     _section("SDK Tests")
     _run("pytest", "-q", "-c", "sdk/engram-client/pyproject.toml", "sdk/engram-client/tests")
 
-    _section("MCP Adapter Smoke Tests")
-    _run("pytest", "-q", "adapters/mcp-server/tests")
+    _section("MCP Adapter Tests")
+    # ENGRAM_FAIL_ON_DB_SKIP=1 makes a DB-backed integration skip fail the run,
+    # so API/SDK drift that breaks the MCP round trips fails CI instead of
+    # silently skipping. The DB is available in the CI Compose stack.
+    _run("pytest", "-q", "adapters/mcp-server/tests", env=env)
 
     _section("CI Result")
     print("All Compose-backed CI checks passed.", flush=True)
