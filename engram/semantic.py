@@ -18,9 +18,8 @@ from typing import Any
 from sqlalchemy import and_, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from engram.embeddings import EMBEDDING_MODEL as _EMBEDDING_MODEL
 from engram.models import MemoryEmbedding, MemoryItem
-
-_EMBEDDING_MODEL = "text-embedding-3-small"
 
 
 async def candidate_count(
