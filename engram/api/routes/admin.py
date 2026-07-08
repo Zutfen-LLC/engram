@@ -10,9 +10,9 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.auth import (
@@ -24,6 +24,7 @@ from engram.auth import (
 from engram.db import get_session
 from engram.models import ApiKey, Tenant, Workspace
 from engram.models import Principal as PrincipalModel
+from engram.promotion import auto_promote_proposed_memories, summarize
 
 router = APIRouter()
 
@@ -84,6 +85,23 @@ class ApiKeyOut(BaseModel):
     scopes: list[str]
     label: str | None
     key: str  # plaintext, shown once
+
+
+class PromotionResponse(BaseModel):
+    """Result of running auto-promotion Path A for the caller's tenant."""
+
+    tenant_id: str
+    enabled: bool
+    confidence_threshold: float
+    min_age_hours: int
+    scanned: int = 0
+    promoted: int = 0
+    skipped_confidence: int = 0
+    skipped_age: int = 0
+    skipped_conflict: int = 0
+    skipped_disabled: int = 0
+    promoted_ids: list[uuid.UUID] = Field(default_factory=list)
+    summary: str
 
 
 # --- Endpoints ---------------------------------------------------------------
@@ -205,3 +223,48 @@ async def list_principals(
         )
         for p in result.scalars()
     ]
+
+
+async def _resolve_tenant_id(session: AsyncSession) -> str:
+    """Read tenant_id from RLS session context (mirrors review.py)."""
+    tid_str = (
+        await session.execute(text("SELECT current_setting('app.tenant_id', true)"))
+    ).scalar()
+    if not tid_str:
+        # With RLS configured every request sets this; reaching here means the
+        # session was constructed without the dependency.
+        raise HTTPException(status_code=403, detail="no tenant context")
+    return str(tid_str)
+
+
+@router.post(
+    "/admin/promote",
+    response_model=PromotionResponse,
+    dependencies=[Depends(require_scopes("admin"))],  # noqa: B008
+)
+async def promote_proposed(
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> PromotionResponse:
+    """Run auto-promotion Path A for the caller's tenant.
+
+    Promotes ``proposed`` items whose ``memory_confidence`` meets the tenant
+    threshold, whose age meets ``auto_promote_min_age_hours``, and which have
+    no unresolved conflict. Each promotion writes an ``item_events`` audit row.
+    Idempotent — safe to call repeatedly. Returns per-reason skip counts.
+    """
+    tenant_id = await _resolve_tenant_id(session)
+    result = await auto_promote_proposed_memories(session, tenant_id)
+    return PromotionResponse(
+        tenant_id=result.tenant_id,
+        enabled=result.enabled,
+        confidence_threshold=result.confidence_threshold,
+        min_age_hours=result.min_age_hours,
+        scanned=result.scanned,
+        promoted=result.promoted,
+        skipped_confidence=result.skipped_confidence,
+        skipped_age=result.skipped_age,
+        skipped_conflict=result.skipped_conflict,
+        skipped_disabled=result.skipped_disabled,
+        promoted_ids=result.promoted_ids,
+        summary=summarize(result),
+    )

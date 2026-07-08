@@ -56,6 +56,21 @@ written → proposed → active → (disputed → resolved) → superseded/archi
 - **Auto-promotion** (on by default): proposed items with confidence ≥ 0.7, no conflicts, and 72h unchallenged auto-promote to active.
 - **Disputed** doctrine/invariant stays in recall with warnings — operating constraints don't silently vanish.
 
+Auto-promotion runs on demand — there is no built-in scheduler. Wire the CLI to cron/systemd, or call the admin endpoint:
+
+```bash
+# All tenants (run as the table-owning DB role to bypass RLS):
+engram promote-proposed
+# Single tenant, capped at 1000 candidates:
+engram promote-proposed --tenant <tenant-id> --limit 1000
+```
+
+```
+POST /v1/admin/promote   # promotes the caller's tenant; requires the admin scope
+```
+
+Both return per-reason counts (`scanned`, `promoted`, `skipped_confidence`, `skipped_age`, `skipped_conflict`, `skipped_disabled`) and are idempotent. Thresholds come from `tenant_config` (`auto_promote_enabled`, `auto_promote_confidence_threshold`, `auto_promote_min_age_hours`).
+
 ### Trust Model
 
 Trust isn't binary. Every memory carries:
