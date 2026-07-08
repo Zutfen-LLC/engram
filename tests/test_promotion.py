@@ -11,12 +11,17 @@ The default tenant_config seeded by the migration has:
 
 Pattern (shared with test_remember.py / test_semantic_recall.py): a NullPool
 engine avoids asyncpg cross-loop issues across pytest-asyncio's per-function
-event loops. Setup and assertions use raw ``_test_engine.begin()`` /
-``_test_engine.connect()`` (connections fully closed by NullPool), and the
-promotion action is driven through the HTTP client
-(``POST /v1/admin/promote``) so the request runs through the app's
-``_get_test_session`` dependency on the test's own loop. This keeps every DB
-interaction within a single event loop per test.
+event loops. Two rules keep every DB interaction on the test's own loop:
+
+  * the promotion action is driven through the HTTP client
+    (``POST /v1/admin/promote``), which runs the app's ``_get_test_session``
+    dependency in-loop;
+  * in-body setup and assertions use ``_test_session_factory()`` sessions (NOT
+    raw ``_test_engine.connect()``/``.begin()`` — those trip asyncpg when mixed
+    with the ASGI client in the same test).
+
+``_test_engine`` is therefore only touched by the ``_db_ok`` and ``_clean_db``
+fixtures, never inside a test body alongside ``client``.
 """
 
 from __future__ import annotations
@@ -129,17 +134,21 @@ def _reset_embedding_provider():
 
 async def _default_tenant_principal() -> tuple[str, str]:
     """Return (tenant_id, principal_id) for the seeded default tenant/admin."""
-    async with _test_engine.connect() as conn:
+    async with _test_session_factory() as session:
         row = (
-            await conn.execute(
-                text(
-                    "SELECT t.id::text AS tenant_id, p.id::text AS principal_id "
-                    "FROM tenants t "
-                    "JOIN principals p ON p.tenant_id = t.id AND p.name = 'admin' "
-                    "WHERE t.slug = 'default'"
+            (
+                await session.execute(
+                    text(
+                        "SELECT t.id::text AS tenant_id, p.id::text AS principal_id "
+                        "FROM tenants t "
+                        "JOIN principals p ON p.tenant_id = t.id AND p.name = 'admin' "
+                        "WHERE t.slug = 'default'"
+                    )
                 )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
     return str(row["tenant_id"]), str(row["principal_id"])
 
 
@@ -166,8 +175,8 @@ async def _insert_item(
     item_id = str(uuid.uuid4())
     if created_at is None:
         created_at = _hours_ago(100)  # default: old enough to pass the 72h age gate
-    async with _test_engine.begin() as conn:
-        await conn.execute(
+    async with _test_session_factory() as session:
+        await session.execute(
             text(
                 "INSERT INTO memory_items ("
                 "id, tenant_id, principal_id, content, content_hash, kind, "
@@ -197,6 +206,7 @@ async def _insert_item(
                 "created_at": created_at,
             },
         )
+        await session.commit()
     return item_id
 
 
@@ -205,8 +215,8 @@ async def _insert_embedding(
 ) -> None:
     """Insert a memory_embeddings row bound to an item (composite FK on tenant)."""
     vec_literal = "[" + ",".join(repr(v) for v in vector) + "]"
-    async with _test_engine.begin() as conn:
-        await conn.execute(
+    async with _test_session_factory() as session:
+        await session.execute(
             text(
                 "INSERT INTO memory_embeddings "
                 "(id, memory_item_id, tenant_id, embedding_model, embedding_dim, "
@@ -223,13 +233,14 @@ async def _insert_embedding(
                 "vec": vec_literal,
             },
         )
+        await session.commit()
 
 
 async def _status_of(item_id: str) -> str:
-    async with _test_engine.connect() as conn:
+    async with _test_session_factory() as session:
         return str(
             (
-                await conn.execute(
+                await session.execute(
                     text("SELECT review_status FROM memory_items WHERE id = :id"),
                     {"id": item_id},
                 )
@@ -238,9 +249,9 @@ async def _status_of(item_id: str) -> str:
 
 
 async def _events_for(item_id: str) -> list[dict[str, Any]]:
-    async with _test_engine.connect() as conn:
+    async with _test_session_factory() as session:
         rows = (
-            await conn.execute(
+            await session.execute(
                 text(
                     "SELECT event_type, field_name, old_value, new_value, reason "
                     "FROM item_events WHERE item_id = :id "
@@ -299,11 +310,12 @@ async def test_disabled_config_promotes_nothing(client):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     tenant_id, principal_id = await _default_tenant_principal()
-    async with _test_engine.begin() as conn:
-        await conn.execute(
+    async with _test_session_factory() as session:
+        await session.execute(
             text("UPDATE tenant_config SET auto_promote_enabled = FALSE WHERE tenant_id = :tid"),
             {"tid": tenant_id},
         )
+        await session.commit()
     item_id = await _insert_item(
         tenant_id=tenant_id, principal_id=principal_id, content="disabled tenant fact"
     )
@@ -526,25 +538,26 @@ async def test_tenant_isolation(client):
     # Create tenant B (items written under its own tenant id).
     tid_b = str(uuid.uuid4())
     pid_b = str(uuid.uuid4())
-    async with _test_engine.begin() as conn:
-        await conn.execute(
+    async with _test_session_factory() as session:
+        await session.execute(
             text("INSERT INTO tenants (id, name, slug) VALUES (:id, 'B', :slug)"),
             {"id": tid_b, "slug": f"tenant-b-{tid_b[:8]}"},
         )
-        await conn.execute(
+        await session.execute(
             text(
                 "INSERT INTO principals (id, tenant_id, name, type) "
                 "VALUES (:id, :tid, 'agent-b', 'agent')"
             ),
             {"id": pid_b, "tid": tid_b},
         )
-        await conn.execute(
+        await session.execute(
             text(
                 "INSERT INTO tenant_config (tenant_id, config_version, active) "
                 "VALUES (:tid, 'v1', TRUE)"
             ),
             {"tid": tid_b},
         )
+        await session.commit()
 
     item_a = await _insert_item(
         tenant_id=tid_a, principal_id=pid_a, content="tenant A eligible"
@@ -707,8 +720,8 @@ async def test_custom_tenant_config_thresholds_respected(client):
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     tenant_id, principal_id = await _default_tenant_principal()
     # Tighten confidence to 0.95 and age to 1h.
-    async with _test_engine.begin() as conn:
-        await conn.execute(
+    async with _test_session_factory() as session:
+        await session.execute(
             text(
                 "UPDATE tenant_config SET "
                 "auto_promote_confidence_threshold = 0.95, "
@@ -717,6 +730,7 @@ async def test_custom_tenant_config_thresholds_respected(client):
             ),
             {"tid": tenant_id},
         )
+        await session.commit()
 
     # 0.9 confidence < 0.95 → skipped_confidence.
     low = await _insert_item(
