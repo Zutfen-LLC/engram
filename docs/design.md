@@ -1,27 +1,35 @@
 # Engram — Design Document
 
-**Status:** Locked (v2.2, 2026-07-06 — schema completeness)
-**Product:** Trustable institutional memory for multi-agent AI teams
+**Status:** Locked (v2.3, 2026-07-08 — positioning broadened)
+**Product:** Trustable memory infrastructure for AI agents, assistants, and teams
 
 ---
 
 ## 1. What Engram Is
 
-Engram is a standalone memory service that gives teams of AI agents a shared, structured, durable, and **trustable** brain. It's not a flat key-value memory store — it's an institutional memory system with taxonomy, relationships, temporal validity, review states, provenance, and conflict detection.
+Engram is a standalone memory service that gives AI systems structured, durable, and **trustable** memory. It works for a single long-running assistant, and it is designed for the harder case: multiple agents sharing memory without corrupting, overwriting, or blindly trusting each other.
+
+It is not a flat key-value memory store. Engram is a memory system of record with taxonomy, relationships, temporal validity, review states, provenance, conflict detection, and explainable recall.
 
 The name comes from neuroscience: an **engram** is the physical trace a memory leaves in brain tissue — the literal substrate of stored memory.
 
 ### Product thesis
 
-The hard problem in agent memory is not "can we store and recall facts?" — that's solved. The hard problem is: **can agents and humans trust what is stored, know why it was stored, know whether it is still true, and safely act on it?**
+The hard problem in AI memory is not "can we store and recall facts?" — that's solved. The hard problem is: **can an AI system trust what it remembers, know where it came from, know whether it is still true, and safely act on it?**
+
+That matters for a single assistant remembering a user's preferences across sessions. It matters even more for coding agents, research agents, support agents, operations agents, and multi-agent teams that share institutional knowledge.
 
 Engram is designed as a trust system, not just a storage system.
 
+Single-agent memory is the on-ramp. Multi-agent institutional memory is the moat.
+
 ### Target users
 
-- **Self-hosted (Phase 1):** Zutfen LLC's own agent fleet across Hermes profiles
-- **Open source (Phase 3):** Any team running multiple AI agents
-- **Hosted (future):** Managed Engram Cloud for teams that don't want to self-host
+* **Individual builders / single-agent setups:** developers running one assistant or coding agent that needs durable, self-hosted, auditable memory across sessions
+* **Coding-agent users:** users who want agents to retain project context, repo conventions, architectural decisions, backlog state, and prior review decisions
+* **Self-hosted agent fleets:** Zutfen LLC's own agent fleet across Hermes profiles
+* **Open source:** developers and teams running AI agents that need structured, trustable memory
+* **Hosted future:** managed Engram Cloud for users and teams that do not want to self-host
 
 ---
 
@@ -35,15 +43,17 @@ Engram is designed as a trust system, not just a storage system.
 
 4. **REST core, MCP/SDK as thin wrappers.** The service exposes a clean HTTP API. MCP is one client adapter. Any framework can adopt it.
 
-5. **Content is append-first; metadata changes are audited.** Memory content is never UPDATEd. Supersession/invalidation marks old rows. Metadata changes (wing, room, visibility, review_status) are recorded in `item_events` for full audit trail.
+5. **Content is append-first; metadata changes are audited.** Memory content is never UPDATEd. Supersession/invalidation marks old rows. Metadata changes such as wing, room, visibility, and review status are recorded in `item_events` for full audit trail.
 
-6. **Profile/workspace scoping is first-class.** Memory items belong to a tenant + workspace + principal. Visibility levels and workspace membership control access.
+6. **Principal/workspace scoping is first-class.** Memory items belong to a tenant, workspace, and principal. Visibility levels and workspace membership control access.
 
-7. **The memory model concepts are the product, not the storage.** Wings/rooms/drawers, knowledge graph triples, tunnels, and agent diaries are Engram's product vocabulary.
+7. **The memory model concepts are the product, not the storage.** Wings/rooms/drawers, knowledge graph triples, tunnels, and diaries are Engram's product vocabulary.
 
-8. **Classification intelligence is a service feature; lifecycle hooks are client-side.** The service provides content classification (what kind? what wing/room?) as an endpoint. Lifecycle hooks (when to extract, when to promote) stay client-side because they are framework-specific.
+8. **Classification intelligence is a service feature; lifecycle hooks are client-side.** The service provides content classification — what kind, what wing, what room — as an endpoint. Lifecycle hooks such as when to extract, when to promote, and when to write are client-side because they are framework-specific.
 
-9. **Trust is a product feature, not an implementation detail.** Review states, provenance, confidence, conflict detection, and recall explanations are core to the product — they elevate Engram from "memory store" to "trustable institutional memory."
+9. **Trust is a product feature, not an implementation detail.** Review states, provenance, confidence, conflict detection, and recall explanations are core to the product — they elevate Engram from "memory store" to "trustable memory infrastructure."
+
+10. **Single-agent deployments must remain first-class.** Engram must be useful when there is one user and one assistant. Multi-agent collaboration should be an additive strength, not a prerequisite for value.
 
 ---
 
@@ -51,61 +61,79 @@ Engram is designed as a trust system, not just a storage system.
 
 Every memory item has a simple state machine (`review_status`) plus derived signals from other columns and an event log. The lifecycle diagram shows the full trajectory, but only `review_status` is a stored state:
 
-```
+```text
 observed → proposed → active → recalled → confirmed/stale → superseded/invalidated/archived
 ```
 
 **What is a state, event, or derived flag:**
 
-| Concept | Type | Where it lives |
-|---|---|---|
-| `proposed`, `active`, `disputed`, `rejected`, `archived` | **State** (`review_status`) | Column on memory_items |
-| `observed` | **Event** | Recorded in item_events (event_type='observed') |
-| `recalled` | **Derived flag** | `last_recalled_at IS NOT NULL` |
-| `confirmed` | **Derived flag** | `verified_at IS NOT NULL` (human_verified is a convenience alias for this) |
-| `stale` | **Derived flag** | Computed from `last_verified_at` (or `valid_from` if never verified): `COALESCE(last_verified_at, valid_from) < now() - stale_after_interval`. Measures whether a memory is unconfirmed, not whether it's unused. `last_recalled_at` feeds only the usage/decay side of recall scoring. NULL `last_recalled_at` does NOT exempt an item from staleness — a never-recalled item is still subject to the staleness check against `valid_from`. |
-| `invalidated` | **Derived flag** | `valid_to IS NOT NULL AND superseded_by IS NULL` |
-| `superseded` | **Derived flag** | `superseded_by IS NOT NULL` |
+| Concept                                                  | Type                        | Where it lives                                                     |
+| -------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------ |
+| `proposed`, `active`, `disputed`, `rejected`, `archived` | **State** (`review_status`) | Column on `memory_items`                                           |
+| `observed`                                               | **Event**                   | Recorded in `item_events` with `event_type='observed'`             |
+| `recalled`                                               | **Derived flag**            | `last_recalled_at IS NOT NULL`                                     |
+| `confirmed`                                              | **Derived flag**            | `verified_at IS NOT NULL`; `human_verified` is a convenience alias |
+| `stale`                                                  | **Derived flag**            | Computed from `last_verified_at` or `valid_from` if never verified |
+| `invalidated`                                            | **Derived flag**            | `valid_to IS NOT NULL AND superseded_by IS NULL`                   |
+| `superseded`                                             | **Derived flag**            | `superseded_by IS NOT NULL`                                        |
 
-This keeps the state machine simple (5 stored states) while the full lifecycle is reconstructable from columns + events.
+Staleness measures whether a memory is unconfirmed or aging out of confidence, not whether it is unused. `last_recalled_at` feeds only the usage/decay side of recall scoring. A NULL `last_recalled_at` does not exempt an item from staleness — a never-recalled item is still subject to the staleness check against `valid_from`.
 
-| State | Meaning | Enters startup recall? | Enters semantic recall? |
-|---|---|---|---|
-| `proposed` | Written by agent, not yet reviewed | No (auto-promotes per policy below) | Yes (tagged with warnings) |
-| `active` | Reviewed and trusted | Yes | Yes |
-| `disputed` | Flagged as potentially wrong | Conditional (see below) | Yes (tagged with warnings) |
-| `rejected` | Reviewed and rejected (kept for audit) | No | No |
-| `archived` | Old/superseded, excluded from default recall | No | No (unless explicitly requested) |
+This keeps the state machine simple while the full lifecycle remains reconstructable from columns and events.
 
-Agents can freely write `proposed` memories. Only `active` memories enter the deterministic startup recall set. High-trust sources (explicit user instruction, verified imports) can write directly to `active`.
+| State      | Meaning                                         | Enters startup recall?   | Enters semantic recall?         |
+| ---------- | ----------------------------------------------- | ------------------------ | ------------------------------- |
+| `proposed` | Written by agent, not yet reviewed              | No, unless auto-promoted | Yes, tagged with warnings       |
+| `active`   | Reviewed or trusted                             | Yes                      | Yes                             |
+| `disputed` | Flagged as potentially wrong                    | Conditional              | Yes, tagged with warnings       |
+| `rejected` | Reviewed and rejected, kept for audit           | No                       | No                              |
+| `archived` | Old or superseded, excluded from default recall | No                       | No, unless explicitly requested |
+
+Agents can freely write `proposed` memories. Only `active` memories enter the deterministic startup recall set. High-trust sources such as explicit user instruction and verified imports can write directly to `active`.
+
+For single-agent deployments, this still matters: the assistant should not blindly promote every low-confidence inference into durable operating memory.
+
+For multi-agent deployments, this becomes critical: one agent's guess should not silently become another agent's trusted instruction.
 
 ### Auto-promotion policy
 
 Without auto-promotion, the proposed queue grows unboundedly while the working set stays frozen — agents write all day but their knowledge never reaches recall. Auto-promotion makes human review exception handling, not the pipeline.
 
-**Auto-promotion conditions** (tenant-configurable, **on by default** with conservative thresholds). An item promotes if it meets EITHER path:
+**Auto-promotion conditions** are tenant-configurable and on by default with conservative thresholds. An item promotes if it meets either path.
 
-**Path A — Confidence + age (default):**
-- `review_status = 'proposed'`
-- `memory_confidence >= auto_promote_confidence_threshold` (default 0.7)
-- No unresolved conflicts (`conflict_resolution_status IS NULL OR = 'accepted'`). In Phase 1A (before conflict detection exists), this is vacuously true — all proposed items are eligible for promotion.
-- Age >= `auto_promote_min_age_hours` (default 72 hours unchallenged)
-- No dispute event in `item_events` from another principal
+#### Path A — Confidence + age
 
-**Path B — Usage-validated (quorum):**
-- `review_status = 'proposed'`
-- 2+ distinct non-author principals have marked the item "useful" via `/v1/feedback`
-- No dispute events
+* `review_status = 'proposed'`
+* `memory_confidence >= auto_promote_confidence_threshold`, default `0.7`
+* No unresolved conflicts: `conflict_resolution_status IS NULL OR = 'accepted'`
+* Age >= `auto_promote_min_age_hours`, default 72 hours unchallenged
+* No dispute event in `item_events` from another principal
+
+In Phase 1A, before conflict detection exists, the unresolved-conflict condition is vacuously true — all proposed items are eligible for promotion if they satisfy the remaining gates.
+
+#### Path B — Usage-validated quorum
+
+* `review_status = 'proposed'`
+* 2+ distinct non-author principals have marked the item useful via `/v1/feedback`
+* No dispute events
 
 Usage-validated promotion means a memory that multiple agents independently found useful has earned activation — a stronger signal than aging quietly.
 
-A background job (or lazy check on recall) promotes eligible items to `active`. The promotion is logged in `item_events`.
+In single-agent deployments, Path A is the normal path. In multi-agent deployments, Path B allows fleet behavior to surface useful memories without requiring constant human review.
 
-**Disputed high-stakes items:** When a `doctrine` or `invariant` is disputed, it does NOT silently vanish from startup recall. Disputed items of kind `doctrine` or `invariant` stay in startup recall with `warnings: ['disputed — pending resolution']` until resolved. Disputed items of other kinds are excluded from startup recall (standard behavior). This prevents an agent's operating constraints from silently shrinking.
+A background job, scheduled CLI invocation, or lazy check on recall promotes eligible items to `active`. The promotion is logged in `item_events`.
+
+**Disputed high-stakes items:** When a `doctrine` or `invariant` is disputed, it does not silently vanish from startup recall. Disputed items of kind `doctrine` or `invariant` stay in startup recall with warnings such as `['disputed — pending resolution']` until resolved. Disputed items of other kinds are excluded from startup recall by default.
+
+This prevents an assistant's operating constraints from silently shrinking.
 
 ### Semantic recall includes proposed
 
-Semantic recall (`mode=semantic`) returns both `active` and `proposed` items, but proposed items include `warnings: ['unreviewed']`. This allows agents to rediscover their own observations. `rejected` and `archived` items are never returned unless explicitly requested via a `include_archived` parameter.
+Semantic recall (`mode=semantic`) returns both `active` and `proposed` items, but proposed items include warnings such as `['unreviewed']`.
+
+This allows agents to rediscover their own observations without treating them as trusted startup context.
+
+`rejected` and `archived` items are never returned unless explicitly requested through an explicit archive/history parameter.
 
 ---
 
@@ -113,41 +141,97 @@ Semantic recall (`mode=semantic`) returns both `active` and `proposed` items, bu
 
 ### Confidence layers
 
-| Field | What it means | Example |
-|---|---|---|
-| `source_trust` | Trust in where this came from | User said it = 0.9; agent guessed = 0.4 |
-| `memory_confidence` | Overall confidence this memory is accurate | Verified fact = 0.95; LLM inference = 0.6 |
-| `extraction_confidence` | Confidence of the extraction process | Direct quote = 0.9; LLM summary = 0.5 |
-| `human_verified` | A human has confirmed this is true | Boolean |
+| Field                   | What it means                              | Example                                   |
+| ----------------------- | ------------------------------------------ | ----------------------------------------- |
+| `source_trust`          | Trust in where this came from              | User said it = 0.9; agent guessed = 0.4   |
+| `memory_confidence`     | Overall confidence this memory is accurate | Verified fact = 0.95; LLM inference = 0.6 |
+| `extraction_confidence` | Confidence of the extraction process       | Direct quote = 0.9; LLM summary = 0.5     |
+| `human_verified`        | A human has confirmed this is true         | Boolean                                   |
+
+Trust is not binary. It is layered so that Engram can distinguish between:
+
+* what was said
+* who said it
+* how it was extracted
+* how confident the system is
+* whether a human verified it
+* whether it has been challenged or superseded
 
 ### Source trust defaults
 
-Source trust is calculated from both `source_type` and the principal's type. `memory_confidence` defaults track `source_trust` defaults so auto-promotion works in Phase 1A without LLM classification. LLM classification (1B) refines `memory_confidence` per-item; in 1A, the defaults below are used.
+Source trust is calculated from both `source_type` and the principal's type. `memory_confidence` defaults track `source_trust` defaults so auto-promotion works in Phase 1A without LLM classification. LLM classification in Phase 1B refines `memory_confidence` per item. In Phase 1A, the defaults below are used.
 
-| source_type | principal.type | Authority | Default source_trust | Default memory_confidence | Default review_status |
-|---|---|---|---|---|---|
-| `manual` | `user` | explicit_user | 0.9 | 0.9 | `active` |
-| `manual` | `agent` | trusted_agent | 0.6 | 0.5 | `proposed` |
-| `manual` | `admin` | explicit_user | 0.9 | 0.9 | `active` |
-| `import` | `system` | trusted_import | 0.8 | 0.8 | `active` |
-| `migration` | `system` | trusted_import | 0.8 | 0.8 | `active` |
-| `extraction` | `agent` | inferred | 0.5 | 0.5 | `proposed` |
-| `sync_turn` | `agent` | inferred | 0.4 | 0.4 | `proposed` |
-| `pre_compress` | `agent` | inferred | 0.3 | 0.3 | `proposed` |
+| source_type    | principal.type | Authority      | Default source_trust | Default memory_confidence | Default review_status |
+| -------------- | -------------- | -------------- | -------------------- | ------------------------- | --------------------- |
+| `manual`       | `user`         | explicit_user  | 0.9                  | 0.9                       | `active`              |
+| `manual`       | `agent`        | trusted_agent  | 0.6                  | 0.5                       | `proposed`            |
+| `manual`       | `admin`        | explicit_user  | 0.9                  | 0.9                       | `active`              |
+| `import`       | `system`       | trusted_import | 0.8                  | 0.8                       | `active`              |
+| `migration`    | `system`       | trusted_import | 0.8                  | 0.8                       | `active`              |
+| `extraction`   | `agent`        | inferred       | 0.5                  | 0.5                       | `proposed`            |
+| `sync_turn`    | `agent`        | inferred       | 0.4                  | 0.4                       | `proposed`            |
+| `pre_compress` | `agent`        | inferred       | 0.3                  | 0.3                       | `proposed`            |
 
-Note: `sync_turn` and `pre_compress` have confidence below the 0.7 auto-promotion threshold — they stay `proposed` until an LLM classification (1B) or human review raises their confidence, or a quorum of 2+ distinct non-author agents marks the item "useful" via `/v1/feedback` (usage-validated promotion — a memory multiple agents independently found useful has earned activation more honestly than one that aged 72 hours quietly). This is intentional: chatty low-confidence sources should not auto-promote without some signal that the memory is actually useful.
+`sync_turn` and `pre_compress` have confidence below the default 0.7 auto-promotion threshold. They stay `proposed` until LLM classification or human review raises their confidence, or until a quorum of 2+ distinct non-author principals marks the item useful via `/v1/feedback`.
 
-**Phase 1A phasing note:** In practice, the frozen-queue concern is resolved by sequencing — Phase 1A's only writers are imports and manual user actions (both default `active`), since agent write paths (`sync_turn`, `pre_compress`) arrive with engram-hooks in Phase 2, by which point Phase 1B's LLM classification refines confidence above the gate. The auto-promotion machinery is ready for when agent writers come online.
+This is intentional: chatty low-confidence sources should not auto-promote without some signal that the memory is actually useful.
 
-All defaults are tenant-configurable via the `tenant_config` table.
+**Phase 1A phasing note:** In practice, the frozen-queue concern is resolved by sequencing. Phase 1A's only writers are imports and manual user actions, both of which default to `active`. Agent write paths such as `sync_turn` and `pre_compress` arrive with Engram hooks in Phase 2, by which point Phase 1B's LLM classification refines confidence above the gate. The auto-promotion machinery is ready for when agent writers come online.
 
-**Authority hierarchy** (used in conflict resolution): `explicit_user > trusted_import > trusted_agent > untrusted_agent > inferred`
+All defaults are tenant-configurable through the `tenant_config` table.
 
-### Recall ranking formula
+### Authority hierarchy
+
+Authority hierarchy is used in conflict resolution and supersession:
+
+```text
+explicit_user > trusted_import > trusted_agent > untrusted_agent > inferred
+```
+
+A lower-authority source can never silently replace a higher-authority memory.
+
+Examples:
+
+* A coding agent cannot silently override an explicit user instruction.
+* A low-confidence extracted summary cannot silently replace a verified project decision.
+* An inferred preference cannot silently replace a manually supplied user preference.
+* An agent-private observation cannot silently become tenant-wide doctrine.
+
+### Single-agent trust still matters
+
+Even with only one assistant and one user, trust machinery is valuable because the assistant may write memories from different sources:
+
+* explicit user statements
+* summaries of conversations
+* inferred preferences
+* imported project documentation
+* compressed session notes
+* tool observations
+* failed assumptions
+* decisions that later become stale
+
+A single assistant should not treat all of those equally.
+
+### Multi-agent trust matters more
+
+With multiple agents, trust machinery becomes mandatory. Shared memory without provenance and authority rules will eventually produce:
+
+* overwritten instructions
+* conflicting project assumptions
+* agents reinforcing each other's guesses
+* stale decisions treated as current
+* private observations leaking into shared recall
+* one agent's speculative summary becoming another agent's operating rule
+
+Engram is designed to prevent those failure modes.
+
+---
+
+## 5. Recall
 
 Startup recall uses a scoring formula to order items within the budget:
 
-```
+```text
 score = (importance * 0.30)
       + (source_trust * 0.25)
       + (memory_confidence * 0.20)
@@ -156,382 +240,564 @@ score = (importance * 0.30)
 ```
 
 Where:
-- `recency_bonus` = decay function based on `last_recalled_at` (recently recalled = relevant)
-- `human_verified_bonus` = 1.0 if verified, 0.0 otherwise
 
-**Pinning is a pure bypass, not a score component.** Pinned items are not scored by the formula — they're inserted first, outside the scoring pipeline. The previous `pinned_bonus * 0.10` weight has been redistributed (importance +0.05, source_trust +0.05). The bypass mechanism: pinned active items are included first, capped at `max_pinned_tokens` (default 2048). Excess pinned items are ordered by importance × source_trust and dropped; `pinned_omitted_count` in the response tells the caller truncation occurred. After pinned items consume their budget, the scorer fills the remainder.
+* `recency_bonus` = decay function based on `last_recalled_at`
+* `human_verified_bonus` = 1.0 if verified, 0.0 otherwise
 
-**Anti-feedback-loop guardrail:** `recency_bonus` rewards recent recall for semantic continuity, but a `repeated_startup_penalty` applies when an item has been recalled in startup mode N times (default 5) without positive feedback via `POST /v1/feedback`. The penalty reduces the recency component by 0.5× per excess recall, preventing the same memories from permanently dominating startup recall.
+### Pinned memories
 
-**Penalty safeguards** (prevent over-punishment in autonomous fleets where humans rarely review):
-- **Floor:** The penalty cannot reduce the recency component below 0.1 (an invariant recalled 500 times should never score below a random observation).
-- **Multi-agent quorum:** Feedback from 2+ distinct non-author agents counts as a partial penalty reset (0.5× weight), not just user/admin feedback. This prevents penalty accumulation on load-bearing memories in fleets where humans review rarely.
-- **Pinned exemption:** Pinned items bypass scoring entirely, so the penalty counter does not apply to them.
+Pinning is a pure bypass, not a score component.
 
-**Feedback authority weighting:** To prevent agents from self-entrenching their own memories, feedback is weighted by principal authority:
-- `user` feedback: full weight (resets penalty counter, adjusts importance)
-- `agent` feedback on own memories: zero weight on penalty reset (an agent marking its own recalled items "useful" does NOT reset the penalty)
-- `agent` feedback on another agent's memories: partial weight (0.5×) on importance. 2+ distinct non-author agents together count as a partial reset (quorum, see above).
-- Only `user` or `admin` feedback fully resets the `startup_recall_count` penalty counter
+Pinned items are not scored by the formula. They are inserted first, outside the scoring pipeline. Pinned active items are included first, capped at `max_pinned_tokens`, default 2048.
 
-**Write-path cost escape valve:** If the trust machinery's per-`remember` cost (dedup check + classification + conflict similarity check) proves too expensive for chatty sources like `sync_turn`, a fast-path exists: low-trust proposed writes (source_trust < 0.5) defer the conflict similarity check to promotion time instead of write time. This is a tenant-configurable flag (`conflict_check_on_write`, default true). This is a planned option, not a Phase 1A deliverable.
+Excess pinned items are ordered by `importance × source_trust` and dropped. `pinned_omitted_count` in the response tells the caller truncation occurred.
 
----
+After pinned items consume their budget, the scorer fills the remainder.
 
-## 5. What Is NOT in Engram
+### Anti-feedback-loop guardrail
 
-**Lifecycle hooks (framework-specific):**
-- Pre-compression extraction, turn/session boundary detection, volatile recall. These require in-process visibility the service cannot have. They live in the companion library (engram-hooks).
+`recency_bonus` rewards recent recall for semantic continuity, but a `repeated_startup_penalty` applies when an item has been recalled in startup mode N times, default 5, without positive feedback via `POST /v1/feedback`.
 
-**What IS in Engram (classification intelligence):**
-- Content classification (`POST /v1/classify`). LLM-backed with rule-based fallback. Tenant-configurable rules.
-- Auto-classification on remember. When kind/wing/room are omitted, the service classifies before storing.
+The penalty reduces the recency component by 0.5× per excess recall, preventing the same memories from permanently dominating startup recall.
 
-**Also NOT in Engram:**
-- Agent configuration, skills, prompts (belong in version control)
-- Secrets, auth tokens, machine-specific config (always local)
+### Penalty safeguards
 
----
+To prevent over-punishment in autonomous fleets where humans rarely review:
 
-## 6. Memory Model
+* **Floor:** The penalty cannot reduce the recency component below 0.1.
+* **Multi-agent quorum:** Feedback from 2+ distinct non-author agents counts as a partial penalty reset at 0.5× weight.
+* **Pinned exemption:** Pinned items bypass scoring entirely, so the penalty counter does not apply to them.
 
-### Core concept: the memory item
+An invariant recalled 500 times should never score below a random observation.
 
-Each memory item has:
-- **Content** — verbatim text + content_hash for dedup
-- **Kind** — fact, preference, doctrine, decision, invariant, observation, diary_entry
-- **Taxonomy** — optional wing + room
-- **Subject** — what this memory is ABOUT (subject_type, subject_id, subject_name), separate from who wrote it
-- **Scope** — tenant + workspace + principal
-- **Visibility** — private / workspace / tenant / public
-- **Trust** — review_status, memory_confidence, source_trust, verified_by, verified_at, review_notes (human_verified is a derived convenience: `verified_at IS NOT NULL`)
-- **Recall signals** — importance, pinned, last_recalled_at, recall_count, startup_recall_count, last_verified_at
-- **Provenance** — source_type, source_session, source_uri, extracted_by_model, extraction_confidence
-- **Conflict tracking** — conflicts_with_item_id, conflict_type, conflict_resolution_status
-- **Privacy** — sensitivity (normal/sensitive/restricted)
-- **External linkage** — external_id, external_source
-- **Temporal validity** — valid_from, valid_to, superseded_by
+### Feedback authority weighting
 
-### MemPalace succession
+To prevent agents from self-entrenching their own memories, feedback is weighted by principal authority:
 
-| MemPalace concept | Engram representation |
-|---|---|
-| Wing | `wing` field on memory_items |
-| Room | `room` field on memory_items |
-| Drawer | A memory_item |
-| Knowledge graph fact | Row in `kg_triples` (with visibility inherited from source_item_id) |
-| Tunnel | Row in `tunnels` |
-| Agent diary entry | memory_item with kind='diary_entry' |
-| CCA ledger entry | memory_item with kind IN (doctrine, decision, invariant, preference) |
+* `user` feedback: full weight; resets penalty counter and adjusts importance
+* `admin` feedback: full weight
+* `agent` feedback on own memories: zero weight on penalty reset
+* `agent` feedback on another agent's memories: partial weight on importance
+* 2+ distinct non-author agents together count as a partial reset
+
+Only `user` or `admin` feedback fully resets the `startup_recall_count` penalty counter.
+
+### Recall explanations
+
+Every recalled item includes a `reasons` array explaining why it was included.
+
+Examples:
+
+```text
+["pinned"]
+["high_importance", "human_verified"]
+["recently_recalled", "high_source_trust"]
+["semantic_match", "unreviewed"]
+["disputed — pending resolution"]
+```
+
+Recall should be inspectable. Agents and humans should be able to see why a memory appeared in context.
 
 ---
 
-## 7. Postgres Schema
+## 6. Visibility, Scope, and Tenancy
 
-See `migrations/001_init.sql` for the canonical DDL. Key design decisions:
+Engram is designed for both simple and complex deployments.
 
-### Tables (15 total)
+A single user can run one tenant, one workspace, and one assistant.
 
-| Table | Purpose |
-|---|---|
-| `tenants` | Multi-tenant root |
-| `workspaces` | Project/team scoping within a tenant |
-| `principals` | Agents and users that write memories |
-| `workspace_members` | Role-based workspace membership (owner/admin/member/viewer) |
-| `memory_items` | The core: all memories with trust, provenance, review state |
-| `memory_embeddings` | Embeddings stored separately (supports multiple models, re-embedding) |
-| `kg_triples` | Knowledge graph facts with visibility and review state |
-| `tunnels` | Cross-wing/room links |
-| `item_events` | Audit trail for metadata mutations (content stays append-first) |
-| `classification_rules` | Tenant-configurable classification rules |
-| `api_keys` | Authentication credentials |
-| `recall_logs` | Recall audit with item_ids, scoring_version, config_version for feedback loops and reproducibility |
-| `deletion_events` | Tombstone records for hard-deleted items (GDPR/hosted) |
-| `feedback_events` | Per-item feedback (useful/noise) from principals — drives penalty resets, importance, quorum |
-| `tenant_config` | Versioned tenant-configurable trust defaults, scoring weights, recall policy |
+A team can run one tenant with multiple workspaces and multiple agents.
 
-### Key schema decisions
+A hosted deployment can run many tenants with strict isolation.
 
-- **Check constraints** on all enum-like fields (kind, visibility, review_status, source_type, sensitivity, conflict_type) to prevent taxonomy drift.
-- **Full-text search** via `content_tsv TSVECTOR GENERATED ALWAYS AS (to_tsvector('english', coalesce(content, ''))) STORED` + GIN index. A generated column is used instead of a trigger — it's simpler, cannot drift, and requires no plpgsql function. Essential for keyword search on IDs, paths, names.
-- **Separate embeddings table** keyed by `(memory_item_id, embedding_model)` with denormalized `tenant_id` for RLS. A composite FK `(memory_item_id, tenant_id) → memory_items(id, tenant_id)` enforces that the denormalized tenant_id always matches the parent item — this is a multi-tenant safety boundary enforced at the database level. A model change is new rows, not a migration. Old vectors remain queryable during re-embedding. The denormalized tenant_id enables RLS policy enforcement directly on the embeddings table, allowing tenant filtering BEFORE the join to memory_items — critical for HNSW + iterative_scan performance.
-- **Unique dedup index** on `(tenant_id, workspace_id, principal_id, content_hash) WHERE valid_to IS NULL AND review_status != 'rejected'` with `NULLS NOT DISTINCT` (Postgres 15+). Makes remember idempotent for retries within scope, including tenant-level memories with NULL workspace_id.
-- **Row Level Security** on all tenant-scoped tables. Application uses `SET LOCAL` inside each transaction (pool-safe for PgBouncer); Postgres enforces isolation even when application code is wrong. RLS is enabled on: memory_items, memory_embeddings (denormalized tenant_id), kg_triples, tunnels, item_events, classification_rules, recall_logs, workspace_members, api_keys, tenant_config, deletion_events, feedback_events, workspaces, principals. Semantic search queries filter on embeddings.tenant_id BEFORE joining to memory_items, which is the query to load-test first.
-- **HNSW with iterative_scan** — requires pgvector 0.8+. Set `hnsw.iterative_scan = strict` at query time to handle filtered (tenant-scoped) queries without recall degradation.
-- **Security-invoker views** — `active_memories` and `cca_ledger` use `WITH (security_invoker = true)` so RLS policies apply through the view. Without this, Postgres views are security-definer by default and can bypass RLS. Requires Postgres 15+ (already required for `NULLS NOT DISTINCT`).
+### Visibility levels
 
-### KG visibility
+| Visibility  | Who can read                            |
+| ----------- | --------------------------------------- |
+| `private`   | Only the principal that wrote it        |
+| `workspace` | Any principal in the same workspace     |
+| `tenant`    | Any principal in the organization       |
+| `public`    | Any authenticated caller, where enabled |
 
-KG triples inherit visibility from their `source_item_id` at query time. A private memory item that spawns a triple does NOT leak that knowledge — querying the KG checks the source item's visibility against the caller's scope.
+The default visibility is `workspace`.
 
-**Source-less triple policy:** Every KG triple must be traceable to a memory item. If `POST /v1/kg` is called without `source_item_id`, the endpoint auto-creates a system-generated backing memory item (kind='fact', source_type='extraction', review_status='proposed', visibility='workspace') and links the triple to it. This ensures every triple has a visibility source and an audit trail. Manual triples without provenance are never allowed — they must go through the backing item.
+### Principal model
 
----
+A principal is any actor that can write, recall, or review memory.
 
-## 8. API Surface (REST)
+Principal types include:
 
-### Memory operations
+* `user`
+* `agent`
+* `admin`
+* `system`
 
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/v1/remember` | Write a memory item (dedup, supersession, auto-classify, conflict check) |
-| POST | `/v1/recall` | Bounded recall: startup (deterministic) or semantic (query-based) |
-| POST | `/v1/search` | Keyword (FTS), semantic (pgvector), or hybrid search |
-| GET | `/v1/items` | List items with filters (cursor pagination) |
-| GET | `/v1/items/{id}` | Full detail with provenance, events, linked KG facts |
-| PATCH | `/v1/items/{id}` | Update metadata (creates item_event, never touches content) |
-| POST | `/v1/items/{id}/supersede` | Mark superseded + write replacement |
-| POST | `/v1/items/{id}/invalidate` | Mark invalid |
-| POST | `/v1/items/{id}/review` | Change review_status (proposed → active, dispute, etc.) |
-| POST | `/v1/items/{id}/verify` | Mark human-verified |
-| POST | `/v1/feedback` | Mark recalled items as useful/noise (recall scoring feedback loop) |
+Memory items belong to:
 
-### Classification
+* tenant
+* workspace
+* principal
+* visibility scope
 
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/v1/classify` | Classify raw text: suggest kind, wing, room, confidence |
-| GET | `/v1/classification/rules` | List tenant rules |
-| POST | `/v1/classification/rules` | Create/update a rule |
-| DELETE | `/v1/classification/rules/{id}` | Delete a rule |
+### Row Level Security
 
-### Knowledge graph
+Row Level Security is enforced at the Postgres level.
 
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/v1/kg` | Add triple (requires source_item_id; auto-creates backing item if none provided) |
-| GET | `/v1/kg/query` | Query by entity, with temporal + visibility filtering |
-| POST | `/v1/kg/invalidate` | Mark triple invalid |
-| GET | `/v1/kg/timeline` | Chronological timeline for an entity |
+One forgotten `WHERE` clause cannot cause a cross-tenant leak.
 
-### Taxonomy & navigation
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/v1/taxonomy` | Wing → room → item count hierarchy |
-| GET | `/v1/tunnels` | Cross-wing links |
-| POST | `/v1/tunnels` | Create tunnel |
-
-### Diary
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/v1/diary` | Write diary entry (kind=diary_entry, visibility=private) |
-| GET | `/v1/diary/{principal}` | Read diary entries |
-
-### Review & governance
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/v1/review/queue` | Items awaiting review (proposed status) |
-| GET | `/v1/review/conflicts` | Items with unresolved conflicts |
-| POST | `/v1/items/{id}/resolve-conflict` | Resolve a conflict (accept/reject/merge) |
-
-### Export & operations
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/v1/export/cca` | Export CCA ledger as JSON (git-friendly) |
-| GET | `/health` | Liveness |
-| GET | `/ready` | Readiness (DB check) |
+Application-level filtering is still required for correctness and performance, but database-level RLS is the security backstop.
 
 ---
 
-## 9. Recall Policy
+## 7. Memory Topology
+
+Engram's memory model is intentionally more structured than a flat vector store.
+
+### Wings and rooms
+
+Wings and rooms provide a memory-palace taxonomy:
+
+* **Wing:** top-level domain or category
+* **Room:** subcategory within a wing
+
+Examples:
+
+| Wing      | Room           | Memory type               |
+| --------- | -------------- | ------------------------- |
+| `project` | `architecture` | design decision           |
+| `project` | `backlog`      | completed or pending work |
+| `user`    | `preferences`  | user preference           |
+| `ops`     | `deployment`   | infrastructure note       |
+| `product` | `positioning`  | strategic decision        |
+| `agent`   | `behavior`     | standing instruction      |
+
+The taxonomy is tenant-configurable.
+
+### Memory kinds
+
+Memory items can have kinds such as:
+
+* `fact`
+* `preference`
+* `decision`
+* `doctrine`
+* `invariant`
+* `procedure`
+* `observation`
+* `summary`
+* `diary_entry`
+
+Kinds affect review behavior, recall behavior, and dispute handling.
+
+### Tunnels
+
+Tunnels are cross-category links between memories, rooms, or concepts.
+
+They support the product vocabulary of "this memory belongs here, but it is related to that."
+
+Examples:
+
+* a product decision linked to the GitHub issue that caused it
+* a user preference linked to a recurring workflow
+* an architecture decision linked to a deployment invariant
+* a project memory linked to a coding-agent instruction
+
+Tunnels are planned for Phase 1C.
+
+### Knowledge graph triples
+
+Knowledge graph triples represent explicit relationships with temporal validity.
+
+Example:
+
+```text
+subject: "Engram"
+predicate: "uses_storage_backend"
+object: "Postgres + pgvector"
+valid_from: "2026-07-06"
+valid_to: null
+```
+
+Triples are backed by memory items so that graph facts retain provenance, confidence, and review state.
+
+---
+
+## 8. Write Path
+
+The write path must balance trust, cost, and latency.
+
+A typical write path:
+
+1. Receive memory candidate.
+2. Normalize input.
+3. Apply source trust defaults.
+4. Classify kind, wing, room, and visibility.
+5. Deduplicate against existing memories.
+6. Check for contradiction or supersession candidates.
+7. Persist append-first memory item.
+8. Record event in `item_events`.
+9. Return memory id, review status, confidence, and warnings.
+
+### Write-path cost escape valve
+
+If the trust machinery's per-`remember` cost proves too expensive for chatty sources such as `sync_turn`, a fast path exists.
+
+Low-trust proposed writes with `source_trust < 0.5` may defer the conflict similarity check to promotion time instead of write time.
+
+This is tenant-configurable via `conflict_check_on_write`, default true.
+
+This is a planned option, not a Phase 1A deliverable.
+
+---
+
+## 9. Read Path
+
+Engram supports multiple recall and search modes.
 
 ### Startup recall
 
-Bounded working set for session initialization. 
+Startup recall returns a deterministic, bounded working set of active memories for an agent or assistant.
 
-**Determinism contract:** Startup recall is "deterministic given state" — same corpus + same item states + same config version = same output. It is NOT "deterministic across time" because recall mutates state (last_recalled_at, recall_count) which feeds the scoring formula. For audit reproducibility, `recall_logs` records `scoring_version` and `config_version` so any past recall can be replayed.
+Use cases:
 
-**Eligibility:** `review_status = 'active' AND valid_to IS NULL`, filtered by caller's visibility scope. (Disputed doctrine/invariant items are included with warnings per Section 3.)
+* load user preferences at session start
+* load project constraints
+* load standing instructions
+* load recent relevant decisions
+* load pinned invariants
+* load workspace context
 
-**Ordering:** Scored by the recall ranking formula (Section 4). Pinned items included first.
-
-**Budget:** Accepts `byte_budget` or `token_budget` (approximated as bytes/4). Default from config.
-
-**Output:** `working_set` (rendered text), `item_count`, `byte_count`, `omitted_count`, `pinned_omitted_count`, `scoring_version`, `config_version`, plus per-item `reasons` array explaining why each item was included.
+Startup recall prioritizes trust, importance, confidence, recency, and verification.
 
 ### Semantic recall
 
-Query-vector matches filtered by visibility scope, scored by cosine similarity + kind weight + recency.
+Semantic recall is query-driven and may include proposed memories with warnings.
 
-### Why-recalled explanations
+Use cases:
 
-Every recalled item includes a `reasons` array:
-```json
-{
-  "score": 0.87,
-  "reasons": ["matched workspace", "kind=invariant", "human verified", "semantic similarity 0.78", "pinned"],
-  "warnings": ["not confirmed in 90 days"]
-}
-```
+* "What do we know about this project?"
+* "Have we already made a decision about this?"
+* "What did the user say about deployment preferences?"
+* "What are the known gotchas for this repo?"
 
----
+### Search
 
-## 10. Conflict Handling
+Search supports:
 
-### Detection at write time
+* keyword search
+* semantic search
+* hybrid search
 
-When `POST /v1/remember` writes a new item, it runs a semantic similarity check against active items in the same scope. Above a threshold, the classifier is asked: "does this contradict, refine, or duplicate?"
+Search can be filtered by:
 
-- **duplicate** → auto-dedup (return existing item)
-- **refine** → conditional supersession (see below)
-- **contradict** → flag conflict, set `conflicts_with_item_id`, `conflict_type='contradiction'`, `conflict_resolution_status='unresolved'`
-
-### Refine supersession rules
-
-Auto-supersession on "refine" is **conditional**, not automatic:
-
-| Condition | Action |
-|---|---|
-| New item has high source_trust AND classifier confidence ≥ 0.8 | Auto-supersede (mark old, write new) |
-| New item has medium confidence OR source_trust mismatch | Proposed supersession: write new as `proposed`, link via `conflicts_with_item_id` with `conflict_type='stale'`, require review |
-| New item is from a lower-authority source than old | Never auto-supersede. Flag as `conflict_type='scope_overlap'` for manual review |
-
-Authority hierarchy: `explicit_user > trusted_import > trusted_agent > untrusted_agent > inferred`. A lower-authority source can never silently replace a higher-authority memory.
-
-**1:N conflict limitation (v1):** `conflicts_with_item_id` is a single column, meaning an item can directly conflict with one other item. Three agents writing mutually contradictory versions can't be fully represented in v1 — only pairwise conflicts are tracked. A `memory_conflicts` join table is the eventual solution for multi-way conflicts; for 1B, the single-column approach covers the common case (new vs existing). Document this as a known v1 limitation.
-
-### Tenant-configurable trust constants
-
-All trust defaults and formula weights are tenant-configurable, not hardcoded:
-- Source trust defaults (the table above) are defaults overridable via tenant config
-- Scoring formula weights are versioned and stored in tenant config
-- `recall_logs` records `scoring_version` and `config_version` for full audit reproducibility — any past recall can be replayed with the config that produced it
-- This allows A/B testing different scoring policies and rolling forward/backward without losing auditability
-
-### Resolution
-
-Conflicts surface in `GET /v1/review/conflicts`. Resolution via `POST /v1/items/{id}/resolve-conflict` sets the resolution status and optionally invalidates the loser.
+* tenant
+* workspace
+* principal
+* visibility
+* wing
+* room
+* kind
+* review status
+* temporal validity
+* archived status
 
 ---
 
-## 11. Privacy & Safety
+## 10. Interfaces
 
-- **Sensitivity field** on every memory item: `normal`, `sensitive`, `restricted`.
-- **Secret-pattern denylist**: pre-write check blocks content matching common secret patterns (API keys, tokens, passwords).
-- **PII-risk classification**: optional LLM check flags content likely containing PII.
-- **Hard-delete support**: `DELETE /v1/items/{id}` physically removes the item. Because `item_events` has a FK to `memory_items`, physical deletion would break the audit trail. Instead, a `deletion_events` table captures tombstone metadata (deleted_item_id, content_hash, deleted_by, reason, deleted_at) WITHOUT storing the deleted content. This proves deletion occurred for GDPR compliance without orphaning FK references. **Cascade behavior:** Hard-deleting an item that is `source_item_id` for KG triples cascades: those triples are invalidated (`valid_to = now()`) or deleted, and recorded in the tombstone. Hard-deleting an item in a `superseded_by` chain nullifies the FK (`ON DELETE SET NULL` is the column constraint), so supersession chains don't break — the chain simply loses the deleted node. Note: this means a predecessor whose successor was hard-deleted changes from "superseded" to "invalidated" in derived lifecycle queries (its `valid_to` is still set, so it does not resurrect). The tombstone preserves the original audit trail.
-- **Read audit**: sensitive reads are logged to recall_logs.
+### REST API
+
+REST is the core interface.
+
+All other integrations are thin wrappers.
+
+The service exposes APIs for:
+
+* remember
+* recall
+* search
+* item inspection
+* classification
+* review
+* feedback
+* promotion
+* export
+* health and readiness
+
+### Python SDK
+
+The Python SDK is a thin async client over the REST API.
+
+It should not hide the product model. SDK users should still understand review states, visibility, trust, and recall modes.
+
+### MCP adapter
+
+The MCP adapter exposes Engram tools to MCP-compatible clients such as Hermes, Claude Desktop, and other agent runtimes.
+
+MCP tools include:
+
+* `engram_remember`
+* `engram_recall`
+* `engram_search`
+* `engram_classify`
+* `engram_kg_query`
+* `engram_kg_add`
+* `engram_diary_write`
+
+The MCP adapter is a client of the SDK. The SDK is a client of the REST API. The REST API is the canonical interface.
+
+### Framework integration
+
+Agent frameworks are clients.
+
+Engram should not require Hermes, Claude Desktop, LangGraph, AutoGen, CrewAI, OpenAI Assistants, or any other specific framework.
+
+Framework-specific lifecycle hooks belong in adapters.
 
 ---
 
-## 12. Repo Structure
+## 11. Architecture
 
-```
-engram/
-├── docs/
-│   ├── design.md
-│   └── backlog.json
-├── engram/
-│   ├── __init__.py
-│   ├── config.py
-│   ├── db.py
-│   ├── models.py
-│   ├── auth.py
-│   ├── embeddings.py
-│   ├── canonicalize.py
-│   ├── classification.py
-│   ├── recall.py
-│   ├── conflicts.py            ← write-time conflict detection
-│   └── api/
-│       ├── app.py
-│       └── routes/
-│           ├── memory.py
-│           ├── classify.py
-│           ├── review.py       ← review queue + conflict resolution
-│           ├── kg.py
-│           ├── taxonomy.py
-│           ├── diary.py
-│           └── export.py
-├── migrations/
-│   └── 001_init.sql
-├── sdk/engram-client/
-├── adapters/
-│   ├── mcp-server/
-│   └── engram-hooks/           ← Hermes lifecycle hooks companion library
-├── scripts/
-├── docker-compose.yml
-├── Dockerfile
-└── pyproject.toml
-```
+* **Postgres 16 + pgvector** — single storage backend, no abstraction layer
+* **FastAPI** — REST core
+* **Multi-tenant from day one** — `tenant_id` on every tenant-scoped table
+* **RLS on tenant-scoped tables** — database-enforced isolation
+* **Append-first content** — content is never silently overwritten
+* **Audited metadata events** — lifecycle and metadata changes recorded in `item_events`
+* **Separate embeddings table** — model-keyed, supports re-embedding without migration
+* **Full-text search** — generated `tsvector` column and GIN index
+* **Tenant-configurable policy** — scoring weights, trust defaults, and recall policy stored per tenant
+* **REST core, SDK/MCP wrappers** — framework-agnostic by design
+
+### Storage
+
+Postgres is the source of truth.
+
+pgvector supports semantic recall.
+
+Generated `tsvector` columns support full-text search.
+
+No storage abstraction layer is planned until real demand exists.
+
+### Embeddings
+
+Embeddings are stored separately from memory items.
+
+Embeddings are keyed by model so that re-embedding does not require rewriting memory content or changing the memory item schema.
+
+This supports:
+
+* model migration
+* multiple embedding models
+* stale embedding detection
+* backfill jobs
+* embedding regeneration
+
+### Auditability
+
+Memory content is append-first.
+
+Content changes create new memory rows or supersession links.
+
+Metadata changes are recorded as events.
+
+Auditability is part of the trust model, not a compliance afterthought.
 
 ---
 
-## 13. Phased Delivery
+## 12. Vocabulary
+
+Engram uses evocative naming drawn from memory palace traditions.
+
+| Engram term | Plain-language equivalent             |
+| ----------- | ------------------------------------- |
+| Wing        | Domain / category                     |
+| Room        | Subcategory                           |
+| Drawer      | Optional deeper grouping              |
+| Memory item | A stored memory                       |
+| Tunnel      | Cross-category link                   |
+| Diary       | Principal-private journal             |
+| Doctrine    | Standing instruction / operating rule |
+| Invariant   | Must-remain-true constraint           |
+
+Vocabulary should be evocative in product surfaces but never obscure in API documentation. Every evocative term should have a plain-language equivalent.
+
+---
+
+## 13. Roadmap
 
 ### Phase 1A — Canonical memory MVP
-- Schema with trust fields, review states, FTS, RLS
-- `remember`, `recall` (startup mode), `search` (keyword + basic semantic)
-- `items` CRUD with cursor pagination
-- CCA export
-- Import CCA only
-- Docker Compose deployment
-- Rule-based classification only (no LLM yet)
-- **No KG, no LLM classification, no conflict detection yet**
 
-### Phase 1B — Trust and classification
-- LLM-backed classification
-- Review workflow (propose → activate → dispute → resolve)
-- Conflict detection at write time
-- Recall explanations ("why recalled")
-- Semantic search with HNSW iterative_scan
-- Import MemPalace
-- Feedback endpoint for usage-informed recall scoring
+Goal: establish the durable memory substrate.
 
-### Phase 1C — Graph and navigation
-- KG triples (with visibility inheritance)
-- Tunnels
-- Taxonomy browser
-- Diary views
-- Memory hygiene tools (stale detection, archival)
+Includes:
 
-### Phase 2 — Hermes integration
-- MCP adapter (replaces MemPalace MCP server)
-- engram-hooks companion library (lifecycle hooks calling classify + remember)
-- Hermes config integration
-- Retire MemPalace ChromaDB + CCA JSON files
+* Postgres schema and migrations
+* Row Level Security foundation
+* full-text search foundation
+* pgvector embedding storage foundation
+* FastAPI service skeleton
+* Docker Compose deployment
+* functional endpoints for remember, recall, search, items, and export
+* CCA import
+* Python SDK
 
-### Phase 3 — Open source readiness
-- Naming, docs, README, examples
-- Multi-framework quickstarts
-- Auth hardening (OAuth/org model for hosted)
-- Admin console (review queue, conflict queue, recall logs)
-- Helm chart / cloud deployment artifacts
+### Phase 1B — Trustable memory workflow
+
+Goal: make memory reviewable and reliable.
+
+Includes:
+
+* LLM classification
+* rule-based classification fallback
+* review workflow
+* promotion workflow
+* dispute workflow
+* conflict detection
+* provenance enrichment
+* confidence refinement
+* feedback endpoints
+
+### Phase 1C — Rich memory topology
+
+Goal: move beyond flat recall into structured institutional memory.
+
+Includes:
+
+* knowledge graph
+* tunnels
+* taxonomy browser
+* relationship-aware recall
+* temporal graph queries
+* richer memory inspection
+
+### Phase 2 — Agent integration
+
+Goal: make Engram useful in real agent workflows.
+
+Includes:
+
+* Hermes integration
+* MCP hardening
+* lifecycle hooks
+* startup recall
+* semantic recall
+* pre-compression memory capture
+* sync-turn ingestion
+* coding-agent context patterns
+
+### Phase 3 — Open-source readiness
+
+Goal: make Engram broadly usable outside Zutfen LLC.
+
+Includes:
+
+* documentation pass
+* README positioning
+* quickstart examples
+* single-agent setup guide
+* multi-agent setup guide
+* deployment hardening
+* security review
+* example integrations
+* release packaging
+
+### Phase 4 — Hosted future
+
+Goal: managed Engram for users and teams that do not want to self-host.
+
+Includes:
+
+* hosted tenant provisioning
+* auth and billing
+* managed backups
+* hosted admin UI
+* usage metering
+* organizational controls
 
 ---
 
-## 14. Differentiation
+## 14. Non-Goals
 
-| Feature | mem0 | Letta/MemGPT | Zep/Graphiti | **Engram** |
-|---|---|---|---|---|
-| Storage | Vector DB | SQLite/Postgres | Graph+vector | **Postgres+pgvector** |
-| Memory model | Flat facts | Agent-scoped blocks | Temporal graph | **Structured taxonomy + KG + diary** |
-| Multi-agent scoping | Per-agent | Per-agent session | Per-user | **Multi-tenant, workspace-scoped, visibility levels + RLS** |
-| Temporal validity | No | No | Yes | **Yes (valid_from/valid_to)** |
-| Review / trust states | No | No | No | **Yes (proposed/active/disputed/rejected/archived)** |
-| Conflict detection | Basic (dedup on write) | No | Partial | **Yes (contradiction detection, resolution workflow)** |
-| Classification | Basic extraction | No | No | **LLM + rule-based, tenant-configurable, no-LLM fallback** |
-| Provenance | Minimal | Minimal | Partial | **Source trust, extraction model, verification tracking** |
-| Recall explanations | No | No | No | **Yes ("why recalled" reasons array)** |
-| Self-hostable | Yes | Yes | Yes | **Yes (Docker Compose)** |
+Engram is not:
 
-**Engram's wedge:** Trustable institutional memory for agent teams — with review states, provenance, conflict detection, and scoped recall. Not just "store and retrieve," but "know what to trust and why."
+* a chatbot
+* an agent runtime
+* a vector database replacement
+* a generic document store
+* a private notes app
+* a prompt manager
+* a workflow engine
+* a universal knowledge-management UI
+
+Engram is memory infrastructure.
+
+Agent runtimes decide when to write, when to recall, and how to act.
+
+Engram decides how memories are stored, trusted, reviewed, searched, related, and recalled.
 
 ---
 
-## 15. Vocabulary
+## 15. Product Positioning
 
-Engram keeps MemPalace's evocative vocabulary. For external audiences, the docs and README provide plain-language equivalents:
+Engram should be described as:
 
-| Engram term | Plain-language equivalent |
-|---|---|
-| Wing | Domain / category |
-| Room | Subcategory |
-| Drawer / memory item | Memory |
-| Tunnel | Cross-category link |
-| Diary | Agent-private journal |
-| Doctrine | Standing instruction / operating rule |
-| Invariant | Must-remain-true constraint |
+> Trustable memory infrastructure for AI agents, assistants, and teams.
+
+Secondary descriptions:
+
+* durable, auditable memory for AI systems
+* self-hostable memory for assistants and coding agents
+* institutional memory for multi-agent teams
+* explainable recall with provenance and trust
+* memory for AI that needs to remember safely
+
+Avoid positioning Engram as only:
+
+* multi-agent memory
+* a vector memory store
+* a chatbot memory plugin
+* a LangChain-style memory abstraction
+* a hosted SaaS product before the self-hosted foundation is complete
+
+The correct positioning is broad at the top and specific in the differentiation:
+
+> Engram works for one assistant. It was designed for the harder case: many agents sharing memory safely.
+
+---
+
+## 16. Locked Decisions
+
+The following decisions are locked for this design version:
+
+1. Engram is a standalone service.
+2. Postgres + pgvector is the only storage backend.
+3. REST is the canonical interface.
+4. MCP and SDK are thin wrappers.
+5. Multi-tenancy and RLS are foundational.
+6. Content is append-first.
+7. Metadata changes are audited.
+8. Trust model is core product surface.
+9. Review states are first-class.
+10. Authority hierarchy governs supersession.
+11. Single-agent use is first-class.
+12. Multi-agent collaboration is a primary differentiator.
+13. Lifecycle hooks are client-side.
+14. Classification is a service feature.
+15. Memory topology is product vocabulary, not implementation trivia.
+
+---
+
+## 17. Summary
+
+Engram is trustable memory infrastructure for AI.
+
+It gives a single assistant durable, inspectable memory across sessions.
+
+It gives coding agents persistent project context without relying on fragile prompt stuffing.
+
+It gives multi-agent teams shared institutional memory with provenance, authority, conflict handling, review states, temporal validity, and explainable recall.
+
+The core belief is simple:
+
+> AI systems should not merely remember. They should remember safely.
