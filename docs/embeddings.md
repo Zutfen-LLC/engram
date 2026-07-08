@@ -1,5 +1,15 @@
 # Embeddings
 
+> **Implementation status (BL-006):** the embedding pipeline (write-path
+> generation, semantic search, conflict similarity) and the
+> `engram backfill-embeddings` command are **implemented** and verified with a
+> **mocked** provider. The **live OpenAI path has not been recorded-verified** —
+> the checklist at the bottom of this file still has blank `Observed:` fields and
+> must be run before claiming live embeddings are verified. The dogfood
+> deployment intentionally runs with `ENGRAM_EMBEDDING_PROVIDER=none`; keyword
+> (FTS) recall and search work without embeddings, while semantic recall/search
+> and write-time conflict detection stay inert until a provider is configured.
+
 Engram stores embeddings in a separate `memory_embeddings` table keyed by
 `(memory_item_id, embedding_model)` with a denormalized `tenant_id` for RLS.
 This keeps the vector column out of the hot read path for non-semantic queries

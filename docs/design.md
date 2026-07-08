@@ -3,6 +3,31 @@
 **Status:** Locked (v2.3, 2026-07-08 — positioning broadened)
 **Product:** Trustable memory infrastructure for AI agents, assistants, and teams
 
+> **Implementation status (2026-07-08, post-MVP dogfood).** This document is the
+> *design*; it is intentionally not rewritten as features land. The reality, as
+> of the BL-010 documentation truth pass: the MVP is **implemented and
+> dogfood-deployed**. Inline `> Implementation status:` notes below mark which
+> designed behaviors are implemented, dogfood-verified, or deferred. The
+> authoritative capability matrix is in `README.md`; the execution backlog and
+> post-MVP work are in `docs/plans/engram-mvp-backlog.md`.
+>
+> Implemented & verified: all 38 REST routes (remember, startup + semantic
+> recall, keyword/semantic/hybrid search, item CRUD + audited PATCH,
+> review/verify/supersede, conflict detection + resolution, feedback,
+> knowledge graph with visibility inheritance, taxonomy, tunnels, diary,
+> hygiene, classification, export), API-key auth + admin, RLS, the Python SDK,
+> the MCP adapter (dogfood-verified over the network), and a live auth-enabled
+> deployment with backup/restore (`docs/ops/dogfood-verification.md`).
+>
+> Implemented, not yet live-verified: embedding backfill and the OpenAI embedding
+> path (mocked-tested only — the live OpenAI checklist in `docs/embeddings.md` is
+> not yet recorded; the dogfood runs with embeddings disabled).
+>
+> Deferred (post-MVP): engram-hooks / Hermes automatic lifecycle capture,
+> auto-promotion Path B (usage quorum), hard-delete + `deletion_events`
+> tombstones, PII-risk classification, sensitive-read audit logging, and Phase 3
+> open-source packaging.
+
 ---
 
 ## 1. What Engram Is
@@ -97,6 +122,13 @@ For multi-agent deployments, this becomes critical: one agent's guess should not
 
 ### Auto-promotion policy
 
+> **Implementation status:** Auto-promotion **Path A is implemented** (BL-004) as
+> a lazy check on startup recall plus the `engram promote-proposed` CLI and the
+> `POST /v1/admin/promote` endpoint, honoring the `tenant_config.auto_promote_*`
+> thresholds. **Path B (usage-validated quorum) is deferred** — post-MVP. The
+> machinery (feedback, recall logs) exists; only the quorum-based promotion path
+> is not yet wired.
+
 Without auto-promotion, the proposed queue grows unboundedly while the working set stays frozen — agents write all day but their knowledge never reaches recall. Auto-promotion makes human review exception handling, not the pipeline.
 
 **Auto-promotion conditions** are tenant-configurable and on by default with conservative thresholds. An item promotes if it meets either path.
@@ -128,6 +160,14 @@ A background job, scheduled CLI invocation, or lazy check on recall promotes eli
 This prevents an assistant's operating constraints from silently shrinking.
 
 ### Semantic recall includes proposed
+
+> **Implementation status:** Semantic recall (`POST /v1/recall mode=semantic`) is
+> **implemented** (BL-003): query-embedding similarity over active **and
+> proposed** items (proposed tagged `warnings: ["unreviewed"]`), visibility-scoped,
+> budget-bounded, excluded `rejected`/`archived` unless requested, and logged to
+> `recall_logs`. It reuses the search embedding machinery, so it is inert when
+> `ENGRAM_EMBEDDING_PROVIDER=none` (the dogfood default) — keyword/startup recall
+> are unaffected.
 
 Semantic recall (`mode=semantic`) returns both `active` and `proposed` items, but proposed items include warnings such as `['unreviewed']`.
 
@@ -581,6 +621,15 @@ No storage abstraction layer is planned until real demand exists.
 
 ### Embeddings
 
+> **Implementation status:** The separate `memory_embeddings` table, write-path
+> generation, semantic search, conflict-detection similarity, and the
+> `engram backfill-embeddings` command (BL-006) are **implemented**. The provider
+> is `none` by default; with the OpenAI provider, embeddings are generated on
+> `remember` and backfilled idempotently. The backfill is verified with a mocked
+> provider; the **live OpenAI path has not been recorded-verified** (see the
+> checklist in `docs/embeddings.md`). The dogfood deployment runs with embeddings
+> disabled intentionally.
+
 Embeddings are stored separately from memory items.
 
 Embeddings are keyed by model so that re-embedding does not require rewriting memory content or changing the memory item schema.
@@ -594,6 +643,13 @@ This supports:
 * embedding regeneration
 
 ### Auditability
+
+> **Implementation status:** Append-first content and audited metadata events
+> (`item_events`) are **implemented**. **Hard delete** (with `deletion_events`
+> tombstones and KG cascade), **PII-risk classification**, and **sensitive-read
+> audit logging** are **designed but deferred** — post-MVP. Today, removal is via
+> supersession/invalidation (soft removal that preserves the audit trail), not
+> physical row deletion.
 
 Memory content is append-first.
 
@@ -628,6 +684,8 @@ Vocabulary should be evocative in product surfaces but never obscure in API docu
 
 ### Phase 1A — Canonical memory MVP
 
+> **Implementation status: done.**
+
 Goal: establish the durable memory substrate.
 
 Includes:
@@ -643,6 +701,8 @@ Includes:
 * Python SDK
 
 ### Phase 1B — Trustable memory workflow
+
+> **Implementation status: done.**
 
 Goal: make memory reviewable and reliable.
 
@@ -660,6 +720,8 @@ Includes:
 
 ### Phase 1C — Rich memory topology
 
+> **Implementation status: done.**
+
 Goal: move beyond flat recall into structured institutional memory.
 
 Includes:
@@ -672,6 +734,13 @@ Includes:
 * richer memory inspection
 
 ### Phase 2 — Agent integration
+
+> **Implementation status: partial.** The Python SDK, MCP adapter, startup recall,
+> and semantic recall are **done and dogfood-verified**. Hermes integration and
+> lifecycle hooks (`engram-hooks`) are **written but not verified
+> end-to-end** (post-MVP, BL-012): explicit MCP-driven memory capture works today;
+> *automatic* lifecycle capture (pre-compression, sync-turn) is pending
+> verification of the upstream Hermes `prepare_memory_write` hook.
 
 Goal: make Engram useful in real agent workflows.
 
@@ -687,6 +756,10 @@ Includes:
 * coding-agent context patterns
 
 ### Phase 3 — Open-source readiness
+
+> **Implementation status: in progress** (this documentation truth pass is part of
+> it). Deployment artifacts and a dogfood deployment are landed; the remaining
+> security review, example integrations, and release packaging are pending.
 
 Goal: make Engram broadly usable outside Zutfen LLC.
 

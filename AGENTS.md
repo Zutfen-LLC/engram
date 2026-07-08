@@ -11,14 +11,14 @@ Guidelines for AI coding agents working on Engram.
 - **Linting:** ruff (E, F, I, UP, B, SIM; line-length=100)
 - **Type checking:** mypy --strict
 - **Commit style:** conventional commits (feat:, fix:, test:, docs:, refactor:)
-- **Design doc:** `docs/design.md` (source of truth for architecture and trust model)
-- **Backlog:** `docs/backlog.json` (task definitions, dependency graph, acceptance criteria)
+- **Design doc:** `docs/design.md` (source of truth for architecture and trust model, with implementation-status annotations)
+- **Backlog:** `docs/plans/engram-mvp-backlog.md` (execution backlog; MVP items BL-001–BL-010 are complete, BL-011+ is post-MVP). `docs/backlog.json` is retired to a pointer — do not use it as an active task source.
 
 ## Before you start
 
-1. Read the task definition in `docs/backlog.json` — it has acceptance criteria, file scope, and context notes.
+1. Read the task definition in `docs/plans/engram-mvp-backlog.md` — it has acceptance criteria, file scope, and context notes.
 2. Read `docs/design.md` sections referenced by the task.
-3. Check `docs/backlog.json` `dependency_graph` — your task's dependencies must be merged first.
+3. Check the task's **Dependencies** line — its dependencies must be merged first.
 
 ## Code conventions
 
@@ -29,7 +29,7 @@ Guidelines for AI coding agents working on Engram.
 
 ### Database
 - ORM models live in `engram/models.py`. Migration DDL lives in `migrations/`.
-- `engram.db:get_session` yields an `AsyncSession`. The dependency must set `app.tenant_id` and `app.principal_id` via `SET LOCAL` for RLS (not yet implemented — see T01).
+- `engram.db:get_session` yields an `AsyncSession`. The dependency sets `app.tenant_id` and `app.principal_id` via `SET LOCAL` for RLS based on the authenticated principal (with auth disabled, it falls back to the seeded default tenant/admin).
 - Content is append-first: never `UPDATE` memory item content. Metadata changes go through PATCH which writes to `item_events` first, then updates the column.
 - Dedup is enforced by unique index `idx_memitems_dedup` on `(tenant_id, workspace_id, principal_id, content_hash) WHERE valid_to IS NULL AND review_status != 'rejected'` with `NULLS NOT DISTINCT`.
 

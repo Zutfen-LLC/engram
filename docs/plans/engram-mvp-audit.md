@@ -1,5 +1,26 @@
 # Engram MVP Audit
 
+> **⚠️ Historical snapshot — findings resolved.** This audit was taken on
+> 2026-07-07 at `ee424a7`. It is preserved as a historical record. **Every
+> finding it raised has since been addressed by BL-001 through BL-010:**
+> - The sensitivity `confidential`→500 bug is fixed (BL-001; now 422).
+> - DB constraint violations map to 422, not 500 (BL-002).
+> - Semantic recall is implemented (BL-003) and auto-promotion Path A is
+>   implemented (BL-004).
+> - CI runs the full suite against Postgres + pgvector, including SDK and adapter
+>   coverage (BL-005).
+> - Embedding backfill is implemented (BL-006); the *live* OpenAI checklist is
+>   the one item still outstanding.
+> - Deployment artifacts exist (BL-007) and a real dogfood instance is running,
+>   network-verified, and backed up (BL-009; record:
+>   [`docs/ops/dogfood-verification.md`](../ops/dogfood-verification.md)).
+> - Docs are aligned to reality (BL-010).
+>
+> References below to "confidential", "not yet implemented", "T19", "no
+> endpoint is functional yet", etc. describe the state **as audited**, not the
+> current state. Read this document for the gap analysis it provided, not as a
+> description of Engram today. The current capability matrix is in `README.md`.
+
 **Date:** 2026-07-07
 **Auditor:** reality-based MVP audit (implementation completeness, docs drift, ops readiness, test coverage, product readiness)
 **Audited state:** `main` @ `ee424a7` (identical to audit branch base)

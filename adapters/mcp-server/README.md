@@ -5,6 +5,19 @@ MCP-compatible clients (Hermes, Claude Desktop, etc.). Each tool is a thin async
 wrapper over the [Engram Python SDK](../../sdk/engram-client), so anything you
 can do through the REST API you can do from an MCP-connected agent.
 
+> **Status & dogfooding:** This adapter is **implemented and verified** — it
+> ships unit + integration tests and was smoke-tested end-to-end
+> (`engram_remember`/`engram_recall`/`engram_search`) against the running dogfood
+> deployment (record: [`docs/ops/dogfood-verification.md`](../../docs/ops/dogfood-verification.md)).
+> It provides **explicit, tool-driven** memory capture: an agent (or its harness)
+> decides when to call `engram_remember`. **Automatic** lifecycle capture
+> (extracting facts on `pre_compress` / `sync_turn` / `session_end` without an
+> explicit tool call) is the job of the separate
+> [`engram-hooks`](../engram-hooks) companion library, which is written but not
+> yet verified end-to-end (post-MVP). Point a client at the dogfood instance by
+> setting `ENGRAM_BASE_URL` to the deployment URL and `ENGRAM_API_KEY` to an
+> issued key.
+
 ## Tools
 
 All tool names are prefixed with `engram_`.

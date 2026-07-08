@@ -8,6 +8,14 @@ Engram is intentionally hosting-agnostic: it runs anywhere Docker Compose (or
 equivalent Postgres 16 + pgvector ≥ 0.8 + Python 3.11+) is available. It does
 not require any specific host, VPN, or provider.
 
+> **A real deployment exists.** These steps are not theoretical: Engram is
+> running dogfood on a dedicated VM, auth-enabled, reachable over a Tailscale
+> mesh, with nightly backups and a restore smoke test. The sanitized
+> verification record (deployment, network health, authenticated remember→recall
+> round trips, MCP adapter smoke, backup/restore) is in
+> [`docs/ops/dogfood-verification.md`](ops/dogfood-verification.md). Hostnames,
+> IPs, and credentials are deliberately omitted from the repo.
+
 ---
 
 ## 1. Requirements
@@ -330,6 +338,7 @@ The `ENGRAM_DATABASE_URL` must use the `postgresql+asyncpg://` scheme.
 
 | Symptom | Likely cause / fix |
 | --- | --- |
+| `docker compose up` builds then the container runs the test suite forever and never serves `/health` | The `engram-service` build is missing `target: runtime`. The Dockerfile is multi-stage and its final stage is `ci` (whose CMD runs tests, not uvicorn). `docker-compose.yml` sets `build: { context: ., target: runtime }` — keep that if you fork/customize the compose file. |
 | `/ready` returns 503 with `pgvector: missing` or a low version | The `vector` extension is missing or below 0.8. Use the `pgvector/pgvector:pg16` image (Compose does this) or install pgvector ≥ 0.8 and `CREATE EXTENSION vector;`. |
 | `/ready` returns 503 `no_tenant_context` | The seed migration didn't run. On a fresh DB run `engram init-db`; on an existing-but-untracked DB run `engram init-db --baseline`. |
 | `engram init-db` errors that `memory_items` already exists | The DB was bootstrapped externally (Docker first-boot). Run `engram init-db --baseline` once. |
