@@ -74,6 +74,7 @@ class RecallResponse(BaseModel):
     scoring_version: str = "v1"
     config_version: str = "v1"
     recall_log_id: str | None = None
+    message: str | None = None
 
 
 # ---- /v1/search ----

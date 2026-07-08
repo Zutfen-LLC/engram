@@ -8,11 +8,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
+from uuid import UUID
 
 from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from engram import semantic
 from engram.config import settings
+from engram.embeddings import generate_embedding
 from engram.models import MemoryItem, RecallLog, TenantConfig
 
 
@@ -371,4 +374,238 @@ async def execute_startup_recall(
         "scoring_version": scoring_version,
         "config_version": config_version,
         "recall_log_id": str(recall_log.id),
+    }
+
+
+# ---- Semantic recall ----
+
+# Semantic recall includes active AND proposed items (design.md §3) so agents
+# can rediscover their own observations. Rejected/archived/expired are excluded
+# by the review_status + valid_to filter in semantic.search().
+_SEMANTIC_REVIEW_STATUSES = ("active", "proposed")
+
+# Over-fetch factor: pull more candidates than the item budget so byte/token
+# budget enforcement still has a pool to draw from after dropping large items.
+_SEMANTIC_OVERFETCH = 3
+_SEMANTIC_OVERFETCH_CAP = 200
+
+_NO_EMBEDDINGS_MESSAGE = (
+    "No embeddings are available yet. Semantic recall requires memories written "
+    "with embedding_provider != 'none'."
+)
+
+
+def _enforce_semantic_budget(
+    candidates: list[dict[str, Any]],
+    *,
+    byte_budget: int | None,
+    token_budget: int | None,
+    item_budget: int | None,
+) -> list[dict[str, Any]]:
+    """Enforce item/byte/token budgets on similarity-ordered candidates.
+
+    Items are already ordered by descending similarity (ascending cosine
+    distance), so we keep them in order until a budget would be exceeded.
+    A single item that itself exceeds the byte/token budget is still kept —
+    recall should surface the single best match rather than return empty.
+    """
+    if byte_budget is None and token_budget is None and item_budget is None:
+        return candidates
+
+    result: list[dict[str, Any]] = []
+    budget_used = 0
+
+    for cand in candidates:
+        if item_budget is not None and len(result) >= item_budget:
+            break
+        item_bytes = len(cand["content"].encode())
+        item_tokens = max(1, item_bytes // 4)
+
+        # Once we've included at least one item, respect the byte/token ceiling.
+        if result and byte_budget is not None and budget_used + item_bytes > byte_budget:
+            break
+        if result and token_budget is not None and budget_used + item_tokens > token_budget:
+            break
+
+        budget_used += item_bytes if byte_budget is not None else item_tokens
+        result.append(cand)
+
+    return result
+
+
+async def execute_semantic_recall(
+    session: AsyncSession,
+    tenant_id: str,
+    principal_id: str,
+    workspace: str | None,
+    query: str,
+    *,
+    byte_budget: int | None,
+    token_budget: int | None,
+    item_budget: int | None,
+) -> dict[str, Any]:
+    """Execute semantic recall and return the response dict.
+
+    Owns the query-embedding generation flow end to end. Eligibility mirrors
+    design.md §3: active AND proposed items, valid_to IS NULL. Proposed items
+    are tagged ``warnings: ["unreviewed"]`` so callers can distinguish them
+    from reviewed/active memories.
+
+    When embeddings are unavailable (provider=none) or the corpus has no
+    candidates, returns an empty working set with a helpful message rather
+    than raising — and still writes a recall_logs audit row.
+    """
+    now = datetime.now(UTC)
+    config = await _get_tenant_config(session, tenant_id)
+
+    # 1. Generate the query embedding. This is the single place the query
+    #    vector is produced; the shared semantic.search() never embeds.
+    query_embedding = await generate_embedding(query)
+
+    candidate_total = await semantic.candidate_count(
+        session, review_statuses=_SEMANTIC_REVIEW_STATUSES
+    )
+
+    if query_embedding is None or candidate_total == 0:
+        # Empty, non-error response. Still log the attempt for auditability.
+        config_version = config.config_version if config is not None else "v1"
+        recall_log = RecallLog(
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            mode="semantic",
+            query=query,
+            byte_budget=byte_budget,
+            token_budget=token_budget,
+            item_ids=[],
+            scoring_version="semantic-v1",
+            config_version=config_version,
+        )
+        session.add(recall_log)
+        await session.commit()
+        return {
+            "working_set": "",
+            "item_count": 0,
+            "byte_count": 0,
+            "pinned_omitted_count": 0,
+            "omitted_count": 0,
+            "items": [],
+            "scoring_version": "semantic-v1",
+            "config_version": config_version,
+            "recall_log_id": str(recall_log.id),
+            "message": _NO_EMBEDDINGS_MESSAGE,
+        }
+
+    # 2. Retrieve nearest candidates by cosine similarity.
+    #    RLS scopes results to the caller's tenant; an explicit workspace slug
+    #    would narrow further but semantic.search is tenant-scoped today, so
+    #    we accept the workspace param for API parity without filtering yet.
+    _ = workspace
+    item_limit = item_budget if item_budget is not None else settings.recall_item_budget
+    fetch_limit = min(item_limit * _SEMANTIC_OVERFETCH, _SEMANTIC_OVERFETCH_CAP)
+    candidates = await semantic.search(
+        session,
+        query_embedding,
+        fetch_limit,
+        review_statuses=_SEMANTIC_REVIEW_STATUSES,
+    )
+
+    # 4. Enrich candidates with full MemoryItem trust fields (pinned,
+    #    importance, source_trust, memory_confidence, human_verified).
+    candidate_ids = [UUID(c["id"]) for c in candidates]
+    item_by_id: dict[UUID, MemoryItem] = {}
+    if candidate_ids:
+        rows = await session.execute(
+            select(MemoryItem).where(MemoryItem.id.in_(candidate_ids))
+        )
+        item_by_id = {item.id: item for item in rows.scalars().all()}
+
+    # 5. Build per-item response dicts in similarity order.
+    enriched: list[dict[str, Any]] = []
+    for cand in candidates:
+        item = item_by_id.get(UUID(cand["id"]))
+        if item is None:
+            # Stale embedding whose item disappeared — skip.
+            continue
+        distance = float(cand.get("distance", 0.0))
+        similarity = float(cand.get("score", 1.0 - distance))
+        warnings: list[str] = []
+        if item.review_status == "proposed":
+            warnings.append("unreviewed")
+        enriched.append(
+            {
+                "id": str(item.id),
+                "kind": item.kind,
+                "content": item.content,
+                "score": round(similarity, 4),
+                "distance": round(distance, 4),
+                "review_status": item.review_status,
+                "reasons": [
+                    f"semantic similarity {similarity:.2f}",
+                    f"cosine_distance={distance:.4f}",
+                ],
+                "warnings": warnings,
+                "pinned": item.pinned,
+                "importance": item.importance,
+                "source_trust": item.source_trust,
+                "memory_confidence": item.memory_confidence,
+                "human_verified": item.human_verified,
+            }
+        )
+
+    # 6. Enforce item/byte/token budgets.
+    selected = _enforce_semantic_budget(
+        enriched,
+        byte_budget=byte_budget,
+        token_budget=token_budget,
+        item_budget=item_budget,
+    )
+
+    # 7. Build working set + counts.
+    working_set_lines = [f"[{item['kind']}] {item['content']}" for item in selected]
+    working_set = "\n".join(working_set_lines)
+    item_count = len(selected)
+    byte_count = sum(len(item["content"].encode()) for item in selected)
+
+    # 8. Write recall_logs (mode='semantic', query populated).
+    config_version = config.config_version if config is not None else "v1"
+    selected_ids = [UUID(item["id"]) for item in selected]
+    recall_log = RecallLog(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        mode="semantic",
+        query=query,
+        byte_budget=byte_budget,
+        token_budget=token_budget,
+        item_ids=selected_ids,
+        scoring_version="semantic-v1",
+        config_version=config_version,
+    )
+    session.add(recall_log)
+
+    # 9. Update recall signals. Only recall_count/last_recalled_at —
+    #    startup_recall_count drives the startup anti-feedback penalty and
+    #    must not accumulate from semantic queries (design §4).
+    if selected_ids:
+        await session.execute(
+            update(MemoryItem)
+            .where(MemoryItem.id.in_(selected_ids))
+            .values(
+                recall_count=MemoryItem.recall_count + 1,
+                last_recalled_at=now,
+            )
+        )
+
+    await session.commit()
+
+    return {
+        "working_set": working_set,
+        "item_count": item_count,
+        "byte_count": byte_count,
+        "pinned_omitted_count": 0,
+        "omitted_count": max(0, candidate_total - item_count),
+        "items": selected,
+        "scoring_version": "semantic-v1",
+        "config_version": config_version,
+        "recall_log_id": str(recall_log.id),
+        "message": None,
     }

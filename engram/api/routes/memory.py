@@ -14,10 +14,11 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, func, insert, select, text, update
+from sqlalchemy import func, insert, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from engram import semantic
 from engram.canonicalize import canonicalize, content_hash
 from engram.classification import ClassificationResult
 from engram.classification import classify as classify_memory
@@ -28,7 +29,6 @@ from engram.embeddings import create_embedding_placeholder, generate_embedding
 from engram.models import (
     FeedbackEvent,
     ItemEvent,
-    MemoryEmbedding,
     MemoryItem,
     Principal,
     TenantConfig,
@@ -106,6 +106,7 @@ class RecallResponse(BaseModel):
     scoring_version: str = "v1"
     config_version: str = "v1"
     recall_log_id: str | None = None
+    message: str | None = None
 
 
 class SearchRequest(BaseModel):
@@ -340,79 +341,18 @@ async def _keyword_search(session: AsyncSession, query: str, limit: int) -> list
     ]
 
 
-async def _semantic_candidate_count(session: AsyncSession) -> int:
-    stmt = (
-        select(func.count())
-        .select_from(MemoryEmbedding)
-        .join(
-            MemoryItem,
-            and_(
-                MemoryItem.id == MemoryEmbedding.memory_item_id,
-                MemoryItem.tenant_id == MemoryEmbedding.tenant_id,
-            ),
-        )
-        .where(
-            MemoryEmbedding.embedding_model == "text-embedding-3-small",
-            MemoryEmbedding.embedding.is_not(None),
-            MemoryItem.review_status == "active",
-            MemoryItem.valid_to.is_(None),
-        )
+def _format_semantic_result(row: dict[str, Any]) -> dict[str, Any]:
+    """Shape a semantic.search() row into the /v1/search response format."""
+    return _search_result_row(
+        row,
+        mode="semantic",
+        score=float(row.get("score", 0.0)),
+        extra={
+            "distance": row.get("distance"),
+            "embedding_model": row.get("embedding_model"),
+            "embedding_dim": row.get("embedding_dim"),
+        },
     )
-    return int((await session.execute(stmt)).scalar_one())
-
-
-async def _semantic_search(
-    session: AsyncSession,
-    query_embedding: list[float],
-    limit: int,
-) -> list[dict[str, Any]]:
-    await session.execute(text("SET LOCAL hnsw.iterative_scan = strict_order"))
-    distance = MemoryEmbedding.embedding.cosine_distance(query_embedding)
-    stmt = (
-        select(
-            MemoryItem.id.label("id"),
-            MemoryItem.content.label("content"),
-            MemoryItem.kind.label("kind"),
-            MemoryItem.review_status.label("review_status"),
-            MemoryItem.valid_to.label("valid_to"),
-            MemoryEmbedding.embedding_model.label("embedding_model"),
-            MemoryEmbedding.embedding_dim.label("embedding_dim"),
-            distance.label("distance"),
-        )
-        .select_from(MemoryEmbedding)
-        .join(
-            MemoryItem,
-            and_(
-                MemoryItem.id == MemoryEmbedding.memory_item_id,
-                MemoryItem.tenant_id == MemoryEmbedding.tenant_id,
-            ),
-        )
-        .where(
-            MemoryEmbedding.embedding_model == "text-embedding-3-small",
-            MemoryEmbedding.embedding.is_not(None),
-            MemoryItem.review_status == "active",
-            MemoryItem.valid_to.is_(None),
-        )
-        .order_by(distance.asc(), MemoryItem.created_at.desc())
-        .limit(limit)
-    )
-    rows = (await session.execute(stmt)).mappings().all()
-    results: list[dict[str, Any]] = []
-    for row in rows:
-        distance_value = float(row["distance"] or 0.0)
-        results.append(
-            _search_result_row(
-                row,
-                mode="semantic",
-                score=1.0 - distance_value,
-                extra={
-                    "distance": distance_value,
-                    "embedding_model": row["embedding_model"],
-                    "embedding_dim": row["embedding_dim"],
-                },
-            )
-        )
-    return results
 
 
 def _rrf_fuse(
@@ -717,29 +657,46 @@ async def recall(
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> RecallResponse:
     """Bounded recall: deterministic startup set or semantic query."""
+    from engram.recall import execute_semantic_recall, execute_startup_recall
 
-    # Determine mode
-    if req.mode != "startup":
+    mode = req.mode
+    if mode not in ("startup", "semantic"):
         raise HTTPException(
             status_code=422,
-            detail=f"mode={req.mode!r} not yet implemented (only 'startup' supported)",
+            detail=f"mode={mode!r} not supported (use 'startup' or 'semantic')",
+        )
+
+    if mode == "semantic" and (req.query is None or not req.query.strip()):
+        raise HTTPException(
+            status_code=422,
+            detail="mode='semantic' requires a non-empty query",
         )
 
     # Resolve RLS context
     tenant_id = await _resolve_tenant_id(session)
     principal_id, _ = await _resolve_principal(session, tenant_id)
 
-    # Execute startup recall
-    from engram.recall import execute_startup_recall
-
-    result = await execute_startup_recall(
-        session=session,
-        tenant_id=str(tenant_id),
-        principal_id=str(principal_id),
-        workspace=req.workspace,
-        byte_budget=req.byte_budget,
-        token_budget=req.token_budget,
-    )
+    if mode == "semantic":
+        # execute_semantic_recall owns the query-embedding generation flow.
+        result = await execute_semantic_recall(
+            session=session,
+            tenant_id=str(tenant_id),
+            principal_id=str(principal_id),
+            workspace=req.workspace,
+            query=req.query or "",
+            byte_budget=req.byte_budget,
+            token_budget=req.token_budget,
+            item_budget=req.item_budget,
+        )
+    else:
+        result = await execute_startup_recall(
+            session=session,
+            tenant_id=str(tenant_id),
+            principal_id=str(principal_id),
+            workspace=req.workspace,
+            byte_budget=req.byte_budget,
+            token_budget=req.token_budget,
+        )
 
     return RecallResponse(
         working_set=result["working_set"],
@@ -751,6 +708,7 @@ async def recall(
         scoring_version=result.get("scoring_version", "v1"),
         config_version=result.get("config_version", "v1"),
         recall_log_id=result.get("recall_log_id"),
+        message=result.get("message"),
     )
 
 
@@ -768,14 +726,15 @@ async def search(
         return SearchResponse(results=results, total=len(results))
 
     query_embedding = await generate_embedding(req.query)
-    semantic_count = await _semantic_candidate_count(session)
+    semantic_count = await semantic.candidate_count(session)
 
     if mode == "semantic":
         if query_embedding is None or semantic_count == 0:
             return SearchResponse(results=[], total=0, message=_SEARCH_HELPFUL_MESSAGE)
-        results = await _semantic_search(session, query_embedding, limit)
-        if not results:
+        raw = await semantic.search(session, query_embedding, limit)
+        if not raw:
             return SearchResponse(results=[], total=0, message=_SEARCH_HELPFUL_MESSAGE)
+        results = [_format_semantic_result(row) for row in raw]
         return SearchResponse(results=results, total=len(results))
 
     keyword_results = await _keyword_search(session, req.query, max(limit * 5, limit))
@@ -786,7 +745,8 @@ async def search(
             message=_SEARCH_HELPFUL_MESSAGE,
         )
 
-    semantic_results = await _semantic_search(session, query_embedding, max(limit * 5, limit))
+    raw_semantic = await semantic.search(session, query_embedding, max(limit * 5, limit))
+    semantic_results = [_format_semantic_result(row) for row in raw_semantic]
     results = _rrf_fuse(keyword_results, semantic_results, limit=limit)
     return SearchResponse(results=results, total=len(results))
 
