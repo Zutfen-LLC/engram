@@ -83,6 +83,12 @@ def main() -> int:
     # silently skipping. The DB is available in the CI Compose stack.
     _run("pytest", "-q", "adapters/mcp-server/tests", env=env)
 
+    _section("engram-hooks Tests")
+    # No DB, no network, no real Hermes checkout needed: guard/detection/shim
+    # tests build a fake hermes_agent module tree in-process (see
+    # adapters/engram-hooks/tests/conftest.py).
+    _run("pytest", "-q", "adapters/engram-hooks/tests")
+
     _section("CI Result")
     print("All Compose-backed CI checks passed.", flush=True)
     return 0

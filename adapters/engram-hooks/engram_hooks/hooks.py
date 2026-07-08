@@ -357,6 +357,57 @@ def _split_sentences(line: str) -> list[str]:
 # ===========================================================================
 
 
+class AutomaticCaptureUnavailable(RuntimeError):
+    """Raised by :func:`install` when automatic capture is required but inactive.
+
+    Set ``HooksConfig.require_automatic_capture=True`` to make this fatal: a
+    profile that loads engram-hooks and expects automatic memory capture
+    should not silently degrade to "nothing is patched" while still claiming
+    the feature works. ``str(exc)`` includes the failure reason and
+    remediation guidance; ``exc.status`` carries the full
+    :class:`InstallStatus` for programmatic inspection.
+    """
+
+    def __init__(self, status: InstallStatus) -> None:
+        self.status = status
+        super().__init__(
+            "engram-hooks: automatic capture was required (require_automatic_capture=True) "
+            f"but is not active — {status.failure_reason}. Set "
+            "ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE=false to disable automatic capture "
+            "instead of failing, or ENGRAM_HOOKS_COMPAT_SHIM=false to disable the shim "
+            "and rely on native prepare_memory_write only."
+        )
+
+
+@dataclass(slots=True)
+class InstallStatus:
+    """Structured, inspectable result of one :func:`install` call.
+
+    This is the single source of truth for "what path is active" — logged at
+    startup, returned to the caller, and asserted on directly in tests instead
+    of scraping log lines.
+    """
+
+    native_hook_available: bool
+    compat_shim_installed: bool
+    patched_modules: list[str] = field(default_factory=list)
+    failure_reason: str | None = None
+    detection: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def automatic_capture_active(self) -> bool:
+        """True iff Hermes will actually route writes through our guard."""
+        return self.native_hook_available or self.compat_shim_installed
+
+    def describe(self) -> str:
+        """One-line human-readable summary, used for the startup log line."""
+        if self.native_hook_available:
+            return f"native prepare_memory_write active (provider={self.detection.get('provider')})"
+        if self.compat_shim_installed:
+            return f"compatibility shim active (patched={', '.join(self.patched_modules)})"
+        return f"automatic capture DISABLED — {self.failure_reason}"
+
+
 def detect_prepare_memory_write() -> dict[str, Any]:
     """Probe the Hermes ``MemoryProvider`` ABC for the ``prepare_memory_write`` hook.
 
@@ -422,22 +473,42 @@ def _find_memory_provider() -> type:
     )
 
 
-def _patch_memory_dispatch(mod: Any, hooks: LifecycleHooks) -> bool:
+# Marker attribute set on our wrapper functions. Its presence on a module
+# attribute is how we detect "already patched" so a second install() call
+# (e.g. a test harness re-installing, or a plugin loader calling install()
+# more than once) never wraps a wrapper — the double-wrap idempotency AC.
+_SHIM_MARKER = "__engram_hooks_shim__"
+
+
+def _patch_memory_dispatch(mod: Any) -> bool:
     """Wrap one module's memory() dispatch to route through our guard.
 
-    Returns ``True`` if a dispatch function was found and patched, ``False``
-    otherwise. The wrapper calls :meth:`LifecycleHooks.prepare_memory_write`
-    (i.e. the active-rejection guard) before delegating to the original; a
-    ``reject`` verdict short-circuits the native write entirely.
+    Returns ``True`` if a dispatch function is patched (or was already
+    patched by a prior :func:`install` call — idempotent no-op), ``False`` if
+    no known dispatch attribute exists on ``mod``.
+
+    The wrapper looks up :func:`get_active_hooks` *at call time* rather than
+    closing over a fixed ``LifecycleHooks`` instance, so a later ``install()``
+    (which rebinds the module-level active hooks) is picked up without
+    re-patching. If no hooks are installed when the wrapper fires, it falls
+    back to the stateless :func:`prepare_memory_write_guard` so the guard is
+    never silently bypassed.
     """
     for attr in _MEMORY_DISPATCH_ATTRS:
         original = getattr(mod, attr, None)
         if not callable(original):
             continue
+        if getattr(original, _SHIM_MARKER, False):
+            # Already wrapped by a previous install() — idempotent no-op.
+            return True
 
-        def wrapper(content: str, *args: Any, _orig: Any = original,
-                    _hooks: LifecycleHooks = hooks, **kw: Any) -> Any:
-            verdict = _hooks.prepare_memory_write(content, **kw)
+        def wrapper(content: str, *args: Any, _orig: Any = original, **kw: Any) -> Any:
+            active = get_active_hooks()
+            verdict = (
+                active.prepare_memory_write(content, **kw)
+                if active is not None
+                else prepare_memory_write_guard(content, **kw)
+            )
             if not is_allowed(verdict):
                 logger.info(
                     "engram-hooks compat shim rejected a memory write: %s",
@@ -446,6 +517,7 @@ def _patch_memory_dispatch(mod: Any, hooks: LifecycleHooks) -> bool:
                 return verdict  # {handled: True, action: reject} — active rejection
             return _orig(content, *args, **kw)
 
+        setattr(wrapper, _SHIM_MARKER, True)
         setattr(mod, attr, wrapper)
         logger.info(
             "engram-hooks compat shim wrapped %s.%s", mod.__name__, attr
@@ -454,7 +526,7 @@ def _patch_memory_dispatch(mod: Any, hooks: LifecycleHooks) -> bool:
     return False
 
 
-def install_compat_shim(hooks: LifecycleHooks) -> dict[str, Any]:
+def install_compat_shim(hooks: LifecycleHooks) -> InstallStatus:
     """Detect ``prepare_memory_write`` and patch dispatch if it's missing.
 
     This is the ~20-line compatibility shim the task spec calls for. It:
@@ -463,7 +535,12 @@ def install_compat_shim(hooks: LifecycleHooks) -> dict[str, Any]:
     2. If yes: logs that we're using it natively and returns.
     3. If no: wraps each memory() dispatch site so our guard runs first.
 
-    The result dict records what happened, for logging and tests.
+    ``hooks`` is accepted for backward compatibility / explicitness at the
+    call site but the actual patched wrappers dispatch through
+    :func:`get_active_hooks` at call time (see :func:`_patch_memory_dispatch`).
+
+    Returns an :class:`InstallStatus` — the same structure :func:`install`
+    returns — so callers and tests never have to parse log output.
     """
     detection = detect_prepare_memory_write()
 
@@ -472,7 +549,9 @@ def install_compat_shim(hooks: LifecycleHooks) -> dict[str, Any]:
             "prepare_memory_write found natively on %s — using hook directly, "
             "no monkey-patch needed.", detection["provider"]
         )
-        return {"shim_applied": False, "detection": detection}
+        return InstallStatus(
+            native_hook_available=True, compat_shim_installed=False, detection=detection,
+        )
 
     if not detection["hermes_present"]:
         # No Hermes at all (e.g. tests, or plugin imported outside Hermes).
@@ -481,7 +560,12 @@ def install_compat_shim(hooks: LifecycleHooks) -> dict[str, Any]:
             "Hermes not installed ( %s ) — compat shim inactive, lifecycle "
             "hooks available standalone.", detection["error"]
         )
-        return {"shim_applied": False, "detection": detection}
+        return InstallStatus(
+            native_hook_available=False,
+            compat_shim_installed=False,
+            failure_reason=f"Hermes is not installed in this process ({detection['error']})",
+            detection=detection,
+        )
 
     # Hermes is present but the hook is missing — this is the case the shim
     # exists for. Log clearly with the PR link so operators understand why
@@ -494,24 +578,43 @@ def install_compat_shim(hooks: LifecycleHooks) -> dict[str, Any]:
     )
 
     patched: list[str] = []
+    unimportable: list[str] = []
     for mod_path in _HERMES_DISPATCH_MODULES:
         try:
             mod = __import__(mod_path, fromlist=["*"])
         except ImportError:
             logger.debug("Hermes module %s not importable — skipping", mod_path)
+            unimportable.append(mod_path)
             continue
-        if _patch_memory_dispatch(mod, hooks):
+        if _patch_memory_dispatch(mod):
             patched.append(mod_path)
 
     if not patched:
-        logger.warning(
-            "engram-hooks compat shim could not locate any memory() dispatch in "
-            "%s — no patch applied. The lifecycle hooks still work; only the "
-            "write-boundary guard on direct memory() calls is inactive.",
-            ", ".join(_HERMES_DISPATCH_MODULES),
+        # Hermes is installed but every known dispatch site is gone or
+        # renamed — API drift. Fail loudly with actionable diagnostics rather
+        # than a debug-level "no patch applied" that an operator would miss.
+        reason = (
+            "Hermes is installed but no known memory() dispatch site could be patched "
+            f"(tried modules {_HERMES_DISPATCH_MODULES!r}, attributes {_MEMORY_DISPATCH_ATTRS!r}; "
+            f"unimportable: {unimportable!r}). This usually means Hermes changed its "
+            "internal module layout — update _HERMES_DISPATCH_MODULES / "
+            "_MEMORY_DISPATCH_ATTRS in engram_hooks/hooks.py to match the installed "
+            "Hermes version."
+        )
+        logger.error("engram-hooks compat shim FAILED to patch: %s", reason)
+        return InstallStatus(
+            native_hook_available=False,
+            compat_shim_installed=False,
+            failure_reason=reason,
+            detection=detection,
         )
 
-    return {"shim_applied": bool(patched), "patched_modules": patched, "detection": detection}
+    return InstallStatus(
+        native_hook_available=False,
+        compat_shim_installed=True,
+        patched_modules=patched,
+        detection=detection,
+    )
 
 
 # ===========================================================================
@@ -522,10 +625,30 @@ def install_compat_shim(hooks: LifecycleHooks) -> dict[str, Any]:
 def install(config: HooksConfig | None = None) -> dict[str, Any]:
     """Plugin load entry point: build hooks, apply shim, return state.
 
-    Call this once at plugin load (Hermes' plugin discovery invokes it, or a
-    human calls it from their Hermes config). It constructs the
-    :class:`LifecycleHooks` engine, applies the compatibility shim if needed,
-    and returns a dict the caller can log or inspect.
+    Call this once per process at plugin load (Hermes' plugin discovery
+    invokes it, or a human calls it from their Hermes profile/config — see
+    ``docs/ops/hermes-dogfood-profile.md``). It constructs the
+    :class:`LifecycleHooks` engine, detects/patches ``prepare_memory_write``
+    if the profile has the compat shim enabled, and returns a dict the caller
+    can log or inspect: ``{"hooks": LifecycleHooks, "status": InstallStatus}``.
+
+    Startup behavior (see also ``HooksConfig``):
+
+    * Native ``prepare_memory_write`` present → registered natively, no patch.
+    * Native hook absent, ``enable_compat_shim=True`` (default) → the compat
+      shim patches Hermes' memory() dispatch sites.
+    * Native hook absent, ``enable_compat_shim=False`` → automatic capture is
+      disabled; lifecycle hooks (``pre_compress``/``sync_turn``/``session_end``)
+      still work if the profile wires them explicitly, but direct
+      ``memory()`` calls are not intercepted.
+    * ``require_automatic_capture=True`` and neither path ended up active →
+      raises :class:`AutomaticCaptureUnavailable` instead of returning, so a
+      profile that expects automatic capture cannot silently run without it.
+
+    Idempotent: calling ``install()`` again re-detects and, if the compat
+    shim already patched a module, recognizes the existing patch (via a
+    marker attribute) instead of double-wrapping it — see
+    :func:`_patch_memory_dispatch`.
 
     The constructed ``LifecycleHooks`` is also stashed at module level
     (readable via :func:`get_active_hooks`) so the Hermes lifecycle bus can find
@@ -533,18 +656,29 @@ def install(config: HooksConfig | None = None) -> dict[str, Any]:
     handle is mutated by ``install()``, and a ``from … import`` of the name would
     capture the pre-install value.
     """
-    global ACTIVE_HOOKS
+    global ACTIVE_HOOKS, ACTIVE_STATUS
     hooks = LifecycleHooks(config)
     ACTIVE_HOOKS = hooks
-    shim_result = install_compat_shim(hooks) if hooks.config.enable_compat_shim else {
-        "shim_applied": False, "detection": {"hermes_present": False},
-    }
+
+    if hooks.config.enable_compat_shim:
+        status = install_compat_shim(hooks)
+    else:
+        status = InstallStatus(
+            native_hook_available=False,
+            compat_shim_installed=False,
+            failure_reason="compat shim disabled (ENGRAM_HOOKS_COMPAT_SHIM=false)",
+        )
+    ACTIVE_STATUS = status
+
     logger.info(
-        "engram-hooks installed: base_url=%s volatile=%s shim_applied=%s",
-        hooks.config.base_url or "(unset)", hooks.volatile.path,
-        shim_result.get("shim_applied", False),
+        "engram-hooks installed: base_url=%s volatile=%s active_path=%s",
+        hooks.config.base_url or "(unset)", hooks.volatile.path, status.describe(),
     )
-    return {"hooks": hooks, "shim": shim_result}
+
+    if hooks.config.require_automatic_capture and not status.automatic_capture_active:
+        raise AutomaticCaptureUnavailable(status)
+
+    return {"hooks": hooks, "status": status, "shim": status}
 
 
 def get_active_hooks() -> LifecycleHooks | None:
@@ -558,7 +692,20 @@ def get_active_hooks() -> LifecycleHooks | None:
     return ACTIVE_HOOKS
 
 
-# Module-level handle to the active LifecycleHooks, set by install(). Read it
-# through get_active_hooks() so callers always see the post-install value. The
-# Hermes lifecycle bus dispatches pre_compress / sync_turn / session_end here.
+def get_install_status() -> InstallStatus | None:
+    """Return the :class:`InstallStatus` from the last :func:`install` call.
+
+    ``None`` if ``install()`` has never run in this process. Operators and
+    tests should use this (not log scraping) to check which path is active:
+    ``get_install_status().automatic_capture_active`` is the single boolean
+    that answers "is Engram actually capturing memory automatically right now".
+    """
+    return ACTIVE_STATUS
+
+
+# Module-level handles set by install(). Read them through the accessor
+# functions above so callers always see the post-install value — a
+# `from engram_hooks import ACTIVE_HOOKS` binds at import time and would miss
+# a later install() rebind.
 ACTIVE_HOOKS: LifecycleHooks | None = None
+ACTIVE_STATUS: InstallStatus | None = None

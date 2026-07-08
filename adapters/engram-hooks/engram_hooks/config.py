@@ -133,9 +133,23 @@ class HooksConfig:
     )
 
     # When True (default), emit the prepare_memory_write compat shim on install.
-    # Disable for environments that already ship PR #59898.
+    # Disable for environments that already ship PR #59898, or if the shim
+    # causes trouble and you want the plugin to fall back to volatile-only
+    # lifecycle hooks without touching Hermes' memory dispatch at all.
     enable_compat_shim: bool = field(
         default_factory=lambda: _env_bool("ENGRAM_HOOKS_COMPAT_SHIM", True)
+    )
+
+    # When True, a profile that loads engram-hooks is asserting "automatic
+    # memory capture is active" and means it. install() raises
+    # AutomaticCaptureUnavailable if, after detection + shim installation,
+    # neither the native prepare_memory_write hook nor the compat shim ended
+    # up active — instead of silently degrading while the profile still
+    # claims automatic capture works. Off by default so the library keeps
+    # working standalone (tests, no-Hermes contexts) without opting into a
+    # hard failure mode.
+    require_automatic_capture: bool = field(
+        default_factory=lambda: _env_bool("ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE", False)
     )
 
     def source_type_for(self, event: str) -> Literal["sync_turn", "pre_compress", "extraction"]:

@@ -40,10 +40,13 @@ from .guards import (
     prepare_memory_write_guard,
 )
 from .hooks import (
+    AutomaticCaptureUnavailable,
     HookResult,
+    InstallStatus,
     LifecycleHooks,
     detect_prepare_memory_write,
     get_active_hooks,
+    get_install_status,
     install,
     install_compat_shim,
 )
@@ -72,4 +75,7 @@ __all__ = [
     "install_compat_shim",
     "detect_prepare_memory_write",
     "get_active_hooks",
+    "InstallStatus",
+    "get_install_status",
+    "AutomaticCaptureUnavailable",
 ]

@@ -15,6 +15,14 @@
 >   network-verified, and backed up (BL-009; record:
 >   [`docs/ops/dogfood-verification.md`](../ops/dogfood-verification.md)).
 > - Docs are aligned to reality (BL-010).
+> - The "engram-hooks / MCP adapter have zero tests" finding below is
+>   resolved for engram-hooks: ENG-HERMES-001 added 37 tests
+>   (`adapters/engram-hooks/tests/`) covering detection, the compatibility
+>   shim, guard allow/reject, install idempotency, and patch failure, and
+>   wired `install()` into a documented Hermes dogfood profile
+>   (`docs/ops/hermes-dogfood-profile.md`). The upstream Hermes PR #59898 is
+>   no longer a blocker — the shim works without it. What remains open is a
+>   recorded end-to-end run against a real Hermes checkout (see BL-012).
 >
 > References below to "confidential", "not yet implemented", "T19", "no
 > endpoint is functional yet", etc. describe the state **as audited**, not the
