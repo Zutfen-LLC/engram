@@ -23,10 +23,13 @@
 > path (mocked-tested only — the live OpenAI checklist in `docs/embeddings.md` is
 > not yet recorded; the dogfood runs with embeddings disabled).
 >
-> Deferred (post-MVP): engram-hooks / Hermes automatic lifecycle capture,
-> auto-promotion Path B (usage quorum), hard-delete + `deletion_events`
-> tombstones, PII-risk classification, sensitive-read audit logging, and Phase 3
-> open-source packaging.
+> Deferred (post-MVP): a recorded end-to-end Hermes dogfood run of engram-hooks'
+> automatic lifecycle capture (the shim itself is implemented, unit-tested, and
+> profile-wired as of ENG-HERMES-001 — see `docs/ops/hermes-dogfood-profile.md`;
+> only the real-Hermes-checkout verification is outstanding), auto-promotion
+> Path B (usage quorum), hard-delete + `deletion_events` tombstones, PII-risk
+> classification, sensitive-read audit logging, and Phase 3 open-source
+> packaging.
 
 ---
 
@@ -736,11 +739,16 @@ Includes:
 ### Phase 2 — Agent integration
 
 > **Implementation status: partial.** The Python SDK, MCP adapter, startup recall,
-> and semantic recall are **done and dogfood-verified**. Hermes integration and
-> lifecycle hooks (`engram-hooks`) are **written but not verified
-> end-to-end** (post-MVP, BL-012): explicit MCP-driven memory capture works today;
-> *automatic* lifecycle capture (pre-compression, sync-turn) is pending
-> verification of the upstream Hermes `prepare_memory_write` hook.
+> and semantic recall are **done and dogfood-verified**. Hermes lifecycle hooks
+> (`engram-hooks`) — detection, compatibility shim, guard, idempotent install,
+> structured status — are **implemented and unit-tested**
+> (ENG-HERMES-001; no longer blocked on the upstream Hermes
+> `prepare_memory_write` PR, which is used natively if present and
+> monkey-patched around otherwise). A documented Hermes dogfood profile now
+> loads it (`docs/ops/hermes-dogfood-profile.md`,
+> `profiles/hermes-engram-dogfood.yaml`). What remains post-MVP is a recorded
+> end-to-end run against a real Hermes checkout; explicit MCP-driven memory
+> capture works today independent of that.
 
 Goal: make Engram useful in real agent workflows.
 

@@ -91,7 +91,8 @@ through to spawned processes).
 | `ENGRAM_HOOKS_VOLATILE_CAP` | no | `2000` | Max volatile entries. |
 | `ENGRAM_HOOKS_PROMOTE_THRESHOLD` | no | `0.6` | classify() confidence ≥ this → `remember` (proposed). |
 | `ENGRAM_HOOKS_WORKSPACE` | no | — | Default workspace for writes. |
-| `ENGRAM_HOOKS_COMPAT_SHIM` | no | `true` | Apply the `prepare_memory_write` compat shim on install. |
+| `ENGRAM_HOOKS_COMPAT_SHIM` | no | `true` | Apply the `prepare_memory_write` compat shim on install. Set `false` to disable automatic capture entirely (lifecycle hooks/MCP still work). |
+| `ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE` | no | `false` | If `true`, `install()` raises `AutomaticCaptureUnavailable` instead of degrading quietly when neither the native hook nor the compat shim ends up active. |
 
 ¹ If unset, the plugin still loads but parks every candidate in the volatile
 store (no classify/remember). This is intentional graceful degradation.
@@ -101,10 +102,16 @@ store (no classify/remember). This is intentional graceful degradation.
 ### As a Hermes plugin
 
 ```python
-from engram_hooks import install, get_active_hooks
+from engram_hooks import install, get_active_hooks, get_install_status
 
-# At plugin load: build the engine + apply the compat shim.
-install()
+# At plugin load: build the engine, detect native prepare_memory_write vs.
+# apply the compat shim, and return/log which path is active.
+result = install()
+status = get_install_status()  # same object as result["status"]
+print(status.describe())
+# "native prepare_memory_write active (provider=...)" or
+# "compatibility shim active (patched=hermes_agent.tools.tool_executor, ...)" or
+# "automatic capture DISABLED — <reason>"
 
 # On each lifecycle event (wire to the Hermes lifecycle bus):
 hooks = get_active_hooks()
@@ -115,6 +122,20 @@ result = await hooks.sync_turn(payload)
 > Use `get_active_hooks()` rather than importing `ACTIVE_HOOKS` by name — the
 > handle is rebound by `install()`, and a `from … import ACTIVE_HOOKS` would
 > capture the pre-install value (`None`).
+
+`install()` is idempotent: calling it again (e.g. a Hermes plugin-reload path)
+re-detects and recognizes an already-patched dispatch site instead of
+wrapping it a second time — see `_SHIM_MARKER` in `hooks.py`.
+
+Set `ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE=true` to make `install()` raise
+`AutomaticCaptureUnavailable` instead of returning when neither the native
+hook nor the compat shim ends up active — for profiles where "engram-hooks is
+loaded" is supposed to mean "automatic capture actually works," not "the
+import didn't crash." See
+[`docs/ops/hermes-dogfood-profile.md`](../../docs/ops/hermes-dogfood-profile.md)
+for the full runbook, including the documented profile template at
+[`profiles/hermes-engram-dogfood.yaml`](../../profiles/hermes-engram-dogfood.yaml)
+and how to disable the shim if it causes trouble.
 
 ### Standalone (no Hermes)
 

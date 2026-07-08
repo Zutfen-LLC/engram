@@ -325,10 +325,15 @@ These are intentionally out of scope for the MVP and tracked in
 
 * **Production data migration runs** (CCA + MemPalace `--apply` against the live
   instance) — BL-011. The importers are built; only the operational import is pending.
-* **engram-hooks / Hermes automatic lifecycle capture** — BL-012. The companion
-  library is written, but Hermes lifecycle integration is not yet verified
-  end-to-end. Explicit MCP-driven dogfooding works today; *automatic* memory
-  capture is post-MVP.
+* **engram-hooks / Hermes automatic lifecycle capture** — BL-012 /
+  ENG-HERMES-001. The compatibility shim (native-hook detection, monkey-patch,
+  guard, idempotent `install()`, structured status) is implemented and unit
+  tested (`pytest -q adapters/engram-hooks/tests`), and a documented Hermes
+  dogfood profile now loads it (`profiles/hermes-engram-dogfood.yaml`,
+  `docs/ops/hermes-dogfood-profile.md`). What's **not yet done**: a recorded
+  end-to-end run against a real Hermes checkout confirming an automatic write
+  reaches the deployed Engram instance. Explicit MCP-driven dogfooding works
+  today regardless.
 * Auto-promotion **Path B** (usage-validated quorum).
 * Hard delete + `deletion_events` tombstones + KG cascade.
 * PII-risk classification and sensitive-read audit logging.
