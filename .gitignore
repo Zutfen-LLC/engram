@@ -27,6 +27,9 @@ ENV/
 # zcode
 .zcode
 
+# Agent-local state (Kilo)
+.kilo/
+
 # Environment / secrets
 .env
 .env.*

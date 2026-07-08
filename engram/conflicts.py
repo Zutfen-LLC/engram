@@ -17,11 +17,11 @@ from sqlalchemy import and_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.config import settings
+from engram.embeddings import EMBEDDING_MODEL as _EMBEDDING_MODEL
 from engram.models import MemoryEmbedding, MemoryItem
 
 # Cosine similarity above this triggers conflict classification.
 _SIMILARITY_THRESHOLD = 0.85
-_EMBEDDING_MODEL = "text-embedding-3-small"
 
 # source_trust at or above this counts as "high authority" for auto-supersession.
 _HIGH_SOURCE_TRUST = 0.8
