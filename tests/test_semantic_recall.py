@@ -98,18 +98,31 @@ async def _clean_db():
 
 @pytest.fixture(autouse=True)
 def _reset_embedding_provider():
-    original = settings.embedding_provider
+    original_provider = settings.embedding_provider
+    original_conflict = settings.conflict_check_on_write
+    # These tests exercise recall, not the write-path conflict detector.
+    # With provider=openai, items sharing the query vector hit similarity 1.0
+    # and would otherwise be auto-deduped by the conflict classifier — which
+    # has its own dedicated test suite. Disable it here for isolation.
+    settings.conflict_check_on_write = False
     yield
-    settings.embedding_provider = original
+    settings.embedding_provider = original_provider
+    settings.conflict_check_on_write = original_conflict
 
 
 _TARGET_VEC = [1.0] + [0.0] * 1535
 _DISTRACTOR_VEC = [0.0, 1.0] + [0.0] * 1534
 
+# Strings that should embed near the query vector. Using a prefix match lets
+# tests create multiple DISTINCT-content items (so dedup doesn't collapse
+# them) that all share the target vector — e.g. "semantic target one" and
+# "semantic target two" both embed to _TARGET_VEC.
+_TARGET_PREFIXES = ("semantic target", "semantic query", "proposed target")
+
 
 def _fake_embedding_for(text_value: str) -> list[float]:
-    """Deterministic embedding: known strings map to fixed vectors."""
-    if text_value in {"semantic target", "semantic query"}:
+    """Deterministic embedding: target-prefix strings map to the query vector."""
+    if text_value.startswith(_TARGET_PREFIXES):
         return _TARGET_VEC
     return _DISTRACTOR_VEC
 
@@ -171,13 +184,11 @@ async def test_semantic_recall_includes_proposed_with_unreviewed_warning(client,
     settings.embedding_provider = "openai"
     _patch_embeddings(monkeypatch)
 
-    # active item via manual/user source
-    active = await _remember(client, "semantic target")
+    # Distinct content so dedup doesn't collapse them; both share the target
+    # vector via the prefix match in _fake_embedding_for.
+    active = await _remember(client, "semantic target active")
     assert active["review_status"] == "active"
-    # proposed item via extraction source
-    proposed = await _remember(
-        client, "semantic target", source_type="extraction"
-    )
+    proposed = await _remember(client, "proposed target unreviewed", source_type="extraction")
     assert proposed["review_status"] == "proposed"
 
     resp = await client.post(
@@ -322,21 +333,30 @@ async def test_semantic_recall_byte_budget_enforced(client, monkeypatch):
     settings.embedding_provider = "openai"
     _patch_embeddings(monkeypatch)
 
-    # Two matches; budget admits exactly one (~19 bytes each).
+    # Three distinct-content matches, all near the query vector.
     await _remember(client, "semantic target one")
     await _remember(client, "semantic target two")
+    await _remember(client, "semantic target three")
 
+    # A generous budget returns all three.
+    all_resp = await client.post(
+        "/v1/recall", json={"mode": "semantic", "query": "semantic query"}
+    )
+    assert all_resp.status_code == 200
+    assert all_resp.json()["item_count"] == 3
+
+    # A budget that admits only the first (best) item drops the rest.
+    first_bytes = len(all_resp.json()["items"][0]["content"].encode())
     resp = await client.post(
         "/v1/recall",
-        json={"mode": "semantic", "query": "semantic query", "byte_budget": 24},
+        json={"mode": "semantic", "query": "semantic query", "byte_budget": first_bytes},
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    # The first (best) item is always kept; the second is dropped by the budget.
     assert body["item_count"] == 1
-    assert body["omitted_count"] >= 1
-    # byte_count reflects only the items actually returned.
-    assert body["byte_count"] == len(body["items"][0]["content"].encode())
+    # byte_count cannot exceed the budget (the single returned item fits).
+    assert body["byte_count"] <= first_bytes
+    assert body["omitted_count"] == 2
 
 
 async def test_semantic_recall_token_budget_enforced(client, monkeypatch):
@@ -348,13 +368,13 @@ async def test_semantic_recall_token_budget_enforced(client, monkeypatch):
     await _remember(client, "semantic target one")
     await _remember(client, "semantic target two")
 
+    # token_budget that admits exactly one item (~19 bytes // 4 = 4 tokens).
     resp = await client.post(
         "/v1/recall",
         json={"mode": "semantic", "query": "semantic query", "token_budget": 4},
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    # ~19 bytes // 4 = 4 tokens each; token_budget=4 admits exactly one item.
     assert body["item_count"] == 1
 
 
