@@ -605,24 +605,12 @@ async def test_tenant_isolation():
 async def test_admin_endpoint_returns_summary(client):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
-    # Write a proposed item via the write path (client-first establishes the
-    # engine's connection on the request loop), then make it promotion-eligible
-    # via a session-after-client tweak (the pattern test_semantic_recall uses).
-    create = await client.post(
-        "/v1/remember",
-        json={"content": "endpoint fact", "source_type": "extraction"},
+    # Setup via helper sessions, then a single client call to the endpoint —
+    # mirrors the passing test_startup_recall_* structure (helper-then-client).
+    tenant_id, principal_id = await _default_tenant_principal()
+    await _insert_item(
+        tenant_id=tenant_id, principal_id=principal_id, content="endpoint fact"
     )
-    assert create.status_code == 201, create.text
-    item_id = create.json()["id"]
-    async with _test_session_factory() as session:
-        await session.execute(
-            text(
-                "UPDATE memory_items SET memory_confidence = 0.9, "
-                "created_at = :old WHERE id = :id"
-            ),
-            {"old": _default_now() - timedelta(hours=100), "id": item_id},
-        )
-        await session.commit()
 
     resp = await client.post("/v1/admin/promote")
     assert resp.status_code == 200, resp.text
