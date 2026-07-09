@@ -11,6 +11,8 @@ dependency so the app uses our test engine.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
@@ -18,6 +20,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import NullPool
 
 from engram.api.app import create_app
+from engram.api.routes import memory as memory_routes
+from engram.classification import ClassificationResult
 from engram.config import settings
 from engram.db import get_session
 
@@ -475,3 +479,203 @@ async def test_sensitivity_confidential_rejected_with_422(client):
         },
     )
     assert response.status_code == 422
+
+
+# ---- Classification → trust/visibility wiring (ENG-AUD-005) ----
+
+
+async def _stored_item(item_id: str) -> dict[str, object]:
+    """Read the stored memory_items row to verify visibility/confidence on disk."""
+    async with _test_engine.connect() as conn:
+        result = await conn.execute(
+            text(
+                "SELECT visibility, memory_confidence FROM memory_items WHERE id = :id"
+            ),
+            {"id": item_id},
+        )
+        return dict(result.mappings().one())
+
+
+async def _latest_classification_event() -> dict[str, object]:
+    async with _test_engine.connect() as conn:
+        result = await conn.execute(
+            text(
+                """
+                SELECT new_value
+                FROM item_events
+                WHERE event_type = 'classification'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            )
+        )
+        row = result.mappings().one()
+        return json.loads(row["new_value"])
+
+
+def _patch_classifier(monkeypatch, **result_kwargs):
+    """Make /v1/remember classify() return a deterministic ClassificationResult."""
+
+    async def fake_classifier(content: str, tenant_id, session, context=None):
+        return ClassificationResult(
+            suggested_kind="observation",
+            confidence=0.5,
+            reason="test classifier",
+            rules_matched=[],
+            provenance={"provider": "openai", "mode": "llm"},
+            **result_kwargs,
+        )
+
+    monkeypatch.setattr(memory_routes, "classify_memory", fake_classifier)
+
+
+async def test_blend_weak_source_low_classifier_lowers_stored_confidence(client, monkeypatch):
+    """sync_turn + low classifier confidence → stored memory_confidence is blended down."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    _patch_classifier(monkeypatch, confidence=0.2)
+    response = await client.post(
+        "/v1/remember",
+        json={"content": "Turn summary from sync", "source_type": "sync_turn"},
+    )
+    assert response.status_code == 201
+    # 0.5*0.4 + 0.5*0.2 = 0.30, authority cap = 0.4
+    assert response.json()["memory_confidence"] == pytest.approx(0.30)
+
+
+async def test_blend_weak_source_high_classifier_capped_by_authority(client, monkeypatch):
+    """sync_turn + high classifier confidence cannot self-promote past source authority."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    _patch_classifier(monkeypatch, confidence=0.9)
+    response = await client.post(
+        "/v1/remember",
+        json={"content": "Turn summary from sync", "source_type": "sync_turn"},
+    )
+    assert response.status_code == 201
+    # blended = 0.65 but cap = max(0.4, 0.4) = 0.4
+    assert response.json()["memory_confidence"] == pytest.approx(0.40)
+
+
+async def test_blend_manual_source_modest_drop_on_uncertain_classification(client, monkeypatch):
+    """manual_user + low classifier confidence → modest drop, not aggressive."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    _patch_classifier(monkeypatch, confidence=0.2)
+    response = await client.post(
+        "/v1/remember",
+        json={"content": "A manually recorded fact", "source_type": "manual"},
+    )
+    assert response.status_code == 201
+    # 0.85*0.9 + 0.15*0.2 = 0.795
+    assert response.json()["memory_confidence"] == pytest.approx(0.795)
+
+
+async def test_explicit_kind_preserves_default_confidence_and_visibility(client, monkeypatch):
+    """Explicit-kind writes skip classification → confidence/visibility untouched."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+
+    async def should_not_run(*args, **kwargs):
+        raise AssertionError("classify() must not be called when kind is explicit")
+
+    monkeypatch.setattr(memory_routes, "classify_memory", should_not_run)
+    response = await client.post(
+        "/v1/remember",
+        json={
+            "content": "Explicit kind keeps defaults",
+            "kind": "fact",
+            "source_type": "manual",
+            "visibility": "tenant",
+        },
+    )
+    assert response.status_code == 201
+    body = response.json()
+    # manual_user default, no blend
+    assert body["memory_confidence"] == pytest.approx(0.9)
+    stored = await _stored_item(body["id"])
+    assert stored["visibility"] == "tenant"
+
+
+async def test_visibility_narrowed_downward_on_remember(client, monkeypatch):
+    """requested=tenant, suggested=private → stored=private."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    _patch_classifier(monkeypatch, suggested_visibility="private")
+    response = await client.post(
+        "/v1/remember",
+        json={
+            "content": "Narrow me down",
+            "source_type": "manual",
+            "visibility": "tenant",
+        },
+    )
+    assert response.status_code == 201
+    stored = await _stored_item(response.json()["id"])
+    assert stored["visibility"] == "private"
+
+
+async def test_visibility_not_widened_on_remember(client, monkeypatch):
+    """requested=private, suggested=tenant → stored=private (never widens)."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    _patch_classifier(monkeypatch, suggested_visibility="tenant")
+    response = await client.post(
+        "/v1/remember",
+        json={
+            "content": "Do not widen me",
+            "source_type": "manual",
+            "visibility": "private",
+        },
+    )
+    assert response.status_code == 201
+    stored = await _stored_item(response.json()["id"])
+    assert stored["visibility"] == "private"
+
+
+async def test_visibility_preserved_when_classifier_has_no_suggestion(client, monkeypatch):
+    """requested=workspace, suggested=None → stored=workspace."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    _patch_classifier(monkeypatch, suggested_visibility=None)
+    response = await client.post(
+        "/v1/remember",
+        json={
+            "content": "No visibility opinion",
+            "source_type": "manual",
+            "visibility": "workspace",
+        },
+    )
+    assert response.status_code == 201
+    stored = await _stored_item(response.json()["id"])
+    assert stored["visibility"] == "workspace"
+
+
+async def test_classification_event_records_trust_and_visibility_audit(client, monkeypatch):
+    """The classification event JSON records requested/suggested/final visibility
+    and default/final memory_confidence plus the applied policy flags."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    _patch_classifier(monkeypatch, confidence=0.2, suggested_visibility="private")
+    response = await client.post(
+        "/v1/remember",
+        json={
+            "content": "Audit my trust decisions",
+            "source_type": "sync_turn",
+            "visibility": "tenant",
+        },
+    )
+    assert response.status_code == 201
+    payload = await _latest_classification_event()
+    assert payload["source"] == "auto_classified"
+    assert payload["source_type"] == "sync_turn"
+    assert payload["requested_visibility"] == "tenant"
+    assert payload["suggested_visibility"] == "private"
+    assert payload["final_visibility"] == "private"
+    assert payload["visibility_narrowed"] is True
+    assert payload["default_memory_confidence"] == pytest.approx(0.4)
+    assert payload["final_memory_confidence"] == pytest.approx(0.30)
+    assert payload["memory_confidence_blended"] is True
+    # The classifier dump carries its own confidence/visibility for traceability.
+    assert payload["classification"]["confidence"] == pytest.approx(0.2)
+    assert payload["classification"]["suggested_visibility"] == "private"
