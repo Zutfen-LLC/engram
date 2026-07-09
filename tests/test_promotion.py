@@ -666,9 +666,10 @@ async def test_cli_promote_single_tenant(capsys):
 # ---- startup + semantic recall integration (acceptance criteria) ----
 
 
-async def test_startup_recall_excludes_proposed_includes_after_promotion(client, monkeypatch):
-    """Before promotion: proposed item absent from startup recall.
-    After promotion: the same item appears as active."""
+async def test_startup_recall_lazily_promotes_eligible_item(client):
+    """ENG-AUD-007 F11: an eligible proposed item is promoted by the bounded
+    lazy pass inside POST /v1/recall (mode=startup) itself — no explicit
+    promote call needed — and appears active in that same response."""
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     tenant_id, principal_id = await _default_tenant_principal()
@@ -680,25 +681,108 @@ async def test_startup_recall_excludes_proposed_includes_after_promotion(client,
         created_at=_default_now() - timedelta(hours=100),
     )
 
-    # Proposed → not in startup recall (active-only).
-    resp = await client.post("/v1/recall", json={"mode": "startup"})
-    assert resp.status_code == 200, resp.text
-    ids = {item["id"] for item in resp.json()["items"]}
-    assert item_id not in ids
-
-    # Promote.
-    async with _test_session_factory() as session:
-        await session.execute(
-            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
-        )
-        result = await auto_promote_proposed_memories(session)
-    assert result.promoted == 1
-
-    # Now active → present in startup recall.
     resp = await client.post("/v1/recall", json={"mode": "startup"})
     assert resp.status_code == 200, resp.text
     ids = {item["id"] for item in resp.json()["items"]}
     assert item_id in ids
+
+    assert await _status_of(item_id) == "active"
+
+
+async def test_startup_recall_does_not_promote_ineligible_item(client):
+    """A proposed item that fails Path A gates (too new) is not promoted or
+    included by the lazy startup-recall pass."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    tenant_id, principal_id = await _default_tenant_principal()
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="too new for lazy promotion",
+        memory_confidence=0.9,
+        created_at=_default_now() - timedelta(hours=1),
+    )
+
+    resp = await client.post("/v1/recall", json={"mode": "startup"})
+    assert resp.status_code == 200, resp.text
+    ids = {item["id"] for item in resp.json()["items"]}
+    assert item_id not in ids
+    assert await _status_of(item_id) == "proposed"
+
+
+async def test_startup_recall_promotion_disabled_tenant_does_not_promote(client):
+    """tenant_config.auto_promote_enabled = FALSE disables the lazy pass too."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    tenant_id, principal_id = await _default_tenant_principal()
+    async with _test_session_factory() as session:
+        await session.execute(
+            text("UPDATE tenant_config SET auto_promote_enabled = FALSE WHERE tenant_id = :tid"),
+            {"tid": tenant_id},
+        )
+        await session.commit()
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="disabled tenant lazy fact",
+        memory_confidence=0.9,
+        created_at=_default_now() - timedelta(hours=100),
+    )
+
+    resp = await client.post("/v1/recall", json={"mode": "startup"})
+    assert resp.status_code == 200, resp.text
+    ids = {item["id"] for item in resp.json()["items"]}
+    assert item_id not in ids
+    assert await _status_of(item_id) == "proposed"
+
+
+async def test_startup_recall_promotion_respects_limit(client, monkeypatch):
+    """The lazy pass is bounded by settings.startup_promotion_limit: with the
+    cap set to 1, only one of two eligible proposed items promotes per call."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    from engram.config import settings as engram_settings
+
+    monkeypatch.setattr(engram_settings, "startup_promotion_limit", 1)
+
+    tenant_id, principal_id = await _default_tenant_principal()
+    old = _default_now() - timedelta(hours=100)
+    item_a = await _insert_item(
+        tenant_id=tenant_id, principal_id=principal_id,
+        content="bounded lazy fact A", memory_confidence=0.9, created_at=old,
+    )
+    item_b = await _insert_item(
+        tenant_id=tenant_id, principal_id=principal_id,
+        content="bounded lazy fact B", memory_confidence=0.9, created_at=old,
+    )
+
+    resp = await client.post("/v1/recall", json={"mode": "startup"})
+    assert resp.status_code == 200, resp.text
+
+    statuses = {await _status_of(item_a), await _status_of(item_b)}
+    # Exactly one promoted, one still proposed — never both under limit=1.
+    assert statuses == {"active", "proposed"}
+
+
+async def test_semantic_recall_does_not_trigger_lazy_promotion(client):
+    """mode='semantic' does not invoke the lazy promotion pass in this slice —
+    an eligible proposed item stays proposed after a semantic recall call."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    tenant_id, principal_id = await _default_tenant_principal()
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="semantic no lazy promotion fact",
+        memory_confidence=0.9,
+        created_at=_default_now() - timedelta(hours=100),
+    )
+
+    resp = await client.post(
+        "/v1/recall", json={"mode": "semantic", "query": "semantic no lazy promotion fact"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert await _status_of(item_id) == "proposed"
 
 
 async def test_semantic_recall_warning_changes_after_promotion(client, monkeypatch):
@@ -814,3 +898,519 @@ async def test_custom_tenant_config_thresholds_respected():
     assert result.min_age_hours == 1
     assert await _status_of(low) == "proposed"
     assert await _status_of(high) == "active"
+
+
+# ---- dispute gate (F12) ----
+
+
+async def _insert_principal(tenant_id: str, name: str) -> str:
+    """Insert a principal with a uuid-suffixed name (unique per call — the
+    default tenant is shared and not reset between test runs, unlike
+    tenant-B-style isolation tests which drop their own tenant)."""
+    principal_id = str(uuid.uuid4())
+    unique_name = f"{name}-{uuid.uuid4().hex[:8]}"
+    async with _test_session_factory() as session:
+        await session.execute(
+            text(
+                "INSERT INTO principals (id, tenant_id, name, type) "
+                "VALUES (:id, :tid, :name, 'agent')"
+            ),
+            {"id": principal_id, "tid": tenant_id, "name": unique_name},
+        )
+        await session.commit()
+    return principal_id
+
+
+async def _insert_review_change_event(
+    *, item_id: str, new_value: str, actor_principal_id: str
+) -> None:
+    async with _test_session_factory() as session:
+        await session.execute(
+            text(
+                "INSERT INTO item_events (id, item_id, event_type, field_name, "
+                "old_value, new_value, actor_principal_id) VALUES "
+                "(:id, :item_id, 'review_change', 'review_status', 'proposed', "
+                ":new_value, :actor)"
+            ),
+            {
+                "id": str(uuid.uuid4()),
+                "item_id": item_id,
+                "new_value": new_value,
+                "actor": actor_principal_id,
+            },
+        )
+        await session.commit()
+
+
+async def _insert_feedback_event(
+    *, tenant_id: str, item_id: str, principal_id: str, verdict: str
+) -> None:
+    async with _test_session_factory() as session:
+        await session.execute(
+            text(
+                "INSERT INTO feedback_events (id, tenant_id, item_id, principal_id, verdict) "
+                "VALUES (:id, :tid, :item_id, :pid, :verdict)"
+            ),
+            {
+                "id": str(uuid.uuid4()),
+                "tid": tenant_id,
+                "item_id": item_id,
+                "pid": principal_id,
+                "verdict": verdict,
+            },
+        )
+        await session.commit()
+
+
+async def test_dispute_by_other_principal_blocks_promotion():
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    tenant_id, principal_id = await _default_tenant_principal()
+    other_principal_id = await _insert_principal(tenant_id, "other-agent-disputer")
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="disputed by another principal",
+        memory_confidence=0.9,
+        created_at=_default_now() - timedelta(hours=100),
+    )
+    await _insert_review_change_event(
+        item_id=item_id, new_value="disputed", actor_principal_id=other_principal_id
+    )
+
+    async with _test_session_factory() as session:
+        await session.execute(
+            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
+        )
+        result = await auto_promote_proposed_memories(session)
+
+    assert result.promoted == 0
+    assert result.skipped_dispute == 1
+    assert await _status_of(item_id) == "proposed"
+
+
+async def test_dispute_by_creator_self_does_not_block():
+    """The item's own creator disputing their own item is not an external
+    dispute — Path A still promotes (design.md §3: only another principal's
+    dispute blocks)."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    tenant_id, principal_id = await _default_tenant_principal()
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="self-disputed by creator",
+        memory_confidence=0.9,
+        created_at=_default_now() - timedelta(hours=100),
+    )
+    await _insert_review_change_event(
+        item_id=item_id, new_value="disputed", actor_principal_id=principal_id
+    )
+
+    async with _test_session_factory() as session:
+        await session.execute(
+            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
+        )
+        result = await auto_promote_proposed_memories(session)
+
+    assert result.promoted == 1
+    assert result.skipped_dispute == 0
+    assert await _status_of(item_id) == "active"
+
+
+async def test_negative_feedback_from_other_principal_blocks_promotion():
+    """A 'noise' feedback_events row from another principal also counts as an
+    external dispute signal (design.md §3 dispute-event definition)."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    tenant_id, principal_id = await _default_tenant_principal()
+    other_principal_id = await _insert_principal(tenant_id, "other-agent-feedback")
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="noise feedback from another principal",
+        memory_confidence=0.9,
+        created_at=_default_now() - timedelta(hours=100),
+    )
+    await _insert_feedback_event(
+        tenant_id=tenant_id, item_id=item_id, principal_id=other_principal_id, verdict="noise"
+    )
+
+    async with _test_session_factory() as session:
+        await session.execute(
+            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
+        )
+        result = await auto_promote_proposed_memories(session)
+
+    assert result.promoted == 0
+    assert result.skipped_dispute == 1
+    assert await _status_of(item_id) == "proposed"
+
+
+async def test_own_noise_feedback_does_not_block():
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    tenant_id, principal_id = await _default_tenant_principal()
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="own noise feedback",
+        memory_confidence=0.9,
+        created_at=_default_now() - timedelta(hours=100),
+    )
+    await _insert_feedback_event(
+        tenant_id=tenant_id, item_id=item_id, principal_id=principal_id, verdict="noise"
+    )
+
+    async with _test_session_factory() as session:
+        await session.execute(
+            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
+        )
+        result = await auto_promote_proposed_memories(session)
+
+    assert result.promoted == 1
+    assert result.skipped_dispute == 0
+
+
+# ---- promotion-time conflict recheck + top-k candidates (F13) ----
+
+
+async def _insert_embedding(
+    *, item_id: str, tenant_id: str, vector: list[float]
+) -> None:
+    from engram.embeddings import EMBEDDING_MODEL
+
+    async with _test_session_factory() as session:
+        await session.execute(
+            text(
+                "INSERT INTO memory_embeddings (id, memory_item_id, tenant_id, "
+                "embedding_model, embedding_dim, embedding, embedding_status) "
+                "VALUES (:id, :item_id, :tid, :model, :dim, :embedding, 'complete')"
+            ),
+            {
+                "id": str(uuid.uuid4()),
+                "item_id": item_id,
+                "tid": tenant_id,
+                "model": EMBEDDING_MODEL,
+                "dim": len(vector),
+                "embedding": str(vector),
+            },
+        )
+        await session.commit()
+
+
+def _unit_vector_2d(angle_degrees: float, dim: int = 1536) -> list[float]:
+    import math
+
+    radians = math.radians(angle_degrees)
+    vec = [0.0] * dim
+    vec[0] = math.cos(radians)
+    vec[1] = math.sin(radians)
+    return vec
+
+
+async def test_conflict_recheck_blocks_when_active_item_conflicts_later(monkeypatch):
+    """A candidate clean at write time (conflict_resolution_status IS NULL)
+    but that now conflicts with a *later* active memory does not promote."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    from engram.conflicts import ConflictVerdict
+
+    tenant_id, principal_id = await _default_tenant_principal()
+    proposed_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="recheck candidate",
+        memory_confidence=0.9,
+        created_at=_default_now() - timedelta(hours=100),
+    )
+    active_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="later active conflicting memory",
+        review_status="active",
+    )
+    await _insert_embedding(
+        item_id=proposed_id, tenant_id=tenant_id, vector=_unit_vector_2d(0)
+    )
+    await _insert_embedding(
+        item_id=active_id, tenant_id=tenant_id, vector=_unit_vector_2d(5)
+    )
+
+    import engram.conflicts as conflicts_mod
+
+    async def fake_classify(old_content, new_content, similarity):
+        return ConflictVerdict.CONTRADICT, 0.9, "forced contradiction", {}
+
+    monkeypatch.setattr(conflicts_mod, "_classify_relationship", fake_classify)
+
+    async with _test_session_factory() as session:
+        await session.execute(
+            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
+        )
+        result = await auto_promote_proposed_memories(session)
+
+    assert result.promoted == 0
+    assert result.skipped_conflict_recheck == 1
+    assert await _status_of(proposed_id) == "proposed"
+
+    row = await _fetch_conflict_fields(proposed_id)
+    assert row["conflict_resolution_status"] == "unresolved"
+    assert str(row["conflicts_with_item_id"]) == active_id
+
+    events = await _events_for(proposed_id)
+    assert any(e["event_type"] == "conflict_resolution" for e in events)
+
+
+async def _fetch_conflict_fields(item_id: str) -> dict[str, Any]:
+    async with _test_session_factory() as session:
+        return dict(
+            (
+                await session.execute(
+                    text(
+                        "SELECT conflict_resolution_status, conflicts_with_item_id "
+                        "FROM memory_items WHERE id = :id"
+                    ),
+                    {"id": item_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+
+
+async def test_topk_conflict_candidate_third_nearest_detected(monkeypatch):
+    """The conflicting candidate is only the 3rd-nearest by embedding
+    distance. A top-1-only implementation (checking only the nearest active
+    item) would never see it and would wrongly promote."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    from engram.conflicts import ConflictVerdict
+
+    tenant_id, principal_id = await _default_tenant_principal()
+    proposed_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="topk candidate",
+        memory_confidence=0.9,
+        created_at=_default_now() - timedelta(hours=100),
+    )
+    # Three active items, all above the 0.85 similarity threshold, ordered
+    # nearest (cand1) -> farthest (cand3) by embedding angle.
+    cand1 = await _insert_item(
+        tenant_id=tenant_id, principal_id=principal_id,
+        content="cand1 nearest duplicate", review_status="active",
+    )
+    cand2 = await _insert_item(
+        tenant_id=tenant_id, principal_id=principal_id,
+        content="cand2 middle refine", review_status="active",
+    )
+    cand3 = await _insert_item(
+        tenant_id=tenant_id, principal_id=principal_id,
+        content="cand3 farthest contradiction", review_status="active",
+    )
+    await _insert_embedding(item_id=proposed_id, tenant_id=tenant_id, vector=_unit_vector_2d(0))
+    await _insert_embedding(item_id=cand1, tenant_id=tenant_id, vector=_unit_vector_2d(2))
+    await _insert_embedding(item_id=cand2, tenant_id=tenant_id, vector=_unit_vector_2d(15))
+    await _insert_embedding(item_id=cand3, tenant_id=tenant_id, vector=_unit_vector_2d(28))
+
+    import engram.conflicts as conflicts_mod
+
+    async def fake_classify(old_content, new_content, similarity):
+        if "cand1" in old_content:
+            return ConflictVerdict.DUPLICATE, 0.9, "cand1 dup", {}
+        if "cand2" in old_content:
+            return ConflictVerdict.REFINE, 0.9, "cand2 refine", {}
+        return ConflictVerdict.CONTRADICT, 0.9, "cand3 contradict", {}
+
+    monkeypatch.setattr(conflicts_mod, "_classify_relationship", fake_classify)
+
+    async with _test_session_factory() as session:
+        await session.execute(
+            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
+        )
+        result = await auto_promote_proposed_memories(session)
+
+    assert result.promoted == 0
+    assert result.skipped_conflict_recheck == 1
+    assert await _status_of(proposed_id) == "proposed"
+    row = await _fetch_conflict_fields(proposed_id)
+    assert str(row["conflicts_with_item_id"]) == cand3
+
+
+async def test_topk_candidate_count_bounded(monkeypatch):
+    """find_promotion_conflict_candidates never returns more than k rows."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    from engram.conflicts import find_promotion_conflict_candidates
+    from engram.models import MemoryItem
+
+    tenant_id, principal_id = await _default_tenant_principal()
+    proposed_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="bounded topk candidate",
+        memory_confidence=0.9,
+        created_at=_default_now() - timedelta(hours=100),
+    )
+    await _insert_embedding(item_id=proposed_id, tenant_id=tenant_id, vector=_unit_vector_2d(0))
+    # 8 active candidates, all within the similarity threshold — more than k.
+    for i in range(8):
+        cand_id = await _insert_item(
+            tenant_id=tenant_id, principal_id=principal_id,
+            content=f"bounded candidate {i}", review_status="active",
+        )
+        await _insert_embedding(
+            item_id=cand_id, tenant_id=tenant_id, vector=_unit_vector_2d(1 + i)
+        )
+
+    async with _test_session_factory() as session:
+        await session.execute(
+            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
+        )
+        from sqlalchemy import select
+
+        item = (
+            await session.execute(select(MemoryItem).where(MemoryItem.id == proposed_id))
+        ).scalar_one()
+        candidates = await find_promotion_conflict_candidates(session, item, k=3)
+
+    assert len(candidates) <= 3
+
+
+# ---- embeddings-off fallback (F13) ----
+
+
+async def test_embeddings_off_same_subject_conflict_blocks_promotion():
+    """With embeddings disabled (no stored embedding for the candidate item),
+    a same-subject/same-kind active memory with different content blocks
+    promotion via the structural fallback."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    tenant_id, principal_id = await _default_tenant_principal()
+    proposed_id = str(uuid.uuid4())
+    active_id = str(uuid.uuid4())
+    async with _test_session_factory() as session:
+        for item_id, content, review_status, content_hash in (
+            (active_id, "Alice's role is engineer", "active", "sha256:active-hash"),
+            (proposed_id, "Alice's role is manager", "proposed", "sha256:proposed-hash"),
+        ):
+            await session.execute(
+                text(
+                    "INSERT INTO memory_items (id, tenant_id, principal_id, content, "
+                    "content_hash, kind, visibility, review_status, memory_confidence, "
+                    "source_trust, importance, source_type, subject_type, subject_id, "
+                    "created_at, valid_from) VALUES (:id, :tid, :pid, :content, :hash, "
+                    "'fact', 'workspace', :status, 0.9, 0.5, 0.5, 'manual', 'domain_entity', "
+                    "'alice', :created_at, :created_at)"
+                ),
+                {
+                    "id": item_id,
+                    "tid": tenant_id,
+                    "pid": principal_id,
+                    "content": content,
+                    "hash": content_hash,
+                    "status": review_status,
+                    "created_at": _default_now() - timedelta(hours=100),
+                },
+            )
+        await session.commit()
+
+    async with _test_session_factory() as session:
+        await session.execute(
+            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
+        )
+        result = await auto_promote_proposed_memories(session)
+
+    assert result.promoted == 0
+    assert result.skipped_conflict_recheck == 1
+    assert await _status_of(proposed_id) == "proposed"
+    row = await _fetch_conflict_fields(proposed_id)
+    assert row["conflict_resolution_status"] == "unresolved"
+    assert str(row["conflicts_with_item_id"]) == active_id
+
+
+async def test_embeddings_off_exact_same_subject_content_still_promotes():
+    """Same subject + same content_hash (an exact match, not a conflict) is
+    not flagged by the structural fallback and promotes normally.
+
+    Uses two distinct principals for the active/proposed rows: the dedup
+    unique index (tenant_id, workspace_id, principal_id, content_hash) forbids
+    two *live* rows from the same principal sharing a content_hash, but two
+    different principals independently writing identical content is a valid
+    scenario and exercises exactly the "exact match, not a conflict" case.
+    """
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    tenant_id, principal_id = await _default_tenant_principal()
+    other_principal_id = await _insert_principal(tenant_id, "exact-match-other-writer")
+    shared_hash = f"sha256:{uuid.uuid4().hex}"
+    active_id = str(uuid.uuid4())
+    proposed_id = str(uuid.uuid4())
+    async with _test_session_factory() as session:
+        for item_id, review_status, pid in (
+            (active_id, "active", other_principal_id),
+            (proposed_id, "proposed", principal_id),
+        ):
+            await session.execute(
+                text(
+                    "INSERT INTO memory_items (id, tenant_id, principal_id, content, "
+                    "content_hash, kind, visibility, review_status, memory_confidence, "
+                    "source_trust, importance, source_type, subject_type, subject_id, "
+                    "created_at, valid_from) VALUES (:id, :tid, :pid, 'Bob is an engineer', "
+                    ":hash, 'fact', 'workspace', :status, 0.9, 0.5, 0.5, 'manual', "
+                    "'domain_entity', 'bob', :created_at, :created_at)"
+                ),
+                {
+                    "id": item_id,
+                    "tid": tenant_id,
+                    "pid": pid,
+                    "hash": shared_hash,
+                    "status": review_status,
+                    "created_at": _default_now() - timedelta(hours=100),
+                },
+            )
+        await session.commit()
+
+    async with _test_session_factory() as session:
+        await session.execute(
+            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
+        )
+        result = await auto_promote_proposed_memories(session)
+
+    assert result.promoted == 1
+    assert result.skipped_conflict_recheck == 0
+    assert await _status_of(proposed_id) == "active"
+
+
+# ---- explicit promotion still uses the same gates (CLI / admin) ----
+
+
+async def test_admin_endpoint_uses_dispute_gate():
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    tenant_id, principal_id = await _default_tenant_principal()
+    other_principal_id = await _insert_principal(tenant_id, "admin-endpoint-disputer")
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="admin endpoint disputed fact",
+        memory_confidence=0.9,
+        created_at=_default_now() - timedelta(hours=100),
+    )
+    await _insert_review_change_event(
+        item_id=item_id, new_value="disputed", actor_principal_id=other_principal_id
+    )
+
+    # Exercises the same shared gate the route (POST /v1/admin/promote) calls
+    # with source="admin_endpoint" — the route itself is covered end-to-end by
+    # test_admin_endpoint_returns_summary.
+    async with _test_session_factory() as session:
+        await session.execute(
+            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
+        )
+        result = await auto_promote_proposed_memories(session, tenant_id, source="admin_endpoint")
+
+    assert result.promoted == 0
+    assert result.skipped_dispute == 1
+    assert await _status_of(item_id) == "proposed"

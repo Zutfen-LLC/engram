@@ -18,6 +18,7 @@ from engram.config import settings
 from engram.embeddings import generate_embedding
 from engram.memory_access import eligibility_expression, resolve_workspace_scope
 from engram.models import MemoryItem, RecallLog, TenantConfig
+from engram.promotion import maybe_auto_promote_for_startup_recall
 
 
 class ScoreResult:
@@ -306,6 +307,14 @@ async def execute_startup_recall(
     workspace_id, workspace_accessible = await resolve_workspace_scope(
         session, tenant_id=tenant_id, principal_id=principal_id, workspace=workspace
     )
+
+    # 0. Lazy, bounded, tenant-scoped Path A promotion pass (design.md §3,
+    #    ENG-AUD-007 F11) — runs before active items are selected so an item
+    #    that becomes eligible between recalls can appear in this working set
+    #    rather than waiting for the next CLI/admin sweep. Honors
+    #    tenant_config.auto_promote_enabled and settings.startup_promotion_limit
+    #    internally; a disabled tenant pays only a single count query.
+    await maybe_auto_promote_for_startup_recall(session, tenant_id, now=now)
 
     # 1. Fetch active items
     if workspace is not None and not workspace_accessible:

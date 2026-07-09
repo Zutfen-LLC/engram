@@ -70,5 +70,15 @@ class Settings(BaseSettings):
     # if False, low-trust writes defer conflict check to promotion
     conflict_check_on_write: bool = True
 
+    # Promotion (Path A auto-promotion, ENG-AUD-007)
+    # Hard cap on proposed items scanned per lazy startup-recall promotion pass
+    # (POST /v1/recall mode=startup) — keeps startup recall bounded regardless
+    # of how large a tenant's proposed backlog grows. The explicit CLI/admin
+    # promotion paths pass their own limit (or None for unbounded).
+    startup_promotion_limit: int = 20
+    # Top-k plausible active-item candidates considered by the promotion-time
+    # conflict recheck (engram.conflicts.find_promotion_conflict_candidates).
+    promotion_conflict_candidate_k: int = 5
+
 
 settings = Settings()
