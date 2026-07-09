@@ -15,7 +15,10 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = [REPO_ROOT / "deploy" / "backup.sh"]
+SCRIPTS = [
+    REPO_ROOT / "deploy" / "backup.sh",
+    REPO_ROOT / "migrations" / "app_role_password.sh",
+]
 
 
 @pytest.mark.parametrize("script", SCRIPTS, ids=[s.name for s in SCRIPTS])

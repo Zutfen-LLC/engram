@@ -19,6 +19,16 @@ DB_TABLES: Final[tuple[str, ...]] = (
     "tenant_config",
 )
 
+# Tables that must have FORCE ROW LEVEL SECURITY (ENG-AUD-002).
+RLS_FORCED_TABLES: Final[tuple[str, ...]] = (
+    "memory_items",
+    "memory_embeddings",
+    "item_events",
+    "recall_logs",
+    "api_keys",
+    "workspace_members",
+)
+
 
 def _section(title: str) -> None:
     print(f"\n=== {title} ===", flush=True)
@@ -55,6 +65,38 @@ async def _verify_database() -> None:
 
         print(f"pgvector version: {version}", flush=True)
         print(f"seed tenants: {tenant_count}", flush=True)
+
+        # ENG-AUD-002: the non-owner application role must exist with no
+        # BYPASSRLS, and tenant-scoped tables must FORCE RLS.
+        app_role = await conn.fetchrow(
+            "SELECT rolname, rolbypassrls, rolsuper FROM pg_roles WHERE rolname = 'engram_app'"
+        )
+        if app_role is None:
+            raise RuntimeError("engram_app role was not created (migration 003 missing?)")
+        if app_role["rolbypassrls"]:
+            raise RuntimeError("engram_app must not have BYPASSRLS")
+        if app_role["rolsuper"]:
+            raise RuntimeError("engram_app must not be a superuser")
+
+        not_forced = []
+        for table in RLS_FORCED_TABLES:
+            forced = await conn.fetchval(
+                """
+                SELECT c.relforcerowsecurity
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = 'public' AND c.relname = $1
+                """,
+                table,
+            )
+            if not forced:
+                not_forced.append(table)
+        if not_forced:
+            raise RuntimeError(
+                f"FORCE ROW LEVEL SECURITY missing on: {', '.join(not_forced)}"
+            )
+        print("engram_app role: present, NOBYPASSRLS, non-superuser", flush=True)
+        print(f"FORCE RLS verified on {len(RLS_FORCED_TABLES)} representative table(s)", flush=True)
     finally:
         await conn.close()
 

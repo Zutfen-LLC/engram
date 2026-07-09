@@ -159,7 +159,10 @@ def main() -> None:
     elif args.command == "init-db":
         from engram.config import settings
 
-        db_url = args.database_url or settings.database_url
+        # Migrations run DDL (CREATE ROLE/GRANT/ALTER TABLE FORCE RLS), which the
+        # non-owner app role cannot do. Prefer the owner URL; fall back to the
+        # runtime URL for single-role dev/test where they are the same.
+        db_url = args.database_url or settings.owner_database_url or settings.database_url
         migrations_dir = Path(args.migrations_dir) if args.migrations_dir else None
         raise SystemExit(
             asyncio.run(
@@ -187,7 +190,10 @@ def main() -> None:
     elif args.command == "bootstrap-key":
         from engram.config import settings
 
-        db_url = args.database_url or settings.database_url
+        # bootstrap-key resolves the seed principal and inserts an api_keys row
+        # WITHOUT RLS context (the very first key, before auth exists). It must
+        # bypass RLS, so it connects as the owner.
+        db_url = args.database_url or settings.owner_database_url or settings.database_url
         raise SystemExit(
             asyncio.run(
                 _run_bootstrap_key(
@@ -543,13 +549,13 @@ async def _run_promotion(
     bypasses RLS so every tenant is scanned; the service still filters by an
     explicit ``tenant_id`` so results are correct under RLS too.
 
-    ``session_factory`` defaults to the app's ``engram.db.async_session_factory``;
+    ``session_factory`` defaults to the app's ``engram.db.owner_session_factory``;
     tests pass their own NullPool factory so the CLI shares the test event loop's
     engine (avoiding asyncpg cross-loop connection issues).
     """
     from sqlalchemy import select
 
-    from engram.db import async_session_factory as _default_factory
+    from engram.db import owner_session_factory as _default_factory
     from engram.models import Tenant
     from engram.promotion import auto_promote_proposed_memories, summarize
 
@@ -599,13 +605,13 @@ async def _run_backfill(
     every tenant is scanned; the service still filters by an explicit
     ``tenant_id`` so results are correct under RLS too.
 
-    ``session_factory`` defaults to the app's ``engram.db.async_session_factory``;
+    ``session_factory`` defaults to the app's ``engram.db.owner_session_factory``;
     tests pass their own NullPool factory so the CLI shares the test event
     loop's engine (avoiding asyncpg cross-loop connection issues).
     """
     from sqlalchemy import select
 
-    from engram.db import async_session_factory as _default_factory
+    from engram.db import owner_session_factory as _default_factory
     from engram.embeddings import EXIT_PROVIDER_DISABLED, backfill_embeddings, summarize_backfill
     from engram.models import Tenant
 

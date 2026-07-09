@@ -12,8 +12,16 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Database
+    # Database — runtime application role (non-owner; RLS-enforced).
     database_url: str = "postgresql+asyncpg://engram:engram@localhost:5432/engram"
+
+    # Owner/migration role — used for DDL (``engram init-db``), the first-key
+    # bootstrap, cross-tenant admin/CLI scans, and principal/key resolution
+    # (which must see across tenants and therefore bypass RLS). When unset it
+    # falls back to ``database_url`` (single-role dev/test, where the same role
+    # is both owner and app). In the default Compose deployment this points at
+    # the table-owning superuser so migrations and admin commands work.
+    owner_database_url: str | None = None
 
     # Service
     host: str = "0.0.0.0"
