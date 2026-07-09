@@ -200,6 +200,8 @@ Trust is not binary. Every memory carries:
 
 Authority hierarchy governs supersession. A lower-authority source can never silently replace a higher-authority memory.
 
+Supersession is **atomic**: expiring the original and inserting the replacement happen in one transaction (the original is expired *before* the replacement is inserted, so the dedup unique index can never see both as active), and a failure between the two rolls back the original's expiration. The original points forward to its replacement (`superseded_by`), the replacement records what it replaced (`item_events`), and supersede behavior is covered by Postgres-backed tests that enforce the real unique index and RLS policies.
+
 `memory_confidence` starts from source-type defaults (see the table in [`docs/design.md`](docs/design.md) §4). When `/v1/remember` auto-classifies a write, the classifier's confidence **refines** that default — but source authority caps how far a low-trust automated source can promote itself, so a confident classifier can pull a weak capture *down* without letting it self-promote *up*. See [Classification](#classification) below.
 
 ### Recall

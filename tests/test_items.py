@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -319,14 +319,15 @@ async def test_patch_supersede_review_verify_and_404s(client, session_factory):
     assert patch_payload["event"]["field_name"] == "wing"
     assert len(patch_payload["events"]) == 5
 
-    supersede_response = await client.post(
-        f"/v1/items/{item_id}/supersede",
-        json={"reason": "replace", "actor_principal_id": base["principal_id"]},
-    )
-    assert supersede_response.status_code == 200
-    supersede_payload = supersede_response.json()
-    assert UUID(supersede_payload["old_item"]["superseded_by"]) == UUID(supersede_payload["new_item"]["id"])
-    assert supersede_payload["old_item"]["valid_to"] is not None
+    # NOTE: the supersede *happy path* (expire + insert + linkage) is NOT
+    # exercised here. It depends on the real idx_memitems_dedup partial unique
+    # index (migrations/001_init.sql), which this hand-rolled SQLite schema does
+    # not enforce — so a SQLite run would pass spuriously even with the F6
+    # ordering bug present. Full supersede invariant coverage (unique-index
+    # safety, atomic rollback, dedup interaction, provenance linkage, authority,
+    # cross-tenant RLS) lives in tests/test_supersede.py against real Postgres.
+    # Only the supersede 404 case (which returns before any constraint) is
+    # covered below.
 
     review_id = str(uuid4())
     verify_id = str(uuid4())

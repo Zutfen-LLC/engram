@@ -24,7 +24,12 @@ from engram.classification import ClassificationResult
 from engram.classification import classify as classify_memory
 from engram.classification_trust import blend_memory_confidence, narrow_visibility
 from engram.config import settings
-from engram.conflicts import ConflictAction, ConflictResult, detect_conflicts
+from engram.conflicts import (
+    ConflictAction,
+    ConflictResult,
+    authority_allows_supersession,
+    detect_conflicts,
+)
 from engram.db import get_session
 from engram.embeddings import create_embedding_placeholder, generate_embedding
 from engram.memory_access import eligibility_sql, resolve_workspace_scope, tenant_sql
@@ -1296,11 +1301,54 @@ async def supersede_item(
     req: MutationAuditRequest | None = None,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> dict[str, Any]:
-    """Mark superseded + write replacement."""
+    """Atomically expire an item and write its replacement.
+
+    Ordering is load-bearing for the partial unique index ``idx_memitems_dedup``
+    (``WHERE valid_to IS NULL AND review_status != 'rejected'``): the original
+    is expired *before* the replacement is inserted, so the two never satisfy
+    the index predicate with identical ``(tenant, workspace, principal,
+    content_hash)`` keys at the same time. The whole operation runs in one
+    transaction — a failure after expiring the original but before inserting
+    the replacement rolls the expiration back.
+    """
     item = await _require_item(session, item_id)
+
+    # 1. Lock the original row to serialize concurrent supersedes. FOR UPDATE
+    #    is supported by Postgres and a no-op on the SQLite test fixture.
+    await session.execute(
+        select(MemoryItem.id).where(MemoryItem.id == item_id).with_for_update()
+    )
+
+    # 2. Eligibility: cannot supersede an item that is already expired or
+    #    rejected — it has left the active set the replacement would target.
+    if item.get("valid_to") is not None or item.get("review_status") == "rejected":
+        raise HTTPException(
+            status_code=409,
+            detail="Item is already expired or rejected and cannot be superseded",
+        )
+
+    # 3. Authority: a lower-authority source must not silently replace a
+    #    higher-authority memory (design §4). The replacement is a clone, so
+    #    by default authority is equal and the gate passes — but it is present
+    #    structurally so a future divergent-authority supersede is enforced.
+    if not authority_allows_supersession(
+        new_trust=float(item["source_trust"]),
+        old_trust=float(item["source_trust"]),
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Lower-authority source may not supersede a higher-authority memory",
+        )
+
     now = _now_dt()
     new_id = uuid.uuid4()
-    replacement = dict(item)
+    # Build the replacement from only the ORM-mapped columns. ``item`` comes
+    # from ``SELECT * FROM memory_items``, which includes the generated
+    # ``content_tsv`` column (STORED GENERATED ALWAYS AS) — inserting it
+    # explicitly is rejected by Postgres, and passing it to insert(MemoryItem)
+    # raises "Unconsumed column names" because it isn't an ORM attribute.
+    mapped_keys = {c.name for c in MemoryItem.__table__.columns}
+    replacement = {k: v for k, v in item.items() if k in mapped_keys}
     replacement.update(
         {
             "id": new_id,
@@ -1324,7 +1372,39 @@ async def supersede_item(
         str(item["principal_id"])
     )
     reason = req.reason if req else None
+
+    # 4. Expire the original BEFORE inserting the replacement. Setting
+    #    ``valid_to`` removes the original from the idx_memitems_dedup partial
+    #    index (predicate: ``valid_to IS NULL AND review_status != 'rejected'``)
+    #    so the replacement insert — which reuses the original's content_hash —
+    #    cannot violate uniqueness.
+    #
+    #    The ``superseded_by`` link is set in a SEPARATE update AFTER the
+    #    replacement exists, because ``superseded_by`` is a self-FK to
+    #    memory_items(id): setting it before the replacement row exists would
+    #    violate memory_items_superseded_by_fkey. (``valid_to`` alone carries
+    #    no FK, so it is safe to set first.)
+    #
+    #    Pass ``valid_to`` as a datetime (not an isoformat string) so the
+    #    asyncpg driver binds it to the TIMESTAMPTZ column natively.
+    await session.execute(
+        text("UPDATE memory_items SET valid_to = :valid_to WHERE id = :item_id"),
+        {"valid_to": now, "item_id": str(item_id)},
+    )
+
+    # 5. Insert the replacement. With the original now expired, the two rows
+    #    never both satisfy the dedup index predicate simultaneously.
     await session.execute(insert(MemoryItem).values(**replacement))
+
+    # 6. Link the original forward to its replacement. The replacement row now
+    #    exists, so the superseded_by self-FK is satisfied.
+    await session.execute(
+        text("UPDATE memory_items SET superseded_by = :superseded_by WHERE id = :item_id"),
+        {"superseded_by": str(new_id), "item_id": str(item_id)},
+    )
+
+    # 7. Record provenance both ways: the original points forward to its
+    #    replacement, and the replacement points back at what it replaced.
     event = await _insert_item_event(
         session,
         item_id=item_id,
@@ -1335,17 +1415,25 @@ async def supersede_item(
         actor_principal_id=actor,
         reason=reason,
     )
-    await session.execute(
-        text(
-            "UPDATE memory_items SET valid_to = :valid_to, superseded_by = :superseded_by "
-            "WHERE id = :item_id"
-        ),
-        {"valid_to": now.isoformat(), "superseded_by": str(new_id), "item_id": str(item_id)},
+    replacement_event = await _insert_item_event(
+        session,
+        item_id=new_id,
+        event_type="supersede",
+        field_name="replaces",
+        old_value=None,
+        new_value=item_id,
+        actor_principal_id=actor,
+        reason=reason,
     )
     old_item = await _require_item(session, item_id)
     new_item = await _require_item(session, new_id)
     await session.commit()
-    return {"old_item": old_item, "new_item": new_item, "event": event}
+    return {
+        "old_item": old_item,
+        "new_item": new_item,
+        "event": event,
+        "replacement_event": replacement_event,
+    }
 
 
 @router.post("/items/{item_id}/invalidate", response_model=None)
@@ -1373,7 +1461,7 @@ async def invalidate_item(
     )
     await session.execute(
         text("UPDATE memory_items SET valid_to = :valid_to WHERE id = :item_id"),
-        {"valid_to": now.isoformat(), "item_id": str(item_id)},
+        {"valid_to": now, "item_id": str(item_id)},
     )
     updated = await _require_item(session, item_id)
     await session.commit()

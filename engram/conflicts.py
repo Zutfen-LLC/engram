@@ -159,6 +159,20 @@ async def detect_conflicts(
     )
 
 
+def authority_allows_supersession(*, new_trust: float, old_trust: float) -> bool:
+    """Whether a new item's source authority may supersede an existing one.
+
+    Authority is derived from ``source_trust`` (design §4: explicit_user >
+    trusted_import > trusted_agent > untrusted_agent > inferred). Equal-or-higher
+    authority may supersede; strictly lower authority may not — a lower-authority
+    source must never silently replace a higher-authority memory. This is the
+    single canonical comparison used by both write-time conflict resolution
+    (:func:`_resolve_action`) and explicit supersession
+    (``POST /items/{id}/supersede``).
+    """
+    return new_trust >= old_trust
+
+
 def _resolve_action(
     verdict: ConflictVerdict,
     new_trust: float,
@@ -173,7 +187,7 @@ def _resolve_action(
         return ConflictAction.FLAG_CONTRADICTION, "contradiction"
 
     # refine — conditional supersession based on authority hierarchy.
-    if new_trust < old_trust:
+    if not authority_allows_supersession(new_trust=new_trust, old_trust=old_trust):
         return ConflictAction.FLAG_SCOPE_OVERLAP, "scope_overlap"
 
     if new_trust >= _HIGH_SOURCE_TRUST and classifier_confidence >= _HIGH_CLASSIFIER_CONFIDENCE:

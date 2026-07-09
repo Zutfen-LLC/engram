@@ -31,8 +31,8 @@ Section 8 gives the prioritized roadmap. The one-line version: **P0 = make the r
 | F3 | **P0** | Storage/RLS | RLS is inert in the shipped deployment (app connects as table owner; no `FORCE ROW LEVEL SECURITY`) |
 | F4 | **P0** | Auth | API-key verification is O(n·bcrypt) over all keys of all tenants, per request |
 | F5 | **P1** | Storage | RLS session context is transaction-scoped and silently lost after rollback/commit mid-request |
-| F6 | **P1** | Items | `POST /items/{id}/supersede` inserts the replacement before expiring the original — latent unique-index violation on real Postgres |
-| F7 | **P1** | Testing | Several "DB" test suites run against a hand-rolled SQLite schema with no constraints, indexes, or RLS |
+| F6 | **P1** | Items | ~~`POST /items/{id}/supersede` inserts the replacement before expiring the original — latent unique-index violation on real Postgres~~ **Addressed (ENG-AUD-006):** handler now locks + validates + expires the original *before* inserting the replacement in a single transaction; eligibility (409), authority, dual provenance, and Postgres-backed rollback/unique-index tests added |
+| F7 | **P1** | Testing | ~~Several "DB" test suites run against a hand-rolled SQLite schema with no constraints, indexes, or RLS~~ **Partially addressed (ENG-AUD-006):** supersede invariant coverage migrated to real Postgres (tests/test_supersede.py); the SQLite suite (test_items.py) is now route-logic-only with a comment marking it as not certifying DB invariants. Sibling suites (auth/export/hygiene) remain on SQLite and are tracked for a later pass |
 | F8 | **P1** | Classification | ~~LLM classification never refines `memory_confidence`; `suggested_visibility` is never applied; confidence floor of 0.7 makes low confidence unrepresentable~~ **Addressed (ENG-AUD-005):** classifier confidence blends into `memory_confidence` (authority-capped, source-type-weighted); `suggested_visibility` applied downward-only on remember; 0.7 floor removed (real `0.0–0.95` signal) |
 | F9 | **P1** | Classification | ~~Seed skip-rules misfire (`\b(ok|done|failed)\b` matches almost any agent output) and "skip" still stores the item~~ **Addressed (ENG-AUD-005):** skip rules reworked to whole-message status-only anchors; doctrine requires explicit policy/invariant phrasing; "skip" naming reframed as low-information status. (Deferred: explicit `store/skip/quarantine` disposition — out of scope for this slice) |
 | F10 | **P1** | Recall | Semantic recall ranks by similarity only — the trust model is absent from semantic ranking |
@@ -106,9 +106,13 @@ Implement it once (a SQLAlchemy composable filter + an equivalent SQL fragment f
 
 `POST /v1/items/{id}/supersede` (`memory.py:1088-1143`) inserts a full copy of the row — same `(tenant_id, workspace_id, principal_id, content_hash)`, `valid_to = NULL` — *before* expiring the original. `idx_memitems_dedup` (`001_init.sql:380-382`, `NULLS NOT DISTINCT`, partial on `valid_to IS NULL AND review_status != 'rejected'`) should reject that insert on real Postgres. The endpoint's test passes because it runs on SQLite without the index (F7). Fix the ordering (expire first, insert second, in one transaction) and add a Postgres-backed test.
 
+> **Landed (ENG-AUD-006):** the handler now (1) locks the original with `SELECT ... FOR UPDATE`, (2) validates eligibility (409 on already-expired/rejected), (3) validates authority via the centralized `authority_allows_supersession` helper, (4) expires the original *before* inserting the replacement — all in one transaction, so a failed replacement insert rolls back the expiration. Dual provenance events link the original forward and the replacement back. Coverage migrated to real Postgres in `tests/test_supersede.py` (unique-index safety, rollback, dedup interaction, authority, cross-tenant RLS, singleton supersession, eligibility).
+
 ### F7. Test fidelity: hand-rolled SQLite schemas (P1)
 
 `tests/test_items.py` (and siblings: auth, export, hygiene…) create their own SQLite DDL with **no CHECK constraints, no unique indexes, no RLS, no generated tsvector** (`tests/test_items.py:16-90`). These tests validate route logic but certify nothing about the real schema — F6 is the proof. Recommendation: converge on the Postgres-backed fixture used by the conflict/remember/search suites for anything that touches `memory_items`, and reserve SQLite for pure-logic units. Add the F1/F3 isolation tests to the Postgres suite. This is cheap insurance and directly protects the product's core claims.
+
+> **Partially landed (ENG-AUD-006):** the supersede coverage that depends on the real unique index/RLS moved to `tests/test_supersede.py` (real Postgres); `tests/test_items.py` is now route-logic-only with a comment marking it as not certifying DB invariants. The sibling SQLite suites (auth/export/hygiene) remain a tracked follow-up.
 
 ---
 
@@ -263,7 +267,7 @@ The locked decisions (standalone service, Postgres-only, REST core, RLS foundati
 | **P0** | Shared visibility/membership predicate on all read paths + Postgres-backed isolation tests | F1, F2, F7 | M |
 | **P0** | RLS: app role + `FORCE`, transaction-safe context, RLS-as-non-owner CI test | F3, F5 | M |
 | **P0** | API key: key-id lookup, O(1) verify, principal cache | F4 | S |
-| **P0** | Fix supersede ordering; migrate item-touching tests to Postgres fixtures | F6, F7 | S–M |
+| **P0** | ~~Fix supersede ordering; migrate item-touching tests to Postgres fixtures~~ **Done (ENG-AUD-006)** | F6, F7 | S–M |
 | **P1** | ~~Classification → trust wiring: confidence blend, visibility (downward only), remove 0.7 floor; fix seed rules; skip semantics~~ **Done (ENG-AUD-005)** | F8, F9 | M |
 | **P1** | Trust-weighted semantic ranking (`semantic-v2`); honor search filters; default budgets; skip-not-break packing; freshness in recency | F10, F14, F15 | M |
 | **P1** | Promotion: lazy check on startup recall, dispute gate; conflict check at promotion time; top-k conflict candidates | F11, F12, F13 | M |
