@@ -7,7 +7,13 @@ from typing import Any
 from uuid import uuid4
 
 from engram.models import MemoryItem, TenantConfig
-from engram.recall import _enforce_budget, _separate_pinned, score_item
+from engram.recall import (
+    _enforce_budget,
+    _enforce_semantic_budget,
+    _resolve_recall_budgets,
+    _separate_pinned,
+    score_item,
+)
 
 
 def _make_item(**overrides: Any) -> MemoryItem:
@@ -119,11 +125,75 @@ class TestScoreItem:
         result = score_item(item, config, datetime.now(UTC))
         assert "human_verified" not in result.reasons
 
-    def test_no_recency_when_never_recalled(self) -> None:
+    def test_freshness_recency_for_never_recalled(self) -> None:
+        """A never-recalled fresh item still gets a recency contribution via
+        the freshness signal (decay from valid_from), so recall is not biased
+        purely toward previously-recalled incumbents."""
         item = _make_item(last_recalled_at=None)
         config = _make_config()
-        result = score_item(item, config, datetime.now(UTC))
-        assert any("recency=0" in r for r in result.reasons)
+        now = datetime.now(UTC)
+        result = score_item(item, config, now)
+        # Freshness reason is present and recency is non-zero for a just-created item.
+        assert any("freshness=" in r for r in result.reasons)
+        assert not any("recency=0.00" in r for r in result.reasons)
+
+    def test_freshness_half_weighted_and_deterministic(self) -> None:
+        """Freshness is capped at 0.5 (half-weight) and deterministic under a
+        frozen clock."""
+        now = datetime.now(UTC)
+        item = _make_item(last_recalled_at=None, valid_from=now, created_at=now)
+        config = _make_config()
+        r1 = score_item(item, config, now)
+        r2 = score_item(item, config, now)
+        assert r1.score == r2.score
+        # A brand-new item has freshness = (1 - 0/30) * 0.5 = 0.5.
+        assert any("freshness=0.50" in reason for reason in r1.reasons)
+
+    def test_freshness_does_not_dominate_trust(self) -> None:
+        """An old, high-trust item should still outscore a fresh, low-trust
+        item (freshness must not dominate trust/importance)."""
+        now = datetime.now(UTC)
+        fresh_low_trust = _make_item(
+            last_recalled_at=None,
+            valid_from=now,
+            created_at=now,
+            importance=0.1,
+            source_trust=0.1,
+            memory_confidence=0.1,
+        )
+        old_high_trust = _make_item(
+            last_recalled_at=now - timedelta(days=100),
+            valid_from=now - timedelta(days=200),
+            created_at=now - timedelta(days=200),
+            importance=0.9,
+            source_trust=0.9,
+            memory_confidence=0.9,
+            human_verified=True,
+        )
+        config = _make_config()
+        fresh_score = score_item(fresh_low_trust, config, now).score
+        old_score = score_item(old_high_trust, config, now).score
+        assert old_score > fresh_score
+
+    def test_anti_feedback_penalty_only_affects_recall_recency(self) -> None:
+        """The startup anti-feedback penalty reduces recall-driven recency but
+        a fresh, never-recalled item still gets its full freshness signal."""
+        now = datetime.now(UTC)
+        # A frequently-recalled item: high startup_recall_count triggers the
+        # penalty, which must NOT bleed into a separate fresh item's freshness.
+        penalized = _make_item(
+            last_recalled_at=now - timedelta(days=1),
+            startup_recall_count=20,
+        )
+        config = _make_config()
+        result = score_item(penalized, config, now)
+        # The penalty reason is present and tied to recall recency.
+        assert any("recency_penalty(count=20)" in r for r in result.reasons)
+        # A never-recalled fresh item shows freshness with no penalty reason.
+        fresh = _make_item(last_recalled_at=None, valid_from=now, created_at=now)
+        fresh_result = score_item(fresh, config, now)
+        assert not any("recency_penalty" in r for r in fresh_result.reasons)
+        assert any("freshness=" in r for r in fresh_result.reasons)
 
 
 class TestPinnedBypass:
@@ -148,6 +218,88 @@ class TestBudgetEnforcement:
         result = _enforce_budget(items_with_scores, byte_budget=150, token_budget=None)
         total_bytes = sum(len(i.content.encode()) for i, _ in result)
         assert total_bytes <= 150
+
+    def test_skip_not_break_byte_budget(self) -> None:
+        """An oversized high-ranked item is skipped and lower-ranked items
+        that fit still fill the budget (requirement: skip-not-break)."""
+        items_with_scores = [
+            (_make_item(content="A" * 1200), 0.99),  # oversized -> skipped
+            (_make_item(content="B" * 200), 0.90),  # fits
+            (_make_item(content="C" * 300), 0.80),  # fits
+        ]
+        result = _enforce_budget(items_with_scores, byte_budget=1000, token_budget=None)
+        contents = [i.content[0] for i, _ in result]
+        # A omitted; B and C included, in rank order.
+        assert contents == ["B", "C"]
+        total_bytes = sum(len(i.content.encode()) for i, _ in result)
+        assert total_bytes <= 1000
+
+    def test_skip_not_break_token_budget(self) -> None:
+        items_with_scores = [
+            (_make_item(content="A" * 1200), 0.99),  # ~300 tokens -> skipped
+            (_make_item(content="B" * 200), 0.90),  # ~50 tokens -> fits
+            (_make_item(content="C" * 300), 0.80),  # ~75 tokens -> fits
+        ]
+        result = _enforce_budget(items_with_scores, byte_budget=None, token_budget=200)
+        contents = [i.content[0] for i, _ in result]
+        assert contents == ["B", "C"]
+
+
+class TestSemanticBudgetSkipNotBreak:
+    def test_oversized_top_item_skipped(self) -> None:
+        candidates = [
+            {"content": "A" * 1200},  # oversized, score-best
+            {"content": "B" * 200},
+            {"content": "C" * 300},
+        ]
+        result = _enforce_semantic_budget(
+            candidates, byte_budget=1000, token_budget=None, item_budget=None
+        )
+        contents = [c["content"][0] for c in result]
+        assert contents == ["B", "C"]
+
+    def test_item_budget_cap_respected(self) -> None:
+        candidates = [{"content": "x"}, {"content": "y"}, {"content": "z"}]
+        result = _enforce_semantic_budget(
+            candidates, byte_budget=None, token_budget=None, item_budget=2
+        )
+        assert len(result) == 2
+
+    def test_no_budget_returns_all(self) -> None:
+        candidates = [{"content": "a"}, {"content": "b"}]
+        result = _enforce_semantic_budget(
+            candidates, byte_budget=None, token_budget=None, item_budget=None
+        )
+        assert result == candidates
+
+
+class TestDefaultBudgets:
+    def test_omitted_budgets_use_global_defaults(self) -> None:
+        byte_b, token_b, item_b = _resolve_recall_budgets(
+            byte_budget=None, token_budget=None, item_budget=None
+        )
+        from engram.config import settings
+
+        assert byte_b == settings.recall_byte_budget
+        assert item_b == settings.recall_item_budget
+        assert token_b is None  # no global default
+
+    def test_explicit_budgets_override_defaults(self) -> None:
+        byte_b, token_b, item_b = _resolve_recall_budgets(
+            byte_budget=128, token_budget=64, item_budget=3
+        )
+        assert byte_b == 128
+        assert token_b == 64
+        assert item_b == 3
+
+    def test_recall_is_bounded_by_default(self) -> None:
+        """Omitted byte/item budgets resolve to non-None defaults."""
+        byte_b, _token_b, item_b = _resolve_recall_budgets(
+            byte_budget=None, token_budget=None, item_budget=None
+        )
+        assert byte_b is not None
+        assert item_b is not None
+
 
 
 class TestDeterminism:

@@ -199,14 +199,14 @@ async def test_recall_semantic_mode_sends_query() -> None:
                 }
             ],
             "recall_log_id": OTHER_ID,
-            "scoring_version": "semantic-v1",
+            "scoring_version": "semantic-v2",
             "message": None,
         },
     )
     async with _client(rec) as client:
         resp = await client.recall(mode="semantic", query="semantic query", item_budget=5)
     assert isinstance(resp, RecallResponse)
-    assert resp.scoring_version == "semantic-v1"
+    assert resp.scoring_version == "semantic-v2"
     assert resp.message is None
     assert resp.items[0]["reasons"] == ["semantic similarity 0.92"]
     assert rec.request is not None

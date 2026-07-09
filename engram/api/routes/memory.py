@@ -296,6 +296,12 @@ _SEARCH_HELPFUL_MESSAGE = (
 )
 _RRF_K = 60
 
+# Semantic search pulls more candidates than the requested limit from the HNSW
+# index so trust-weighted re-ranking (engram.semantic) has room to reorder
+# within the window before trimming to the caller's limit.
+_SEMANTIC_SEARCH_OVERFETCH = 3
+_SEMANTIC_SEARCH_OVERFETCH_CAP = 200
+
 
 def _search_result_row(
     row: Any,
@@ -325,12 +331,39 @@ async def _keyword_search(
     *,
     tenant_id: UUID | str,
     principal_id: UUID | str,
+    kind: str | None = None,
+    wing: str | None = None,
+    room: str | None = None,
 ) -> list[dict[str, Any]]:
     """Keyword (full-text) search, scoped to the caller's tenant + visibility.
 
     Uses the shared raw-SQL eligibility fragment (``engram.memory_access``)
-    since this query is over raw ``text(...)`` SQL, not the ORM.
+    since this query is over raw ``text(...)`` SQL, not the ORM. Optional
+    ``kind``/``wing``/``room`` filters apply with AND semantics before the
+    rank/limit so ineligible rows don't displace matches.
     """
+    clauses: list[str] = [
+        "mi.review_status = 'active'",
+        "mi.valid_to IS NULL",
+        tenant_sql("mi"),
+        eligibility_sql("mi"),
+        "mi.content_tsv @@ plainto_tsquery('english', :query)",
+    ]
+    params: dict[str, Any] = {
+        "query": query,
+        "limit": limit,
+        "caller_tenant_id": str(tenant_id),
+        "caller_principal_id": str(principal_id),
+    }
+    if kind is not None:
+        clauses.append("mi.kind = :kind")
+        params["kind"] = kind
+    if wing is not None:
+        clauses.append("mi.wing = :wing")
+        params["wing"] = wing
+    if room is not None:
+        clauses.append("mi.room = :room")
+        params["room"] = room
     stmt = text(
         f"""
         SELECT
@@ -341,39 +374,32 @@ async def _keyword_search(
             mi.valid_to,
             ts_rank_cd(mi.content_tsv, plainto_tsquery('english', :query)) AS score
         FROM memory_items mi
-        WHERE mi.review_status = 'active'
-          AND mi.valid_to IS NULL
-          AND {tenant_sql("mi")}
-          AND {eligibility_sql("mi")}
-          AND mi.content_tsv @@ plainto_tsquery('english', :query)
+        WHERE {' AND '.join(clauses)}
         ORDER BY score DESC, mi.created_at DESC
         LIMIT :limit
         """
     )
-    rows = (
-        await session.execute(
-            stmt,
-            {
-                "query": query,
-                "limit": limit,
-                "caller_tenant_id": str(tenant_id),
-                "caller_principal_id": str(principal_id),
-            },
-        )
-    ).mappings().all()
+    rows = (await session.execute(stmt, params)).mappings().all()
     return [
         _search_result_row(row, mode="keyword", score=float(row["score"] or 0.0)) for row in rows
     ]
 
 
 def _format_semantic_result(row: dict[str, Any]) -> dict[str, Any]:
-    """Shape a semantic.search() row into the /v1/search response format."""
+    """Shape a semantic.search() row into the /v1/search response format.
+
+    ``score`` is the final trust-weighted semantic score; ``distance``,
+    ``similarity_score`` and ``trust_score`` are exposed for transparency so
+    callers can explain the ordering.
+    """
     return _search_result_row(
         row,
         mode="semantic",
         score=float(row.get("score", 0.0)),
         extra={
             "distance": row.get("distance"),
+            "similarity_score": row.get("similarity_score"),
+            "trust_score": row.get("trust_score"),
             "embedding_model": row.get("embedding_model"),
             "embedding_dim": row.get("embedding_dim"),
         },
@@ -751,30 +777,56 @@ async def search(
     """
     limit = req.limit
     mode = req.mode
+    # kind/wing/room filters apply (AND semantics) to all three search modes.
+    kind = req.kind
+    wing = req.wing
+    room = req.room
 
     tenant_id = await _resolve_tenant_id(session)
     principal_id, _ = await _resolve_principal(session, tenant_id)
 
     if mode == "keyword":
         results = await _keyword_search(
-            session, req.query, limit, tenant_id=tenant_id, principal_id=principal_id
+            session,
+            req.query,
+            limit,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            kind=kind,
+            wing=wing,
+            room=room,
         )
         return SearchResponse(results=results, total=len(results))
 
     query_embedding = await generate_embedding(req.query)
     semantic_count = await semantic.candidate_count(
-        session, tenant_id=tenant_id, principal_id=principal_id
+        session,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        kind=kind,
+        wing=wing,
+        room=room,
     )
 
     if mode == "semantic":
         if query_embedding is None or semantic_count == 0:
             return SearchResponse(results=[], total=0, message=_SEARCH_HELPFUL_MESSAGE)
+        # Over-fetch so trust-weighted re-ranking can reorder within the window
+        # before trimming to the caller's requested limit.
+        fetch_limit = min(limit * _SEMANTIC_SEARCH_OVERFETCH, _SEMANTIC_SEARCH_OVERFETCH_CAP)
         raw = await semantic.search(
-            session, query_embedding, limit, tenant_id=tenant_id, principal_id=principal_id
+            session,
+            query_embedding,
+            fetch_limit,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            kind=kind,
+            wing=wing,
+            room=room,
         )
         if not raw:
             return SearchResponse(results=[], total=0, message=_SEARCH_HELPFUL_MESSAGE)
-        results = [_format_semantic_result(row) for row in raw]
+        results = [_format_semantic_result(row) for row in raw[:limit]]
         return SearchResponse(results=results, total=len(results))
 
     keyword_results = await _keyword_search(
@@ -783,6 +835,9 @@ async def search(
         max(limit * 5, limit),
         tenant_id=tenant_id,
         principal_id=principal_id,
+        kind=kind,
+        wing=wing,
+        room=room,
     )
     if query_embedding is None or semantic_count == 0:
         return SearchResponse(
@@ -797,6 +852,9 @@ async def search(
         max(limit * 5, limit),
         tenant_id=tenant_id,
         principal_id=principal_id,
+        kind=kind,
+        wing=wing,
+        room=room,
     )
     semantic_results = [_format_semantic_result(row) for row in raw_semantic]
     results = _rrf_fuse(keyword_results, semantic_results, limit=limit)

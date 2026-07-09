@@ -212,11 +212,32 @@ score = importance × 0.30
       + human_verified × 0.10
 ```
 
+The `recency` component is the larger of two decay signals: recall recency (decay from `last_recalled_at`, subject to the anti-feedback penalty) and freshness (decay from `valid_from`/`created_at`, half-weighted). This gives a fresh, never-recalled memory a modest recency contribution without letting freshness dominate trust/importance.
+
 Pinned items bypass scoring and are included first, up to a ceiling.
+
+Recall is **bounded by default**: omitted `byte_budget` / `item_budget` fall back to the configured defaults (`recall_byte_budget`, `recall_item_budget`) rather than leaving recall unbounded. Explicit caller budgets always override the defaults.
 
 Every recalled item includes a `reasons` array explaining why it was included.
 
 Anti-feedback-loop guardrails prevent the same memories from permanently dominating recall without useful feedback.
+
+#### Semantic recall & search ranking
+
+Semantic recall (`mode=semantic`) and semantic/hybrid search rank results by a deterministic trust-weighted score (`scoring_version = semantic-v2`), not pure cosine distance:
+
+```text
+similarity   = clamp(1.0 − cosine_distance, 0.0, 1.0)
+trust_score  = 0.30·source_trust + 0.30·memory_confidence + 0.25·importance
+             + 0.10·human_verified + 0.05·review_status_factor   (clamped to [0.05, 1.0])
+semantic_score = similarity × trust_score
+```
+
+Unresolved conflicts multiply `trust_score` by 0.75; proposed items multiply by 0.85. So a slightly-closer low-trust or unreviewed item cannot outrank a higher-trust memory. Semantic result rows preserve `distance` and additionally expose `similarity_score`, `trust_score`, and the final `score` for transparency.
+
+#### Search filters
+
+`/v1/search` honors `kind`, `wing`, and `room` filters (AND semantics) across keyword, semantic, and hybrid modes. Filters apply before ranking/limit and alongside tenant/read-eligibility scoping, so ineligible rows never displace matches.
 
 ### Visibility & Multi-Tenancy
 
