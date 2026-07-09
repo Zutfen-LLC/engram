@@ -200,6 +200,8 @@ Trust is not binary. Every memory carries:
 
 Authority hierarchy governs supersession. A lower-authority source can never silently replace a higher-authority memory.
 
+`memory_confidence` starts from source-type defaults (see the table in [`docs/design.md`](docs/design.md) §4). When `/v1/remember` auto-classifies a write, the classifier's confidence **refines** that default — but source authority caps how far a low-trust automated source can promote itself, so a confident classifier can pull a weak capture *down* without letting it self-promote *up*. See [Classification](#classification) below.
+
 ### Recall
 
 Startup recall returns a deterministic, bounded working set of active memories, scored by:
@@ -251,6 +253,25 @@ Engram supports visibility scopes for both single-agent and multi-agent deployme
 | `public`    | Any authenticated caller, where enabled |
 
 Row Level Security is enforced at the Postgres level — one forgotten `WHERE` clause cannot cause a cross-tenant leak. The runtime service connects as a dedicated non-owner role (`engram_app`) with no `BYPASSRLS`, and every tenant-scoped table uses `FORCE ROW LEVEL SECURITY`, so isolation holds even if the connecting role is the table owner. App-layer visibility/workspace logic is still the primary semantic rule; RLS is defense-in-depth beneath it.
+
+### Classification
+
+Two endpoints serve classification with distinct roles:
+
+* **`POST /v1/classify`** returns *suggestions* — suggested kind, wing, room, an advisory `suggested_visibility`, and the classifier's true `confidence`. It never stores anything or applies trust policy.
+* **`POST /v1/remember`** applies the *safe storage policy* when it auto-classifies a write (i.e. when the caller omits `kind`).
+
+Classifier confidence is a real `0.0–0.95` signal — low values are preserved rather than floored, so a doubtful classification can actually lower a memory's confidence. When `/v1/remember` classifies, it blends classifier confidence into the stored `memory_confidence`:
+
+* **Automated sources** (`sync_turn`, `pre_compress`, `extraction`) feel classification strongly (0.5·default + 0.5·classifier) — a confident classifier is their main quality signal.
+* **Authoritative sources** (`manual`, `import`, `migration`) are barely moved by uncertain taxonomy classification (0.85·default + 0.15·classifier), so a high-trust manual write isn't downrated just because the classifier was unsure about *kind*.
+* The result is **capped by source authority** (`max(default, source_trust)`), so a low-trust automated source can never self-promote past a safe ceiling, then clamped to `[0, 1]`.
+
+The classifier's `suggested_visibility` is applied **downward only** — it may narrow the requested scope (e.g. `tenant` → `private`) but never widen it. Invalid or absent suggestions preserve the caller's requested visibility unchanged.
+
+Every classified write records a `classification` event with full provenance: classifier confidence and raw confidence, default vs. final `memory_confidence`, requested/suggested/final visibility, whether visibility was narrowed, and whether confidence was blended. Content is never mutated.
+
+Seed classification rules are intentionally conservative: "skip" rules are whole-message *status-only* matchers (bare `ok`, `done`, `passed`) that don't fire on status words inside meaningful sentences, and doctrine classification requires explicit policy/invariant phrasing rather than casual modal verbs.
 
 ## Architecture
 

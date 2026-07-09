@@ -547,16 +547,22 @@ WHERE t.slug = 'default'
 ON CONFLICT (workspace_id, principal_id) DO NOTHING;
 
 -- ============ Seed: default classification rules ============
+-- Skip rules are "low-information status" rules: they match whole-message
+-- status-only text (e.g. bare "ok", "done", "passed") and apply a conservative
+-- fact default. They are anchored with \A...\Z so they never match a status
+-- word *inside* a meaningful sentence. Doctrine is intentionally conservative:
+-- it requires explicit policy/invariant phrasing rather than bare modal verbs,
+-- so casual "should" statements are not promoted to the highest-stakes kind.
 
 INSERT INTO classification_rules (tenant_id, name, rule_type, pattern, target_kind, priority)
 SELECT t.id, r.name, r.rule_type, r.pattern, r.target_kind, r.priority
 FROM tenants t, (VALUES
-    ('skip_tool_output',      'regex_skip', '\b(passed|failed|ok|done)\b',                        NULL, 10),
-    ('skip_single_token',     'regex_skip', '^.{1,15}$',                                            NULL, 10),
-    ('kind_doctrine',         'keyword_kind', 'doctrine|invariant|must|should|always|never',     'doctrine', 50),
-    ('kind_decision',         'keyword_kind', 'decided|decision|chose|we will|going to',         'decision', 50),
-    ('kind_preference',       'keyword_kind', 'prefers|wants|likes|dislikes|convention',         'preference', 50),
-    ('kind_observation',      'keyword_kind', 'observed|noticed|error|failed|warning',           'observation', 60)
+    ('skip_status_only',   'regex_skip',  '\A\s*(ok|done|passed|failed|success(ful)?|all\s+good|ack|acknowledged|got\s+it|will\s+do)\s*[.!?]*\s*\Z', NULL, 10),
+    ('skip_single_token',  'regex_skip',  '\A\S{1,12}\Z',                                                                            NULL, 10),
+    ('kind_doctrine',      'keyword_kind', '\b(doctrine|invariant)\b|policy\s*:|rule\s*:|invariant\s*:|must\s+(never|always|not)',            'doctrine', 50),
+    ('kind_decision',      'keyword_kind', 'decided|decision|chose|we will|going to',                                                              'decision', 50),
+    ('kind_preference',    'keyword_kind', 'prefers|wants|likes|dislikes|convention',                                                              'preference', 50),
+    ('kind_observation',   'keyword_kind', 'observed|noticed|error|failed|warning',                                                                'observation', 60)
 ) AS r(name, rule_type, pattern, target_kind, priority)
 WHERE t.slug = 'default'
 ON CONFLICT DO NOTHING;

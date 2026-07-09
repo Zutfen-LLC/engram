@@ -22,6 +22,7 @@ from engram import semantic
 from engram.canonicalize import canonicalize, content_hash
 from engram.classification import ClassificationResult
 from engram.classification import classify as classify_memory
+from engram.classification_trust import blend_memory_confidence, narrow_visibility
 from engram.config import settings
 from engram.conflicts import ConflictAction, ConflictResult, detect_conflicts
 from engram.db import get_session
@@ -486,6 +487,27 @@ async def remember(
     if classification_result is not None and classification_result.suggested_kind == "decision":
         review_status = "proposed"
 
+    # 4b. Classification → trust/visibility wiring (only when classification ran).
+    # The classifier may refine memory_confidence (capped by source authority so
+    # weak automated sources can't self-promote) and narrow — never widen — the
+    # requested visibility. Explicit-kind writes skip classification entirely, so
+    # their confidence/visibility come straight from the request/defaults.
+    default_confidence = memory_confidence
+    final_visibility = req.visibility
+    suggested_visibility: str | None = None
+    visibility_narrowed = False
+    memory_confidence_blended = False
+    if classification_result is not None:
+        suggested_visibility = classification_result.suggested_visibility
+        final_visibility = narrow_visibility(req.visibility, suggested_visibility)
+        visibility_narrowed = final_visibility != req.visibility
+        memory_confidence, memory_confidence_blended = blend_memory_confidence(
+            source_default_confidence=default_confidence,
+            classifier_confidence=classification_result.confidence,
+            source_trust=source_trust,
+            source_type=req.source_type,
+        )
+
     # 5. Supersession check for singleton kinds.
     superseded_id = await _check_supersession(
         session,
@@ -510,7 +532,7 @@ async def remember(
         subject_type=req.subject_type,
         subject_id=req.subject_id,
         subject_name=req.subject_name,
-        visibility=req.visibility,
+        visibility=final_visibility,
         review_status=review_status,
         memory_confidence=memory_confidence,
         source_trust=source_trust,
@@ -566,6 +588,18 @@ async def remember(
         "wing": wing,
         "room": room,
         "provider": provider,
+        # Trust/visibility audit — present on every classification event so the
+        # record is self-describing even for explicit-kind writes (where the
+        # classifier did not run and these are the untouched request/defaults).
+        "source_type": req.source_type,
+        "source_trust": source_trust,
+        "default_memory_confidence": default_confidence,
+        "final_memory_confidence": memory_confidence,
+        "memory_confidence_blended": memory_confidence_blended,
+        "requested_visibility": req.visibility,
+        "suggested_visibility": suggested_visibility,
+        "final_visibility": final_visibility,
+        "visibility_narrowed": visibility_narrowed,
     }
     if classification_result is not None:
         classification_dump = classification_result.model_dump(exclude={"provenance"})
