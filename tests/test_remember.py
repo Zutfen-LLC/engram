@@ -38,13 +38,17 @@ async def _db_ok() -> bool:
 
 
 async def _get_test_session() -> AsyncSession:
-    """Replacement for get_session that uses the NullPool test engine."""
+    """Replacement for get_session that uses the NullPool test engine.
+
+    Applies RLS context via the SAME helper get_session uses (apply_rls_context)
+    so this override tracks production behavior — including the commit that lets
+    context survive a mid-request rollback (the dedup path exercised below).
+    """
+    from sqlalchemy import text as sa_text
+
+    from engram.db import _DEFAULT_PRINCIPAL_NAME, _DEFAULT_TENANT_SLUG, apply_rls_context
+
     async with _test_session_factory() as session:
-        # Replicate the RLS context setup from engram.db.get_session.
-        from sqlalchemy import text as sa_text
-
-        from engram.db import _DEFAULT_PRINCIPAL_NAME, _DEFAULT_TENANT_SLUG
-
         row = (
             await session.execute(
                 sa_text(
@@ -56,13 +60,8 @@ async def _get_test_session() -> AsyncSession:
                 {"slug": _DEFAULT_TENANT_SLUG, "principal": _DEFAULT_PRINCIPAL_NAME},
             )
         ).mappings().one()
-        await session.execute(
-            sa_text("SELECT set_config('app.tenant_id', :tid, true)"),
-            {"tid": row["tenant_id"]},
-        )
-        await session.execute(
-            sa_text("SELECT set_config('app.principal_id', :pid, true)"),
-            {"pid": row["principal_id"]},
+        await apply_rls_context(
+            session, tenant_id=row["tenant_id"], principal_id=row["principal_id"]
         )
         yield session
 

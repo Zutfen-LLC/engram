@@ -17,6 +17,15 @@
 # once so future migrations are tracked:
 #     docker compose exec engram-service engram init-db --baseline
 # See docs/deployment.md (Upgrades & migrations) for the full procedure.
+#
+# --- DB roles --------------------------------------------------------------
+# Two roles are used for defense-in-depth tenant isolation (ENG-AUD-002):
+#   POSTGRES_OWNER_USER/PASSWORD -> the table-owning superuser that runs
+#       migrations and admin/bootstrap commands (bypasses RLS).
+#   POSTGRES_APP_USER/PASSWORD   -> the non-owner application role the service
+#       connects as at runtime (subject to RLS; no table ownership, no
+#       BYPASSRLS). Created by migrations/003_app_role_and_force_rls.sql; its
+#       password is set on first boot by migrations/app_role_password.sh.
 
 services:
   postgres:
@@ -24,15 +33,20 @@ services:
     container_name: engram-db
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-engram}
-      POSTGRES_USER: ${POSTGRES_USER:-engram}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-engram}
+      # Owner/migration superuser. Falls back to the legacy POSTGRES_USER/
+      # POSTGRES_PASSWORD for .env files that predate the owner/app split.
+      POSTGRES_USER: ${POSTGRES_OWNER_USER:-${POSTGRES_USER:-engram}}
+      POSTGRES_PASSWORD: ${POSTGRES_OWNER_PASSWORD:-${POSTGRES_PASSWORD:-engram}}
+      # Consumed by migrations/app_role_password.sh on first boot only.
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER:-engram_app}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:-engram_app}
     volumes:
       - engram-db-data:/var/lib/postgresql/data
       - ./migrations:/docker-entrypoint-initdb.d:ro
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-engram} -d ${POSTGRES_DB:-engram}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_OWNER_USER:-${POSTGRES_USER:-engram}} -d ${POSTGRES_DB:-engram}"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -44,7 +58,12 @@ services:
       target: runtime
     container_name: engram-service
     environment:
-      ENGRAM_DATABASE_URL: postgresql+asyncpg://engram:${POSTGRES_PASSWORD:-engram}@postgres:5432/${POSTGRES_DB:-engram}
+      # Runtime: connect as the non-owner app role (RLS-enforced).
+      ENGRAM_DATABASE_URL: postgresql+asyncpg://${POSTGRES_APP_USER:-engram_app}:${POSTGRES_APP_PASSWORD:-engram_app}@postgres:5432/${POSTGRES_DB:-engram}
+      # Migrations/admin: connect as the owner (bypasses RLS for DDL + cross-
+      # tenant CLI paths). Used by `engram init-db`, `engram bootstrap-key`, and
+      # `engram promote-proposed` / `engram backfill-embeddings`.
+      ENGRAM_OWNER_DATABASE_URL: postgresql+asyncpg://${POSTGRES_OWNER_USER:-${POSTGRES_USER:-engram}}:${POSTGRES_OWNER_PASSWORD:-${POSTGRES_PASSWORD:-engram}}@postgres:5432/${POSTGRES_DB:-engram}
       ENGRAM_HOST: 0.0.0.0
       ENGRAM_PORT: 8000
       ENGRAM_LOG_LEVEL: ${ENGRAM_LOG_LEVEL:-info}

@@ -52,14 +52,9 @@ async def _get_test_session() -> AsyncSession:
         ).mappings().one()
         rls_tenant_id = row["tenant_id"]
         rls_principal_id = row["principal_id"]
-        await session.execute(
-            sa_text("SELECT set_config('app.tenant_id', :tid, true)"),
-            {"tid": rls_tenant_id},
-        )
-        await session.execute(
-            sa_text("SELECT set_config('app.principal_id', :pid, true)"),
-            {"pid": rls_principal_id},
-        )
+        from engram.db import apply_rls_context
+
+        await apply_rls_context(session, tenant_id=rls_tenant_id, principal_id=rls_principal_id)
         yield session
 
 

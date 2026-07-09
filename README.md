@@ -158,7 +158,7 @@ Auto-promotion is available for memories that meet tenant-configurable confidenc
 Auto-promotion runs on demand. Wire the CLI to cron/systemd, or call the admin endpoint:
 
 ```bash
-# All tenants, run as the table-owning DB role to bypass RLS:
+# All tenants. Runs as the owner role (bypasses RLS) via ENGRAM_OWNER_DATABASE_URL:
 engram promote-proposed
 
 # Single tenant, capped at 1000 candidates:
@@ -229,7 +229,7 @@ Engram supports visibility scopes for both single-agent and multi-agent deployme
 | `tenant`    | Any principal in the organization       |
 | `public`    | Any authenticated caller, where enabled |
 
-Row Level Security is enforced at the Postgres level — one forgotten `WHERE` clause cannot cause a cross-tenant leak.
+Row Level Security is enforced at the Postgres level — one forgotten `WHERE` clause cannot cause a cross-tenant leak. The runtime service connects as a dedicated non-owner role (`engram_app`) with no `BYPASSRLS`, and every tenant-scoped table uses `FORCE ROW LEVEL SECURITY`, so isolation holds even if the connecting role is the table owner. App-layer visibility/workspace logic is still the primary semantic rule; RLS is defense-in-depth beneath it.
 
 ## Architecture
 

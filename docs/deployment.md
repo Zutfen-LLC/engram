@@ -30,6 +30,23 @@ not require any specific host, VPN, or provider.
 > sufficient pgvector version is installed, so an old extension fails readiness
 > *before* semantic queries 500 at runtime.
 
+### Database roles (defense-in-depth tenant isolation)
+
+Engram uses two Postgres roles, set in `.env`:
+
+| Role                 | Env vars                              | Used for                                            | RLS         |
+| -------------------- | ------------------------------------- | --------------------------------------------------- | ----------- |
+| **Owner** (`engram`) | `POSTGRES_OWNER_USER` / `_PASSWORD`   | Migrations (`init-db`), `bootstrap-key`, cross-tenant CLI scans, backups | **bypassed** (superuser) |
+| **App** (`engram_app`) | `POSTGRES_APP_USER` / `_PASSWORD`   | All runtime service traffic                         | **enforced** (no ownership, no `BYPASSRLS`) |
+
+The app role is created by `migrations/003_app_role_and_force_rls.sql` with
+only DML privileges; its password is set on first boot by
+`migrations/app_role_password.sh`. Every tenant-scoped table uses `FORCE ROW
+LEVEL SECURITY`, so a forgotten `WHERE tenant_id = ...` in the application
+cannot cause a cross-tenant leak when the service connects through the app role.
+Migrations and admin commands run as the owner (which bypasses RLS) via
+`ENGRAM_OWNER_DATABASE_URL`.
+
 ---
 
 ## 2. Fresh deployment (Docker Compose) — full walkthrough
@@ -41,7 +58,7 @@ This is the complete, copy-pasteable path from clone to authenticated recall.
 git clone https://github.com/Zutfen-LLC/engram.git
 cd engram
 
-# 2. Configure (edit POSTGRES_PASSWORD and others!)
+# 2. Configure (set POSTGRES_OWNER_PASSWORD and POSTGRES_APP_PASSWORD at minimum!)
 cp .env.example .env
 $EDITOR .env
 
@@ -145,7 +162,7 @@ backups. Configure it via `.env` (all optional, safe defaults):
 | `BACKUP_DIR`             | `./backups`   | Output directory (created if missing)              |
 | `BACKUP_RETENTION_DAYS`  | `14`          | Delete backups older than N days; `0` keeps all    |
 | `BACKUP_PGHOST`          | `127.0.0.1`   | `host:port` override for pg_dump (else `PGHOST`)   |
-| `POSTGRES_USER` / `POSTGRES_DB` / `POSTGRES_PASSWORD` | from `.env` | DB connection |
+| `POSTGRES_OWNER_USER` / `POSTGRES_DB` / `POSTGRES_OWNER_PASSWORD` | from `.env` | Owner-role DB connection for the dump (falls back to `POSTGRES_USER`/`POSTGRES_PASSWORD` for older `.env` files) |
 
 Run a backup (requires `pg_dump` on the host):
 
@@ -259,8 +276,47 @@ docker compose build
 docker compose up -d
 
 # 3. Apply pending migrations
+#    init-db connects as the OWNER role (ENGRAM_OWNER_DATABASE_URL), which can
+#    run DDL. The runtime service stays on the APP role (ENGRAM_DATABASE_URL).
 docker compose exec engram-service engram init-db
 ```
+
+#### Upgrading an existing database to the app-role split (ENG-AUD-002)
+
+A database created before this change connects as the owner at runtime. To move
+it onto the enforced-RLS app-role posture:
+
+> **Precondition:** the owner/migration role must be a **superuser** or hold
+> `BYPASSRLS`. `FORCE ROW LEVEL SECURITY` makes policies apply to the table
+> owner too, so an existing deployment whose owner is a non-privileged role
+> (managed Postgres / bare-metal) would have every still-running query
+> RLS-filtered the moment 003 applies. If your owner is not a superuser, **stop
+> the service first** (`docker compose stop engram-service`) so no traffic runs
+> against a FORCE-RLS'd, non-bypassing owner during the window, then complete
+> all steps before restarting.
+
+1. Apply migration `003` (creates `engram_app`, grants, `FORCE RLS`):
+
+   ```bash
+   # Baseline the pre-003 schema as applied, then apply 003:
+   docker compose exec engram-service engram init-db --baseline 002_backfill_indexes.sql
+   docker compose exec engram-service engram init-db
+   ```
+
+2. Set the app-role password (the password script only runs on first boot, so
+   on an existing volume set it directly):
+
+   ```bash
+   docker compose exec postgres psql -U engram -d engram -c \
+       "ALTER ROLE engram_app WITH LOGIN PASSWORD 'your-app-password' NOBYPASSRLS;"
+   ```
+
+3. Set `POSTGRES_APP_PASSWORD` (and the owner vars) in `.env`, then recreate the
+   service so it connects as the app role:
+
+   ```bash
+   docker compose up -d
+   ```
 
 ### Baseline an already-bootstrapped database
 
@@ -272,7 +328,9 @@ current migrations as applied:
 
 ```bash
 # Safest: baseline up to a specific file the DB is known to already have.
-docker compose exec engram-service engram init-db --baseline 002_backfill_indexes.sql
+# A fresh `docker compose up` runs every file in migrations/ (including 003),
+# so baseline at the latest file for a first-boot DB:
+docker compose exec engram-service engram init-db --baseline 003_app_role_and_force_rls.sql
 # Future runs apply only newer migrations.
 docker compose exec engram-service engram init-db
 ```
@@ -314,23 +372,35 @@ guide. See `engram backfill-embeddings --help` for batching/retry options.
 ## 8. Bare-metal / non-Compose deployment
 
 Without Compose, provide a Postgres 16 + pgvector ≥ 0.8 database and run the
-service directly:
+service directly. You need **two** roles: an owner/migration role and the
+non-owner application role (`engram_app`).
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 
-# Configure
-cp .env.example .env && $EDITOR .env   # set ENGRAM_DATABASE_URL explicitly
+# Configure (copy .env.example and edit):
+cp .env.example .env && $EDITOR .env
+#   ENGRAM_DATABASE_URL       -> the app role (postgresql+asyncpg://engram_app:...)
+#   ENGRAM_OWNER_DATABASE_URL -> the owner role (postgresql+asyncpg://engram:...)
 
-# Migrate (uses ENGRAM_DATABASE_URL)
+# Create the app role if it does not exist yet (run once as the owner/superuser):
+psql -U engram -d engram -f migrations/003_app_role_and_force_rls.sql
+#   then set its password:  ALTER ROLE engram_app WITH LOGIN PASSWORD '...';
+
+# Apply migrations (connects as the owner via ENGRAM_OWNER_DATABASE_URL):
 engram init-db
 
-# Run
+# Run the service (connects as the app role via ENGRAM_DATABASE_URL):
 engram serve
 ```
 
-The `ENGRAM_DATABASE_URL` must use the `postgresql+asyncpg://` scheme.
+Both URLs must use the `postgresql+asyncpg://` scheme. Migrations require the
+owner role (they run DDL and `FORCE ROW LEVEL SECURITY`); the service requires
+the app role (so RLS is enforced). The owner role should be a **superuser** (or
+have `BYPASSRLS`) so cross-tenant CLI scans (`promote-proposed`,
+`backfill-embeddings`) and `bootstrap-key` work — `FORCE ROW LEVEL SECURITY`
+applies to the owner too, and only superusers / `BYPASSRLS` roles bypass it.
 
 ---
 
@@ -349,7 +419,8 @@ The `ENGRAM_DATABASE_URL` must use the `postgresql+asyncpg://` scheme.
 
 ### Production hardening checklist
 
-- [ ] `POSTGRES_PASSWORD` changed from the default
+- [ ] `POSTGRES_OWNER_PASSWORD` and `POSTGRES_APP_PASSWORD` both changed from the default
+- [ ] Service connects as the non-owner app role (`engram_app`); migrations/admin use the owner role
 - [ ] `ENGRAM_AUTH_ENABLED=true` and a non-bootstrap admin key in use
 - [ ] Postgres port bound to `127.0.0.1` or not exposed on the public interface
 - [ ] `deploy/backup.sh` scheduled with off-host/durable `BACKUP_DIR`

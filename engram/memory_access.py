@@ -4,13 +4,15 @@ Every read path that can return memory-item content (recall, search, item
 list/detail) must apply the same predicate: the item belongs to the caller's
 tenant, and its visibility permits the caller to see it.
 
-Note on RLS: ``memory_items`` (and friends) have ``ENABLE ROW LEVEL
-SECURITY`` policies (see migrations/001_init.sql) keyed off
-``current_setting('app.tenant_id')``, but the tables are not
-``FORCE ROW LEVEL SECURITY``. Policies do not apply to the table owner/role
-the application connects as, so tenant scoping cannot be delegated to
-Postgres alone — every read path here filters ``tenant_id`` explicitly in
-the application layer.
+Note on RLS: ``memory_items`` (and every other tenant-scoped table) have
+``ENABLE`` + ``FORCE ROW LEVEL SECURITY`` (see migrations/001_init.sql and
+migrations/003_app_role_and_force_rls.sql) keyed off
+``current_setting('app.tenant_id')``. The runtime service connects as the
+non-owner application role (``engram_app``), which is subject to those policies
+— so a forgotten ``tenant_id`` filter here would be caught at the database
+level. This predicate remains the *primary* semantic visibility rule
+(visibility/workspace logic the DB cannot express); RLS is defense-in-depth
+tenant isolation beneath it. Both layers are required.
 
 Visibility rules (design.md):
     visibility = 'tenant'
@@ -43,8 +45,9 @@ def eligibility_expression(principal_id: str | UUID) -> ColumnElement[bool]:
     """SQLAlchemy boolean expression: is a ``MemoryItem`` row visible to ``principal_id``?
 
     Does NOT check ``tenant_id`` — callers must additionally filter
-    ``MemoryItem.tenant_id == <caller tenant>`` (see module docstring for why
-    RLS cannot be relied on alone).
+    ``MemoryItem.tenant_id == <caller tenant>``. RLS now enforces tenant
+    isolation at the DB level too, but the app layer keeps the explicit filter
+    as the primary rule (and so non-DB tests stay correct).
 
     A ``visibility='workspace'`` item with ``workspace_id IS NULL`` (the
     default for memories written without an explicit ``workspace``) isn't

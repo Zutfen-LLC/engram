@@ -3,8 +3,15 @@ services:
     image: pgvector/pgvector:pg16
     environment:
       POSTGRES_DB: engram
+      # Owner/migration superuser (bypasses RLS). The existing test suites run
+      # as this role so their cross-table setup/cleanup keeps working.
       POSTGRES_USER: engram
       POSTGRES_PASSWORD: engram
+      # Non-owner application role, created by 003_app_role_and_force_rls.sql;
+      # its password is set on first boot by app_role_password.sh. The RLS
+      # isolation tests connect as this role to prove enforcement.
+      POSTGRES_APP_USER: engram_app
+      POSTGRES_APP_PASSWORD: engram_app
     volumes:
       - ./migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
@@ -18,7 +25,12 @@ services:
       context: .
       target: ci
     environment:
+      # Root test suites connect as the owner (bypass RLS) — unchanged from the
+      # pre-ENG-AUD-002 behavior so cross-table setup/cleanup is unaffected.
       ENGRAM_DATABASE_URL: postgresql+asyncpg://engram:engram@postgres:5432/engram
+      ENGRAM_OWNER_DATABASE_URL: postgresql+asyncpg://engram:engram@postgres:5432/engram
+      # App-role DSN consumed ONLY by the non-owner RLS isolation tests.
+      ENGRAM_APP_DATABASE_URL: postgresql+asyncpg://engram_app:engram_app@postgres:5432/engram
       ENGRAM_AUTH_ENABLED: "false"
       ENGRAM_EMBEDDING_PROVIDER: none
       PYTHONUNBUFFERED: "1"

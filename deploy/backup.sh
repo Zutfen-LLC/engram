@@ -39,8 +39,11 @@ BACKUP_DIR="${BACKUP_DIR:-${REPO_ROOT}/backups}"
 BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-14}"
 
 POSTGRES_DB="${POSTGRES_DB:-engram}"
-POSTGRES_USER="${POSTGRES_USER:-engram}"
-POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-engram}"
+# Backups must dump ALL data across tenants, so they run as the table-owning
+# role (which bypasses RLS). Prefer the explicit owner vars; fall back to the
+# legacy POSTGRES_USER/PASSWORD for older .env files.
+POSTGRES_USER="${POSTGRES_OWNER_USER:-${POSTGRES_USER:-engram}}"
+POSTGRES_PASSWORD="${POSTGRES_OWNER_PASSWORD:-${POSTGRES_PASSWORD:-engram}}"
 
 # Connection: BACKUP_PGHOST may be "host" or "host:port"; PGHOST/PGPORT are the
 # libpq-standard fallbacks. Defaults match docker-compose (127.0.0.1:5432).

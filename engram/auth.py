@@ -72,10 +72,18 @@ def verify_api_key(plaintext: str, key_hash: str) -> bool:
 
 
 def _get_session_factory() -> async_sessionmaker[AsyncSession]:
-    """Lazy accessor — avoids a module-level import cycle with engram.db."""
-    from engram.db import async_session_factory
+    """Lazy accessor — avoids a module-level import cycle with engram.db.
 
-    return async_session_factory
+    Returns the *owner* session factory. Principal/key resolution must see
+    ``principals``/``api_keys`` across ALL tenants (it does not yet know which
+    tenant a key belongs to), so it must bypass RLS — which the non-owner app
+    role cannot. The owner role (a superuser in the default deployment) bypasses
+    RLS, making this lookup correct and keeping the resolved tenant/principal
+    out of the RLS-protected path until the request session applies it.
+    """
+    from engram.db import owner_session_factory
+
+    return owner_session_factory
 
 
 # --- Principal resolution ----------------------------------------------------
