@@ -26,6 +26,7 @@ from engram.config import settings
 from engram.conflicts import ConflictAction, ConflictResult, detect_conflicts
 from engram.db import get_session
 from engram.embeddings import create_embedding_placeholder, generate_embedding
+from engram.memory_access import eligibility_sql, resolve_workspace_scope, tenant_sql
 from engram.models import (
     FeedbackEvent,
     ItemEvent,
@@ -317,9 +318,21 @@ def _search_result_row(
     return result
 
 
-async def _keyword_search(session: AsyncSession, query: str, limit: int) -> list[dict[str, Any]]:
+async def _keyword_search(
+    session: AsyncSession,
+    query: str,
+    limit: int,
+    *,
+    tenant_id: UUID | str,
+    principal_id: UUID | str,
+) -> list[dict[str, Any]]:
+    """Keyword (full-text) search, scoped to the caller's tenant + visibility.
+
+    Uses the shared raw-SQL eligibility fragment (``engram.memory_access``)
+    since this query is over raw ``text(...)`` SQL, not the ORM.
+    """
     stmt = text(
-        """
+        f"""
         SELECT
             mi.id,
             mi.content,
@@ -330,12 +343,24 @@ async def _keyword_search(session: AsyncSession, query: str, limit: int) -> list
         FROM memory_items mi
         WHERE mi.review_status = 'active'
           AND mi.valid_to IS NULL
+          AND {tenant_sql("mi")}
+          AND {eligibility_sql("mi")}
           AND mi.content_tsv @@ plainto_tsquery('english', :query)
         ORDER BY score DESC, mi.created_at DESC
         LIMIT :limit
         """
     )
-    rows = (await session.execute(stmt, {"query": query, "limit": limit})).mappings().all()
+    rows = (
+        await session.execute(
+            stmt,
+            {
+                "query": query,
+                "limit": limit,
+                "caller_tenant_id": str(tenant_id),
+                "caller_principal_id": str(principal_id),
+            },
+        )
+    ).mappings().all()
     return [
         _search_result_row(row, mode="keyword", score=float(row["score"] or 0.0)) for row in rows
     ]
@@ -717,27 +742,48 @@ async def search(
     req: SearchRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> SearchResponse:
-    """Keyword, semantic, or hybrid search."""
+    """Keyword, semantic, or hybrid search.
+
+    All three modes resolve the caller's tenant/principal and apply the
+    shared read-eligibility predicate (``engram.memory_access``) so a caller
+    never sees another tenant's memory, another principal's private memory,
+    or workspace memory from a workspace they aren't a member of.
+    """
     limit = req.limit
     mode = req.mode
 
+    tenant_id = await _resolve_tenant_id(session)
+    principal_id, _ = await _resolve_principal(session, tenant_id)
+
     if mode == "keyword":
-        results = await _keyword_search(session, req.query, limit)
+        results = await _keyword_search(
+            session, req.query, limit, tenant_id=tenant_id, principal_id=principal_id
+        )
         return SearchResponse(results=results, total=len(results))
 
     query_embedding = await generate_embedding(req.query)
-    semantic_count = await semantic.candidate_count(session)
+    semantic_count = await semantic.candidate_count(
+        session, tenant_id=tenant_id, principal_id=principal_id
+    )
 
     if mode == "semantic":
         if query_embedding is None or semantic_count == 0:
             return SearchResponse(results=[], total=0, message=_SEARCH_HELPFUL_MESSAGE)
-        raw = await semantic.search(session, query_embedding, limit)
+        raw = await semantic.search(
+            session, query_embedding, limit, tenant_id=tenant_id, principal_id=principal_id
+        )
         if not raw:
             return SearchResponse(results=[], total=0, message=_SEARCH_HELPFUL_MESSAGE)
         results = [_format_semantic_result(row) for row in raw]
         return SearchResponse(results=results, total=len(results))
 
-    keyword_results = await _keyword_search(session, req.query, max(limit * 5, limit))
+    keyword_results = await _keyword_search(
+        session,
+        req.query,
+        max(limit * 5, limit),
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+    )
     if query_embedding is None or semantic_count == 0:
         return SearchResponse(
             results=keyword_results[:limit],
@@ -745,7 +791,13 @@ async def search(
             message=_SEARCH_HELPFUL_MESSAGE,
         )
 
-    raw_semantic = await semantic.search(session, query_embedding, max(limit * 5, limit))
+    raw_semantic = await semantic.search(
+        session,
+        query_embedding,
+        max(limit * 5, limit),
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+    )
     semantic_results = [_format_semantic_result(row) for row in raw_semantic]
     results = _rrf_fuse(keyword_results, semantic_results, limit=limit)
     return SearchResponse(results=results, total=len(results))
@@ -907,9 +959,48 @@ def _decode_cursor(cursor: str) -> tuple[str, str]:
 
 
 async def _fetch_item(session: AsyncSession, item_id: UUID) -> dict[str, Any] | None:
+    """Fetch a memory item by id, with no tenant/visibility scoping.
+
+    Used only by mutation endpoints (patch/supersede/invalidate/review/verify)
+    that operate on an item an internal caller already has a reference to —
+    not a caller-facing read path. Caller-facing reads must use
+    :func:`_fetch_readable_item` instead, which applies the shared
+    eligibility predicate.
+    """
     result = await session.execute(
         text("SELECT * FROM memory_items WHERE id = :item_id OR id = :item_id_hex"),
         {"item_id": str(item_id), "item_id_hex": item_id.hex},
+    )
+    row = result.mappings().first()
+    return _row_to_dict(row) if row else None
+
+
+async def _fetch_readable_item(
+    session: AsyncSession,
+    item_id: UUID,
+    *,
+    tenant_id: UUID | str,
+    principal_id: UUID | str,
+) -> dict[str, Any] | None:
+    """Fetch a memory item for a caller-facing read, applying the shared
+    tenant + visibility eligibility predicate (``engram.memory_access``).
+
+    Returns ``None`` both when the item doesn't exist and when it exists but
+    the caller is ineligible to read it — callers should map both cases to a
+    404, never a 403, to avoid disclosing item existence.
+    """
+    stmt = text(
+        "SELECT * FROM memory_items WHERE (id = :item_id OR id = :item_id_hex) "
+        f"AND {tenant_sql()} AND {eligibility_sql()}"
+    )
+    result = await session.execute(
+        stmt,
+        {
+            "item_id": str(item_id),
+            "item_id_hex": item_id.hex,
+            "caller_tenant_id": str(tenant_id),
+            "caller_principal_id": str(principal_id),
+        },
     )
     row = result.mappings().first()
     return _row_to_dict(row) if row else None
@@ -978,16 +1069,27 @@ async def list_items(
     cursor: str | None = None,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> dict[str, Any]:
-    """List items with stable cursor pagination."""
+    """List items with stable cursor pagination, scoped to the caller's
+    tenant and read eligibility (``engram.memory_access``)."""
     limit = max(1, min(limit, 100))
-    clauses: list[str] = []
-    params: dict[str, Any] = {"limit": limit + 1}
-    if workspace is not None:
-        clauses.append(
-            "workspace_id IN (SELECT id FROM workspaces "
-            "WHERE slug = :workspace OR name = :workspace)"
-        )
-        params["workspace"] = workspace
+    tenant_id = await _resolve_tenant_id(session)
+    principal_id, _ = await _resolve_principal(session, tenant_id)
+
+    workspace_id, workspace_accessible = await resolve_workspace_scope(
+        session, tenant_id=tenant_id, principal_id=principal_id, workspace=workspace
+    )
+    if workspace is not None and not workspace_accessible:
+        return {"items": [], "count": 0, "next_cursor": None, "cursor": None}
+
+    clauses: list[str] = [tenant_sql(), eligibility_sql()]
+    params: dict[str, Any] = {
+        "limit": limit + 1,
+        "caller_tenant_id": str(tenant_id),
+        "caller_principal_id": str(principal_id),
+    }
+    if workspace_id is not None:
+        clauses.append("workspace_id = :workspace_id")
+        params["workspace_id"] = workspace_id
     if kind is not None:
         clauses.append("kind = :kind")
         params["kind"] = kind
@@ -1031,8 +1133,19 @@ async def get_item(
     item_id: UUID,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> dict[str, Any]:
-    """Full detail with provenance and linked KG facts."""
-    item = await _require_item(session, item_id)
+    """Full detail with provenance and linked KG facts.
+
+    Scoped to the caller's tenant + read eligibility (``engram.memory_access``);
+    an ineligible item is indistinguishable from a nonexistent one (404, not
+    403) so its existence is never disclosed.
+    """
+    tenant_id = await _resolve_tenant_id(session)
+    principal_id, _ = await _resolve_principal(session, tenant_id)
+    item = await _fetch_readable_item(
+        session, item_id, tenant_id=tenant_id, principal_id=principal_id
+    )
+    if item is None:
+        raise HTTPException(status_code=404, detail="Item not found")
     events = await _fetch_events(session, item_id)
     kg_facts = await _fetch_kg_facts(session, item_id)
     return {

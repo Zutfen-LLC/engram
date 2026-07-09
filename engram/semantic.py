@@ -14,24 +14,31 @@ recall engine depend on it without importing from the FastAPI route layer.
 from __future__ import annotations
 
 from typing import Any
+from uuid import UUID
 
 from sqlalchemy import and_, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.embeddings import EMBEDDING_MODEL as _EMBEDDING_MODEL
+from engram.memory_access import eligibility_expression
 from engram.models import MemoryEmbedding, MemoryItem
 
 
 async def candidate_count(
     session: AsyncSession,
     *,
+    tenant_id: str | UUID,
+    principal_id: str | UUID,
+    workspace_id: str | None = None,
     review_statuses: tuple[str, ...] = ("active",),
 ) -> int:
     """Count recall/search-eligible embeddings currently in the corpus.
 
     An embedding is a candidate when its model matches, the vector is
-    populated, and the parent item is in one of ``review_statuses`` with
-    ``valid_to IS NULL``.
+    populated, the parent item is in one of ``review_statuses`` with
+    ``valid_to IS NULL``, and the parent item belongs to ``tenant_id`` and is
+    eligible for ``principal_id`` under the shared visibility predicate
+    (see ``engram.memory_access``).
     """
     stmt = (
         select(func.count())
@@ -48,8 +55,12 @@ async def candidate_count(
             MemoryEmbedding.embedding.is_not(None),
             MemoryItem.review_status.in_(review_statuses),
             MemoryItem.valid_to.is_(None),
+            MemoryItem.tenant_id == tenant_id,
+            eligibility_expression(principal_id),
         )
     )
+    if workspace_id is not None:
+        stmt = stmt.where(MemoryItem.workspace_id == workspace_id)
     return int((await session.execute(stmt)).scalar_one())
 
 
@@ -58,6 +69,9 @@ async def search(
     query_embedding: list[float],
     limit: int,
     *,
+    tenant_id: str | UUID,
+    principal_id: str | UUID,
+    workspace_id: str | None = None,
     review_statuses: tuple[str, ...] = ("active",),
 ) -> list[dict[str, Any]]:
     """Return the top-``limit`` items nearest to ``query_embedding`` by cosine distance.
@@ -66,6 +80,11 @@ async def search(
     tenant-filtered queries don't suffer recall degradation. Results are
     ordered by distance ascending (most similar first), with ``created_at``
     descending as a stable tiebreaker.
+
+    Candidates are scoped to ``tenant_id`` and filtered through the shared
+    visibility predicate for ``principal_id`` (see ``engram.memory_access``)
+    before the distance ordering/limit is applied, so ineligible rows never
+    displace eligible ones out of the top-``limit`` window.
 
     Each row is returned as a dict with: ``id``, ``content``, ``kind``,
     ``review_status``, ``valid_to``, ``embedding_model``, ``embedding_dim``,
@@ -98,10 +117,14 @@ async def search(
             MemoryEmbedding.embedding.is_not(None),
             MemoryItem.review_status.in_(review_statuses),
             MemoryItem.valid_to.is_(None),
+            MemoryItem.tenant_id == tenant_id,
+            eligibility_expression(principal_id),
         )
         .order_by(distance.asc(), MemoryItem.created_at.desc())
         .limit(limit)
     )
+    if workspace_id is not None:
+        stmt = stmt.where(MemoryItem.workspace_id == workspace_id)
     rows = (await session.execute(stmt)).mappings().all()
     results: list[dict[str, Any]] = []
     for row in rows:
