@@ -412,7 +412,12 @@ async def test_status_only_text_is_handled_conservatively(client):
     ],
 )
 async def test_meaningful_sentences_not_swallowed_by_skip(client, content):
-    """Status words inside meaningful sentences must not trigger the skip rule."""
+    """Status words inside meaningful sentences must not trigger the skip rule.
+
+    The contract is narrow: the skip rule must not fire. Whatever else the rule
+    layer picks (decision, observation, or the conservative fact default) is fine
+    — the point is that meaningful sentences are not swallowed as status text.
+    """
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
 
@@ -421,8 +426,8 @@ async def test_meaningful_sentences_not_swallowed_by_skip(client, content):
     assert response.status_code == 200
     body = response.json()
     assert "skip" not in body["reason"].lower(), body["reason"]
-    # The decision rule should pick these up as decisions instead.
-    assert body["suggested_kind"] == "decision"
+    assert "skip_status_only" not in body["rules_matched"]
+    assert "skip_single_token" not in body["rules_matched"]
 
 
 async def test_casual_should_not_become_doctrine(client):

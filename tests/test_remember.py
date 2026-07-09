@@ -101,9 +101,11 @@ async def test_manual_user_source_active_high_trust(client):
     """source_type='manual' from user/admin → review_status='active', source_trust=0.9."""
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    # kind is pinned so this isolates _resolve_trust_defaults; without it the
+    # classifier would run and blend confidence away from the pure default.
     response = await client.post(
         "/v1/remember",
-        json={"content": "The sky is blue today", "source_type": "manual"},
+        json={"content": "The sky is blue today", "source_type": "manual", "kind": "fact"},
     )
     assert response.status_code == 201
     body = response.json()
@@ -119,7 +121,11 @@ async def test_extraction_source_proposed_low_trust(client):
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     response = await client.post(
         "/v1/remember",
-        json={"content": "Extracted fact from conversation log", "source_type": "extraction"},
+        json={
+            "content": "Extracted fact from conversation log",
+            "source_type": "extraction",
+            "kind": "fact",
+        },
     )
     assert response.status_code == 201
     body = response.json()
@@ -134,7 +140,11 @@ async def test_sync_turn_source_proposed_low_trust(client):
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     response = await client.post(
         "/v1/remember",
-        json={"content": "Turn summary from sync", "source_type": "sync_turn"},
+        json={
+            "content": "Turn summary from sync",
+            "source_type": "sync_turn",
+            "kind": "fact",
+        },
     )
     assert response.status_code == 201
     body = response.json()
@@ -149,7 +159,11 @@ async def test_import_source_active_medium_trust(client):
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     response = await client.post(
         "/v1/remember",
-        json={"content": "Imported memory from external store", "source_type": "import"},
+        json={
+            "content": "Imported memory from external store",
+            "source_type": "import",
+            "kind": "fact",
+        },
     )
     assert response.status_code == 201
     body = response.json()
@@ -164,7 +178,11 @@ async def test_migration_source_active_medium_trust(client):
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     response = await client.post(
         "/v1/remember",
-        json={"content": "Migrated memory from legacy system", "source_type": "migration"},
+        json={
+            "content": "Migrated memory from legacy system",
+            "source_type": "migration",
+            "kind": "fact",
+        },
     )
     assert response.status_code == 201
     body = response.json()
@@ -179,7 +197,11 @@ async def test_pre_compress_source_proposed_lowest_trust(client):
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     response = await client.post(
         "/v1/remember",
-        json={"content": "Pre-compression extracted memory", "source_type": "pre_compress"},
+        json={
+            "content": "Pre-compression extracted memory",
+            "source_type": "pre_compress",
+            "kind": "fact",
+        },
     )
     assert response.status_code == 201
     body = response.json()
@@ -514,17 +536,22 @@ async def _latest_classification_event() -> dict[str, object]:
 
 
 def _patch_classifier(monkeypatch, **result_kwargs):
-    """Make /v1/remember classify() return a deterministic ClassificationResult."""
+    """Make /v1/remember classify() return a deterministic ClassificationResult.
+
+    kwargs override the defaults, including ``confidence`` and
+    ``suggested_visibility``.
+    """
+    defaults: dict[str, object] = {
+        "suggested_kind": "observation",
+        "confidence": 0.5,
+        "reason": "test classifier",
+        "rules_matched": [],
+        "provenance": {"provider": "openai", "mode": "llm"},
+    }
+    defaults.update(result_kwargs)
 
     async def fake_classifier(content: str, tenant_id, session, context=None):
-        return ClassificationResult(
-            suggested_kind="observation",
-            confidence=0.5,
-            reason="test classifier",
-            rules_matched=[],
-            provenance={"provider": "openai", "mode": "llm"},
-            **result_kwargs,
-        )
+        return ClassificationResult(**defaults)  # type: ignore[arg-type]
 
     monkeypatch.setattr(memory_routes, "classify_memory", fake_classifier)
 
