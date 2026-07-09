@@ -83,7 +83,7 @@ for production**. Enable auth and bootstrap the first key:
 ENGRAM_AUTH_ENABLED=true docker compose up -d
 
 # Create the first API key for the seeded admin principal.
-# The plaintext key is printed EXACTLY ONCE; only a bcrypt hash is stored.
+# The plaintext key is printed EXACTLY ONCE; only a digest of the secret is stored.
 docker compose exec engram-service engram bootstrap-key
 ```
 
@@ -117,11 +117,35 @@ curl -s http://localhost:8000/v1/recall \
 
 ## 3. Auth model and key management
 
-- API keys are `eng_<random>` tokens. The database stores **only a bcrypt
-  hash** (`key_hash`); the plaintext is shown once at creation.
-- Keys resolve to `(tenant_id, principal_id, scopes)`. Scopes are
-  `read | write | admin | export`.
-- `/health` and `/ready` are always exempt from auth.
+Engram authenticates API keys presented as a `Bearer` token in the
+`Authorization` header. Keys resolve to `(tenant_id, principal_id, scopes)`.
+Scopes are `read | write | admin | export`. `/health` and `/ready` are always
+exempt from auth.
+
+**New keys** (created from ENG-AUD-003 onward) use the format
+`eng_<key_id>_<secret>`:
+
+- The `<key_id>` is looked up by a unique database index, so verification is
+  O(1): a single indexed query plus a constant-time digest check. No bcrypt,
+  no full-table scan — this scales to many tenants/keys.
+- The high-entropy `<secret>` is verified against a stored **deterministic
+  digest** (SHA-256), not a bcrypt hash. This is appropriate because API keys
+  are random secrets, not human passwords. The plaintext is shown once at
+  creation and never persisted.
+- A short in-process cache (default 60s, see
+  `ENGRAM_API_KEY_CACHE_TTL_SECONDS`) lets repeated requests with the same key
+  skip the lookup. Revocation therefore takes effect after at most that TTL.
+
+**Legacy keys** (`eng_<random>`, bcrypt-hashed) created before this change keep
+working through a transitional fallback: because bcrypt salts its hashes, a
+legacy key cannot be looked up by value, so verification scans the legacy rows
+and bcrypt-checks each one. This path is intentionally transitional and will be
+removed in a future cleanup. Rotate legacy keys to the new format when
+convenient.
+
+> Do not construct API keys manually. Always generate them with
+> `engram bootstrap-key`, `engram generate-key`, or the admin API so the
+> `key_id`/digest are produced and stored correctly.
 
 ### Create additional keys (after the first)
 
@@ -135,11 +159,14 @@ curl -s -X POST http://localhost:8000/v1/admin/api-keys \
     -d '{"tenant_id":"<tenant-uuid>","principal_id":"<principal-uuid>","scopes":["read","write"],"label":"agent-1"}'
 ```
 
+For manual/offline insertion, `engram generate-key` prints a new-format key
+along with its `key_id`, `secret_digest`, and `digest_algorithm`.
+
 ### Rotate or revoke a key
 
-Revocation sets `revoked_at` so the key immediately stops authenticating. The
-cleanest rotation is: create a new key, update your clients, then revoke the old
-one.
+Revocation sets `revoked_at`. For new-format keys it takes effect immediately on
+the next uncached lookup (or after at most the cache TTL). The cleanest rotation
+is: create a new key, update your clients, then revoke the old one.
 
 ```sql
 -- Revoke by label (run inside the DB; bypasses RLS as the table owner)

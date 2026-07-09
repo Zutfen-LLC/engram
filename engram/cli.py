@@ -53,7 +53,10 @@ def main() -> None:
     )
 
     key_parser = sub.add_parser(
-        "generate-key", help="Generate a new API key and its bcrypt hash"
+        "generate-key",
+        help="Generate a new API key (eng_<key_id>_<secret>) and its digest "
+        "for manual insertion into api_keys. Prefer `bootstrap-key` or the "
+        "admin API for normal key creation.",
     )
     key_parser.add_argument(
         "--label", default=None, help="Optional label for the key"
@@ -174,17 +177,25 @@ def main() -> None:
             )
         )
     elif args.command == "generate-key":
-        from engram.auth import generate_api_key, hash_api_key
+        from engram.auth import (
+            DIGEST_ALGORITHM,
+            digest_api_key_secret,
+            generate_api_key,
+            parse_api_key,
+        )
 
         plaintext = generate_api_key()
-        key_hash = hash_api_key(plaintext)
-        print(f"key:      {plaintext}")
-        print(f"key_hash: {key_hash}")
+        parsed = parse_api_key(plaintext)
+        assert parsed.key_id is not None  # new-format keys always carry a key_id
+        print(f"key:              {plaintext}")
+        print(f"key_id:           {parsed.key_id}")
+        print(f"secret_digest:    {digest_api_key_secret(parsed.secret)}")
+        print(f"digest_algorithm: {DIGEST_ALGORITHM}")
         if args.label:
-            print(f"label:    {args.label}")
+            print(f"label:            {args.label}")
         print(
-            "Store the key_hash in the api_keys table. The plaintext key is "
-            "shown only once.",
+            "Insert key_id/secret_digest/digest_algorithm into the api_keys "
+            "table. The plaintext key is shown only once.",
             file=sys.stderr,
         )
     elif args.command == "bootstrap-key":
@@ -392,7 +403,9 @@ class BootstrapKeyMaterial:
     """Pure key material produced for a bootstrap key (no DB state)."""
 
     plaintext: str
-    key_hash: str
+    key_id: str
+    secret_digest: str
+    digest_algorithm: str
     scopes: tuple[str, ...]
     label: str | None
 
@@ -422,14 +435,22 @@ def parse_scopes(raw: str) -> list[str]:
 
 
 def make_bootstrap_key(label: str | None, scopes: list[str]) -> BootstrapKeyMaterial:
-    """Generate plaintext + bcrypt hash for a bootstrap key (pure, no DB)."""
-    from engram.auth import generate_api_key, hash_api_key
+    """Generate a new-format key + digest for a bootstrap key (pure, no DB)."""
+    from engram.auth import (
+        DIGEST_ALGORITHM,
+        digest_api_key_secret,
+        generate_api_key,
+        parse_api_key,
+    )
 
     plaintext = generate_api_key()
-    key_hash = hash_api_key(plaintext)
+    parsed = parse_api_key(plaintext)
+    assert parsed.key_id is not None  # new-format keys always carry a key_id
     return BootstrapKeyMaterial(
         plaintext=plaintext,
-        key_hash=key_hash,
+        key_id=parsed.key_id,
+        secret_digest=digest_api_key_secret(parsed.secret),
+        digest_algorithm=DIGEST_ALGORITHM,
         scopes=tuple(scopes),
         label=label,
     )
@@ -505,14 +526,16 @@ async def _run_bootstrap_key(
             )
             return 1
 
-        key_id = await conn.fetchval(
+        await conn.execute(
             "INSERT INTO api_keys "
-            "  (tenant_id, principal_id, key_hash, scopes, label, created_at) "
-            "VALUES ($1::uuid, $2::uuid, $3, $4, $5, now()) "
-            "RETURNING CAST(id AS TEXT)",
+            "  (tenant_id, principal_id, key_hash, key_id, secret_digest, "
+            "   digest_algorithm, scopes, label, created_at) "
+            "VALUES ($1::uuid, $2::uuid, NULL, $3, $4, $5, $6, $7, now())",
             row["tenant_id"],
             row["principal_id"],
-            material.key_hash,
+            material.key_id,
+            material.secret_digest,
+            material.digest_algorithm,
             list(material.scopes),
             material.label,
         )
@@ -526,13 +549,14 @@ async def _run_bootstrap_key(
     print(f"key:          {material.plaintext}")
     print(f"label:        {material.label}")
     print(f"scopes:       {', '.join(material.scopes)}")
-    print(f"key_id:       {key_id}")
+    print(f"key_id:       {material.key_id}")
     print(f"tenant_id:    {row['tenant_id']}")
     print(f"principal_id: {row['principal_id']}")
     print()
     print(
-        "Store this key securely. Only a bcrypt hash is persisted. To revoke or "
-        "rotate, see docs/deployment.md (Auth > Rotate or revoke a key).",
+        "Store this key securely. Only a deterministic digest of the secret is "
+        "persisted (no plaintext, no bcrypt hash). To revoke or rotate, see "
+        "docs/deployment.md (Auth > Rotate or revoke a key).",
         file=sys.stderr,
     )
     return 0

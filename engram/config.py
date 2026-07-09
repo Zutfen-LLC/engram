@@ -44,6 +44,16 @@ class Settings(BaseSettings):
     # When false, auth is skipped (dev mode). Production must set True.
     auth_enabled: bool = False
 
+    # Short TTL (seconds) for the in-process principal cache used by new-format
+    # (eng_<key_id>_<secret>) API keys. A successful verification is cached so
+    # repeated requests with the same key skip the DB lookup. Set to 0 to
+    # disable caching. Revocation takes effect after at most this many seconds
+    # (a revoked key may still authenticate until its cache entry expires).
+    api_key_cache_ttl_seconds: int = 60
+    # Safety cap on the number of cached principals (per process). Evicts the
+    # soonest-expiring entries when exceeded.
+    api_key_cache_max_size: int = 4096
+
     # Recall defaults
     recall_byte_budget: int = 4096
     recall_item_budget: int = 50
