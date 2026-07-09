@@ -79,20 +79,33 @@ def score_item(
     reasons.append(f"memory_confidence={memory_confidence:.2f}")
     score += memory_confidence * w_memory_confidence
 
-    # Recency bonus (decay: max(0, 1 - days/30))
-    recency_bonus = 0.0
+    # Recency bonus (decay: max(0, 1 - days/30)).
+    #
+    # Two contributions, taking the max:
+    #   * recall_recency — decay from last_recalled_at (0 when never recalled).
+    #     The anti-feedback penalty applies ONLY to this term.
+    #   * freshness — decay from when the item became valid (valid_from or
+    #     created_at), scaled by 0.5 so a fresh, never-recalled memory gets a
+    #     modest recency contribution without dominating trust/importance.
+    recall_recency = 0.0
     if item.last_recalled_at is not None:
         days_since = (now - item.last_recalled_at).total_seconds() / 86400
-        recency_bonus = max(0.0, 1.0 - days_since / 30.0)
-        # Anti-feedback penalty
+        recall_recency = max(0.0, 1.0 - days_since / 30.0)
+        # Anti-feedback penalty (tied to recall-driven recency only).
         if item.startup_recall_count > penalty_threshold:
             excess = item.startup_recall_count - penalty_threshold
             penalty = penalty_factor ** excess
-            recency_bonus *= penalty
-            recency_bonus = max(recency_bonus, settings.startup_recall_penalty_floor)
-            reasons.append(
-                f"recency_penalty(count={item.startup_recall_count})"
-            )
+            recall_recency *= penalty
+            recall_recency = max(recall_recency, settings.startup_recall_penalty_floor)
+            reasons.append(f"recency_penalty(count={item.startup_recall_count})")
+
+    freshness_anchor = item.valid_from or item.created_at
+    days_since_anchor = max(0.0, (now - freshness_anchor).total_seconds() / 86400)
+    freshness = max(0.0, 1.0 - days_since_anchor / 30.0) * 0.5
+
+    recency_bonus = max(recall_recency, freshness)
+    if freshness > recall_recency:
+        reasons.append(f"freshness={freshness:.2f}")
     reasons.append(f"recency={recency_bonus:.2f}")
     score += recency_bonus * w_recency
 
@@ -134,6 +147,31 @@ async def _get_tenant_config(
         )
     )
     return result.scalar_one_or_none()
+
+
+def _resolve_recall_budgets(
+    *,
+    byte_budget: int | None,
+    token_budget: int | None,
+    item_budget: int | None,
+) -> tuple[int | None, int | None, int | None]:
+    """Apply configured defaults for omitted recall budgets.
+
+    Recall is bounded by default: an omitted budget falls back to the global
+    settings default rather than leaving recall unbounded. There is no
+    API-documented way to request unbounded recall, so an omitted budget is
+    treated as "use the default".
+
+    Note: ``tenant_config`` does not currently carry per-tenant recall budgets,
+    so defaults come from global ``settings`` (``recall_byte_budget``,
+    ``recall_item_budget``). There is no global default for ``token_budget``,
+    so it remains unset (unbounded) unless the caller provides one — the byte
+    default still bounds recall.
+    """
+    resolved_byte = byte_budget if byte_budget is not None else settings.recall_byte_budget
+    resolved_item = item_budget if item_budget is not None else settings.recall_item_budget
+    resolved_token = token_budget
+    return resolved_byte, resolved_token, resolved_item
 
 
 async def _fetch_active_items(
@@ -202,26 +240,31 @@ def _enforce_budget(
     byte_budget: int | None,
     token_budget: int | None,
 ) -> list[tuple[MemoryItem, float]]:
-    """Enforce byte/token budget, preserving score order."""
+    """Enforce byte/token budget, preserving score order.
+
+    Skip-not-break: an item that would exceed a budget is skipped and scanning
+    continues to lower-ranked items that still fit, so one oversized item can't
+    prematurely end the working set. Both byte and token accumulators are
+    tracked independently when both budgets are set. Truncation is counted by
+    the caller via the omitted_count difference (ranked items not selected).
+    """
     if byte_budget is None and token_budget is None:
         return items_with_scores
 
-    result = []
-    budget_used = 0
+    result: list[tuple[MemoryItem, float]] = []
+    bytes_used = 0
+    tokens_used = 0
 
     for item, score in items_with_scores:
         item_bytes = len(item.content.encode())
         item_tokens = max(1, item_bytes // 4)
 
-        if token_budget is not None:
-            if budget_used + item_tokens > token_budget:
-                break
-            budget_used += item_tokens
-        elif byte_budget is not None:
-            if budget_used + item_bytes > byte_budget:
-                break
-            budget_used += item_bytes
-
+        if byte_budget is not None and bytes_used + item_bytes > byte_budget:
+            continue
+        if token_budget is not None and tokens_used + item_tokens > token_budget:
+            continue
+        bytes_used += item_bytes
+        tokens_used += item_tokens
         result.append((item, score))
 
     return result
@@ -248,6 +291,14 @@ async def execute_startup_recall(
     """
     now = datetime.now(UTC)
     config = await _get_tenant_config(session, tenant_id)
+
+    # Apply configured defaults for omitted budgets so startup recall is
+    # bounded by default (no API-documented way to request unbounded recall).
+    byte_budget, token_budget, _item_budget = _resolve_recall_budgets(
+        byte_budget=byte_budget,
+        token_budget=token_budget,
+        item_budget=None,
+    )
 
     # Resolve workspace_id if provided. An explicit workspace request that
     # doesn't resolve, or where the caller isn't a member, must not fall back
@@ -407,18 +458,21 @@ def _enforce_semantic_budget(
     token_budget: int | None,
     item_budget: int | None,
 ) -> list[dict[str, Any]]:
-    """Enforce item/byte/token budgets on similarity-ordered candidates.
+    """Enforce item/byte/token budgets on trust-ranked candidates.
 
-    Items are already ordered by descending similarity (ascending cosine
-    distance), so we keep them in order until a budget would be exceeded.
-    A single item that itself exceeds the byte/token budget is still kept —
-    recall should surface the single best match rather than return empty.
+    Candidates arrive ordered by the final trust-weighted semantic score
+    (engram.semantic). Skip-not-break: an item that would exceed a budget is
+    skipped and scanning continues to lower-ranked items that still fit, so one
+    oversized high-ranked item can't prematurely end the working set. Both byte
+    and token accumulators are tracked independently when both budgets are set.
+    Skipped oversized items are counted as omitted by the caller.
     """
     if byte_budget is None and token_budget is None and item_budget is None:
         return candidates
 
     result: list[dict[str, Any]] = []
-    budget_used = 0
+    bytes_used = 0
+    tokens_used = 0
 
     for cand in candidates:
         if item_budget is not None and len(result) >= item_budget:
@@ -426,13 +480,14 @@ def _enforce_semantic_budget(
         item_bytes = len(cand["content"].encode())
         item_tokens = max(1, item_bytes // 4)
 
-        # Once we've included at least one item, respect the byte/token ceiling.
-        if result and byte_budget is not None and budget_used + item_bytes > byte_budget:
-            break
-        if result and token_budget is not None and budget_used + item_tokens > token_budget:
-            break
+        # Skip oversized items and keep scanning lower-ranked ones that fit.
+        if byte_budget is not None and bytes_used + item_bytes > byte_budget:
+            continue
+        if token_budget is not None and tokens_used + item_tokens > token_budget:
+            continue
 
-        budget_used += item_bytes if byte_budget is not None else item_tokens
+        bytes_used += item_bytes
+        tokens_used += item_tokens
         result.append(cand)
 
     return result
@@ -462,6 +517,14 @@ async def execute_semantic_recall(
     """
     now = datetime.now(UTC)
     config = await _get_tenant_config(session, tenant_id)
+
+    # Apply configured defaults for omitted budgets so semantic recall is
+    # bounded by default (no API-documented way to request unbounded recall).
+    byte_budget, token_budget, item_budget = _resolve_recall_budgets(
+        byte_budget=byte_budget,
+        token_budget=token_budget,
+        item_budget=item_budget,
+    )
 
     # Resolve workspace_id if provided. An explicit workspace request that
     # doesn't resolve, or where the caller isn't a member, must not fall back
@@ -496,7 +559,7 @@ async def execute_semantic_recall(
             byte_budget=byte_budget,
             token_budget=token_budget,
             item_ids=[],
-            scoring_version="semantic-v1",
+            scoring_version=semantic.SEMANTIC_SCORING_VERSION,
             config_version=config_version,
         )
         session.add(recall_log)
@@ -508,7 +571,7 @@ async def execute_semantic_recall(
             "pinned_omitted_count": 0,
             "omitted_count": 0,
             "items": [],
-            "scoring_version": "semantic-v1",
+            "scoring_version": semantic.SEMANTIC_SCORING_VERSION,
             "config_version": config_version,
             "recall_log_id": str(recall_log.id),
             "message": _NO_EMBEDDINGS_MESSAGE,
@@ -516,6 +579,7 @@ async def execute_semantic_recall(
 
     # 2. Retrieve nearest candidates by cosine similarity, scoped to the
     #    caller's tenant/principal/workspace eligibility (engram.memory_access).
+    #    item_budget is already resolved to a default above.
     item_limit = item_budget if item_budget is not None else settings.recall_item_budget
     fetch_limit = min(item_limit * _SEMANTIC_OVERFETCH, _SEMANTIC_OVERFETCH_CAP)
     candidates = await semantic.search(
@@ -543,7 +607,10 @@ async def execute_semantic_recall(
         )
         item_by_id = {item.id: item for item in rows.scalars().all()}
 
-    # 5. Build per-item response dicts in similarity order.
+    # 5. Build per-item response dicts in trust-weighted order. The candidate
+    #    dicts already carry the trust-weighted semantic score, similarity, and
+    #    trust blend computed by engram.semantic; we add the MemoryItem fields
+    #    (pinned, etc.) needed by callers.
     enriched: list[dict[str, Any]] = []
     for cand in candidates:
         item = item_by_id.get(UUID(cand["id"]))
@@ -551,7 +618,9 @@ async def execute_semantic_recall(
             # Stale embedding whose item disappeared — skip.
             continue
         distance = float(cand.get("distance", 0.0))
-        similarity = float(cand.get("score", 1.0 - distance))
+        similarity = float(cand.get("similarity_score", 1.0 - distance))
+        trust_score = float(cand.get("trust_score", 1.0))
+        semantic_score = float(cand.get("score", similarity * trust_score))
         warnings: list[str] = []
         if item.review_status == "proposed":
             warnings.append("unreviewed")
@@ -560,11 +629,14 @@ async def execute_semantic_recall(
                 "id": str(item.id),
                 "kind": item.kind,
                 "content": item.content,
-                "score": round(similarity, 4),
+                "score": round(semantic_score, 4),
                 "distance": round(distance, 4),
+                "similarity_score": round(similarity, 4),
+                "trust_score": round(trust_score, 4),
                 "review_status": item.review_status,
                 "reasons": [
                     f"semantic similarity {similarity:.2f}",
+                    f"trust_score={trust_score:.2f}",
                     f"cosine_distance={distance:.4f}",
                 ],
                 "warnings": warnings,
@@ -601,7 +673,7 @@ async def execute_semantic_recall(
         byte_budget=byte_budget,
         token_budget=token_budget,
         item_ids=selected_ids,
-        scoring_version="semantic-v1",
+        scoring_version=semantic.SEMANTIC_SCORING_VERSION,
         config_version=config_version,
     )
     session.add(recall_log)
@@ -628,7 +700,7 @@ async def execute_semantic_recall(
         "pinned_omitted_count": 0,
         "omitted_count": max(0, candidate_total - item_count),
         "items": selected,
-        "scoring_version": "semantic-v1",
+        "scoring_version": semantic.SEMANTIC_SCORING_VERSION,
         "config_version": config_version,
         "recall_log_id": str(recall_log.id),
         "message": None,

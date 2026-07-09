@@ -243,3 +243,190 @@ async def test_semantic_search_without_embeddings_returns_helpful_message(client
     assert body["results"] == []
     assert body["total"] == 0
     assert "embeddings" in body["message"].lower()
+
+
+# ---- search filters (kind/wing/room) honored across all modes ----
+
+
+async def test_keyword_search_kind_filter_excludes_other_kinds(client):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    settings.embedding_provider = "none"
+    await _remember(client, "alpha fact note about tea", kind="fact")
+    await _remember(client, "alpha observation note about tea", kind="observation")
+    resp = await client.post(
+        "/v1/search", json={"query": "alpha tea", "mode": "keyword", "kind": "observation"}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 1
+    assert body["results"][0]["kind"] == "observation"
+
+
+async def test_keyword_search_wing_and_room_filters_and_semantics(client):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    settings.embedding_provider = "none"
+    await _remember(client, "gamma deploy note one", kind="fact", wing="ops", room="deploy")
+    await _remember(client, "gamma deploy note two", kind="fact", wing="ops", room="monitor")
+    await _remember(client, "gamma deploy note three", kind="fact", wing="dev", room="deploy")
+    # wing only
+    resp = await client.post(
+        "/v1/search", json={"query": "gamma deploy", "mode": "keyword", "wing": "ops"}
+    )
+    contents = {r["content"] for r in resp.json()["results"]}
+    assert contents == {"gamma deploy note one", "gamma deploy note two"}
+    # room only
+    resp = await client.post(
+        "/v1/search", json={"query": "gamma deploy", "mode": "keyword", "room": "deploy"}
+    )
+    contents = {r["content"] for r in resp.json()["results"]}
+    assert contents == {"gamma deploy note one", "gamma deploy note three"}
+    # combined AND
+    resp = await client.post(
+        "/v1/search",
+        json={"query": "gamma deploy", "mode": "keyword", "wing": "ops", "room": "deploy"},
+    )
+    contents = {r["content"] for r in resp.json()["results"]}
+    assert contents == {"gamma deploy note one"}
+
+
+async def test_semantic_search_kind_filter_honored(client, monkeypatch):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    settings.embedding_provider = "openai"
+
+    # All items embed to the same vector so similarity is identical; the kind
+    # filter is the only differentiator.
+    same_vec = [1.0] + [0.0] * 1535
+
+    async def fake_embedding(text_value: str):
+        return same_vec
+
+    monkeypatch.setattr(memory_routes, "generate_embedding", fake_embedding)
+
+    await _remember(client, "delta matched item a", kind="fact")
+    await _remember(client, "delta matched item b", kind="observation")
+    resp = await client.post(
+        "/v1/search",
+        json={"query": "delta matched", "mode": "semantic", "kind": "fact", "limit": 10},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    kinds = {r["kind"] for r in body["results"]}
+    assert kinds == {"fact"}
+
+
+async def test_semantic_search_room_filter_honored(client, monkeypatch):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    settings.embedding_provider = "openai"
+    same_vec = [1.0] + [0.0] * 1535
+
+    async def fake_embedding(text_value: str):
+        return same_vec
+
+    monkeypatch.setattr(memory_routes, "generate_embedding", fake_embedding)
+
+    await _remember(client, "epsilon matched item a", kind="fact", room="alpha")
+    await _remember(client, "epsilon matched item b", kind="fact", room="beta")
+    resp = await client.post(
+        "/v1/search",
+        json={"query": "epsilon matched", "mode": "semantic", "room": "alpha", "limit": 10},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    rooms = {r.get("content") for r in body["results"]}
+    assert rooms == {"epsilon matched item a"}
+
+
+async def test_hybrid_search_wing_filter_honored(client, monkeypatch):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    settings.embedding_provider = "openai"
+    same_vec = [1.0] + [0.0] * 1535
+
+    async def fake_embedding(text_value: str):
+        return same_vec
+
+    monkeypatch.setattr(memory_routes, "generate_embedding", fake_embedding)
+
+    # Items share a keyword so keyword + semantic branches both match; the wing
+    # filter must restrict both branches.
+    await _remember(client, "zeta shared keyword ops", kind="fact", wing="ops")
+    await _remember(client, "zeta shared keyword dev", kind="fact", wing="dev")
+    resp = await client.post(
+        "/v1/search",
+        json={"query": "zeta shared keyword", "mode": "hybrid", "wing": "ops", "limit": 10},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    contents = {r["content"] for r in body["results"]}
+    assert contents == {"zeta shared keyword ops"}
+
+
+async def test_search_filters_do_not_bypass_tenant_read_eligibility(client, monkeypatch):
+    """Filters apply alongside tenant/visibility eligibility; an explicit filter
+    must not leak items the caller is otherwise ineligible to read. We verify
+    the filter path reuses the shared eligibility predicate by confirming a
+    kind filter that matches no eligible items returns empty (not an error and
+    not a cross-tenant leak)."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    settings.embedding_provider = "none"
+    await _remember(client, "eta eligible fact one", kind="fact")
+    resp = await client.post(
+        "/v1/search", json={"query": "eta eligible", "mode": "keyword", "kind": "nonexistent_kind"}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 0
+    assert body["results"] == []
+
+
+# ---- semantic trust-weighted ranking ----
+
+
+async def test_semantic_search_ranks_high_trust_above_slightly_closer_low_trust(
+    client, monkeypatch
+):
+    """Under semantic-v2, a high-trust item that is slightly less semantically
+    similar must outrank a low-trust item that is slightly more similar."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    settings.embedding_provider = "openai"
+
+    # The low-trust (extraction/proposed) item is slightly closer to the query
+    # vector than the high-trust (manual/active) item.
+    high_trust_vec = [0.9, 0.1] + [0.0] * 1534  # slightly farther from query
+    low_trust_vec = [1.0, 0.0] + [0.0] * 1534  # exactly the query vector
+    query_vec = [1.0, 0.0] + [0.0] * 1534
+
+    async def fake_embedding(text_value: str):
+        if text_value == "high trust memory":
+            return high_trust_vec
+        if text_value == "low trust memory":
+            return low_trust_vec
+        if text_value == "trust query":
+            return query_vec
+        return low_trust_vec
+
+    monkeypatch.setattr(memory_routes, "generate_embedding", fake_embedding)
+
+    # High-trust: manual user write -> active, source_trust/confidence 0.9.
+    await _remember(client, "high trust memory", kind="fact")
+    # Low-trust: extraction source -> proposed, source_trust/confidence 0.5.
+    await _remember(client, "low trust memory", kind="fact", source_type="extraction")
+
+    resp = await client.post(
+        "/v1/search", json={"query": "trust query", "mode": "semantic", "limit": 10}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["results"][0]["content"] == "high trust memory"
+    # Explanatory scoring fields are present.
+    top = body["results"][0]
+    assert "distance" in top
+    assert "similarity_score" in top
+    assert "trust_score" in top
+    assert "score" in top

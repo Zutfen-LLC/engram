@@ -169,7 +169,7 @@ async def test_semantic_recall_returns_best_match(client, monkeypatch):
     assert "score" in body["items"][0]
     # recall_log_id present, scoring_version reflects semantic mode
     assert body["recall_log_id"]
-    assert body["scoring_version"] == "semantic-v1"
+    assert body["scoring_version"] == "semantic-v2"
     assert body["config_version"]
     # working_set rendered one line per item
     assert "semantic target" in body["working_set"]
@@ -393,7 +393,75 @@ async def test_semantic_recall_item_budget_limits_count(client, monkeypatch):
     assert body["item_count"] == 1
 
 
-# ---- recall_logs audit ----
+async def test_semantic_recall_omitted_budgets_use_configured_defaults(client, monkeypatch):
+    """Omitted budgets fall back to configured defaults; explicit smaller
+    budgets override them; recall is never unbounded by default."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+
+    await _remember(client, "semantic target one")
+    await _remember(client, "semantic target two")
+    await _remember(client, "semantic target three")
+
+    # Default item budget resolves to settings.recall_item_budget (50) -> all 3.
+    default_resp = await client.post(
+        "/v1/recall", json={"mode": "semantic", "query": "semantic query"}
+    )
+    assert default_resp.status_code == 200
+    assert default_resp.json()["item_count"] == 3
+
+    # Shrink the default item budget to 1; omitting item_budget now yields 1.
+    monkeypatch.setattr(settings, "recall_item_budget", 1)
+    resp = await client.post(
+        "/v1/recall", json={"mode": "semantic", "query": "semantic query"}
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["item_count"] == 1
+    # An explicit smaller budget still overrides the default.
+    monkeypatch.setattr(settings, "recall_item_budget", 50)
+    explicit = await client.post(
+        "/v1/recall",
+        json={"mode": "semantic", "query": "semantic query", "item_budget": 2},
+    )
+    assert explicit.status_code == 200
+    assert explicit.json()["item_count"] == 2
+
+
+async def test_semantic_recall_skip_not_break_packing(client, monkeypatch):
+    """An oversized high-ranked item is skipped and smaller lower-ranked items
+    still fill the budget (skip-not-break)."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+
+    # Large item ranks first (highest importance -> highest trust score) but is
+    # oversized vs the budget; smaller lower-importance items fit.
+    big_payload = "semantic target big " + "x" * 400
+    await _remember(client, big_payload, importance=0.95)
+    await _remember(client, "semantic target small one", importance=0.3)
+    await _remember(client, "semantic target small two", importance=0.2)
+
+    resp = await client.post(
+        "/v1/recall",
+        json={"mode": "semantic", "query": "semantic query", "byte_budget": 100},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    contents = {item["content"] for item in body["items"]}
+    # The oversized item is omitted; both small items are included.
+    assert big_payload not in contents
+    assert "semantic target small one" in contents
+    assert "semantic target small two" in contents
+    # omitted_count reflects the skipped oversized item.
+    assert body["omitted_count"] >= 1
+    assert body["byte_count"] <= 100
+
+
+
 
 
 async def test_semantic_recall_writes_recall_log(client, monkeypatch):
@@ -423,7 +491,7 @@ async def test_semantic_recall_writes_recall_log(client, monkeypatch):
 
     assert row.mode == "semantic"
     assert row.query == "semantic query"
-    assert row.scoring_version == "semantic-v1"
+    assert row.scoring_version == "semantic-v2"
     assert row.config_version is not None
     assert row.n_items == 1
 
