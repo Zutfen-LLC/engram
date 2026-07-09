@@ -17,7 +17,12 @@ from pathlib import Path
 
 import pytest
 
-from engram.auth import verify_api_key
+from engram.auth import (
+    DIGEST_ALGORITHM,
+    digest_api_key_secret,
+    parse_api_key,
+    verify_api_key_secret,
+)
 from engram.cli import (
     BootstrapKeyMaterial,
     make_bootstrap_key,
@@ -167,34 +172,41 @@ def test_make_bootstrap_key_material_shape():
     # Plaintext key has the expected prefix and is non-trivial.
     assert material.plaintext.startswith("eng_")
     assert len(material.plaintext) > 20
-    # The stored hash is NOT the plaintext.
-    assert material.key_hash != material.plaintext
-    assert not material.key_hash.startswith("eng_")
+    # New-format: plaintext embeds the key_id; the stored digest is NOT the key.
+    assert material.key_id in material.plaintext
+    parsed = parse_api_key(material.plaintext)
+    assert parsed.key_id == material.key_id
+    assert material.digest_algorithm == DIGEST_ALGORITHM
+    assert material.secret_digest == digest_api_key_secret(parsed.secret)
+    assert material.secret_digest != material.plaintext
+    assert not material.secret_digest.startswith("eng_")
 
 
-def test_bootstrap_key_hash_authenticates():
-    """A bootstrap-produced key authenticates against its stored bcrypt hash.
+def test_bootstrap_key_digest_authenticates():
+    """A bootstrap-produced key authenticates against its stored digest.
 
-    This is the hash-authentication viability check: the plaintext printed by
-    ``engram bootstrap-key`` (shown once) must verify against the only thing
-    persisted (the bcrypt hash), since ``get_current_principal`` authenticates
-    exactly this way at request time.
+    The plaintext printed by ``engram bootstrap-key`` (shown once) must verify
+    against the only thing persisted (the digest), since ``get_current_principal``
+    authenticates new-format keys via the digest + constant-time comparison.
     """
     material = make_bootstrap_key("bootstrap", ["read", "write", "admin", "export"])
-    # The stored hash must verify the printed plaintext...
-    assert verify_api_key(material.plaintext, material.key_hash) is True
+    parsed = parse_api_key(material.plaintext)
+    # The stored digest must verify the printed secret...
+    assert verify_api_key_secret(parsed.secret, material.secret_digest) is True
     # ...and reject anything else.
-    assert verify_api_key("eng_some-other-key", material.key_hash) is False
-    assert verify_api_key(material.plaintext, "not-a-real-hash") is False
+    assert verify_api_key_secret("some-other-secret", material.secret_digest) is False
 
 
 def test_bootstrap_keys_are_unique():
     a = make_bootstrap_key("a", ["admin"])
     b = make_bootstrap_key("b", ["admin"])
     assert a.plaintext != b.plaintext
-    assert a.key_hash != b.key_hash
-    # Cross-verification fails (a's hash must not verify b's key).
-    assert verify_api_key(b.plaintext, a.key_hash) is False
+    assert a.key_id != b.key_id
+    assert a.secret_digest != b.secret_digest
+    # Cross-verification fails (a's digest must not verify b's secret).
+    assert verify_api_key_secret(
+        parse_api_key(b.plaintext).secret, a.secret_digest
+    ) is False
 
 
 # --- CLI wiring: argparse exposes the new subcommands -------------------

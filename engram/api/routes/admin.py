@@ -16,9 +16,11 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.auth import (
+    DIGEST_ALGORITHM,
     Principal,
+    digest_api_key_secret,
     generate_api_key,
-    hash_api_key,
+    parse_api_key,
     require_scopes,
 )
 from engram.db import get_session
@@ -182,10 +184,15 @@ async def create_api_key(
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> ApiKeyOut:
     plaintext = generate_api_key()
+    parsed = parse_api_key(plaintext)
+    assert parsed.key_id is not None  # new-format keys always carry a key_id
     api_key = ApiKey(
         tenant_id=body.tenant_id,
         principal_id=body.principal_id,
-        key_hash=hash_api_key(plaintext),
+        key_hash=None,
+        key_id=parsed.key_id,
+        secret_digest=digest_api_key_secret(parsed.secret),
+        digest_algorithm=DIGEST_ALGORITHM,
         scopes=body.scopes,
         label=body.label,
         created_at=datetime.now(UTC),

@@ -7,8 +7,9 @@ from collections.abc import AsyncGenerator
 from uuid import UUID
 
 from fastapi import Depends
-from sqlalchemy import text
+from sqlalchemy import Connection, event, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import Session, SessionTransaction
 
 from engram.auth import Principal, get_current_principal
 from engram.config import settings
@@ -48,48 +49,60 @@ owner_session_factory = async_sessionmaker(
 _DEFAULT_TENANT_SLUG = "default"
 _DEFAULT_PRINCIPAL_NAME = "admin"
 
-# Coalesce both GUC writes into a single round-trip.
+# SET LOCAL (is_local=true): the GUC is scoped to the *current transaction*. It
+# is re-applied at the start of every transaction by the ``after_begin`` listener
+# in :func:`apply_rls_context`, so it survives the route's mid-request
+# commit/rollback. Transaction-scoping matters because SQLAlchemy's AsyncSession
+# checks out a fresh connection whenever a transaction ends (commit/rollback) — a
+# session-level GUC set once would be dropped on the next transaction. It also
+# means a pooled connection never carries a stale tenant context (the GUC is
+# discarded automatically at transaction end).
 _APPLY_RLS_SQL = text(
-    "SELECT set_config('app.tenant_id', :tid, false), "
-    "set_config('app.principal_id', :pid, false)"
-)
-_CLEAR_RLS_SQL = text(
-    "SELECT set_config('app.tenant_id', '', false), "
-    "set_config('app.principal_id', '', false)"
+    "SELECT set_config('app.tenant_id', :tid, true), "
+    "set_config('app.principal_id', :pid, true)"
 )
 
 
 async def apply_rls_context(
     session: AsyncSession, *, tenant_id: str | UUID, principal_id: str | UUID
 ) -> None:
-    """Set the request's RLS tenant/principal context on ``session``.
+    """Set the request's RLS tenant/principal context for the whole session.
 
-    Uses session-scoped GUCs (``set_config(..., is_local=false)``) and **commits**
-    them in their own short transaction. The commit is essential: PostgreSQL
-    reverts a session-level ``SET`` when the transaction it was issued in is
-    rolled back. Without it, a mid-request rollback (e.g. the dedup re-query
-    after an ``IntegrityError``) would drop the context and the next statement
-    would see no rows under enforced RLS. Once committed, the GUCs persist across
-    every subsequent transaction in the request.
+    Sets ``SET LOCAL`` for the current transaction AND registers an
+    ``after_begin`` listener that re-applies it at the start of every subsequent
+    transaction in ``session``. This is required because SQLAlchemy's AsyncSession
+    checks out a fresh connection whenever a transaction ends (commit/rollback),
+    so a GUC set once would be lost on the next transaction. Re-applying per
+    transaction keeps the context alive for the entire request — including the
+    ``/v1/remember`` dedup path's mid-request rollback — while ``SET LOCAL``
+    scoping means pooled connections never carry a stale tenant context.
     """
-    await session.execute(
-        _APPLY_RLS_SQL, {"tid": str(tenant_id), "pid": str(principal_id)}
-    )
-    await session.commit()
+    tid, pid = str(tenant_id), str(principal_id)
+
+    def _apply_rls(
+        _session: Session, _transaction: SessionTransaction, connection: Connection
+    ) -> None:
+        # Fetch + close the result so asyncpg doesn't keep the operation pending
+        # (which would surface as "another operation is in progress" on the next
+        # statement).
+        connection.execute(_APPLY_RLS_SQL, {"tid": tid, "pid": pid}).close()
+
+    # Re-apply at the start of every transaction (instance-scoped listener; the
+    # session is short-lived per request, so the listener is collected with it).
+    event.listen(session.sync_session, "after_begin", _apply_rls)
+    # Apply to the current/next transaction immediately so a transaction already
+    # begun before this call (e.g. a test fixture's seed query) is covered too.
+    await session.execute(_APPLY_RLS_SQL, {"tid": tid, "pid": pid})
 
 
 async def clear_rls_context(session: AsyncSession) -> None:
-    """Clear the RLS context before the connection returns to the pool.
+    """Best-effort cleanup before the session returns to the pool.
 
-    Drops any pending/failed transaction, then resets both GUCs and **commits**
-    so the reset persists (same session-level-SET-reverts-on-rollback rule as
-    :func:`apply_rls_context`). Belt-and-suspenders: every consumer of the
-    runtime engine applies context before querying, so a stale value is already
-    overwritten before use; this keeps the pooled connection clean regardless.
+    With ``SET LOCAL`` scoping the tenant GUC is already dropped at transaction
+    end, so pooled connections never carry stale context. This only rolls back
+    any pending/failed transaction to leave the session clean.
     """
     await session.rollback()
-    await session.execute(_CLEAR_RLS_SQL)
-    await session.commit()
 
 
 async def get_session(

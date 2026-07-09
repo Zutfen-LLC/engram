@@ -323,7 +323,13 @@ class ApiKey(Base):
     principal_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("principals.id"), nullable=True
     )
-    key_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    # Bcrypt hash for LEGACY keys (eng_<random>, pre-ENG-AUD-003). Nullable now:
+    # new-format keys store a digest instead and leave this NULL.
+    key_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # New-format (eng_<key_id>_<secret>) indexed lookup + digest verification.
+    key_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    secret_digest: Mapped[str | None] = mapped_column(Text, nullable=True)
+    digest_algorithm: Mapped[str | None] = mapped_column(Text, nullable=True)
     scopes: Mapped[list[str]] = mapped_column(ARRAY(String), default=["read", "write"])
     label: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(

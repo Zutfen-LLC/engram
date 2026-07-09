@@ -101,19 +101,24 @@ async def _get_test_session() -> AsyncSession:
 @pytest.fixture
 def app():
     # Override the route handler's session (get_session) AND the auth path's
-    # session factory. get_current_principal (engram/auth.py) opens its own
-    # session from engram.db.async_session_factory — the real app engine, which
-    # uses a *connection pool* (pool_size=10). A pooled connection bound to one
-    # test's event loop gets reused by a later test on a different loop →
-    # asyncpg "Future attached to a different loop". Pointing both at the
-    # per-test NullPool factory keeps every connection on the current test's loop.
+    # session factories. get_current_principal (engram/auth.py) resolves the
+    # caller (and, with auth disabled, the default principal) through the OWNER
+    # session factory (engram.db.owner_session_factory); the request session uses
+    # async_session_factory. Both are the real app engines, which use a
+    # *connection pool* (pool_size=10). A pooled connection bound to one test's
+    # event loop gets reused by a later test on a different loop → asyncpg
+    # "Future attached to a different loop". Pointing both at the per-test
+    # NullPool factory keeps every connection on the current test's loop.
     import engram.db as db_module
 
     app = create_app()
     app.dependency_overrides[get_session] = _get_test_session
-    real_factory = db_module.async_session_factory
+    real_app_factory = db_module.async_session_factory
+    real_owner_factory = db_module.owner_session_factory
     db_module.async_session_factory = _test_session_factory
-    app.state._engram_real_session_factory = real_factory  # type: ignore[attr-defined]
+    db_module.owner_session_factory = _test_session_factory
+    app.state._engram_real_session_factory = real_app_factory  # type: ignore[attr-defined]
+    app.state._engram_real_owner_factory = real_owner_factory  # type: ignore[attr-defined]
     return app
 
 
@@ -122,10 +127,11 @@ async def client(app):
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
-    # Restore the real factory so other test files see the app engine.
+    # Restore the real factories so other test files see the app engines.
     import engram.db as db_module
 
     db_module.async_session_factory = app.state._engram_real_session_factory
+    db_module.owner_session_factory = app.state._engram_real_owner_factory
 
 
 @pytest.fixture(autouse=True)

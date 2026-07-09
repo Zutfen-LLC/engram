@@ -101,7 +101,7 @@ curl http://localhost:8000/health
 curl http://localhost:8000/ready
 ```
 
-Create the first API key (auth is off by default for local dev; enable it for production):
+Create the first API key (auth is off by default for local dev; enable it for production). The printed key uses the `eng_<key_id>_<secret>` format and is shown only once:
 
 ```bash
 docker compose exec engram-service engram bootstrap-key

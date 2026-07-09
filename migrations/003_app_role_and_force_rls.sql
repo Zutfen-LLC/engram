@@ -49,7 +49,23 @@ GRANT SELECT, INSERT, UPDATE, DELETE
 -- ``schema_migrations`` is migration bookkeeping. The runtime app role must not
 -- reach either. (Principal/tenant resolution runs through the OWNER role, so the
 -- app role needs no privilege on ``tenants``.)
-REVOKE ALL PRIVILEGES ON tenants, schema_migrations FROM engram_app;
+--
+-- ``schema_migrations`` may not exist yet on a first-boot initdb.d run (it is
+-- created lazily by ``engram init-db``, not by any SQL migration), and the
+-- GRANT ... ON ALL TABLES above only covered tables that already existed — so no
+-- grant touched it in that case. Guard its revocation so the migration does not
+-- hard-fail; ``tenants`` always exists after 001 and is revoked unconditionally.
+REVOKE ALL PRIVILEGES ON tenants FROM engram_app;
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = 'schema_migrations'
+    ) THEN
+        EXECUTE 'REVOKE ALL PRIVILEGES ON schema_migrations FROM engram_app';
+    END IF;
+END
+$$;
 
 -- Sequence USAGE for any SERIAL/identity columns (none today — every key is a
 -- uuid_generate_v4() default — but granted for forward-safety).
