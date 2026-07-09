@@ -153,9 +153,9 @@ written → proposed → active → disputed → resolved → superseded/archive
 * **Disputed** memories remain available with warnings where appropriate.
 * **Archived** and superseded memories are preserved for audit but excluded from default recall.
 
-Auto-promotion is available for memories that meet tenant-configurable confidence, age, conflict, and feedback thresholds.
+Auto-promotion is available for memories that meet tenant-configurable confidence, age, conflict, dispute, and feedback thresholds.
 
-Auto-promotion runs on demand. Wire the CLI to cron/systemd, or call the admin endpoint:
+`POST /v1/recall` with `mode=startup` runs a bounded, tenant-scoped promotion pass automatically before building the working set (capped at `settings.startup_promotion_limit`, default 20 proposed items per call) — no separate trigger needed for day-to-day recall. For full sweeps of a large proposed backlog, wire the CLI to cron/systemd, or call the admin endpoint on demand:
 
 ```bash
 # All tenants. Runs as the owner role (bypasses RLS) via ENGRAM_OWNER_DATABASE_URL:
@@ -169,6 +169,8 @@ engram promote-proposed --tenant <tenant-id> --limit 1000
 POST /v1/admin/promote
 ```
 
+All three entry points (lazy startup recall, CLI, admin endpoint) share one promotion service function and the same gates — none can drift from the others.
+
 Promotion returns per-reason counts:
 
 ```text
@@ -177,6 +179,8 @@ promoted
 skipped_confidence
 skipped_age
 skipped_conflict
+skipped_dispute            # blocked by another principal's dispute/negative feedback
+skipped_conflict_recheck   # blocked by a promotion-time conflict recheck
 skipped_disabled
 ```
 

@@ -125,9 +125,13 @@ For multi-agent deployments, this becomes critical: one agent's guess should not
 
 ### Auto-promotion policy
 
-> **Implementation status:** Auto-promotion **Path A is implemented** (BL-004) as
-> a lazy check on startup recall plus the `engram promote-proposed` CLI and the
-> `POST /v1/admin/promote` endpoint, honoring the `tenant_config.auto_promote_*`
+> **Implementation status:** Auto-promotion **Path A is implemented** (BL-004,
+> hardened by ENG-AUD-007) as a *bounded, tenant-scoped* lazy check inside
+> `POST /v1/recall` (`mode=startup`, before active items are selected) plus the
+> `engram promote-proposed` CLI and the `POST /v1/admin/promote` endpoint — all
+> three share one service function
+> (`engram.promotion.auto_promote_proposed_memories`) so the gates below can
+> never drift apart between entry points. Honors the `tenant_config.auto_promote_*`
 > thresholds. **Path B (usage-validated quorum) is deferred** — post-MVP. The
 > machinery (feedback, recall logs) exists; only the quorum-based promotion path
 > is not yet wired.
@@ -138,13 +142,64 @@ Without auto-promotion, the proposed queue grows unboundedly while the working s
 
 #### Path A — Confidence + age
 
+All of the following must hold (ENG-AUD-007 closes F11/F12/F13 against this
+list — every gate below is enforced, not aspirational):
+
 * `review_status = 'proposed'`
 * `memory_confidence >= auto_promote_confidence_threshold`, default `0.7`
-* No unresolved conflicts: `conflict_resolution_status IS NULL OR = 'accepted'`
 * Age >= `auto_promote_min_age_hours`, default 72 hours unchallenged
-* No dispute event in `item_events` from another principal
+* No unresolved conflict at write time: `conflict_resolution_status IS NULL OR = 'accepted'`
+* No dispute event from another principal (`engram.promotion.has_external_dispute_event`) —
+  either an `item_events` row with `event_type='review_change'`,
+  `field_name='review_status'`, `new_value='disputed'` whose actor is not the
+  item's own principal, or a `feedback_events` row with `verdict='noise'`
+  recorded by another principal. The item's own creator disputing or giving
+  negative feedback on their own item does **not** block promotion — only an
+  external signal does.
+* A **promotion-time conflict recheck** against currently-active memories
+  passes (`engram.conflicts.check_promotion_conflict`) — a write-time "clean"
+  status does not guarantee a later active write hasn't since created a
+  conflict. The recheck considers up to `settings.promotion_conflict_candidate_k`
+  (default 5) plausible active-item candidates, not only the single nearest
+  one (top-k, not top-1 — see below). A blocking recheck marks the item
+  `conflict_resolution_status='unresolved'`, sets `conflicts_with_item_id`,
+  and writes a `conflict_resolution` item event so the block is auditable and
+  idempotent (a later scan sees the write-time `skipped_conflict` gate instead
+  of re-running the recheck).
+* `tenant_config.auto_promote_enabled` is true
 
-In Phase 1A, before conflict detection exists, the unresolved-conflict condition is vacuously true — all proposed items are eligible for promotion if they satisfy the remaining gates.
+**Lazy startup-recall promotion** (F11): every `POST /v1/recall` call with
+`mode=startup` runs `engram.promotion.maybe_auto_promote_for_startup_recall`
+before `_fetch_active_items`, bounded by `settings.startup_promotion_limit`
+(default 20 proposed items scanned per call) so recall latency stays
+predictable regardless of how large a tenant's proposed backlog grows. A
+disabled tenant (`auto_promote_enabled=false`) pays only a single `COUNT`
+query. Semantic recall (`mode=semantic`) does **not** trigger this pass in
+this slice — that remains a deliberate scope boundary, not an oversight.
+
+**Conflict candidate selection is top-k, not top-1** (F13): both the recheck
+above and `find_promotion_conflict_candidates` scope candidates to the same
+tenant/kind, same workspace when the item is workspace-scoped (tenant-wide
+otherwise), and fetch up to `k` embedding-nearest active items — not just the
+single nearest — since the actual conflicting item is not always the nearest
+neighbour by embedding distance.
+
+**Embeddings-off fallback** (F13, partial by design): when the promotion
+candidate has no stored embedding (`embedding_provider='none'`, or the row
+predates embedding generation), the recheck falls back to a structural
+heuristic — active items in scope sharing `subject_type`+`subject_id` or
+`subject_name`, whose `content_hash` differs from the candidate's. Any match
+is treated conservatively as a block; an exact `content_hash` match (the same
+content re-observed, e.g. by a different principal) is never flagged. This
+fallback has real limits — it has no semantic understanding and will miss
+conflicts that don't share an explicit subject field — but it prevents
+"embeddings disabled" from silently disabling conflict checking, which was
+the original audit gap.
+
+`PromotionResult` (and the admin endpoint's `PromotionResponse`) now report
+`skipped_dispute` and `skipped_conflict_recheck` counts alongside the
+existing `skipped_confidence` / `skipped_age` / `skipped_conflict` /
+`skipped_disabled`, so promotion is auditable without log scraping.
 
 #### Path B — Usage-validated quorum
 

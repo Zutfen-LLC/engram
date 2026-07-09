@@ -599,7 +599,7 @@ async def _run_promotion(
         total_promoted = 0
         total_scanned = 0
         for tid in tenant_ids:
-            result = await auto_promote_proposed_memories(session, tid, limit=limit)
+            result = await auto_promote_proposed_memories(session, tid, limit=limit, source="cli")
             print(summarize(result))
             total_promoted += result.promoted
             total_scanned += result.scanned
