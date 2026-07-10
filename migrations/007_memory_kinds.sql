@@ -98,6 +98,56 @@ CROSS JOIN (VALUES
 ) AS k(name, display_name, description, singleton, stays, requires_review, default_importance, sort_order)
 ON CONFLICT (tenant_id, name) DO NOTHING;
 
+-- ============ 2b. Auto-seed builtin kinds for every FUTURE tenant ============
+-- Step 2 only backfills tenants that exist at migration time. Without this
+-- trigger, any tenant created afterwards by a path other than the
+-- POST /v1/admin/tenants route (raw SQL, import tooling, other admin
+-- surfaces, tests) would have zero memory_kinds rows and be unable to write
+-- ANY memory item, since kind is now FK-governed by this table. The trigger
+-- makes "every tenant has its builtin kinds" a database invariant rather
+-- than something every tenant-creation code path must remember to do.
+-- engram.memory_kinds.seed_builtin_kinds() (called by the admin route) and
+-- this trigger both use ON CONFLICT DO NOTHING, so calling both is harmless.
+CREATE OR REPLACE FUNCTION seed_builtin_memory_kinds() RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO memory_kinds (
+        tenant_id, name, display_name, description, is_builtin, enabled,
+        singleton, stays_in_recall_when_disputed, requires_review,
+        default_importance, sort_order
+    )
+    SELECT
+        NEW.id, k.name, k.display_name, k.description, TRUE, TRUE,
+        k.singleton, k.stays, k.requires_review, k.default_importance, k.sort_order
+    FROM (VALUES
+        ('fact',        'Fact',        'An observed or stated fact.',
+            FALSE, FALSE, FALSE, 0.5::double precision, 10),
+        ('preference',  'Preference',  'A stated preference or convention.',
+            TRUE,  FALSE, FALSE, 0.5, 20),
+        ('doctrine',    'Doctrine',    'A standing policy or rule that governs behavior.',
+            FALSE, TRUE,  TRUE,  0.7, 30),
+        ('decision',    'Decision',    'A decision that was made and should be remembered.',
+            FALSE, FALSE, TRUE,  0.6, 40),
+        ('invariant',   'Invariant',   'A rule that must always hold; violations are high-stakes.',
+            TRUE,  TRUE,  TRUE,  0.8, 50),
+        ('observation', 'Observation', 'Something noticed but not yet trusted or reviewed.',
+            FALSE, FALSE, FALSE, 0.4, 60),
+        ('diary_entry', 'Diary Entry', 'A private agent diary entry.',
+            FALSE, FALSE, FALSE, 0.4, 70),
+        ('procedure',   'Procedure',   'A how-to, runbook, or operational procedure.',
+            FALSE, FALSE, FALSE, 0.5, 80),
+        ('summary',     'Summary',     'A condensed summary derived from other memories.',
+            FALSE, FALSE, FALSE, 0.4, 90)
+    ) AS k(name, display_name, description, singleton, stays, requires_review, default_importance, sort_order)
+    ON CONFLICT (tenant_id, name) DO NOTHING;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_seed_builtin_memory_kinds ON tenants;
+CREATE TRIGGER trg_seed_builtin_memory_kinds
+    AFTER INSERT ON tenants
+    FOR EACH ROW EXECUTE FUNCTION seed_builtin_memory_kinds();
+
 -- ============ 3. Auto-register any existing kind not covered above ============
 -- Defensive: chk_kind already restricted memory_items.kind to the 7 legacy
 -- values, all of which are seeded above, so this should be a no-op on any
