@@ -214,12 +214,23 @@ async def handle_embedding_generate(session: AsyncSession, job: Job) -> None:
         logger.info("embedding.generate id=%s already ready, no-op", item_id)
         return
 
-    vector = await generate_embedding(item.content)
+    try:
+        vector = await generate_embedding(item.content)
+    except Exception:
+        # Provider call failed — persist the failed status (committed below)
+        # before re-raising so the row records the failure even though the job
+        # will retry/dead-letter. Without this commit the failed-status write
+        # would be rolled back with the raising transaction.
+        if emb is not None:
+            emb.embedding_status = STATUS_FAILED
+            await session.commit()
+        raise
     if vector is None:
         # Provider disabled or returned nothing — mark failed so the job retries
         # and eventually dead-letters rather than spinning.
         if emb is not None:
             emb.embedding_status = STATUS_FAILED
+            await session.commit()
         raise RuntimeError("embedding provider returned no vector")
 
     if emb is None:
@@ -272,8 +283,30 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
 
     action = result.action
 
+    # Creation-order guard: detect_conflicts finds the nearest neighbor by
+    # embedding distance, not by age. conflict.check runs for EVERY item once its
+    # embedding is ready, so without a guard the older item's job would find the
+    # newer item as a neighbor and act on it — inverting the dedup/supersede
+    # direction. Establish ordering: the "existing" neighbor must predate the
+    # job's item for DEDUP (the new item is the duplicate), and the job's item
+    # must predate the neighbor for AUTO_SUPERSEDE (the new item supersedes the
+    # old). Flag actions are symmetric and need no guard.
+    existing_created_at = (
+        await session.execute(
+            select(MemoryItem.created_at).where(MemoryItem.id == result.existing_item_id)
+        )
+    ).scalar_one_or_none()
+    item_is_newer = (
+        existing_created_at is not None and item.created_at > existing_created_at
+    )
+
     # Idempotency: if already in the target state, no-op.
     if action == ConflictAction.DEDUP:
+        if not item_is_newer:
+            # The job's item is the original; the newer neighbor's own
+            # conflict.check will handle the dedup. Avoid acting twice.
+            await session.commit()
+            return
         # Semantic duplicate — mark the new item rejected + invalidated so it
         # leaves the active/recallable set (append-first: not deleted).
         await _insert_event(
@@ -295,6 +328,11 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
         return
 
     if action == ConflictAction.AUTO_SUPERSEDE:
+        # The NEW item supersedes the OLD neighbor. Only act when the job's item
+        # is the newer one; otherwise the neighbor's own job handles it.
+        if not item_is_newer:
+            await session.commit()
+            return
         # Supersede the OLD item with the new one. Idempotent.
         existing = await _reload_item(session, result.existing_item_id)
         if existing is None or existing.superseded_by == item.id:
@@ -446,13 +484,12 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
             )
             changed = True
 
-    # memory_confidence: blend toward a source-authority-capped candidate,
-    # monotonic-up (max) so refinement never destabilizes (ENG-AUD-005).
+    # memory_confidence: source-authority-capped candidate, monotonic-up (max)
+    # so refinement never destabilizes (ENG-AUD-005) AND is idempotent —
+    # re-running with the same candidate is a no-op (max is stable), so a refine
+    # job cannot oscillate the value.
     candidate = min(item.source_trust, result.confidence)
-    blended = item.memory_confidence + (
-        (candidate - item.memory_confidence) * settings.classification_confidence_blend
-    )
-    blended = max(item.memory_confidence, min(item.source_trust, blended))
+    blended = max(item.memory_confidence, candidate)
     if blended - item.memory_confidence > settings.classification_refine_min_delta:
         await _insert_event(
             session,

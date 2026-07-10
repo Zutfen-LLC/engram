@@ -229,7 +229,10 @@ async def test_failed_provider_retries_then_dead(client, monkeypatch):
     )
     item_id = response.json()["id"]
 
-    # Drain all attempts (max_attempts default 5). Each iteration claims+fails.
+    # Drain all attempts (max_attempts default 5). Each failed attempt is retried
+    # with exponential backoff, which pushes run_after into the future. The
+    # worker won't reclaim it until run_after passes, so reset run_after to now
+    # between iterations to exercise the full retry → dead-letter sequence.
     from engram.worker import process_one_job
 
     for _ in range(10):
@@ -241,6 +244,15 @@ async def test_failed_provider_retries_then_dead(client, monkeypatch):
         )
         if not processed:
             break
+        # Make the backoff-delayed job immediately reclaimable for the next loop.
+        async with _test_session_factory() as session:
+            await session.execute(
+                text(
+                    "UPDATE jobs SET run_after = now() "
+                    "WHERE job_type = 'embedding.generate' AND status = 'pending'"
+                )
+            )
+            await session.commit()
 
     state = await _embedding_state(item_id)
     assert state["embedding_status"] == "failed"
