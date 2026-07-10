@@ -88,9 +88,11 @@ END
 $$;
 
 -- Idempotent enqueue: at most one pending/running job per
--- (tenant, job_type, dedupe_key). NULLS NOT DISTINCT keeps rows without a
--- dedupe_key from colliding (the WHERE clause excludes them anyway). Enqueue
--- stores the key in payload->>'dedupe_key' so the index covers it.
+-- (tenant, job_type, dedupe_key). The partial predicate
+-- ``payload ? 'dedupe_key'`` excludes rows without a dedupe key, and the
+-- indexed expression ``payload->>'dedupe_key'`` is non-NULL for every indexed
+-- row, so NULLS NOT DISTINCT is unnecessary here (and is unsupported on an
+-- expression index). Enqueue stores the key in payload->>'dedupe_key'.
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -99,7 +101,6 @@ BEGIN
     ) THEN
         CREATE UNIQUE INDEX idx_jobs_dedupe
             ON jobs (tenant_id, job_type, (payload->>'dedupe_key'))
-            WITH NULLS NOT DISTINCT
             WHERE status IN ('pending', 'running') AND payload ? 'dedupe_key';
     END IF;
 END
