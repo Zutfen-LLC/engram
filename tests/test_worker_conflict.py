@@ -101,7 +101,9 @@ async def _ctx_and_tenant():
         return session, row["tenant_id"], row["principal_id"]
 
 
-async def _insert_item(session, *, content: str, kind: str = "fact") -> str:
+async def _insert_item(
+    session, *, content: str, kind: str = "fact", created_at: datetime | None = None
+) -> str:
     import uuid as _uuid
 
     from engram.models import MemoryItem
@@ -114,6 +116,8 @@ async def _insert_item(session, *, content: str, kind: str = "fact") -> str:
         review_status="active",
         visibility="workspace",
     )
+    if created_at is not None:
+        item.created_at = created_at
     # tenant/principal come from the RLS context, but the model requires values.
     tid = (await session.execute(text("SELECT current_setting('app.tenant_id', true)"))).scalar()
     pid = (
@@ -193,8 +197,12 @@ async def test_dedupe_rejects_new_item(monkeypatch):
     _stub_verdict(monkeypatch, ConflictVerdict.DUPLICATE, confidence=0.95)
 
     session, _, _ = await _ctx_and_tenant()
-    old_id = await _insert_item(session, content="original dup")
-    new_id = await _insert_item(session, content="reworded dup")
+    old_id = await _insert_item(
+        session, content="original dup", created_at=datetime(2026, 1, 1, tzinfo=UTC)
+    )
+    new_id = await _insert_item(
+        session, content="reworded dup", created_at=datetime(2026, 1, 2, tzinfo=UTC)
+    )
     # Give both items ready embeddings so detect_conflicts sees similarity.
     for iid in (old_id, new_id):
         await _add_ready_embedding(session, iid)
@@ -216,8 +224,12 @@ async def test_auto_supersede_marks_old_item(monkeypatch):
     _stub_verdict(monkeypatch, ConflictVerdict.REFINE, confidence=0.9)
 
     session, _, _ = await _ctx_and_tenant()
-    old_id = await _insert_item(session, content="auto supersede old")
-    new_id = await _insert_item(session, content="auto supersede new")
+    old_id = await _insert_item(
+        session, content="auto supersede old", created_at=datetime(2026, 1, 1, tzinfo=UTC)
+    )
+    new_id = await _insert_item(
+        session, content="auto supersede new", created_at=datetime(2026, 1, 2, tzinfo=UTC)
+    )
     for iid in (old_id, new_id):
         await _add_ready_embedding(session, iid)
     await session.commit()
@@ -236,8 +248,12 @@ async def test_flag_sets_conflict_metadata(monkeypatch):
     _stub_verdict(monkeypatch, ConflictVerdict.CONTRADICT, confidence=0.9)
 
     session, _, _ = await _ctx_and_tenant()
-    old_id = await _insert_item(session, content="contradict old")
-    new_id = await _insert_item(session, content="contradict new")
+    old_id = await _insert_item(
+        session, content="contradict old", created_at=datetime(2026, 1, 1, tzinfo=UTC)
+    )
+    new_id = await _insert_item(
+        session, content="contradict new", created_at=datetime(2026, 1, 2, tzinfo=UTC)
+    )
     for iid in (old_id, new_id):
         await _add_ready_embedding(session, iid)
     await session.commit()
@@ -279,8 +295,12 @@ async def test_conflict_rerun_is_idempotent(monkeypatch):
     _stub_verdict(monkeypatch, ConflictVerdict.REFINE, confidence=0.9)
 
     session, _, _ = await _ctx_and_tenant()
-    old_id = await _insert_item(session, content="idempotent old")
-    new_id = await _insert_item(session, content="idempotent new")
+    old_id = await _insert_item(
+        session, content="idempotent old", created_at=datetime(2026, 1, 1, tzinfo=UTC)
+    )
+    new_id = await _insert_item(
+        session, content="idempotent new", created_at=datetime(2026, 1, 2, tzinfo=UTC)
+    )
     for iid in (old_id, new_id):
         await _add_ready_embedding(session, iid)
     await session.commit()
