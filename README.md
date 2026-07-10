@@ -360,7 +360,7 @@ all exist and are exercised by a live, network-verified deployment.
 | API-key auth + admin endpoints (scopes, bootstrap flow)                 |     yes     |       yes        |
 | Python SDK (async client over REST)                                     |     yes     |       yes        |
 | MCP adapter (stdio, all tools)                                          |     yes     |       yes        |
-| Embedding backfill (`engram backfill-embeddings`)                       |     yes     |    mocked only   |
+| Profile-keyed embeddings + zero-downtime re-embedding                   |     yes     |    mocked only   |
 | Postgres job queue + `engram worker` (async embeddings, classification refine, conflict check) | yes |       —          |
 | Deployment artifacts (Compose, `.env.example`, backup, `init-db`)       |     yes     |       yes        |
 | **Dogfood deployment** (auth-enabled, network-reachable, backed up)     |     yes     |       yes        |

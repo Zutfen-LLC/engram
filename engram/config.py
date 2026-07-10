@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     # Provider: "openai", "local", or "none" (defer embedding generation)
     embedding_provider: str = "none"
     openai_api_key: str | None = None
+    embedding_activation_coverage_threshold: float = 95.0
 
     # Classification
     # Provider: "openai", "local", or "none" (rule-based fallback only)

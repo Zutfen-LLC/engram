@@ -1,8 +1,8 @@
 # Embeddings
 
-> **Implementation status (BL-006):** the embedding pipeline (write-path
-> generation, semantic search, conflict similarity) and the
-> `engram backfill-embeddings` command are **implemented** and verified with a
+> **Implementation status (BL-006 / ENG-AUD-009):** the profile-keyed embedding
+> pipeline (dual-write generation, semantic search, conflict similarity) and
+> queue-backed profile backfill are **implemented** and verified with a
 > **mocked** provider. The **live OpenAI path has not been recorded-verified** —
 > the checklist at the bottom of this file still has blank `Observed:` fields and
 > must be run before claiming live embeddings are verified. The dogfood
@@ -11,15 +11,15 @@
 > and write-time conflict detection stay inert until a provider is configured.
 
 Engram stores embeddings in a separate `memory_embeddings` table keyed by
-`(memory_item_id, embedding_model)` with a denormalized `tenant_id` for RLS.
+`(tenant_id, memory_item_id, profile_id)` with a denormalized `tenant_id` for RLS.
 This keeps the vector column out of the hot read path for non-semantic queries
 and lets a model change be new rows, not a migration.
 
 - **Provider:** `ENGRAM_EMBEDDING_PROVIDER` — `none` (defer, the default) or
   `openai`.
-- **Model:** `text-embedding-3-small` (1536-dim). The model name is a single
-  source of truth at `engram.embeddings.EMBEDDING_MODEL`; the write path,
-  semantic search, and conflict detection all key off it.
+- **Profile:** the seeded legacy profile is
+  `openai:text-embedding-3-small:1536`. Registry rows are authoritative for
+  provider, model, and dimension; jobs permanently carry the target profile.
 - **API key:** `ENGRAM_OPENAI_API_KEY` when the provider is `openai`. Never
   commit a key or print one in logs.
 
@@ -33,8 +33,9 @@ ENGRAM_EMBEDDING_PROVIDER=openai
 ENGRAM_OPENAI_API_KEY=sk-...
 ```
 
-Once enabled, every `POST /v1/remember` creates a `memory_embeddings` row,
-generates the vector, and marks it `ready`. Items written **before** the
+Once enabled, every `POST /v1/remember` creates one pending row and durable job
+for the active profile and each candidate, then returns without provider
+latency. Workers generate vectors and mark rows `ready`. Items written **before** the
 provider was enabled (or whose generation crashed) have either no embedding
 row or a `pending`/`failed` row with no vector. The backfill command
 populates that backlog.
@@ -49,13 +50,36 @@ populates that backlog.
 | `ready`   | Vector populated; eligible for semantic search/recall.   |
 | `failed`  | Generation errored or returned no vector. Not retried by default. |
 
-> The migration comment on the column lists `complete | failed | stale` and
-> the column `DEFAULT` is `'complete'`, but there is no CHECK constraint and
-> the application writes only `pending`/`ready`/`failed`. Semantic search and
-> recall filter on `embedding IS NOT NULL`, so the status string does not
-> gate retrieval — a populated vector is used regardless of status.
+> Migration 006 normalizes historical populated `complete` rows to `ready`.
+> Semantic reads require `ready`, the active profile id, and the exact profile
+> dimension before performing a typed distance operation.
 
 ## `engram backfill-embeddings`
+
+### Profile migration workflow (ENG-AUD-009)
+
+Embedding profiles are deployment-global records containing provider, model,
+dimension, cosine metric, lifecycle state, and index state. Provider secrets
+remain environment-managed. Vectors from different profiles or dimensions are
+never compared.
+
+```bash
+engram embedding-profiles create \
+  --key openai:new-model:768 --provider openai --model new-model --dimensions 768
+engram embedding-profiles ensure-index openai:new-model:768
+engram backfill-embeddings --profile openai:new-model:768
+engram worker --job-type embedding.generate --max-jobs 100
+engram embedding-profiles list
+engram embedding-profiles activate openai:new-model:768
+```
+
+Creating a candidate starts automatic dual writes for new memories. Backfill
+only enqueues durable, profile-bound jobs. Only the active profile participates
+in semantic search, recall, and conflict transitions. Activation requires a
+ready index and 95% ready coverage by default; `--force` is an explicit operator
+override. The previous profile and vectors remain retired and can be reactivated
+through the same validated command for rollback. At most one active plus two
+candidate profiles may be writable simultaneously.
 
 Populate `pending`/`missing` embeddings for the configured model, across all
 tenants (or one with `--tenant`). Idempotent and safe to rerun.

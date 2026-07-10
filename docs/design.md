@@ -679,9 +679,11 @@ No storage abstraction layer is planned until real demand exists.
 
 ### Embeddings
 
-> **Implementation status:** The separate `memory_embeddings` table, write-path
-> generation, semantic search, conflict-detection similarity, and the
-> `engram backfill-embeddings` command (BL-006) are **implemented**. The provider
+> **Implementation status:** The profile-keyed `memory_embeddings` table,
+> variable-dimension vectors, active/candidate dual writes, profile-specific
+> indexes, queue-backed re-embedding, validated atomic cutover/rollback,
+> semantic search, and conflict-detection similarity are **implemented**
+> (ENG-AUD-009 / F16). The provider
 > is `none` by default; with the OpenAI provider, embeddings are generated on
 > `remember` and backfilled idempotently. The backfill is verified with a mocked
 > provider; the **live OpenAI path has not been recorded-verified** (see the
@@ -690,7 +692,10 @@ No storage abstraction layer is planned until real demand exists.
 
 Embeddings are stored separately from memory items.
 
-Embeddings are keyed by model so that re-embedding does not require rewriting memory content or changing the memory item schema.
+Embeddings are keyed by a deployment-global profile (provider, model, dimension,
+metric, lifecycle, and index state), so re-embedding does not require rewriting
+memory content or changing the memory item schema. Only the active profile is
+queried; candidate profiles receive dual writes and retired vectors are retained.
 
 This supports:
 

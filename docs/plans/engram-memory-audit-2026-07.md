@@ -41,7 +41,7 @@ Section 8 gives the prioritized roadmap. The one-line version: **P0 = make the r
 | F13 | **P1** | Conflicts | Conflict detection checks only the single nearest neighbor of the *same kind and workspace*, and is entirely disabled when embeddings are off (i.e., in the dogfood deployment) |
 | F14 | **P1** | Search | `SearchRequest.wing/room/kind` filters are accepted and silently ignored |
 | F15 | **P1** | Recall | Default recall is unbounded; `recall_byte_budget` and `quorum_reset_agent_count` config are dead |
-| F16 | **P2** | Storage | `vector(1536)` fixed column contradicts the model-keyed multi-model embedding design; `EMBEDDING_MODEL` is a hardcoded constant |
+| F16 | **resolved (ENG-AUD-009)** | Storage | Profile registry, variable dimensions, profile indexes, dual-write backfill, validated cutover, and rollback retention implemented |
 | F17 | **P2** | Storage | `chk_kind` CHECK constraint contradicts "tenant-configurable taxonomy" and omits design kinds (`procedure`, `summary`) |
 | F18 | **P2** | Recall | Scoring loads the entire active corpus into Python; recall is also a write (recall-count updates), blocking read-replica scaling |
 | F19 | **P2** | Recall | "Relationship-aware recall" is claimed done (README roadmap layer 3) but recall never touches the KG or tunnels |
@@ -183,6 +183,12 @@ There is no way to know whether classification is any good, or whether a rule/pr
 ### Findings
 
 **F16 — Embedding model claims vs. reality.** The design promises model-keyed embeddings supporting model migration and multiple models. In reality: `embedding vector(1536)` fixes the dimension at DDL time (`001_init.sql:184`), `EMBEDDING_MODEL` is a module constant (`embeddings.py:22`), and every read path filters on that constant — a second model can't be stored (wrong dim) or queried (constant). `settings.embedding_dim` exists but only feeds the placeholder row's metadata.
+
+> **Resolved by ENG-AUD-009:** deployment-global profiles now bind provider,
+> model, dimension, metric, lifecycle, and index state. Storage uses untyped
+> `vector` with profile-specific typed partial indexes; jobs are profile-bound;
+> candidates dual-write/backfill; active-only reads and conflict checks enforce
+> vector-space isolation; validated activation retains retired vectors for rollback.
 
 *Fix:* per-model dimensioned storage. Practical options: (a) one table per registered model dimension (created by a small registry migration step), or (b) a single table with an untyped `vector` column — pgvector allows this — plus per-model partial HNSW indexes with fixed-dim casts, or (c) `halfvec` for cost. Add `embedding_models` registry (model name, dim, provider, active flag) in `tenant_config` or globally; make read paths select the tenant's active model. This unlocks re-embedding migration (backfill machinery already exists and is good), local models, and Matryoshka-style dimension choices — and it is much cheaper to do before there is hosted data.
 

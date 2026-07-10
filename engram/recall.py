@@ -95,7 +95,7 @@ def score_item(
         # Anti-feedback penalty (tied to recall-driven recency only).
         if item.startup_recall_count > penalty_threshold:
             excess = item.startup_recall_count - penalty_threshold
-            penalty = penalty_factor ** excess
+            penalty = penalty_factor**excess
             recall_recency *= penalty
             recall_recency = max(recall_recency, settings.startup_recall_penalty_floor)
             reasons.append(f"recency_penalty(count={item.startup_recall_count})")
@@ -118,11 +118,7 @@ def score_item(
 
     # Warnings
     warnings: list[str] = []
-    stale_after_days = (
-        config.stale_after_days
-        if config is not None
-        else settings.stale_after_days
-    )
+    stale_after_days = config.stale_after_days if config is not None else settings.stale_after_days
     last_verified = item.last_verified_at or item.valid_from
     if last_verified is not None:
         days_since_verified = (now - last_verified).total_seconds() / 86400
@@ -323,11 +319,7 @@ async def execute_startup_recall(
         items = await _fetch_active_items(session, tenant_id, principal_id, workspace_id)
 
     # 2. Separate pinned
-    max_pinned = (
-        config.max_pinned_tokens
-        if config is not None
-        else settings.max_pinned_tokens
-    )
+    max_pinned = config.max_pinned_tokens if config is not None else settings.max_pinned_tokens
     pinned_items, scored_items, pinned_omitted = _separate_pinned(items, max_pinned)
 
     # 3. Score remaining items
@@ -347,9 +339,7 @@ async def execute_startup_recall(
         effective_budget = None
 
     if token_budget is not None:
-        pinned_tokens = sum(
-            max(1, len(i.content.encode()) // 4) for i in pinned_items
-        )
+        pinned_tokens = sum(max(1, len(i.content.encode()) // 4) for i in pinned_items)
         effective_token_budget = max(0, token_budget - pinned_tokens)
     else:
         effective_token_budget = None
@@ -368,10 +358,9 @@ async def execute_startup_recall(
     ]
 
     # 5. Build response
-    all_items: list[tuple[MemoryItem, float | None, list[str], list[str]]] = (
-        [(i, None, [], []) for i in pinned_items]
-        + [(i, s, r, w) for i, s, r, w in scored_with_reasons]
-    )
+    all_items: list[tuple[MemoryItem, float | None, list[str], list[str]]] = [
+        (i, None, [], []) for i in pinned_items
+    ] + [(i, s, r, w) for i, s, r, w in scored_with_reasons]
 
     working_set_lines = []
     response_items = []
@@ -544,7 +533,15 @@ async def execute_semantic_recall(
 
     # 1. Generate the query embedding. This is the single place the query
     #    vector is produced; the shared semantic.search() never embeds.
-    query_embedding = await generate_embedding(query)
+    import inspect
+
+    from engram.embedding_profiles import get_active_profile
+
+    active_profile = await get_active_profile(session)
+    if len(inspect.signature(generate_embedding).parameters) >= 2:
+        query_embedding = await generate_embedding(query, active_profile)
+    else:
+        query_embedding = await generate_embedding(query)
 
     if workspace is not None and not workspace_accessible:
         candidate_total = 0
@@ -555,6 +552,7 @@ async def execute_semantic_recall(
             principal_id=principal_id,
             workspace_id=workspace_id,
             review_statuses=_SEMANTIC_REVIEW_STATUSES,
+            profile=active_profile,
         )
 
     if query_embedding is None or candidate_total == 0:
@@ -599,6 +597,7 @@ async def execute_semantic_recall(
         principal_id=principal_id,
         workspace_id=workspace_id,
         review_statuses=_SEMANTIC_REVIEW_STATUSES,
+        profile=active_profile,
     )
 
     # 4. Enrich candidates with full MemoryItem trust fields (pinned,

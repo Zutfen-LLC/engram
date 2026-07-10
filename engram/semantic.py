@@ -21,12 +21,12 @@ from __future__ import annotations
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import and_, func, select, text
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import and_, cast, func, literal_column, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from engram.embeddings import EMBEDDING_MODEL as _EMBEDDING_MODEL
 from engram.memory_access import eligibility_expression
-from engram.models import MemoryEmbedding, MemoryItem
+from engram.models import EmbeddingProfile, MemoryEmbedding, MemoryItem
 
 # Scoring version exposed in search/recall results and recall_logs so the
 # ranking that produced a given working set is auditable and reproducible.
@@ -99,6 +99,7 @@ async def candidate_count(
     kind: str | None = None,
     wing: str | None = None,
     room: str | None = None,
+    profile: EmbeddingProfile | None = None,
 ) -> int:
     """Count recall/search-eligible embeddings currently in the corpus.
 
@@ -109,6 +110,10 @@ async def candidate_count(
     (see ``engram.memory_access``). Optional ``kind``/``wing``/``room``
     filters further narrow the candidate set (matching :func:`search`).
     """
+    if profile is None:
+        from engram.embedding_profiles import get_active_profile
+
+        profile = await get_active_profile(session)
     stmt = (
         select(func.count())
         .select_from(MemoryEmbedding)
@@ -120,7 +125,9 @@ async def candidate_count(
             ),
         )
         .where(
-            MemoryEmbedding.embedding_model == _EMBEDDING_MODEL,
+            MemoryEmbedding.profile_id == profile.id,
+            MemoryEmbedding.embedding_dim == profile.dimensions,
+            MemoryEmbedding.embedding_status == "ready",
             MemoryEmbedding.embedding.is_not(None),
             MemoryItem.review_status.in_(review_statuses),
             MemoryItem.valid_to.is_(None),
@@ -151,6 +158,7 @@ async def search(
     kind: str | None = None,
     wing: str | None = None,
     room: str | None = None,
+    profile: EmbeddingProfile | None = None,
 ) -> list[dict[str, Any]]:
     """Return the top-``limit`` items for ``query_embedding``, trust-ranked.
 
@@ -173,9 +181,21 @@ async def search(
     ordered by ``score`` descending, then distance ascending, then
     ``created_at`` descending.
     """
+    if profile is None:
+        from engram.embedding_profiles import get_active_profile
+
+        profile = await get_active_profile(session)
+    if len(query_embedding) != profile.dimensions:
+        raise ValueError(
+            f"query vector dimension {len(query_embedding)} does not match active "
+            f"profile {profile.profile_key} ({profile.dimensions})"
+        )
     # strict_order handles tenant-filtered queries without recall degradation.
     await session.execute(text("SET LOCAL hnsw.iterative_scan = strict_order"))
-    distance = MemoryEmbedding.embedding.cosine_distance(query_embedding)
+    typed_embedding = cast(MemoryEmbedding.embedding, Vector(profile.dimensions))
+    distance = typed_embedding.cosine_distance(query_embedding)
+    profile_id_sql: Any = literal_column(f"'{profile.id}'::uuid")
+    dimensions_sql: Any = literal_column(str(int(profile.dimensions)))
     stmt = (
         select(
             MemoryItem.id.label("id"),
@@ -202,7 +222,9 @@ async def search(
             ),
         )
         .where(
-            MemoryEmbedding.embedding_model == _EMBEDDING_MODEL,
+            MemoryEmbedding.profile_id == profile_id_sql,
+            MemoryEmbedding.embedding_dim == dimensions_sql,
+            MemoryEmbedding.embedding_status == "ready",
             MemoryEmbedding.embedding.is_not(None),
             MemoryItem.review_status.in_(review_statuses),
             MemoryItem.valid_to.is_(None),
@@ -251,6 +273,7 @@ async def search(
                 "score": semantic_score,
                 "embedding_model": row["embedding_model"],
                 "embedding_dim": row["embedding_dim"],
+                "embedding_profile": profile.profile_key,
                 "created_at": row["created_at"],
             }
         )
@@ -258,9 +281,7 @@ async def search(
     # Trust-weighted re-ranking: final score desc, then distance asc (closer
     # first among equal trust-weighted scores), then newest first as a stable
     # tiebreaker.
-    results.sort(
-        key=lambda r: (-r["score"], r["distance"], _sort_created_desc(r["created_at"]))
-    )
+    results.sort(key=lambda r: (-r["score"], r["distance"], _sort_created_desc(r["created_at"])))
     return results
 
 

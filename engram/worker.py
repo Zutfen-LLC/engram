@@ -62,9 +62,7 @@ def _truncate_error(exc: BaseException | str) -> str:
     return msg if len(msg) <= _LAST_ERROR_TRUNC else msg[:_LAST_ERROR_TRUNC]
 
 
-async def _resolve_tenant_admin(
-    owner_session: AsyncSession, tenant_id: str
-) -> str:
+async def _resolve_tenant_admin(owner_session: AsyncSession, tenant_id: str) -> str:
     """Resolve a tenant's seeded admin principal id for RLS context + audit.
 
     Runs through the owner session (cross-tenant lookup). Falls back to the
@@ -155,13 +153,9 @@ def _payload_item_id(job: Job) -> UUID:
 # ---------------------------------------------------------------------------
 
 
-async def _reload_item(
-    session: AsyncSession, item_id: UUID
-) -> MemoryItem | None:
+async def _reload_item(session: AsyncSession, item_id: UUID) -> MemoryItem | None:
     return (
-        await session.execute(
-            select(MemoryItem).where(MemoryItem.id == item_id)
-        )
+        await session.execute(select(MemoryItem).where(MemoryItem.id == item_id))
     ).scalar_one_or_none()
 
 
@@ -189,25 +183,36 @@ async def handle_embedding_generate(session: AsyncSession, job: Job) -> None:
     runs off the write path.
     """
     # Lazy imports keep the module importable when the openai package is absent.
+    import inspect
+
+    from engram.embedding_profiles import get_active_profile, get_profile_by_id
     from engram.embeddings import STATUS_FAILED, STATUS_READY, generate_embedding
     from engram.models import MemoryEmbedding
 
     item_id = _payload_item_id(job)
+    raw_profile_id = job.payload.get("profile_id")
+    profile = (
+        await get_profile_by_id(session, _parse_uuid(raw_profile_id))
+        if raw_profile_id is not None
+        else await get_active_profile(session)
+    )
+    payload_key = job.payload.get("profile_key")
+    if payload_key is not None and str(payload_key) != profile.profile_key:
+        raise ValueError("embedding job profile_id/profile_key mismatch")
     item = await _reload_item(session, item_id)
     if item is None or _is_expired_or_inactive(item):
-        logger.info(
-            "embedding.generate id=%s skipped: item gone/inactive", item_id
-        )
+        logger.info("embedding.generate id=%s skipped: item gone/inactive", item_id)
         return
     # Re-verify tenant routing context.
     if str(item.tenant_id) != str(job.tenant_id):
-        raise RuntimeError(
-            f"job tenant {job.tenant_id} != item tenant {item.tenant_id}"
-        )
+        raise RuntimeError(f"job tenant {job.tenant_id} != item tenant {item.tenant_id}")
 
     emb = (
         await session.execute(
-            select(MemoryEmbedding).where(MemoryEmbedding.memory_item_id == item_id)
+            select(MemoryEmbedding).where(
+                MemoryEmbedding.memory_item_id == item_id,
+                MemoryEmbedding.profile_id == profile.id,
+            )
         )
     ).scalar_one_or_none()
     if emb is not None and emb.embedding_status == STATUS_READY:
@@ -215,7 +220,12 @@ async def handle_embedding_generate(session: AsyncSession, job: Job) -> None:
         return
 
     try:
-        vector = await generate_embedding(item.content)
+        # Compatibility with one-argument test/provider shims while the public
+        # implementation receives the durable profile contract explicitly.
+        if len(inspect.signature(generate_embedding).parameters) >= 2:
+            vector = await generate_embedding(item.content, profile)
+        else:
+            vector = await generate_embedding(item.content)
     except Exception:
         # Provider call failed — persist the failed status (committed below)
         # before re-raising so the row records the failure even though the job
@@ -236,22 +246,34 @@ async def handle_embedding_generate(session: AsyncSession, job: Job) -> None:
     if emb is None:
         from engram.embeddings import create_embedding_placeholder
 
-        emb = await create_embedding_placeholder(session, item_id, job.tenant_id)
+        emb = await create_embedding_placeholder(session, item_id, job.tenant_id, profile)
+    if len(vector) != profile.dimensions:
+        emb.embedding_status = STATUS_FAILED
+        await session.commit()
+        raise ValueError(
+            f"embedding dimension {len(vector)} does not match profile "
+            f"{profile.profile_key} ({profile.dimensions})"
+        )
     emb.embedding = vector
-    emb.embedding_dim = len(vector)
+    emb.embedding_model = profile.model
+    emb.embedding_dim = profile.dimensions
     emb.embedding_status = STATUS_READY
     await session.commit()
 
     # Enqueue conflict check now that the embedding is ready.
-    if settings.conflict_check_on_write:
+    if settings.conflict_check_on_write and profile.state == "active":
         from engram.jobs import enqueue_job
 
         await enqueue_job(
             session,
             tenant_id=job.tenant_id,
             job_type="conflict.check",
-            payload={"memory_item_id": str(item_id)},
-            dedupe_key=f"conflict:{item_id}",
+            payload={
+                "memory_item_id": str(item_id),
+                "profile_id": str(profile.id),
+                "profile_key": profile.profile_key,
+            },
+            dedupe_key=f"conflict:{item_id}:{profile.id}",
         )
 
 
@@ -266,18 +288,34 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
     import json
 
     from engram.conflicts import ConflictAction, detect_conflicts
+    from engram.embedding_profiles import get_active_profile, get_profile_by_id
 
     item_id = _payload_item_id(job)
+    raw_profile_id = job.payload.get("profile_id")
+    profile = (
+        await get_profile_by_id(session, _parse_uuid(raw_profile_id))
+        if raw_profile_id is not None
+        else await get_active_profile(session)
+    )
+    payload_key = job.payload.get("profile_key")
+    if payload_key is not None and str(payload_key) != profile.profile_key:
+        raise ValueError("conflict job profile_id/profile_key mismatch")
+    if profile.state != "active":
+        logger.info(
+            "conflict.check id=%s skipped: profile %s is %s",
+            item_id,
+            profile.profile_key,
+            profile.state,
+        )
+        return
     item = await _reload_item(session, item_id)
     if item is None or _is_expired_or_inactive(item):
         logger.info("conflict.check id=%s skipped: item gone/inactive", item_id)
         return
     if str(item.tenant_id) != str(job.tenant_id):
-        raise RuntimeError(
-            f"job tenant {job.tenant_id} != item tenant {item.tenant_id}"
-        )
+        raise RuntimeError(f"job tenant {job.tenant_id} != item tenant {item.tenant_id}")
 
-    result = await detect_conflicts(item, session)
+    result = await detect_conflicts(item, session, profile=profile)
     if result is None:
         return
 
@@ -438,9 +476,7 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
         logger.info("classification.refine id=%s skipped: item gone/inactive", item_id)
         return
     if str(item.tenant_id) != str(job.tenant_id):
-        raise RuntimeError(
-            f"job tenant {job.tenant_id} != item tenant {item.tenant_id}"
-        )
+        raise RuntimeError(f"job tenant {job.tenant_id} != item tenant {item.tenant_id}")
 
     result = await classify(item.content, item.tenant_id, session)
     actor = item.principal_id
@@ -518,16 +554,13 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
             reason=f"LLM confidence blend ({result.reason})",
         )
         await session.execute(
-            update(MemoryItem)
-            .where(MemoryItem.id == item.id)
-            .values(memory_confidence=blended)
+            update(MemoryItem).where(MemoryItem.id == item.id).values(memory_confidence=blended)
         )
         changed = True
 
     # Visibility: NARROW only (never widen). ENG-AUD-005.
-    if (
-        result.suggested_visibility is not None
-        and _can_narrow(item.visibility, result.suggested_visibility)
+    if result.suggested_visibility is not None and _can_narrow(
+        item.visibility, result.suggested_visibility
     ):
         await _insert_event(
             session,
@@ -647,9 +680,7 @@ async def process_one_job(
             principal_id = await _resolve_tenant_admin(owner, tenant_id)
 
         async with app_session_factory() as app:
-            await apply_rls_context(
-                app, tenant_id=tenant_id, principal_id=principal_id
-            )
+            await apply_rls_context(app, tenant_id=tenant_id, principal_id=principal_id)
             await handler(app, job)
     except Exception as exc:  # noqa: BLE001 — any handler error retries/dead-letters
         logger.exception(
@@ -694,9 +725,7 @@ async def run_worker(
     Otherwise polls indefinitely. Exits 0 on normal completion; nonzero only on
     fatal setup errors (ordinary job failures do NOT stop the loop).
     """
-    interval = (
-        poll_interval if poll_interval is not None else settings.job_poll_interval_seconds
-    )
+    interval = poll_interval if poll_interval is not None else settings.job_poll_interval_seconds
     stale = (
         lease_stale_after
         if lease_stale_after is not None
