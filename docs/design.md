@@ -100,6 +100,23 @@ Single-agent memory is the on-ramp. Multi-agent institutional memory is the moat
 
 Every memory item has a simple state machine (`review_status`) plus derived signals from other columns and an event log. The lifecycle diagram shows the full trajectory, but only `review_status` is a stored state:
 
+> **Review authorization (V2-BL-003):** Caller-facing transitions are governed
+> by the database-free policy in `engram.review_policy`; read eligibility is
+> resolved before that policy runs. Agents may move eligible proposed or active
+> items to `disputed`, and may archive only their own still-proposed item as a
+> withdrawal. They may not activate, reactivate, or reject memories. Human
+> `user` principals and administrators may make governed review decisions;
+> restoring an archived item is administrator-only. Path A auto-promotion uses
+> an explicit, server-selected `promotion_service` authority and retains all of
+> its existing gates. Complete API-key route-scope enforcement remains deferred
+> to V2-BL-004.
+>
+> Human verification is separate from activation: it never changes
+> `review_status` or clears a dispute. Only authenticated `user` or `admin`
+> principals may verify, and `verified_by` is always derived from that caller.
+> Caller-supplied verifier identity is not part of the request schema;
+> delegation remains audit metadata and never impersonates the verifier.
+
 ```text
 observed → proposed → active → recalled → confirmed/stale → superseded/invalidated/archived
 ```

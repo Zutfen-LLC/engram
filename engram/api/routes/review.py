@@ -22,6 +22,7 @@ from engram.api.routes.memory import (
 from engram.db import get_session
 from engram.memory_access import eligibility_sql
 from engram.models import MemoryItem
+from engram.review_policy import TransitionOutcome, can_human_verify, evaluate_transition
 
 router = APIRouter()
 
@@ -37,7 +38,9 @@ _ON_BEHALF_OF_DESCRIPTION = (
 
 
 class ReviewChangeRequest(BaseModel):
-    review_status: str  # proposed | active | disputed | rejected | archived
+    # Validated by the transition policy only after the item eligibility check,
+    # preserving non-disclosing 404 behavior for inaccessible item ids.
+    review_status: str
     reason: str | None = None
     review_notes: str | None = None
     actor_principal_id: UUID | None = Field(
@@ -49,7 +52,6 @@ class ReviewChangeRequest(BaseModel):
 
 
 class VerifyRequest(BaseModel):
-    verified_by: UUID | None = None
     reason: str | None = None
     on_behalf_of_principal_id: UUID | None = Field(
         default=None, description=_ON_BEHALF_OF_DESCRIPTION
@@ -322,10 +324,27 @@ async def change_review_status(
     body.
     """
     tenant_id = await _resolve_tenant_id(session)
-    principal_id, _ = await _resolve_principal(session, tenant_id)
+    principal_id, principal_type = await _resolve_principal(session, tenant_id)
     item = await _require_eligible_item(
-        session, item_id, tenant_id=tenant_id, principal_id=principal_id
+        session, item_id, tenant_id=tenant_id, principal_id=principal_id, for_update=True
     )
+    decision = evaluate_transition(
+        principal_id=principal_id,
+        principal_type=principal_type,
+        item_author_principal_id=UUID(str(item["principal_id"])),
+        current_status=str(item["review_status"]),
+        requested_status=req.review_status,
+    )
+    if decision.outcome is TransitionOutcome.INVALID:
+        raise HTTPException(status_code=409, detail="invalid review-state transition")
+    if decision.outcome is TransitionOutcome.FORBIDDEN:
+        raise HTTPException(
+            status_code=403,
+            detail="The authenticated principal is not authorized for this review transition.",
+        )
+    if decision.outcome is TransitionOutcome.NOOP:
+        await session.commit()
+        return {"item": item, "event": None}
     actor, on_behalf_of = await _resolve_actor_and_delegation(
         session, tenant_id=tenant_id, requested_on_behalf_of=req.on_behalf_of_principal_id
     )
@@ -362,28 +381,30 @@ async def verify_item(
     req: VerifyRequest | None = None,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> dict[str, Any]:
-    """Mark item as human-verified.
-
-    ``verified_by`` is a domain field on ``memory_items`` (who verified the
-    item) and is unchanged by this slice — human-only verification and
-    review-transition authorization are later trust-integrity work
-    (V2-BL-003), not this one. The item_events actor is a separate concern:
-    it is always the authenticated caller, never ``verified_by`` (which the
-    audit's spoofing surface explicitly named) and never the item's author.
-    """
+    """Mark an eligible, non-terminal item as verified by the human caller."""
     tenant_id = await _resolve_tenant_id(session)
-    principal_id, _ = await _resolve_principal(session, tenant_id)
+    principal_id, principal_type = await _resolve_principal(session, tenant_id)
     item = await _require_eligible_item(
-        session, item_id, tenant_id=tenant_id, principal_id=principal_id
+        session, item_id, tenant_id=tenant_id, principal_id=principal_id, for_update=True
     )
+    if not can_human_verify(principal_type):
+        raise HTTPException(status_code=403, detail="human verification requires a user or admin")
+    if item["review_status"] in {"rejected", "archived"}:
+        raise HTTPException(status_code=409, detail="terminal items cannot be human-verified")
     actor, on_behalf_of = await _resolve_actor_and_delegation(
         session,
         tenant_id=tenant_id,
         requested_on_behalf_of=req.on_behalf_of_principal_id if req else None,
     )
     now = _now_dt()
-    verified_by = req.verified_by if req and req.verified_by else UUID(str(item["principal_id"]))
     reason = req.reason if req else None
+    if item.get("human_verified"):
+        if UUID(str(item["verified_by"])) != actor:
+            raise HTTPException(
+                status_code=409, detail="item was already verified by another principal"
+            )
+        await session.commit()
+        return {"item": item, "event": None}
     event = await _insert_item_event(
         session,
         item_id=item_id,
@@ -401,7 +422,7 @@ async def verify_item(
             "verified_at = :verified_at, last_verified_at = :last_verified_at WHERE id = :item_id"
         ),
         {
-            "verified_by": str(verified_by),
+            "verified_by": str(actor),
             "verified_at": now,
             "last_verified_at": now,
             "item_id": str(item_id),
@@ -510,25 +531,40 @@ async def bulk_archive(
     for i, item_id in enumerate(requested):
         fetch_placeholders.append(f":id{i}")
         fetch_params[f"id{i}"] = str(item_id)
+    lock_suffix = " FOR UPDATE" if session.bind.dialect.name == "postgresql" else ""
     fetch_sql = text(
         "SELECT id, review_status, principal_id FROM memory_items "
         "WHERE tenant_id = :tenant_id AND "
         f"{eligibility_sql()} AND "
-        f"CAST(id AS TEXT) IN ({', '.join(fetch_placeholders)})"
+        f"CAST(id AS TEXT) IN ({', '.join(fetch_placeholders)}){lock_suffix}"
     )
     rows = (await session.execute(fetch_sql, fetch_params)).all()
     found: dict[str, tuple[str, object]] = {
         str(row[0]): (str(row[1]), row[2]) for row in rows
     }
 
+    _, principal_type = await _resolve_principal(session, tenant_id)
     to_archive: list[UUID] = []
     skipped: list[UUID] = []
     for item_id in requested:
         entry = found.get(str(item_id))
         if entry is None or entry[0] in ("archived", "rejected"):
             skipped.append(item_id)
-        else:
+            continue
+        decision = evaluate_transition(
+            principal_id=principal_id,
+            principal_type=principal_type,
+            item_author_principal_id=UUID(str(entry[1])),
+            current_status=entry[0],
+            requested_status="archived",
+        )
+        if decision.allowed:
             to_archive.append(item_id)
+        else:
+            raise HTTPException(
+                status_code=403,
+                detail="The authenticated principal is not authorized to archive these items.",
+            )
 
     actor, on_behalf_of = await _resolve_actor_and_delegation(
         session, tenant_id=tenant_id, requested_on_behalf_of=req.on_behalf_of_principal_id
