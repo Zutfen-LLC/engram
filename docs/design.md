@@ -73,6 +73,17 @@ Single-agent memory is the on-ramp. Multi-agent institutional memory is the moat
 
 5. **Content is append-first; metadata changes are audited.** Memory content is never UPDATEd. Supersession/invalidation marks old rows. Metadata changes such as wing, room, visibility, and review status are recorded in `item_events` for full audit trail.
 
+   > **Implementation status (V2-BL-001):** `item_events.actor_principal_id` is
+   > always derived from the authenticated caller resolved by the auth
+   > dependency — never from a request body, and never defaulted to the
+   > item's author. Request fields named `actor_principal_id` are
+   > deprecated and silently ignored. Legitimate administrative delegation is
+   > recorded separately via `on_behalf_of_principal_id` (admin-scoped,
+   > tenant-bound, folded into the event's `reason` as JSON metadata rather
+   > than a caller-writable column) and never replaces the authenticated
+   > actor. Review-transition authorization and broader mutation-eligibility
+   > enforcement are separate, later trust-integrity work (V2-BL-002/003).
+
 6. **Principal/workspace scoping is first-class.** Memory items belong to a tenant, workspace, and principal. Visibility levels and workspace membership control access.
 
 7. **The memory model concepts are the product, not the storage.** Wings/rooms/drawers, knowledge graph triples, tunnels, and diaries are Engram's product vocabulary.

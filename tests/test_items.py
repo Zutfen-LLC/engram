@@ -7,11 +7,39 @@ from uuid import uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from engram.api.app import create_app
 from engram.db import get_session
+
+
+# The mutation routes under test (PATCH/supersede/invalidate/review/verify)
+# resolve the item_events actor from the RLS session context
+# (current_setting('app.principal_id', ...)) rather than trusting a
+# caller-supplied actor field (V2-BL-001) — the same mechanism
+# tests/test_hygiene.py already emulates on SQLite via
+# current_setting/set_config functions registered on connect.
+def _register_pg_funcs(dbapi_conn, _record):
+    store: dict[str, str] = {}
+
+    def _current_setting(name, _local=None):
+        return store.get(name)
+
+    def _set_config(name, value, _local=False):
+        store[name] = value
+        return value
+
+    dbapi_conn.create_function("current_setting", 2, _current_setting)
+    dbapi_conn.create_function("set_config", 3, _set_config)
+
+
+# Populated by _seed_base() before any request is made in a test, and read by
+# the client fixture's session override at request time — lets each test seed
+# its own dynamic tenant/principal ids (unlike test_hygiene.py's fixed
+# module-level ids) while still giving the RLS-context routes something to
+# resolve as the authenticated caller.
+_rls_context: dict[str, str] = {}
 
 CREATE_STATEMENTS = [
     """
@@ -124,6 +152,7 @@ CREATE_STATEMENTS = [
 async def session_factory(tmp_path: Path):
     db_path = tmp_path / "engram.sqlite3"
     engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    event.listen(engine.sync_engine, "connect", _register_pg_funcs)
     async with engine.begin() as conn:
         for stmt in CREATE_STATEMENTS:
             await conn.exec_driver_sql(stmt)
@@ -132,12 +161,28 @@ async def session_factory(tmp_path: Path):
     await engine.dispose()
 
 
+@pytest.fixture(autouse=True)
+def _reset_rls_context():
+    _rls_context.clear()
+    yield
+    _rls_context.clear()
+
+
 @pytest.fixture()
 async def client(session_factory):
     app = create_app()
 
     async def override_get_session() -> AsyncIterator[AsyncSession]:
         async with session_factory() as session:
+            if _rls_context:
+                await session.execute(
+                    text("SELECT set_config('app.tenant_id', :tid, true)"),
+                    {"tid": _rls_context["tenant_id"]},
+                )
+                await session.execute(
+                    text("SELECT set_config('app.principal_id', :pid, true)"),
+                    {"pid": _rls_context["principal_id"]},
+                )
             yield session
 
     app.dependency_overrides[get_session] = override_get_session
@@ -151,6 +196,8 @@ async def _seed_base(session: AsyncSession, *, created_at: str) -> dict[str, str
     tenant_id = str(uuid4())
     workspace_id = str(uuid4())
     principal_id = str(uuid4())
+    _rls_context["tenant_id"] = tenant_id
+    _rls_context["principal_id"] = principal_id
     await session.execute(
         text("INSERT INTO tenants (id, name, slug, created_at) VALUES (:id, :name, :slug, :created_at)"),
         {"id": tenant_id, "name": "Tenant", "slug": "tenant", "created_at": created_at},
