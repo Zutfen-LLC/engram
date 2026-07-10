@@ -72,6 +72,24 @@ def _reset_embedding_provider():
     settings.embedding_provider = original
 
 
+@pytest.fixture(autouse=True)
+def _use_test_read_session_factory():
+    """Point startup recall's read-oriented session (ENG-AUD-011) at this
+    file's own NullPool factory instead of the real pooled app engine.
+
+    A pooled connection bound to one test's event loop can get reused by a
+    later test on a different loop → asyncpg "another operation is in
+    progress" (SQLAlchemy async pool + per-test event loops). Same pattern as
+    test_promotion.py's async_session_factory/owner_session_factory patch.
+    """
+    import engram.db as db_module
+
+    original = db_module.read_session_factory
+    db_module.read_session_factory = _test_session_factory
+    yield
+    db_module.read_session_factory = original
+
+
 async def _default_tenant_id() -> str:
     async with _test_session_factory() as session:
         row = (

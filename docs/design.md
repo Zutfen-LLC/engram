@@ -327,6 +327,38 @@ Engram is designed to prevent those failure modes.
 
 ## 5. Recall
 
+### Two-stage pipeline (ENG-AUD-011 / F18)
+
+Startup recall does not load the entire eligible corpus into Python. It runs
+as two stages:
+
+1. **SQL candidate selection** — Postgres selects a bounded pool of at most
+   `ENGRAM_STARTUP_RECALL_CANDIDATE_LIMIT` candidate rows (default 500,
+   hard-capped at `ENGRAM_STARTUP_RECALL_CANDIDATE_LIMIT_MAX`, default 5000;
+   always ≥ `recall_item_budget`). The pool is the deduplicated union of
+   several bounded sub-pools so a coarse SQL score alone can't accidentally
+   omit an item that would rank highly under detailed scoring:
+   pinned items (fetched separately, up to the candidate limit, so they can
+   never be displaced by the cap), highest coarse-score (60% of the pool),
+   freshest (15%), highest-importance (15%), and least-recently-recalled
+   (10%). The coarse score approximates the detailed formula below using
+   only SQL-computable columns (it is candidate retrieval, not the final
+   score). This runs over a read-oriented session
+   (`ENGRAM_READ_DATABASE_URL`, falling back to the primary database when
+   unset) — the only write in this stage is the lazy promotion pass, and it
+   always uses the primary session; when that pass actually promotes a row,
+   candidate selection for *this* recall reads from the primary too
+   (replication lag would otherwise hide the row it was invoked to surface).
+2. **Detailed Python scoring** — the formula below runs only over the
+   bounded candidate set, producing the same reasons, warnings, and budget
+   packing as before. The SQL score is never returned to callers.
+
+Recall-signal telemetry (`last_recalled_at`, `recall_count`,
+`startup_recall_count`) is not written inline in the read transaction. It is
+enqueued as a best-effort `recall.telemetry` job after the recall set is
+selected (see §9 "Async recall telemetry"); enqueue failure is logged and
+never fails the recall response.
+
 Startup recall uses a scoring formula to order items within the budget:
 
 ```text
@@ -621,6 +653,37 @@ Search can be filtered by:
 * review status
 * temporal validity
 * archived status
+
+### Async recall telemetry (ENG-AUD-011 / F18)
+
+Startup recall's read transaction never writes `last_recalled_at` /
+`recall_count` / `startup_recall_count`. After the recall set is selected, a
+`recall.telemetry` job is enqueued (payload: `tenant_id`, `principal_id`,
+`mode`, `recall_log_id`, `item_ids`, `recalled_at`, `request_id`) and applied
+asynchronously by the background worker.
+
+**Idempotency guarantee:** `recall_logs` gains a `telemetry_applied_at`
+column. The worker's claim (`UPDATE recall_logs SET telemetry_applied_at =
+now() WHERE id = :id AND telemetry_applied_at IS NULL`) and the
+per-item counter update run in the *same transaction*, committed together —
+so a retried or redelivered job either applies both exactly once, or (if it
+fails before commit) neither, and the next attempt safely retries. A retry
+that lands after a successful commit finds the claim already set and is a
+pure no-op. This means retries cannot double-increment
+`startup_recall_count`, which the anti-feedback-loop penalty depends on
+being accurate.
+
+Enqueue failure is logged (tenant/request context, no memory content) and
+swallowed — it never fails the recall response; `telemetry_enqueued: false`
+is available for callers/tests that want to observe it. Deleted or expired
+items simply don't match the `UPDATE ... WHERE id IN (...)` and are silently
+skipped; an expired item that still exists gets its counters bumped anyway
+(harmless historical bookkeeping, not an eligibility signal).
+
+Without a worker running, telemetry lags exactly like every other async job
+in this system (embedding generation, classification refinement) — recall
+itself does not depend on these counters being current to return correct
+results.
 
 ---
 

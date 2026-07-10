@@ -43,7 +43,7 @@ Section 8 gives the prioritized roadmap. The one-line version: **P0 = make the r
 | F15 | **P1** | Recall | Default recall is unbounded; `recall_byte_budget` and `quorum_reset_agent_count` config are dead |
 | F16 | **resolved (ENG-AUD-009)** | Storage | Profile registry, variable dimensions, profile indexes, dual-write backfill, validated cutover, and rollback retention implemented |
 | F17 | **resolved (ENG-AUD-010)** | Storage | `chk_kind` replaced by a tenant-scoped `memory_kinds` registry with governed custom kinds and behavior flags |
-| F18 | **P2** | Recall | Scoring loads the entire active corpus into Python; recall is also a write (recall-count updates), blocking read-replica scaling |
+| F18 | **resolved (ENG-AUD-011)** | Recall | Bounded SQL candidate selection replaces full-corpus load; recall-count updates moved to an async job off the read path |
 | F19 | **P2** | Recall | "Relationship-aware recall" is claimed done (README roadmap layer 3) but recall never touches the KG or tunnels |
 | F20 | **P2** | Write path | Sync LLM classification + 6 `DISTINCT` vocabulary scans per unclassified write — **addressed (ENG-AUD-008)** |
 
@@ -227,7 +227,7 @@ There is no way to know whether classification is any good, or whether a rule/pr
 
 **Recency bonus penalizes new memories.** `recency_bonus` derives solely from `last_recalled_at` (`recall.py:82-96`), so a never-recalled item scores 0 on 15% of the formula — a systematic bias *against* fresh memories and toward incumbents, the opposite of what "recency" suggests. Blend in freshness from `valid_from`/`created_at` for never-recalled items (e.g., `recency = max(recall_recency, freshness × 0.5)`); keep the penalty machinery on the recall-driven component only.
 
-**F18 — Recall scalability.** Startup recall fetches *every* active item in scope into Python, scores, sorts, then issues an UPDATE against every returned item (`recall.py:257-363`). Consequences at scale: memory/latency proportional to corpus (not budget); the read path is a write path (write amplification on hot items, and it forecloses serving recall from read replicas — the natural first scaling move for a hosted read-heavy service). Fixes: (a) express the score as a SQL expression (it's a linear formula over columns; the penalty term is computable in SQL) with `ORDER BY score DESC LIMIT k×overfetch`, then budget-pack in Python; (b) decouple recall-signal updates — write them to `recall_logs` only (already done) and fold `recall_count`/`last_recalled_at`/`startup_recall_count` updates into an async batch job or a sampled update. This preserves determinism (same corpus + config ⇒ same output) while removing both cliffs.
+~~**F18 — Recall scalability.** Startup recall fetches *every* active item in scope into Python, scores, sorts, then issues an UPDATE against every returned item.~~ **Resolved (ENG-AUD-011):** startup recall is now a two-stage pipeline — bounded SQL candidate selection (`engram.recall._fetch_startup_candidates`, `ENGRAM_STARTUP_RECALL_CANDIDATE_LIMIT`, default 500 / hard cap 5000, diversified across coarse-score/freshest/highest-importance/least-recently-recalled sub-pools plus a separately-fetched pinned pool so the cap can never displace pinned items) followed by the unchanged detailed Python scorer running only over that bounded set. Recall-count/timestamp updates (`last_recalled_at`, `recall_count`, `startup_recall_count`) are no longer written inline — they are enqueued as a best-effort `recall.telemetry` job, applied by the worker with transactional idempotency (`recall_logs.telemetry_applied_at` claimed together with the item updates in one commit, so retries cannot double-increment). Candidate selection runs over a read-oriented session (`ENGRAM_READ_DATABASE_URL`, falling back to the primary when unset); when a recall's own lazy promotion pass actually promotes rows, that recall's candidate read runs against the primary instead (replication-lag safety). See `docs/design.md` §5/§9 for the full architecture and `tests/test_recall_scaling.py` / `tests/test_recall_telemetry.py` / `scripts/benchmark_startup_recall.py` for verification. F19 (relationship-aware/KG recall) is explicitly untouched by this slice.
 
 ### Recall evals — the moat, unbuilt
 
@@ -299,7 +299,7 @@ The locked decisions (standalone service, Postgres-only, REST core, RLS foundati
 | **P1** | Recall eval harness over `recall_logs`+`feedback_events`; classification golden set + eval script | — | M |
 | **P2** | Extraction endpoint (`/v1/extract`); provider abstraction (Anthropic, OpenAI-compatible, local embeddings) | — | M–L |
 | **P2** | ~~Embedding model registry + per-model storage; kind reference table replacing `chk_kind`~~ **done (ENG-AUD-009, ENG-AUD-010)** | F16, F17 | M |
-| **P2** | SQL-side scoring + async recall-count updates; `tenant_id` on `item_events`; retention jobs | F18 | M |
+| **P2** | ~~SQL-side scoring + async recall-count updates~~ **done (ENG-AUD-011)**; `tenant_id` on `item_events`; retention jobs | F18 | M |
 | **P2** | KG/tunnel 1-hop recall expansion (or correct the claim) | F19 | M |
 | **P2** | TS SDK, HTTP MCP transport, framework recipes, metrics/tracing, published benchmarks | — | L |
 | **P3** | Hosted H0 items not already covered (metering, rate limits); then H1 control plane per §8 | — | L |

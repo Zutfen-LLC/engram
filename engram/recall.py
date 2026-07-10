@@ -2,24 +2,60 @@
 
 Implements the trust-model scoring formula from design.md Section 4.
 Startup recall is deterministic given state — same corpus + config = same output.
+
+Startup recall is a two-stage pipeline (ENG-AUD-011 / F18):
+
+  1. Bounded SQL candidate selection (:func:`_fetch_startup_candidates`) — a
+     coarse, SQL-computed score plus several diversified sub-pools (freshest,
+     highest-importance, least-recently-recalled) select at most
+     ``settings.startup_recall_candidate_limit`` rows, over a read-oriented
+     session. Pinned items are fetched separately so the candidate cap can
+     never displace them.
+  2. Detailed Python scoring (:func:`score_item`) runs only over that bounded
+     candidate set — reasons, warnings, and budget packing are unchanged from
+     the pre-ENG-AUD-011 full-corpus behavior; the only difference is what
+     population is scored.
+
+Recall-signal telemetry (``last_recalled_at``, ``startup_recall_count``,
+``recall_count``) is no longer written inline in the read transaction — it is
+enqueued as a best-effort ``recall.telemetry`` job (see engram/worker.py
+``handle_recall_telemetry``) after the recall set is selected, so a durable
+telemetry-write failure never fails the read.
 """
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import ColumnElement, case, func, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from engram import db as db_module
 from engram import semantic
 from engram.config import settings
 from engram.embeddings import generate_embedding
+from engram.jobs import enqueue_job
 from engram.memory_access import eligibility_expression, resolve_workspace_scope
 from engram.memory_kinds import get_disputed_stay_kind_names
 from engram.models import MemoryItem, RecallLog, TenantConfig
 from engram.promotion import maybe_auto_promote_for_startup_recall
+
+logger = logging.getLogger(__name__)
+
+# Candidate-selection strategy/version identifier, logged alongside
+# scoring_version/config_version for audit reproducibility (requirement 16).
+STARTUP_CANDIDATES_VERSION = "startup-candidates-v1"
+
+# Sub-pool allocation as a fraction of the total candidate limit. Pinned items
+# are fetched separately (not part of this split) so the cap can never
+# displace them. Remainder after coarse/freshest/importance goes to
+# least-recently-recalled, absorbing integer rounding.
+_CANDIDATE_COARSE_FRACTION = 0.60
+_CANDIDATE_FRESHEST_FRACTION = 0.15
+_CANDIDATE_IMPORTANCE_FRACTION = 0.15
 
 
 class ScoreResult:
@@ -180,7 +216,7 @@ async def _fetch_active_items(
     principal_id: str,
     workspace_id: str | None,
 ) -> list[MemoryItem]:
-    """Fetch active, non-expired items for startup recall.
+    """Fetch EVERY active, non-expired, eligible item — the pre-ENG-AUD-011 path.
 
     ``review_status='active'`` items always qualify. Disputed items also
     qualify when their kind is governed with
@@ -190,14 +226,16 @@ async def _fetch_active_items(
     Also enforces the shared tenant/visibility eligibility predicate so a
     principal never sees another principal's private memory, or workspace
     memory from a workspace they aren't a member of.
+
+    NOT used by :func:`execute_startup_recall` anymore — it loads the whole
+    eligible corpus into Python, which is exactly what F18 flags as a
+    scalability cliff. Kept as the reference full-corpus scoring path for
+    scoring-parity tests (requirement 13): compare its output, run through
+    :func:`score_item`, against the bounded pipeline's output on the same
+    fixtures.
     """
     stay_kinds = await get_disputed_stay_kind_names(session, tenant_id)
-    review_status_clause = MemoryItem.review_status == "active"
-    if stay_kinds:
-        review_status_clause = or_(
-            review_status_clause,
-            (MemoryItem.review_status == "disputed") & MemoryItem.kind.in_(stay_kinds),
-        )
+    review_status_clause = _review_status_clause(stay_kinds)
     stmt = select(MemoryItem).where(
         MemoryItem.tenant_id == tenant_id,
         review_status_clause,
@@ -208,6 +246,271 @@ async def _fetch_active_items(
         stmt = stmt.where(MemoryItem.workspace_id == workspace_id)
     result = await session.execute(stmt)
     return list(result.scalars().all())
+
+
+def _review_status_clause(stay_kinds: set[str]) -> ColumnElement[bool]:
+    """Shared active/governed-disputed eligibility clause (see _fetch_active_items)."""
+    clause = MemoryItem.review_status == "active"
+    if stay_kinds:
+        clause = or_(
+            clause,
+            (MemoryItem.review_status == "disputed") & MemoryItem.kind.in_(stay_kinds),
+        )
+    return clause
+
+
+def _coarse_score_expression(
+    config: TenantConfig | None,
+    now: datetime,
+) -> ColumnElement[float]:
+    """SQL-computable approximation of :func:`score_item`, for candidate ranking only.
+
+    Mirrors the Python formula's shape (importance/source_trust/
+    memory_confidence/verified/recency weights, freshness vs. recall-recency
+    max, anti-feedback penalty via ``power()``) using only columns available in
+    SQL. This is candidate retrieval ranking, not the final externally
+    meaningful score — :func:`score_item` remains the sole source of the
+    returned ``score``/``reasons``/``warnings``.
+    """
+    if config is not None:
+        w_importance = config.weight_importance
+        w_source_trust = config.weight_source_trust
+        w_memory_confidence = config.weight_memory_confidence
+        w_recency = config.weight_recency
+        w_verified = config.weight_verified
+        penalty_threshold = config.startup_recall_penalty_threshold
+        penalty_factor = config.startup_recall_penalty_factor
+    else:
+        w_importance = 0.30
+        w_source_trust = 0.25
+        w_memory_confidence = 0.20
+        w_recency = 0.15
+        w_verified = 0.10
+        penalty_threshold = settings.startup_recall_penalty_threshold
+        penalty_factor = settings.startup_recall_penalty_factor
+
+    now_lit = literal(now)
+    seconds_per_day = 86400.0
+
+    freshness_anchor = func.coalesce(MemoryItem.valid_from, MemoryItem.created_at)
+    days_since_anchor = func.extract("epoch", now_lit - freshness_anchor) / seconds_per_day
+    freshness = func.greatest(0.0, 1.0 - days_since_anchor / 30.0) * 0.5
+
+    days_since_recalled = (
+        func.extract("epoch", now_lit - MemoryItem.last_recalled_at) / seconds_per_day
+    )
+    recall_recency_raw = func.greatest(0.0, 1.0 - days_since_recalled / 30.0)
+    excess = func.greatest(MemoryItem.startup_recall_count - penalty_threshold, 0)
+    penalty = func.power(penalty_factor, excess)
+    recall_recency_penalized = func.greatest(
+        recall_recency_raw * penalty, settings.startup_recall_penalty_floor
+    )
+    recall_recency = case(
+        (MemoryItem.last_recalled_at.is_(None), 0.0),
+        else_=recall_recency_penalized,
+    )
+
+    recency = func.greatest(recall_recency, freshness)
+    verified = case((MemoryItem.human_verified.is_(True), 1.0), else_=0.0)
+
+    return (
+        MemoryItem.importance * w_importance
+        + MemoryItem.source_trust * w_source_trust
+        + MemoryItem.memory_confidence * w_memory_confidence
+        + recency * w_recency
+        + verified * w_verified
+    )
+
+
+def _candidate_allocation(candidate_limit: int) -> dict[str, int]:
+    """Split the candidate pool budget across diversified sub-pools.
+
+    Pinned items are fetched separately (not part of this split — see
+    :func:`_fetch_startup_candidates`). Default allocation for a 500-item pool:
+    300 by coarse score, 75 freshest, 75 highest-importance, 50
+    least-recently-recalled — matching the documented example allocation.
+    """
+    coarse = int(candidate_limit * _CANDIDATE_COARSE_FRACTION)
+    freshest = int(candidate_limit * _CANDIDATE_FRESHEST_FRACTION)
+    importance = int(candidate_limit * _CANDIDATE_IMPORTANCE_FRACTION)
+    least_recalled = max(0, candidate_limit - coarse - freshest - importance)
+    return {
+        "coarse": coarse,
+        "freshest": freshest,
+        "importance": importance,
+        "least_recalled": least_recalled,
+    }
+
+
+def _base_candidate_filters(
+    *,
+    tenant_id: str,
+    principal_id: str,
+    workspace_id: str | None,
+    review_status_clause: ColumnElement[bool],
+) -> list[Any]:
+    """Shared WHERE clauses for every candidate sub-query (tenant/eligibility/kind)."""
+    filters: list[Any] = [
+        MemoryItem.tenant_id == tenant_id,
+        review_status_clause,
+        MemoryItem.valid_to.is_(None),
+        eligibility_expression(principal_id),
+    ]
+    if workspace_id is not None:
+        filters.append(MemoryItem.workspace_id == workspace_id)
+    return filters
+
+
+class CandidateStats:
+    """Observability counters for one candidate-selection call (requirement 16)."""
+
+    def __init__(self) -> None:
+        self.pinned_count = 0
+        self.coarse_count = 0
+        self.freshest_count = 0
+        self.importance_count = 0
+        self.least_recalled_count = 0
+        self.deduped_total = 0
+        self.query_count = 0
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "pinned": self.pinned_count,
+            "coarse": self.coarse_count,
+            "freshest": self.freshest_count,
+            "importance": self.importance_count,
+            "least_recalled": self.least_recalled_count,
+            "deduped_total": self.deduped_total,
+            "query_count": self.query_count,
+        }
+
+
+async def _fetch_startup_candidates(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    principal_id: str,
+    workspace_id: str | None,
+    now: datetime,
+    config: TenantConfig | None,
+    candidate_limit: int,
+) -> tuple[list[MemoryItem], CandidateStats]:
+    """Bounded, diversified SQL candidate selection (ENG-AUD-011 / F18 stage 1).
+
+    Runs entirely over ``session`` (expected to be a read-oriented session —
+    see :func:`execute_startup_recall`), issuing a small, fixed number of
+    LIMITed queries regardless of corpus size:
+
+    1. Pinned eligible items, up to ``candidate_limit`` rows — fetched
+       separately from the scored sub-pools so the candidate cap can never
+       displace a pinned item (the final pinned ceiling/budget packing still
+       happens in Python, unchanged).
+    2. Highest coarse-score items (:func:`_coarse_score_expression`).
+    3. Freshest items (by ``valid_from``/``created_at``).
+    4. Highest-importance items.
+    5. Least-recently-recalled (nulls first) items.
+
+    Sub-pools 2-5 are allocated via :func:`_candidate_allocation` and
+    deduplicated by item id before being returned — a candidate ranked highly
+    by more than one signal is scored once. This diversification protects
+    against a bounded coarse-score-only pool accidentally omitting an item
+    that would rank highly under detailed Python scoring (requirement 6).
+    """
+    stats = CandidateStats()
+    stay_kinds = await get_disputed_stay_kind_names(session, tenant_id)
+    stats.query_count += 1
+    review_status_clause = _review_status_clause(stay_kinds)
+    filters = _base_candidate_filters(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        workspace_id=workspace_id,
+        review_status_clause=review_status_clause,
+    )
+
+    # 1. Pinned — bounded by candidate_limit itself (worst case: every eligible
+    #    item is pinned), never by a fraction of it.
+    pinned_stmt = (
+        select(MemoryItem)
+        .where(*filters, MemoryItem.pinned.is_(True))
+        .order_by(
+            (MemoryItem.importance * MemoryItem.source_trust).desc(),
+            MemoryItem.created_at.desc(),
+            MemoryItem.id.asc(),
+        )
+        .limit(candidate_limit)
+    )
+    pinned_result = await session.execute(pinned_stmt)
+    pinned_items = list(pinned_result.scalars().all())
+    stats.pinned_count = len(pinned_items)
+    stats.query_count += 1
+
+    allocation = _candidate_allocation(candidate_limit)
+    not_pinned = MemoryItem.pinned.is_(False)
+
+    coarse_score = _coarse_score_expression(config, now)
+    coarse_stmt = (
+        select(MemoryItem)
+        .where(*filters, not_pinned)
+        .order_by(coarse_score.desc(), MemoryItem.created_at.desc(), MemoryItem.id.asc())
+        .limit(allocation["coarse"])
+    )
+    coarse_result = await session.execute(coarse_stmt)
+    coarse_items = list(coarse_result.scalars().all())
+    stats.coarse_count = len(coarse_items)
+    stats.query_count += 1
+
+    freshness_anchor = func.coalesce(MemoryItem.valid_from, MemoryItem.created_at)
+    freshest_stmt = (
+        select(MemoryItem)
+        .where(*filters, not_pinned)
+        .order_by(freshness_anchor.desc(), MemoryItem.id.asc())
+        .limit(allocation["freshest"])
+    )
+    freshest_result = await session.execute(freshest_stmt)
+    freshest_items = list(freshest_result.scalars().all())
+    stats.freshest_count = len(freshest_items)
+    stats.query_count += 1
+
+    importance_stmt = (
+        select(MemoryItem)
+        .where(*filters, not_pinned)
+        .order_by(
+            MemoryItem.importance.desc(), MemoryItem.created_at.desc(), MemoryItem.id.asc()
+        )
+        .limit(allocation["importance"])
+    )
+    importance_result = await session.execute(importance_stmt)
+    importance_items = list(importance_result.scalars().all())
+    stats.importance_count = len(importance_items)
+    stats.query_count += 1
+
+    least_recalled_stmt = (
+        select(MemoryItem)
+        .where(*filters, not_pinned)
+        .order_by(
+            MemoryItem.last_recalled_at.asc().nulls_first(),
+            MemoryItem.created_at.desc(),
+            MemoryItem.id.asc(),
+        )
+        .limit(allocation["least_recalled"])
+    )
+    least_recalled_result = await session.execute(least_recalled_stmt)
+    least_recalled_items = list(least_recalled_result.scalars().all())
+    stats.least_recalled_count = len(least_recalled_items)
+    stats.query_count += 1
+
+    seen: set[UUID] = set()
+    merged: list[MemoryItem] = []
+    buckets = (pinned_items, coarse_items, freshest_items, importance_items, least_recalled_items)
+    for bucket in buckets:
+        for item in bucket:
+            if item.id in seen:
+                continue
+            seen.add(item.id)
+            merged.append(item)
+    stats.deduped_total = len(merged)
+
+    return merged, stats
 
 
 def _separate_pinned(
@@ -288,17 +591,23 @@ async def execute_startup_recall(
     workspace: str | None,
     byte_budget: int | None,
     token_budget: int | None,
+    *,
+    request_id: str | None = None,
 ) -> dict[str, Any]:
     """Execute startup recall and return the response dict.
 
-    Flow:
-    1. Fetch active items (review_status='active', valid_to IS NULL)
-    2. Separate pinned (bypass, capped) from scored
-    3. Score remaining items by formula, sort descending
-    4. Enforce budget
-    5. Write recall_logs entry
-    6. Increment recall_count, update last_recalled_at
-    7. Return working_set + items with reasons
+    Two-stage pipeline (ENG-AUD-011 / F18 — see module docstring):
+    0. Lazy, bounded promotion pass (write session).
+    1. Bounded SQL candidate selection (read session, unless this call's
+       promotion pass actually promoted rows — see step 1 below).
+    2. Separate pinned (bypass, capped) from scored candidates.
+    3. Score remaining candidates by the detailed formula, sort descending.
+    4. Enforce budget.
+    5. Write the recall_logs audit row (write session — this is audit
+       provenance, not the per-item telemetry counters removed by F18).
+    6. Best-effort enqueue of a ``recall.telemetry`` job to apply
+       last_recalled_at/recall_count/startup_recall_count asynchronously.
+    7. Return working_set + items with reasons.
     """
     now = datetime.now(UTC)
     config = await _get_tenant_config(session, tenant_id)
@@ -319,22 +628,71 @@ async def execute_startup_recall(
     )
 
     # 0. Lazy, bounded, tenant-scoped Path A promotion pass (design.md §3,
-    #    ENG-AUD-007 F11) — runs before active items are selected so an item
+    #    ENG-AUD-007 F11) — runs before candidates are selected so an item
     #    that becomes eligible between recalls can appear in this working set
     #    rather than waiting for the next CLI/admin sweep. Honors
     #    tenant_config.auto_promote_enabled and settings.startup_promotion_limit
-    #    internally; a disabled tenant pays only a single count query.
-    await maybe_auto_promote_for_startup_recall(session, tenant_id, now=now)
+    #    internally; a disabled tenant pays only a single count query. This is
+    #    a write and always runs on the primary session.
+    promotion_result = await maybe_auto_promote_for_startup_recall(session, tenant_id, now=now)
 
-    # 1. Fetch active items
+    # 1. Bounded SQL candidate selection. Promotion consistency policy
+    #    (requirement 12, "preferred conservative behavior"): when this
+    #    recall's own lazy promotion pass actually promoted rows, read
+    #    candidates from the primary/write session so the just-promoted rows
+    #    are guaranteed visible in this recall — a read replica could lag
+    #    behind the promotion write. Otherwise use the read-oriented session
+    #    (a configured replica via ENGRAM_READ_DATABASE_URL, or the primary
+    #    when unset — see engram.db.read_session_factory).
+    candidate_limit = min(
+        settings.startup_recall_candidate_limit,
+        settings.startup_recall_candidate_limit_max,
+    )
+    read_source = "primary"
     if workspace is not None and not workspace_accessible:
-        items: list[MemoryItem] = []
+        candidates: list[MemoryItem] = []
+        candidate_stats = CandidateStats()
+    elif promotion_result.promoted > 0:
+        candidates, candidate_stats = await _fetch_startup_candidates(
+            session,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            workspace_id=workspace_id,
+            now=now,
+            config=config,
+            candidate_limit=candidate_limit,
+        )
     else:
-        items = await _fetch_active_items(session, tenant_id, principal_id, workspace_id)
+        read_source = "replica" if settings.read_database_url else "primary"
+        async with db_module.read_session_factory() as read_session:
+            await db_module.apply_rls_context(
+                read_session, tenant_id=tenant_id, principal_id=principal_id
+            )
+            candidates, candidate_stats = await _fetch_startup_candidates(
+                read_session,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                workspace_id=workspace_id,
+                now=now,
+                config=config,
+                candidate_limit=candidate_limit,
+            )
+
+    logger.info(
+        "startup_recall_candidates tenant=%s mode=startup candidate_limit=%s "
+        "candidates=%s read_source=%s promoted=%s strategy=%s request_id=%s",
+        tenant_id,
+        candidate_limit,
+        candidate_stats.deduped_total,
+        read_source,
+        promotion_result.promoted,
+        STARTUP_CANDIDATES_VERSION,
+        request_id,
+    )
 
     # 2. Separate pinned
     max_pinned = config.max_pinned_tokens if config is not None else settings.max_pinned_tokens
-    pinned_items, scored_items, pinned_omitted = _separate_pinned(items, max_pinned)
+    pinned_items, scored_items, pinned_omitted = _separate_pinned(candidates, max_pinned)
 
     # 3. Score remaining items
     scored_with_results = []
@@ -411,9 +769,13 @@ async def execute_startup_recall(
     item_count = len(all_items)
     byte_count = sum(len(i.content.encode()) for i, _, _, _ in all_items)
 
-    # 6. Write recall_logs
+    # 5. Write recall_logs — audit provenance (what was surfaced under which
+    #    scoring/config version), NOT the per-item telemetry counters. This
+    #    row also doubles as the telemetry job's idempotency claim record
+    #    (RecallLog.telemetry_applied_at) — see engram.worker.handle_recall_telemetry.
     scoring_version = "v1"
     config_version = config.config_version if config is not None else "v1"
+    item_ids = [i.id for i, _, _, _ in all_items]
 
     recall_log = RecallLog(
         tenant_id=tenant_id,
@@ -421,36 +783,69 @@ async def execute_startup_recall(
         mode="startup",
         byte_budget=byte_budget,
         token_budget=token_budget,
-        item_ids=[i.id for i, _, _, _ in all_items],
+        item_ids=item_ids,
         scoring_version=scoring_version,
         config_version=config_version,
     )
     session.add(recall_log)
-
-    # 7. Update recall_count and last_recalled_at
-    item_ids = [i.id for i, _, _, _ in all_items]
-    await session.execute(
-        update(MemoryItem)
-        .where(MemoryItem.id.in_(item_ids))
-        .values(
-            recall_count=MemoryItem.recall_count + 1,
-            startup_recall_count=MemoryItem.startup_recall_count + 1,
-            last_recalled_at=now,
-        )
-    )
-
     await session.commit()
+
+    # 6. Best-effort telemetry enqueue (ENG-AUD-011 / F18 requirement 7/9):
+    #    last_recalled_at/recall_count/startup_recall_count updates run
+    #    asynchronously via a recall.telemetry job instead of inline in this
+    #    transaction. dedupe_key=recall_log.id means a duplicate enqueue (e.g.
+    #    a caller retry racing this same request) resolves to the same job
+    #    rather than double-queuing; the worker's own idempotency guard
+    #    (RecallLog.telemetry_applied_at, claimed transactionally) is what
+    #    actually prevents double-incrementing counters on job retry. Enqueue
+    #    failure is logged and swallowed — it must never fail the read.
+    telemetry_enqueued = False
+    if item_ids:
+        try:
+            await enqueue_job(
+                session,
+                tenant_id=tenant_id,
+                job_type="recall.telemetry",
+                payload={
+                    "tenant_id": str(tenant_id),
+                    "principal_id": str(principal_id),
+                    "mode": "startup",
+                    "recall_log_id": str(recall_log.id),
+                    "item_ids": [str(i) for i in item_ids],
+                    "recalled_at": now.isoformat(),
+                    "request_id": request_id,
+                },
+                dedupe_key=str(recall_log.id),
+            )
+            telemetry_enqueued = True
+        except Exception:
+            logger.exception(
+                "recall_telemetry_enqueue_failed tenant=%s recall_log_id=%s request_id=%s",
+                tenant_id,
+                recall_log.id,
+                request_id,
+            )
 
     return {
         "working_set": working_set,
         "item_count": item_count,
         "byte_count": byte_count,
         "pinned_omitted_count": pinned_omitted,
-        "omitted_count": max(0, len(items) - item_count),
+        "omitted_count": max(0, len(candidates) - item_count),
         "items": response_items,
         "scoring_version": scoring_version,
         "config_version": config_version,
         "recall_log_id": str(recall_log.id),
+        # Observability (requirement 16) — not part of the documented public
+        # response contract (RecallResponse only reads the keys above), but
+        # available to tests/logs/callers that want the bounded-pipeline
+        # counters without re-deriving them from logs.
+        "candidate_count": candidate_stats.deduped_total,
+        "candidate_stats": candidate_stats.as_dict(),
+        "scored_count": len(scored_items),
+        "candidate_strategy_version": STARTUP_CANDIDATES_VERSION,
+        "read_source": read_source,
+        "telemetry_enqueued": telemetry_enqueued,
     }
 
 

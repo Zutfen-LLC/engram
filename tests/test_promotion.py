@@ -104,21 +104,26 @@ def app():
     # session factories. get_current_principal (engram/auth.py) resolves the
     # caller (and, with auth disabled, the default principal) through the OWNER
     # session factory (engram.db.owner_session_factory); the request session uses
-    # async_session_factory. Both are the real app engines, which use a
-    # *connection pool* (pool_size=10). A pooled connection bound to one test's
-    # event loop gets reused by a later test on a different loop → asyncpg
-    # "Future attached to a different loop". Pointing both at the per-test
-    # NullPool factory keeps every connection on the current test's loop.
+    # async_session_factory; startup recall's bounded candidate selection
+    # (ENG-AUD-011) uses read_session_factory. All three are real app engines,
+    # which use a *connection pool* (pool_size=10). A pooled connection bound
+    # to one test's event loop gets reused by a later test on a different loop
+    # → asyncpg "Future attached to a different loop". Pointing all three at
+    # the per-test NullPool factory keeps every connection on the current
+    # test's loop.
     import engram.db as db_module
 
     app = create_app()
     app.dependency_overrides[get_session] = _get_test_session
     real_app_factory = db_module.async_session_factory
     real_owner_factory = db_module.owner_session_factory
+    real_read_factory = db_module.read_session_factory
     db_module.async_session_factory = _test_session_factory
     db_module.owner_session_factory = _test_session_factory
+    db_module.read_session_factory = _test_session_factory
     app.state._engram_real_session_factory = real_app_factory  # type: ignore[attr-defined]
     app.state._engram_real_owner_factory = real_owner_factory  # type: ignore[attr-defined]
+    app.state._engram_real_read_factory = real_read_factory  # type: ignore[attr-defined]
     return app
 
 
@@ -132,6 +137,7 @@ async def client(app):
 
     db_module.async_session_factory = app.state._engram_real_session_factory
     db_module.owner_session_factory = app.state._engram_real_owner_factory
+    db_module.read_session_factory = app.state._engram_real_read_factory
 
 
 @pytest.fixture(autouse=True)

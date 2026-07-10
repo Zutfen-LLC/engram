@@ -47,6 +47,13 @@ cannot cause a cross-tenant leak when the service connects through the app role.
 Migrations and admin commands run as the owner (which bypasses RLS) via
 `ENGRAM_OWNER_DATABASE_URL`.
 
+Optionally, `ENGRAM_READ_DATABASE_URL` (ENG-AUD-011) points startup recall's
+bounded candidate selection at a read replica instead of the primary. Unset
+(the default) falls back to `ENGRAM_DATABASE_URL` — there is no bundled
+read-replica deployment in this repo; this is a hook for operators who add
+one. Writes (promotion, item events, job enqueue, recall telemetry) always
+use the primary connection regardless of this setting.
+
 ---
 
 ## 2. Fresh deployment (Docker Compose) — full walkthrough
@@ -416,9 +423,22 @@ backfill and the retired profile remains intact for rollback. See
 
 The worker drains the `jobs` table and runs the off-request-path work:
 `embedding.generate`, `conflict.check`, `classification.refine`,
-`promotion.path_a`, and `retention.sweep`. It is Postgres-only (no
-Redis/Celery/SQS): workers claim with `FOR UPDATE SKIP LOCKED`, retry failures
-with exponential backoff, and dead-letter after `ENGRAM_JOB_MAX_ATTEMPTS`.
+`promotion.path_a`, `retention.sweep`, and (ENG-AUD-011) `recall.telemetry`. It
+is Postgres-only (no Redis/Celery/SQS): workers claim with
+`FOR UPDATE SKIP LOCKED`, retry failures with exponential backoff, and
+dead-letter after `ENGRAM_JOB_MAX_ATTEMPTS`.
+
+`recall.telemetry` applies startup recall's `last_recalled_at`/`recall_count`/
+`startup_recall_count` updates — moved off the synchronous recall path so
+recall latency/memory no longer scale with corpus size and the read path can
+run through a read-oriented session. Recall itself works correctly without a
+worker running; only these counters (and the anti-feedback-loop penalty they
+drive) lag until a worker processes the queue. Process just that job type
+with:
+
+```bash
+docker compose exec engram-service engram worker --job-type recall.telemetry --once
+```
 
 Claim/lock bookkeeping runs through the table-owning role (cross-tenant queue
 coordination); each job's payload runs through an app-role session scoped to the
