@@ -42,6 +42,14 @@ CREATE_STATEMENTS = [
     )
     """,
     """
+    CREATE TABLE workspace_members (
+        workspace_id TEXT NOT NULL,
+        principal_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        PRIMARY KEY (workspace_id, principal_id)
+    )
+    """,
+    """
     CREATE TABLE memory_items (
         id TEXT PRIMARY KEY,
         tenant_id TEXT NOT NULL,
@@ -192,6 +200,13 @@ async def _seed_base(session: AsyncSession, *, created_at: str) -> None:
             "type": "agent",
             "created_at": created_at,
         },
+    )
+    await session.execute(
+        text(
+            "INSERT INTO workspace_members (workspace_id, principal_id, role) "
+            "VALUES (:workspace_id, :principal_id, 'member')"
+        ),
+        {"workspace_id": WORKSPACE_ID, "principal_id": PRINCIPAL_ID},
     )
 
 

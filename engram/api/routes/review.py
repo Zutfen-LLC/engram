@@ -14,11 +14,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from engram.api.routes.memory import (
     _insert_item_event,
     _now_dt,
-    _require_item,
+    _require_eligible_item,
     _resolve_actor_and_delegation,
+    _resolve_principal,
     _resolve_workspace_id,
 )
 from engram.db import get_session
+from engram.memory_access import eligibility_sql
 from engram.models import MemoryItem
 
 router = APIRouter()
@@ -320,7 +322,10 @@ async def change_review_status(
     body.
     """
     tenant_id = await _resolve_tenant_id(session)
-    item = await _require_item(session, item_id)
+    principal_id, _ = await _resolve_principal(session, tenant_id)
+    item = await _require_eligible_item(
+        session, item_id, tenant_id=tenant_id, principal_id=principal_id
+    )
     actor, on_behalf_of = await _resolve_actor_and_delegation(
         session, tenant_id=tenant_id, requested_on_behalf_of=req.on_behalf_of_principal_id
     )
@@ -344,7 +349,9 @@ async def change_review_status(
         text(f"UPDATE memory_items SET {', '.join(assignments)} WHERE id = :item_id"),
         params,
     )
-    updated = await _require_item(session, item_id)
+    updated = await _require_eligible_item(
+        session, item_id, tenant_id=tenant_id, principal_id=principal_id
+    )
     await session.commit()
     return {"item": updated, "event": event}
 
@@ -365,7 +372,10 @@ async def verify_item(
     audit's spoofing surface explicitly named) and never the item's author.
     """
     tenant_id = await _resolve_tenant_id(session)
-    item = await _require_item(session, item_id)
+    principal_id, _ = await _resolve_principal(session, tenant_id)
+    item = await _require_eligible_item(
+        session, item_id, tenant_id=tenant_id, principal_id=principal_id
+    )
     actor, on_behalf_of = await _resolve_actor_and_delegation(
         session,
         tenant_id=tenant_id,
@@ -397,7 +407,9 @@ async def verify_item(
             "item_id": str(item_id),
         },
     )
-    updated = await _require_item(session, item_id)
+    updated = await _require_eligible_item(
+        session, item_id, tenant_id=tenant_id, principal_id=principal_id
+    )
     await session.commit()
     return {"item": updated, "event": event}
 
@@ -416,23 +428,26 @@ async def resolve_conflict(
     conflict.
     """
     tenant_id = await _resolve_tenant_id(session)
-
-    result = await session.execute(
-        select(MemoryItem).where(MemoryItem.id == item_id)
+    principal_id, _ = await _resolve_principal(session, tenant_id)
+    item_data = await _require_eligible_item(
+        session, item_id, tenant_id=tenant_id, principal_id=principal_id
     )
-    item = result.scalar_one_or_none()
-    if item is None:
-        raise HTTPException(status_code=404, detail="item not found")
-    if item.conflict_resolution_status != "unresolved" or item.conflicts_with_item_id is None:
+    counterpart_id = item_data.get("conflicts_with_item_id")
+    if item_data.get("conflict_resolution_status") != "unresolved" or counterpart_id is None:
         raise HTTPException(
             status_code=422, detail="item has no unresolved conflict to resolve"
         )
+    await _require_eligible_item(
+        session,
+        UUID(str(counterpart_id)),
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+    )
     actor, on_behalf_of = await _resolve_actor_and_delegation(
         session, tenant_id=tenant_id, requested_on_behalf_of=req.on_behalf_of_principal_id
     )
 
-    old_status = item.conflict_resolution_status
-    item.conflict_resolution_status = req.resolution
+    old_status = str(item_data["conflict_resolution_status"])
     resolved_at = func.now()
 
     await session.execute(
@@ -480,6 +495,7 @@ async def bulk_archive(
     just not actively useful).
     """
     tenant_id = await _resolve_tenant_id(session)
+    principal_id, _ = await _resolve_principal(session, tenant_id)
     requested = list(dict.fromkeys(req.item_ids))  # de-dup, preserve order
     if not requested:
         return BulkArchiveResponse(
@@ -487,13 +503,17 @@ async def bulk_archive(
         )
 
     fetch_placeholders: list[str] = []
-    fetch_params: dict[str, Any] = {"tenant_id": str(tenant_id)}
+    fetch_params: dict[str, Any] = {
+        "tenant_id": str(tenant_id),
+        "caller_principal_id": str(principal_id),
+    }
     for i, item_id in enumerate(requested):
         fetch_placeholders.append(f":id{i}")
         fetch_params[f"id{i}"] = str(item_id)
     fetch_sql = text(
         "SELECT id, review_status, principal_id FROM memory_items "
         "WHERE tenant_id = :tenant_id AND "
+        f"{eligibility_sql()} AND "
         f"CAST(id AS TEXT) IN ({', '.join(fetch_placeholders)})"
     )
     rows = (await session.execute(fetch_sql, fetch_params)).all()
@@ -550,4 +570,3 @@ async def bulk_archive(
         skipped=skipped,
         skipped_count=len(skipped),
     )
-

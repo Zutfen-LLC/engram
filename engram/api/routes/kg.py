@@ -11,6 +11,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.db import get_session
+from engram.memory_access import apply_read_eligibility
 from engram.models import KgTriple, MemoryItem
 
 router = APIRouter()
@@ -135,14 +136,15 @@ async def add_triple(
 
     if source_item_id is not None:
         result = await session.execute(
-            select(MemoryItem).where(
-                MemoryItem.id == source_item_id,
-                MemoryItem.tenant_id == tenant_id,
+            apply_read_eligibility(
+                select(MemoryItem).where(MemoryItem.id == source_item_id),
+                tenant_id=tenant_id,
+                principal_id=principal_id,
             )
         )
         existing = result.scalar_one_or_none()
         if existing is None:
-            raise HTTPException(status_code=422, detail="source_item_id not found in this tenant")
+            raise HTTPException(status_code=404, detail="Item not found")
     else:
         item = MemoryItem(
             tenant_id=tenant_id,

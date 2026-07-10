@@ -112,6 +112,13 @@ async def _seed_test_item(session: AsyncSession, tenant_id: str | None = None) -
     if tenant_id is None:
         tid_row = await session.execute(text("SELECT current_setting('app.tenant_id', true)"))
         tenant_id = tid_row.scalar()
+    await session.execute(
+        text(
+            "INSERT INTO workspace_members (workspace_id, principal_id, role) "
+            "VALUES (:ws, :pid, 'member') ON CONFLICT DO NOTHING"
+        ),
+        {"ws": workspace_id, "pid": principal_id},
+    )
     item_id = str(uuid4())
     await session.execute(
         text("""
@@ -277,7 +284,7 @@ async def test_kg_add_triple_nonexistent_source_item(client):
             "source_item_id": str(uuid4()),
         },
     )
-    assert response.status_code == 422
+    assert response.status_code == 404
 
 
 @pytest.mark.asyncio
