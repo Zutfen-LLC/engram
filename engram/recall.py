@@ -10,13 +10,14 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram import semantic
 from engram.config import settings
 from engram.embeddings import generate_embedding
 from engram.memory_access import eligibility_expression, resolve_workspace_scope
+from engram.memory_kinds import get_disputed_stay_kind_names
 from engram.models import MemoryItem, RecallLog, TenantConfig
 from engram.promotion import maybe_auto_promote_for_startup_recall
 
@@ -128,6 +129,8 @@ def score_item(
         warnings.append("low confidence")
     if item.conflict_resolution_status == "unresolved":
         warnings.append("unresolved conflicts")
+    if item.review_status == "disputed":
+        warnings.append("disputed — pending resolution")
 
     return ScoreResult(round(score, 4), reasons, warnings)
 
@@ -179,14 +182,25 @@ async def _fetch_active_items(
 ) -> list[MemoryItem]:
     """Fetch active, non-expired items for startup recall.
 
-    Only review_status='active' and valid_to IS NULL enter startup recall.
+    ``review_status='active'`` items always qualify. Disputed items also
+    qualify when their kind is governed with
+    ``stays_in_recall_when_disputed=True`` (ENG-AUD-010 / F17, design.md
+    §"Disputed high-stakes items") — replaces the doctrine/invariant-string
+    special case the design doc described but that was never implemented.
     Also enforces the shared tenant/visibility eligibility predicate so a
     principal never sees another principal's private memory, or workspace
     memory from a workspace they aren't a member of.
     """
+    stay_kinds = await get_disputed_stay_kind_names(session, tenant_id)
+    review_status_clause = MemoryItem.review_status == "active"
+    if stay_kinds:
+        review_status_clause = or_(
+            review_status_clause,
+            (MemoryItem.review_status == "disputed") & MemoryItem.kind.in_(stay_kinds),
+        )
     stmt = select(MemoryItem).where(
         MemoryItem.tenant_id == tenant_id,
-        MemoryItem.review_status == "active",
+        review_status_clause,
         MemoryItem.valid_to.is_(None),
         eligibility_expression(principal_id),
     )
@@ -358,8 +372,16 @@ async def execute_startup_recall(
     ]
 
     # 5. Build response
+    # Pinned items bypass score_item() entirely, so the disputed warning is
+    # applied here directly (mirrors the same check in score_item's warnings).
     all_items: list[tuple[MemoryItem, float | None, list[str], list[str]]] = [
-        (i, None, [], []) for i in pinned_items
+        (
+            i,
+            None,
+            [],
+            ["disputed — pending resolution"] if i.review_status == "disputed" else [],
+        )
+        for i in pinned_items
     ] + [(i, s, r, w) for i, s, r, w in scored_with_reasons]
 
     working_set_lines = []
@@ -373,6 +395,7 @@ async def execute_startup_recall(
             "id": str(item.id),
             "kind": item.kind,
             "content": item.content,
+            "review_status": item.review_status,
             "score": score,
             "reasons": reasons if reasons else [],
             "warnings": warnings if warnings else [],

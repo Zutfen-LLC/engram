@@ -42,7 +42,7 @@ Section 8 gives the prioritized roadmap. The one-line version: **P0 = make the r
 | F14 | **P1** | Search | `SearchRequest.wing/room/kind` filters are accepted and silently ignored |
 | F15 | **P1** | Recall | Default recall is unbounded; `recall_byte_budget` and `quorum_reset_agent_count` config are dead |
 | F16 | **resolved (ENG-AUD-009)** | Storage | Profile registry, variable dimensions, profile indexes, dual-write backfill, validated cutover, and rollback retention implemented |
-| F17 | **P2** | Storage | `chk_kind` CHECK constraint contradicts "tenant-configurable taxonomy" and omits design kinds (`procedure`, `summary`) |
+| F17 | **resolved (ENG-AUD-010)** | Storage | `chk_kind` replaced by a tenant-scoped `memory_kinds` registry with governed custom kinds and behavior flags |
 | F18 | **P2** | Recall | Scoring loads the entire active corpus into Python; recall is also a write (recall-count updates), blocking read-replica scaling |
 | F19 | **P2** | Recall | "Relationship-aware recall" is claimed done (README roadmap layer 3) but recall never touches the KG or tunnels |
 | F20 | **P2** | Write path | Sync LLM classification + 6 `DISTINCT` vocabulary scans per unclassified write — **addressed (ENG-AUD-008)** |
@@ -192,7 +192,7 @@ There is no way to know whether classification is any good, or whether a rule/pr
 
 *Fix:* per-model dimensioned storage. Practical options: (a) one table per registered model dimension (created by a small registry migration step), or (b) a single table with an untyped `vector` column — pgvector allows this — plus per-model partial HNSW indexes with fixed-dim casts, or (c) `halfvec` for cost. Add `embedding_models` registry (model name, dim, provider, active flag) in `tenant_config` or globally; make read paths select the tenant's active model. This unlocks re-embedding migration (backfill machinery already exists and is good), local models, and Matryoshka-style dimension choices — and it is much cheaper to do before there is hosted data.
 
-**F17 — Kind vocabulary is hard-coded in a CHECK constraint.** `chk_kind` (`001_init.sql:133-136`) contradicts both the design (which lists `procedure` and `summary` as kinds — both rejected by the DB today) and the "tenant-configurable taxonomy" claim (true for wings/rooms, false for kinds). Kinds drive behavior (singleton supersession, disputed-doctrine recall), so a free-for-all is wrong — but the right shape is a `memory_kinds` reference table (global seed + tenant additions, with per-kind behavior flags: `singleton`, `stays_in_recall_when_disputed`, `default_importance`) instead of DDL. `procedure` in particular matters for the coding-agent audience ("how we deploy" is a procedure, not a fact).
+~~**F17 — Kind vocabulary is hard-coded in a CHECK constraint.**~~ **Addressed (ENG-AUD-010):** `chk_kind` is dropped. `memory_items(tenant_id, kind)` is now governed by a composite FK to a tenant-scoped `memory_kinds` registry (`migrations/007_memory_kinds.sql`), with builtin rows (including `procedure` and `summary`) seeded per tenant and behavior flags (`singleton`, `requires_review`, `stays_in_recall_when_disputed`, `default_importance`) replacing the hard-coded `_SINGLETON_KINDS`/`_DEFAULT_KIND_TAXONOMY`/bare `"decision"` string checks. Tenants can add governed custom kinds via `POST /v1/admin/memory-kinds` without a schema migration; disabling a kind blocks new writes/classification without touching existing memories. See `engram/memory_kinds.py` and the PR for the full behavior-flag mapping.
 
 **Scale cliffs to plan for (F18 partially, plus):**
 - `item_events` RLS policy is a correlated `EXISTS` per row (`001_init.sql:484-491`) — denormalize `tenant_id` onto `item_events` (matching every other table) before it matters.
@@ -298,7 +298,7 @@ The locked decisions (standalone service, Postgres-only, REST core, RLS foundati
 | **P1** | Async job queue (embeddings, LLM classify refine, promotion, retention); vocab caching — **done (ENG-AUD-008)** | F20 | M |
 | **P1** | Recall eval harness over `recall_logs`+`feedback_events`; classification golden set + eval script | — | M |
 | **P2** | Extraction endpoint (`/v1/extract`); provider abstraction (Anthropic, OpenAI-compatible, local embeddings) | — | M–L |
-| **P2** | Embedding model registry + per-model storage; kind reference table replacing `chk_kind` | F16, F17 | M |
+| **P2** | ~~Embedding model registry + per-model storage; kind reference table replacing `chk_kind`~~ **done (ENG-AUD-009, ENG-AUD-010)** | F16, F17 | M |
 | **P2** | SQL-side scoring + async recall-count updates; `tenant_id` on `item_events`; retention jobs | F18 | M |
 | **P2** | KG/tunnel 1-hop recall expansion (or correct the claim) | F19 | M |
 | **P2** | TS SDK, HTTP MCP transport, framework recipes, metrics/tracing, published benchmarks | — | L |
@@ -312,7 +312,7 @@ Effort: S ≈ a day, M ≈ days, L ≈ weeks.
 - BL-004 "lazy check on startup recall" — not implemented; correct or implement.
 - README roadmap layer 3 "relationship-aware recall — done" — not implemented.
 - README "Row Level Security is enforced at the Postgres level" — qualify until F3 lands (owner bypass in default deployment).
-- design.md §7 kinds `procedure`/`summary` vs. `chk_kind`.
+- ~~design.md §7 kinds `procedure`/`summary` vs. `chk_kind`~~ — resolved (ENG-AUD-010): both are now seeded builtin kinds in `memory_kinds`.
 
 ---
 

@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.auth import (
@@ -23,8 +24,15 @@ from engram.auth import (
     parse_api_key,
     require_scopes,
 )
+from engram.classification import invalidate_vocab_cache
 from engram.db import get_session
-from engram.models import ApiKey, Tenant, Workspace
+from engram.memory_kinds import (
+    BUILTIN_KIND_NAMES,
+    NAME_PATTERN,
+    invalidate_memory_kind_cache,
+    seed_builtin_kinds,
+)
+from engram.models import ApiKey, MemoryKind, Tenant, Workspace
 from engram.models import Principal as PrincipalModel
 from engram.promotion import auto_promote_proposed_memories, summarize
 
@@ -89,6 +97,58 @@ class ApiKeyOut(BaseModel):
     key: str  # plaintext, shown once
 
 
+class MemoryKindCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    display_name: str = Field(min_length=1, max_length=255)
+    description: str | None = None
+    singleton: bool = False
+    stays_in_recall_when_disputed: bool = False
+    requires_review: bool = False
+    default_importance: float | None = Field(default=None, ge=0.0, le=1.0)
+    sort_order: int = 100
+
+
+class MemoryKindPatch(BaseModel):
+    display_name: str | None = None
+    description: str | None = None
+    enabled: bool | None = None
+    singleton: bool | None = None
+    stays_in_recall_when_disputed: bool | None = None
+    requires_review: bool | None = None
+    default_importance: float | None = Field(default=None, ge=0.0, le=1.0)
+    sort_order: int | None = None
+
+
+class MemoryKindOut(BaseModel):
+    tenant_id: uuid.UUID
+    name: str
+    display_name: str
+    description: str | None
+    is_builtin: bool
+    enabled: bool
+    singleton: bool
+    stays_in_recall_when_disputed: bool
+    requires_review: bool
+    default_importance: float | None
+    sort_order: int
+
+
+def _kind_to_out(kind: MemoryKind) -> MemoryKindOut:
+    return MemoryKindOut(
+        tenant_id=kind.tenant_id,
+        name=kind.name,
+        display_name=kind.display_name,
+        description=kind.description,
+        is_builtin=kind.is_builtin,
+        enabled=kind.enabled,
+        singleton=kind.singleton,
+        stays_in_recall_when_disputed=kind.stays_in_recall_when_disputed,
+        requires_review=kind.requires_review,
+        default_importance=kind.default_importance,
+        sort_order=kind.sort_order,
+    )
+
+
 class PromotionResponse(BaseModel):
     """Result of running auto-promotion Path A for the caller's tenant."""
 
@@ -123,6 +183,11 @@ async def create_tenant(
 ) -> TenantOut:
     tenant = Tenant(name=body.name, slug=body.slug, created_at=datetime.now(UTC))
     session.add(tenant)
+    await session.flush()
+    # Seed the builtin kind registry (ENG-AUD-010 / F17) so the new tenant can
+    # write memory items immediately — memory_items.kind is now FK-governed by
+    # memory_kinds, so a tenant with zero registry rows could write nothing.
+    await seed_builtin_kinds(session, tenant.id)
     await session.commit()
     await session.refresh(tenant)
     return TenantOut(id=tenant.id, name=tenant.name, slug=tenant.slug)
@@ -244,6 +309,124 @@ async def _resolve_tenant_id(session: AsyncSession) -> str:
         # session was constructed without the dependency.
         raise HTTPException(status_code=403, detail="no tenant context")
     return str(tid_str)
+
+
+# --- Memory-kind registry admin (ENG-AUD-010 / F17) --------------------------
+#
+# Actual deletion is unsupported by design (disabling is sufficient — see the
+# module-level docstring and docs/design.md). There is no DELETE endpoint, so
+# "built-in kinds cannot be deleted" and "kinds referenced by existing
+# memories cannot be deleted" hold trivially: nothing can ever be deleted.
+# ``name`` is immutable after creation (not a PATCH field) — enforces "custom
+# kinds cannot be renamed."
+
+
+@router.get(
+    "/admin/memory-kinds",
+    response_model=list[MemoryKindOut],
+    dependencies=[Depends(require_scopes("admin"))],  # noqa: B008
+)
+async def list_memory_kinds(
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> list[MemoryKindOut]:
+    """List every kind (enabled and disabled) governed for the caller's tenant."""
+    tenant_id = await _resolve_tenant_id(session)
+    result = await session.execute(
+        select(MemoryKind)
+        .where(MemoryKind.tenant_id == tenant_id)
+        .order_by(MemoryKind.sort_order.asc(), MemoryKind.name.asc())
+    )
+    return [_kind_to_out(k) for k in result.scalars().all()]
+
+
+@router.post(
+    "/admin/memory-kinds",
+    response_model=MemoryKindOut,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_scopes("admin"))],  # noqa: B008
+)
+async def create_memory_kind(
+    body: MemoryKindCreate,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> MemoryKindOut:
+    """Create a governed tenant custom kind.
+
+    Names use a stable normalized format (``^[a-z][a-z0-9_]{0,63}$``) and may
+    not collide with a reserved built-in kind name. Custom kinds always start
+    ``is_builtin=False`` and are otherwise indistinguishable from built-ins to
+    the write/classification paths — they cannot bypass review, trust, or RLS.
+    """
+    tenant_id = uuid.UUID(await _resolve_tenant_id(session))
+    if not NAME_PATTERN.match(body.name):
+        raise HTTPException(
+            status_code=422,
+            detail="name must match ^[a-z][a-z0-9_]{0,63}$ (lowercase snake_case)",
+        )
+    if body.name in BUILTIN_KIND_NAMES:
+        raise HTTPException(
+            status_code=422, detail=f"{body.name!r} is a reserved built-in kind name"
+        )
+    kind = MemoryKind(
+        tenant_id=tenant_id,
+        name=body.name,
+        display_name=body.display_name,
+        description=body.description,
+        is_builtin=False,
+        enabled=True,
+        singleton=body.singleton,
+        stays_in_recall_when_disputed=body.stays_in_recall_when_disputed,
+        requires_review=body.requires_review,
+        default_importance=body.default_importance,
+        sort_order=body.sort_order,
+    )
+    session.add(kind)
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise HTTPException(
+            status_code=409, detail=f"kind {body.name!r} already exists for this tenant"
+        ) from exc
+    await session.commit()
+    invalidate_memory_kind_cache(tenant_id)
+    invalidate_vocab_cache(tenant_id)
+    return _kind_to_out(kind)
+
+
+@router.patch(
+    "/admin/memory-kinds/{name}",
+    response_model=MemoryKindOut,
+    dependencies=[Depends(require_scopes("admin"))],  # noqa: B008
+)
+async def update_memory_kind(
+    name: str,
+    body: MemoryKindPatch,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> MemoryKindOut:
+    """Edit description/display name/behavior flags, or enable/disable a kind.
+
+    Disabling a kind prevents new writes/classification into it (the write
+    path and classifier vocab both read ``enabled=True`` rows only) but does
+    not touch existing memories of that kind — they remain fully readable.
+    """
+    tenant_id = uuid.UUID(await _resolve_tenant_id(session))
+    kind = (
+        await session.execute(
+            select(MemoryKind).where(MemoryKind.tenant_id == tenant_id, MemoryKind.name == name)
+        )
+    ).scalar_one_or_none()
+    if kind is None:
+        raise HTTPException(status_code=404, detail=f"kind {name!r} not found")
+
+    updates = body.model_dump(exclude_unset=True)
+    for field, value in updates.items():
+        setattr(kind, field, value)
+    kind.updated_at = datetime.now(UTC)
+
+    await session.commit()
+    invalidate_memory_kind_cache(tenant_id)
+    invalidate_vocab_cache(tenant_id)
+    return _kind_to_out(kind)
 
 
 @router.post(

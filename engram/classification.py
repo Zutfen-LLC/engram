@@ -17,17 +17,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.config import settings
+from engram.memory_kinds import DEFAULT_KIND_TAXONOMY as _DEFAULT_KIND_TAXONOMY
+from engram.memory_kinds import get_enabled_memory_kinds
 from engram.models import ClassificationRule, MemoryItem
-
-_DEFAULT_KIND_TAXONOMY = (
-    "fact",
-    "preference",
-    "doctrine",
-    "decision",
-    "invariant",
-    "observation",
-    "diary_entry",
-)
 
 
 class ClassificationResult(BaseModel):
@@ -232,11 +224,16 @@ async def _load_vocab(
     session: AsyncSession,
     tenant_id: UUID,
 ) -> tuple[list[str], list[str], list[str]]:
-    kind_rows = await session.execute(
-        select(MemoryItem.kind)
-        .where(MemoryItem.tenant_id == tenant_id, MemoryItem.kind.is_not(None))
-        .distinct()
+    # Kind taxonomy is the governed registry (ENG-AUD-010 / F17), not a DISTINCT
+    # scan over memory_items.kind or classification_rules.target_kind — those
+    # would let stale/typo'd values leak into the classifier's allowed output.
+    # _DEFAULT_KIND_TAXONOMY is a defensive fallback only, for the pathological
+    # case of a tenant with zero enabled registry rows.
+    registry_kinds = await get_enabled_memory_kinds(session, tenant_id)
+    kinds = sorted({k.name for k in registry_kinds}) if registry_kinds else list(
+        _DEFAULT_KIND_TAXONOMY
     )
+
     wing_rows = await session.execute(
         select(MemoryItem.wing)
         .where(MemoryItem.tenant_id == tenant_id, MemoryItem.wing.is_not(None))
@@ -248,15 +245,6 @@ async def _load_vocab(
         .distinct()
     )
 
-    rule_kind_rows = await session.execute(
-        select(ClassificationRule.target_kind)
-        .where(
-            ClassificationRule.tenant_id == tenant_id,
-            ClassificationRule.enabled.is_(True),
-            ClassificationRule.target_kind.is_not(None),
-        )
-        .distinct()
-    )
     rule_wing_rows = await session.execute(
         select(ClassificationRule.target_wing)
         .where(
@@ -276,11 +264,6 @@ async def _load_vocab(
         .distinct()
     )
 
-    kinds = _merge_vocab(
-        kind_rows.scalars().all(),
-        rule_kind_rows.scalars().all(),
-        _DEFAULT_KIND_TAXONOMY,
-    )
     wings = _merge_vocab(wing_rows.scalars().all(), rule_wing_rows.scalars().all())
     rooms = _merge_vocab(room_rows.scalars().all(), rule_room_rows.scalars().all())
     return kinds, wings, rooms

@@ -28,6 +28,7 @@ from engram.db import get_session
 from engram.embeddings import create_embedding_placeholder, generate_embedding
 from engram.jobs import enqueue_job
 from engram.memory_access import eligibility_sql, resolve_workspace_scope, tenant_sql
+from engram.memory_kinds import UnknownMemoryKindError, require_enabled_memory_kind
 from engram.models import (
     FeedbackEvent,
     ItemEvent,
@@ -39,10 +40,6 @@ from engram.models import (
 from engram.safety import has_secrets
 
 router = APIRouter()
-
-# Kinds with singleton semantics — writing a new item with the same family
-# key supersedes the old one instead of creating a duplicate.
-_SINGLETON_KINDS = {"preference", "invariant"}
 
 # source_type values that default to review_status='active'.
 _ACTIVE_SOURCES = {"manual", "import", "migration"}
@@ -257,13 +254,17 @@ async def _check_supersession(
     kind: str,
     subject_type: str | None,
     subject_id: str | None,
+    *,
+    singleton: bool,
 ) -> UUID | None:
-    """For singleton kinds (preference/invariant), find an existing active item
-    with the same family key and return its ID for supersession.
+    """For singleton kinds (memory_kinds.singleton), find an existing active
+    item with the same family key and return its ID for supersession.
 
     Family key = (tenant, workspace, principal, subject_type, subject_id, kind).
+    ``singleton`` comes from the tenant's kind registry (ENG-AUD-010 / F17)
+    rather than a hard-coded kind-name set.
     """
-    if kind not in _SINGLETON_KINDS:
+    if not singleton:
         return None
 
     stmt = (
@@ -478,7 +479,9 @@ async def remember(
     if kind is None:
         # Synchronous rule-based classification only (ENG-AUD-008 / F20): the
         # OpenAI LLM refinement runs later via an async classification.refine
-        # job, so the request path never blocks on a provider call.
+        # job, so the request path never blocks on a provider call. The
+        # classifier's taxonomy is already the tenant's enabled registry
+        # (engram.memory_kinds), so suggested_kind is always registry-valid.
         classification_result = await classify_rules_only(req.content, tenant_id, session)
         kind = classification_result.suggested_kind
         if wing is None:
@@ -486,11 +489,23 @@ async def remember(
         if room is None:
             room = classification_result.suggested_room
 
+    # 3b. Validate kind against the tenant's governed registry (ENG-AUD-010 /
+    # F17). An explicit caller-supplied kind that is unknown or disabled fails
+    # with a clear 4xx — it is never silently coerced to a default.
+    try:
+        kind_row = await require_enabled_memory_kind(session, tenant_id, kind)
+    except UnknownMemoryKindError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     # 4. Trust defaults from tenant_config.
     source_trust, memory_confidence, review_status = await _resolve_trust_defaults(
         session, tenant_id, req.source_type, principal_type
     )
-    if classification_result is not None and classification_result.suggested_kind == "decision":
+    # The kind's governance flag decides whether a write must begin as
+    # proposed — regardless of whether the kind came from an explicit request
+    # or the classifier (generalizes the old classifier-only
+    # suggested_kind == "decision" special case, ENG-AUD-010 / F17).
+    if kind_row.requires_review:
         review_status = "proposed"
 
     # 4b. Classification → trust/visibility wiring (only when classification ran).
@@ -523,6 +538,7 @@ async def remember(
         kind,
         req.subject_type,
         req.subject_id,
+        singleton=kind_row.singleton,
     )
 
     # 6. Build the memory item.

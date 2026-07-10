@@ -339,6 +339,42 @@ class ClassificationRule(Base):
     )
 
 
+class MemoryKind(Base):
+    """Tenant-governed kind registry entry (ENG-AUD-010 / F17).
+
+    The source of truth for which ``memory_items.kind`` values are valid and
+    what behavior they carry. Behavior flags replace hard-coded kind-name
+    checks: ``singleton`` (supersession), ``requires_review`` (initial
+    review_status), and ``stays_in_recall_when_disputed`` (startup recall
+    inclusion while disputed). Builtin kinds are seeded per tenant; tenants
+    may add governed custom kinds without a schema migration.
+    """
+
+    __tablename__ = "memory_kinds"
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), primary_key=True
+    )
+    name: Mapped[str] = mapped_column(Text, primary_key=True)
+    display_name: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_builtin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    singleton: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    stays_in_recall_when_disputed: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+    requires_review: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    default_importance: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=100, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
 class ApiKey(Base):
     __tablename__ = "api_keys"
 

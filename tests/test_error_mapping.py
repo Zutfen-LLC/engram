@@ -129,20 +129,20 @@ async def _default_tenant_id() -> str:
 # ---- CHECK constraint violations ----
 
 
-async def test_remember_invalid_kind_returns_422_check_violation(client):
-    """`kind` isn't Pydantic-restricted — an unknown value must be caught by
-    the DB CHECK constraint (chk_kind) and mapped to a stable 422, not a 500."""
+async def test_remember_invalid_kind_returns_422(client):
+    """`kind` isn't Pydantic-restricted — an unknown value must be rejected with
+    a clear 422, not a 500. As of ENG-AUD-010, this is caught by application-level
+    registry validation (engram.memory_kinds.require_enabled_memory_kind) before
+    the DB is ever touched, replacing the old chk_kind CHECK constraint."""
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     response = await client.post(
         "/v1/remember",
-        json={"content": "CHECK violation probe content", "kind": "not_a_real_kind"},
+        json={"content": "invalid kind probe content", "kind": "not_a_real_kind"},
     )
     assert response.status_code == 422
     detail = response.json()["detail"]
-    assert isinstance(detail, dict)
-    assert detail["code"] == "check_violation"
-    assert detail["constraint"] == "chk_kind"
+    assert "not_a_real_kind" in str(detail)
 
 
 async def test_admin_principal_invalid_type_returns_422_check_violation(client):

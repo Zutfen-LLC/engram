@@ -408,9 +408,10 @@ async def test_typed_errors_with_structured_detail(
     object (``{message, code, constraint}``), not a plain string — the SDK
     must classify purely on status code and pass the object through as-is."""
     structured_detail = {
-        "message": "request rejected by database constraint (check_violation): chk_kind",
+        "message": "request rejected by database constraint (check_violation): "
+        "principals_type_check",
         "code": "check_violation",
-        "constraint": "chk_kind",
+        "constraint": "principals_type_check",
     }
     rec = _Recorder(status_code=status, payload={"detail": structured_detail})
     async with _client(rec) as client:

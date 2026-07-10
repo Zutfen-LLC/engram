@@ -54,6 +54,7 @@ RLS_TABLES: tuple[str, ...] = (
     "workspaces",
     "principals",
     "jobs",
+    "memory_kinds",
 )
 
 # Representative high-risk tables exercised with real rows below. The full set
