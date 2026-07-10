@@ -70,5 +70,32 @@ class Settings(BaseSettings):
     # if False, low-trust writes defer conflict check to promotion
     conflict_check_on_write: bool = True
 
+    # Background worker / job queue (ENG-AUD-008). The service still works
+    # without a worker running; pending jobs simply queue and semantic recall /
+    # LLM refinement lag until processed.
+    # How often (seconds) a polling worker claims jobs. ``--once`` ignores this.
+    job_poll_interval_seconds: float = 2.0
+    # Default per-job retry ceiling before a job is marked dead (overridable per
+    # enqueue). Matches the jobs.max_attempts column default.
+    job_max_attempts: int = 5
+    # A running job whose locked_at is older than this (seconds) is considered
+    # abandoned (worker crash) and returned to pending on the next reclaim.
+    job_lease_stale_after_seconds: int = 300
+
+    # Classification vocabulary cache (ENG-AUD-008 / F20). In-process TTL cache
+    # so the six DISTINCT vocab scans run at most once per window per tenant.
+    # Set to 0 to disable caching (every classify() rescans — useful in tests).
+    vocab_cache_ttl_seconds: int = 120
+    # Safety cap on the number of cached tenant vocab entries (LRU eviction).
+    vocab_cache_max_tenants: int = 256
+
+    # LLM classification refinement (async, classification.refine jobs).
+    # Blend weight for memory_confidence: candidate = min(source_default,
+    # classifier_confidence); new_confidence blends toward candidate by this.
+    classification_confidence_blend: float = 0.5
+    # Minimum confidence delta before a refine job records a change (idempotency
+    # guard against oscillation). 0.0 applies any improvement.
+    classification_refine_min_delta: float = 0.0
+
 
 settings = Settings()

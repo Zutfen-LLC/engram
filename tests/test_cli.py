@@ -232,3 +232,65 @@ def test_cli_argparse_has_init_db_and_bootstrap():
     # The module exposes the async runners (imported elsewhere, not here).
     assert hasattr(cli_mod, "_run_init_db")
     assert hasattr(cli_mod, "_run_bootstrap_key")
+    # ENG-AUD-008: the worker subcommand is registered.
+    assert hasattr(cli_mod, "_run_worker")
+
+
+# --- worker: --once processes a job and exits 0 (DB-backed) ---------------
+
+
+async def test_cli_worker_once_processes_one_job():
+    """``engram worker --once`` claims/processes at most one job, then exits 0."""
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from engram.cli import _run_worker
+    from engram.config import settings
+    from engram.jobs import enqueue_job
+
+    engine = create_async_engine(settings.database_url, poolclass=NullPool)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+    except Exception:
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+        await engine.dispose()
+        return
+
+    try:
+        async with factory() as session:
+            tenant_id = (
+                await session.execute(text("SELECT id::text FROM tenants WHERE slug = 'default'"))
+            ).scalar_one()
+            # retention.sweep is a documented no-op handler, ideal for a smoke test.
+            await enqueue_job(
+                session,
+                tenant_id=tenant_id,
+                job_type="retention.sweep",
+                payload={},
+            )
+
+        rc = await _run_worker(
+            once=True,
+            session_factory=factory,
+            app_session_factory=factory,
+            worker_id="cli-test",
+        )
+        assert rc == 0
+
+        async with factory() as session:
+            done = (
+                await session.execute(
+                    text(
+                        "SELECT count(*) FROM jobs WHERE job_type = 'retention.sweep' "
+                        "AND status = 'succeeded'"
+                    )
+                )
+            ).scalar_one()
+            assert done == 1
+    finally:
+        async with engine.begin() as conn:
+            await conn.execute(text("DELETE FROM jobs WHERE job_type = 'retention.sweep'"))
+        await engine.dispose()

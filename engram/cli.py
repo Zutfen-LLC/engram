@@ -154,6 +154,53 @@ def main() -> None:
         "are skipped (counted as skipped_failed) to avoid an endless failure loop.",
     )
 
+    worker_parser = sub.add_parser(
+        "worker",
+        help="Run the background job worker. Polls the jobs table and processes "
+        "embedding.generate / conflict.check / classification.refine / "
+        "promotion.path_a / retention.sweep jobs off the request path. The "
+        "service still works without a worker; semantic recall, LLM "
+        "classification refinement, and semantic conflict detection lag until "
+        "jobs are processed.",
+    )
+    worker_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Process at most one job, then exit (exit 0 even if no job was "
+        "available). Without --once the worker polls indefinitely.",
+    )
+    worker_parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=None,
+        help="Seconds between claim attempts (default: ENGRAM_JOB_POLL_INTERVAL_SECONDS).",
+    )
+    worker_parser.add_argument(
+        "--job-type",
+        action="append",
+        default=None,
+        help="Only claim jobs of this type. Repeatable (e.g. "
+        "--job-type embedding.generate --job-type classification.refine). "
+        "Default: every job type.",
+    )
+    worker_parser.add_argument(
+        "--max-jobs",
+        type=int,
+        default=None,
+        help="Stop after processing this many jobs, then exit. Default: run forever.",
+    )
+    worker_parser.add_argument(
+        "--tenant",
+        default=None,
+        help="Informational only — a single worker claims jobs across all tenants. "
+        "Reserved for future tenant-sharded workers.",
+    )
+    worker_parser.add_argument(
+        "--worker-id",
+        default=None,
+        help="Identifier recorded on claimed jobs (default: <hostname>:<pid>).",
+    )
+
     args = parser.parse_args()
     if args.command == "serve":
         import uvicorn
@@ -233,6 +280,18 @@ def main() -> None:
                     dry_run=args.dry_run,
                     fail_fast=args.fail_fast,
                     retry_failed=args.retry_failed,
+                )
+            )
+        )
+    elif args.command == "worker":
+        raise SystemExit(
+            asyncio.run(
+                _run_worker(
+                    once=args.once,
+                    poll_interval=args.poll_interval,
+                    job_types=args.job_type,
+                    max_jobs=args.max_jobs,
+                    worker_id=args.worker_id,
                 )
             )
         )
@@ -690,6 +749,53 @@ async def _run_backfill(
         if provider_disabled:
             return EXIT_PROVIDER_DISABLED
         return 0
+
+
+async def _run_worker(
+    *,
+    once: bool = False,
+    poll_interval: float | None = None,
+    job_types: list[str] | None = None,
+    max_jobs: int | None = None,
+    worker_id: str | None = None,
+    session_factory: Any | None = None,
+    app_session_factory: Any | None = None,
+) -> int:
+    """Run the background job worker.
+
+    Returns 0 on normal completion (``--once`` always returns 0, even when no
+    job was available); nonzero only on fatal setup errors. Ordinary job
+    failures retry/dead-letter without stopping the loop.
+
+    Claim/lock bookkeeping uses the owner session factory (cross-tenant queue
+    coordination via ``FOR UPDATE SKIP LOCKED``); payload processing uses the
+    app-role session factory scoped per-tenant (see engram/worker.py).
+
+    ``session_factory`` / ``app_session_factory`` default to the app's
+    ``owner_session_factory`` / ``async_session_factory``; tests inject their
+    own NullPool factories so the CLI shares the test event loop's engine
+    (avoiding asyncpg cross-loop connection issues).
+    """
+    import os
+    import socket
+
+    from engram.db import async_session_factory as _default_app_factory
+    from engram.db import owner_session_factory as _default_owner_factory
+    from engram.worker import run_worker
+
+    owner_factory = session_factory if session_factory is not None else _default_owner_factory
+    app_factory = app_session_factory if app_session_factory is not None else _default_app_factory
+    wid = worker_id or f"{socket.gethostname()}:{os.getpid()}"
+
+    return await run_worker(
+        worker_id=wid,
+        session_factory=owner_factory,
+        app_session_factory=app_factory,
+        once=once,
+        poll_interval=poll_interval,
+        job_types=job_types,
+        max_jobs=max_jobs,
+    )
 
 
 if __name__ == "__main__":
