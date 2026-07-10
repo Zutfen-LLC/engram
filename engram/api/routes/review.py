@@ -7,7 +7,7 @@ from typing import Any, Literal, NoReturn
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,29 +15,51 @@ from engram.api.routes.memory import (
     _insert_item_event,
     _now_dt,
     _require_item,
+    _resolve_actor_and_delegation,
     _resolve_workspace_id,
 )
 from engram.db import get_session
-from engram.models import ItemEvent, MemoryItem
+from engram.models import MemoryItem
 
 router = APIRouter()
+
+_ACTOR_PRINCIPAL_ID_DEPRECATION = (
+    "Deprecated and ignored — the event actor is always the authenticated "
+    "caller. Use on_behalf_of_principal_id for admin-scoped delegation."
+)
+_ON_BEHALF_OF_DESCRIPTION = (
+    "Admin-only. Records this principal as the represented party in the "
+    "event's audit metadata. Does not change who the event actor is — the "
+    "authenticated caller remains the actor."
+)
 
 
 class ReviewChangeRequest(BaseModel):
     review_status: str  # proposed | active | disputed | rejected | archived
     reason: str | None = None
     review_notes: str | None = None
-    actor_principal_id: UUID | None = None
+    actor_principal_id: UUID | None = Field(
+        default=None, deprecated=True, description=_ACTOR_PRINCIPAL_ID_DEPRECATION
+    )
+    on_behalf_of_principal_id: UUID | None = Field(
+        default=None, description=_ON_BEHALF_OF_DESCRIPTION
+    )
 
 
 class VerifyRequest(BaseModel):
     verified_by: UUID | None = None
     reason: str | None = None
+    on_behalf_of_principal_id: UUID | None = Field(
+        default=None, description=_ON_BEHALF_OF_DESCRIPTION
+    )
 
 
 class ConflictResolution(BaseModel):
     resolution: Literal["accepted", "rejected", "merged"]
     reason: str | None = None
+    on_behalf_of_principal_id: UUID | None = Field(
+        default=None, description=_ON_BEHALF_OF_DESCRIPTION
+    )
 
 
 class ConflictItem(BaseModel):
@@ -87,7 +109,12 @@ class StaleListResponse(BaseModel):
 class BulkArchiveRequest(BaseModel):
     item_ids: list[UUID]
     reason: str | None = None
-    actor_principal_id: UUID | None = None
+    actor_principal_id: UUID | None = Field(
+        default=None, deprecated=True, description=_ACTOR_PRINCIPAL_ID_DEPRECATION
+    )
+    on_behalf_of_principal_id: UUID | None = Field(
+        default=None, description=_ON_BEHALF_OF_DESCRIPTION
+    )
 
 
 class BulkArchiveResponse(BaseModel):
@@ -282,9 +309,21 @@ async def change_review_status(
     req: ReviewChangeRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> dict[str, Any]:
-    """Change review_status (proposed -> active, dispute, etc.). Writes item_event."""
+    """Change review_status (proposed -> active, dispute, etc.). Writes item_event.
+
+    The event actor is always the authenticated caller (never the item's
+    author, and never the deprecated ``actor_principal_id`` request field) —
+    this is what lets the external-dispute predicate
+    (``engram.promotion.has_external_dispute_event``) trust that a
+    ``disputed`` transition genuinely came from a principal other than the
+    item's author, even if the caller supplies the author's id in the request
+    body.
+    """
+    tenant_id = await _resolve_tenant_id(session)
     item = await _require_item(session, item_id)
-    actor = req.actor_principal_id or UUID(str(item["principal_id"]))
+    actor, on_behalf_of = await _resolve_actor_and_delegation(
+        session, tenant_id=tenant_id, requested_on_behalf_of=req.on_behalf_of_principal_id
+    )
     event = await _insert_item_event(
         session,
         item_id=item_id,
@@ -293,6 +332,7 @@ async def change_review_status(
         old_value=item.get("review_status"),
         new_value=req.review_status,
         actor_principal_id=actor,
+        on_behalf_of_principal_id=on_behalf_of,
         reason=req.reason,
     )
     assignments = ["review_status = :review_status"]
@@ -315,8 +355,22 @@ async def verify_item(
     req: VerifyRequest | None = None,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> dict[str, Any]:
-    """Mark item as human-verified."""
+    """Mark item as human-verified.
+
+    ``verified_by`` is a domain field on ``memory_items`` (who verified the
+    item) and is unchanged by this slice — human-only verification and
+    review-transition authorization are later trust-integrity work
+    (V2-BL-003), not this one. The item_events actor is a separate concern:
+    it is always the authenticated caller, never ``verified_by`` (which the
+    audit's spoofing surface explicitly named) and never the item's author.
+    """
+    tenant_id = await _resolve_tenant_id(session)
     item = await _require_item(session, item_id)
+    actor, on_behalf_of = await _resolve_actor_and_delegation(
+        session,
+        tenant_id=tenant_id,
+        requested_on_behalf_of=req.on_behalf_of_principal_id if req else None,
+    )
     now = _now_dt()
     verified_by = req.verified_by if req and req.verified_by else UUID(str(item["principal_id"]))
     reason = req.reason if req else None
@@ -327,18 +381,19 @@ async def verify_item(
         field_name="human_verified",
         old_value=item.get("human_verified"),
         new_value=True,
-        actor_principal_id=verified_by,
+        actor_principal_id=actor,
+        on_behalf_of_principal_id=on_behalf_of,
         reason=reason,
     )
     await session.execute(
         text(
-            "UPDATE memory_items SET human_verified = 1, verified_by = :verified_by, "
+            "UPDATE memory_items SET human_verified = TRUE, verified_by = :verified_by, "
             "verified_at = :verified_at, last_verified_at = :last_verified_at WHERE id = :item_id"
         ),
         {
             "verified_by": str(verified_by),
-            "verified_at": now.isoformat(),
-            "last_verified_at": now.isoformat(),
+            "verified_at": now,
+            "last_verified_at": now,
             "item_id": str(item_id),
         },
     )
@@ -355,10 +410,12 @@ async def resolve_conflict(
 ) -> ConflictResolutionResponse:
     """Resolve a conflict (accept/reject/merge).
 
-    Sets ``conflict_resolution_status`` and writes an ``item_event`` audit row.
-    Returns 422 if the item has no unresolved conflict.
+    Sets ``conflict_resolution_status`` and writes an ``item_event`` audit row
+    whose actor is always the authenticated caller (previously this event was
+    written with no actor at all). Returns 422 if the item has no unresolved
+    conflict.
     """
-    await _resolve_tenant_id(session)
+    tenant_id = await _resolve_tenant_id(session)
 
     result = await session.execute(
         select(MemoryItem).where(MemoryItem.id == item_id)
@@ -370,6 +427,9 @@ async def resolve_conflict(
         raise HTTPException(
             status_code=422, detail="item has no unresolved conflict to resolve"
         )
+    actor, on_behalf_of = await _resolve_actor_and_delegation(
+        session, tenant_id=tenant_id, requested_on_behalf_of=req.on_behalf_of_principal_id
+    )
 
     old_status = item.conflict_resolution_status
     item.conflict_resolution_status = req.resolution
@@ -383,15 +443,16 @@ async def resolve_conflict(
             conflict_resolved_at=resolved_at,
         )
     )
-    session.add(
-        ItemEvent(
-            item_id=item_id,
-            event_type="conflict_resolution",
-            field_name="conflict_resolution_status",
-            old_value=old_status,
-            new_value=req.resolution,
-            reason=req.reason,
-        )
+    await _insert_item_event(
+        session,
+        item_id=item_id,
+        event_type="conflict_resolution",
+        field_name="conflict_resolution_status",
+        old_value=old_status,
+        new_value=req.resolution,
+        actor_principal_id=actor,
+        on_behalf_of_principal_id=on_behalf_of,
+        reason=req.reason,
     )
     await session.commit()
 
@@ -449,9 +510,12 @@ async def bulk_archive(
         else:
             to_archive.append(item_id)
 
+    actor, on_behalf_of = await _resolve_actor_and_delegation(
+        session, tenant_id=tenant_id, requested_on_behalf_of=req.on_behalf_of_principal_id
+    )
+
     for item_id in to_archive:
-        old_status, principal_id = found[str(item_id)]
-        actor = req.actor_principal_id or UUID(str(principal_id))
+        old_status, _principal_id = found[str(item_id)]
         await _insert_item_event(
             session,
             item_id=item_id,
@@ -460,6 +524,7 @@ async def bulk_archive(
             old_value=old_status,
             new_value="archived",
             actor_principal_id=actor,
+            on_behalf_of_principal_id=on_behalf_of,
             reason=req.reason,
         )
 

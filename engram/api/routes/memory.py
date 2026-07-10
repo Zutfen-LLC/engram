@@ -33,7 +33,6 @@ from engram.models import (
     FeedbackEvent,
     ItemEvent,
     MemoryItem,
-    Principal,
     TenantConfig,
     Workspace,
 )
@@ -230,7 +229,15 @@ async def _resolve_principal(
         raise HTTPException(status_code=403, detail="no principal context")
     principal_id = UUID(pid_str)
 
-    result = await session.execute(select(Principal.type).where(Principal.id == principal_id))
+    # Raw SQL (not the ORM UUID column) so this matches regardless of how a
+    # test fixture's SQLite schema happens to store the id string — the ORM's
+    # generic UUID type binds a hex literal on non-Postgres dialects, which
+    # would never match a plain ``str(uuid4())`` seed row. Mirrors the
+    # dual-format lookup already used by ``_fetch_item``.
+    result = await session.execute(
+        text("SELECT type FROM principals WHERE id = :pid OR id = :pid_hex"),
+        {"pid": str(principal_id), "pid_hex": principal_id.hex},
+    )
     ptype = result.scalar_one_or_none()
     if ptype is None:
         raise HTTPException(status_code=403, detail="principal not found")
@@ -954,12 +961,44 @@ class ItemMetadataPatchRequest(BaseModel):
     visibility: str | None = None
     importance: float | None = None
     pinned: bool | None = None
-    actor_principal_id: UUID | None = None
+    actor_principal_id: UUID | None = Field(
+        default=None,
+        deprecated=True,
+        description=(
+            "Deprecated and ignored — the event actor is always the "
+            "authenticated caller. Use on_behalf_of_principal_id for "
+            "admin-scoped delegation."
+        ),
+    )
+    on_behalf_of_principal_id: UUID | None = Field(
+        default=None,
+        description=(
+            "Admin-only. Records this principal as the represented party in "
+            "the event's audit metadata. Does not change who the event "
+            "actor is — the authenticated caller remains the actor."
+        ),
+    )
     reason: str | None = None
 
 
 class MutationAuditRequest(BaseModel):
-    actor_principal_id: UUID | None = None
+    actor_principal_id: UUID | None = Field(
+        default=None,
+        deprecated=True,
+        description=(
+            "Deprecated and ignored — the event actor is always the "
+            "authenticated caller. Use on_behalf_of_principal_id for "
+            "admin-scoped delegation."
+        ),
+    )
+    on_behalf_of_principal_id: UUID | None = Field(
+        default=None,
+        description=(
+            "Admin-only. Records this principal as the represented party in "
+            "the event's audit metadata. Does not change who the event "
+            "actor is — the authenticated caller remains the actor."
+        ),
+    )
     reason: str | None = None
 
 
@@ -1079,6 +1118,75 @@ async def _fetch_kg_facts(session: AsyncSession, item_id: UUID) -> list[dict[str
     return [dict(row) for row in result.mappings().all()]
 
 
+def _encode_delegation_reason(
+    reason: str | None, on_behalf_of_principal_id: UUID | None
+) -> str | None:
+    """Fold admin delegation into the event's ``reason`` column.
+
+    ``item_events`` has no dedicated structured-details column and this slice
+    must not add one (see V2-BL-001), so delegation is carried as a small JSON
+    envelope in ``reason`` — but only when delegation is actually present.
+    With no delegation, ``reason`` is stored exactly as given: full backward
+    compatibility for every existing caller/test. The caller-supplied
+    ``reason`` text is nested under the ``"reason"`` key, so it can never
+    collide with or overwrite the server-set ``on_behalf_of_principal_id`` key
+    at the envelope's top level.
+    """
+    if on_behalf_of_principal_id is None:
+        return reason
+    return json.dumps(
+        {"reason": reason, "on_behalf_of_principal_id": str(on_behalf_of_principal_id)},
+        sort_keys=True,
+    )
+
+
+async def _resolve_actor_and_delegation(
+    session: AsyncSession,
+    *,
+    tenant_id: UUID,
+    requested_on_behalf_of: UUID | None,
+) -> tuple[UUID, UUID | None]:
+    """Resolve the item_events actor and validate any requested delegation.
+
+    The actor is always the authenticated caller (read from the RLS session
+    context established by ``get_session``/``apply_rls_context`` off the
+    resolved auth ``Principal``) — never a request-supplied value, and never
+    the item's own author. This is the single choke point every caller-facing
+    mutation route must go through so a spoofed ``actor_principal_id`` in a
+    request body can never reach an event-write.
+
+    ``requested_on_behalf_of`` is the caller's *explicit* delegation request
+    (``on_behalf_of_principal_id``, distinct from the deprecated/ignored
+    ``actor_principal_id``). Only a caller whose principal ``type='admin'`` —
+    this codebase's existing authority marker for elevated actions (see
+    ``_resolve_trust_defaults`` and ``feedback``'s authority weighting) — may
+    supply one; it must resolve to a principal in the caller's own tenant.
+    Raises 403 (non-admin) or a non-disclosing 404 (missing/cross-tenant
+    principal) *before* any mutation is attempted, so a rejected delegation
+    request never leaves a partial mutation or event committed.
+    """
+    actor_id, actor_type = await _resolve_principal(session, tenant_id)
+    if requested_on_behalf_of is None:
+        return actor_id, None
+    if actor_type != "admin":
+        raise HTTPException(
+            status_code=403, detail="on_behalf_of_principal_id requires admin authority"
+        )
+    represented = await session.execute(
+        text(
+            "SELECT 1 FROM principals WHERE (id = :pid OR id = :pid_hex) AND tenant_id = :tid"
+        ),
+        {
+            "pid": str(requested_on_behalf_of),
+            "pid_hex": requested_on_behalf_of.hex,
+            "tid": str(tenant_id),
+        },
+    )
+    if represented.scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="principal not found")
+    return actor_id, requested_on_behalf_of
+
+
 async def _insert_item_event(
     session: AsyncSession,
     *,
@@ -1087,9 +1195,16 @@ async def _insert_item_event(
     field_name: str | None,
     old_value: Any,
     new_value: Any,
-    actor_principal_id: UUID | None,
+    actor_principal_id: UUID,
     reason: str | None,
+    on_behalf_of_principal_id: UUID | None = None,
 ) -> dict[str, Any]:
+    """Write an ``item_events`` audit row. ``actor_principal_id`` is required —
+    always the authenticated caller (see :func:`_resolve_actor_and_delegation`),
+    never a caller-facing request model. Delegation, when present, is folded
+    into ``reason`` (see :func:`_encode_delegation_reason`); the returned dict
+    reflects the same encoding stored on the row.
+    """
     event = {
         "id": uuid.uuid4(),
         "item_id": item_id,
@@ -1098,7 +1213,7 @@ async def _insert_item_event(
         "old_value": _stringify(old_value),
         "new_value": _stringify(new_value),
         "actor_principal_id": actor_principal_id,
-        "reason": reason,
+        "reason": _encode_delegation_reason(reason, on_behalf_of_principal_id),
         "created_at": _now_dt(),
     }
     await session.execute(insert(ItemEvent).values(**event))
@@ -1218,8 +1333,11 @@ async def update_item_metadata(
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> dict[str, Any]:
     """Update metadata (wing, room, visibility, importance, pinned) — not content."""
+    tenant_id = await _resolve_tenant_id(session)
     item = await _require_item(session, item_id)
-    actor = req.actor_principal_id or UUID(str(item["principal_id"]))
+    actor, on_behalf_of = await _resolve_actor_and_delegation(
+        session, tenant_id=tenant_id, requested_on_behalf_of=req.on_behalf_of_principal_id
+    )
     changes: list[dict[str, Any]] = []
     for field in MUTATION_FIELDS:
         new_value = getattr(req, field)
@@ -1240,6 +1358,7 @@ async def update_item_metadata(
             old_value=change["old"],
             new_value=change["new"],
             actor_principal_id=actor,
+            on_behalf_of_principal_id=on_behalf_of,
             reason=req.reason,
         )
         await session.execute(
@@ -1268,7 +1387,13 @@ async def supersede_item(
     transaction — a failure after expiring the original but before inserting
     the replacement rolls the expiration back.
     """
+    tenant_id = await _resolve_tenant_id(session)
     item = await _require_item(session, item_id)
+    actor, on_behalf_of = await _resolve_actor_and_delegation(
+        session,
+        tenant_id=tenant_id,
+        requested_on_behalf_of=req.on_behalf_of_principal_id if req else None,
+    )
 
     # 1. Lock the original row to serialize concurrent supersedes. FOR UPDATE
     #    is supported by Postgres and a no-op on the SQLite test fixture.
@@ -1323,11 +1448,6 @@ async def supersede_item(
     ):
         if replacement.get(key) is not None:
             replacement[key] = UUID(str(replacement[key]))
-    actor = (
-        req.actor_principal_id
-        if req and req.actor_principal_id
-        else UUID(str(item["principal_id"]))
-    )
     reason = req.reason if req else None
 
     # 4. Expire the original BEFORE inserting the replacement. Setting
@@ -1370,6 +1490,7 @@ async def supersede_item(
         old_value=item.get("superseded_by"),
         new_value=new_id,
         actor_principal_id=actor,
+        on_behalf_of_principal_id=on_behalf_of,
         reason=reason,
     )
     replacement_event = await _insert_item_event(
@@ -1380,6 +1501,7 @@ async def supersede_item(
         old_value=None,
         new_value=item_id,
         actor_principal_id=actor,
+        on_behalf_of_principal_id=on_behalf_of,
         reason=reason,
     )
     old_item = await _require_item(session, item_id)
@@ -1400,13 +1522,14 @@ async def invalidate_item(
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> dict[str, Any]:
     """Mark invalid (set valid_to)."""
+    tenant_id = await _resolve_tenant_id(session)
     item = await _require_item(session, item_id)
-    now = _now_dt()
-    actor = (
-        req.actor_principal_id
-        if req and req.actor_principal_id
-        else UUID(str(item["principal_id"]))
+    actor, on_behalf_of = await _resolve_actor_and_delegation(
+        session,
+        tenant_id=tenant_id,
+        requested_on_behalf_of=req.on_behalf_of_principal_id if req else None,
     )
+    now = _now_dt()
     reason = req.reason if req else None
     event = await _insert_item_event(
         session,
@@ -1416,6 +1539,7 @@ async def invalidate_item(
         old_value=item.get("valid_to"),
         new_value=now,
         actor_principal_id=actor,
+        on_behalf_of_principal_id=on_behalf_of,
         reason=reason,
     )
     await session.execute(
