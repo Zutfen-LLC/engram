@@ -555,7 +555,36 @@ Examples:
 * an architecture decision linked to a deployment invariant
 * a project memory linked to a coding-agent instruction
 
-Tunnels are planned for Phase 1C.
+Implemented (`Tunnel` model, `GET`/`POST /v1/tunnels`) as cross-wing/room
+links: `source_wing`/`source_room` <-> `target_wing`/`target_room`, with an
+optional human-readable `label`. A memory's tunnel membership is any tunnel
+row whose source or target `(wing, room)` matches its own `(wing, room)`; a
+`NULL` room on either side means "the whole wing." Semantic recall's tunnel
+expansion (ENG-AUD-012 / F19, see §9) uses exactly this membership rule to
+pull bounded, deterministic neighboring memories into the working set — see
+"Relationship-aware recall" below.
+
+### Memory edges (ENG-AUD-012 / F19)
+
+`memory_edges` is a typed, directed, depth-1 relationship between two
+concrete `memory_items` rows — distinct from a knowledge graph triple (below),
+which is a free-text subject/predicate/object fact optionally backed by one
+memory item. An edge always links two memory items directly:
+
+```text
+source_item_id: <decision memory>
+target_item_id: <the observation it was derived from>
+edge_type: "derived_from"
+weight: null   # falls back to the static strength map (see §9)
+```
+
+Edge types: `derived_from`, `references`, `explains`, `contradicts`,
+`supports`, `depends_on`, `mentions`. Used by semantic recall's graph
+expansion (ENG-AUD-012 / F19, see §9) to reconstruct the context surrounding
+a semantic hit — the decisions it was derived from, what it contradicts or
+supports. RLS-protected and tenant-scoped like every other table; there is
+no CRUD API in this slice (retrieval only) — rows are written directly by
+whatever process establishes the relationship.
 
 ### Knowledge graph triples
 
@@ -632,6 +661,97 @@ Use cases:
 * "Have we already made a decision about this?"
 * "What did the user say about deployment preferences?"
 * "What are the known gotchas for this repo?"
+
+### Relationship-aware recall (ENG-AUD-012 / F19)
+
+Semantic search finds relevant memories. Relationship expansion reconstructs
+the context *surrounding* them — that is the differentiator this slice adds.
+For example, "what's our deployment policy?" might semantically match one
+memory, but the decision that memory was `derived_from`, the invariant it
+`contradicts`, and its siblings in the same tunnel are usually more valuable
+together than the single closest-matching memory in isolation.
+
+Semantic recall (`mode=semantic`) is a pipeline:
+
+```text
+query
+    -> semantic retrieval          (engram.semantic.search)
+    -> graph expansion             (depth 1, bounded)
+    -> tunnel expansion            (bounded)
+    -> merge (dedupe by id)
+    -> relationship-aware rescoring
+    -> budget packing              (unchanged — byte/token/item budgets)
+    -> response
+```
+
+Implemented in `engram/relationship_recall.py`
+(`expand_recall_candidates`), invoked from
+`engram.recall.execute_semantic_recall` between `semantic.search()` and
+budget enforcement. Startup recall is unaffected — it has no query to anchor
+expansion from.
+
+**Graph expansion.** Uses a new `memory_edges` table: typed, directed,
+depth-1 relationships between two `memory_items` rows (`derived_from`,
+`references`, `explains`, `contradicts`, `supports`, `depends_on`,
+`mentions`). For each of the top `recall_semantic_expansion_seed_limit`
+(default 50) semantic candidates, up to `max_graph_neighbors_per_item`
+(default 5) neighbors are fetched per seed, deterministically ordered by
+edge strength, capped overall at `max_graph_expanded_items` (default 20).
+No recursion — only the original semantic seeds are expanded, never their
+neighbors' neighbors.
+
+**Tunnel expansion.** A memory's tunnel membership is any `tunnels` row
+whose source/target `(wing, room)` matches its own; the tunnel's *other*
+endpoint names the neighboring `(wing, room)` to pull bounded items from
+(a `NULL` room on the tunnel side means "the whole wing"). Each matched
+`(wing, room)` runs its own small `LIMIT` query — no full-wing table scan.
+Capped at `max_tunnel_additions` (default 20) total, `max_tunnel_neighbors_per_item`
+(default 5) per matched location.
+
+**Trust.** Every expanded candidate is re-filtered through the exact same
+predicate direct semantic recall itself uses: tenant scope, `eligibility_expression`
+(private/workspace/tenant/public visibility), active/proposed review status
+(disputed items are excluded, matching semantic recall's own governance),
+and workspace scope when requested. Expansion can only ever *narrow* what a
+graph/tunnel query returns — it is never an eligibility bypass.
+
+**Merge and scoring.** Candidates are deduplicated by id and tagged with
+their origin(s): `semantic`, `graph`, `tunnel`, or a combination
+(`semantic+graph`, `graph+tunnel`). Relationship strength uses edge-type
+weights (`derived_from`=0.9 strong, `references`/`explains`/`supports`/
+`contradicts`/`depends_on`=0.6 medium, `mentions`=0.3 weak — an edge's own
+stored `weight` overrides the static map when set). Final score:
+
+```text
+score = semantic_component * 0.70
+      + relationship_bonus  * 0.15   (strongest incoming edge weight, 0 if none)
+      + tunnel_bonus         * 0.10   (1.0 if tunnel-linked, else 0)
+      + importance_bonus     * 0.05   (item.importance)
+```
+
+`semantic_component` is the item's own semantic score when it was itself a
+semantic hit, or the strongest seed's semantic score when it was reached
+only through expansion — semantic relevance still dominates the blend. A
+highly-connected node cannot dominate recall: `relationship_bonus` uses the
+single strongest edge, not a sum, and every stage above has its own bounded
+cap. The merged, rescored set is truncated to `recall_candidate_ceiling`
+(default 100) before the existing (unchanged) byte/token/item budget packer
+runs — expanded memories compete for budget exactly like direct hits, with
+the same skip-not-break behavior.
+
+**Explainability.** Expanded memories get reasons appended to the existing
+`reasons` array — `"linked via derived_from"`, `'same tunnel "Atlas"'` —
+alongside (or instead of) the semantic `"semantic similarity …"` reason,
+using the same flat-string-list convention as startup/semantic recall.
+
+All limits above are configurable via `ENGRAM_*` settings
+(`engram/config.py`, "Relationship-aware recall" block); none are exposed as
+per-request API parameters, matching the existing pattern for deployment-level
+recall knobs.
+
+Out of scope for this slice (see `docs/plans/engram-mvp-backlog.md`):
+arbitrary/recursive graph traversal, graph visualization, ontology redesign,
+automatic edge generation, graph embeddings, a cache layer.
 
 ### Search
 

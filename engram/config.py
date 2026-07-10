@@ -123,6 +123,32 @@ class Settings(BaseSettings):
     # guard against oscillation). 0.0 applies any improvement.
     classification_refine_min_delta: float = 0.0
 
+    # Relationship-aware recall — graph + tunnel expansion (ENG-AUD-012 / F19).
+    # Semantic recall expands its top candidates via depth-1 graph edges and
+    # tunnel membership before rescoring/budget packing (see
+    # engram.relationship_recall). All limits below are deployment-level
+    # safety caps, not part of the public recall API.
+    relationship_expansion_enabled: bool = True
+    # How many of the top semantic candidates are used as expansion seeds.
+    # Protects the pipeline from expanding a huge unbounded semantic result.
+    recall_semantic_expansion_seed_limit: int = 50
+    # Per-seed neighbor caps — a single highly-connected node cannot dominate
+    # recall (requirement 11: "avoid relationship explosions").
+    max_graph_neighbors_per_item: int = 5
+    max_tunnel_neighbors_per_item: int = 5
+    # Overall additions from each expansion stage, after eligibility filtering.
+    max_graph_expanded_items: int = 20
+    max_tunnel_additions: int = 20
+    # Ceiling on the merged (semantic + graph + tunnel) candidate set before
+    # relationship-aware rescoring and budget packing.
+    recall_candidate_ceiling: int = 100
+    # Relationship-aware scoring weights (requirement 6). Semantic relevance
+    # must dominate — relationship/tunnel bonuses stay intentionally modest.
+    relationship_score_weight_semantic: float = 0.70
+    relationship_score_weight_relationship: float = 0.15
+    relationship_score_weight_tunnel: float = 0.10
+    relationship_score_weight_importance: float = 0.05
+
     # Promotion (Path A auto-promotion, ENG-AUD-007)
     # Hard cap on proposed items scanned per lazy startup-recall promotion pass
     # (POST /v1/recall mode=startup) — keeps startup recall bounded regardless

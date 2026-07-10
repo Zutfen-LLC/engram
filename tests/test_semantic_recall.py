@@ -197,7 +197,7 @@ async def test_semantic_recall_returns_best_match(client, monkeypatch):
     assert "score" in body["items"][0]
     # recall_log_id present, scoring_version reflects semantic mode
     assert body["recall_log_id"]
-    assert body["scoring_version"] == "semantic-v2"
+    assert body["scoring_version"] == "semantic-v3"
     assert body["config_version"]
     # working_set rendered one line per item
     assert "semantic target" in body["working_set"]
@@ -519,7 +519,7 @@ async def test_semantic_recall_writes_recall_log(client, monkeypatch):
 
     assert row.mode == "semantic"
     assert row.query == "semantic query"
-    assert row.scoring_version == "semantic-v2"
+    assert row.scoring_version == "semantic-v3"
     assert row.config_version is not None
     assert row.n_items == 1
 
