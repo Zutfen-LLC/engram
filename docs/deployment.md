@@ -386,13 +386,21 @@ semantic recall/search is disabled. To enable:
    ENGRAM_OPENAI_API_KEY=sk-...
    ```
 2. Restart: `docker compose up -d`.
-3. Backfill embeddings for existing memories:
+3. Inspect the seeded legacy active profile, enqueue its backfill, and run workers:
    ```bash
-   docker compose exec engram-service engram backfill-embeddings
+   docker compose exec engram-service engram embedding-profiles list
+   docker compose exec engram-service engram backfill-embeddings \
+     --profile openai:text-embedding-3-small:1536
+   docker compose exec engram-service engram worker \
+     --job-type embedding.generate --max-jobs 1000
    ```
 
 OpenAI credentials are **not** required for the deployment smoke tests in this
 guide. See `engram backfill-embeddings --help` for batching/retry options.
+For a model change, create a candidate profile, ensure its index, backfill it,
+inspect coverage, then activate it. New writes are dual-written during the
+backfill and the retired profile remains intact for rollback. See
+`docs/embeddings.md` for the complete workflow.
 
 > **ENG-AUD-008 — async write path.** As of this change, `/v1/remember` no
 > longer calls the embedding provider inline: it creates the embedding

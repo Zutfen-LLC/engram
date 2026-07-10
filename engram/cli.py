@@ -58,9 +58,7 @@ def main() -> None:
         "for manual insertion into api_keys. Prefer `bootstrap-key` or the "
         "admin API for normal key creation.",
     )
-    key_parser.add_argument(
-        "--label", default=None, help="Optional label for the key"
-    )
+    key_parser.add_argument("--label", default=None, help="Optional label for the key")
 
     bootstrap_parser = sub.add_parser(
         "bootstrap-key",
@@ -76,8 +74,7 @@ def main() -> None:
     bootstrap_parser.add_argument(
         "--scopes",
         default="read,write,admin,export",
-        help="Comma-separated scopes for the bootstrap key "
-        "(default: read,write,admin,export).",
+        help="Comma-separated scopes for the bootstrap key (default: read,write,admin,export).",
     )
     bootstrap_parser.add_argument(
         "--database-url",
@@ -153,6 +150,35 @@ def main() -> None:
         help="Re-attempt rows previously marked 'failed'. By default failed rows "
         "are skipped (counted as skipped_failed) to avoid an endless failure loop.",
     )
+    backfill_parser.add_argument(
+        "--profile",
+        default=None,
+        help="Target profile key. Uses queue-backed profile backfill (recommended).",
+    )
+    backfill_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-enqueue already-ready rows for --profile.",
+    )
+
+    profiles_parser = sub.add_parser(
+        "embedding-profiles", help="Manage deployment-global embedding profiles."
+    )
+    profiles_sub = profiles_parser.add_subparsers(dest="profiles_command", required=True)
+    profiles_sub.add_parser("list", help="List profiles and coverage.")
+    create_profile = profiles_sub.add_parser("create", help="Create a candidate profile.")
+    create_profile.add_argument("--key", required=True)
+    create_profile.add_argument("--provider", required=True)
+    create_profile.add_argument("--model", required=True)
+    create_profile.add_argument("--dimensions", required=True, type=int)
+    ensure_profile = profiles_sub.add_parser("ensure-index", help="Ensure its HNSW index.")
+    ensure_profile.add_argument("profile_key")
+    activate_profile_parser = profiles_sub.add_parser("activate", help="Activate a profile.")
+    activate_profile_parser.add_argument("profile_key")
+    activate_profile_parser.add_argument("--force", action="store_true")
+    activate_profile_parser.add_argument("--threshold", type=float, default=None)
+    retire_profile_parser = profiles_sub.add_parser("retire", help="Retire a candidate profile.")
+    retire_profile_parser.add_argument("profile_key")
 
     worker_parser = sub.add_parser(
         "worker",
@@ -254,9 +280,7 @@ def main() -> None:
         db_url = args.database_url or settings.owner_database_url or settings.database_url
         raise SystemExit(
             asyncio.run(
-                _run_bootstrap_key(
-                    db_url, label=args.label, scopes=args.scopes, force=args.force
-                )
+                _run_bootstrap_key(db_url, label=args.label, scopes=args.scopes, force=args.force)
             )
         )
     elif args.command == "promote-proposed":
@@ -271,6 +295,14 @@ def main() -> None:
                 f"--batch-size must be <= {MAX_PROVIDER_BATCH_SIZE} "
                 "(provider per-request input limit)"
             )
+        if args.profile is not None:
+            raise SystemExit(
+                asyncio.run(
+                    _run_profile_backfill(
+                        args.profile, tenant_id=args.tenant, limit=args.limit, force=args.force
+                    )
+                )
+            )
         raise SystemExit(
             asyncio.run(
                 _run_backfill(
@@ -283,6 +315,8 @@ def main() -> None:
                 )
             )
         )
+    elif args.command == "embedding-profiles":
+        raise SystemExit(asyncio.run(_run_embedding_profiles(args)))
     elif args.command == "worker":
         raise SystemExit(
             asyncio.run(
@@ -314,8 +348,7 @@ def select_baseline_targets(all_names: list[str], baseline: str) -> list[str]:
         return list(all_names)
     if baseline not in all_names:
         raise ValueError(
-            f"--baseline cutoff {baseline!r} not found in migrations "
-            f"({', '.join(all_names)})"
+            f"--baseline cutoff {baseline!r} not found in migrations ({', '.join(all_names)})"
         )
     index = all_names.index(baseline)
     return list(all_names[: index + 1])
@@ -357,8 +390,7 @@ async def _run_init_db(
     try:
         await conn.execute(SCHEMA_MIGRATIONS_DDL)
         applied = {
-            row["filename"]
-            for row in await conn.fetch("SELECT filename FROM schema_migrations")
+            row["filename"] for row in await conn.fetch("SELECT filename FROM schema_migrations")
         }
         files = discover_migrations(directory) if directory is not None else discover_migrations()
         names = [migration_filename(f) for f in files]
@@ -415,8 +447,7 @@ async def _run_init_db(
             )
             if core_exists:
                 print(
-                    "ERROR: the 'memory_items' table already exists but no "
-                    "migrations are tracked.",
+                    "ERROR: the 'memory_items' table already exists but no migrations are tracked.",
                     file=sys.stderr,
                 )
                 print(
@@ -567,8 +598,7 @@ async def _run_bootstrap_key(
             return 1
 
         existing = await conn.fetchval(
-            "SELECT COUNT(*) FROM api_keys "
-            "WHERE principal_id = $1::uuid AND revoked_at IS NULL",
+            "SELECT COUNT(*) FROM api_keys WHERE principal_id = $1::uuid AND revoked_at IS NULL",
             row["principal_id"],
         )
         if existing and not force:
@@ -749,6 +779,135 @@ async def _run_backfill(
         if provider_disabled:
             return EXIT_PROVIDER_DISABLED
         return 0
+
+
+async def _run_profile_backfill(
+    profile_key: str,
+    *,
+    tenant_id: str | None = None,
+    limit: int | None = None,
+    force: bool = False,
+    session_factory: Any | None = None,
+) -> int:
+    """Enqueue profile-specific backfill work without provider calls."""
+    from engram.db import owner_session_factory as default_factory
+    from engram.embedding_profiles import enqueue_profile_backfill, get_profile
+
+    factory = session_factory or default_factory
+    async with factory() as session:
+        profile = await get_profile(session, profile_key)
+        result = await enqueue_profile_backfill(
+            session, profile, tenant_id=tenant_id, limit=limit, force=force
+        )
+        print(
+            f"profile={profile.profile_key} eligible={result.eligible} "
+            f"already_ready={result.already_ready} pending={result.pending} "
+            f"failed={result.failed} enqueued={result.enqueued} "
+            f"skipped_expired_rejected={result.skipped_expired_rejected}"
+        )
+    return 0
+
+
+async def _run_embedding_profiles(
+    args: argparse.Namespace,
+    *,
+    session_factory: Any | None = None,
+    owner_engine: Any | None = None,
+) -> int:
+    from sqlalchemy import func, select
+
+    from engram.config import settings
+    from engram.db import owner_engine as default_engine
+    from engram.db import owner_session_factory as default_factory
+    from engram.embedding_profiles import (
+        MAX_WRITABLE_PROFILES,
+        activate_profile,
+        calculate_coverage,
+        ensure_profile_index,
+        get_profile,
+        retire_profile,
+        validate_profile,
+    )
+    from engram.models import EmbeddingProfile
+
+    factory = session_factory or default_factory
+    engine = owner_engine or default_engine
+    async with factory() as session:
+        command = args.profiles_command
+        if command == "list":
+            profiles = list(
+                (
+                    await session.execute(
+                        select(EmbeddingProfile).order_by(EmbeddingProfile.created_at)
+                    )
+                ).scalars()
+            )
+            for profile in profiles:
+                coverage = await calculate_coverage(session, profile)
+                print(
+                    f"{profile.profile_key} provider={profile.provider} model={profile.model} "
+                    f"dimensions={profile.dimensions} state={profile.state} "
+                    f"index={profile.index_status}:{profile.index_name or '-'} "
+                    f"coverage={coverage.percentage:.2f}% "
+                    f"ready={coverage.ready}/{coverage.total_eligible} "
+                    f"pending={coverage.pending} failed={coverage.failed} "
+                    f"missing={coverage.missing}"
+                )
+            return 0
+        if command == "create":
+            writable = int(
+                (
+                    await session.execute(
+                        select(func.count())
+                        .select_from(EmbeddingProfile)
+                        .where(EmbeddingProfile.state.in_(("active", "candidate")))
+                    )
+                ).scalar_one()
+            )
+            if writable >= MAX_WRITABLE_PROFILES:
+                raise ValueError(f"maximum writable profile count is {MAX_WRITABLE_PROFILES}")
+            profile = EmbeddingProfile(
+                profile_key=args.key,
+                provider=args.provider,
+                model=args.model,
+                dimensions=args.dimensions,
+                distance_metric="cosine",
+                state="candidate",
+                index_status="missing",
+                profile_metadata={},
+            )
+            validate_profile(profile)
+            session.add(profile)
+            await session.commit()
+            print(f"created candidate profile {profile.profile_key} ({profile.id})")
+            return 0
+        profile = await get_profile(session, args.profile_key)
+        if command == "ensure-index":
+            await session.commit()
+            name = await ensure_profile_index(engine, profile.id)
+            print(f"profile={profile.profile_key} index=ready:{name}")
+            return 0
+        if command == "activate":
+            threshold = (
+                args.threshold
+                if args.threshold is not None
+                else settings.embedding_activation_coverage_threshold
+            )
+            if args.force:
+                print(
+                    "WARNING: forcing embedding profile activation below coverage threshold",
+                    file=sys.stderr,
+                )
+            coverage = await activate_profile(
+                session, profile, threshold=threshold, force=args.force
+            )
+            print(f"activated {profile.profile_key}; coverage={coverage.percentage:.2f}%")
+            return 0
+        if command == "retire":
+            await retire_profile(session, profile)
+            print(f"retired {profile.profile_key}; vectors and index retained")
+            return 0
+    return 1
 
 
 async def _run_worker(

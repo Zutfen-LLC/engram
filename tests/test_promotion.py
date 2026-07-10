@@ -1100,7 +1100,7 @@ async def _insert_embedding(
             text(
                 "INSERT INTO memory_embeddings (id, memory_item_id, tenant_id, "
                 "embedding_model, embedding_dim, embedding, embedding_status) "
-                "VALUES (:id, :item_id, :tid, :model, :dim, :embedding, 'complete')"
+                "VALUES (:id, :item_id, :tid, :model, :dim, :embedding, 'ready')"
             ),
             {
                 "id": str(uuid.uuid4()),

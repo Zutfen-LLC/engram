@@ -12,14 +12,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.config import settings
-from engram.models import MemoryEmbedding, MemoryItem
+from engram.embedding_profiles import LEGACY_MODEL
+from engram.models import EmbeddingProfile, MemoryEmbedding, MemoryItem
 
 log = logging.getLogger(__name__)
 
 # Single source of truth for the embedding model name. The write path, the
 # semantic-search read path, and conflict detection all key off this so an
 # embedding written by one path is queryable by the others.
-EMBEDDING_MODEL = "text-embedding-3-small"
+EMBEDDING_MODEL = LEGACY_MODEL
 
 # Back-compat alias for existing ``from engram.embeddings import _EMBEDDING_MODEL``
 # imports (memory routes, semantic.py, conflicts.py). New code should use
@@ -38,17 +39,22 @@ STATUS_READY = "ready"
 STATUS_FAILED = "failed"
 
 
-async def generate_embeddings(texts: list[str]) -> list[list[float] | None]:
+async def generate_embeddings(
+    texts: list[str], profile: EmbeddingProfile | None = None
+) -> list[list[float] | None]:
     """Generate embedding vectors for a batch of ``texts`` in one provider call.
 
     Returns one vector per input text, in input order. When the provider is
     ``none`` every entry is ``None``. Provider call errors propagate to the
     caller; the backfill batches so a single failed call only fails its batch.
     """
-    if settings.embedding_provider == "none":
+    provider = profile.provider if profile is not None else settings.embedding_provider
+    model = profile.model if profile is not None else EMBEDDING_MODEL
+    dimensions = profile.dimensions if profile is not None else settings.embedding_dim
+    if provider == "none" or settings.embedding_provider == "none":
         return [None] * len(texts)
-    if settings.embedding_provider != "openai":
-        raise ValueError(f"unsupported embedding provider: {settings.embedding_provider!r}")
+    if provider != "openai":
+        raise ValueError(f"unsupported embedding provider: {provider!r}")
 
     try:
         from openai import AsyncOpenAI
@@ -58,27 +64,46 @@ async def generate_embeddings(texts: list[str]) -> list[list[float] | None]:
         ) from exc
 
     client = AsyncOpenAI(api_key=settings.openai_api_key)
-    response = await client.embeddings.create(model=_EMBEDDING_MODEL, input=texts)
+    response = await client.embeddings.create(model=model, input=texts, dimensions=dimensions)
     # The API returns exactly one embedding per input, in input order.
-    return [[float(value) for value in item.embedding] for item in response.data]
+    vectors: list[list[float] | None] = [
+        [float(value) for value in item.embedding] for item in response.data
+    ]
+    for vector in vectors:
+        if vector is None:
+            continue
+        if len(vector) != dimensions:
+            raise ValueError(
+                f"embedding provider returned dimension {len(vector)}; expected {dimensions} "
+                f"for profile {profile.profile_key if profile else model}"
+            )
+    return vectors
 
 
-async def generate_embedding(text: str) -> list[float] | None:
+async def generate_embedding(
+    text: str, profile: EmbeddingProfile | None = None
+) -> list[float] | None:
     """Generate an embedding vector for ``text`` or return ``None`` when disabled."""
-    return (await generate_embeddings([text]))[0]
+    return (await generate_embeddings([text], profile))[0]
 
 
 async def create_embedding_placeholder(
     session: AsyncSession,
     memory_item_id: uuid.UUID,
     tenant_id: uuid.UUID,
+    profile: EmbeddingProfile | None = None,
 ) -> MemoryEmbedding:
     """Insert a pending memory_embeddings row to be updated once the vector is ready."""
+    if profile is None:
+        from engram.embedding_profiles import get_active_profile
+
+        profile = await get_active_profile(session)
     placeholder = MemoryEmbedding(
         memory_item_id=memory_item_id,
         tenant_id=tenant_id,
-        embedding_model=_EMBEDDING_MODEL,
-        embedding_dim=settings.embedding_dim,
+        profile_id=profile.id,
+        embedding_model=profile.model,
+        embedding_dim=profile.dimensions,
         embedding=None,
         embedding_status=STATUS_PENDING,
     )
@@ -312,14 +337,21 @@ async def backfill_embeddings(
     # ---- Real run with provider enabled: streamed, batched embedding ------------
     eff_batch = max(1, batch_size)
     await _stream_pending(
-        session, tenant_id,
-        batch_size=eff_batch, max_rows=would_populate,
-        retry_failed=retry_failed, result=result, fail_fast=fail_fast,
+        session,
+        tenant_id,
+        batch_size=eff_batch,
+        max_rows=would_populate,
+        retry_failed=retry_failed,
+        result=result,
+        fail_fast=fail_fast,
     )
     await _stream_missing(
-        session, tenant_id,
-        batch_size=eff_batch, max_rows=would_create,
-        result=result, fail_fast=fail_fast,
+        session,
+        tenant_id,
+        batch_size=eff_batch,
+        max_rows=would_create,
+        result=result,
+        fail_fast=fail_fast,
     )
     await session.commit()
     return result
@@ -605,9 +637,7 @@ async def _embed_batch(
         if content is None:
             # Parent item vanished mid-run (deleted, RLS). Record and move on.
             if fail_fast:
-                raise RuntimeError(
-                    f"memory_item {emb.memory_item_id} not found during backfill"
-                )
+                raise RuntimeError(f"memory_item {emb.memory_item_id} not found during backfill")
             _mark_failed(emb, result)
         else:
             to_embed.append((emb, content))

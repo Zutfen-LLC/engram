@@ -375,7 +375,7 @@ async def _keyword_search(
             mi.valid_to,
             ts_rank_cd(mi.content_tsv, plainto_tsquery('english', :query)) AS score
         FROM memory_items mi
-        WHERE {' AND '.join(clauses)}
+        WHERE {" AND ".join(clauses)}
         ORDER BY score DESC, mi.created_at DESC
         LIMIT :limit
         """
@@ -403,6 +403,7 @@ def _format_semantic_result(row: dict[str, Any]) -> dict[str, Any]:
             "trust_score": row.get("trust_score"),
             "embedding_model": row.get("embedding_model"),
             "embedding_dim": row.get("embedding_dim"),
+            "embedding_profile": row.get("embedding_profile"),
         },
     )
 
@@ -432,6 +433,8 @@ def _rrf_fuse(
             entry["embedding_model"] = result["embedding_model"]
         if "embedding_dim" not in entry and "embedding_dim" in result:
             entry["embedding_dim"] = result["embedding_dim"]
+        if "embedding_profile" not in entry and "embedding_profile" in result:
+            entry["embedding_profile"] = result["embedding_profile"]
     return sorted(
         fused.values(),
         key=lambda item: (
@@ -582,8 +585,10 @@ async def remember(
             deduped_existing_id=existing_id,
         )
 
-    provider = "caller" if classification_result is None else classification_result.provenance.get(
-        "provider", "rule"
+    provider = (
+        "caller"
+        if classification_result is None
+        else classification_result.provenance.get("provider", "rule")
     )
     provenance_payload: dict[str, Any] = {
         "source": "explicit_kind" if classification_result is None else "auto_classified",
@@ -644,15 +649,24 @@ async def remember(
     # conflict.check job that runs the now-embedding-dependent semantic dedup /
     # auto-supersede / contradiction detection as eventual state transitions.
     if settings.embedding_provider != "none":
-        await create_embedding_placeholder(session, item.id, tenant_id)
+        from engram.embedding_profiles import get_writable_profiles
+
+        profiles = await get_writable_profiles(session)
+        for profile in profiles:
+            await create_embedding_placeholder(session, item.id, tenant_id, profile)
         await session.flush()
-        await enqueue_job(
-            session,
-            tenant_id=tenant_id,
-            job_type="embedding.generate",
-            payload={"memory_item_id": str(item.id)},
-            dedupe_key=f"embedding:{item.id}",
-        )
+        for profile in profiles:
+            await enqueue_job(
+                session,
+                tenant_id=tenant_id,
+                job_type="embedding.generate",
+                payload={
+                    "memory_item_id": str(item.id),
+                    "profile_id": str(profile.id),
+                    "profile_key": profile.profile_key,
+                },
+                dedupe_key=f"embedding.generate:{item.id}:{profile.id}",
+            )
 
     await session.commit()
 
@@ -761,7 +775,15 @@ async def search(
         )
         return SearchResponse(results=results, total=len(results))
 
-    query_embedding = await generate_embedding(req.query)
+    import inspect
+
+    from engram.embedding_profiles import get_active_profile
+
+    active_profile = await get_active_profile(session)
+    if len(inspect.signature(generate_embedding).parameters) >= 2:
+        query_embedding = await generate_embedding(req.query, active_profile)
+    else:
+        query_embedding = await generate_embedding(req.query)
     semantic_count = await semantic.candidate_count(
         session,
         tenant_id=tenant_id,
@@ -769,6 +791,7 @@ async def search(
         kind=kind,
         wing=wing,
         room=room,
+        profile=active_profile,
     )
 
     if mode == "semantic":
@@ -786,6 +809,7 @@ async def search(
             kind=kind,
             wing=wing,
             room=room,
+            profile=active_profile,
         )
         if not raw:
             return SearchResponse(results=[], total=0, message=_SEARCH_HELPFUL_MESSAGE)
@@ -818,6 +842,7 @@ async def search(
         kind=kind,
         wing=wing,
         room=room,
+        profile=active_profile,
     )
     semantic_results = [_format_semantic_result(row) for row in raw_semantic]
     results = _rrf_fuse(keyword_results, semantic_results, limit=limit)
@@ -868,9 +893,7 @@ async def feedback(
                 .where(MemoryItem.id == req.item_id)
                 .values(
                     startup_recall_count=0,
-                    importance=func.least(
-                        func.greatest(item["importance"] + 0.05, 0.1), 0.95
-                    ),
+                    importance=func.least(func.greatest(item["importance"] + 0.05, 0.1), 0.95),
                 )
             )
         elif not is_own_memory:
@@ -879,9 +902,7 @@ async def feedback(
                 update(MemoryItem)
                 .where(MemoryItem.id == req.item_id)
                 .values(
-                    importance=func.least(
-                        func.greatest(item["importance"] + 0.025, 0.1), 0.95
-                    ),
+                    importance=func.least(func.greatest(item["importance"] + 0.025, 0.1), 0.95),
                 )
             )
         # Agent on own memory: no-op for importance/penalty
@@ -892,9 +913,7 @@ async def feedback(
                 update(MemoryItem)
                 .where(MemoryItem.id == req.item_id)
                 .values(
-                    importance=func.least(
-                        func.greatest(item["importance"] - 0.1, 0.1), 0.95
-                    ),
+                    importance=func.least(func.greatest(item["importance"] - 0.1, 0.1), 0.95),
                 )
             )
         elif not is_own_memory:
@@ -903,9 +922,7 @@ async def feedback(
                 update(MemoryItem)
                 .where(MemoryItem.id == req.item_id)
                 .values(
-                    importance=func.least(
-                        func.greatest(item["importance"] - 0.05, 0.1), 0.95
-                    ),
+                    importance=func.least(func.greatest(item["importance"] - 0.05, 0.1), 0.95),
                 )
             )
         # Agent on own memory: no-op for importance
@@ -1239,9 +1256,7 @@ async def supersede_item(
 
     # 1. Lock the original row to serialize concurrent supersedes. FOR UPDATE
     #    is supported by Postgres and a no-op on the SQLite test fixture.
-    await session.execute(
-        select(MemoryItem.id).where(MemoryItem.id == item_id).with_for_update()
-    )
+    await session.execute(select(MemoryItem.id).where(MemoryItem.id == item_id).with_for_update())
 
     # 2. Eligibility: cannot supersede an item that is already expired or
     #    rejected — it has left the active set the replacement would target.
@@ -1292,8 +1307,10 @@ async def supersede_item(
     ):
         if replacement.get(key) is not None:
             replacement[key] = UUID(str(replacement[key]))
-    actor = req.actor_principal_id if req and req.actor_principal_id else UUID(
-        str(item["principal_id"])
+    actor = (
+        req.actor_principal_id
+        if req and req.actor_principal_id
+        else UUID(str(item["principal_id"]))
     )
     reason = req.reason if req else None
 
@@ -1369,8 +1386,10 @@ async def invalidate_item(
     """Mark invalid (set valid_to)."""
     item = await _require_item(session, item_id)
     now = _now_dt()
-    actor = req.actor_principal_id if req and req.actor_principal_id else UUID(
-        str(item["principal_id"])
+    actor = (
+        req.actor_principal_id
+        if req and req.actor_principal_id
+        else UUID(str(item["principal_id"]))
     )
     reason = req.reason if req else None
     event = await _insert_item_event(

@@ -21,8 +21,6 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-from engram.config import settings
-
 
 class Base(DeclarativeBase):
     pass
@@ -191,6 +189,30 @@ class MemoryItem(Base):
     events: Mapped[list[ItemEvent]] = relationship(back_populates="item")
 
 
+class EmbeddingProfile(Base):
+    """Deployment-global contract for one compatible embedding vector space."""
+
+    __tablename__ = "embedding_profiles"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    profile_key: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
+    provider: Mapped[str] = mapped_column(Text, nullable=False)
+    model: Mapped[str] = mapped_column(Text, nullable=False)
+    dimensions: Mapped[int] = mapped_column(Integer, nullable=False)
+    distance_metric: Mapped[str] = mapped_column(Text, default="cosine", nullable=False)
+    state: Mapped[str] = mapped_column(Text, default="candidate", nullable=False)
+    index_status: Mapped[str] = mapped_column(Text, default="missing", nullable=False)
+    index_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    profile_metadata: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, default=dict, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
 class MemoryEmbedding(Base):
     """Embeddings stored separately to support multiple models and re-embedding."""
 
@@ -208,17 +230,20 @@ class MemoryEmbedding(Base):
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
     )
+    profile_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("embedding_profiles.id"),
+        server_default=text("active_embedding_profile_id()"), nullable=False
+    )
     embedding_model: Mapped[str] = mapped_column(Text, nullable=False)
     embedding_dim: Mapped[int] = mapped_column(Integer, nullable=False)
-    embedding: Mapped[list[float] | None] = mapped_column(
-        Vector(settings.embedding_dim), nullable=True
-    )
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(), nullable=True)
     embedded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )
     embedding_status: Mapped[str] = mapped_column(String(20), default="complete")
 
     memory_item: Mapped[MemoryItem] = relationship(back_populates="embeddings")
+    profile: Mapped[EmbeddingProfile] = relationship()
 
 
 class KgTriple(Base):

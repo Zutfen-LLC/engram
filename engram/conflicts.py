@@ -13,13 +13,13 @@ from typing import Any
 from uuid import UUID
 
 from openai import AsyncOpenAI
+from pgvector.sqlalchemy import Vector
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, or_, select, text
+from sqlalchemy import and_, cast, literal_column, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.config import settings
-from engram.embeddings import EMBEDDING_MODEL as _EMBEDDING_MODEL
-from engram.models import MemoryEmbedding, MemoryItem
+from engram.models import EmbeddingProfile, MemoryEmbedding, MemoryItem
 
 # Cosine similarity above this triggers conflict classification.
 _SIMILARITY_THRESHOLD = 0.85
@@ -73,6 +73,8 @@ _VERDICT_MAP: dict[str, ConflictVerdict] = {
 async def detect_conflicts(
     new_item: MemoryItem,
     session: AsyncSession,
+    *,
+    profile: EmbeddingProfile | None = None,
 ) -> ConflictResult | None:
     """Check ``new_item`` against active items in scope for semantic conflicts.
 
@@ -81,12 +83,18 @@ async def detect_conflicts(
     active item is found above the similarity threshold, or when the new item
     has no usable embedding.
     """
+    if profile is None:
+        from engram.embedding_profiles import get_active_profile
+
+        profile = await get_active_profile(session)
     # 1. Load the new item's embedding vector.
     query_embedding = (
         await session.execute(
             select(MemoryEmbedding.embedding).where(
                 MemoryEmbedding.memory_item_id == new_item.id,
-                MemoryEmbedding.embedding_model == _EMBEDDING_MODEL,
+                MemoryEmbedding.profile_id == profile.id,
+                MemoryEmbedding.embedding_dim == profile.dimensions,
+                MemoryEmbedding.embedding_status == "ready",
                 MemoryEmbedding.embedding.is_not(None),
             )
         )
@@ -97,7 +105,10 @@ async def detect_conflicts(
 
     # 2. Find the nearest active item in scope (excluding self).
     await session.execute(text("SET LOCAL hnsw.iterative_scan = strict_order"))
-    distance = MemoryEmbedding.embedding.cosine_distance(query_embedding)
+    typed_embedding = cast(MemoryEmbedding.embedding, Vector(profile.dimensions))
+    distance = typed_embedding.cosine_distance(query_embedding)
+    profile_id_sql: Any = literal_column(f"'{profile.id}'::uuid")
+    dimensions_sql: Any = literal_column(str(int(profile.dimensions)))
     stmt = (
         select(
             MemoryItem.id.label("id"),
@@ -118,7 +129,9 @@ async def detect_conflicts(
             MemoryItem.review_status == "active",
             MemoryItem.valid_to.is_(None),
             MemoryItem.id != new_item.id,
-            MemoryEmbedding.embedding_model == _EMBEDDING_MODEL,
+            MemoryEmbedding.profile_id == profile_id_sql,
+            MemoryEmbedding.embedding_dim == dimensions_sql,
+            MemoryEmbedding.embedding_status == "ready",
             MemoryEmbedding.embedding.is_not(None),
         )
     )
@@ -383,19 +396,26 @@ async def find_promotion_conflict_candidates(
     the full corpus.
     """
     resolved_k = k if k is not None else settings.promotion_conflict_candidate_k
+    from engram.embedding_profiles import get_active_profile
+
+    profile = await get_active_profile(session)
 
     query_embedding = (
         await session.execute(
             select(MemoryEmbedding.embedding).where(
                 MemoryEmbedding.memory_item_id == item.id,
-                MemoryEmbedding.embedding_model == _EMBEDDING_MODEL,
+                MemoryEmbedding.profile_id == profile.id,
+                MemoryEmbedding.embedding_dim == profile.dimensions,
+                MemoryEmbedding.embedding_status == "ready",
                 MemoryEmbedding.embedding.is_not(None),
             )
         )
     ).scalar_one_or_none()
 
     if query_embedding is not None:
-        return await _find_candidates_by_embedding(session, item, query_embedding, resolved_k)
+        return await _find_candidates_by_embedding(
+            session, item, query_embedding, resolved_k, profile
+        )
     return await _find_candidates_by_heuristic(session, item, resolved_k)
 
 
@@ -404,9 +424,13 @@ async def _find_candidates_by_embedding(
     item: MemoryItem,
     query_embedding: Any,
     k: int,
+    profile: EmbeddingProfile,
 ) -> list[ConflictCandidate]:
     await session.execute(text("SET LOCAL hnsw.iterative_scan = strict_order"))
-    distance = MemoryEmbedding.embedding.cosine_distance(query_embedding)
+    typed_embedding = cast(MemoryEmbedding.embedding, Vector(profile.dimensions))
+    distance = typed_embedding.cosine_distance(query_embedding)
+    profile_id_sql: Any = literal_column(f"'{profile.id}'::uuid")
+    dimensions_sql: Any = literal_column(str(int(profile.dimensions)))
     stmt = (
         select(
             MemoryItem.id.label("id"),
@@ -428,7 +452,9 @@ async def _find_candidates_by_embedding(
             MemoryItem.review_status == "active",
             MemoryItem.valid_to.is_(None),
             MemoryItem.id != item.id,
-            MemoryEmbedding.embedding_model == _EMBEDDING_MODEL,
+            MemoryEmbedding.profile_id == profile_id_sql,
+            MemoryEmbedding.embedding_dim == dimensions_sql,
+            MemoryEmbedding.embedding_status == "ready",
             MemoryEmbedding.embedding.is_not(None),
         )
     )
@@ -479,21 +505,18 @@ async def _find_candidates_by_heuristic(
         # guessing from kind alone (which would be too noisy).
         return []
 
-    stmt = (
-        select(
-            MemoryItem.id.label("id"),
-            MemoryItem.content.label("content"),
-            MemoryItem.source_trust.label("source_trust"),
-            MemoryItem.content_hash.label("content_hash"),
-        )
-        .where(
-            MemoryItem.tenant_id == item.tenant_id,
-            MemoryItem.kind == item.kind,
-            MemoryItem.review_status == "active",
-            MemoryItem.valid_to.is_(None),
-            MemoryItem.id != item.id,
-            or_(*subject_clauses),
-        )
+    stmt = select(
+        MemoryItem.id.label("id"),
+        MemoryItem.content.label("content"),
+        MemoryItem.source_trust.label("source_trust"),
+        MemoryItem.content_hash.label("content_hash"),
+    ).where(
+        MemoryItem.tenant_id == item.tenant_id,
+        MemoryItem.kind == item.kind,
+        MemoryItem.review_status == "active",
+        MemoryItem.valid_to.is_(None),
+        MemoryItem.id != item.id,
+        or_(*subject_clauses),
     )
     if item.workspace_id is None:
         stmt = stmt.where(MemoryItem.workspace_id.is_(None))
