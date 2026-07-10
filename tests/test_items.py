@@ -232,7 +232,7 @@ async def _seed_base(session: AsyncSession, *, created_at: str) -> dict[str, str
             "id": principal_id,
             "tenant_id": tenant_id,
             "name": "Agent",
-            "type": "agent",
+            "type": "user",
             "created_at": created_at,
         },
     )

@@ -55,6 +55,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from engram.config import settings
 from engram.conflicts import PromotionConflictCheck, check_promotion_conflict
 from engram.models import FeedbackEvent, ItemEvent, MemoryItem, TenantConfig
+from engram.review_policy import TrustedReviewOperation, evaluate_transition
 
 # Fallbacks match the schema defaults in migrations/001_init.sql. Used only
 # when a tenant has no active tenant_config row — the normal path reads live
@@ -326,6 +327,17 @@ async def auto_promote_proposed_memories(
             )
 
     if to_promote:
+        for item in to_promote:
+            decision = evaluate_transition(
+                principal_id=item.principal_id,
+                principal_type="system",
+                item_author_principal_id=item.principal_id,
+                current_status=item.review_status,
+                requested_status="active",
+                trusted_operation=TrustedReviewOperation.PROMOTION,
+            )
+            if not decision.allowed:
+                raise RuntimeError("review policy rejected trusted Path A promotion")
         promote_ids = [item.id for item in to_promote]
         await session.execute(
             update(MemoryItem)

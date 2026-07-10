@@ -197,7 +197,7 @@ async def _seed_base(session: AsyncSession, *, created_at: str) -> None:
             "id": PRINCIPAL_ID,
             "tenant_id": TENANT_ID,
             "name": "Agent",
-            "type": "agent",
+            "type": "user",
             "created_at": created_at,
         },
     )
