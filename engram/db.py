@@ -44,6 +44,25 @@ owner_session_factory = async_sessionmaker(
     owner_engine, class_=AsyncSession, expire_on_commit=False
 )
 
+# Read engine — connects as the same non-owner application role, but may point
+# at a read replica via ``ENGRAM_READ_DATABASE_URL`` (ENG-AUD-011 / F18). RLS
+# applies identically to this connection since it uses the same app role.
+# When unset this falls back to the primary ``database_url`` (same fallback
+# idiom as ``owner_database_url``), so "read session" always means "the
+# read-safe path", not "a replica specifically" — read-replica support is
+# opt-in and only as complete as this fallback. Only read-only recall paths
+# (currently: startup recall candidate selection) use this engine; promotion,
+# item-event writes, job-queue writes, and telemetry always use the primary
+# engine.
+read_engine = create_async_engine(
+    settings.read_database_url or settings.database_url,
+    echo=False,
+    pool_size=10,
+    max_overflow=20,
+)
+
+read_session_factory = async_sessionmaker(read_engine, class_=AsyncSession, expire_on_commit=False)
+
 # Seed principal name / tenant slug used as the default RLS context when auth is
 # disabled (Phase 1A). These match the rows inserted by migrations/001_init.sql.
 _DEFAULT_TENANT_SLUG = "default"

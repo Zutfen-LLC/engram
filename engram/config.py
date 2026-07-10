@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,6 +23,16 @@ class Settings(BaseSettings):
     # is both owner and app). In the default Compose deployment this points at
     # the table-owning superuser so migrations and admin commands work.
     owner_database_url: str | None = None
+
+    # Read-oriented database URL (ENG-AUD-011 / F18). Optional: when unset,
+    # read-heavy paths (currently: startup recall candidate selection) use
+    # ``database_url`` like every other request. When set, it should point at
+    # a read replica (or any read-only-safe connection) reachable with the
+    # same app-role credentials/RLS posture as ``database_url`` — RLS context
+    # is applied identically. Write actions (promotion, telemetry, item
+    # events, job enqueue) never use this connection, regardless of whether
+    # it is set.
+    read_database_url: str | None = None
 
     # Service
     host: str = "0.0.0.0"
@@ -67,6 +78,20 @@ class Settings(BaseSettings):
     # N distinct non-author agents for partial penalty reset
     quorum_reset_agent_count: int = 2
 
+    # Bounded SQL candidate selection for startup recall (ENG-AUD-011 / F18).
+    # Postgres performs a coarse first-stage selection of at most this many
+    # candidate rows (across the diversified sub-pools — see
+    # engram.recall._fetch_startup_candidates); Python's detailed scorer then
+    # runs only over that bounded set instead of the whole eligible corpus.
+    # Must be >= recall_item_budget (enforced at settings load) since a
+    # candidate pool smaller than the item budget could under-fill recall.
+    # Callers cannot raise this through the public recall API — it is a
+    # deployment-level setting only.
+    startup_recall_candidate_limit: int = 500
+    # Hard safety cap: startup_recall_candidate_limit is clamped to this even
+    # if misconfigured, so a bad env value cannot reintroduce an unbounded scan.
+    startup_recall_candidate_limit_max: int = 5000
+
     # Write-path cost control
     # if False, low-trust writes defer conflict check to promotion
     conflict_check_on_write: bool = True
@@ -107,6 +132,21 @@ class Settings(BaseSettings):
     # Top-k plausible active-item candidates considered by the promotion-time
     # conflict recheck (engram.conflicts.find_promotion_conflict_candidates).
     promotion_conflict_candidate_k: int = 5
+
+    @model_validator(mode="after")
+    def _clamp_startup_recall_candidate_limit(self) -> Settings:
+        """Enforce the documented invariants for the candidate-pool setting.
+
+        Positive, bounded by ``startup_recall_candidate_limit_max`` (a
+        misconfigured env value cannot reintroduce an unbounded scan), and at
+        least ``recall_item_budget`` (a pool smaller than the item budget
+        could under-fill recall before Python packing even runs).
+        """
+        limit = max(1, self.startup_recall_candidate_limit)
+        limit = min(limit, self.startup_recall_candidate_limit_max)
+        limit = max(limit, self.recall_item_budget)
+        self.startup_recall_candidate_limit = limit
+        return self
 
 
 settings = Settings()

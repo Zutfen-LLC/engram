@@ -424,6 +424,15 @@ class RecallLog(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )
+    # Idempotency claim for the async recall.telemetry job (ENG-AUD-011 / F18):
+    # NULL until the telemetry worker has applied last_recalled_at/recall
+    # counter updates for this recall's item_ids. The worker claims by
+    # transactionally setting this column (WHERE telemetry_applied_at IS NULL)
+    # together with the item updates in one commit, so a retry (worker crash,
+    # queue redelivery) that finds it already set is a safe no-op.
+    telemetry_applied_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class TenantConfig(Base):

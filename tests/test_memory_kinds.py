@@ -109,9 +109,21 @@ async def _override_get_current_principal() -> AuthPrincipal:
 
 @pytest.fixture
 def app():
+    # Startup recall's bounded candidate selection (ENG-AUD-011) reads through
+    # engram.db.read_session_factory, a real pooled app engine independent of
+    # the get_session override above. A pooled connection bound to one test's
+    # event loop can get reused by a later test on a different loop → asyncpg
+    # "another operation is in progress" (SQLAlchemy async pool + per-test
+    # event loops). Point it at this file's own NullPool factory (same
+    # pattern as test_promotion.py) so every connection stays on the current
+    # test's loop.
+    import engram.db as db_module
+
     application = create_app()
     application.dependency_overrides[get_session] = _get_test_session
     application.dependency_overrides[get_current_principal] = _override_get_current_principal
+    application.state._engram_real_read_factory = db_module.read_session_factory  # type: ignore[attr-defined]
+    db_module.read_session_factory = _test_session_factory
     return application
 
 
@@ -120,6 +132,9 @@ async def client(app):
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
+    import engram.db as db_module
+
+    db_module.read_session_factory = app.state._engram_real_read_factory
 
 
 @pytest.fixture(autouse=True)

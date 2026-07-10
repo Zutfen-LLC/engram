@@ -33,7 +33,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from engram.config import settings
@@ -625,6 +625,89 @@ async def handle_retention_sweep(session: AsyncSession, job: Job) -> None:
     )
 
 
+async def handle_recall_telemetry(session: AsyncSession, job: Job) -> None:
+    """Apply recall counters/timestamps off the synchronous recall path (ENG-AUD-011 / F18).
+
+    Payload: ``{tenant_id, principal_id, mode, recall_log_id, item_ids,
+    recalled_at, request_id}`` — see engram.recall.execute_startup_recall.
+
+    Idempotency (requirement 8): ``recall_logs.telemetry_applied_at`` is the
+    claim. The claim UPDATE and the item-counter UPDATE run in the same
+    transaction, committed together — so either both apply exactly once, or
+    (on any failure before commit) neither applies and the retry sees
+    ``telemetry_applied_at IS NULL`` again and safely re-attempts. A retry
+    that lands after a successful commit finds the claim already set and is a
+    pure no-op: it CANNOT double-increment counters.
+
+    Handles deleted/expired items without failing: the UPDATE only touches
+    rows that still exist and match this job's tenant; a hard-deleted item
+    simply matches zero rows, and an expired/rejected item still gets its
+    counters bumped (harmless bookkeeping — recall counts are historical
+    telemetry, not eligibility state).
+    """
+    recall_log_id = job.payload.get("recall_log_id")
+    if recall_log_id is None:
+        raise ValueError("recall.telemetry payload missing recall_log_id")
+    raw_item_ids = job.payload.get("item_ids") or []
+    if not isinstance(raw_item_ids, list):
+        raise ValueError("recall.telemetry payload item_ids must be a list")
+    item_ids = [_parse_uuid(v) for v in raw_item_ids]
+    mode = job.payload.get("mode", "startup")
+
+    recalled_at_raw = job.payload.get("recalled_at")
+    recalled_at = datetime.fromisoformat(recalled_at_raw) if recalled_at_raw else _utcnow()
+
+    if not item_ids:
+        logger.info("recall.telemetry recall_log_id=%s: no item_ids, no-op", recall_log_id)
+        return
+
+    moment = _utcnow()
+    claimed = (
+        await session.execute(
+            text(
+                "UPDATE recall_logs SET telemetry_applied_at = :moment "
+                "WHERE id = :id AND tenant_id = :tenant_id AND telemetry_applied_at IS NULL "
+                "RETURNING id"
+            ),
+            {
+                "moment": moment,
+                "id": _parse_uuid(recall_log_id),
+                "tenant_id": job.tenant_id,
+            },
+        )
+    ).scalar_one_or_none()
+
+    if claimed is None:
+        # Already applied by a prior successful run of this job (or a
+        # concurrent worker that won the race) — safe no-op.
+        await session.commit()
+        logger.info(
+            "recall.telemetry recall_log_id=%s already applied, no-op", recall_log_id
+        )
+        return
+
+    values: dict[str, Any] = {
+        "recall_count": MemoryItem.recall_count + 1,
+        "last_recalled_at": recalled_at,
+    }
+    if mode == "startup":
+        values["startup_recall_count"] = MemoryItem.startup_recall_count + 1
+
+    await session.execute(
+        update(MemoryItem)
+        .where(MemoryItem.id.in_(item_ids), MemoryItem.tenant_id == job.tenant_id)
+        .values(**values)
+    )
+    await session.commit()
+    logger.info(
+        "recall.telemetry recall_log_id=%s tenant=%s mode=%s items=%s applied",
+        recall_log_id,
+        job.tenant_id,
+        mode,
+        len(item_ids),
+    )
+
+
 # Registry of job type → handler.
 JOB_HANDLERS: dict[str, JobHandler] = {
     "embedding.generate": handle_embedding_generate,
@@ -632,6 +715,7 @@ JOB_HANDLERS: dict[str, JobHandler] = {
     "classification.refine": handle_classification_refine,
     "promotion.path_a": handle_promotion_path_a,
     "retention.sweep": handle_retention_sweep,
+    "recall.telemetry": handle_recall_telemetry,
 }
 
 
