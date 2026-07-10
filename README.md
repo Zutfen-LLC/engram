@@ -292,6 +292,7 @@ Seed classification rules are intentionally conservative: "skip" rules are whole
 * **Separate embeddings table** — model-keyed embeddings support re-embedding without schema churn
 * **Full-text search** — generated `tsvector` column and GIN index
 * **Tenant-configurable policy** — scoring weights, trust defaults, recall policy, and promotion thresholds
+* **Postgres job queue** — `/v1/remember` enqueues embedding generation and LLM classification refinement; a worker (`engram worker`) drains the queue off the request path so memory stays cheap per write
 
 REST is the core interface. MCP and SDK integrations are adapters.
 
@@ -360,6 +361,7 @@ all exist and are exercised by a live, network-verified deployment.
 | Python SDK (async client over REST)                                     |     yes     |       yes        |
 | MCP adapter (stdio, all tools)                                          |     yes     |       yes        |
 | Embedding backfill (`engram backfill-embeddings`)                       |     yes     |    mocked only   |
+| Postgres job queue + `engram worker` (async embeddings, classification refine, conflict check) | yes |       —          |
 | Deployment artifacts (Compose, `.env.example`, backup, `init-db`)       |     yes     |       yes        |
 | **Dogfood deployment** (auth-enabled, network-reachable, backed up)     |     yes     |       yes        |
 

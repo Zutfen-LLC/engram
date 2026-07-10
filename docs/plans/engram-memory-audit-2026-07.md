@@ -45,7 +45,7 @@ Section 8 gives the prioritized roadmap. The one-line version: **P0 = make the r
 | F17 | **P2** | Storage | `chk_kind` CHECK constraint contradicts "tenant-configurable taxonomy" and omits design kinds (`procedure`, `summary`) |
 | F18 | **P2** | Recall | Scoring loads the entire active corpus into Python; recall is also a write (recall-count updates), blocking read-replica scaling |
 | F19 | **P2** | Recall | "Relationship-aware recall" is claimed done (README roadmap layer 3) but recall never touches the KG or tunnels |
-| F20 | **P2** | Write path | Sync LLM classification + 6 `DISTINCT` vocabulary scans per unclassified write |
+| F20 | **P2** | Write path | Sync LLM classification + 6 `DISTINCT` vocabulary scans per unclassified write — **addressed (ENG-AUD-008)** |
 
 Details for each in the sections below.
 
@@ -141,6 +141,24 @@ Implement it once (a SQLAlchemy composable filter + an equivalent SQL fragment f
 **F20 — Classification is synchronous on the write path.** An unclassified `remember` does: 6 `DISTINCT` scans over `memory_items`/`classification_rules` for vocabulary (`classification.py:96-151`), then optionally a blocking OpenAI chat completion, then optionally a second LLM call for conflict classification. For `sync_turn`-style chatty writers this is the difference between "memory is free" and "memory is a tax."
 
 *Fix:* (a) cache vocabulary per tenant with event-based invalidation; (b) split classification into *write-time cheap* (rules/k-NN, provisional) and *async refine* (LLM job updates kind/wing/room/confidence and writes an `item_events` row — the audit trail already supports reclassification cleanly). A simple Postgres job queue (`FOR UPDATE SKIP LOCKED`) avoids new infrastructure and also absorbs embedding generation and promotion (see §6). The append-first model makes async refinement safe: nothing downstream assumes classification is final.
+
+> **Status (ENG-AUD-008, addressed):** F20 is addressed. A Postgres-backed
+> `jobs` table + `engram worker` (claim via `FOR UPDATE SKIP LOCKED`, retry with
+> backoff, dead-letter after max attempts) moves the expensive write-path work
+> off the request path: `/v1/remember` now runs rule-based classification only
+> (no inline OpenAI call), creates the embedding placeholder, and enqueues
+> `embedding.generate`; the worker then enqueues `conflict.check` once the
+> embedding is ready and runs `classification.refine` (LLM) as a job. The six
+> `DISTINCT` vocab scans are served from a per-tenant in-process TTL cache
+> (`engram.classification`, `ENGRAM_VOCAB_CACHE_TTL_SECONDS`). Exact (content-
+> hash) dedup stays synchronous; semantic dedup / auto-supersede / contradiction
+> are now eventual state transitions applied by `conflict.check` jobs — so
+> `/v1/remember` may return `created` while semantic conflict analysis is
+> pending. The service degrades gracefully without a worker (jobs queue;
+> semantic recall / refinement / semantic conflict detection lag until
+> processed). `retention.sweep` is a documented stub (retention logic deferred).
+> No Redis/Celery/SQS, extraction endpoint, k-NN classifier, Path B quorum, or
+> hosted control plane is included.
 
 **Extraction is the missing product surface.** Engram classifies *given* content, but the dominant integration question for a memory layer is "here is a conversation — figure out what to remember." Today that burden is entirely on clients (engram-hooks). Design principle 8 says lifecycle hooks are client-side — correct — but *extraction* (transcript → memory candidates with kind/subject/confidence) is classification intelligence, which principle 8 explicitly puts server-side. Recommendation: `POST /v1/extract` accepting a transcript/messages array, returning candidate memories (not writing them) or writing them as `proposed` with `source_type='extraction'` in one call. This single endpoint makes every framework integration ~10 lines and is the #1 thing that closes the gap with Mem0/Zep-class competitors.
 
@@ -271,7 +289,7 @@ The locked decisions (standalone service, Postgres-only, REST core, RLS foundati
 | **P1** | ~~Classification → trust wiring: confidence blend, visibility (downward only), remove 0.7 floor; fix seed rules; skip semantics~~ **Done (ENG-AUD-005)** | F8, F9 | M |
 | **P1** | Trust-weighted semantic ranking (`semantic-v2`); honor search filters; default budgets; skip-not-break packing; freshness in recency | F10, F14, F15 | M |
 | **P1** | Promotion: lazy check on startup recall, dispute gate; conflict check at promotion time; top-k conflict candidates | F11, F12, F13 | M |
-| **P1** | Async job queue (embeddings, LLM classify refine, promotion, retention); vocab caching | F20 | M |
+| **P1** | Async job queue (embeddings, LLM classify refine, promotion, retention); vocab caching — **done (ENG-AUD-008)** | F20 | M |
 | **P1** | Recall eval harness over `recall_logs`+`feedback_events`; classification golden set + eval script | — | M |
 | **P2** | Extraction endpoint (`/v1/extract`); provider abstraction (Anthropic, OpenAI-compatible, local embeddings) | — | M–L |
 | **P2** | Embedding model registry + per-model storage; kind reference table replacing `chk_kind` | F16, F17 | M |

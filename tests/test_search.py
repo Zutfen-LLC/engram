@@ -8,6 +8,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
+import engram.embeddings as embeddings_mod
 from engram.api.app import create_app
 from engram.api.routes import memory as memory_routes
 from engram.config import settings
@@ -90,7 +91,30 @@ def _reset_embedding_provider():
 async def _remember(client: AsyncClient, content: str, **payload: object):
     body = {"content": content, "source_type": "manual"}
     body.update(payload)
-    return await client.post("/v1/remember", json=body)
+    resp = await client.post("/v1/remember", json=body)
+    # ENG-AUD-008: /v1/remember enqueues embedding.generate; process it so the
+    # embedding is ready before any semantic search in the test.
+    await _drain_jobs()
+    return resp
+
+
+async def _drain_jobs(max_iterations: int = 10) -> None:
+    """Process queued embedding.generate jobs until empty (ENG-AUD-008).
+
+    Only embedding.generate is processed to avoid conflict-check side effects
+    in search-only tests.
+    """
+    from engram.worker import process_one_job
+
+    for _ in range(max_iterations):
+        processed = await process_one_job(
+            worker_id="test",
+            session_factory=_test_session_factory,
+            app_session_factory=_test_session_factory,
+            job_types=["embedding.generate"],
+        )
+        if not processed:
+            return
 
 
 async def _memory_embeddings_rows() -> list[dict[str, object]]:
@@ -163,6 +187,7 @@ async def test_semantic_search_returns_best_match_and_ready_embedding_row(client
         return distractor
 
     monkeypatch.setattr(memory_routes, "generate_embedding", fake_embedding)
+    monkeypatch.setattr(embeddings_mod, "generate_embedding", fake_embedding)
 
     first = await _remember(client, "semantic target")
     second = await _remember(client, "semantic distractor")
@@ -212,6 +237,7 @@ async def test_hybrid_search_fuses_keyword_and_semantic_rankings(client, monkeyp
         return distractor
 
     monkeypatch.setattr(memory_routes, "generate_embedding", fake_embedding)
+    monkeypatch.setattr(embeddings_mod, "generate_embedding", fake_embedding)
 
     keyword_only = await _remember(client, "blue keyword match")
     semantic_only = await _remember(client, "semantic only match")
@@ -304,6 +330,7 @@ async def test_semantic_search_kind_filter_honored(client, monkeypatch):
         return same_vec
 
     monkeypatch.setattr(memory_routes, "generate_embedding", fake_embedding)
+    monkeypatch.setattr(embeddings_mod, "generate_embedding", fake_embedding)
 
     await _remember(client, "delta matched item a", kind="fact")
     await _remember(client, "delta matched item b", kind="observation")
@@ -327,6 +354,7 @@ async def test_semantic_search_room_filter_honored(client, monkeypatch):
         return same_vec
 
     monkeypatch.setattr(memory_routes, "generate_embedding", fake_embedding)
+    monkeypatch.setattr(embeddings_mod, "generate_embedding", fake_embedding)
 
     await _remember(client, "epsilon matched item a", kind="fact", room="alpha")
     await _remember(client, "epsilon matched item b", kind="fact", room="beta")
@@ -350,6 +378,7 @@ async def test_hybrid_search_wing_filter_honored(client, monkeypatch):
         return same_vec
 
     monkeypatch.setattr(memory_routes, "generate_embedding", fake_embedding)
+    monkeypatch.setattr(embeddings_mod, "generate_embedding", fake_embedding)
 
     # Items share a keyword so keyword + semantic branches both match; the wing
     # filter must restrict both branches.
@@ -412,6 +441,7 @@ async def test_semantic_search_ranks_high_trust_above_slightly_closer_low_trust(
         return low_trust_vec
 
     monkeypatch.setattr(memory_routes, "generate_embedding", fake_embedding)
+    monkeypatch.setattr(embeddings_mod, "generate_embedding", fake_embedding)
 
     # High-trust: manual user write -> active, source_trust/confidence 0.9.
     await _remember(client, "high trust memory", kind="fact")

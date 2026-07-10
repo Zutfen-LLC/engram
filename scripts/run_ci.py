@@ -27,6 +27,7 @@ RLS_FORCED_TABLES: Final[tuple[str, ...]] = (
     "recall_logs",
     "api_keys",
     "workspace_members",
+    "jobs",
 )
 
 

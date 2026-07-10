@@ -394,6 +394,70 @@ semantic recall/search is disabled. To enable:
 OpenAI credentials are **not** required for the deployment smoke tests in this
 guide. See `engram backfill-embeddings --help` for batching/retry options.
 
+> **ENG-AUD-008 — async write path.** As of this change, `/v1/remember` no
+> longer calls the embedding provider inline: it creates the embedding
+> placeholder and enqueues an `embedding.generate` job. (When `kind` is omitted
+> it also runs rule-based classification only — OpenAI LLM refinement runs
+> later as an async `classification.refine` job.) To actually populate
+> embeddings / run LLM refinement / run semantic conflict detection, start the
+> worker (see "Background worker" below). Exact (content-hash) dedup remains
+> synchronous. The service still works without a worker; semantic recall /
+> refinement / semantic conflict detection simply lag until jobs are processed.
+
+### 7a. Background worker
+
+The worker drains the `jobs` table and runs the off-request-path work:
+`embedding.generate`, `conflict.check`, `classification.refine`,
+`promotion.path_a`, and `retention.sweep`. It is Postgres-only (no
+Redis/Celery/SQS): workers claim with `FOR UPDATE SKIP LOCKED`, retry failures
+with exponential backoff, and dead-letter after `ENGRAM_JOB_MAX_ATTEMPTS`.
+
+Claim/lock bookkeeping runs through the table-owning role (cross-tenant queue
+coordination); each job's payload runs through an app-role session scoped to the
+job's tenant (RLS-enforced — see ENG-AUD-002).
+
+Smoke-test one job:
+
+```bash
+docker compose exec engram-service engram worker --once
+```
+
+Run the worker continuously under Compose (add a service, or run it attached):
+
+```bash
+docker compose exec engram-service engram worker --poll-interval 2
+```
+
+Under systemd:
+
+```ini
+# /etc/systemd/system/engram-worker.service
+[Unit]
+Description=Engram background job worker
+After=network-online.target postgresql.service
+
+[Service]
+WorkingDirectory=/opt/engram
+EnvironmentFile=/opt/engram/.env
+ExecStart=/opt/engram/.venv/bin/engram worker --poll-interval 2
+Restart=always
+User=engram
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Or via cron (process the queue every minute):
+
+```cronfile
+* * * * * engram /opt/engram/.venv/bin/engram worker --max-jobs 100 >> /var/log/engram-worker.log 2>&1
+```
+
+Flags: `--once`, `--poll-interval <s>`, `--job-type <t>` (repeatable),
+`--max-jobs <n>`, `--worker-id <id>`. The worker exits nonzero only on fatal
+setup errors — ordinary job failures retry/dead-letter without stopping the
+loop.
+
 ---
 
 ## 8. Bare-metal / non-Compose deployment

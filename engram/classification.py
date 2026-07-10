@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+import time
+from collections import OrderedDict
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 from openai import AsyncOpenAI
@@ -49,10 +52,15 @@ async def classify(
     session: AsyncSession,
     context: str | None = None,
 ) -> ClassificationResult:
-    """Classify raw memory text using tenant rules, with optional LLM enrichment."""
+    """Classify raw memory text using tenant rules, with optional LLM enrichment.
 
-    rules = await _load_rules(session, tenant_id)
-    taxonomy, wings, rooms = await _load_vocab(session, tenant_id)
+    Used by ``/v1/classify`` and the async ``classification.refine`` worker. The
+    synchronous ``/v1/remember`` write path uses :func:`classify_rules_only` so
+    the OpenAI call never blocks the request (ENG-AUD-008 / F20).
+    """
+
+    rules = await _load_rules_cached(session, tenant_id)
+    taxonomy, wings, rooms = await _load_vocab_cached(session, tenant_id)
 
     rule_result = _classify_rules(content, rules, taxonomy)
     if settings.classification_provider != "openai":
@@ -82,6 +90,130 @@ async def classify(
         rooms=rooms,
         rule_result=rule_result,
     )
+
+
+async def classify_rules_only(
+    content: str,
+    tenant_id: UUID,
+    session: AsyncSession,
+    context: str | None = None,
+) -> ClassificationResult:
+    """Synchronous (request-path) classification: rules only, never OpenAI.
+
+    This is what ``/v1/remember`` calls. It runs the deterministic rule pass
+    using the cached tenant vocab, and never makes a provider call — the LLM
+    refinement happens later via an async ``classification.refine`` job
+    (ENG-AUD-008 / F20). ``context`` is accepted for API parity but is unused
+    by the rule pass.
+    """
+    rules = await _load_rules_cached(session, tenant_id)
+    taxonomy, _wings, _rooms = await _load_vocab_cached(session, tenant_id)
+    return _classify_rules(content, rules, taxonomy)
+
+
+# ---------------------------------------------------------------------------
+# Per-tenant in-process TTL cache for vocab + rules (ENG-AUD-008 / F20).
+#
+# F20: each unclassified ``remember`` previously ran six DISTINCT scans over
+# memory_items + classification_rules for vocabulary, on every call. This cache
+# serves that vocab at most once per TTL window per tenant. Keyed by tenant_id
+# so cache entries never cross tenants. Bounded LRU eviction guards memory.
+# TTL-based invalidation is sufficient for this slice; explicit invalidation on
+# classification-rule writes is not required (no rule-write endpoint exists
+# today) but :func:`invalidate_vocab_cache` is provided for tests + future use.
+# ---------------------------------------------------------------------------
+
+
+class _CacheEntry:
+    __slots__ = ("value", "fetched_at")
+
+    def __init__(self, value: object, fetched_at: float) -> None:
+        self.value = value
+        self.fetched_at = fetched_at
+
+
+# OrderedDict gives O(1) LRU move-to-end on access.
+_vocab_cache: OrderedDict[str, _CacheEntry] = OrderedDict()
+_rules_cache: OrderedDict[str, _CacheEntry] = OrderedDict()
+_cache_lock: asyncio.Lock = asyncio.Lock()
+
+
+def _cache_expired(fetched_at: float) -> bool:
+    ttl = settings.vocab_cache_ttl_seconds
+    if ttl <= 0:  # 0 disables caching
+        return True
+    return (time.monotonic() - fetched_at) > ttl
+
+
+def _cache_get(
+    cache: OrderedDict[str, _CacheEntry], tenant_id: UUID
+) -> object | None:
+    key = str(tenant_id)
+    entry = cache.get(key)
+    if entry is None:
+        return None
+    if _cache_expired(entry.fetched_at):
+        cache.pop(key, None)
+        return None
+    cache.move_to_end(key)  # LRU
+    return entry.value
+
+
+def _cache_put(
+    cache: OrderedDict[str, _CacheEntry], tenant_id: UUID, value: object
+) -> None:
+    key = str(tenant_id)
+    max_tenants = settings.vocab_cache_max_tenants
+    cache[key] = _CacheEntry(value, time.monotonic())
+    cache.move_to_end(key)
+    while len(cache) > max_tenants:
+        cache.popitem(last=False)  # evict oldest
+
+
+def invalidate_vocab_cache(tenant_id: UUID | str | None = None) -> None:
+    """Drop cached vocab/rules for a tenant (or all tenants when ``None``).
+
+    Safe to call from tests to force a reload. A future classification-rule
+    write endpoint would call this with the affected tenant id.
+    """
+    if tenant_id is None:
+        _vocab_cache.clear()
+        _rules_cache.clear()
+    else:
+        key = str(tenant_id)
+        _vocab_cache.pop(key, None)
+        _rules_cache.pop(key, None)
+
+
+async def _load_rules_cached(
+    session: AsyncSession, tenant_id: UUID
+) -> list[ClassificationRule]:
+    cached = _cache_get(_rules_cache, tenant_id)
+    if cached is not None:
+        return cast(list[ClassificationRule], cached)
+    async with _cache_lock:
+        # Re-check under the lock to avoid duplicate loads from racing callers.
+        cached = _cache_get(_rules_cache, tenant_id)
+        if cached is not None:
+            return cast(list[ClassificationRule], cached)
+        rules = await _load_rules(session, tenant_id)
+        _cache_put(_rules_cache, tenant_id, rules)
+        return rules
+
+
+async def _load_vocab_cached(
+    session: AsyncSession, tenant_id: UUID
+) -> tuple[list[str], list[str], list[str]]:
+    cached = _cache_get(_vocab_cache, tenant_id)
+    if cached is not None:
+        return cast(tuple[list[str], list[str], list[str]], cached)
+    async with _cache_lock:
+        cached = _cache_get(_vocab_cache, tenant_id)
+        if cached is not None:
+            return cast(tuple[list[str], list[str], list[str]], cached)
+        vocab = await _load_vocab(session, tenant_id)
+        _cache_put(_vocab_cache, tenant_id, vocab)
+        return vocab
 
 
 async def _load_rules(session: AsyncSession, tenant_id: UUID) -> list[ClassificationRule]:

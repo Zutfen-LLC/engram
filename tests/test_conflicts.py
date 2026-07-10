@@ -1,8 +1,14 @@
-"""Tests for write-time conflict detection (T09).
+"""Tests for conflict detection (T09 / ENG-AUD-008).
 
 These tests require a live PostgreSQL with the v2 schema (migrations/001_init.sql).
 They skip automatically when no DB is reachable, matching the pattern in
 test_remember.py / test_search.py.
+
+As of ENG-AUD-008, conflict detection runs OFF the write path: ``/v1/remember``
+enqueues an ``embedding.generate`` job, which (when ready) enqueues a
+``conflict.check`` job that runs ``detect_conflicts`` and applies conservative
+state transitions. These tests POST items, then drain the worker job queue to
+drive the async conflict detection, then assert on the resulting memory state.
 
 Embeddings are generated through a fake provider (orthogonal unit vectors),
 and the conflict classifier is monkeypatched at the module level so the real
@@ -17,6 +23,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
+import engram.embeddings as embeddings_mod
 from engram.api.app import create_app
 from engram.api.routes import memory as memory_routes
 from engram.config import settings
@@ -86,6 +93,7 @@ async def _clean_db():
     if not await _db_ok():
         return
     async with _test_engine.begin() as conn:
+        await conn.execute(text("DELETE FROM jobs"))
         await conn.execute(text("DELETE FROM memory_embeddings"))
         await conn.execute(text("DELETE FROM memory_items"))
 
@@ -97,7 +105,13 @@ _VECTOR_B = [1.0, 0.0] + [0.0] * 1534  # near-identical to A → similarity > 0.
 
 
 def _enable_embeddings(monkeypatch):
-    """Turn on the fake embedding provider and stub the generator."""
+    """Turn on the fake embedding provider and stub the generator.
+
+    Patches BOTH ``memory_routes.generate_embedding`` (used by search/recall
+    query embedding) and ``engram.embeddings.generate_embedding`` (used by the
+    worker's embedding.generate handler). The worker imports it lazily at
+    handler-call time, so patching the module attribute is sufficient.
+    """
     settings.embedding_provider = "openai"
 
     async def fake_embedding(text_value: str):
@@ -111,6 +125,27 @@ def _enable_embeddings(monkeypatch):
         return _VECTOR_B
 
     monkeypatch.setattr(memory_routes, "generate_embedding", fake_embedding)
+    monkeypatch.setattr(embeddings_mod, "generate_embedding", fake_embedding)
+
+
+async def _drain_jobs(max_iterations: int = 10) -> None:
+    """Process queued jobs until the queue is empty.
+
+    Drives the async write path: embedding.generate → conflict.check. Uses the
+    worker's process_one_job against the per-test session factories so the same
+    NullPool engine (current event loop) is used. Conflict check on write is
+    honored automatically by the embedding handler.
+    """
+    from engram.worker import process_one_job
+
+    for _ in range(max_iterations):
+        processed = await process_one_job(
+            worker_id="test",
+            session_factory=_test_session_factory,
+            app_session_factory=_test_session_factory,
+        )
+        if not processed:
+            return
 
 
 def _stub_verdict(monkeypatch, verdict: ConflictVerdict, confidence: float = 0.9):
@@ -168,7 +203,12 @@ async def test_conflict_check_skipped_when_no_embeddings(client, monkeypatch):
 
 
 async def test_duplicate_auto_dedups(client, monkeypatch):
-    """duplicate verdict → status='deduped', returns existing item id."""
+    """duplicate verdict → the new item is rejected+invalidated (eventual, async).
+
+    As of ENG-AUD-008, conflict detection runs off the write path: the second
+    /v1/remember returns 'created' (a placeholder + jobs), then the worker
+    drains embedding.generate → conflict.check, which rejects the duplicate.
+    """
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     _enable_embeddings(monkeypatch)
@@ -187,13 +227,23 @@ async def test_duplicate_auto_dedups(client, monkeypatch):
         json={"content": "dup reworded content", "kind": "fact", "source_type": "manual"},
     )
     assert second.status_code == 201
-    body = second.json()
-    assert body["status"] == "deduped"
-    assert body["deduped_existing_id"] == first_id
+    # The write path returns 'created' immediately; the dedup is eventual.
+    assert second.json()["status"] == "created"
+    new_id = second.json()["id"]
+
+    await _drain_jobs()
+
+    # After the conflict.check job runs, the duplicate (new) item is rejected
+    # and invalidated; the original survives.
+    new = await _fetch_item_fields(new_id)
+    assert new["review_status"] == "rejected"
+    assert new["valid_to"] is not None
+    original = await _fetch_item_fields(first_id)
+    assert original["review_status"] != "rejected"
 
 
 async def test_refine_auto_supersede_high_authority(client, monkeypatch):
-    """refine + high source_trust + high confidence → auto-supersede."""
+    """refine + high source_trust + high confidence → auto-supersede (eventual)."""
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     _enable_embeddings(monkeypatch)
@@ -212,14 +262,16 @@ async def test_refine_auto_supersede_high_authority(client, monkeypatch):
         json={"content": "refine improved content", "kind": "fact", "source_type": "manual"},
     )
     assert second.status_code == 201
-    body = second.json()
-    assert body["status"] == "superseded"
-    assert body["superseded_id"] == first_id
+    new_id = second.json()["id"]
+    # The supersession is eventual (applied by the conflict.check job).
+    assert second.json()["status"] == "created"
 
-    # Old item must be marked superseded.
+    await _drain_jobs()
+
+    # Old item must be marked superseded by the new item.
     old = await _fetch_item_fields(first_id)
     assert old["valid_to"] is not None
-    assert str(old["superseded_by"]) == body["id"]
+    assert str(old["superseded_by"]) == new_id
 
 
 async def test_refine_proposed_supersession_medium_confidence(client, monkeypatch):
@@ -247,6 +299,8 @@ async def test_refine_proposed_supersession_medium_confidence(client, monkeypatc
     # Proposed supersession: new item created (not deduped, not superseded old)
     assert body["status"] == "created"
     new_id = body["id"]
+
+    await _drain_jobs()
 
     row = await _fetch_item_fields(new_id)
     assert str(row["conflicts_with_item_id"]) == first_id
@@ -285,6 +339,8 @@ async def test_refine_lower_authority_never_supersedes(client, monkeypatch):
     assert body["status"] == "created"
     new_id = body["id"]
 
+    await _drain_jobs()
+
     row = await _fetch_item_fields(new_id)
     assert str(row["conflicts_with_item_id"]) == first_id
     assert row["conflict_type"] == "scope_overlap"
@@ -318,6 +374,8 @@ async def test_contradict_flags_conflict(client, monkeypatch):
     assert body["status"] == "created"
     new_id = body["id"]
 
+    await _drain_jobs()
+
     row = await _fetch_item_fields(new_id)
     assert str(row["conflicts_with_item_id"]) == first_id
     assert row["conflict_type"] == "contradiction"
@@ -339,6 +397,7 @@ async def test_no_conflict_below_similarity_threshold(client, monkeypatch):
         return vec
 
     monkeypatch.setattr(memory_routes, "generate_embedding", fake_embedding)
+    monkeypatch.setattr(embeddings_mod, "generate_embedding", fake_embedding)
     # If the threshold were crossed this would force a dedup; it should not fire.
     _stub_verdict(monkeypatch, ConflictVerdict.DUPLICATE, confidence=0.99)
 
@@ -353,6 +412,12 @@ async def test_no_conflict_below_similarity_threshold(client, monkeypatch):
     assert first.status_code == 201
     assert second.status_code == 201
     assert second.json()["status"] == "created"
+    second_id = second.json()["id"]
+
+    await _drain_jobs()
+    # No conflict applied: the second item remains active (manual default).
+    row = await _fetch_item_fields(second_id)
+    assert row["conflicts_with_item_id"] is None
 
 
 async def test_review_conflicts_lists_unresolved(client, monkeypatch):
@@ -373,6 +438,8 @@ async def test_review_conflicts_lists_unresolved(client, monkeypatch):
     assert first.status_code == 201
     assert second.status_code == 201
     new_id = second.json()["id"]
+
+    await _drain_jobs()
 
     response = await client.get("/v1/review/conflicts")
     assert response.status_code == 200
@@ -400,6 +467,8 @@ async def test_resolve_conflict_accepts_resolution(client, monkeypatch):
     assert first.status_code == 201
     assert second.status_code == 201
     conflict_id = second.json()["id"]
+
+    await _drain_jobs()
 
     response = await client.post(
         f"/v1/items/{conflict_id}/resolve-conflict",

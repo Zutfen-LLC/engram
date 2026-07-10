@@ -195,7 +195,25 @@ async def _remember(
     body.update(payload)
     resp = await client.post("/v1/remember", json=body)
     assert resp.status_code == 201, resp.text
+    # ENG-AUD-008: drain embedding.generate so the embedding is ready before any
+    # semantic search in the test.
+    await _drain_jobs()
     return resp.json()
+
+
+async def _drain_jobs(max_iterations: int = 10) -> None:
+    """Process queued embedding.generate jobs until empty (ENG-AUD-008)."""
+    from engram.worker import process_one_job
+
+    for _ in range(max_iterations):
+        processed = await process_one_job(
+            worker_id="test",
+            session_factory=_test_session_factory,
+            app_session_factory=_test_session_factory,
+            job_types=["embedding.generate"],
+        )
+        if not processed:
+            return
 
 
 def _patch_embeddings(monkeypatch: pytest.MonkeyPatch, target_prefix: str) -> None:
@@ -205,8 +223,11 @@ def _patch_embeddings(monkeypatch: pytest.MonkeyPatch, target_prefix: str) -> No
     async def fake_embedding(text_value: str) -> list[float] | None:
         return target_vec if text_value.startswith(target_prefix) else distractor_vec
 
+    import engram.embeddings as embeddings_mod
+
     monkeypatch.setattr(recall_mod, "generate_embedding", fake_embedding)
     monkeypatch.setattr(memory_routes, "generate_embedding", fake_embedding)
+    monkeypatch.setattr(embeddings_mod, "generate_embedding", fake_embedding)
 
 
 # ---- 1. private memory: principal A owns it, principal B (same tenant) cannot see it ----

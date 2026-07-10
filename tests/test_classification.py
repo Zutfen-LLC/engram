@@ -200,7 +200,7 @@ async def test_auto_classify_on_remember_stores_provenance(client, monkeypatch):
             provenance={"provider": "openai", "mode": "llm", "matched_rules": ["kind_decision"]},
         )
 
-    monkeypatch.setattr(memory_routes, "classify_memory", fake_classifier)
+    monkeypatch.setattr(memory_routes, "classify_rules_only", fake_classifier)
     response = await client.post("/v1/remember", json={"content": "We decided to keep wing-alpha."})
     assert response.status_code == 201
     body = response.json()
@@ -222,7 +222,7 @@ async def test_explicit_kind_override_skips_auto_classify(client, monkeypatch):
     async def should_not_run(*args, **kwargs):
         raise AssertionError("classify() must not be called when kind is explicit")
 
-    monkeypatch.setattr(memory_routes, "classify_memory", should_not_run)
+    monkeypatch.setattr(memory_routes, "classify_rules_only", should_not_run)
     response = await client.post(
         "/v1/remember",
         json={

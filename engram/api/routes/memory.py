@@ -20,18 +20,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram import semantic
 from engram.canonicalize import canonicalize, content_hash
-from engram.classification import ClassificationResult
-from engram.classification import classify as classify_memory
+from engram.classification import ClassificationResult, classify_rules_only
 from engram.classification_trust import blend_memory_confidence, narrow_visibility
 from engram.config import settings
-from engram.conflicts import (
-    ConflictAction,
-    ConflictResult,
-    authority_allows_supersession,
-    detect_conflicts,
-)
+from engram.conflicts import authority_allows_supersession
 from engram.db import get_session
 from engram.embeddings import create_embedding_placeholder, generate_embedding
+from engram.jobs import enqueue_job
 from engram.memory_access import eligibility_sql, resolve_workspace_scope, tenant_sql
 from engram.models import (
     FeedbackEvent,
@@ -478,7 +473,10 @@ async def remember(
     room = req.room
     classification_result: ClassificationResult | None = None
     if kind is None:
-        classification_result = await classify_memory(req.content, tenant_id, session)
+        # Synchronous rule-based classification only (ENG-AUD-008 / F20): the
+        # OpenAI LLM refinement runs later via an async classification.refine
+        # job, so the request path never blocks on a provider call.
+        classification_result = await classify_rules_only(req.content, tenant_id, session)
         kind = classification_result.suggested_kind
         if wing is None:
             wing = classification_result.suggested_wing
@@ -638,96 +636,22 @@ async def remember(
             )
         )
 
-    # 9. Create embedding row when embeddings are enabled.
+    # 9. Embeddings are generated OFF the request path (ENG-AUD-008 / F20).
+    # Create the pending placeholder synchronously so the row exists, then
+    # enqueue an embedding.generate job. The provider is never called inline,
+    # so /v1/remember returns without waiting on OpenAI. The worker fills in
+    # the vector later and (when conflict_check_on_write is set) enqueues a
+    # conflict.check job that runs the now-embedding-dependent semantic dedup /
+    # auto-supersede / contradiction detection as eventual state transitions.
     if settings.embedding_provider != "none":
-        embedding_row = await create_embedding_placeholder(session, item.id, tenant_id)
-        embedding = await generate_embedding(req.content)
-        if embedding is not None:
-            embedding_row.embedding = embedding
-            embedding_row.embedding_dim = len(embedding)
-            embedding_row.embedding_status = "ready"
-
-    # 10. Conflict detection (semantic similarity + classifier).
-    # Only runs when embeddings are available — skipped cleanly otherwise.
-    conflict_result: ConflictResult | None = None
-    if settings.embedding_provider != "none" and settings.conflict_check_on_write:
+        await create_embedding_placeholder(session, item.id, tenant_id)
         await session.flush()
-        conflict_result = await detect_conflicts(item, session)
-
-    if conflict_result is not None:
-        action = conflict_result.action
-        if action is ConflictAction.DEDUP:
-            await session.rollback()
-            return RememberResponse(
-                id=conflict_result.existing_item_id,
-                status="deduped",
-                review_status=review_status,
-                memory_confidence=memory_confidence,
-                deduped_existing_id=conflict_result.existing_item_id,
-            )
-        if action is ConflictAction.AUTO_SUPERSEDE:
-            await session.execute(
-                update(MemoryItem)
-                .where(MemoryItem.id == conflict_result.existing_item_id)
-                .values(
-                    valid_to=func.now(),
-                    superseded_by=item.id,
-                )
-            )
-            session.add(
-                ItemEvent(
-                    item_id=item.id,
-                    event_type="conflict_detected",
-                    field_name="conflicts_with_item_id",
-                    old_value=None,
-                    new_value=json.dumps(
-                        {
-                            "verdict": conflict_result.verdict.value,
-                            "action": action.value,
-                            "similarity": conflict_result.similarity,
-                            "existing_item_id": str(conflict_result.existing_item_id),
-                            "reason": conflict_result.reason,
-                        },
-                        sort_keys=True,
-                    ),
-                    actor_principal_id=principal_id,
-                    reason=conflict_result.reason,
-                )
-            )
-            await session.commit()
-            return RememberResponse(
-                id=item.id,
-                status="superseded",
-                review_status=review_status,
-                memory_confidence=memory_confidence,
-                superseded_id=conflict_result.existing_item_id,
-            )
-        # FLAG_CONTRADICTION, PROPOSED_SUPERSEDE, FLAG_SCOPE_OVERLAP:
-        # mark the item with conflict metadata and write an event.
-        item.conflicts_with_item_id = conflict_result.existing_item_id
-        item.conflict_type = conflict_result.conflict_type
-        item.conflict_resolution_status = "unresolved"
-        item.review_status = "proposed"
-        session.add(
-            ItemEvent(
-                item_id=item.id,
-                event_type="conflict_detected",
-                field_name="conflicts_with_item_id",
-                old_value=None,
-                new_value=json.dumps(
-                    {
-                        "verdict": conflict_result.verdict.value,
-                        "action": action.value,
-                        "conflict_type": conflict_result.conflict_type,
-                        "similarity": conflict_result.similarity,
-                        "existing_item_id": str(conflict_result.existing_item_id),
-                        "reason": conflict_result.reason,
-                    },
-                    sort_keys=True,
-                ),
-                actor_principal_id=principal_id,
-                reason=conflict_result.reason,
-            )
+        await enqueue_job(
+            session,
+            tenant_id=tenant_id,
+            job_type="embedding.generate",
+            payload={"memory_item_id": str(item.id)},
+            dedupe_key=f"embedding:{item.id}",
         )
 
     await session.commit()
