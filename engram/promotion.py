@@ -1,28 +1,46 @@
 """Auto-promotion Path A for proposed memories.
 
-Design.md §3 — an item promotes when:
+Design.md §3 — an item promotes when ALL of the following hold:
   - ``review_status = 'proposed'``
   - ``memory_confidence >= auto_promote_confidence_threshold`` (default 0.7)
   - ``created_at`` is older than ``auto_promote_min_age_hours`` (default 72h)
-  - no unresolved conflict (``conflict_resolution_status IS NULL OR = 'accepted'``)
-  - tenant_config.auto_promote_enabled is true
+  - no unresolved conflict at write time
+    (``conflict_resolution_status IS NULL OR = 'accepted'``)
+  - no dispute event in ``item_events``/``feedback_events`` from another
+    principal (:func:`has_external_dispute_event`)
+  - a promotion-time conflict recheck against live active memories finds
+    nothing that blocks promotion (:func:`engram.conflicts.check_promotion_conflict`)
+  - ``tenant_config.auto_promote_enabled`` is true
 
 The service reads thresholds from the active ``tenant_config`` row — never
 hardcoded constants — with fallbacks that match the schema defaults so a
 misconfigured/missing tenant_config still promotes conservatively.
 
-This slice implements Path A only (age + confidence + no conflict). Path B
-(quorum-based, ``feedback_events``) is intentionally out of scope.
+This slice implements Path A only (age + confidence + no conflict + no
+dispute + conflict recheck). Path B (quorum-based, ``feedback_events``
+"useful" counts) is intentionally out of scope — see design.md §3.
 
 Audit: each promotion writes an ``item_events`` row with
 ``event_type='review_change'``, ``field_name='review_status'``,
 ``old_value='proposed'``, ``new_value='active'`` and a reason that names
-auto-promotion — mirroring the manual ``POST /items/{id}/review`` path.
+auto-promotion, the invocation ``source``, and which gates were checked —
+mirroring the manual ``POST /items/{id}/review`` path. Items blocked by the
+promotion-time conflict recheck get a ``conflict_resolution`` event and are
+marked ``conflict_resolution_status='unresolved'`` so a later scan doesn't
+silently re-attempt (and re-log) the same recheck.
 
-Invocation: a thin CLI command (``engram promote-proposed``) loops every
-tenant, and a thin admin endpoint (``POST /v1/admin/promote``) handles the
-caller's tenant. Neither adds a scheduler — deployment runs the CLI on cron
-or systemd.
+Invocation — three entry points, all sharing this one service function so the
+gates can never drift apart:
+  - lazy, bounded, tenant-scoped: ``maybe_auto_promote_for_startup_recall``,
+    called from ``engram.recall.execute_startup_recall`` before active items
+    are selected (source=``startup_recall``);
+  - a thin CLI command (``engram promote-proposed``, source=``cli``) that
+    loops every tenant;
+  - a thin admin endpoint (``POST /v1/admin/promote``, source=``admin_endpoint``)
+    that handles the caller's tenant.
+None of these add a scheduler or job queue — deployment runs the CLI on cron
+or systemd for full sweeps; the startup-recall hook keeps day-to-day recall
+current between sweeps.
 """
 
 from __future__ import annotations
@@ -34,7 +52,9 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from engram.models import ItemEvent, MemoryItem, TenantConfig
+from engram.config import settings
+from engram.conflicts import PromotionConflictCheck, check_promotion_conflict
+from engram.models import FeedbackEvent, ItemEvent, MemoryItem, TenantConfig
 
 # Fallbacks match the schema defaults in migrations/001_init.sql. Used only
 # when a tenant has no active tenant_config row — the normal path reads live
@@ -57,6 +77,9 @@ class PromotionResult:
     skipped_age: int = 0
     skipped_conflict: int = 0
     skipped_disabled: int = 0
+    # New in ENG-AUD-007.
+    skipped_dispute: int = 0
+    skipped_conflict_recheck: int = 0
     promoted_ids: list[uuid.UUID] = field(default_factory=list)
 
 
@@ -75,8 +98,59 @@ def summarize(result: PromotionResult) -> str:
         f"skipped_confidence={result.skipped_confidence} "
         f"skipped_age={result.skipped_age} "
         f"skipped_conflict={result.skipped_conflict} "
+        f"skipped_dispute={result.skipped_dispute} "
+        f"skipped_conflict_recheck={result.skipped_conflict_recheck} "
         f"skipped_disabled={result.skipped_disabled}"
     )
+
+
+async def has_external_dispute_event(session: AsyncSession, item: MemoryItem) -> bool:
+    """True if a principal other than ``item.principal_id`` has disputed this item.
+
+    A "dispute event" is defined as either of:
+      - an ``item_events`` row with ``event_type='review_change'``,
+        ``field_name='review_status'``, ``new_value='disputed'``, whose
+        ``actor_principal_id`` is not the item's own ``principal_id`` — i.e.
+        someone else moved this item's review status to ``disputed`` at some
+        point (even if it was later reset back to ``proposed``);
+      - a ``feedback_events`` row with ``verdict='noise'`` whose
+        ``principal_id`` is not the item's own ``principal_id`` — i.e.
+        another principal recalled this item and flagged it as noise.
+
+    The item creator's own uncertainty — self-disputing their own item, or
+    giving their own item "noise" feedback — never counts; only an *external*
+    signal blocks Path A. Manual/admin review can still promote or reject
+    outside Path A regardless of this gate.
+    """
+    dispute_event = (
+        await session.execute(
+            select(ItemEvent.id)
+            .where(
+                ItemEvent.item_id == item.id,
+                ItemEvent.event_type == "review_change",
+                ItemEvent.field_name == "review_status",
+                ItemEvent.new_value == "disputed",
+                ItemEvent.actor_principal_id.is_not(None),
+                ItemEvent.actor_principal_id != item.principal_id,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if dispute_event is not None:
+        return True
+
+    negative_feedback = (
+        await session.execute(
+            select(FeedbackEvent.id)
+            .where(
+                FeedbackEvent.item_id == item.id,
+                FeedbackEvent.verdict == "noise",
+                FeedbackEvent.principal_id != item.principal_id,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return negative_feedback is not None
 
 
 def _resolve_thresholds(config: TenantConfig | None) -> tuple[float, int]:
@@ -104,17 +178,24 @@ async def auto_promote_proposed_memories(
     *,
     now: datetime | None = None,
     limit: int | None = None,
+    source: str = "cli",
 ) -> PromotionResult:
     """Promote eligible proposed memories for a tenant (Path A).
 
     When ``tenant_id`` is None the tenant is read from the session's RLS
     context (``app.tenant_id``) the same way the route layer does.
 
+    ``source`` identifies the caller for provenance in the promotion event's
+    ``reason`` — one of ``"startup_recall"``, ``"cli"``, or ``"admin_endpoint"``.
+    It does not change promotion behavior; all three entry points use the
+    same gates.
+
     Returns a :class:`PromotionResult` with per-reason skip counts.
 
     The function commits on success so callers (CLI / endpoint) don't need to
     manage transaction boundaries. It is idempotent: a second run re-scans the
-    same set but finds nothing left to promote (those rows are now ``active``).
+    same set but finds nothing left to promote (those rows are now ``active``
+    or ``conflict_resolution_status='unresolved'``).
     """
     effective_now = now or datetime.now(UTC)
 
@@ -184,6 +265,7 @@ async def auto_promote_proposed_memories(
     result.scanned = len(candidates)
 
     to_promote: list[MemoryItem] = []
+    blocked_by_conflict: list[tuple[MemoryItem, PromotionConflictCheck]] = []
     for item in candidates:
         # Exclude superseded/terminal states defensively (valid_to IS NULL can
         # coexist with superseded_by transiently during supersession writes).
@@ -195,11 +277,53 @@ async def auto_promote_proposed_memories(
         if item.created_at > age_cutoff:
             result.skipped_age += 1
             continue
-        # No unresolved conflict: status must be NULL or 'accepted'.
+        # No unresolved conflict at write time: status must be NULL or
+        # 'accepted'.
         if item.conflict_resolution_status == "unresolved":
             result.skipped_conflict += 1
             continue
+        # No dispute event from another principal.
+        if await has_external_dispute_event(session, item):
+            result.skipped_dispute += 1
+            continue
+        # Promotion-time conflict recheck: don't rely solely on the
+        # write-time conflict status, since a later active write can create a
+        # conflict this item never saw.
+        conflict_check = await check_promotion_conflict(session, item)
+        if conflict_check is not None:
+            result.skipped_conflict_recheck += 1
+            blocked_by_conflict.append((item, conflict_check))
+            continue
         to_promote.append(item)
+
+    if blocked_by_conflict:
+        for item, check in blocked_by_conflict:
+            old_conflict_status = item.conflict_resolution_status
+            await session.execute(
+                update(MemoryItem)
+                .where(MemoryItem.id == item.id)
+                .values(
+                    conflict_resolution_status="unresolved",
+                    conflicts_with_item_id=check.conflicting_item_id,
+                )
+            )
+            session.add(
+                ItemEvent(
+                    item_id=item.id,
+                    event_type="conflict_resolution",
+                    field_name="conflict_resolution_status",
+                    old_value=old_conflict_status,
+                    new_value="unresolved",
+                    actor_principal_id=item.principal_id,
+                    reason=(
+                        f"auto-promotion Path A conflict recheck ({source}): "
+                        f"blocked by {check.verdict} against item "
+                        f"{check.conflicting_item_id} "
+                        f"({'embedding' if check.used_embeddings else 'heuristic fallback'}) "
+                        f"— {check.reason}"
+                    ),
+                )
+            )
 
     if to_promote:
         promote_ids = [item.id for item in to_promote]
@@ -209,8 +333,9 @@ async def auto_promote_proposed_memories(
             .values(review_status="active")
         )
         reason = (
-            "auto-promotion Path A: memory_confidence >= "
-            f"{threshold} and age >= {min_age_hours}h with no unresolved conflict"
+            f"auto-promotion Path A ({source}): memory_confidence >= {threshold} "
+            f"and age >= {min_age_hours}h, no unresolved conflict, no external "
+            "dispute event, promotion-time conflict recheck clear"
         )
         for item in to_promote:
             session.add(
@@ -229,3 +354,32 @@ async def auto_promote_proposed_memories(
 
     await session.commit()
     return result
+
+
+async def maybe_auto_promote_for_startup_recall(
+    session: AsyncSession,
+    tenant_id: str,
+    *,
+    now: datetime | None = None,
+) -> PromotionResult:
+    """Bounded, tenant-scoped Path A promotion pass invoked lazily from
+    ``POST /v1/recall`` (``mode='startup'``), before active items are
+    selected (design.md §3, ENG-AUD-007 F11).
+
+    Delegates entirely to :func:`auto_promote_proposed_memories` — no
+    promotion logic is duplicated here — bounded by
+    ``settings.startup_promotion_limit`` so a request handler never scans an
+    unbounded proposed-item backlog. ``tenant_config.auto_promote_enabled`` is
+    honored by the shared service function; when disabled this is a cheap
+    no-op (one count query, no writes).
+
+    Not invoked for semantic recall in this slice (see design.md — Path A
+    promotion is a startup-recall concern only for now).
+    """
+    return await auto_promote_proposed_memories(
+        session,
+        tenant_id,
+        now=now,
+        limit=settings.startup_promotion_limit,
+        source="startup_recall",
+    )

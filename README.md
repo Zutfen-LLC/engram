@@ -153,9 +153,9 @@ written → proposed → active → disputed → resolved → superseded/archive
 * **Disputed** memories remain available with warnings where appropriate.
 * **Archived** and superseded memories are preserved for audit but excluded from default recall.
 
-Auto-promotion is available for memories that meet tenant-configurable confidence, age, conflict, and feedback thresholds.
+Auto-promotion is available for memories that meet tenant-configurable confidence, age, conflict, dispute, and feedback thresholds.
 
-Auto-promotion runs on demand. Wire the CLI to cron/systemd, or call the admin endpoint:
+`POST /v1/recall` with `mode=startup` runs a bounded, tenant-scoped promotion pass automatically before building the working set (capped at `settings.startup_promotion_limit`, default 20 proposed items per call) — no separate trigger needed for day-to-day recall. For full sweeps of a large proposed backlog, wire the CLI to cron/systemd, or call the admin endpoint on demand:
 
 ```bash
 # All tenants. Runs as the owner role (bypasses RLS) via ENGRAM_OWNER_DATABASE_URL:
@@ -169,6 +169,8 @@ engram promote-proposed --tenant <tenant-id> --limit 1000
 POST /v1/admin/promote
 ```
 
+All three entry points (lazy startup recall, CLI, admin endpoint) share one promotion service function and the same gates — none can drift from the others.
+
 Promotion returns per-reason counts:
 
 ```text
@@ -177,6 +179,8 @@ promoted
 skipped_confidence
 skipped_age
 skipped_conflict
+skipped_dispute            # blocked by another principal's dispute/negative feedback
+skipped_conflict_recheck   # blocked by a promotion-time conflict recheck
 skipped_disabled
 ```
 
@@ -200,6 +204,10 @@ Trust is not binary. Every memory carries:
 
 Authority hierarchy governs supersession. A lower-authority source can never silently replace a higher-authority memory.
 
+Supersession is **atomic**: expiring the original and inserting the replacement happen in one transaction (the original is expired *before* the replacement is inserted, so the dedup unique index can never see both as active), and a failure between the two rolls back the original's expiration. The original points forward to its replacement (`superseded_by`), the replacement records what it replaced (`item_events`), and supersede behavior is covered by Postgres-backed tests that enforce the real unique index and RLS policies.
+
+`memory_confidence` starts from source-type defaults (see the table in [`docs/design.md`](docs/design.md) §4). When `/v1/remember` auto-classifies a write, the classifier's confidence **refines** that default — but source authority caps how far a low-trust automated source can promote itself, so a confident classifier can pull a weak capture *down* without letting it self-promote *up*. See [Classification](#classification) below.
+
 ### Recall
 
 Startup recall returns a deterministic, bounded working set of active memories, scored by:
@@ -212,11 +220,32 @@ score = importance × 0.30
       + human_verified × 0.10
 ```
 
+The `recency` component is the larger of two decay signals: recall recency (decay from `last_recalled_at`, subject to the anti-feedback penalty) and freshness (decay from `valid_from`/`created_at`, half-weighted). This gives a fresh, never-recalled memory a modest recency contribution without letting freshness dominate trust/importance.
+
 Pinned items bypass scoring and are included first, up to a ceiling.
+
+Recall is **bounded by default**: omitted `byte_budget` / `item_budget` fall back to the configured defaults (`recall_byte_budget`, `recall_item_budget`) rather than leaving recall unbounded. Explicit caller budgets always override the defaults.
 
 Every recalled item includes a `reasons` array explaining why it was included.
 
 Anti-feedback-loop guardrails prevent the same memories from permanently dominating recall without useful feedback.
+
+#### Semantic recall & search ranking
+
+Semantic recall (`mode=semantic`) and semantic/hybrid search rank results by a deterministic trust-weighted score (`scoring_version = semantic-v2`), not pure cosine distance:
+
+```text
+similarity   = clamp(1.0 − cosine_distance, 0.0, 1.0)
+trust_score  = 0.30·source_trust + 0.30·memory_confidence + 0.25·importance
+             + 0.10·human_verified + 0.05·review_status_factor   (clamped to [0.05, 1.0])
+semantic_score = similarity × trust_score
+```
+
+Unresolved conflicts multiply `trust_score` by 0.75; proposed items multiply by 0.85. So a slightly-closer low-trust or unreviewed item cannot outrank a higher-trust memory. Semantic result rows preserve `distance` and additionally expose `similarity_score`, `trust_score`, and the final `score` for transparency.
+
+#### Search filters
+
+`/v1/search` honors `kind`, `wing`, and `room` filters (AND semantics) across keyword, semantic, and hybrid modes. Filters apply before ranking/limit and alongside tenant/read-eligibility scoping, so ineligible rows never displace matches.
 
 ### Visibility & Multi-Tenancy
 
@@ -230,6 +259,25 @@ Engram supports visibility scopes for both single-agent and multi-agent deployme
 | `public`    | Any authenticated caller, where enabled |
 
 Row Level Security is enforced at the Postgres level — one forgotten `WHERE` clause cannot cause a cross-tenant leak. The runtime service connects as a dedicated non-owner role (`engram_app`) with no `BYPASSRLS`, and every tenant-scoped table uses `FORCE ROW LEVEL SECURITY`, so isolation holds even if the connecting role is the table owner. App-layer visibility/workspace logic is still the primary semantic rule; RLS is defense-in-depth beneath it.
+
+### Classification
+
+Two endpoints serve classification with distinct roles:
+
+* **`POST /v1/classify`** returns *suggestions* — suggested kind, wing, room, an advisory `suggested_visibility`, and the classifier's true `confidence`. It never stores anything or applies trust policy.
+* **`POST /v1/remember`** applies the *safe storage policy* when it auto-classifies a write (i.e. when the caller omits `kind`).
+
+Classifier confidence is a real `0.0–0.95` signal — low values are preserved rather than floored, so a doubtful classification can actually lower a memory's confidence. When `/v1/remember` classifies, it blends classifier confidence into the stored `memory_confidence`:
+
+* **Automated sources** (`sync_turn`, `pre_compress`, `extraction`) feel classification strongly (0.5·default + 0.5·classifier) — a confident classifier is their main quality signal.
+* **Authoritative sources** (`manual`, `import`, `migration`) are barely moved by uncertain taxonomy classification (0.85·default + 0.15·classifier), so a high-trust manual write isn't downrated just because the classifier was unsure about *kind*.
+* The result is **capped by source authority** (`max(default, source_trust)`), so a low-trust automated source can never self-promote past a safe ceiling, then clamped to `[0, 1]`.
+
+The classifier's `suggested_visibility` is applied **downward only** — it may narrow the requested scope (e.g. `tenant` → `private`) but never widen it. Invalid or absent suggestions preserve the caller's requested visibility unchanged.
+
+Every classified write records a `classification` event with full provenance: classifier confidence and raw confidence, default vs. final `memory_confidence`, requested/suggested/final visibility, whether visibility was narrowed, and whether confidence was blended. Content is never mutated.
+
+Seed classification rules are intentionally conservative: "skip" rules are whole-message *status-only* matchers (bare `ok`, `done`, `passed`) that don't fire on status words inside meaningful sentences, and doctrine classification requires explicit policy/invariant phrasing rather than casual modal verbs.
 
 ## Architecture
 

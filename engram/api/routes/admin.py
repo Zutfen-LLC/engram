@@ -102,6 +102,8 @@ class PromotionResponse(BaseModel):
     skipped_age: int = 0
     skipped_conflict: int = 0
     skipped_disabled: int = 0
+    skipped_dispute: int = 0
+    skipped_conflict_recheck: int = 0
     promoted_ids: list[uuid.UUID] = Field(default_factory=list)
     summary: str
 
@@ -255,12 +257,15 @@ async def promote_proposed(
     """Run auto-promotion Path A for the caller's tenant.
 
     Promotes ``proposed`` items whose ``memory_confidence`` meets the tenant
-    threshold, whose age meets ``auto_promote_min_age_hours``, and which have
-    no unresolved conflict. Each promotion writes an ``item_events`` audit row.
-    Idempotent — safe to call repeatedly. Returns per-reason skip counts.
+    threshold, whose age meets ``auto_promote_min_age_hours``, which have no
+    unresolved conflict, no dispute event from another principal, and pass a
+    promotion-time conflict recheck. Each promotion writes an ``item_events``
+    audit row. Idempotent — safe to call repeatedly. Returns per-reason skip
+    counts. Uses the same gates as the CLI and the lazy startup-recall
+    promotion pass (``engram.promotion.auto_promote_proposed_memories``).
     """
     tenant_id = await _resolve_tenant_id(session)
-    result = await auto_promote_proposed_memories(session, tenant_id)
+    result = await auto_promote_proposed_memories(session, tenant_id, source="admin_endpoint")
     return PromotionResponse(
         tenant_id=result.tenant_id,
         enabled=result.enabled,
@@ -272,6 +277,8 @@ async def promote_proposed(
         skipped_age=result.skipped_age,
         skipped_conflict=result.skipped_conflict,
         skipped_disabled=result.skipped_disabled,
+        skipped_dispute=result.skipped_dispute,
+        skipped_conflict_recheck=result.skipped_conflict_recheck,
         promoted_ids=result.promoted_ids,
         summary=summarize(result),
     )

@@ -21,7 +21,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from engram import semantic
 from engram.canonicalize import canonicalize, content_hash
 from engram.classification import ClassificationResult, classify_rules_only
+from engram.classification_trust import blend_memory_confidence, narrow_visibility
 from engram.config import settings
+from engram.conflicts import authority_allows_supersession
 from engram.db import get_session
 from engram.embeddings import create_embedding_placeholder, generate_embedding
 from engram.jobs import enqueue_job
@@ -295,6 +297,12 @@ _SEARCH_HELPFUL_MESSAGE = (
 )
 _RRF_K = 60
 
+# Semantic search pulls more candidates than the requested limit from the HNSW
+# index so trust-weighted re-ranking (engram.semantic) has room to reorder
+# within the window before trimming to the caller's limit.
+_SEMANTIC_SEARCH_OVERFETCH = 3
+_SEMANTIC_SEARCH_OVERFETCH_CAP = 200
+
 
 def _search_result_row(
     row: Any,
@@ -324,12 +332,39 @@ async def _keyword_search(
     *,
     tenant_id: UUID | str,
     principal_id: UUID | str,
+    kind: str | None = None,
+    wing: str | None = None,
+    room: str | None = None,
 ) -> list[dict[str, Any]]:
     """Keyword (full-text) search, scoped to the caller's tenant + visibility.
 
     Uses the shared raw-SQL eligibility fragment (``engram.memory_access``)
-    since this query is over raw ``text(...)`` SQL, not the ORM.
+    since this query is over raw ``text(...)`` SQL, not the ORM. Optional
+    ``kind``/``wing``/``room`` filters apply with AND semantics before the
+    rank/limit so ineligible rows don't displace matches.
     """
+    clauses: list[str] = [
+        "mi.review_status = 'active'",
+        "mi.valid_to IS NULL",
+        tenant_sql("mi"),
+        eligibility_sql("mi"),
+        "mi.content_tsv @@ plainto_tsquery('english', :query)",
+    ]
+    params: dict[str, Any] = {
+        "query": query,
+        "limit": limit,
+        "caller_tenant_id": str(tenant_id),
+        "caller_principal_id": str(principal_id),
+    }
+    if kind is not None:
+        clauses.append("mi.kind = :kind")
+        params["kind"] = kind
+    if wing is not None:
+        clauses.append("mi.wing = :wing")
+        params["wing"] = wing
+    if room is not None:
+        clauses.append("mi.room = :room")
+        params["room"] = room
     stmt = text(
         f"""
         SELECT
@@ -340,39 +375,32 @@ async def _keyword_search(
             mi.valid_to,
             ts_rank_cd(mi.content_tsv, plainto_tsquery('english', :query)) AS score
         FROM memory_items mi
-        WHERE mi.review_status = 'active'
-          AND mi.valid_to IS NULL
-          AND {tenant_sql("mi")}
-          AND {eligibility_sql("mi")}
-          AND mi.content_tsv @@ plainto_tsquery('english', :query)
+        WHERE {' AND '.join(clauses)}
         ORDER BY score DESC, mi.created_at DESC
         LIMIT :limit
         """
     )
-    rows = (
-        await session.execute(
-            stmt,
-            {
-                "query": query,
-                "limit": limit,
-                "caller_tenant_id": str(tenant_id),
-                "caller_principal_id": str(principal_id),
-            },
-        )
-    ).mappings().all()
+    rows = (await session.execute(stmt, params)).mappings().all()
     return [
         _search_result_row(row, mode="keyword", score=float(row["score"] or 0.0)) for row in rows
     ]
 
 
 def _format_semantic_result(row: dict[str, Any]) -> dict[str, Any]:
-    """Shape a semantic.search() row into the /v1/search response format."""
+    """Shape a semantic.search() row into the /v1/search response format.
+
+    ``score`` is the final trust-weighted semantic score; ``distance``,
+    ``similarity_score`` and ``trust_score`` are exposed for transparency so
+    callers can explain the ordering.
+    """
     return _search_result_row(
         row,
         mode="semantic",
         score=float(row.get("score", 0.0)),
         extra={
             "distance": row.get("distance"),
+            "similarity_score": row.get("similarity_score"),
+            "trust_score": row.get("trust_score"),
             "embedding_model": row.get("embedding_model"),
             "embedding_dim": row.get("embedding_dim"),
         },
@@ -462,6 +490,27 @@ async def remember(
     if classification_result is not None and classification_result.suggested_kind == "decision":
         review_status = "proposed"
 
+    # 4b. Classification → trust/visibility wiring (only when classification ran).
+    # The classifier may refine memory_confidence (capped by source authority so
+    # weak automated sources can't self-promote) and narrow — never widen — the
+    # requested visibility. Explicit-kind writes skip classification entirely, so
+    # their confidence/visibility come straight from the request/defaults.
+    default_confidence = memory_confidence
+    final_visibility = req.visibility
+    suggested_visibility: str | None = None
+    visibility_narrowed = False
+    memory_confidence_blended = False
+    if classification_result is not None:
+        suggested_visibility = classification_result.suggested_visibility
+        final_visibility = narrow_visibility(req.visibility, suggested_visibility)
+        visibility_narrowed = final_visibility != req.visibility
+        memory_confidence, memory_confidence_blended = blend_memory_confidence(
+            source_default_confidence=default_confidence,
+            classifier_confidence=classification_result.confidence,
+            source_trust=source_trust,
+            source_type=req.source_type,
+        )
+
     # 5. Supersession check for singleton kinds.
     superseded_id = await _check_supersession(
         session,
@@ -486,7 +535,7 @@ async def remember(
         subject_type=req.subject_type,
         subject_id=req.subject_id,
         subject_name=req.subject_name,
-        visibility=req.visibility,
+        visibility=final_visibility,
         review_status=review_status,
         memory_confidence=memory_confidence,
         source_trust=source_trust,
@@ -542,6 +591,18 @@ async def remember(
         "wing": wing,
         "room": room,
         "provider": provider,
+        # Trust/visibility audit — present on every classification event so the
+        # record is self-describing even for explicit-kind writes (where the
+        # classifier did not run and these are the untouched request/defaults).
+        "source_type": req.source_type,
+        "source_trust": source_trust,
+        "default_memory_confidence": default_confidence,
+        "final_memory_confidence": memory_confidence,
+        "memory_confidence_blended": memory_confidence_blended,
+        "requested_visibility": req.visibility,
+        "suggested_visibility": suggested_visibility,
+        "final_visibility": final_visibility,
+        "visibility_narrowed": visibility_narrowed,
     }
     if classification_result is not None:
         classification_dump = classification_result.model_dump(exclude={"provenance"})
@@ -679,30 +740,56 @@ async def search(
     """
     limit = req.limit
     mode = req.mode
+    # kind/wing/room filters apply (AND semantics) to all three search modes.
+    kind = req.kind
+    wing = req.wing
+    room = req.room
 
     tenant_id = await _resolve_tenant_id(session)
     principal_id, _ = await _resolve_principal(session, tenant_id)
 
     if mode == "keyword":
         results = await _keyword_search(
-            session, req.query, limit, tenant_id=tenant_id, principal_id=principal_id
+            session,
+            req.query,
+            limit,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            kind=kind,
+            wing=wing,
+            room=room,
         )
         return SearchResponse(results=results, total=len(results))
 
     query_embedding = await generate_embedding(req.query)
     semantic_count = await semantic.candidate_count(
-        session, tenant_id=tenant_id, principal_id=principal_id
+        session,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        kind=kind,
+        wing=wing,
+        room=room,
     )
 
     if mode == "semantic":
         if query_embedding is None or semantic_count == 0:
             return SearchResponse(results=[], total=0, message=_SEARCH_HELPFUL_MESSAGE)
+        # Over-fetch so trust-weighted re-ranking can reorder within the window
+        # before trimming to the caller's requested limit.
+        fetch_limit = min(limit * _SEMANTIC_SEARCH_OVERFETCH, _SEMANTIC_SEARCH_OVERFETCH_CAP)
         raw = await semantic.search(
-            session, query_embedding, limit, tenant_id=tenant_id, principal_id=principal_id
+            session,
+            query_embedding,
+            fetch_limit,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            kind=kind,
+            wing=wing,
+            room=room,
         )
         if not raw:
             return SearchResponse(results=[], total=0, message=_SEARCH_HELPFUL_MESSAGE)
-        results = [_format_semantic_result(row) for row in raw]
+        results = [_format_semantic_result(row) for row in raw[:limit]]
         return SearchResponse(results=results, total=len(results))
 
     keyword_results = await _keyword_search(
@@ -711,6 +798,9 @@ async def search(
         max(limit * 5, limit),
         tenant_id=tenant_id,
         principal_id=principal_id,
+        kind=kind,
+        wing=wing,
+        room=room,
     )
     if query_embedding is None or semantic_count == 0:
         return SearchResponse(
@@ -725,6 +815,9 @@ async def search(
         max(limit * 5, limit),
         tenant_id=tenant_id,
         principal_id=principal_id,
+        kind=kind,
+        wing=wing,
+        room=room,
     )
     semantic_results = [_format_semantic_result(row) for row in raw_semantic]
     results = _rrf_fuse(keyword_results, semantic_results, limit=limit)
@@ -1132,11 +1225,54 @@ async def supersede_item(
     req: MutationAuditRequest | None = None,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> dict[str, Any]:
-    """Mark superseded + write replacement."""
+    """Atomically expire an item and write its replacement.
+
+    Ordering is load-bearing for the partial unique index ``idx_memitems_dedup``
+    (``WHERE valid_to IS NULL AND review_status != 'rejected'``): the original
+    is expired *before* the replacement is inserted, so the two never satisfy
+    the index predicate with identical ``(tenant, workspace, principal,
+    content_hash)`` keys at the same time. The whole operation runs in one
+    transaction — a failure after expiring the original but before inserting
+    the replacement rolls the expiration back.
+    """
     item = await _require_item(session, item_id)
+
+    # 1. Lock the original row to serialize concurrent supersedes. FOR UPDATE
+    #    is supported by Postgres and a no-op on the SQLite test fixture.
+    await session.execute(
+        select(MemoryItem.id).where(MemoryItem.id == item_id).with_for_update()
+    )
+
+    # 2. Eligibility: cannot supersede an item that is already expired or
+    #    rejected — it has left the active set the replacement would target.
+    if item.get("valid_to") is not None or item.get("review_status") == "rejected":
+        raise HTTPException(
+            status_code=409,
+            detail="Item is already expired or rejected and cannot be superseded",
+        )
+
+    # 3. Authority: a lower-authority source must not silently replace a
+    #    higher-authority memory (design §4). The replacement is a clone, so
+    #    by default authority is equal and the gate passes — but it is present
+    #    structurally so a future divergent-authority supersede is enforced.
+    if not authority_allows_supersession(
+        new_trust=float(item["source_trust"]),
+        old_trust=float(item["source_trust"]),
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Lower-authority source may not supersede a higher-authority memory",
+        )
+
     now = _now_dt()
     new_id = uuid.uuid4()
-    replacement = dict(item)
+    # Build the replacement from only the ORM-mapped columns. ``item`` comes
+    # from ``SELECT * FROM memory_items``, which includes the generated
+    # ``content_tsv`` column (STORED GENERATED ALWAYS AS) — inserting it
+    # explicitly is rejected by Postgres, and passing it to insert(MemoryItem)
+    # raises "Unconsumed column names" because it isn't an ORM attribute.
+    mapped_keys = {c.name for c in MemoryItem.__table__.columns}
+    replacement = {k: v for k, v in item.items() if k in mapped_keys}
     replacement.update(
         {
             "id": new_id,
@@ -1160,7 +1296,39 @@ async def supersede_item(
         str(item["principal_id"])
     )
     reason = req.reason if req else None
+
+    # 4. Expire the original BEFORE inserting the replacement. Setting
+    #    ``valid_to`` removes the original from the idx_memitems_dedup partial
+    #    index (predicate: ``valid_to IS NULL AND review_status != 'rejected'``)
+    #    so the replacement insert — which reuses the original's content_hash —
+    #    cannot violate uniqueness.
+    #
+    #    The ``superseded_by`` link is set in a SEPARATE update AFTER the
+    #    replacement exists, because ``superseded_by`` is a self-FK to
+    #    memory_items(id): setting it before the replacement row exists would
+    #    violate memory_items_superseded_by_fkey. (``valid_to`` alone carries
+    #    no FK, so it is safe to set first.)
+    #
+    #    Pass ``valid_to`` as a datetime (not an isoformat string) so the
+    #    asyncpg driver binds it to the TIMESTAMPTZ column natively.
+    await session.execute(
+        text("UPDATE memory_items SET valid_to = :valid_to WHERE id = :item_id"),
+        {"valid_to": now, "item_id": str(item_id)},
+    )
+
+    # 5. Insert the replacement. With the original now expired, the two rows
+    #    never both satisfy the dedup index predicate simultaneously.
     await session.execute(insert(MemoryItem).values(**replacement))
+
+    # 6. Link the original forward to its replacement. The replacement row now
+    #    exists, so the superseded_by self-FK is satisfied.
+    await session.execute(
+        text("UPDATE memory_items SET superseded_by = :superseded_by WHERE id = :item_id"),
+        {"superseded_by": str(new_id), "item_id": str(item_id)},
+    )
+
+    # 7. Record provenance both ways: the original points forward to its
+    #    replacement, and the replacement points back at what it replaced.
     event = await _insert_item_event(
         session,
         item_id=item_id,
@@ -1171,17 +1339,25 @@ async def supersede_item(
         actor_principal_id=actor,
         reason=reason,
     )
-    await session.execute(
-        text(
-            "UPDATE memory_items SET valid_to = :valid_to, superseded_by = :superseded_by "
-            "WHERE id = :item_id"
-        ),
-        {"valid_to": now.isoformat(), "superseded_by": str(new_id), "item_id": str(item_id)},
+    replacement_event = await _insert_item_event(
+        session,
+        item_id=new_id,
+        event_type="supersede",
+        field_name="replaces",
+        old_value=None,
+        new_value=item_id,
+        actor_principal_id=actor,
+        reason=reason,
     )
     old_item = await _require_item(session, item_id)
     new_item = await _require_item(session, new_id)
     await session.commit()
-    return {"old_item": old_item, "new_item": new_item, "event": event}
+    return {
+        "old_item": old_item,
+        "new_item": new_item,
+        "event": event,
+        "replacement_event": replacement_event,
+    }
 
 
 @router.post("/items/{item_id}/invalidate", response_model=None)
@@ -1209,7 +1385,7 @@ async def invalidate_item(
     )
     await session.execute(
         text("UPDATE memory_items SET valid_to = :valid_to WHERE id = :item_id"),
-        {"valid_to": now.isoformat(), "item_id": str(item_id)},
+        {"valid_to": now, "item_id": str(item_id)},
     )
     updated = await _require_item(session, item_id)
     await session.commit()

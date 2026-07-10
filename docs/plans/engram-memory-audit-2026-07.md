@@ -31,10 +31,10 @@ Section 8 gives the prioritized roadmap. The one-line version: **P0 = make the r
 | F3 | **P0** | Storage/RLS | RLS is inert in the shipped deployment (app connects as table owner; no `FORCE ROW LEVEL SECURITY`) |
 | F4 | **P0** | Auth | API-key verification is O(n·bcrypt) over all keys of all tenants, per request |
 | F5 | **P1** | Storage | RLS session context is transaction-scoped and silently lost after rollback/commit mid-request |
-| F6 | **P1** | Items | `POST /items/{id}/supersede` inserts the replacement before expiring the original — latent unique-index violation on real Postgres |
-| F7 | **P1** | Testing | Several "DB" test suites run against a hand-rolled SQLite schema with no constraints, indexes, or RLS |
-| F8 | **P1** | Classification | LLM classification never refines `memory_confidence`; `suggested_visibility` is never applied; confidence floor of 0.7 makes low confidence unrepresentable |
-| F9 | **P1** | Classification | Seed skip-rules misfire (`\b(ok|done|failed)\b` matches almost any agent output) and "skip" still stores the item |
+| F6 | **P1** | Items | ~~`POST /items/{id}/supersede` inserts the replacement before expiring the original — latent unique-index violation on real Postgres~~ **Addressed (ENG-AUD-006):** handler now locks + validates + expires the original *before* inserting the replacement in a single transaction; eligibility (409), authority, dual provenance, and Postgres-backed rollback/unique-index tests added |
+| F7 | **P1** | Testing | ~~Several "DB" test suites run against a hand-rolled SQLite schema with no constraints, indexes, or RLS~~ **Partially addressed (ENG-AUD-006):** supersede invariant coverage migrated to real Postgres (tests/test_supersede.py); the SQLite suite (test_items.py) is now route-logic-only with a comment marking it as not certifying DB invariants. Sibling suites (auth/export/hygiene) remain on SQLite and are tracked for a later pass |
+| F8 | **P1** | Classification | ~~LLM classification never refines `memory_confidence`; `suggested_visibility` is never applied; confidence floor of 0.7 makes low confidence unrepresentable~~ **Addressed (ENG-AUD-005):** classifier confidence blends into `memory_confidence` (authority-capped, source-type-weighted); `suggested_visibility` applied downward-only on remember; 0.7 floor removed (real `0.0–0.95` signal) |
+| F9 | **P1** | Classification | ~~Seed skip-rules misfire (`\b(ok|done|failed)\b` matches almost any agent output) and "skip" still stores the item~~ **Addressed (ENG-AUD-005):** skip rules reworked to whole-message status-only anchors; doctrine requires explicit policy/invariant phrasing; "skip" naming reframed as low-information status. (Deferred: explicit `store/skip/quarantine` disposition — out of scope for this slice) |
 | F10 | **P1** | Recall | Semantic recall ranks by similarity only — the trust model is absent from semantic ranking |
 | F11 | **P1** | Recall | Auto-promotion is not wired into startup recall (CLI/admin only), contradicting BL-004's status and design §3 |
 | F12 | **P1** | Promotion | Path A is missing the "no dispute event from another principal" gate |
@@ -106,9 +106,13 @@ Implement it once (a SQLAlchemy composable filter + an equivalent SQL fragment f
 
 `POST /v1/items/{id}/supersede` (`memory.py:1088-1143`) inserts a full copy of the row — same `(tenant_id, workspace_id, principal_id, content_hash)`, `valid_to = NULL` — *before* expiring the original. `idx_memitems_dedup` (`001_init.sql:380-382`, `NULLS NOT DISTINCT`, partial on `valid_to IS NULL AND review_status != 'rejected'`) should reject that insert on real Postgres. The endpoint's test passes because it runs on SQLite without the index (F7). Fix the ordering (expire first, insert second, in one transaction) and add a Postgres-backed test.
 
+> **Landed (ENG-AUD-006):** the handler now (1) locks the original with `SELECT ... FOR UPDATE`, (2) validates eligibility (409 on already-expired/rejected), (3) validates authority via the centralized `authority_allows_supersession` helper, (4) expires the original *before* inserting the replacement — all in one transaction, so a failed replacement insert rolls back the expiration. Dual provenance events link the original forward and the replacement back. Coverage migrated to real Postgres in `tests/test_supersede.py` (unique-index safety, rollback, dedup interaction, authority, cross-tenant RLS, singleton supersession, eligibility).
+
 ### F7. Test fidelity: hand-rolled SQLite schemas (P1)
 
 `tests/test_items.py` (and siblings: auth, export, hygiene…) create their own SQLite DDL with **no CHECK constraints, no unique indexes, no RLS, no generated tsvector** (`tests/test_items.py:16-90`). These tests validate route logic but certify nothing about the real schema — F6 is the proof. Recommendation: converge on the Postgres-backed fixture used by the conflict/remember/search suites for anything that touches `memory_items`, and reserve SQLite for pure-logic units. Add the F1/F3 isolation tests to the Postgres suite. This is cheap insurance and directly protects the product's core claims.
+
+> **Partially landed (ENG-AUD-006):** the supersede coverage that depends on the real unique index/RLS moved to `tests/test_supersede.py` (real Postgres); `tests/test_items.py` is now route-logic-only with a comment marking it as not certifying DB invariants. The sibling SQLite suites (auth/export/hygiene) remain a tracked follow-up.
 
 ---
 
@@ -126,7 +130,11 @@ Implement it once (a SQLAlchemy composable filter + an equivalent SQL fragment f
 
 *Fix:* on LLM-classified writes, set `memory_confidence = f(source_default, classifier_confidence)` (e.g., weighted blend, capped by source authority so a chatty source can't self-promote past its ceiling), record old/new in the event, and honor `suggested_visibility` **only downward** (never widen visibility on a suggestion — a classifier must not be able to make something more public). Remove the 0.7 floor; keep the threshold-based conservative fallback.
 
+> **Landed (ENG-AUD-005):** classifier confidence now blends into `memory_confidence` via a source-type-weighted policy (0.5·default + 0.5·classifier for automated sources, 0.85·default + 0.15·classifier for manual/import/migration), capped by `max(default, source_trust)` and clamped to `[0,1]`. `suggested_visibility` is applied downward-only (`engram/classification_trust.py`). The 0.7 floor is removed; confidence is a real `0.0–0.95` signal and below-threshold results are no longer re-floored. The classification event records default/final confidence, requested/suggested/final visibility, and the applied policy flags.
+
 **F9 — Seed rules misfire.** `skip_tool_output` = `\b(passed|failed|ok|done)\b` (priority 10) matches a huge fraction of natural agent output ("the deploy is done", "tests passed after the fix") and forces the conservative `fact` default — silently suppressing the kind/wing/room rules for exactly the content they were written for. Also `kind_doctrine` = `must|should|always|never` will label casual statements as doctrine — the highest-stakes kind (disputed doctrine stays in startup recall). And semantically, "skip" doesn't skip: the item is still stored, just classified as `fact` at 0.6 (`classification.py:194-204`). Either give skip rules a real meaning (reject/quarantine with a `skipped` disposition the caller can see) or rename them. Rework the seeds; better, replace keyword rules as the middle tier (next point).
+
+> **Landed (ENG-AUD-005):** seed rules reworked for all tenants (`005_classification_seed_rules.sql`, mirrored in `001_init.sql`). `skip_tool_output` → `skip_status_only` anchored with `\A...\Z` so it matches only whole-message status text; `skip_single_token` tightened to a whole-string single short token; `kind_doctrine` now requires explicit `doctrine`/`invariant` keywords, `policy:`/`rule:`/`invariant:` labels, or `must (never|always|not)`. The small "preferred approach" (status-only rules + conservative doctrine) was chosen; the explicit `store/conservative/skip/quarantine` disposition is deferred to a later classification redesign.
 
 **Embedding-based classification as the no-LLM middle tier.** Engram already stores embeddings. A k-NN classifier over already-labeled items (label = kind/wing/room of the nearest confirmed neighbors, confidence = neighbor agreement × similarity) gives every tenant a self-improving classifier with zero LLM cost and no rule authoring, sitting between regex and LLM. Human corrections via PATCH become training signal automatically. This is a differentiator no competing layer ships, and it falls out of infrastructure you already have.
 
@@ -277,8 +285,8 @@ The locked decisions (standalone service, Postgres-only, REST core, RLS foundati
 | **P0** | Shared visibility/membership predicate on all read paths + Postgres-backed isolation tests | F1, F2, F7 | M |
 | **P0** | RLS: app role + `FORCE`, transaction-safe context, RLS-as-non-owner CI test | F3, F5 | M |
 | **P0** | API key: key-id lookup, O(1) verify, principal cache | F4 | S |
-| **P0** | Fix supersede ordering; migrate item-touching tests to Postgres fixtures | F6, F7 | S–M |
-| **P1** | Classification → trust wiring: confidence blend, visibility (downward only), remove 0.7 floor; fix seed rules; skip semantics | F8, F9 | M |
+| **P0** | ~~Fix supersede ordering; migrate item-touching tests to Postgres fixtures~~ **Done (ENG-AUD-006)** | F6, F7 | S–M |
+| **P1** | ~~Classification → trust wiring: confidence blend, visibility (downward only), remove 0.7 floor; fix seed rules; skip semantics~~ **Done (ENG-AUD-005)** | F8, F9 | M |
 | **P1** | Trust-weighted semantic ranking (`semantic-v2`); honor search filters; default budgets; skip-not-break packing; freshness in recency | F10, F14, F15 | M |
 | **P1** | Promotion: lazy check on startup recall, dispute gate; conflict check at promotion time; top-k conflict candidates | F11, F12, F13 | M |
 | **P1** | Async job queue (embeddings, LLM classify refine, promotion, retention); vocab caching — **done (ENG-AUD-008)** | F20 | M |

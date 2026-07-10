@@ -36,7 +36,10 @@ class ClassificationResult(BaseModel):
     suggested_kind: str
     suggested_wing: str | None = None
     suggested_room: str | None = None
-    suggested_visibility: str = "workspace"
+    # Advisory only. ``/v1/remember`` applies this downward (never widens);
+    # ``/v1/classify`` returns it as a suggestion. ``None`` means "no suggestion"
+    # and the caller's requested visibility is preserved.
+    suggested_visibility: str | None = None
     confidence: float = Field(ge=0.0, le=1.0)
     reason: str
     rules_matched: list[str] = Field(default_factory=list)
@@ -432,7 +435,8 @@ def _build_prompt(
             "suggested_kind": "str",
             "suggested_wing": "str|null",
             "suggested_room": "str|null",
-            "confidence": "number 0.70-0.95",
+            "suggested_visibility": "one of private|workspace|tenant|public, or null",
+            "confidence": "number 0.0-0.95 (low values are allowed and meaningful)",
             "reason": "str",
             "rules_matched": "list[str]",
         },
@@ -440,6 +444,10 @@ def _build_prompt(
             "Return valid JSON only.",
             "Use only kinds from the taxonomy; otherwise choose fact.",
             "Use wing/room values from the provided vocabulary when possible.",
+            "suggested_visibility is advisory; narrow it when the content looks "
+            "sensitive/personal, or null when you have no opinion.",
+            "Confidence may be any value in 0.0-0.95. Low confidence is a real "
+            "signal — express doubt rather than flooring it.",
             "If uncertain, prefer fact and a lower confidence.",
         ],
     }
@@ -483,11 +491,21 @@ def _apply_llm_payload(
     wing = _normalize_vocab_value(raw_wing, wings)
     room = _normalize_vocab_value(raw_room, rooms)
 
+    # Confidence is a real 0.0-0.95 signal: it is no longer floored to 0.7, so a
+    # doubtful classifier result (e.g. 0.35) survives and can lower the stored
+    # memory_confidence downstream. Missing/unparseable confidence defaults to a
+    # neutral 0.5 rather than the old 0.7 floor.
+    raw_confidence: float | None
     try:
-        confidence = float(payload.get("confidence", 0.7))
+        raw_confidence = float(payload.get("confidence", 0.5))
     except (TypeError, ValueError):
-        confidence = 0.7
-    confidence = max(0.7, min(0.95, confidence))
+        raw_confidence = 0.5
+    confidence = _clamp(raw_confidence, 0.0, 0.95)
+
+    # Suggested visibility is advisory; validated against the enum. Invalid /
+    # unknown values are dropped to None so the caller preserves the requested
+    # visibility rather than trusting a malformed suggestion.
+    suggested_visibility = _normalize_visibility(payload.get("suggested_visibility"))
 
     rules_matched = _merge_vocab(
         rule_result.rules_matched, _as_iterable(payload.get("rules_matched"))
@@ -505,6 +523,8 @@ def _apply_llm_payload(
                 "suggested_kind": kind,
                 "suggested_wing": wing,
                 "suggested_room": room,
+                "suggested_visibility": suggested_visibility,
+                "raw_confidence": raw_confidence,
                 "confidence": confidence,
                 "rules_matched": rules_matched,
             },
@@ -520,12 +540,15 @@ def _apply_llm_payload(
         kind = "fact"
         wing = rule_result.suggested_wing or wing
         room = rule_result.suggested_room or room
-        confidence = max(0.7, confidence)
+        # Do NOT re-floor confidence above the threshold. The whole point of
+        # removing the 0.7 floor is that a doubtful result stays doubtful, so the
+        # downstream confidence blend can lower memory_confidence appropriately.
 
     return ClassificationResult(
         suggested_kind=kind,
         suggested_wing=wing,
         suggested_room=room,
+        suggested_visibility=suggested_visibility,
         confidence=confidence,
         reason=reason,
         rules_matched=rules_matched,
@@ -540,6 +563,24 @@ def _normalize_vocab_value(value: Any, vocab: list[str]) -> str | None:
     if not text:
         return None
     return text if text in vocab else None
+
+
+_VALID_VISIBILITIES = {"private", "workspace", "tenant", "public"}
+
+
+def _normalize_visibility(value: Any) -> str | None:
+    """Coerce an LLM-provided visibility into a valid enum value or None."""
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text or text == "null":
+        return None
+    return text if text in _VALID_VISIBILITIES else None
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    """Clamp ``value`` to ``[lo, hi]``. ``lo``/``hi`` are assumed ordered."""
+    return max(lo, min(hi, value))
 
 
 def _as_iterable(value: Any) -> Iterable[Any]:

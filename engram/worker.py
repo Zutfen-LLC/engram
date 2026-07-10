@@ -472,7 +472,10 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
         changed = True
 
     # Visibility: NARROW only (never widen). ENG-AUD-005.
-    if _can_narrow(item.visibility, result.suggested_visibility):
+    if (
+        result.suggested_visibility is not None
+        and _can_narrow(item.visibility, result.suggested_visibility)
+    ):
         await _insert_event(
             session,
             item_id=item.id,

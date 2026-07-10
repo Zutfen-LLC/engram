@@ -26,7 +26,10 @@ class ClassifyResponse(BaseModel):
     suggested_kind: str
     suggested_wing: str | None = None
     suggested_room: str | None = None
-    suggested_visibility: str = "workspace"
+    # Advisory only. ``/v1/classify`` returns the suggestion; the actual
+    # downward-only narrowing happens on ``/v1/remember``. ``None`` means the
+    # classifier has no opinion and the caller's visibility should be preserved.
+    suggested_visibility: str | None = None
     confidence: float = Field(ge=0.0, le=1.0)
     reason: str
     rules_matched: list[str] = Field(default_factory=list)
