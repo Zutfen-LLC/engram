@@ -794,6 +794,7 @@ async def test_semantic_recall_warning_changes_after_promotion(client, monkeypat
     # the content matches the query vector.
     settings.embedding_provider = "openai"
     settings.conflict_check_on_write = False
+    import engram.embeddings as embeddings_mod
     from engram import recall as recall_mod
     from engram.api.routes import memory as memory_routes
 
@@ -806,6 +807,7 @@ async def test_semantic_recall_warning_changes_after_promotion(client, monkeypat
 
     monkeypatch.setattr(recall_mod, "generate_embedding", fake_embedding)
     monkeypatch.setattr(memory_routes, "generate_embedding", fake_embedding)
+    monkeypatch.setattr(embeddings_mod, "generate_embedding", fake_embedding)
 
     # Write the item via the client so the engine's first connection lands on the
     # request loop (mirrors test_semantic_recall). The write path also creates
@@ -816,6 +818,19 @@ async def test_semantic_recall_warning_changes_after_promotion(client, monkeypat
     )
     assert create.status_code == 201, create.text
     item_id = create.json()["id"]
+    # ENG-AUD-008: /v1/remember enqueues embedding.generate; drain it so the
+    # embedding is ready before semantic recall.
+    from engram.worker import process_one_job
+
+    for _ in range(10):
+        processed = await process_one_job(
+            worker_id="test",
+            session_factory=_test_session_factory,
+            app_session_factory=_test_session_factory,
+            job_types=["embedding.generate"],
+        )
+        if not processed:
+            break
     # Tweak to promotion-eligible (session-after-client is the proven-safe order).
     async with _test_session_factory() as session:
         await session.execute(

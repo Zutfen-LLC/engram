@@ -150,11 +150,12 @@ async def test_skip_locked_prevents_double_claim():
     async with _test_session_factory() as session:
         await enqueue_job(session, tenant_id=tenant, job_type="t", payload={})
 
-    # Two concurrent claims — exactly one wins.
-    w1, w2 = await asyncio.gather(
-        claim_next_job(_test_session_factory()(), worker_id="w1"),
-        claim_next_job(_test_session_factory()(), worker_id="w2"),
-    )
+    async def _claim(wid: str):
+        async with _test_session_factory() as session:
+            return await claim_next_job(session, worker_id=wid)
+
+    # Two concurrent claims — exactly one wins (FOR UPDATE SKIP LOCKED).
+    w1, w2 = await asyncio.gather(_claim("w1"), _claim("w2"))
     winners = [j for j in (w1, w2) if j is not None]
     assert len(winners) == 1
 

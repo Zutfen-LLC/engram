@@ -72,7 +72,7 @@ def _enable_embeddings(monkeypatch):
 
 
 def _stub_verdict(monkeypatch, verdict: ConflictVerdict, confidence: float = 0.9):
-    async def fake_classify(_old: str, _new: str, _similarity: float):
+    async def fake_classify(old_content: str, new_content: str, similarity: float):
         return verdict, confidence, f"forced {verdict.value}", {"provider": "test"}
 
     monkeypatch.setattr("engram.conflicts._classify_relationship", fake_classify)

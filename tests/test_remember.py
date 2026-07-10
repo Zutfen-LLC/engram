@@ -553,7 +553,7 @@ def _patch_classifier(monkeypatch, **result_kwargs):
     async def fake_classifier(content: str, tenant_id, session, context=None):
         return ClassificationResult(**defaults)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(memory_routes, "classify_memory", fake_classifier)
+    monkeypatch.setattr(memory_routes, "classify_rules_only", fake_classifier)
 
 
 async def test_blend_weak_source_low_classifier_lowers_stored_confidence(client, monkeypatch):
@@ -606,7 +606,7 @@ async def test_explicit_kind_preserves_default_confidence_and_visibility(client,
     async def should_not_run(*args, **kwargs):
         raise AssertionError("classify() must not be called when kind is explicit")
 
-    monkeypatch.setattr(memory_routes, "classify_memory", should_not_run)
+    monkeypatch.setattr(memory_routes, "classify_rules_only", should_not_run)
     response = await client.post(
         "/v1/remember",
         json={

@@ -217,7 +217,7 @@ async def test_refinement_updates_kind_above_threshold(client, monkeypatch):
             provenance={"provider": "openai", "mode": "llm"},
         )
 
-    monkeypatch.setattr("engram.worker.classify", fake_classify)
+    monkeypatch.setattr("engram.classification.classify", fake_classify)
     await _run_refine_job(item_id)
 
     row = await _fetch_item(item_id)
@@ -244,7 +244,7 @@ async def test_refinement_narrows_visibility_never_widens(client, monkeypatch):
             provenance={"provider": "openai", "mode": "llm"},
         )
 
-    monkeypatch.setattr("engram.worker.classify", suggest_workspace)
+    monkeypatch.setattr("engram.classification.classify", suggest_workspace)
     await _run_refine_job(item_id)
     assert (await _fetch_item(item_id))["visibility"] == "workspace"
 
@@ -259,7 +259,7 @@ async def test_refinement_narrows_visibility_never_widens(client, monkeypatch):
             provenance={"provider": "openai", "mode": "llm"},
         )
 
-    monkeypatch.setattr("engram.worker.classify", suggest_tenant)
+    monkeypatch.setattr("engram.classification.classify", suggest_tenant)
     await _run_refine_job(item_id)
     assert (await _fetch_item(item_id))["visibility"] == "workspace"
 
@@ -279,7 +279,7 @@ async def test_refinement_writes_item_events(client, monkeypatch):
             provenance={"provider": "openai", "mode": "llm"},
         )
 
-    monkeypatch.setattr("engram.worker.classify", fake_classify)
+    monkeypatch.setattr("engram.classification.classify", fake_classify)
     before = await _event_count(item_id)
     await _run_refine_job(item_id)
     after = await _event_count(item_id)
@@ -301,7 +301,7 @@ async def test_refinement_rerun_is_idempotent(client, monkeypatch):
             provenance={"provider": "openai", "mode": "llm"},
         )
 
-    monkeypatch.setattr("engram.worker.classify", fake_classify)
+    monkeypatch.setattr("engram.classification.classify", fake_classify)
     await _run_refine_job(item_id)
     state_after_first = await _fetch_item(item_id)
     events_after_first = await _event_count(item_id)
@@ -333,7 +333,7 @@ async def test_refinement_skips_below_threshold(client, monkeypatch):
             provenance={"provider": "openai", "mode": "llm"},
         )
 
-    monkeypatch.setattr("engram.worker.classify", fake_classify)
+    monkeypatch.setattr("engram.classification.classify", fake_classify)
     await _run_refine_job(item_id)
     after = await _fetch_item(item_id)
     # kind/wing/room unchanged because confidence < threshold.

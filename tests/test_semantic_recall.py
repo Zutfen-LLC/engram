@@ -129,6 +129,9 @@ async def _remember(client: AsyncClient, content: str, **payload: Any) -> dict[s
     body.update(payload)
     resp = await client.post("/v1/remember", json=body)
     assert resp.status_code == 201, resp.text
+    # ENG-AUD-008: /v1/remember enqueues embedding.generate; process it so the
+    # embedding is ready before any semantic recall in the test.
+    await _drain_jobs()
     return resp.json()
 
 
@@ -137,10 +140,35 @@ def _patch_embeddings(monkeypatch: pytest.MonkeyPatch) -> None:
         return _fake_embedding_for(text_value)
 
     # recall.execute_semantic_recall imports generate_embedding at module load.
+    import engram.embeddings as embeddings_mod
     from engram import recall as recall_mod
 
     monkeypatch.setattr(recall_mod, "generate_embedding", fake_embedding)
     monkeypatch.setattr(memory_routes, "generate_embedding", fake_embedding)
+    # The worker's embedding.generate handler imports generate_embedding from
+    # engram.embeddings at handler-call time (ENG-AUD-008 async write path).
+    monkeypatch.setattr(embeddings_mod, "generate_embedding", fake_embedding)
+
+
+async def _drain_jobs(max_iterations: int = 10) -> None:
+    """Process queued embedding.generate jobs until empty.
+
+    The async write path (ENG-AUD-008) leaves embeddings pending after
+    /v1/remember; draining makes them ready before a semantic operation. Only
+    embedding.generate jobs are processed here to avoid conflict-check side
+    effects in recall-only tests.
+    """
+    from engram.worker import process_one_job
+
+    for _ in range(max_iterations):
+        processed = await process_one_job(
+            worker_id="test",
+            session_factory=_test_session_factory,
+            app_session_factory=_test_session_factory,
+            job_types=["embedding.generate"],
+        )
+        if not processed:
+            return
 
 
 # ---- happy path ----
