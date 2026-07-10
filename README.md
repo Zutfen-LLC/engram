@@ -243,6 +243,23 @@ semantic_score = similarity × trust_score
 
 Unresolved conflicts multiply `trust_score` by 0.75; proposed items multiply by 0.85. So a slightly-closer low-trust or unreviewed item cannot outrank a higher-trust memory. Semantic result rows preserve `distance` and additionally expose `similarity_score`, `trust_score`, and the final `score` for transparency.
 
+#### Relationship-aware recall (graph + tunnel expansion)
+
+`POST /v1/recall` with `mode=semantic` doesn't stop at the nearest matches — it also reconstructs the context *around* them. Semantic search finds relevant memories; relationship expansion finds the decisions they were derived from, what they contradict or support, and their neighbors in the same tunnel. That surrounding context is often more valuable than the single closest-matching memory in isolation.
+
+```text
+query → semantic retrieval → graph expansion → tunnel expansion → merge → relationship-aware rescoring → budget packing → response
+```
+
+* **Graph expansion** follows typed, depth-1 edges (`memory_edges`: `derived_from`, `references`, `explains`, `contradicts`, `supports`, `depends_on`, `mentions`) from the top semantic candidates — bounded (5 neighbors/item, 20 total by default), deterministic, no recursion.
+* **Tunnel expansion** pulls bounded neighbors from a memory's tunnel-linked `(wing, room)` (20 additions by default) — no full tunnel scan.
+* Every expanded candidate passes the same tenant/visibility/review-status trust gate as a direct semantic hit — expansion can only narrow, never bypass.
+* Final score blends semantic relevance (70%), relationship strength (15%), tunnel membership (10%), and importance (5%) — semantic relevance still dominates. Reported as `scoring_version = semantic-v3` in `/v1/recall` (mode=semantic) responses and `recall_logs`.
+* Every expanded item explains itself: `"linked via derived_from"`, `'same tunnel "Atlas"'`, alongside the existing `reasons` array — merged/tagged with an `origin` (`semantic`, `graph`, `tunnel`, or a combination like `semantic+graph`).
+* The existing byte/token/item budget packer is unchanged and authoritative — expanded memories compete for budget exactly like direct hits.
+
+Startup recall is unaffected (no query to anchor expansion from). See `docs/design.md` §9 for the full pipeline, edge-weight mapping, and configuration knobs (`ENGRAM_MAX_GRAPH_*`, `ENGRAM_MAX_TUNNEL_*`, `ENGRAM_RECALL_CANDIDATE_CEILING`).
+
 #### Search filters
 
 `/v1/search` honors `kind`, `wing`, and `room` filters (AND semantics) across keyword, semantic, and hybrid modes. Filters apply before ranking/limit and alongside tenant/read-eligibility scoping, so ineligible rows never displace matches.
@@ -379,6 +396,7 @@ all exist and are exercised by a live, network-verified deployment.
 | Write-time conflict detection + resolution                             |     yes     |       yes        |
 | Feedback endpoint + recall explanations + warnings                      |     yes     |       yes        |
 | Knowledge graph (visibility inheritance), taxonomy, tunnels, diary      |     yes     |       yes        |
+| Relationship-aware recall (bounded graph + tunnel expansion)            |     yes     |   over FTS\*     |
 | Memory hygiene (stale detection, bulk-archive, stats)                   |     yes     |       —          |
 | LLM + rule-based classification                                         |     yes     |       —          |
 | Auto-promotion — Path A (age + confidence + no conflict)                |     yes     |       —          |

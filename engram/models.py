@@ -278,6 +278,40 @@ class KgTriple(Base):
     )
 
 
+class MemoryEdge(Base):
+    """Typed, directed relationship between two memory items (ENG-AUD-012 / F19).
+
+    Distinct from :class:`KgTriple`: a triple is a free-text subject/predicate/
+    object fact optionally backed by one memory item, while an edge links two
+    concrete ``memory_items`` rows so relationship-aware recall can expand a
+    semantic hit to its directly related memories (depth = 1, bounded — see
+    engram.relationship_recall). ``weight`` is optional per-edge override;
+    when unset, recall falls back to the static ``edge_type`` -> strength
+    mapping in engram.relationship_recall.EDGE_TYPE_WEIGHTS.
+    """
+
+    __tablename__ = "memory_edges"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    source_item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("memory_items.id", ondelete="CASCADE"), nullable=False
+    )
+    target_item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("memory_items.id", ondelete="CASCADE"), nullable=False
+    )
+    edge_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    weight: Mapped[float | None] = mapped_column(Float, nullable=True)
+    principal_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("principals.id"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
 class Tunnel(Base):
     __tablename__ = "tunnels"
 

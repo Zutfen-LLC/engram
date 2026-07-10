@@ -42,6 +42,7 @@ from engram.memory_access import eligibility_expression, resolve_workspace_scope
 from engram.memory_kinds import get_disputed_stay_kind_names
 from engram.models import MemoryItem, RecallLog, TenantConfig
 from engram.promotion import maybe_auto_promote_for_startup_recall
+from engram.relationship_recall import RECALL_SCORING_VERSION, expand_recall_candidates
 
 logger = logging.getLogger(__name__)
 
@@ -984,7 +985,7 @@ async def execute_semantic_recall(
             byte_budget=byte_budget,
             token_budget=token_budget,
             item_ids=[],
-            scoring_version=semantic.SEMANTIC_SCORING_VERSION,
+            scoring_version=RECALL_SCORING_VERSION,
             config_version=config_version,
         )
         session.add(recall_log)
@@ -996,7 +997,7 @@ async def execute_semantic_recall(
             "pinned_omitted_count": 0,
             "omitted_count": 0,
             "items": [],
-            "scoring_version": semantic.SEMANTIC_SCORING_VERSION,
+            "scoring_version": RECALL_SCORING_VERSION,
             "config_version": config_version,
             "recall_log_id": str(recall_log.id),
             "message": _NO_EMBEDDINGS_MESSAGE,
@@ -1074,6 +1075,22 @@ async def execute_semantic_recall(
             }
         )
 
+    # 5b. Relationship-aware expansion (ENG-AUD-012 / F19): graph (depth-1,
+    #     bounded) then tunnel (bounded) expansion of the top semantic
+    #     candidates, merged and rescored — semantic relevance still
+    #     dominates the blended score (see engram.relationship_recall). Runs
+    #     before budget packing so expanded memories compete for budget on
+    #     equal footing with direct semantic hits; never bypasses eligibility.
+    enriched = await expand_recall_candidates(
+        session,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        workspace_id=workspace_id,
+        semantic_items=enriched,
+        item_by_id=item_by_id,
+        now=now,
+    )
+
     # 6. Enforce item/byte/token budgets.
     selected = _enforce_semantic_budget(
         enriched,
@@ -1099,7 +1116,7 @@ async def execute_semantic_recall(
         byte_budget=byte_budget,
         token_budget=token_budget,
         item_ids=selected_ids,
-        scoring_version=semantic.SEMANTIC_SCORING_VERSION,
+        scoring_version=RECALL_SCORING_VERSION,
         config_version=config_version,
     )
     session.add(recall_log)
@@ -1126,7 +1143,7 @@ async def execute_semantic_recall(
         "pinned_omitted_count": 0,
         "omitted_count": max(0, candidate_total - item_count),
         "items": selected,
-        "scoring_version": semantic.SEMANTIC_SCORING_VERSION,
+        "scoring_version": RECALL_SCORING_VERSION,
         "config_version": config_version,
         "recall_log_id": str(recall_log.id),
         "message": None,
