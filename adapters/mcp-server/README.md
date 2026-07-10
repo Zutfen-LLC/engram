@@ -220,7 +220,7 @@ Persist a memory item. Returns `{id, status, review_status, memory_confidence}`.
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `content` | string | yes | The memory text. |
-| `kind` | string | no | doctrine, decision, invariant, preference, fact, diary_entry... |
+| `kind` | string | no | Built-in: fact, preference, doctrine, decision, invariant, observation, diary_entry, procedure, summary. Tenants may also register custom kinds — see `docs/design.md` § Memory kinds. Omitted `kind` triggers auto-classification. |
 | `wing` | string | no | Top-level taxonomy bucket. |
 | `room` | string | no | Sub-bucket within a wing. |
 | `workspace` | string | no | Workspace name or id. |

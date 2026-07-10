@@ -213,7 +213,7 @@ In single-agent deployments, Path A is the normal path. In multi-agent deploymen
 
 A background job, scheduled CLI invocation, or lazy check on recall promotes eligible items to `active`. The promotion is logged in `item_events`.
 
-**Disputed high-stakes items:** When a `doctrine` or `invariant` is disputed, it does not silently vanish from startup recall. Disputed items of kind `doctrine` or `invariant` stay in startup recall with warnings such as `['disputed — pending resolution']` until resolved. Disputed items of other kinds are excluded from startup recall by default.
+**Disputed high-stakes items:** When an item of a kind governed with `stays_in_recall_when_disputed=true` (built-in: `doctrine`, `invariant`) is disputed, it does not silently vanish from startup recall — it stays in startup recall with warnings such as `['disputed — pending resolution']` until resolved. Disputed items of other kinds are excluded from startup recall by default. This is a `memory_kinds` registry flag (ENG-AUD-010), not a hard-coded `doctrine`/`invariant` string check — a tenant can grant or withhold the same behavior on any kind, including custom ones.
 
 This prevents an assistant's operating constraints from silently shrinking.
 
@@ -473,19 +473,42 @@ The taxonomy is tenant-configurable.
 
 ### Memory kinds
 
-Memory items can have kinds such as:
+Memory items have a `kind`, governed by a tenant-scoped `memory_kinds`
+registry (ENG-AUD-010) — not a hard-coded enum. Every tenant is seeded with
+the built-in kinds:
 
-* `fact`
-* `preference`
-* `decision`
-* `doctrine`
-* `invariant`
-* `procedure`
-* `observation`
-* `summary`
-* `diary_entry`
+| Kind | Singleton | Requires review | Stays in recall when disputed |
+| --- | ---: | ---: | ---: |
+| `fact` | no | no | no |
+| `preference` | yes | no | no |
+| `doctrine` | no | yes | yes |
+| `decision` | no | yes | no |
+| `invariant` | yes | yes | yes |
+| `observation` | no | no | no |
+| `diary_entry` | no | no | no |
+| `procedure` | no | no | no |
+| `summary` | no | no | no |
 
-Kinds affect review behavior, recall behavior, and dispute handling.
+Behavior flags — not the kind name — drive write-path behavior:
+
+* **`singleton`** — a new write with the same family key (tenant, workspace,
+  principal, subject, kind) supersedes the prior active item instead of
+  creating a duplicate.
+* **`requires_review`** — the item must start `review_status='proposed'`
+  regardless of source authority (a manual admin write of a `requires_review`
+  kind still starts proposed).
+* **`stays_in_recall_when_disputed`** — a disputed item of this kind remains
+  in startup recall (tagged with a `disputed — pending resolution` warning)
+  instead of being excluded like other disputed items.
+* **`default_importance`** — a suggested importance for the kind (informational).
+
+Tenant admins can add governed **custom kinds** via
+`POST /v1/admin/memory-kinds` (name format `^[a-z][a-z0-9_]{0,63}$`,
+built-in names reserved) with the same behavior flags, and disable a kind via
+`PATCH /v1/admin/memory-kinds/{name}` — disabling blocks new writes and
+classification into that kind but never touches existing memories of that
+kind. Custom kinds are subject to the same review/trust/RLS rules as
+built-ins; they cannot bypass tenant isolation.
 
 ### Tunnels
 

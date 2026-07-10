@@ -26,12 +26,18 @@ Every error response is a JSON object with a `detail` key:
    ```json
    {
      "detail": {
-       "message": "request rejected by database constraint (check_violation): chk_kind",
+       "message": "request rejected by database constraint (check_violation): principals_type_check",
        "code": "check_violation",
-       "constraint": "chk_kind"
+       "constraint": "principals_type_check"
      }
    }
    ```
+
+   Note: `memory_items.kind` is no longer gated by a bare CHECK constraint —
+   it's validated against the tenant's governed kind registry
+   (`engram.memory_kinds.require_enabled_memory_kind`, ENG-AUD-010) before the
+   database is ever touched. An unknown or disabled kind returns a plain-string
+   422 (case 1 above), not this structured shape.
 
    `code` is one of: `check_violation`, `not_null_violation`,
    `foreign_key_violation`, `unique_violation`, `exclusion_violation`,

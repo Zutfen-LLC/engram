@@ -126,13 +126,20 @@ async def _clean_db() -> AsyncIterator[None]:
 
 
 async def test_remember_recall_search_round_trip(mcp_live_server) -> None:
-    """engram_remember -> engram_recall -> engram_search against a live service."""
+    """engram_remember -> engram_recall -> engram_search against a live service.
+
+    Uses kind='fact' (requires_review=False in the builtin memory_kinds
+    registry) so this generic plumbing round trip isn't entangled with
+    review-gating semantics — 'invariant' has requires_review=True (ENG-AUD-010),
+    so a manual write of that kind starts 'proposed' and is correctly excluded
+    from startup recall until reviewed, which is not what this test exercises.
+    """
     content = "Always use lowercase table names for portability across databases"
 
     async with create_connected_server_and_client_session(mcp_live_server) as session:
         created = await session.call_tool(
             "engram_remember",
-            {"content": content, "kind": "invariant", "importance": 0.95},
+            {"content": content, "kind": "fact", "importance": 0.95},
         )
         assert not created.isError, _text(created)
         item_id = created.structuredContent["id"]

@@ -90,6 +90,24 @@ CREATE_STATEMENTS = [
         revoked_at TEXT
     )
     """,
+    """
+    CREATE TABLE memory_kinds (
+        tenant_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        description TEXT,
+        is_builtin INTEGER NOT NULL DEFAULT 0,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        singleton INTEGER NOT NULL DEFAULT 0,
+        stays_in_recall_when_disputed INTEGER NOT NULL DEFAULT 0,
+        requires_review INTEGER NOT NULL DEFAULT 0,
+        default_importance REAL,
+        sort_order INTEGER NOT NULL DEFAULT 100,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (tenant_id, name)
+    )
+    """,
 ]
 
 

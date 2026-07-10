@@ -279,6 +279,32 @@ Every classified write records a `classification` event with full provenance: cl
 
 Seed classification rules are intentionally conservative: "skip" rules are whole-message *status-only* matchers (bare `ok`, `done`, `passed`) that don't fire on status words inside meaningful sentences, and doctrine classification requires explicit policy/invariant phrasing rather than casual modal verbs.
 
+### Memory Kinds
+
+`kind` is governed by a tenant-scoped `memory_kinds` registry, not a hard-coded
+enum. Every tenant is seeded with nine built-in kinds — `fact`, `preference`,
+`doctrine`, `decision`, `invariant`, `observation`, `diary_entry`,
+`procedure`, `summary` — each carrying behavior flags (`singleton`,
+`requires_review`, `stays_in_recall_when_disputed`, `default_importance`)
+that drive supersession, initial review status, and disputed-recall
+inclusion. Classification and `/v1/remember` validate against the tenant's
+*enabled* registry rows; an unknown or disabled kind is rejected with a 422,
+never silently coerced to `fact`.
+
+Tenant admins can add governed custom kinds without a schema migration:
+
+```
+GET    /v1/admin/memory-kinds            # list all (enabled + disabled)
+POST   /v1/admin/memory-kinds            # create a custom kind (admin scope)
+PATCH  /v1/admin/memory-kinds/{name}     # edit flags, enable/disable
+```
+
+Custom kind names must match `^[a-z][a-z0-9_]{0,63}$` and may not shadow a
+built-in name. `name` is immutable after creation. Disabling a kind blocks
+new writes/classification into it but never touches existing memories of
+that kind — deletion is intentionally unsupported (disabling is sufficient).
+See `docs/design.md` § Memory kinds for the full built-in behavior table.
+
 ## Architecture
 
 * **Postgres 16 + pgvector** — single storage backend
