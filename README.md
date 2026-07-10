@@ -277,6 +277,13 @@ Engram supports visibility scopes for both single-agent and multi-agent deployme
 
 Row Level Security is enforced at the Postgres level — one forgotten `WHERE` clause cannot cause a cross-tenant leak. The runtime service connects as a dedicated non-owner role (`engram_app`) with no `BYPASSRLS`, and every tenant-scoped table uses `FORCE ROW LEVEL SECURITY`, so isolation holds even if the connecting role is the table owner. App-layer visibility/workspace logic is still the primary semantic rule; RLS is defense-in-depth beneath it.
 
+Caller-facing item mutations apply the same eligibility rules as reads. A caller can
+therefore mutate a private memory only when it owns that memory, and can mutate a
+workspace-visible memory only while eligible for that workspace. Missing and inaccessible
+item IDs both return `404 Not Found` so item existence is not disclosed. This eligibility
+check does not itself grant privileged review transitions; transition authority and route
+scope enforcement are separate trust controls.
+
 ### Classification
 
 Two endpoints serve classification with distinct roles:

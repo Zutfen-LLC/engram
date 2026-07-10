@@ -888,8 +888,10 @@ async def feedback(
     tenant_id = await _resolve_tenant_id(session)
     principal_id, principal_type = await _resolve_principal(session, tenant_id)
 
-    # Verify the item exists
-    item = await _fetch_item(session, req.item_id)
+    # Missing and caller-ineligible items deliberately share the same response.
+    item = await _fetch_readable_item(
+        session, req.item_id, tenant_id=tenant_id, principal_id=principal_id
+    )
     if item is None:
         raise HTTPException(status_code=404, detail="Item not found")
 
@@ -1051,29 +1053,13 @@ def _decode_cursor(cursor: str) -> tuple[str, str]:
     return created_at, item_id
 
 
-async def _fetch_item(session: AsyncSession, item_id: UUID) -> dict[str, Any] | None:
-    """Fetch a memory item by id, with no tenant/visibility scoping.
-
-    Used only by mutation endpoints (patch/supersede/invalidate/review/verify)
-    that operate on an item an internal caller already has a reference to —
-    not a caller-facing read path. Caller-facing reads must use
-    :func:`_fetch_readable_item` instead, which applies the shared
-    eligibility predicate.
-    """
-    result = await session.execute(
-        text("SELECT * FROM memory_items WHERE id = :item_id OR id = :item_id_hex"),
-        {"item_id": str(item_id), "item_id_hex": item_id.hex},
-    )
-    row = result.mappings().first()
-    return _row_to_dict(row) if row else None
-
-
 async def _fetch_readable_item(
     session: AsyncSession,
     item_id: UUID,
     *,
     tenant_id: UUID | str,
     principal_id: UUID | str,
+    for_update: bool = False,
 ) -> dict[str, Any] | None:
     """Fetch a memory item for a caller-facing read, applying the shared
     tenant + visibility eligibility predicate (``engram.memory_access``).
@@ -1082,9 +1068,11 @@ async def _fetch_readable_item(
     the caller is ineligible to read it — callers should map both cases to a
     404, never a 403, to avoid disclosing item existence.
     """
+    dialect_name = session.bind.dialect.name if session.bind is not None else None
+    lock_clause = " FOR UPDATE" if for_update and dialect_name == "postgresql" else ""
     stmt = text(
         "SELECT * FROM memory_items WHERE (id = :item_id OR id = :item_id_hex) "
-        f"AND {tenant_sql()} AND {eligibility_sql()}"
+        f"AND {tenant_sql()} AND {eligibility_sql()}{lock_clause}"
     )
     result = await session.execute(
         stmt,
@@ -1220,8 +1208,22 @@ async def _insert_item_event(
     return event
 
 
-async def _require_item(session: AsyncSession, item_id: UUID) -> dict[str, Any]:
-    item = await _fetch_item(session, item_id)
+async def _require_eligible_item(
+    session: AsyncSession,
+    item_id: UUID,
+    *,
+    tenant_id: UUID | str,
+    principal_id: UUID | str,
+    for_update: bool = False,
+) -> dict[str, Any]:
+    """Resolve a caller-supplied mutation target through read eligibility."""
+    item = await _fetch_readable_item(
+        session,
+        item_id,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        for_update=for_update,
+    )
     if item is None:
         raise HTTPException(status_code=404, detail="Item not found")
     return item
@@ -1334,7 +1336,10 @@ async def update_item_metadata(
 ) -> dict[str, Any]:
     """Update metadata (wing, room, visibility, importance, pinned) — not content."""
     tenant_id = await _resolve_tenant_id(session)
-    item = await _require_item(session, item_id)
+    principal_id, _ = await _resolve_principal(session, tenant_id)
+    item = await _require_eligible_item(
+        session, item_id, tenant_id=tenant_id, principal_id=principal_id
+    )
     actor, on_behalf_of = await _resolve_actor_and_delegation(
         session, tenant_id=tenant_id, requested_on_behalf_of=req.on_behalf_of_principal_id
     )
@@ -1366,7 +1371,9 @@ async def update_item_metadata(
             {"value": change["new"], "item_id": str(item_id)},
         )
         events.append(event)
-    updated = await _require_item(session, item_id)
+    updated = await _require_eligible_item(
+        session, item_id, tenant_id=tenant_id, principal_id=principal_id
+    )
     await session.commit()
     return {"item": updated, "event": events[0] if events else None, "events": events}
 
@@ -1388,16 +1395,21 @@ async def supersede_item(
     the replacement rolls the expiration back.
     """
     tenant_id = await _resolve_tenant_id(session)
-    item = await _require_item(session, item_id)
+    principal_id, _ = await _resolve_principal(session, tenant_id)
+    item = await _require_eligible_item(
+        session,
+        item_id,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        for_update=True,
+    )
     actor, on_behalf_of = await _resolve_actor_and_delegation(
         session,
         tenant_id=tenant_id,
         requested_on_behalf_of=req.on_behalf_of_principal_id if req else None,
     )
 
-    # 1. Lock the original row to serialize concurrent supersedes. FOR UPDATE
-    #    is supported by Postgres and a no-op on the SQLite test fixture.
-    await session.execute(select(MemoryItem.id).where(MemoryItem.id == item_id).with_for_update())
+    # The eligible lookup also locks the original row, avoiding a policy-check/lock gap.
 
     # 2. Eligibility: cannot supersede an item that is already expired or
     #    rejected — it has left the active set the replacement would target.
@@ -1504,8 +1516,12 @@ async def supersede_item(
         on_behalf_of_principal_id=on_behalf_of,
         reason=reason,
     )
-    old_item = await _require_item(session, item_id)
-    new_item = await _require_item(session, new_id)
+    old_item = await _require_eligible_item(
+        session, item_id, tenant_id=tenant_id, principal_id=principal_id
+    )
+    new_item = await _require_eligible_item(
+        session, new_id, tenant_id=tenant_id, principal_id=principal_id
+    )
     await session.commit()
     return {
         "old_item": old_item,
@@ -1523,7 +1539,10 @@ async def invalidate_item(
 ) -> dict[str, Any]:
     """Mark invalid (set valid_to)."""
     tenant_id = await _resolve_tenant_id(session)
-    item = await _require_item(session, item_id)
+    principal_id, _ = await _resolve_principal(session, tenant_id)
+    item = await _require_eligible_item(
+        session, item_id, tenant_id=tenant_id, principal_id=principal_id
+    )
     actor, on_behalf_of = await _resolve_actor_and_delegation(
         session,
         tenant_id=tenant_id,
@@ -1546,6 +1565,8 @@ async def invalidate_item(
         text("UPDATE memory_items SET valid_to = :valid_to WHERE id = :item_id"),
         {"valid_to": now, "item_id": str(item_id)},
     )
-    updated = await _require_item(session, item_id)
+    updated = await _require_eligible_item(
+        session, item_id, tenant_id=tenant_id, principal_id=principal_id
+    )
     await session.commit()
     return {"item": updated, "event": event}
