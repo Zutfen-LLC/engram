@@ -278,12 +278,6 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
         )
 
     result = await detect_conflicts(item, session)
-    logger.warning(
-        "CC debug item=%s result=%s action=%s",
-        item.id,
-        None if result is None else result.existing_item_id,
-        None if result is None else result.action,
-    )
     if result is None:
         return
 
@@ -343,24 +337,13 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
         return
 
     if action == ConflictAction.AUTO_SUPERSEDE:
-        # The NEW item supersede the OLD neighbor. Only act when the job's item
+        # The NEW item supersedes the OLD neighbor. Only act when the job's item
         # is the newer one; otherwise the neighbor's own job handles it.
-        logger.warning(
-            "AS debug item=%s existing=%s newer=%s ic=%s ec=%s",
-            item.id, result.existing_item_id, item_is_newer,
-            item.created_at, existing_created_at,
-        )
         if not item_is_newer:
             await session.commit()
             return
         # Supersede the OLD item with the new one. Idempotent.
         existing = await _reload_item(session, result.existing_item_id)
-        logger.warning(
-            "AS debug2 loaded=%s sb=%s iid=%s",
-            existing is not None,
-            None if existing is None else existing.superseded_by,
-            item.id,
-        )
         if existing is None or existing.superseded_by == item.id:
             await session.commit()
             return

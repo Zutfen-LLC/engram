@@ -115,6 +115,12 @@ async def _insert_item(
             content_hash=content,
             kind=kind,
             source_type="manual",
+            # A manual user memory has high source authority (0.9), matching what
+            # /v1/remember's _resolve_trust_defaults would assign. The directly
+            # inserted item bypasses that resolution, so set it explicitly —
+            # otherwise source_trust defaults to 0.5 and AUTO_SUPERSEDE (which
+            # needs new_trust >= 0.8) never triggers.
+            source_trust=0.9,
             review_status="active",
             visibility="workspace",
             tenant_id=tenant_id,
