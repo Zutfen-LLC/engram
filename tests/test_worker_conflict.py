@@ -78,9 +78,10 @@ def _stub_verdict(monkeypatch, verdict: ConflictVerdict, confidence: float = 0.9
     monkeypatch.setattr("engram.conflicts._classify_relationship", fake_classify)
 
 
-async def _ctx_and_tenant():
+async def _tenant_principal() -> tuple[str, str]:
+    """Resolve the seeded default tenant + admin principal ids (owner-readable)."""
     async with _test_session_factory() as session:
-        from engram.db import _DEFAULT_PRINCIPAL_NAME, _DEFAULT_TENANT_SLUG, apply_rls_context
+        from engram.db import _DEFAULT_PRINCIPAL_NAME, _DEFAULT_TENANT_SLUG
 
         row = (
             (
@@ -95,54 +96,73 @@ async def _ctx_and_tenant():
                 )
             ).mappings().one()
         )
-        await apply_rls_context(
-            session, tenant_id=row["tenant_id"], principal_id=row["principal_id"]
-        )
-        return session, row["tenant_id"], row["principal_id"]
+        return row["tenant_id"], row["principal_id"]
 
 
 async def _insert_item(
-    session, *, content: str, kind: str = "fact", created_at: datetime | None = None
+    *, content: str, kind: str = "fact", created_at: datetime | None = None
 ) -> str:
     import uuid as _uuid
 
+    from engram.db import apply_rls_context
     from engram.models import MemoryItem
 
-    item = MemoryItem(
-        content=content,
-        content_hash=content,
-        kind=kind,
-        source_type="manual",
-        review_status="active",
-        visibility="workspace",
-    )
-    if created_at is not None:
-        item.created_at = created_at
-    # tenant/principal come from the RLS context, but the model requires values.
-    tid = (await session.execute(text("SELECT current_setting('app.tenant_id', true)"))).scalar()
-    pid = (
-        await session.execute(text("SELECT current_setting('app.principal_id', true)"))
-    ).scalar()
-    item.tenant_id = tid
-    item.principal_id = pid
-    item.id = _uuid.uuid4()
-    session.add(item)
-    await session.flush()
-    return str(item.id)
+    tenant_id, principal_id = await _tenant_principal()
+    async with _test_session_factory() as session:
+        await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
+        item = MemoryItem(
+            content=content,
+            content_hash=content,
+            kind=kind,
+            source_type="manual",
+            review_status="active",
+            visibility="workspace",
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            id=_uuid.uuid4(),
+        )
+        if created_at is not None:
+            item.created_at = created_at
+        session.add(item)
+        await session.commit()
+        return str(item.id)
+
+
+async def _add_ready_embedding(item_id: str) -> None:
+    """Attach a ready embedding to an item so detect_conflicts sees similarity."""
+    from engram.db import apply_rls_context
+    from engram.models import MemoryEmbedding
+
+    tenant_id, principal_id = await _tenant_principal()
+    async with _test_session_factory() as session:
+        await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
+        session.add(
+            MemoryEmbedding(
+                memory_item_id=item_id,
+                tenant_id=tenant_id,
+                embedding_model="text-embedding-3-small",
+                embedding_dim=settings.embedding_dim,
+                embedding=_VECTOR_A,
+                embedding_status="ready",
+            )
+        )
+        await session.commit()
 
 
 async def _run_conflict_job(new_item_id: str) -> None:
+    from engram.db import apply_rls_context
     from engram.jobs import enqueue_job
     from engram.worker import process_one_job
 
-    session, tenant_id, _ = await _ctx_and_tenant()
-    await enqueue_job(
-        session,
-        tenant_id=tenant_id,
-        job_type="conflict.check",
-        payload={"memory_item_id": new_item_id},
-    )
-    await session.commit()
+    tenant_id, principal_id = await _tenant_principal()
+    async with _test_session_factory() as session:
+        await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
+        await enqueue_job(
+            session,
+            tenant_id=tenant_id,
+            job_type="conflict.check",
+            payload={"memory_item_id": new_item_id},
+        )
 
     await process_one_job(
         worker_id="test",
@@ -171,42 +191,19 @@ async def _fields(item_id: str) -> dict[str, object]:
         )
 
 
-async def _add_ready_embedding(session, item_id: str) -> None:
-    """Attach a ready embedding to an item so detect_conflicts sees similarity."""
-    from engram.models import MemoryEmbedding
-
-    tid = (
-        await session.execute(text("SELECT current_setting('app.tenant_id', true)"))
-    ).scalar()
-    session.add(
-        MemoryEmbedding(
-            memory_item_id=item_id,
-            tenant_id=tid,
-            embedding_model="text-embedding-3-small",
-            embedding_dim=settings.embedding_dim,
-            embedding=_VECTOR_A,
-            embedding_status="ready",
-        )
-    )
-
-
 async def test_dedupe_rejects_new_item(monkeypatch):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     _enable_embeddings(monkeypatch)
     _stub_verdict(monkeypatch, ConflictVerdict.DUPLICATE, confidence=0.95)
 
-    session, _, _ = await _ctx_and_tenant()
-    old_id = await _insert_item(
-        session, content="original dup", created_at=datetime(2026, 1, 1, tzinfo=UTC)
+    old_id = await _insert_item(content="original dup", created_at=datetime(2026, 1, 1, tzinfo=UTC)
     )
-    new_id = await _insert_item(
-        session, content="reworded dup", created_at=datetime(2026, 1, 2, tzinfo=UTC)
+    new_id = await _insert_item(content="reworded dup", created_at=datetime(2026, 1, 2, tzinfo=UTC)
     )
     # Give both items ready embeddings so detect_conflicts sees similarity.
     for iid in (old_id, new_id):
-        await _add_ready_embedding(session, iid)
-    await session.commit()
+        await _add_ready_embedding(iid)
 
     await _run_conflict_job(new_id)
 
@@ -223,16 +220,14 @@ async def test_auto_supersede_marks_old_item(monkeypatch):
     _enable_embeddings(monkeypatch)
     _stub_verdict(monkeypatch, ConflictVerdict.REFINE, confidence=0.9)
 
-    session, _, _ = await _ctx_and_tenant()
     old_id = await _insert_item(
-        session, content="auto supersede old", created_at=datetime(2026, 1, 1, tzinfo=UTC)
+        content="auto supersede old", created_at=datetime(2026, 1, 1, tzinfo=UTC)
     )
     new_id = await _insert_item(
-        session, content="auto supersede new", created_at=datetime(2026, 1, 2, tzinfo=UTC)
+        content="auto supersede new", created_at=datetime(2026, 1, 2, tzinfo=UTC)
     )
     for iid in (old_id, new_id):
-        await _add_ready_embedding(session, iid)
-    await session.commit()
+        await _add_ready_embedding(iid)
 
     await _run_conflict_job(new_id)
 
@@ -247,16 +242,14 @@ async def test_flag_sets_conflict_metadata(monkeypatch):
     _enable_embeddings(monkeypatch)
     _stub_verdict(monkeypatch, ConflictVerdict.CONTRADICT, confidence=0.9)
 
-    session, _, _ = await _ctx_and_tenant()
     old_id = await _insert_item(
-        session, content="contradict old", created_at=datetime(2026, 1, 1, tzinfo=UTC)
+        content="contradict old", created_at=datetime(2026, 1, 1, tzinfo=UTC)
     )
     new_id = await _insert_item(
-        session, content="contradict new", created_at=datetime(2026, 1, 2, tzinfo=UTC)
+        content="contradict new", created_at=datetime(2026, 1, 2, tzinfo=UTC)
     )
     for iid in (old_id, new_id):
-        await _add_ready_embedding(session, iid)
-    await session.commit()
+        await _add_ready_embedding(iid)
 
     await _run_conflict_job(new_id)
 
@@ -272,13 +265,17 @@ async def test_expired_item_is_skipped(monkeypatch):
     _enable_embeddings(monkeypatch)
     _stub_verdict(monkeypatch, ConflictVerdict.DUPLICATE, confidence=0.95)
 
-    session, _, _ = await _ctx_and_tenant()
-    new_id = await _insert_item(session, content="expired before conflict check")
-    await session.execute(
-        text("UPDATE memory_items SET valid_to = :t WHERE id = :id"),
-        {"t": datetime.now(UTC), "id": new_id},
-    )
-    await session.commit()
+    new_id = await _insert_item(content="expired before conflict check")
+    tenant_id, principal_id = await _tenant_principal()
+    from engram.db import apply_rls_context
+
+    async with _test_session_factory() as session:
+        await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
+        await session.execute(
+            text("UPDATE memory_items SET valid_to = :t WHERE id = :id"),
+            {"t": datetime.now(UTC), "id": new_id},
+        )
+        await session.commit()
 
     # Should succeed without applying any change (skipped safely).
     await _run_conflict_job(new_id)
@@ -294,16 +291,14 @@ async def test_conflict_rerun_is_idempotent(monkeypatch):
     _enable_embeddings(monkeypatch)
     _stub_verdict(monkeypatch, ConflictVerdict.REFINE, confidence=0.9)
 
-    session, _, _ = await _ctx_and_tenant()
     old_id = await _insert_item(
-        session, content="idempotent old", created_at=datetime(2026, 1, 1, tzinfo=UTC)
+        content="idempotent old", created_at=datetime(2026, 1, 1, tzinfo=UTC)
     )
     new_id = await _insert_item(
-        session, content="idempotent new", created_at=datetime(2026, 1, 2, tzinfo=UTC)
+        content="idempotent new", created_at=datetime(2026, 1, 2, tzinfo=UTC)
     )
     for iid in (old_id, new_id):
-        await _add_ready_embedding(session, iid)
-    await session.commit()
+        await _add_ready_embedding(iid)
 
     await _run_conflict_job(new_id)
     state_after_first = await _fields(old_id)
@@ -312,14 +307,17 @@ async def test_conflict_rerun_is_idempotent(monkeypatch):
     from engram.jobs import enqueue_job
     from engram.worker import process_one_job
 
-    session2, tenant_id, _ = await _ctx_and_tenant()
-    await enqueue_job(
-        session2,
-        tenant_id=tenant_id,
-        job_type="conflict.check",
-        payload={"memory_item_id": new_id},
-    )
-    await session2.commit()
+    tenant_id, principal_id = await _tenant_principal()
+    from engram.db import apply_rls_context
+
+    async with _test_session_factory() as session2:
+        await apply_rls_context(session2, tenant_id=tenant_id, principal_id=principal_id)
+        await enqueue_job(
+            session2,
+            tenant_id=tenant_id,
+            job_type="conflict.check",
+            payload={"memory_item_id": new_id},
+        )
     await process_one_job(
         worker_id="test",
         session_factory=_test_session_factory,
