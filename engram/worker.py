@@ -287,18 +287,27 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
     # embedding distance, not by age. conflict.check runs for EVERY item once its
     # embedding is ready, so without a guard the older item's job would find the
     # newer item as a neighbor and act on it — inverting the dedup/supersede
-    # direction. Establish ordering: the "existing" neighbor must predate the
-    # job's item for DEDUP (the new item is the duplicate), and the job's item
-    # must predate the neighbor for AUTO_SUPERSEDE (the new item supersedes the
-    # old). Flag actions are symmetric and need no guard.
+    # direction. Establish ordering: the job's item is the "newer" one (the
+    # duplicate / superseder) when it was created after the neighbor, or — for a
+    # deterministic tiebreaker when both share a created_at (e.g. same
+    # transaction) — when its id sorts later. Flag actions are symmetric and
+    # need no guard.
     existing_created_at = (
         await session.execute(
             select(MemoryItem.created_at).where(MemoryItem.id == result.existing_item_id)
         )
     ).scalar_one_or_none()
-    item_is_newer = (
-        existing_created_at is not None and item.created_at > existing_created_at
-    )
+    if existing_created_at is None:
+        await session.commit()
+        return
+    if item.created_at > existing_created_at:
+        item_is_newer = True
+    elif item.created_at == existing_created_at:
+        # Same timestamp: deterministic id-based tiebreaker so exactly one of the
+        # two items' jobs acts (the higher-id item is treated as "newer").
+        item_is_newer = str(item.id) > str(result.existing_item_id)
+    else:
+        item_is_newer = False
 
     # Idempotency: if already in the target state, no-op.
     if action == ConflictAction.DEDUP:
@@ -357,7 +366,14 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
         return
 
     # FLAG_CONTRADICTION / PROPOSED_SUPERSEDE / FLAG_SCOPE_OVERLAP: set
-    # conflict metadata and demote to proposed (only if currently active).
+    # conflict metadata and demote to proposed (only if currently active). Only
+    # the NEWER item is flagged — mirroring the original write-path semantics
+    # where the newly-written item is the one marked — so that flagging item1
+    # (which demotes it out of the active set) doesn't make it invisible to
+    # item2's conflict.check neighbor query (which requires active neighbors).
+    if not item_is_newer:
+        await session.commit()
+        return
     new_review = "proposed" if item.review_status == "active" else item.review_status
     payload = {
         "verdict": result.verdict.value,
