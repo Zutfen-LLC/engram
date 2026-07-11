@@ -68,7 +68,13 @@ async def _clean_db():
         return
     reset_principal_cache()
     async with _test_engine.begin() as conn:
+        # recall_logs/kg_triples.principal_id have no ON DELETE CASCADE, so
+        # they must be cleared before principals — otherwise a principal
+        # created by a recall/KG-add test in this module leaves a dangling
+        # FK-blocked row that fails the next test's cleanup.
         await conn.execute(text("DELETE FROM item_events"))
+        await conn.execute(text("DELETE FROM recall_logs"))
+        await conn.execute(text("DELETE FROM kg_triples"))
         await conn.execute(
             text(
                 "DELETE FROM memory_items WHERE tenant_id = (SELECT id FROM tenants WHERE slug = 'default') "
