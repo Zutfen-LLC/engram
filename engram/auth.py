@@ -34,7 +34,7 @@ import hmac
 import secrets
 import string
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
 from uuid import UUID
@@ -47,8 +47,29 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from engram.config import settings
 
-Scope = Literal["read", "write", "admin", "export"]
-VALID_SCOPES: frozenset[str] = frozenset({"read", "write", "admin", "export"})
+Scope = Literal["read", "write", "review", "export", "admin"]
+VALID_SCOPES: frozenset[str] = frozenset({"read", "write", "review", "export", "admin"})
+
+# Canonical serialization/persistence order (V2-BL-004). Independent of the
+# order scopes were requested in — issuance always persists/returns scopes in
+# this order so stored rows and API responses are deterministic.
+CANONICAL_SCOPE_ORDER: tuple[Scope, ...] = ("read", "write", "review", "export", "admin")
+
+
+def canonicalize_scopes(scopes: Iterable[str]) -> list[str]:
+    """Validate, dedupe, and canonically order a requested scope list.
+
+    Raises ``ValueError`` naming every unknown scope string rather than
+    silently dropping or "correcting" it — issuance must fail loudly on a
+    typo (e.g. ``"reviews"``) instead of treating it as a harmless no-op.
+    An empty input returns an empty list (an explicitly scopeless key is
+    valid; this function never substitutes a default).
+    """
+    granted = set(scopes)
+    unknown = sorted(granted - VALID_SCOPES)
+    if unknown:
+        raise ValueError(f"unknown scope(s): {', '.join(unknown)}")
+    return [s for s in CANONICAL_SCOPE_ORDER if s in granted]
 
 _KEY_PREFIX = "eng_"
 
@@ -92,6 +113,21 @@ class Principal:
         operations select them via server code, not authentication.
         """
         return self.internal_key is not None
+
+    def has_scope(self, required: str) -> bool:
+        """Whether this principal's granted scopes satisfy ``required``.
+
+        ``admin`` is a super-scope and satisfies every valid requirement
+        (V2-BL-004). Unknown scope strings present in ``self.scopes`` (e.g.
+        historical rows predating scope validation) never confer authority —
+        only an exact match or ``admin`` does.
+        """
+        return "admin" in self.scopes or required in self.scopes
+
+
+def principal_has_scope(principal: Principal, required: Scope) -> bool:
+    """Centralized scope-evaluation rule (V2-BL-004). See :meth:`Principal.has_scope`."""
+    return principal.has_scope(required)
 
 
 @dataclass(frozen=True)
@@ -516,28 +552,142 @@ async def get_current_principal(
 # --- Scope / membership enforcement -----------------------------------------
 
 
-def require_scopes(*required: str) -> Callable[..., Awaitable[Principal]]:
+@dataclass(frozen=True)
+class ScopePolicy:
+    """Declarative scope requirement for one route (V2-BL-004).
+
+    ``all_of`` (AND) and ``any_of`` (OR) may both be set (e.g. a route could
+    require one baseline scope plus one of a set of privileged scopes), though
+    in practice every route in this codebase uses exactly one of the two.
+    ``exempt`` marks a route as having no scope requirement at all (only
+    ``/health`` and ``/ready``). ``conditional`` is documentation-only metadata
+    surfaced in OpenAPI for routes whose *effective* requirement depends on
+    request/DB state beyond what a static guard can express (e.g. the mixed
+    review-transition endpoint) — the actual conditional enforcement lives in
+    application code, not here.
+    """
+
+    all_of: tuple[Scope, ...] = ()
+    any_of: tuple[Scope, ...] = ()
+    exempt: bool = False
+    description: str | None = None
+    conditional: dict[str, str] | None = None
+
+
+def _validate_scope_set(scopes: tuple[str, ...]) -> None:
+    unknown = set(scopes) - VALID_SCOPES
+    if unknown:
+        raise ValueError(f"Unknown scope(s): {sorted(unknown)}")
+
+
+class ScopeGuard:
+    """FastAPI dependency enforcing a non-exempt :class:`ScopePolicy`.
+
+    Introspectable (``.policy``) so the OpenAPI extension and the route-
+    completeness test can derive their view of the world from the exact same
+    object used at runtime — there is no second, hand-maintained table of
+    route scopes anywhere else.
+    """
+
+    def __init__(
+        self,
+        *,
+        all_of: tuple[Scope, ...] = (),
+        any_of: tuple[Scope, ...] = (),
+        description: str | None = None,
+        conditional: dict[str, str] | None = None,
+    ) -> None:
+        _validate_scope_set(all_of)
+        _validate_scope_set(any_of)
+        if not all_of and not any_of:
+            raise ValueError("ScopeGuard requires all_of or any_of")
+        self.policy = ScopePolicy(
+            all_of=tuple(all_of),
+            any_of=tuple(any_of),
+            description=description,
+            conditional=conditional,
+        )
+
+    async def __call__(
+        self, principal: Principal = Depends(get_current_principal)  # noqa: B008
+    ) -> Principal:
+        if self.policy.all_of:
+            missing = [s for s in self.policy.all_of if not principal.has_scope(s)]
+            if missing:
+                label = "scope" if len(missing) == 1 else "scopes"
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Requires {label}: {', '.join(missing)}",
+                )
+        if self.policy.any_of and not any(
+            principal.has_scope(s) for s in self.policy.any_of
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Requires one of scopes: {', '.join(self.policy.any_of)}",
+            )
+        return principal
+
+
+class ExemptScopeGuard:
+    """Marks a route as explicitly exempt from scope enforcement.
+
+    Deliberately takes no parameters — it never resolves a principal and
+    never touches the database. This is what keeps ``/health`` a true,
+    dependency-free liveness probe while still giving the route-completeness
+    test an introspectable policy object to find (every route must have
+    exactly one; only ``/health``/``/ready`` may be exempt).
+    """
+
+    def __init__(self, *, reason: str) -> None:
+        self.policy = ScopePolicy(exempt=True, description=reason)
+
+    async def __call__(self) -> None:
+        return None
+
+
+def require_scopes(*required: Scope) -> ScopeGuard:
     """Dependency factory — enforces that the caller holds every scope.
 
     Usage::
 
         @router.post(..., dependencies=[Depends(require_scopes("admin"))])
     """
+    return ScopeGuard(all_of=tuple(required))
 
-    missing = set(required) - VALID_SCOPES
-    if missing:
-        raise ValueError(f"Unknown scope(s): {missing}")
 
-    async def _check(pr: Principal = Depends(get_current_principal)) -> Principal:  # noqa: B008
-        granted = set(pr.scopes)
-        if not all(s in granted for s in required):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Requires scope(s): {', '.join(required)}",
-            )
-        return pr
+def require_any_scope(*required: Scope) -> ScopeGuard:
+    """Dependency factory — enforces that the caller holds at least one scope."""
+    return ScopeGuard(any_of=tuple(required))
 
-    return _check
+
+# --- Shared scope-guard constants (V2-BL-004) --------------------------------
+#
+# Route modules import these rather than constructing their own guards, so
+# every route sharing a requirement uses the exact same object — this is what
+# lets `/v1/admin/*` be verified as sharing "one canonical runtime guard" and
+# keeps the OpenAPI extension free of hand-duplicated scope strings.
+
+READ_SCOPE = ScopeGuard(all_of=("read",), description="Ordinary read/retrieval operations.")
+WRITE_SCOPE = ScopeGuard(all_of=("write",), description="Ordinary data creation and mutation.")
+REVIEW_SCOPE = ScopeGuard(
+    all_of=("review",), description="Review-domain access and privileged review actions."
+)
+EXPORT_SCOPE = ScopeGuard(all_of=("export",), description="Export operations.")
+ADMIN_SCOPE = ScopeGuard(all_of=("admin",), description="Administrative operations.")
+WRITE_OR_REVIEW_SCOPE = ScopeGuard(
+    any_of=("write", "review"),
+    description=(
+        "Base admission for the mixed review-transition endpoint. Collaborative "
+        "actions (dispute, self-withdrawal) need only `write`; privileged review "
+        "decisions additionally require `review` — enforced in the route handler "
+        "after item eligibility is resolved."
+    ),
+    conditional={"privileged_review_transitions": "review"},
+)
+
+HEALTH_EXEMPT_SCOPE = ExemptScopeGuard(reason="liveness probe")
+READY_EXEMPT_SCOPE = ExemptScopeGuard(reason="readiness probe")
 
 
 async def check_workspace_membership(

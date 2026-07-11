@@ -421,6 +421,21 @@ async def test_typed_errors_with_structured_detail(
     assert exc_info.value.detail == structured_detail
 
 
+async def test_scope_403_is_engram_auth_error_not_a_transport_failure() -> None:
+    """V2-BL-004: a server-side scope-403 (e.g. missing `write`) must surface
+    as the same typed `EngramAuthError` as any other 401/403 — the SDK has no
+    scope vocabulary of its own and must not special-case the detail string
+    or conflate it with a network/transport failure (httpx.TransportError)."""
+    rec = _Recorder(status_code=403, payload={"detail": "Requires scope: write"})
+    async with _client(rec) as client:
+        with pytest.raises(EngramAuthError) as exc_info:
+            await client.remember("x")
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == "Requires scope: write"
+    # Distinct exception hierarchy from a genuine transport failure.
+    assert not isinstance(exc_info.value, httpx.TransportError)
+
+
 async def test_error_non_json_body() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

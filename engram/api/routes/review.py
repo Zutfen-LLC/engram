@@ -19,10 +19,16 @@ from engram.api.routes.memory import (
     _resolve_principal,
     _resolve_workspace_id,
 )
+from engram.auth import REVIEW_SCOPE, WRITE_OR_REVIEW_SCOPE, Principal
 from engram.db import get_session
 from engram.memory_access import eligibility_sql
 from engram.models import MemoryItem
-from engram.review_policy import TransitionOutcome, can_human_verify, evaluate_transition
+from engram.review_policy import (
+    TransitionOutcome,
+    can_human_verify,
+    evaluate_transition,
+    required_scope_for_review_transition,
+)
 
 router = APIRouter()
 
@@ -143,7 +149,7 @@ async def _resolve_tenant_id(session: AsyncSession) -> UUID:
     return UUID(str(tid_str))
 
 
-@router.get("/review/queue", response_model=None)
+@router.get("/review/queue", response_model=None, dependencies=[Depends(REVIEW_SCOPE)])
 async def review_queue(
     kind: str | None = None,
     workspace: str | None = None,
@@ -153,7 +159,9 @@ async def review_queue(
     raise NotImplementedError
 
 
-@router.get("/review/conflicts", response_model=ConflictListResponse)
+@router.get(
+    "/review/conflicts", response_model=ConflictListResponse, dependencies=[Depends(REVIEW_SCOPE)]
+)
 async def conflict_queue(
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> ConflictListResponse:
@@ -194,7 +202,9 @@ async def conflict_queue(
     return ConflictListResponse(items=items, total=len(items))
 
 
-@router.get("/review/stale", response_model=StaleListResponse)
+@router.get(
+    "/review/stale", response_model=StaleListResponse, dependencies=[Depends(REVIEW_SCOPE)]
+)
 async def stale_items(
     days: int = 90,
     workspace: str | None = None,
@@ -244,7 +254,9 @@ async def stale_items(
     return StaleListResponse(items=items, total=len(items), days=days)
 
 
-@router.get("/review/stats", response_model=ReviewStatsResponse)
+@router.get(
+    "/review/stats", response_model=ReviewStatsResponse, dependencies=[Depends(REVIEW_SCOPE)]
+)
 async def review_stats(
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> ReviewStatsResponse:
@@ -312,8 +324,19 @@ async def change_review_status(
     item_id: UUID,
     req: ReviewChangeRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
+    caller: Principal = Depends(WRITE_OR_REVIEW_SCOPE),  # noqa: B008
 ) -> dict[str, Any]:
     """Change review_status (proposed -> active, dispute, etc.). Writes item_event.
+
+    Mixed-purpose endpoint (V2-BL-004): collaborative actions (dispute,
+    self-withdrawal) only need `write`; privileged review decisions
+    (activation, reactivation, rejection, non-author archival) additionally
+    require `review`. Scope is necessary but not sufficient — the existing
+    principal-type/authorship policy below still decides whether a
+    scope-eligible caller may actually perform the transition. Error order is
+    deliberate: item eligibility (404) resolves before the transition-scope
+    check (403), so a write-scoped caller can't use the 403/404 split to
+    probe for inaccessible items.
 
     The event actor is always the authenticated caller (never the item's
     author, and never the deprecated ``actor_principal_id`` request field) —
@@ -328,6 +351,16 @@ async def change_review_status(
     item = await _require_eligible_item(
         session, item_id, tenant_id=tenant_id, principal_id=principal_id, for_update=True
     )
+    is_author = UUID(str(item["principal_id"])) == principal_id
+    required_scope = required_scope_for_review_transition(
+        current_status=str(item["review_status"]),
+        requested_status=req.review_status,
+        is_author=is_author,
+    )
+    if required_scope is not None and not caller.has_scope(required_scope):
+        raise HTTPException(
+            status_code=403, detail=f"Requires scope: {required_scope}"
+        )
     decision = evaluate_transition(
         principal_id=principal_id,
         principal_type=principal_type,
@@ -378,7 +411,9 @@ async def change_review_status(
     return {"item": updated, "event": event}
 
 
-@router.post("/items/{item_id}/verify", response_model=None)
+@router.post(
+    "/items/{item_id}/verify", response_model=None, dependencies=[Depends(REVIEW_SCOPE)]
+)
 async def verify_item(
     item_id: UUID,
     req: VerifyRequest | None = None,
@@ -438,7 +473,11 @@ async def verify_item(
     return {"item": updated, "event": event}
 
 
-@router.post("/items/{item_id}/resolve-conflict", response_model=ConflictResolutionResponse)
+@router.post(
+    "/items/{item_id}/resolve-conflict",
+    response_model=ConflictResolutionResponse,
+    dependencies=[Depends(REVIEW_SCOPE)],
+)
 async def resolve_conflict(
     item_id: UUID,
     req: ConflictResolution,
@@ -505,7 +544,9 @@ async def resolve_conflict(
     )
 
 
-@router.post("/items/bulk-archive", response_model=BulkArchiveResponse)
+@router.post(
+    "/items/bulk-archive", response_model=BulkArchiveResponse, dependencies=[Depends(REVIEW_SCOPE)]
+)
 async def bulk_archive(
     req: BulkArchiveRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008

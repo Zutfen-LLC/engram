@@ -221,3 +221,21 @@ async def test_sdk_error_surfaces_as_mcp_error(mcp_server, mock_client) -> None:
     assert "engram_recall" in message
     assert "503" in message
     assert "upstream is down" in message
+
+
+async def test_scope_403_surfaces_as_distinct_mcp_error(mcp_server, mock_client) -> None:
+    """V2-BL-004: a server-side scope-403 must surface through the same generic
+    error path as any other SDK error — the MCP adapter has no scope-specific
+    handling and must not conflate it with a transport failure or retry it."""
+    mock_client.remember.side_effect = engram_client.EngramAuthError(
+        403, "Requires scope: write", {"detail": "Requires scope: write"}
+    )
+
+    async with create_connected_server_and_client_session(mcp_server) as session:
+        result = await session.call_tool("engram_remember", {"content": "x"})
+
+    assert result.isError
+    message = _text(result)
+    assert "engram_remember" in message
+    assert "403" in message
+    assert "Requires scope: write" in message

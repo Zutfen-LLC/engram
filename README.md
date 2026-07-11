@@ -284,6 +284,108 @@ item IDs both return `404 Not Found` so item existence is not disclosed. This el
 check does not itself grant privileged review transitions; transition authority and route
 scope enforcement are separate trust controls.
 
+### API-Key Scopes & Authorization
+
+Every API key carries an explicit, validated list of **scopes**. Scopes answer
+*"may this credential attempt this class of operation?"* — a question
+orthogonal to tenant membership, item eligibility, and principal type (agent
+vs. user vs. admin), which answer *"may this specific principal perform this
+specific action?"*. All four checks are independently enforced; none
+substitutes for another.
+
+The canonical scope vocabulary is exactly:
+
+| Scope    | Grants                                                                 |
+| -------- | ----------------------------------------------------------------------- |
+| `read`   | recall, search, item list/detail, taxonomy, tunnels, KG query/timeline, diary reads, classification |
+| `write`  | remember, feedback, item metadata/supersede/invalidate, KG writes, diary writes, tunnel creation, and collaborative review actions (dispute, self-withdrawal) |
+| `review` | review queues/hygiene, privileged review decisions (activate, reactivate, reject, non-author archival), human verification, conflict resolution, bulk archival |
+| `export` | `GET /v1/export/cca`                                                     |
+| `admin`  | tenant/workspace/principal/API-key/memory-kind governance, and every operation above |
+
+**`admin` is a super-scope** — a key carrying `admin` satisfies every other
+scope requirement automatically; you never need to also list `read`, `write`,
+`review`, or `export` alongside it. Scopes otherwise do **not** imply one
+another: `write` does not imply `read`, `review` does not imply `write` or
+`read`, and `export` does not imply `read`. A caller missing a required scope
+gets `403 Forbidden` with a body like `{"detail": "Requires scope: write"}`
+(or `"Requires one of scopes: write, review"`) — scope denial always happens
+before any handler-level mutation or eligibility disclosure.
+
+`POST /v1/items/{item_id}/review` is a mixed-purpose endpoint: an agent with
+only `write` may dispute an item or withdraw its own still-`proposed`
+proposal, but activating, reactivating, rejecting, or archiving someone
+else's proposal is a privileged review decision that requires `review` —
+even for a human `user` principal the principal-type policy would otherwise
+allow. Scope and principal-type policy are both required; neither one alone
+is sufficient (an agent with `review` still cannot activate anything — agent
+principal restrictions still apply).
+
+Every route's scope requirement is discoverable in the OpenAPI schema
+(`GET /openapi.json`) under the `x-engram-scope-policy` vendor extension,
+e.g.:
+
+```json
+{ "all_of": ["write"], "admin_satisfies": true }
+{ "any_of": ["write", "review"], "admin_satisfies": true,
+  "conditional": { "privileged_review_transitions": "review" } }
+{ "exempt": true, "reason": "liveness probe" }
+```
+
+Only `GET /health` and `GET /ready` are exempt from scope enforcement; every
+other application route declares an explicit `all_of`/`any_of` requirement,
+and a completeness test fails CI if a new route ships without one.
+
+**Issuing keys.** New-key issuance validates the requested scope list against
+the vocabulary above, rejects unknown/misspelled scopes with `422`, dedupes,
+and persists them in a canonical order (`read, write, review, export,
+admin`). An explicit empty scope list (`"scopes": []`) is allowed and
+authenticates, but such a key can only reach `/health`/`/ready`. Omitting
+`scopes` entirely defaults to `["read", "write"]`.
+
+```bash
+# Full administrator (bootstraps the very first key):
+engram bootstrap-key --scopes read,write,admin,export
+
+# Or via the admin API, once you have an admin-scoped key:
+curl -X POST http://localhost:8000/v1/admin/api-keys \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "tenant_id": "<tenant-uuid>",
+        "principal_id": "<principal-uuid>",
+        "scopes": ["review"],
+        "label": "human-reviewer"
+      }'
+```
+
+Common issuance patterns:
+
+| Key purpose                 | `scopes`                    |
+| ---------------------------- | ---------------------------- |
+| Read-only recall/search agent | `["read"]`                  |
+| Write-only capture agent     | `["write"]`                 |
+| Human reviewer               | `["review"]`                |
+| Export-only integration      | `["export"]`                |
+| Full administrator           | `["admin"]`                 |
+
+**Backward compatibility.** Existing keys with `read`/`write`/`export`/`admin`
+continue working unchanged under the new matrix, and existing `admin`-only
+keys (including bootstrap keys) automatically satisfy `review` via the
+super-scope rule — no data migration is needed. Historical rows may contain
+scope strings that predate validation (e.g. from hand-inserted keys); those
+authenticate normally, and any unrecognized string simply confers no
+authority rather than crashing authentication.
+
+**Development mode.** With `ENGRAM_AUTH_ENABLED=false` (the default for local
+dev), every request resolves the seeded default admin principal, which
+carries `admin` and therefore passes every scope gate — the same runtime
+guards run in both modes; auth-disabled mode is not special-cased per route.
+
+Engram's scopes are a custom bearer-token vocabulary, not OAuth2 — there is
+no token endpoint, no refresh flow, and no third-party identity provider
+integration.
+
 ### Classification
 
 Two endpoints serve classification with distinct roles:

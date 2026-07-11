@@ -126,8 +126,19 @@ curl -s http://localhost:8000/v1/recall \
 
 Engram authenticates API keys presented as a `Bearer` token in the
 `Authorization` header. Keys resolve to `(tenant_id, principal_id, scopes)`.
-Scopes are `read | write | admin | export`. `/health` and `/ready` are always
-exempt from auth.
+Scopes are `read | write | review | export | admin`, and every caller-facing
+route enforces one of them (`admin` is a super-scope that satisfies all the
+others — see the README's "API-Key Scopes & Authorization" section for the
+full route matrix and the mixed review-transition endpoint's conditional
+rule). `/health` and `/ready` are always exempt from auth and scope
+enforcement.
+
+New-key issuance (the admin API and `bootstrap-key --scopes`) validates the
+requested list against that vocabulary, rejects unknown/misspelled scopes
+with `422`, and persists a deduplicated, canonically-ordered list. An
+explicit empty scope list is allowed (the key authenticates but can only
+reach the exempt health/readiness routes); omitting `scopes` defaults to
+`["read", "write"]`.
 
 **New keys** (created from ENG-AUD-003 onward) use the format
 `eng_<key_id>_<secret>`:
@@ -164,6 +175,12 @@ curl -s -X POST http://localhost:8000/v1/admin/api-keys \
     -H "Authorization: Bearer $ADMIN_TOKEN" \
     -H "Content-Type: application/json" \
     -d '{"tenant_id":"<tenant-uuid>","principal_id":"<principal-uuid>","scopes":["read","write"],"label":"agent-1"}'
+
+# A human-reviewer key (review queues, activation/rejection, verification):
+curl -s -X POST http://localhost:8000/v1/admin/api-keys \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"tenant_id":"<tenant-uuid>","principal_id":"<reviewer-principal-uuid>","scopes":["review"],"label":"human-reviewer"}'
 ```
 
 For manual/offline insertion, `engram generate-key` prints a new-format key
@@ -532,6 +549,7 @@ applies to the owner too, and only superusers / `BYPASSRLS` roles bypass it.
 | `/ready` returns 503 `no_tenant_context` | The seed migration didn't run. On a fresh DB run `engram init-db`; on an existing-but-untracked DB run `engram init-db --baseline`. |
 | `engram init-db` errors that `memory_items` already exists | The DB was bootstrapped externally (Docker first-boot). Run `engram init-db --baseline` once. |
 | `401 Unauthorized` with auth enabled | Missing/invalid/revoked key. Bootstrap with `engram bootstrap-key`, or revoke+rotate an existing key. |
+| `403 Forbidden` with `"Requires scope: ..."` | The key authenticated fine but lacks a required scope for that route. Issue a new key with the needed scope (see "API-Key Scopes & Authorization" in the README), or use an `admin`-scoped key, which satisfies every scope. |
 | Semantic recall returns empty / 500 | Embeddings disabled or not backfilled. Set `ENGRAM_EMBEDDING_PROVIDER=openai` and run `engram backfill-embeddings`. |
 | First boot did not migrate | `initdb.d` only runs on an **empty** data volume. If a volume already exists, it is skipped — use `engram init-db`. |
 | Backup fails with `pg_dump: command not found` | Install the `pg` client tools on the host, or run `pg_dump` inside the `postgres` container (see §4). |

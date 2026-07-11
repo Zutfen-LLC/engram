@@ -16,6 +16,7 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from engram.auth import READ_SCOPE, WRITE_SCOPE
 from engram.canonicalize import canonicalize, content_hash
 from engram.db import get_session
 from engram.models import MemoryItem, Principal
@@ -104,7 +105,12 @@ def _diary_to_entry(item: MemoryItem, topic: str | None) -> DiaryEntry:
 # ---- Endpoints ----
 
 
-@router.post("/diary", response_model=DiaryWriteResponse, status_code=201)
+@router.post(
+    "/diary",
+    response_model=DiaryWriteResponse,
+    status_code=201,
+    dependencies=[Depends(WRITE_SCOPE)],
+)
 async def write_diary(
     req: DiaryWrite,
     session: AsyncSession = Depends(get_session),  # noqa: B008
@@ -191,7 +197,9 @@ async def write_diary(
     )
 
 
-@router.get("/diary/{principal}", response_model=list[DiaryEntry])
+@router.get(
+    "/diary/{principal}", response_model=list[DiaryEntry], dependencies=[Depends(READ_SCOPE)]
+)
 async def read_diary(
     principal: str,
     limit: int = 10,

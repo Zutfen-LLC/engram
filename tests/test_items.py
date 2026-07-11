@@ -11,6 +11,7 @@ from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from engram.api.app import create_app
+from engram.auth import Principal, get_current_principal
 from engram.db import get_session
 
 
@@ -194,7 +195,15 @@ async def client(session_factory):
                 )
             yield session
 
+    async def override_get_current_principal() -> Principal:
+        # RLS identity here is driven by _rls_context/set_config(), not by
+        # get_current_principal — this override only keeps V2-BL-004's
+        # ScopeGuard dependencies from hitting the real (unreachable-in-this-
+        # test) Postgres-backed default principal.
+        return Principal(tenant_id="test-tenant", principal_id="test-principal", scopes=("admin",))
+
     app.dependency_overrides[get_session] = override_get_session
+    app.dependency_overrides[get_current_principal] = override_get_current_principal
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac

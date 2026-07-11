@@ -51,6 +51,14 @@ def create_app() -> FastAPI:
     app.include_router(export.router, prefix="/v1", tags=["export"])
     app.include_router(admin.router, prefix="/v1", tags=["admin"])
 
+    # V2-BL-004: every caller-facing route must declare an explicit scope
+    # policy (or be marked exempt). Validated eagerly here so a route added
+    # without one fails at import/startup time, not silently in production.
+    from engram.api.scope_policy import build_custom_openapi, validate_scope_policy_completeness
+
+    validate_scope_policy_completeness(app)
+    app.openapi = lambda: build_custom_openapi(app)  # type: ignore[method-assign]
+
     return app
 
 
