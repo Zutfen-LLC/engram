@@ -18,7 +18,7 @@ from engram.db import get_session
 CREATE_STATEMENTS = [
     "CREATE TABLE tenants (id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL, created_at TEXT NOT NULL)",
     "CREATE TABLE workspaces (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, name TEXT NOT NULL, slug TEXT NOT NULL, created_at TEXT NOT NULL)",
-    "CREATE TABLE principals (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, name TEXT NOT NULL, type TEXT NOT NULL, created_at TEXT NOT NULL)",
+    "CREATE TABLE principals (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, name TEXT NOT NULL, type TEXT NOT NULL, internal_key TEXT, created_at TEXT NOT NULL)",
     """
     CREATE TABLE memory_items (
         id TEXT PRIMARY KEY,

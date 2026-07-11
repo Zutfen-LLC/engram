@@ -45,13 +45,16 @@ current between sweeps.
 
 from __future__ import annotations
 
+import secrets
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from engram.auth import INTERNAL_DISPLAY_NAME_PREFIX
 from engram.config import settings
 from engram.conflicts import PromotionConflictCheck, check_promotion_conflict
 from engram.models import FeedbackEvent, ItemEvent, MemoryItem, TenantConfig
@@ -63,38 +66,174 @@ from engram.review_policy import TrustedReviewOperation, evaluate_transition
 _FALLBACK_CONFIDENCE_THRESHOLD = 0.7
 _FALLBACK_MIN_AGE_HOURS = 72
 
-# Deterministic, per-tenant name for the trusted system principal that owns
-# every trusted-internal review event this module writes (Path A promotion,
-# promotion-time conflict recheck). Never the memory author — see
-# resolve_trusted_system_actor.
-TRUSTED_SYSTEM_PRINCIPAL_NAME = "system"
+# --- Trusted internal review actor identity (V2-BL-003B) -------------------
+#
+# The trusted review actor is identified by a server-owned ``internal_key``
+# column on ``principals``, NOT by its mutable display name. This replaces the
+# V2-BL-003A name-based resolution (``name = 'system'``) which was vulnerable to
+# collision: an agent/user/admin principal named ``system`` would be returned by
+# the old ``(tenant_id, name)`` upsert, recreating false self-approval audit
+# trails.
+#
+# The canonical internal key for the trusted review and promotion actor:
+TRUSTED_REVIEW_INTERNAL_KEY = "review_automation"
 
-_UPSERT_SYSTEM_PRINCIPAL = text(
-    "INSERT INTO principals (tenant_id, name, type) "
-    "VALUES (:tenant_id, :name, 'system') "
-    "ON CONFLICT (tenant_id, name) DO UPDATE SET name = principals.name "
+# Display names for internal principals use the reserved internal prefix (shared
+# with engram.auth, which rejects caller-supplied names starting with it) so
+# they never collide with ordinary principal names. The generated display name
+# is descriptive only and is NOT the security identity.
+TRUSTED_REVIEW_DISPLAY_NAME_PREFIX = INTERNAL_DISPLAY_NAME_PREFIX
+
+# Maximum attempts to generate a collision-free display name before failing
+# closed. Each attempt draws fresh randomness, so the probability of exhausting
+# this budget is negligible (8 attempts × ~16 bytes of entropy).
+_MAX_NAME_GENERATION_RETRIES = 8
+
+
+def _generate_internal_display_name() -> str:
+    """Generate a collision-resistant display name for an internal principal.
+
+    The name uses the reserved internal prefix plus a random suffix, so it
+    cannot collide with ordinary principal names (the admin API rejects the
+    prefix). The name is descriptive only; the security identity is the
+    ``internal_key``, not the name.
+    """
+    suffix = secrets.token_urlsafe(16)
+    return f"{TRUSTED_REVIEW_DISPLAY_NAME_PREFIX}:{suffix}"
+
+
+# Resolve the canonical internal principal by (tenant_id, internal_key). The
+# partial unique index ``idx_principals_internal_key`` (migrations/010) is the
+# concurrency authority: only one row per (tenant, internal_key) can exist.
+# We SELECT first (fast common path); on miss we INSERT with a generated
+# display name, retrying on a name collision (unlikely given the entropy).
+_LOOKUP_INTERNAL_PRINCIPAL = text(
+    "SELECT id, tenant_id::text AS tenant_id, type, internal_key, name "
+    "FROM principals "
+    "WHERE tenant_id = :tenant_id AND internal_key = :internal_key"
+)
+
+_INSERT_INTERNAL_PRINCIPAL = text(
+    "INSERT INTO principals (tenant_id, name, type, internal_key) "
+    "VALUES (:tenant_id, :name, 'system', :internal_key) "
     "RETURNING id"
 )
 
 
-async def resolve_trusted_system_actor(session: AsyncSession, tenant_id: str) -> uuid.UUID:
-    """Resolve this tenant's system principal, creating it on first use.
+class TrustedActorInvariantError(RuntimeError):
+    """Raised when a resolved trusted actor violates a security invariant.
 
-    This is the sole ``item_events.actor_principal_id`` for trusted internal
-    review operations in this module — never the item's author, and never
-    selectable from any caller-facing request. ``principals.type`` already
-    permits ``'system'`` (migrations/001_init.sql), so no schema change is
-    needed; the (tenant_id, name) unique constraint makes the upsert an
-    atomic, concurrency-safe "get-or-create" in one round trip — concurrent
-    first use from multiple workers/requests cannot create duplicate rows or
-    raise a unique-violation, since ``ON CONFLICT ... DO UPDATE ... RETURNING``
-    always returns the single canonical row's id.
+    This is a fail-closed error: the resolver refuses to return a principal
+    whose type, tenant, or internal_key does not match the expected canonical
+    identity, rather than silently adopting an incorrect row.
     """
-    result = await session.execute(
-        _UPSERT_SYSTEM_PRINCIPAL,
-        {"tenant_id": str(tenant_id), "name": TRUSTED_SYSTEM_PRINCIPAL_NAME},
-    )
-    return uuid.UUID(str(result.scalar_one()))
+
+
+async def resolve_trusted_system_actor(session: AsyncSession, tenant_id: str) -> uuid.UUID:
+    """Resolve this tenant's canonical trusted review principal, creating it on
+    first use.
+
+    The trusted actor is identified by ``internal_key = 'review_automation'``
+    within the tenant — NOT by its display name. This replaces the V2-BL-003A
+    name-based resolution that could collide with an ordinary principal named
+    ``system``.
+
+    Resolution strategy:
+      1. SELECT the row by (tenant_id, internal_key) — fast common path.
+      2. On miss, INSERT with a generated collision-resistant display name.
+         The partial unique index on (tenant_id, internal_key) is the
+         concurrency authority: concurrent INSERTs serialize so exactly one
+         row survives; the loser raises IntegrityError and re-reads.
+      3. If the generated display name collides with an existing (tenant_id,
+         name) — extremely unlikely given 128 bits of entropy — retry with a
+         new name, up to _MAX_NAME_GENERATION_RETRIES.
+      4. Verify the returned row's invariants (type, tenant, internal_key).
+      5. Fail closed on any invariant violation.
+
+    Never selects a principal merely because its name is ``system``. Never
+    mutates an existing ordinary principal into an internal principal. Never
+    assigns ``internal_key`` based on request data.
+    """
+    tid = str(tenant_id)
+
+    # Fast path: the canonical row already exists.
+    row = (
+        await session.execute(
+            _LOOKUP_INTERNAL_PRINCIPAL,
+            {"tenant_id": tid, "internal_key": TRUSTED_REVIEW_INTERNAL_KEY},
+        )
+    ).first()
+
+    if row is None:
+        # Create on first use. Retry on a display-name collision (the
+        # (tenant_id, name) unique constraint); the (tenant_id, internal_key)
+        # partial unique index serializes concurrent first-use.
+        for attempt in range(_MAX_NAME_GENERATION_RETRIES):
+            display_name = _generate_internal_display_name()
+            try:
+                insert_result = await session.execute(
+                    _INSERT_INTERNAL_PRINCIPAL,
+                    {
+                        "tenant_id": tid,
+                        "name": display_name,
+                        "internal_key": TRUSTED_REVIEW_INTERNAL_KEY,
+                    },
+                )
+                inserted_id = insert_result.scalar_one_or_none()
+                if inserted_id is not None:
+                    # INSERT succeeded — re-read to get the full row for
+                    # invariant verification (type, tenant, internal_key).
+                    row = (
+                        await session.execute(
+                            _LOOKUP_INTERNAL_PRINCIPAL,
+                            {"tenant_id": tid, "internal_key": TRUSTED_REVIEW_INTERNAL_KEY},
+                        )
+                    ).first()
+                break
+            except IntegrityError:
+                await session.rollback()
+                # Re-check: a concurrent first-use may have already created the
+                # canonical row (the internal_key partial unique index
+                # serializes). If so, use it; otherwise retry the name.
+                existing = (
+                    await session.execute(
+                        _LOOKUP_INTERNAL_PRINCIPAL,
+                        {"tenant_id": tid, "internal_key": TRUSTED_REVIEW_INTERNAL_KEY},
+                    )
+                ).first()
+                if existing is not None:
+                    row = existing
+                    break
+                # Name collision (not internal_key) — retry with a new name.
+                if attempt == _MAX_NAME_GENERATION_RETRIES - 1:
+                    raise TrustedActorInvariantError(
+                        "could not generate a collision-free display name for "
+                        f"the trusted internal principal in tenant {tid} after "
+                        f"{_MAX_NAME_GENERATION_RETRIES} attempts"
+                    ) from None
+                continue
+
+    if row is None:
+        raise TrustedActorInvariantError(
+            f"failed to resolve or create the trusted internal principal for tenant {tid}"
+        )
+
+    # Verify all invariants — fail closed on any mismatch.
+    if str(row.tenant_id) != tid:
+        raise TrustedActorInvariantError(
+            f"trusted actor tenant mismatch: expected {tid}, got {row.tenant_id}"
+        )
+    if row.type != "system":
+        raise TrustedActorInvariantError(
+            f"trusted actor type mismatch: expected 'system', got {row.type!r}"
+        )
+    if row.internal_key != TRUSTED_REVIEW_INTERNAL_KEY:
+        raise TrustedActorInvariantError(
+            f"trusted actor internal_key mismatch: expected {TRUSTED_REVIEW_INTERNAL_KEY!r}, "
+            f"got {row.internal_key!r}"
+        )
+
+    return uuid.UUID(str(row.id))
 
 
 @dataclass

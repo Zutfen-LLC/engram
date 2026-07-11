@@ -37,6 +37,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal
+from uuid import UUID
 
 import bcrypt
 from fastapi import Depends, HTTPException, Request, status
@@ -68,11 +69,29 @@ _bearer = HTTPBearer(auto_error=False)
 
 @dataclass(frozen=True)
 class Principal:
-    """The authenticated caller — tenant + principal + granted scopes."""
+    """The authenticated caller — tenant + principal + granted scopes.
+
+    ``internal_key`` carries the server-owned internal identity marker from the
+    ``principals`` row (V2-BL-003B). It is ``None`` for every ordinary
+    principal. A non-null ``internal_key`` marks a trusted internal actor that
+    must never authenticate via an API key — :func:`is_internal` enforces this
+    invariant at every authentication path.
+    """
 
     tenant_id: str
     principal_id: str
     scopes: tuple[str, ...]
+    internal_key: str | None = None
+
+    @property
+    def is_internal(self) -> bool:
+        """True when this is a server-owned internal principal.
+
+        Internal principals are non-credentialable: they can never authenticate
+        through an API key, even if a key row is inserted manually. Trusted
+        operations select them via server code, not authentication.
+        """
+        return self.internal_key is not None
 
 
 @dataclass(frozen=True)
@@ -272,12 +291,19 @@ def _parse_scopes(raw_scopes: str | list[str]) -> list[str]:
 
 
 async def _resolve_default_principal(session: AsyncSession) -> Principal:
-    """Look up the seed default tenant/admin (auth-disabled path)."""
+    """Look up the seed default tenant/admin (auth-disabled path).
+
+    The seed admin principal has ``internal_key = NULL`` (an ordinary admin),
+    so this path never resolves an internal principal. The internal_key is
+    selected and asserted to confirm the invariant — a fail-closed guard
+    against a future seed change.
+    """
     row = (
         await session.execute(
             text(
                 "SELECT CAST(t.id AS TEXT) AS tenant_id, "
-                "       CAST(p.id AS TEXT) AS principal_id "
+                "       CAST(p.id AS TEXT) AS principal_id, "
+                "       p.internal_key AS internal_key "
                 "FROM tenants t "
                 "JOIN principals p "
                 "  ON p.tenant_id = t.id AND p.name = :principal "
@@ -286,10 +312,15 @@ async def _resolve_default_principal(session: AsyncSession) -> Principal:
             {"slug": "default", "principal": "admin"},
         )
     ).one()
+    if row.internal_key is not None:
+        raise RuntimeError(
+            "seed default principal has an internal_key — auth disabled path is unsafe"
+        )
     return Principal(
         tenant_id=row.tenant_id,
         principal_id=row.principal_id,
         scopes=("read", "write", "admin", "export"),
+        internal_key=None,
     )
 
 
@@ -301,25 +332,40 @@ async def _resolve_new_format_key(parsed: ParsedApiKey) -> Principal | None:
     a legacy token whose random segment contained an underscore parses as
     new-format and must still be tried against bcrypt). Raises 401 when a
     genuine new-format key is found but its secret digest does not match (a hard
-    failure: do not fall back to the legacy scan for a presented wrong secret).
+    failure: do not fall back to the legacy scan for a presented wrong secret),
+    or when the resolved principal is an internal (non-credentialable) actor.
+
+    Fail-closed for internal principals (V2-BL-003B): if the key row resolves to
+    a principal with ``internal_key IS NOT NULL``, authentication fails with a
+    normal 401 — no Principal object carrying trusted authority is returned, and
+    no success cache entry is created. This protects against direct DB key
+    insertion, older app versions, and missed issuance paths.
     """
     assert parsed.key_id is not None  # new-format parse always populates key_id
     secret_digest = digest_api_key_secret(parsed.secret)
 
     cached = _principal_cache.get(parsed.key_id, secret_digest)
     if cached is not None:
+        if cached.is_internal:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or revoked API key",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         return cached
 
     async with _get_session_factory()() as session:
         row = (
             await session.execute(
                 text(
-                    "SELECT CAST(tenant_id AS TEXT) AS tenant_id, "
-                    "       CAST(principal_id AS TEXT) AS principal_id, "
-                    "       scopes AS scopes, "
-                    "       secret_digest AS secret_digest "
+                    "SELECT CAST(api_keys.tenant_id AS TEXT) AS tenant_id, "
+                    "       CAST(api_keys.principal_id AS TEXT) AS principal_id, "
+                    "       api_keys.scopes AS scopes, "
+                    "       api_keys.secret_digest AS secret_digest, "
+                    "       (SELECT p.internal_key FROM principals p "
+                    "        WHERE p.id = api_keys.principal_id) AS principal_internal_key "
                     "FROM api_keys "
-                    "WHERE key_id = :kid AND revoked_at IS NULL"
+                    "WHERE api_keys.key_id = :kid AND api_keys.revoked_at IS NULL"
                 ),
                 {"kid": parsed.key_id},
             )
@@ -335,10 +381,22 @@ async def _resolve_new_format_key(parsed: ParsedApiKey) -> Principal | None:
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    # Fail-closed: an internal principal must never authenticate via API key,
+    # even if a key row was inserted manually. Return a normal auth failure
+    # (not a distinct error) so the existence of an internal principal is not
+    # disclosed.
+    if _row_is_internal(row.principal_internal_key):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or revoked API key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     principal = Principal(
         tenant_id=row.tenant_id,
         principal_id=row.principal_id or "",
         scopes=tuple(_parse_scopes(row.scopes)),
+        internal_key=None,
     )
     _principal_cache.put(parsed.key_id, secret_digest, principal)
     return principal
@@ -354,24 +412,38 @@ async def _resolve_legacy_key(token: str) -> Principal | None:
     migration or explicit cleanup task once legacy keys are rotated out.
 
     Scoped to ``key_id IS NULL`` so it never re-scans new-format rows.
+
+    Fail-closed for internal principals (V2-BL-003B): if a matching key resolves
+    to a principal with ``internal_key IS NOT NULL``, this path returns ``None``
+    (fall through to 401) — no Principal object carrying trusted authority is
+    returned. The check runs after bcrypt verification so a wrong secret still
+    fails fast at the digest/hash check.
     """
     async with _get_session_factory()() as session:
         result = await session.execute(
             text(
-                "SELECT CAST(tenant_id AS TEXT) AS tenant_id, "
-                "       CAST(principal_id AS TEXT) AS principal_id, "
-                "       key_hash AS key_hash, "
-                "       scopes AS scopes "
+                "SELECT CAST(api_keys.tenant_id AS TEXT) AS tenant_id, "
+                "       CAST(api_keys.principal_id AS TEXT) AS principal_id, "
+                "       api_keys.key_hash AS key_hash, "
+                "       api_keys.scopes AS scopes, "
+                "       (SELECT p.internal_key FROM principals p "
+                "        WHERE p.id = api_keys.principal_id) AS principal_internal_key "
                 "FROM api_keys "
-                "WHERE key_id IS NULL AND revoked_at IS NULL"
+                "WHERE api_keys.key_id IS NULL AND api_keys.revoked_at IS NULL"
             )
         )
         for row in result:
             if verify_api_key(token, row.key_hash):
+                # Fail-closed: internal principals cannot authenticate via API
+                # key. Access defensively — the LEFT JOIN may produce NULL.
+                internal_key = row.principal_internal_key if row.principal_internal_key else None
+                if _row_is_internal(internal_key):
+                    return None
                 return Principal(
                     tenant_id=row.tenant_id,
                     principal_id=row.principal_id or "",
                     scopes=tuple(_parse_scopes(row.scopes)),
+                    internal_key=None,
                 )
     return None
 
@@ -483,3 +555,101 @@ async def check_workspace_membership(
         {"pid": principal_id, "wid": workspace_id},
     )
     return result.first() is not None
+
+
+# --- Key-issuance validation (V2-BL-003B) -----------------------------------
+
+
+def _row_is_internal(internal_key: str | None) -> bool:
+    """Shared predicate: a DB-resolved row is internal iff internal_key is non-null.
+
+    All DB-resolve paths (new-format, legacy) route through this helper so the
+    definition of "internal" has one source of truth, matching
+    :attr:`Principal.is_internal`. If the definition evolves, only this
+    helper and the ``Principal`` property need updating.
+    """
+    return internal_key is not None
+
+
+# Reserved display-name prefix for server-owned internal principals. Caller-
+# facing principal creation rejects any name starting with this prefix so an
+# administrator cannot create a row that impersonates an internal actor.
+INTERNAL_DISPLAY_NAME_PREFIX = "__engram_internal_review__"
+
+# Allowed principal types for caller-facing creation (mirrors the DB CHECK
+# constraint in migrations/001_init.sql). Validated in Python so the admin API
+# returns a clear 422 rather than relying solely on the database constraint.
+VALID_PRINCIPAL_TYPES: frozenset[str] = frozenset({"agent", "user", "system", "admin"})
+
+
+class InternalPrincipalCredentialError(Exception):
+    """Raised when key issuance targets an internal (non-credentialable) principal."""
+
+    def __init__(self) -> None:
+        super().__init__("cannot issue API keys for internal principals")
+
+
+def validate_principal_name(name: str) -> None:
+    """Reject caller-supplied principal names that use the reserved internal prefix.
+
+    Ordinary principals named ``system`` remain allowed — the name is no longer
+    security-sensitive (V2-BL-003B). Only names beginning with the server-owned
+    internal prefix are rejected, since those could impersonate an internal
+    actor's display name.
+    """
+    if name.startswith(INTERNAL_DISPLAY_NAME_PREFIX):
+        raise ValueError(
+            f"principal names starting with {INTERNAL_DISPLAY_NAME_PREFIX!r} are reserved "
+            "for server-owned internal identities"
+        )
+
+
+def validate_principal_type(ptype: str) -> None:
+    """Validate principal type against the allowed vocabulary.
+
+    Mirrors the DB CHECK constraint but returns a clear error before hitting the
+    database. ``system`` is allowed here — a caller may create an ordinary
+    ``system``-type principal (with ``internal_key = NULL``); it is not trusted
+    unless the server assigns an internal_key.
+    """
+    if ptype not in VALID_PRINCIPAL_TYPES:
+        raise ValueError(
+            f"principal type must be one of {sorted(VALID_PRINCIPAL_TYPES)}, got {ptype!r}"
+        )
+
+
+async def assert_principal_credentialable(
+    session: AsyncSession,
+    *,
+    tenant_id: str | UUID,
+    principal_id: str | UUID,
+) -> None:
+    """Reusable validation: reject API-key issuance for internal principals.
+
+    Resolves the principal inside the caller's permitted tenant context (RLS-
+    scoped session) and raises :class:`InternalPrincipalCredentialError` if the
+    principal has ``internal_key IS NOT NULL``. A non-existent or cross-tenant
+    principal ID resolves to ``None`` (no row) — the caller maps that to a 404
+    or 409, not an internal-principal disclosure.
+
+    All key-issuance paths (admin API, bootstrap-key, shared service functions)
+    must route through this check so a single authority enforces the invariant.
+    """
+    row = (
+        await session.execute(
+            text(
+                "SELECT internal_key "
+                "FROM principals "
+                "WHERE id = :pid AND tenant_id = :tid"
+            ),
+            {"pid": str(principal_id), "tid": str(tenant_id)},
+        )
+    ).first()
+
+    if row is None:
+        # Not found in this tenant — caller maps to 404/409. Not an internal
+        # principal disclosure (no row means no internal_key).
+        return
+
+    if row.internal_key is not None:
+        raise InternalPrincipalCredentialError()

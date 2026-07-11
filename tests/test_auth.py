@@ -63,6 +63,7 @@ CREATE_STATEMENTS = [
         tenant_id TEXT NOT NULL,
         name TEXT NOT NULL,
         type TEXT NOT NULL,
+        internal_key TEXT,
         created_at TEXT NOT NULL
     )
     """,

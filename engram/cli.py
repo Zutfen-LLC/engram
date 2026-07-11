@@ -577,7 +577,8 @@ async def _run_bootstrap_key(
     try:
         row = await conn.fetchrow(
             "SELECT CAST(t.id AS TEXT) AS tenant_id, "
-            "       CAST(p.id AS TEXT) AS principal_id "
+            "       CAST(p.id AS TEXT) AS principal_id, "
+            "       p.internal_key AS internal_key "
             "FROM tenants t "
             "JOIN principals p "
             "  ON p.tenant_id = t.id AND p.name = $1 "
@@ -593,6 +594,18 @@ async def _run_bootstrap_key(
             print(
                 "Apply the schema first with 'engram init-db' (or let Docker's "
                 "first-boot initdb.d run on an empty volume).",
+                file=sys.stderr,
+            )
+            return 1
+
+        # Fail-closed: the seed admin principal must be an ordinary principal
+        # (internal_key NULL). A future seed change that makes it internal would
+        # make it non-credentialable — refuse rather than silently issuing a
+        # key that cannot authenticate.
+        if row["internal_key"] is not None:
+            print(
+                "ERROR: the seeded default/admin principal is an internal "
+                "principal and cannot receive API keys.",
                 file=sys.stderr,
             )
             return 1
