@@ -121,6 +121,7 @@ async def _insert_item(
             # otherwise source_trust defaults to 0.5 and AUTO_SUPERSEDE (which
             # needs new_trust >= 0.8) never triggers.
             source_trust=0.9,
+            authority=40,
             review_status="active",
             visibility="workspace",
             tenant_id=tenant_id,
