@@ -20,6 +20,220 @@ Guidelines for AI coding agents working on Engram.
 2. Read `docs/design.md` sections referenced by the task.
 3. Check the task's **Dependencies** line — its dependencies must be merged first.
 
+## Docker on this system
+
+Docker is installed, the daemon runs under systemd, and Docker Compose v2 is
+available as the `docker compose` subcommand. The information below is specific
+to this host — do not guess or discover it by trial and error.
+
+### Installed versions
+
+- **Docker Engine:** 29.6.1 (Arch package `docker`)
+- **Docker Compose:** 5.1.4 as a CLI plugin (`docker compose`, NOT the
+  standalone `docker-compose` binary — always use the `docker compose`
+  subcommand form)
+- **Daemon:** systemd-managed, `active` and `enabled` at boot
+- **Socket:** `/var/run/docker.sock` (mode `srw-rw----`, owned by `root:docker`)
+- **Storage driver:** overlayfs; root dir `/var/lib/docker`
+- **Context:** `default` (local socket)
+
+### Permissions — critical
+
+User `zutfen` is a member of the `docker` group (GID 956), but that group is
+**not necessarily active in the current shell session**. A bare `docker ps`
+may fail with `permission denied while trying to connect to the docker API at
+unix:///var/run/docker.sock`.
+
+Two reliable ways to run docker commands:
+
+```bash
+# Preferred — activates the docker group for the command without sudo:
+sg docker -c 'docker ps'
+
+# Alternative — sudo works via wheel group membership:
+sudo docker ps
+```
+
+When running docker compose, wrap the entire invocation:
+
+```bash
+sg docker -c 'docker compose up -d --build'
+```
+
+### Current container state
+
+A standalone pgvector container is running for local development:
+
+| Container           | Image                    | Port mapping      | Purpose                        |
+|---------------------|--------------------------|--------------------|--------------------------------|
+| `engram-pg-debug`   | `pgvector/pgvector:pg16` | `5433 → 5432/tcp`  | Local dev DB (not Compose-managed) |
+
+This container is NOT started by `docker compose` — it was created with `docker
+run`. It has no restart policy. It uses credentials `engram`/`engram` (owner)
+and `engram_app`/`engram_app` (app role), matching `.env`.
+
+There is no `engram-service` container running. The full Compose stack (postgres
++ engram-service) is not currently deployed locally — see "Running the stack"
+below.
+
+### Available images
+
+- `pgvector/pgvector:pg16` — Postgres 16 + pgvector (used by Compose and the
+  debug container)
+- `engram-engram-test:latest` — CI image (Dockerfile `ci` target)
+- `python:3.12-slim` — base image for the Engram service
+
+### Dockerfile — multi-stage
+
+The Dockerfile has three stages:
+
+| Stage      | Purpose                                              | CMD                                        |
+|------------|------------------------------------------------------|--------------------------------------------|
+| `base`     | Shared foundation (deps, source copy)               | —                                          |
+| `runtime`  | Production service image                            | `uvicorn engram.api.app:app` on port 8000  |
+| `ci`       | Test image — installs all dev deps + SDK + adapters | `python scripts/run_ci.py`                 |
+
+The final stage in the Dockerfile is `ci` (runs tests, not the server). Always
+specify the correct `target:` — `docker-compose.yml` uses `target: runtime`,
+`docker-compose.ci.yml` uses `target: ci`. If you build without a target, you
+get the CI image.
+
+### Docker Compose files
+
+| File                     | Purpose                          | Services                                |
+|--------------------------|----------------------------------|-----------------------------------------|
+| `docker-compose.yml`     | Self-host / production deployment| `postgres`, `engram-service`            |
+| `docker-compose.ci.yml`  | CI verification (real DB)        | `postgres`, `engram-test`               |
+
+Both use `pgvector/pgvector:pg16` for Postgres. The deployment compose file
+exposes Postgres on `5432:5432`; the CI compose file does not expose ports
+(tests run inside the network).
+
+### Running the stack (docker-compose.yml)
+
+```bash
+# Start both services (builds the engram-service image):
+sg docker -c 'docker compose up -d --build'
+
+# Check health:
+sg docker -c 'docker compose ps'
+curl http://localhost:8000/ready
+
+# View logs:
+sg docker -c 'docker compose logs -f engram-service'
+
+# Stop:
+sg docker -c 'docker compose down'
+
+# Stop and destroy the DB volume (DESTRUCTIVE — loses all data):
+sg docker -c 'docker compose down -v'
+```
+
+The service is reachable at `http://localhost:8000`. On first boot (empty data
+volume) Postgres runs all migrations in `migrations/` via
+`docker-entrypoint-initdb.d`.
+
+### Running CI tests via Docker (docker-compose.ci.yml)
+
+```bash
+# Build and run the full CI suite against a real pgvector database:
+sg docker -c 'docker compose -f docker-compose.ci.yml up --build --abort-on-container-error'
+
+# Tear down after:
+sg docker -c 'docker compose -f docker-compose.ci.yml down -v'
+```
+
+This verifies migrations, RLS enforcement, and runs the root test suites plus
+SDK and MCP adapter coverage inside containers.
+
+### Executing commands inside the service container
+
+```bash
+# Run a CLI command (e.g., init-db, bootstrap-key, worker):
+sg docker -c 'docker compose exec engram-service engram init-db'
+sg docker -c 'docker compose exec engram-service engram bootstrap-key'
+sg docker -c 'docker compose exec engram-service engram worker --poll-interval 2'
+
+# Open a psql session in the Postgres container:
+sg docker -c 'docker compose exec postgres psql -U engram -d engram'
+```
+
+### Connecting to the dev database directly
+
+The `engram-pg-debug` container maps Postgres to **port 5433** on the host.
+There are no `psql` / `pg_isready` / `pg_dump` client tools installed on this
+host — use `docker exec`:
+
+```bash
+# psql against the debug container:
+sg docker -c 'docker exec -it engram-pg-debug psql -U engram -d engram'
+
+# Against the compose-managed Postgres (when the stack is up):
+sg docker -c 'docker compose exec postgres psql -U engram -d engram'
+```
+
+For local Python dev against the debug container, set the database URL to port
+5433 (these are commented out in `.env` — uncomment or pass inline):
+
+```bash
+export ENGRAM_DATABASE_URL='postgresql+asyncpg://engram_app:engram_app@localhost:5433/engram'
+export ENGRAM_OWNER_DATABASE_URL='postgresql+asyncpg://engram:engram@localhost:5433/engram'
+```
+
+## Local Python development
+
+A `.venv` already exists in the repo root (Python 3.14.6). The project uses
+`uv` for dependency management (install it if missing: `pacman -S uv` or
+`curl -LsSf https://astral.sh/uv/install.sh | sh`).
+
+### Initial setup
+
+```bash
+# Install dependencies (creates .venv if missing, installs dev deps):
+uv sync --extra dev
+
+# Install sibling packages (SDK + adapters) in editable mode:
+bash scripts/setup-python-dev.sh
+```
+
+### Running checks locally
+
+The Makefile wraps all three checks:
+
+```bash
+make check        # runs: lint (ruff) + typecheck (mypy) + test (pytest)
+make lint         # ruff only
+make typecheck    # mypy only
+make test         # pytest only
+```
+
+All Makefile targets use `.venv/bin/` executables — they do not need `uv` at
+runtime once the venv is bootstrapped.
+
+### Running the service locally (without Docker)
+
+```bash
+# Ensure the DB env vars point at a running Postgres (see .env):
+#   ENGRAM_DATABASE_URL       -> app role (RLS-enforced)
+#   ENGRAM_OWNER_DATABASE_URL -> owner role (migrations/admin)
+# For the debug container on port 5433, uncomment the URLs in .env or set them
+# inline as shown in the Docker section above.
+
+# Apply migrations (uses owner role):
+.venv/bin/engram init-db
+
+# Start the API server:
+.venv/bin/engram serve
+# Or directly:
+.venv/bin/uvicorn engram.api.app:app --reload
+```
+
+### Local PostgreSQL client tools
+
+There are no `psql`, `pg_isready`, or `pg_dump` binaries on this host. For any
+Postgres CLI work, use `docker exec` against a running Postgres container (see
+"Connecting to the dev database directly" above).
+
 ## Code conventions
 
 ### Models and types

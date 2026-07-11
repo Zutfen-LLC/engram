@@ -230,6 +230,13 @@ Every recalled item includes a `reasons` array explaining why it was included.
 
 Anti-feedback-loop guardrails prevent the same memories from permanently dominating recall without useful feedback.
 
+Feedback is canonical per principal and item: identical retries are unchanged,
+while changing `useful`/`noise` appends a replacement and preserves the prior
+row as history. Accepted first verdicts and changes are limited per principal
+per UTC day by `tenant_config.feedback_daily_limit` (default 500); exhaustion
+returns `429` and `Retry-After`. Optional `recall_log_id` attribution is accepted
+only when the caller owns that recall and the item was actually surfaced.
+
 #### Semantic recall & search ranking
 
 Semantic recall (`mode=semantic`) and semantic/hybrid search rank results by a deterministic trust-weighted score (`scoring_version = semantic-v2`), not pure cosine distance:
