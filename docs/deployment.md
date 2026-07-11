@@ -563,3 +563,14 @@ applies to the owner too, and only superusers / `BYPASSRLS` roles bypass it.
 - [ ] `deploy/backup.sh` scheduled with off-host/durable `BACKUP_DIR`
 - [ ] A restore smoke test performed against a backup
 - [ ] Embeddings enabled (if semantic recall is required)
+## Feedback integrity and rate limit
+
+Feedback is transactionally canonicalized: each principal has one current
+verdict per item while superseded verdicts remain as history. Each active
+tenant configuration has `feedback_daily_limit` (default `500`, range
+1–100000), counted per principal over UTC calendar days. The database locks
+the item and then the principal, so the limit and importance contribution stay
+correct across processes and across multiple API keys. Exhaustion returns
+HTTP `429` with `Retry-After` set to the next UTC midnight. This setting is
+currently managed directly in versioned `tenant_config`; there is no public
+configuration endpoint.

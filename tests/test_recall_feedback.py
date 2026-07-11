@@ -6,6 +6,7 @@ They skip automatically when no DB is reachable.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 import pytest
@@ -94,6 +95,7 @@ async def _clean_db():
         await conn.execute(text("DELETE FROM feedback_events"))
         await conn.execute(text("DELETE FROM memory_embeddings"))
         await conn.execute(text("DELETE FROM memory_items"))
+        await conn.execute(text("UPDATE tenant_config SET feedback_daily_limit = 500"))
 
 
 async def _create_item(client, content: str, **overrides) -> dict:
@@ -227,3 +229,67 @@ async def test_feedback_invalid_verdict_returns_422(client):
         json={"item_id": item["id"], "feedback": "invalid"},
     )
     assert resp.status_code == 422
+
+
+async def test_concurrent_identical_feedback_is_one_contribution(client):
+    """Item locking makes concurrent retry storms canonical and idempotent."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    item = await _create_item(client, "Concurrent identical feedback", importance=0.5)
+    responses = await asyncio.gather(
+        *(
+            client.post(
+                "/v1/feedback", json={"item_id": item["id"], "feedback": "useful"}
+            )
+            for _ in range(8)
+        )
+    )
+    assert [response.status_code for response in responses].count(201) == 1
+    assert [response.status_code for response in responses].count(200) == 7
+    async with _test_session_factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT count(*) AS events, "
+                    "count(*) FILTER (WHERE superseded_at IS NULL) AS current "
+                    "FROM feedback_events WHERE item_id = :iid"
+                ),
+                {"iid": item["id"]},
+            )
+        ).one()
+        importance = await session.scalar(
+            text("SELECT importance FROM memory_items WHERE id = :iid"), {"iid": item["id"]}
+        )
+    assert row.events == row.current == 1
+    assert importance == pytest.approx(0.55)
+
+
+async def test_concurrent_feedback_cannot_exceed_daily_limit(client):
+    """Principal-row locking makes count+insert safe across simultaneous items."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    async with _test_engine.begin() as conn:
+        await conn.execute(text("UPDATE tenant_config SET feedback_daily_limit = 5"))
+    items = [
+        await _create_item(client, f"Concurrent rate item {index}", importance=0.5)
+        for index in range(10)
+    ]
+    responses = await asyncio.gather(
+        *(
+            client.post(
+                "/v1/feedback", json={"item_id": item["id"], "feedback": "useful"}
+            )
+            for item in items
+        )
+    )
+    assert [response.status_code for response in responses].count(201) == 5
+    limited = [response for response in responses if response.status_code == 429]
+    assert len(limited) == 5
+    assert all(response.headers.get("Retry-After") for response in limited)
+    async with _test_session_factory() as session:
+        event_count = await session.scalar(text("SELECT count(*) FROM feedback_events"))
+        changed_count = await session.scalar(
+            text("SELECT count(*) FROM memory_items WHERE importance > 0.5")
+        )
+    assert event_count == 5
+    assert changed_count == 5

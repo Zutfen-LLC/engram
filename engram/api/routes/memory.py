@@ -12,7 +12,8 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, insert, select, text, update
 from sqlalchemy.exc import IntegrityError
@@ -27,11 +28,17 @@ from engram.config import settings
 from engram.conflicts import authority_allows_supersession
 from engram.db import get_session
 from engram.embeddings import create_embedding_placeholder, generate_embedding
+from engram.feedback import (
+    FeedbackRateLimitError,
+    FeedbackResult,
+    RecallLogItemMismatchError,
+    RecallLogNotFoundError,
+    record_feedback,
+)
 from engram.jobs import enqueue_job
 from engram.memory_access import eligibility_sql, resolve_workspace_scope, tenant_sql
 from engram.memory_kinds import UnknownMemoryKindError, require_enabled_memory_kind
 from engram.models import (
-    FeedbackEvent,
     ItemEvent,
     MemoryItem,
     TenantConfig,
@@ -127,6 +134,16 @@ class FeedbackRequest(BaseModel):
     item_id: UUID
     feedback: Literal["useful", "noise"]
     recall_log_id: UUID | None = None
+
+
+class FeedbackResponse(BaseModel):
+    status: Literal["recorded", "updated", "unchanged"]
+    item_id: UUID
+    feedback: Literal["useful", "noise"]
+    previous_feedback: Literal["useful", "noise"] | None = None
+    feedback_event_id: UUID
+    importance: float
+    startup_recall_count: int
 
 
 # ---- Trust model helpers ----
@@ -879,90 +896,67 @@ async def search(
 
 
 @router.post(
-    "/feedback", response_model=None, status_code=201, dependencies=[Depends(WRITE_SCOPE)]
+    "/feedback",
+    response_model=FeedbackResponse,
+    status_code=201,
+    responses={
+        200: {"model": FeedbackResponse, "description": "Verdict updated or unchanged"},
+        429: {"description": "Daily feedback limit exceeded"},
+    },
+    dependencies=[Depends(WRITE_SCOPE)],
 )
 async def feedback(
     req: FeedbackRequest,
+    response: Response,
     session: AsyncSession = Depends(get_session),  # noqa: B008
-) -> dict[str, Any]:
-    """Record feedback on a recalled item.
-
-    Useful feedback incrementally raises importance (capped at 0.95);
-    noise lowers it (floor at 0.1). Feedback authority weighting:
-    - user/admin: full weight (resets penalty counter, adjusts importance)
-    - agent on own memories: zero penalty-reset weight
-    - agent on other agent's memories: partial weight (0.5x) on importance
-    """
+) -> FeedbackResponse | JSONResponse:
+    """Record or replace the caller's canonical verdict on an eligible item."""
     tenant_id = await _resolve_tenant_id(session)
     principal_id, principal_type = await _resolve_principal(session, tenant_id)
 
     # Missing and caller-ineligible items deliberately share the same response.
     item = await _fetch_readable_item(
-        session, req.item_id, tenant_id=tenant_id, principal_id=principal_id
+        session,
+        req.item_id,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        for_update=True,
     )
     if item is None:
         raise HTTPException(status_code=404, detail="Item not found")
 
-    # Determine authority
-    is_own_memory = str(item["principal_id"]) == str(principal_id)
-    is_user_or_admin = principal_type in ("user", "admin")
-
-    # Log the feedback event
-    session.add(
-        FeedbackEvent(
-            tenant_id=tenant_id,
-            item_id=req.item_id,
-            principal_id=principal_id,
+    try:
+        result: FeedbackResult = await record_feedback(
+            session,
+            tenant_id=UUID(str(tenant_id)),
+            principal_id=UUID(str(principal_id)),
+            principal_type=principal_type,
+            item=item,
             verdict=req.feedback,
             recall_log_id=req.recall_log_id,
         )
-    )
-
-    if req.feedback == "useful":
-        if is_user_or_admin:
-            # Full weight: reset penalty counter, raise importance
-            await session.execute(
-                update(MemoryItem)
-                .where(MemoryItem.id == req.item_id)
-                .values(
-                    startup_recall_count=0,
-                    importance=func.least(func.greatest(item["importance"] + 0.05, 0.1), 0.95),
-                )
-            )
-        elif not is_own_memory:
-            # Agent on another agent's memory: partial weight (0.5x)
-            await session.execute(
-                update(MemoryItem)
-                .where(MemoryItem.id == req.item_id)
-                .values(
-                    importance=func.least(func.greatest(item["importance"] + 0.025, 0.1), 0.95),
-                )
-            )
-        # Agent on own memory: no-op for importance/penalty
-    else:  # noise
-        if is_user_or_admin:
-            # Full weight: lower importance
-            await session.execute(
-                update(MemoryItem)
-                .where(MemoryItem.id == req.item_id)
-                .values(
-                    importance=func.least(func.greatest(item["importance"] - 0.1, 0.1), 0.95),
-                )
-            )
-        elif not is_own_memory:
-            # Agent on another agent's memory: partial weight
-            await session.execute(
-                update(MemoryItem)
-                .where(MemoryItem.id == req.item_id)
-                .values(
-                    importance=func.least(func.greatest(item["importance"] - 0.05, 0.1), 0.95),
-                )
-            )
-        # Agent on own memory: no-op for importance
-
-    await session.commit()
-
-    return {"status": "recorded", "feedback": req.feedback, "item_id": str(req.item_id)}
+    except RecallLogNotFoundError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=404, detail="Recall log not found") from exc
+    except RecallLogItemMismatchError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=422, detail="Recall log did not contain item") from exc
+    except FeedbackRateLimitError as exc:
+        await session.rollback()
+        seconds = max(1, int((exc.reset_at - datetime.now(UTC)).total_seconds()))
+        reset_at = exc.reset_at.isoformat().replace("+00:00", "Z")
+        return JSONResponse(
+            status_code=429,
+            content={
+                "detail": "Daily feedback limit exceeded",
+                "limit": exc.limit,
+                "reset_at": reset_at,
+            },
+            headers={"Retry-After": str(seconds)},
+        )
+    if result.status != "recorded":
+        response.status_code = 200
+    return FeedbackResponse(**result.__dict__)
 
 
 class ItemMetadataPatchRequest(BaseModel):

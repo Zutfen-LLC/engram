@@ -507,6 +507,7 @@ class TenantConfig(Base):
     stale_after_days: Mapped[int] = mapped_column(Integer, default=90)
     startup_recall_penalty_threshold: Mapped[int] = mapped_column(Integer, default=5)
     startup_recall_penalty_factor: Mapped[float] = mapped_column(Float, default=0.5)
+    feedback_daily_limit: Mapped[int] = mapped_column(Integer, default=500)
 
     # Source trust defaults
     trust_manual_user: Mapped[float] = mapped_column(Float, default=0.9)
@@ -566,6 +567,10 @@ class FeedbackEvent(Base):
     verdict: Mapped[str] = mapped_column(String(10), nullable=False)  # useful | noise
     recall_log_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("recall_logs.id", ondelete="SET NULL"), nullable=True
+    )
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    replaces_feedback_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("feedback_events.id", ondelete="SET NULL"), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False

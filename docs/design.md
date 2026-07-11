@@ -280,8 +280,9 @@ list — every gate below is enforced, not aspirational):
 * No dispute event from another principal (`engram.promotion.has_external_dispute_event`) —
   either an `item_events` row with `event_type='review_change'`,
   `field_name='review_status'`, `new_value='disputed'` whose actor is not the
-  item's own principal, or a `feedback_events` row with `verdict='noise'`
-  recorded by another principal. The item's own creator disputing or giving
+  item's own principal, or a **current** (`superseded_at IS NULL`)
+  `feedback_events` row with `verdict='noise'` recorded by another principal.
+  Superseded historical noise no longer blocks Path A. The item's own creator disputing or giving
   negative feedback on their own item does **not** block promotion — only an
   external signal does.
 * A **promotion-time conflict recheck** against currently-active memories
@@ -332,7 +333,7 @@ existing `skipped_confidence` / `skipped_age` / `skipped_conflict` /
 #### Path B — Usage-validated quorum
 
 * `review_status = 'proposed'`
-* 2+ distinct non-author principals have marked the item useful via `/v1/feedback`
+* 2+ distinct non-author principals have a current useful verdict via `/v1/feedback`
 * No dispute events
 
 Usage-validated promotion means a memory that multiple agents independently found useful has earned activation — a stronger signal than aging quietly.
@@ -528,7 +529,16 @@ To prevent over-punishment in autonomous fleets where humans rarely review:
 
 An invariant recalled 500 times should never score below a random observation.
 
-### Feedback authority weighting
+### Canonical feedback and authority weighting
+
+`POST /v1/feedback` maintains at most one current verdict per principal and
+item. Rows are append-preserved history: changing a verdict supersedes the old
+row and links the replacement, while repeating the current verdict returns an
+idempotent `unchanged` success and neither mutates the item nor consumes rate
+allowance. A replacement applies `new contribution - old contribution`, so a
+principal has exactly one bounded contribution. Importance uses a live-column
+database expression and the event transition, importance change, and optional
+penalty reset commit atomically.
 
 To prevent agents from self-entrenching their own memories, feedback is weighted by principal authority:
 
@@ -536,9 +546,24 @@ To prevent agents from self-entrenching their own memories, feedback is weighted
 * `admin` feedback: full weight
 * `agent` feedback on own memories: zero weight on penalty reset
 * `agent` feedback on another agent's memories: partial weight on importance
-* 2+ distinct non-author agents together count as a partial reset
-
 Only `user` or `admin` feedback fully resets the `startup_recall_count` penalty counter.
+
+Accepted first verdicts and changes are limited per authenticated principal
+across the tenant to `tenant_config.feedback_daily_limit` per UTC calendar day
+(default `500`, allowed range 1–100000). The principal row serializes counting
+and insertion across workers and API keys. Exhaustion returns `429` with
+`Retry-After` until the next UTC midnight. Administrators are not exempt.
+
+`recall_log_id` is optional. When present, it must name a recall owned by the
+same tenant and authenticated principal and its `item_ids` must contain the
+feedback item. Missing or foreign logs return non-disclosing `404`; an owned
+log that cannot establish item inclusion returns `422`.
+
+Path B remains unimplemented. Its future quorum must count distinct non-author
+principals only over current useful rows (`superseded_at IS NULL`); historical
+and superseded useful rows do not count, and rate limiting does not grant
+authority. Migration 011 canonicalizes duplicate history by `(created_at, id)`
+without recomputing historical importance.
 
 ### Recall explanations
 

@@ -57,6 +57,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from engram.auth import INTERNAL_DISPLAY_NAME_PREFIX
 from engram.config import settings
 from engram.conflicts import PromotionConflictCheck, check_promotion_conflict
+from engram.feedback import current_feedback_predicate
 from engram.models import FeedbackEvent, ItemEvent, MemoryItem, TenantConfig
 from engram.review_policy import TrustedReviewOperation, evaluate_transition
 
@@ -318,6 +319,7 @@ async def has_external_dispute_event(session: AsyncSession, item: MemoryItem) ->
             .where(
                 FeedbackEvent.item_id == item.id,
                 FeedbackEvent.verdict == "noise",
+                current_feedback_predicate(),
                 FeedbackEvent.principal_id != item.principal_id,
             )
             .limit(1)
