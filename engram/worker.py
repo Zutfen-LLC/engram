@@ -393,7 +393,15 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
             old_value=None,
             new_value=str(result.existing_item_id),
             actor_principal_id=item.principal_id,
-            reason=f"auto-supersede of {result.existing_item_id}: {result.reason}",
+            reason=json.dumps(
+                {
+                    "action": action.value,
+                    "existing_item_id": str(result.existing_item_id),
+                    "reason": result.reason,
+                    **result.provenance,
+                },
+                sort_keys=True,
+            ),
         )
         await session.execute(
             update(MemoryItem)
@@ -420,6 +428,7 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
         "similarity": result.similarity,
         "existing_item_id": str(result.existing_item_id),
         "reason": result.reason,
+        **result.provenance,
     }
     await _insert_event(
         session,

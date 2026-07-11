@@ -371,6 +371,7 @@ This allows agents to rediscover their own observations without treating them as
 | Field                   | What it means                              | Example                                   |
 | ----------------------- | ------------------------------------------ | ----------------------------------------- |
 | `source_trust`          | Trust in where this came from              | User said it = 0.9; agent guessed = 0.4   |
+| `authority`             | Fixed governance ordinal from provenance   | Explicit user = 50; inferred = 10         |
 | `memory_confidence`     | Overall confidence this memory is accurate | Verified fact = 0.95; LLM inference = 0.6 |
 | `extraction_confidence` | Confidence of the extraction process       | Direct quote = 0.9; LLM summary = 0.5     |
 | `human_verified`        | A human has confirmed this is true         | Boolean                                   |
@@ -384,9 +385,12 @@ Trust is not binary. It is layered so that Engram can distinguish between:
 * whether a human verified it
 * whether it has been challenged or superseded
 
-### Source trust defaults
+### Source trust and stable authority
 
-Source trust is calculated from both `source_type` and the principal's type. `memory_confidence` defaults track `source_trust` defaults so auto-promotion works in Phase 1A without LLM classification. LLM classification in Phase 1B refines `memory_confidence` per item. In Phase 1A, the defaults below are used.
+`source_trust` is a tenant-configurable recall-scoring signal. `authority` is a fixed,
+immutable governance ordinal derived at write time from source type and authenticated writer.
+Changing trust configuration, confidence, review state, verification, feedback, or promotion never
+changes authority. A cloned replacement preserves it.
 
 | source_type    | principal.type | Authority      | Default source_trust | Default memory_confidence | Default review_status |
 | -------------- | -------------- | -------------- | -------------------- | ------------------------- | --------------------- |
@@ -398,6 +402,16 @@ Source trust is calculated from both `source_type` and the principal's type. `me
 | `extraction`   | `agent`        | inferred       | 0.5                  | 0.5                       | `proposed`            |
 | `sync_turn`    | `agent`        | inferred       | 0.4                  | 0.4                       | `proposed`            |
 | `pre_compress` | `agent`        | inferred       | 0.3                  | 0.3                       | `proposed`            |
+
+The complete fixed authority mapping is:
+
+| source_type | principal.type | authority |
+| --- | --- | ---: |
+| `manual` | `user`, `admin` | `explicit_user` (50) |
+| `manual` | `agent`, `system` | `trusted_agent` (30) |
+| `import`, `migration` | `user`, `admin`, `system` | `trusted_import` (40) |
+| `import`, `migration` | `agent` | `untrusted_agent` (20) |
+| `extraction`, `sync_turn`, `pre_compress`, `session_end` | any supported type | `inferred` (10) |
 
 `sync_turn` and `pre_compress` have confidence below the default 0.7 auto-promotion threshold. They stay `proposed` until LLM classification or human review raises their confidence, or until a quorum of 2+ distinct non-author principals marks the item useful via `/v1/feedback`.
 
@@ -416,6 +430,14 @@ explicit_user > trusted_import > trusted_agent > untrusted_agent > inferred
 ```
 
 A lower-authority source can never silently replace a higher-authority memory.
+Equal-or-higher authority may supersede. Automatic conflict supersession additionally requires
+authority of at least `trusted_import` (40) and classifier confidence of at least 0.8. A
+lower-authority singleton write is retained as `proposed` with an unresolved `scope_overlap`; the
+higher-authority item remains current.
+
+Migration 012 backfills authority from each historical row's stored `source_type` and owning
+principal type. Delegated caller identity was not historically persisted, so this is deterministic
+but cannot reconstruct a different original caller; malformed combinations fall back to inferred.
 
 Examples:
 

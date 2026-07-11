@@ -21,11 +21,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram import semantic
 from engram.auth import READ_SCOPE, WRITE_SCOPE
+from engram.authority import authority_allows_supersession, authority_label, derive_memory_authority
 from engram.canonicalize import canonicalize, content_hash
 from engram.classification import ClassificationResult, classify_rules_only
 from engram.classification_trust import blend_memory_confidence, narrow_visibility
 from engram.config import settings
-from engram.conflicts import authority_allows_supersession
 from engram.db import get_session
 from engram.embeddings import create_embedding_placeholder, generate_embedding
 from engram.feedback import (
@@ -54,7 +54,9 @@ _ACTIVE_SOURCES = {"manual", "import", "migration"}
 
 # ---- Request/response models ----
 
-SourceKind = Literal["manual", "import", "migration", "extraction", "sync_turn", "pre_compress"]
+SourceKind = Literal[
+    "manual", "import", "migration", "extraction", "sync_turn", "pre_compress", "session_end"
+]
 PrincipalKind = Literal["user", "agent", "system", "admin"]
 SensitivityKind = Literal["normal", "sensitive", "restricted"]
 
@@ -281,7 +283,8 @@ async def _check_supersession(
     subject_id: str | None,
     *,
     singleton: bool,
-) -> UUID | None:
+    new_authority: int,
+) -> tuple[UUID | None, dict[str, Any] | None]:
     """For singleton kinds (memory_kinds.singleton), find an existing active
     item with the same family key and return its ID for supersession.
 
@@ -290,10 +293,10 @@ async def _check_supersession(
     rather than a hard-coded kind-name set.
     """
     if not singleton:
-        return None
+        return None, None
 
     stmt = (
-        select(MemoryItem.id)
+        select(MemoryItem.id, MemoryItem.authority)
         .where(
             MemoryItem.tenant_id == tenant_id,
             MemoryItem.principal_id == principal_id,
@@ -303,6 +306,7 @@ async def _check_supersession(
         )
         .order_by(MemoryItem.created_at.desc())
         .limit(1)
+        .with_for_update()
     )
     if workspace_id is None:
         stmt = stmt.where(MemoryItem.workspace_id.is_(None))
@@ -314,7 +318,15 @@ async def _check_supersession(
         stmt = stmt.where(MemoryItem.subject_id == subject_id)
 
     result = await session.execute(stmt)
-    return result.scalar_one_or_none()
+    row = result.mappings().one_or_none()
+    if row is None:
+        return None, None
+    existing = {"id": row["id"], "authority": int(row["authority"])}
+    if authority_allows_supersession(
+        new_authority=new_authority, old_authority=existing["authority"]
+    ):
+        return UUID(str(existing["id"])), None
+    return None, existing
 
 
 _SEARCH_HELPFUL_MESSAGE = (
@@ -531,6 +543,9 @@ async def remember(
     source_trust, memory_confidence, review_status = await _resolve_trust_defaults(
         session, tenant_id, req.source_type, principal_type
     )
+    authority = derive_memory_authority(
+        source_type=req.source_type, principal_type=principal_type
+    )
     # The kind's governance flag decides whether a write must begin as
     # proposed — regardless of whether the kind came from an explicit request
     # or the classifier (generalizes the old classifier-only
@@ -560,7 +575,7 @@ async def remember(
         )
 
     # 5. Supersession check for singleton kinds.
-    superseded_id = await _check_supersession(
+    superseded_id, withheld_singleton = await _check_supersession(
         session,
         tenant_id,
         workspace_id,
@@ -569,7 +584,10 @@ async def remember(
         req.subject_type,
         req.subject_id,
         singleton=kind_row.singleton,
+        new_authority=authority,
     )
+    if withheld_singleton is not None:
+        review_status = "proposed"
 
     # 6. Build the memory item.
     item = MemoryItem(
@@ -588,12 +606,18 @@ async def remember(
         review_status=review_status,
         memory_confidence=memory_confidence,
         source_trust=source_trust,
+        authority=authority,
         importance=req.importance,
         source_type=req.source_type,
         source_session=req.source_session,
         sensitivity=req.sensitivity,
         external_id=req.external_id,
         external_source=req.external_source,
+        conflicts_with_item_id=(
+            withheld_singleton["id"] if withheld_singleton is not None else None
+        ),
+        conflict_type="scope_overlap" if withheld_singleton is not None else None,
+        conflict_resolution_status="unresolved" if withheld_singleton is not None else None,
     )
 
     session.add(item)
@@ -647,6 +671,8 @@ async def remember(
         # classifier did not run and these are the untouched request/defaults).
         "source_type": req.source_type,
         "source_trust": source_trust,
+        "authority": int(authority),
+        "authority_label": authority_label(authority),
         "default_memory_confidence": default_confidence,
         "final_memory_confidence": memory_confidence,
         "memory_confidence_blended": memory_confidence_blended,
@@ -675,6 +701,29 @@ async def remember(
             reason=reason,
         )
     )
+    if withheld_singleton is not None:
+        old_authority = int(withheld_singleton["authority"])
+        session.add(
+            ItemEvent(
+                item_id=item.id,
+                event_type="conflict_detected",
+                field_name="conflicts_with_item_id",
+                old_value=None,
+                new_value=json.dumps(
+                    {
+                        "existing_item_id": str(withheld_singleton["id"]),
+                        "existing_authority": old_authority,
+                        "existing_authority_label": authority_label(old_authority),
+                        "new_authority": int(authority),
+                        "new_authority_label": authority_label(authority),
+                        "reason": "singleton supersession withheld by authority",
+                    },
+                    sort_keys=True,
+                ),
+                actor_principal_id=principal_id,
+                reason="lower-authority singleton candidate preserved for review",
+            )
+        )
 
     # 8. If supersession applies, mark the old item.
     if superseded_id is not None:
@@ -924,7 +973,6 @@ async def feedback(
     )
     if item is None:
         raise HTTPException(status_code=404, detail="Item not found")
-
     try:
         result: FeedbackResult = await record_feedback(
             session,
@@ -1319,6 +1367,7 @@ async def get_item(
     )
     if item is None:
         raise HTTPException(status_code=404, detail="Item not found")
+    item["authority_label"] = authority_label(int(item["authority"]))
     events = await _fetch_events(session, item_id)
     kg_facts = await _fetch_kg_facts(session, item_id)
     return {
@@ -1428,8 +1477,8 @@ async def supersede_item(
     #    by default authority is equal and the gate passes — but it is present
     #    structurally so a future divergent-authority supersede is enforced.
     if not authority_allows_supersession(
-        new_trust=float(item["source_trust"]),
-        old_trust=float(item["source_trust"]),
+        new_authority=int(item["authority"]),
+        old_authority=int(item["authority"]),
     ):
         raise HTTPException(
             status_code=403,

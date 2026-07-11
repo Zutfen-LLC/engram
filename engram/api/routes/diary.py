@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.auth import READ_SCOPE, WRITE_SCOPE
+from engram.authority import derive_memory_authority
 from engram.canonicalize import canonicalize, content_hash
 from engram.db import get_session
 from engram.models import MemoryItem, Principal
@@ -132,8 +133,11 @@ async def write_diary(
     caller_row = await session.execute(
         select(Principal.type).where(Principal.id == caller_id)
     )
-    caller_type = caller_row.scalar_one_or_none() or "agent"
+    caller_type = caller_row.scalar_one_or_none()
+    if caller_type is None:
+        raise HTTPException(status_code=403, detail="caller principal not found")
     review_status = "active" if caller_type in ("user", "admin", "system") else "proposed"
+    source_type = "manual" if caller_type in ("user", "admin") else "extraction"
 
     # Topic is stored in subject_name (subject_type stays NULL — the DB CHECK
     # constraint limits subject_type to a fixed vocabulary and "topic" isn't
@@ -155,7 +159,10 @@ async def write_diary(
         memory_confidence=0.7,
         source_trust=0.7 if caller_type in ("user", "admin", "system") else 0.5,
         importance=0.4,
-        source_type="manual" if caller_type in ("user", "admin") else "extraction",
+        source_type=source_type,
+        authority=derive_memory_authority(
+            source_type=source_type, principal_type=str(caller_type)
+        ),
         sensitivity="normal",
     )
     session.add(item)

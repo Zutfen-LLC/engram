@@ -11,6 +11,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.auth import READ_SCOPE, WRITE_SCOPE
+from engram.authority import MemoryAuthority
 from engram.db import get_session
 from engram.memory_access import apply_read_eligibility
 from engram.models import KgTriple, MemoryItem
@@ -162,6 +163,7 @@ async def add_triple(
             source_trust=0.5,
             importance=0.5,
             source_type="extraction",
+            authority=MemoryAuthority.INFERRED,
             sensitivity="normal",
         )
         session.add(item)
