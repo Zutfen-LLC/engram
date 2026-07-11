@@ -146,12 +146,19 @@ async def _clean_db():
         return
     # Remove any tenants created by tests (e.g. tenant B in isolation test),
     # cascading to their items/config/principals. Keep the seeded default tenant.
+    # item_events must be deleted before tenants: item_events.actor_principal_id
+    # -> principals has no ON DELETE CASCADE, and a single cascading
+    # `DELETE FROM tenants` fires the principals cascade before the
+    # memory_items -> item_events cascade in FK-creation order, so deleting
+    # tenants first raises a spurious FK violation whenever any tenant (from
+    # this file or a prior test module, since cleanup only runs before each
+    # test) has an item with an event.
     async with _test_engine.begin() as conn:
+        await conn.execute(text("DELETE FROM item_events"))
+        await conn.execute(text("DELETE FROM memory_items"))
         await conn.execute(
             text("DELETE FROM tenants WHERE slug != 'default'")
         )
-        await conn.execute(text("DELETE FROM item_events"))
-        await conn.execute(text("DELETE FROM memory_items"))
     # Reset the default tenant's config to migration defaults between tests.
     async with _test_engine.begin() as conn:
         await conn.execute(

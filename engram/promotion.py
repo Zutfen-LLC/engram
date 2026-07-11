@@ -63,6 +63,39 @@ from engram.review_policy import TrustedReviewOperation, evaluate_transition
 _FALLBACK_CONFIDENCE_THRESHOLD = 0.7
 _FALLBACK_MIN_AGE_HOURS = 72
 
+# Deterministic, per-tenant name for the trusted system principal that owns
+# every trusted-internal review event this module writes (Path A promotion,
+# promotion-time conflict recheck). Never the memory author — see
+# resolve_trusted_system_actor.
+TRUSTED_SYSTEM_PRINCIPAL_NAME = "system"
+
+_UPSERT_SYSTEM_PRINCIPAL = text(
+    "INSERT INTO principals (tenant_id, name, type) "
+    "VALUES (:tenant_id, :name, 'system') "
+    "ON CONFLICT (tenant_id, name) DO UPDATE SET name = principals.name "
+    "RETURNING id"
+)
+
+
+async def resolve_trusted_system_actor(session: AsyncSession, tenant_id: str) -> uuid.UUID:
+    """Resolve this tenant's system principal, creating it on first use.
+
+    This is the sole ``item_events.actor_principal_id`` for trusted internal
+    review operations in this module — never the item's author, and never
+    selectable from any caller-facing request. ``principals.type`` already
+    permits ``'system'`` (migrations/001_init.sql), so no schema change is
+    needed; the (tenant_id, name) unique constraint makes the upsert an
+    atomic, concurrency-safe "get-or-create" in one round trip — concurrent
+    first use from multiple workers/requests cannot create duplicate rows or
+    raise a unique-violation, since ``ON CONFLICT ... DO UPDATE ... RETURNING``
+    always returns the single canonical row's id.
+    """
+    result = await session.execute(
+        _UPSERT_SYSTEM_PRINCIPAL,
+        {"tenant_id": str(tenant_id), "name": TRUSTED_SYSTEM_PRINCIPAL_NAME},
+    )
+    return uuid.UUID(str(result.scalar_one()))
+
 
 @dataclass
 class PromotionResult:
@@ -297,6 +330,13 @@ async def auto_promote_proposed_memories(
             continue
         to_promote.append(item)
 
+    # Trusted internal events (conflict recheck + promotion below) share one
+    # actor per invocation, resolved lazily so a scan with nothing to write
+    # never touches the principals table.
+    trusted_actor_id: uuid.UUID | None = None
+    if blocked_by_conflict or to_promote:
+        trusted_actor_id = await resolve_trusted_system_actor(session, tenant_id)
+
     if blocked_by_conflict:
         for item, check in blocked_by_conflict:
             old_conflict_status = item.conflict_resolution_status
@@ -315,7 +355,7 @@ async def auto_promote_proposed_memories(
                     field_name="conflict_resolution_status",
                     old_value=old_conflict_status,
                     new_value="unresolved",
-                    actor_principal_id=item.principal_id,
+                    actor_principal_id=trusted_actor_id,
                     reason=(
                         f"auto-promotion Path A conflict recheck ({source}): "
                         f"blocked by {check.verdict} against item "
@@ -357,7 +397,7 @@ async def auto_promote_proposed_memories(
                     field_name="review_status",
                     old_value="proposed",
                     new_value="active",
-                    actor_principal_id=item.principal_id,
+                    actor_principal_id=trusted_actor_id,
                     reason=reason,
                 )
             )
