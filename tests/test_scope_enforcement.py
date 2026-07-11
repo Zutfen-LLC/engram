@@ -68,17 +68,23 @@ async def _clean_db():
         return
     reset_principal_cache()
     async with _test_engine.begin() as conn:
-        # recall_logs/kg_triples.principal_id have no ON DELETE CASCADE, so
-        # they must be cleared before principals — otherwise a principal
-        # created by a recall/KG-add test in this module leaves a dangling
-        # FK-blocked row that fails the next test's cleanup.
+        # recall_logs/kg_triples/memory_items.principal_id have no ON DELETE
+        # CASCADE, so they must be cleared before principals — otherwise a
+        # principal created by a test in this module leaves a dangling
+        # FK-blocked row that fails the next test's cleanup. memory_items is
+        # deleted by principal ownership (a subquery against principals),
+        # not by a content-prefix filter: e.g. POST /v1/diary stores its
+        # `entry` field verbatim as memory_items.content, and
+        # test_write_scope_matrix posts entry="x" — a content-prefix filter
+        # misses that row entirely and leaves it dangling.
         await conn.execute(text("DELETE FROM item_events"))
         await conn.execute(text("DELETE FROM recall_logs"))
         await conn.execute(text("DELETE FROM kg_triples"))
         await conn.execute(
             text(
-                "DELETE FROM memory_items WHERE tenant_id = (SELECT id FROM tenants WHERE slug = 'default') "
-                f"AND content LIKE '{_NAME_PREFIX}%'"
+                "DELETE FROM memory_items WHERE principal_id IN ("
+                "SELECT id FROM principals WHERE tenant_id = (SELECT id FROM tenants WHERE slug = 'default') "
+                f"AND name LIKE '{_NAME_PREFIX}%')"
             )
         )
         await conn.execute(
