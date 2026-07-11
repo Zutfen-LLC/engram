@@ -786,6 +786,10 @@ async def test_review_scoped_human_privileged_transitions(monkeypatch: pytest.Mo
             )
         ).status_code == 200
 
+        # Disputing is classified as a `write`-level action (see
+        # review_policy._WRITE_PERMITTED_TRANSITIONS), not a `review`-level
+        # one — a review-only credential lacks `write` and is denied here,
+        # even though every review-gated transition above succeeded.
         to_dispute = await _insert_item(
             tenant_id=tenant_id,
             principal_id=user_id,
@@ -796,7 +800,7 @@ async def test_review_scoped_human_privileged_transitions(monkeypatch: pytest.Mo
             await client.post(
                 f"/v1/items/{to_dispute}/review", json={"review_status": "disputed"}, headers=h
             )
-        ).status_code == 200
+        ).status_code == 403
 
 
 async def test_review_scoped_agent_still_denied_by_principal_type(
@@ -826,6 +830,9 @@ async def test_review_scoped_agent_still_denied_by_principal_type(
         )
         assert resp.status_code == 403, resp.text
 
+        # Disputing needs `write` scope (see review_policy), which this
+        # review-only credential lacks — denied on the scope gate, before
+        # principal-type policy is ever consulted.
         to_dispute = await _insert_item(
             tenant_id=tenant_id,
             principal_id=agent_id,
@@ -835,7 +842,7 @@ async def test_review_scoped_agent_still_denied_by_principal_type(
         resp = await client.post(
             f"/v1/items/{to_dispute}/review", json={"review_status": "disputed"}, headers=h
         )
-        assert resp.status_code == 200, resp.text  # dispute is allowed for any principal type
+        assert resp.status_code == 403, resp.text
 
 
 async def test_write_and_review_user_can_do_both(monkeypatch: pytest.MonkeyPatch):
