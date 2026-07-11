@@ -17,7 +17,8 @@ from sqlalchemy.pool import NullPool
 
 from engram.api.app import create_app
 from engram.config import settings
-from engram.db import get_session
+from engram.db import apply_rls_context, get_session
+from engram.feedback import record_feedback
 
 _test_engine = create_async_engine(settings.database_url, poolclass=NullPool)
 _test_session_factory = async_sessionmaker(
@@ -41,16 +42,20 @@ async def _get_test_session() -> AsyncSession:
         from engram.db import _DEFAULT_PRINCIPAL_NAME, _DEFAULT_TENANT_SLUG
 
         row = (
-            await session.execute(
-                sa_text(
-                    "SELECT t.id::text AS tenant_id, p.id::text AS principal_id "
-                    "FROM tenants t "
-                    "JOIN principals p ON p.tenant_id = t.id AND p.name = :principal "
-                    "WHERE t.slug = :slug"
-                ),
-                {"slug": _DEFAULT_TENANT_SLUG, "principal": _DEFAULT_PRINCIPAL_NAME},
+            (
+                await session.execute(
+                    sa_text(
+                        "SELECT t.id::text AS tenant_id, p.id::text AS principal_id "
+                        "FROM tenants t "
+                        "JOIN principals p ON p.tenant_id = t.id AND p.name = :principal "
+                        "WHERE t.slug = :slug"
+                    ),
+                    {"slug": _DEFAULT_TENANT_SLUG, "principal": _DEFAULT_PRINCIPAL_NAME},
+                )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
         from engram.db import apply_rls_context
 
         await apply_rls_context(
@@ -104,6 +109,12 @@ async def _create_item(client, content: str, **overrides) -> dict:
     resp = await client.post("/v1/remember", json=payload)
     assert resp.status_code == 201
     return resp.json()
+
+
+async def _isolated_feedback_request(app, payload: dict) -> object:
+    """Submit feedback with an independent client and request/session lifecycle."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        return await ac.post("/v1/feedback", json=payload)
 
 
 # ---- Recall response includes reasons and warnings ----
@@ -231,21 +242,147 @@ async def test_feedback_invalid_verdict_returns_422(client):
     assert resp.status_code == 422
 
 
-async def test_concurrent_identical_feedback_is_one_contribution(client):
+async def test_feedback_same_verdict_is_idempotent_even_at_limit(client):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    item = await _create_item(client, "Feedback unchanged at quota", importance=0.5)
+    first = await client.post("/v1/feedback", json={"item_id": item["id"], "feedback": "useful"})
+    async with _test_engine.begin() as conn:
+        await conn.execute(text("UPDATE tenant_config SET feedback_daily_limit = 1"))
+    unchanged = await client.post(
+        "/v1/feedback", json={"item_id": item["id"], "feedback": "useful"}
+    )
+    assert unchanged.status_code == 200
+    assert unchanged.json()["status"] == "unchanged"
+    assert unchanged.json()["feedback_event_id"] == first.json()["feedback_event_id"]
+    async with _test_session_factory() as session:
+        assert await session.scalar(text("SELECT count(*) FROM feedback_events")) == 1
+        assert await session.scalar(
+            text("SELECT importance FROM memory_items WHERE id = :iid"), {"iid": item["id"]}
+        ) == pytest.approx(0.55)
+
+
+async def test_feedback_changed_verdict_preserves_history_and_applies_net_delta(client):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    item = await _create_item(client, "Feedback replacement", importance=0.5)
+    first = await client.post("/v1/feedback", json={"item_id": item["id"], "feedback": "noise"})
+    changed = await client.post("/v1/feedback", json={"item_id": item["id"], "feedback": "useful"})
+    assert first.status_code == 201
+    assert changed.status_code == 200
+    assert changed.json()["status"] == "updated"
+    assert changed.json()["previous_feedback"] == "noise"
+    assert changed.json()["importance"] == pytest.approx(0.55)
+    async with _test_session_factory() as session:
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT id, superseded_at, replaces_feedback_event_id FROM feedback_events "
+                    "WHERE item_id = :iid ORDER BY created_at, id"
+                ),
+                {"iid": item["id"]},
+            )
+        ).all()
+    assert len(rows) == 2
+    assert rows[0].superseded_at is not None
+    assert rows[1].superseded_at is None
+    assert rows[1].replaces_feedback_event_id == rows[0].id
+
+
+@pytest.mark.parametrize(
+    ("importance", "verdict", "expected"),
+    [(0.94, "useful", 0.95), (0.11, "noise", 0.10)],
+)
+async def test_feedback_importance_clamps_at_contract_bounds(
+    client, importance: float, verdict: str, expected: float
+):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    item = await _create_item(client, f"Feedback clamp {verdict}", importance=importance)
+    response = await client.post("/v1/feedback", json={"item_id": item["id"], "feedback": verdict})
+    assert response.status_code == 201
+    assert response.json()["importance"] == pytest.approx(expected)
+
+
+async def test_feedback_provenance_failures_are_mutation_free(client):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    item = await _create_item(client, "Feedback false provenance", importance=0.5)
+    first = await client.post("/v1/feedback", json={"item_id": item["id"], "feedback": "useful"})
+    assert first.status_code == 201
+    missing = await client.post(
+        "/v1/feedback",
+        json={
+            "item_id": item["id"],
+            "feedback": "useful",
+            "recall_log_id": str(uuid.uuid4()),
+        },
+    )
+    assert missing.status_code == 404
+    async with _test_engine.begin() as conn:
+        identity = (
+            await conn.execute(
+                text("SELECT tenant_id, principal_id FROM memory_items WHERE id = :iid"),
+                {"iid": item["id"]},
+            )
+        ).one()
+        null_log, wrong_item_log = uuid.uuid4(), uuid.uuid4()
+        await conn.execute(
+            text(
+                "INSERT INTO recall_logs "
+                "(id, tenant_id, principal_id, mode, item_ids) "
+                "VALUES (:null_id, :tid, :pid, 'semantic', NULL), "
+                "(:wrong_id, :tid, :pid, 'semantic', :items)"
+            ),
+            {
+                "null_id": null_log,
+                "wrong_id": wrong_item_log,
+                "tid": identity.tenant_id,
+                "pid": identity.principal_id,
+                "items": [uuid.uuid4()],
+            },
+        )
+    for recall_log_id in (null_log, wrong_item_log):
+        response = await client.post(
+            "/v1/feedback",
+            json={
+                "item_id": item["id"],
+                "feedback": "useful",
+                "recall_log_id": str(recall_log_id),
+            },
+        )
+        assert response.status_code == 422
+    async with _test_session_factory() as session:
+        assert await session.scalar(text("SELECT count(*) FROM feedback_events")) == 1
+        assert await session.scalar(
+            text("SELECT importance FROM memory_items WHERE id = :iid"), {"iid": item["id"]}
+        ) == pytest.approx(0.55)
+
+
+async def test_feedback_concurrency_identical_verdict_race(app, client):
     """Item locking makes concurrent retry storms canonical and idempotent."""
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     item = await _create_item(client, "Concurrent identical feedback", importance=0.5)
     responses = await asyncio.gather(
         *(
-            client.post(
-                "/v1/feedback", json={"item_id": item["id"], "feedback": "useful"}
-            )
+            _isolated_feedback_request(app, {"item_id": item["id"], "feedback": "useful"})
             for _ in range(8)
         )
     )
     assert [response.status_code for response in responses].count(201) == 1
     assert [response.status_code for response in responses].count(200) == 7
+    recorded_id = next(
+        response.json()["feedback_event_id"]
+        for response in responses
+        if response.status_code == 201
+    )
+    assert all(
+        response.json()["status"] == "unchanged"
+        for response in responses
+        if response.status_code == 200
+    )
+    assert all(response.json()["feedback_event_id"] == recorded_id for response in responses)
     async with _test_session_factory() as session:
         row = (
             await session.execute(
@@ -264,7 +401,7 @@ async def test_concurrent_identical_feedback_is_one_contribution(client):
     assert importance == pytest.approx(0.55)
 
 
-async def test_concurrent_feedback_cannot_exceed_daily_limit(client):
+async def test_feedback_concurrency_daily_rate_cap_race(app, client):
     """Principal-row locking makes count+insert safe across simultaneous items."""
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
@@ -276,9 +413,7 @@ async def test_concurrent_feedback_cannot_exceed_daily_limit(client):
     ]
     responses = await asyncio.gather(
         *(
-            client.post(
-                "/v1/feedback", json={"item_id": item["id"], "feedback": "useful"}
-            )
+            _isolated_feedback_request(app, {"item_id": item["id"], "feedback": "useful"})
             for item in items
         )
     )
@@ -286,6 +421,10 @@ async def test_concurrent_feedback_cannot_exceed_daily_limit(client):
     limited = [response for response in responses if response.status_code == 429]
     assert len(limited) == 5
     assert all(response.headers.get("Retry-After") for response in limited)
+    assert all(
+        set(("detail", "limit", "reset_at")) <= response.json().keys() for response in limited
+    )
+    assert all(response.json()["limit"] == 5 for response in limited)
     async with _test_session_factory() as session:
         event_count = await session.scalar(text("SELECT count(*) FROM feedback_events"))
         changed_count = await session.scalar(
@@ -293,3 +432,111 @@ async def test_concurrent_feedback_cannot_exceed_daily_limit(client):
         )
     assert event_count == 5
     assert changed_count == 5
+
+
+async def test_feedback_concurrency_opposite_verdict_race(app, client):
+    """Opposite transitions serialize into a coherent append-preserved chain."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    item = await _create_item(client, "Concurrent opposite feedback", importance=0.5)
+    responses = await asyncio.gather(
+        _isolated_feedback_request(app, {"item_id": item["id"], "feedback": "useful"}),
+        _isolated_feedback_request(app, {"item_id": item["id"], "feedback": "noise"}),
+    )
+    assert all(response.status_code in {200, 201} for response in responses)
+    async with _test_session_factory() as session:
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT id, verdict, superseded_at, replaces_feedback_event_id "
+                    "FROM feedback_events WHERE item_id = :iid ORDER BY created_at, id"
+                ),
+                {"iid": item["id"]},
+            )
+        ).all()
+        importance = await session.scalar(
+            text("SELECT importance FROM memory_items WHERE id = :iid"), {"iid": item["id"]}
+        )
+    assert len(rows) == 2
+    assert sum(row.superseded_at is None for row in rows) == 1
+    current = next(row for row in rows if row.superseded_at is None)
+    prior = next(row for row in rows if row.superseded_at is not None)
+    assert current.replaces_feedback_event_id == prior.id
+    assert importance == pytest.approx(0.55 if current.verdict == "useful" else 0.4)
+
+
+async def test_feedback_concurrency_distinct_principal_race(client):
+    """Independent principals retain distinct canonical contributions on one item."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    item = await _create_item(client, "Concurrent distinct principal feedback", importance=0.5)
+    async with _test_engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE memory_items SET startup_recall_count = 7 WHERE id = :iid"),
+            {"iid": item["id"]},
+        )
+        tenant_id = await conn.scalar(
+            text("SELECT tenant_id FROM memory_items WHERE id = :iid"), {"iid": item["id"]}
+        )
+        principals = []
+        for index, principal_type in enumerate(("user", "admin", "agent", "system")):
+            principal_id = uuid.uuid4()
+            await conn.execute(
+                text(
+                    "INSERT INTO principals (id, tenant_id, name, type) "
+                    "VALUES (:id, :tid, :name, :type)"
+                ),
+                {
+                    "id": principal_id,
+                    "tid": tenant_id,
+                    "name": f"feedback-race-{index}-{principal_id}",
+                    "type": principal_type,
+                },
+            )
+            principals.append((principal_id, principal_type))
+
+    async def submit(principal_id: uuid.UUID, principal_type: str) -> object:
+        async with _test_session_factory() as session:
+            await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
+            locked = (
+                (
+                    await session.execute(
+                        text(
+                            "SELECT id, principal_id, importance, startup_recall_count "
+                            "FROM memory_items WHERE id = :iid FOR UPDATE"
+                        ),
+                        {"iid": item["id"]},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            return await record_feedback(
+                session,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                principal_type=principal_type,
+                item=locked,
+                verdict="useful",
+                recall_log_id=None,
+            )
+
+    results = await asyncio.gather(*(submit(*principal) for principal in principals))
+    assert all(result.status == "recorded" for result in results)
+    async with _test_session_factory() as session:
+        count = await session.scalar(
+            text(
+                "SELECT count(*) FROM feedback_events "
+                "WHERE item_id = :iid AND superseded_at IS NULL"
+            ),
+            {"iid": item["id"]},
+        )
+        state = (
+            await session.execute(
+                text("SELECT importance, startup_recall_count FROM memory_items WHERE id = :iid"),
+                {"iid": item["id"]},
+            )
+        ).one()
+    assert count == 4
+    assert state.importance == pytest.approx(0.65)
+    assert state.startup_recall_count == 0

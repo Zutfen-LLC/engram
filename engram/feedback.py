@@ -137,11 +137,15 @@ async def record_feedback(
         )
 
     # Principal-row serialization makes count + insert safe across all workers and keys.
-    await session.execute(
-        select(Principal.id)
-        .where(Principal.id == principal_id, Principal.tenant_id == tenant_id)
-        .with_for_update()
-    )
+    locked_principal = (
+        await session.execute(
+            select(Principal.id)
+            .where(Principal.id == principal_id, Principal.tenant_id == tenant_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if locked_principal is None:
+        raise RuntimeError("authenticated principal no longer exists")
     timestamp = (now or datetime.now(UTC)).astimezone(UTC)
     day_start = timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
     reset_at = day_start + timedelta(days=1)
@@ -182,6 +186,10 @@ async def record_feedback(
     replacement_time = timestamp
     if current is not None:
         current.superseded_at = replacement_time
+        # Make the old row non-current before inserting its replacement. This
+        # avoids relying on SQLAlchemy's cross-operation ordering against the
+        # partial unique index while retaining one atomic transaction.
+        await session.flush()
 
     event = FeedbackEvent(
         tenant_id=tenant_id,
