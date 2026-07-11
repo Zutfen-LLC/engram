@@ -608,7 +608,7 @@ async def handle_promotion_path_a(session: AsyncSession, job: Job) -> None:
     """Run Path A auto-promotion for the job's tenant. Thin wrapper."""
     from engram.promotion import auto_promote_proposed_memories
 
-    result = await auto_promote_proposed_memories(session, str(job.tenant_id))
+    result = await auto_promote_proposed_memories(session, str(job.tenant_id), source="worker")
     logger.info(
         "promotion.path_a tenant=%s scanned=%s promoted=%s",
         job.tenant_id,

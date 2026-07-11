@@ -342,12 +342,15 @@ async def change_review_status(
             status_code=403,
             detail="The authenticated principal is not authorized for this review transition.",
         )
-    if decision.outcome is TransitionOutcome.NOOP:
-        await session.commit()
-        return {"item": item, "event": None}
     actor, on_behalf_of = await _resolve_actor_and_delegation(
         session, tenant_id=tenant_id, requested_on_behalf_of=req.on_behalf_of_principal_id
     )
+    if decision.outcome is TransitionOutcome.NOOP:
+        # Delegation is validated above even though a no-op writes nothing, so
+        # an unauthorized on_behalf_of_principal_id can't ride a same-state
+        # request to a silent 200 (Problem 2 / V2-BL-003A).
+        await session.commit()
+        return {"item": item, "event": None}
     event = await _insert_item_event(
         session,
         item_id=item_id,
