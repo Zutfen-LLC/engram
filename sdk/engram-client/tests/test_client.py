@@ -124,6 +124,25 @@ async def test_remember_success() -> None:
     assert "external_id" not in body
 
 
+async def test_remember_forwards_session_end_source_type() -> None:
+    rec = _Recorder(
+        status_code=201,
+        payload={
+            "id": ITEM_ID,
+            "status": "created",
+            "review_status": "proposed",
+            "memory_confidence": 0.35,
+        },
+    )
+    client = _client(rec)
+    try:
+        await client.remember("session summary", source_type="session_end")
+    finally:
+        await client.close()
+    assert rec.request is not None
+    assert _body(rec.request)["source_type"] == "session_end"
+
+
 async def test_remember_deduped_response() -> None:
     rec = _Recorder(
         status_code=201,

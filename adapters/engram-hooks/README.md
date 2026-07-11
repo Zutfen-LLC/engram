@@ -21,7 +21,7 @@ Three Hermes lifecycle events are mapped to hook entry points:
 | --- | --- | --- | --- |
 | `pre_compress` | `pre_compress()` | `pre_compress` | Extract facts about to be lost to context compression. |
 | `sync_turn` | `sync_turn()` | `sync_turn` | Extract durable facts at the end of a turn. |
-| `session_end` | `session_end()` | `extraction` | Final fact-extraction pass when a session closes. |
+| `session_end` | `session_end()` | `session_end` | Final fact-extraction pass when a session closes. |
 
 Each candidate flows through one pipeline:
 

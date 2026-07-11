@@ -210,6 +210,98 @@ async def test_pre_compress_source_proposed_lowest_trust(client):
     assert body["memory_confidence"] == pytest.approx(0.3)
 
 
+async def test_session_end_source_has_dedicated_inferred_defaults(client):
+    """An active tenant config resolves session_end without changing governance authority."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    response = await client.post(
+        "/v1/remember",
+        json={
+            "content": "Session-end integration fact",
+            "source_type": "session_end",
+            "kind": "fact",
+        },
+    )
+    assert response.status_code == 201
+    body = response.json()
+    assert body["review_status"] == "proposed"
+    assert body["memory_confidence"] == pytest.approx(0.35)
+
+    async with _test_engine.connect() as conn:
+        row = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT source_type, source_trust, memory_confidence, authority "
+                        "FROM memory_items WHERE id = :id"
+                    ),
+                    {"id": body["id"]},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        event_value = await conn.scalar(
+            text(
+                "SELECT new_value FROM item_events WHERE item_id = :id "
+                "AND event_type = 'classification'"
+            ),
+            {"id": body["id"]},
+        )
+    assert row["source_type"] == "session_end"
+    assert row["source_trust"] == pytest.approx(0.35)
+    assert row["memory_confidence"] == pytest.approx(0.35)
+    assert row["authority"] == 10
+    provenance = json.loads(event_value)
+    assert provenance["source_type"] == "session_end"
+    assert provenance["authority"] == 10
+    assert provenance["authority_label"] == "inferred"
+    assert provenance["source_trust"] == pytest.approx(0.35)
+    assert provenance["default_memory_confidence"] == pytest.approx(0.35)
+
+
+async def test_session_end_scoring_override_cannot_raise_authority(client):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    async with _test_engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE tenant_config SET trust_session_end = 1.0, "
+                "confidence_session_end = 0.95 WHERE active = TRUE"
+            )
+        )
+    try:
+        response = await client.post(
+            "/v1/remember",
+            json={
+                "content": "High-scoring lifecycle fact",
+                "source_type": "session_end",
+                "kind": "fact",
+            },
+        )
+        assert response.status_code == 201
+        assert response.json()["review_status"] == "proposed"
+        async with _test_engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT source_trust, memory_confidence, authority "
+                        "FROM memory_items WHERE id=:id"
+                    ),
+                    {"id": response.json()["id"]},
+                )
+            ).one()
+        assert tuple(row) == pytest.approx((1.0, 0.95, 10))
+    finally:
+        async with _test_engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "UPDATE tenant_config SET trust_session_end = 0.35, "
+                    "confidence_session_end = 0.35 WHERE active = TRUE"
+                )
+            )
+
+
 # ---- Dedup ----
 
 

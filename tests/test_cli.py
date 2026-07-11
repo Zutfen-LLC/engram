@@ -45,6 +45,7 @@ def test_discover_migrations_finds_and_sorts_bundled():
     # The bundled migrations must ship with the package.
     assert names == sorted(names), "migrations must be returned in sorted order"
     assert "001_init.sql" in names
+    assert "013_session_end_defaults.sql" in names
     # Every entry is a .sql file.
     assert all(f.suffix == ".sql" for f in files)
 

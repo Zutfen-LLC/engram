@@ -42,12 +42,10 @@ EVENT_HOOK_MAP: dict[str, HookName] = {
 # produced from that event. The server uses source_type (together with the
 # principal type) to pick source_trust / memory_confidence / review_status
 # defaults — see design.md §4.
-EVENT_SOURCE_TYPE: dict[str, Literal["sync_turn", "pre_compress", "extraction"]] = {
+EVENT_SOURCE_TYPE: dict[str, Literal["sync_turn", "pre_compress", "session_end"]] = {
     "pre_compress": "pre_compress",
     "sync_turn": "sync_turn",
-    # session_end has no dedicated source_type; facts extracted at session close
-    # are recorded as extraction (inferred, defaults to proposed).
-    "session_end": "extraction",
+    "session_end": "session_end",
 }
 
 
@@ -152,7 +150,9 @@ class HooksConfig:
         default_factory=lambda: _env_bool("ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE", False)
     )
 
-    def source_type_for(self, event: str) -> Literal["sync_turn", "pre_compress", "extraction"]:
+    def source_type_for(
+        self, event: str
+    ) -> Literal["sync_turn", "pre_compress", "session_end", "extraction"]:
         """Resolve the Engram source_type for a Hermes lifecycle ``event``."""
         if event not in EVENT_SOURCE_TYPE:
             # Unknown events default to extraction (inferred, proposed). This is

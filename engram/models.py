@@ -520,6 +520,7 @@ class TenantConfig(Base):
     trust_extraction: Mapped[float] = mapped_column(Float, default=0.5)
     trust_sync_turn: Mapped[float] = mapped_column(Float, default=0.4)
     trust_pre_compress: Mapped[float] = mapped_column(Float, default=0.3)
+    trust_session_end: Mapped[float] = mapped_column(Float, default=0.35)
 
     # Default memory_confidence per source_type (enables auto-promotion in 1A without LLM)
     confidence_manual_user: Mapped[float] = mapped_column(Float, default=0.9)
@@ -528,6 +529,7 @@ class TenantConfig(Base):
     confidence_extraction: Mapped[float] = mapped_column(Float, default=0.5)
     confidence_sync_turn: Mapped[float] = mapped_column(Float, default=0.4)
     confidence_pre_compress: Mapped[float] = mapped_column(Float, default=0.3)
+    confidence_session_end: Mapped[float] = mapped_column(Float, default=0.35)
 
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(

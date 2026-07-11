@@ -22,3 +22,8 @@ def test_remember_request_accepts_restricted() -> None:
 def test_remember_request_rejects_confidential() -> None:
     with pytest.raises(ValidationError):
         RememberRequest(content="secret plans", sensitivity="confidential")
+
+
+def test_remember_request_accepts_session_end() -> None:
+    req = RememberRequest(content="session summary", source_type="session_end")
+    assert req.source_type == "session_end"

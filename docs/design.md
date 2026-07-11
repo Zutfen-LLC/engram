@@ -402,6 +402,7 @@ changes authority. A cloned replacement preserves it.
 | `extraction`   | `agent`        | inferred       | 0.5                  | 0.5                       | `proposed`            |
 | `sync_turn`    | `agent`        | inferred       | 0.4                  | 0.4                       | `proposed`            |
 | `pre_compress` | `agent`        | inferred       | 0.3                  | 0.3                       | `proposed`            |
+| `session_end`  | any supported type | inferred (10)  | 0.35                 | 0.35                      | `proposed`            |
 
 The complete fixed authority mapping is:
 
@@ -413,7 +414,11 @@ The complete fixed authority mapping is:
 | `import`, `migration` | `agent` | `untrusted_agent` (20) |
 | `extraction`, `sync_turn`, `pre_compress`, `session_end` | any supported type | `inferred` (10) |
 
-`sync_turn` and `pre_compress` have confidence below the default 0.7 auto-promotion threshold. They stay `proposed` until LLM classification or human review raises their confidence, or until a quorum of 2+ distinct non-author principals marks the item useful via `/v1/feedback`.
+Lifecycle defaults (`sync_turn`, `pre_compress`, and `session_end`) are independently configurable
+and have confidence below the default 0.7 auto-promotion threshold. They stay `proposed` until LLM
+classification or human review raises their confidence, or until a quorum of 2+ distinct non-author
+principals marks the item useful via `/v1/feedback`. Lifecycle captures always retain inferred
+authority; raising their configured source trust never grants supersession authority.
 
 This is intentional: chatty low-confidence sources should not auto-promote without some signal that the memory is actually useful.
 

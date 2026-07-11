@@ -15,7 +15,7 @@ from uuid import UUID
 from pydantic import BaseModel, Field
 
 SourceKind = Literal[
-    "manual", "import", "migration", "extraction", "sync_turn", "pre_compress"
+    "manual", "import", "migration", "extraction", "sync_turn", "pre_compress", "session_end"
 ]
 SensitivityKind = Literal["normal", "sensitive", "restricted"]
 SearchMode = Literal["keyword", "semantic", "hybrid"]
