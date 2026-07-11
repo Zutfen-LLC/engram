@@ -15,6 +15,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.auth import EXPORT_SCOPE
+from engram.authority import authority_label
 from engram.canonicalize import canonicalize
 from engram.db import get_session
 
@@ -38,7 +39,7 @@ async def export_cca(
     sql = text(
         "SELECT id, kind, content, content_hash, "
         "source_type, source_session, wing, room, "
-        "review_status, memory_confidence, source_trust, human_verified, "
+        "review_status, memory_confidence, source_trust, authority, human_verified, "
         "valid_from "
         f"FROM memory_items WHERE kind IN ({kind_list}) AND valid_to IS NULL "
         "ORDER BY valid_from ASC"
@@ -61,6 +62,8 @@ async def export_cca(
                 "review_status": row["review_status"],
                 "memory_confidence": row["memory_confidence"],
                 "source_trust": row["source_trust"],
+                "authority": row["authority"],
+                "authority_label": authority_label(int(row["authority"])),
                 "human_verified": bool(row["human_verified"]),
                 # Taxonomy
                 "wing": row["wing"],

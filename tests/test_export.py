@@ -38,6 +38,7 @@ CREATE_STATEMENTS = [
         review_status TEXT NOT NULL,
         memory_confidence REAL NOT NULL,
         source_trust REAL NOT NULL,
+        authority INTEGER NOT NULL DEFAULT 10,
         human_verified INTEGER NOT NULL,
         verified_by TEXT,
         verified_at TEXT,

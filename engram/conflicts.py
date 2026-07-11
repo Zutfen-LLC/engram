@@ -18,6 +18,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy import and_, cast, literal_column, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from engram.authority import (
+    authority_allows_supersession,
+    authority_label,
+    qualifies_for_auto_supersession,
+)
 from engram.config import settings
 from engram.models import EmbeddingProfile, MemoryEmbedding, MemoryItem
 
@@ -28,8 +33,6 @@ _SIMILARITY_THRESHOLD = 0.85
 # recheck (engram.promotion). Bounded so a recheck never scans the full corpus.
 _PROMOTION_CANDIDATE_K = 5
 
-# source_trust at or above this counts as "high authority" for auto-supersession.
-_HIGH_SOURCE_TRUST = 0.8
 # Classifier confidence at or above this permits auto-supersession.
 _HIGH_CLASSIFIER_CONFIDENCE = 0.8
 
@@ -113,7 +116,7 @@ async def detect_conflicts(
         select(
             MemoryItem.id.label("id"),
             MemoryItem.content.label("content"),
-            MemoryItem.source_trust.label("source_trust"),
+            MemoryItem.authority.label("authority"),
             distance.label("distance"),
         )
         .select_from(MemoryEmbedding)
@@ -150,7 +153,7 @@ async def detect_conflicts(
         return None
 
     # 3. Classify the relationship (duplicate / refine / contradict).
-    existing_trust = float(row["source_trust"])
+    existing_authority = int(row["authority"])
     verdict, confidence, reason, provenance = await _classify_relationship(
         old_content=str(row["content"]),
         new_content=new_item.content,
@@ -160,8 +163,8 @@ async def detect_conflicts(
     # 4. Resolve the action based on verdict + authority hierarchy.
     action, conflict_type = _resolve_action(
         verdict=verdict,
-        new_trust=new_item.source_trust,
-        old_trust=existing_trust,
+        new_authority=new_item.authority,
+        old_authority=existing_authority,
         classifier_confidence=confidence,
     )
 
@@ -173,28 +176,23 @@ async def detect_conflicts(
         classifier_confidence=confidence,
         conflict_type=conflict_type,
         reason=reason,
-        provenance=provenance,
+        provenance={
+            **provenance,
+            "new_authority": new_item.authority,
+            "new_authority_label": authority_label(new_item.authority),
+            "existing_authority": existing_authority,
+            "existing_authority_label": authority_label(existing_authority),
+            "authority_allows_supersession": authority_allows_supersession(
+                new_authority=new_item.authority, old_authority=existing_authority
+            ),
+        },
     )
-
-
-def authority_allows_supersession(*, new_trust: float, old_trust: float) -> bool:
-    """Whether a new item's source authority may supersede an existing one.
-
-    Authority is derived from ``source_trust`` (design §4: explicit_user >
-    trusted_import > trusted_agent > untrusted_agent > inferred). Equal-or-higher
-    authority may supersede; strictly lower authority may not — a lower-authority
-    source must never silently replace a higher-authority memory. This is the
-    single canonical comparison used by both write-time conflict resolution
-    (:func:`_resolve_action`) and explicit supersession
-    (``POST /items/{id}/supersede``).
-    """
-    return new_trust >= old_trust
 
 
 def _resolve_action(
     verdict: ConflictVerdict,
-    new_trust: float,
-    old_trust: float,
+    new_authority: int,
+    old_authority: int,
     classifier_confidence: float,
 ) -> tuple[ConflictAction, str | None]:
     """Map a verdict + authority comparison to an action and conflict_type."""
@@ -205,10 +203,14 @@ def _resolve_action(
         return ConflictAction.FLAG_CONTRADICTION, "contradiction"
 
     # refine — conditional supersession based on authority hierarchy.
-    if not authority_allows_supersession(new_trust=new_trust, old_trust=old_trust):
+    if not authority_allows_supersession(
+        new_authority=new_authority, old_authority=old_authority
+    ):
         return ConflictAction.FLAG_SCOPE_OVERLAP, "scope_overlap"
 
-    if new_trust >= _HIGH_SOURCE_TRUST and classifier_confidence >= _HIGH_CLASSIFIER_CONFIDENCE:
+    if qualifies_for_auto_supersession(
+        new_authority
+    ) and classifier_confidence >= _HIGH_CLASSIFIER_CONFIDENCE:
         return ConflictAction.AUTO_SUPERSEDE, None
 
     return ConflictAction.PROPOSED_SUPERSEDE, "stale"
@@ -349,7 +351,7 @@ class ConflictCandidate:
 
     id: UUID
     content: str
-    source_trust: float
+    authority: int
     content_hash: str
     # Cosine similarity when found via embeddings; None for heuristic matches
     # (no embedding-based score is available in that mode).
@@ -435,7 +437,7 @@ async def _find_candidates_by_embedding(
         select(
             MemoryItem.id.label("id"),
             MemoryItem.content.label("content"),
-            MemoryItem.source_trust.label("source_trust"),
+            MemoryItem.authority.label("authority"),
             MemoryItem.content_hash.label("content_hash"),
             distance.label("distance"),
         )
@@ -474,7 +476,7 @@ async def _find_candidates_by_embedding(
             ConflictCandidate(
                 id=UUID(str(row["id"])),
                 content=str(row["content"]),
-                source_trust=float(row["source_trust"]),
+                authority=int(row["authority"]),
                 content_hash=str(row["content_hash"]),
                 similarity=similarity,
             )
@@ -508,7 +510,7 @@ async def _find_candidates_by_heuristic(
     stmt = select(
         MemoryItem.id.label("id"),
         MemoryItem.content.label("content"),
-        MemoryItem.source_trust.label("source_trust"),
+        MemoryItem.authority.label("authority"),
         MemoryItem.content_hash.label("content_hash"),
     ).where(
         MemoryItem.tenant_id == item.tenant_id,
@@ -529,7 +531,7 @@ async def _find_candidates_by_heuristic(
         ConflictCandidate(
             id=UUID(str(row["id"])),
             content=str(row["content"]),
-            source_trust=float(row["source_trust"]),
+            authority=int(row["authority"]),
             content_hash=str(row["content_hash"]),
             similarity=None,
         )
@@ -578,7 +580,7 @@ async def check_promotion_conflict(
             if verdict is ConflictVerdict.CONTRADICT:
                 return PromotionConflictCheck(candidate.id, verdict.value, reason, True)
             if verdict is ConflictVerdict.REFINE and not authority_allows_supersession(
-                new_trust=item.source_trust, old_trust=candidate.source_trust
+                new_authority=item.authority, old_authority=candidate.authority
             ):
                 return PromotionConflictCheck(candidate.id, verdict.value, reason, True)
             # DUPLICATE, or authority-eligible REFINE: not a promotion blocker.

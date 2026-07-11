@@ -459,11 +459,11 @@ async def test_dedup_still_enforced_and_expired_original_no_longer_blocks():
 def test_authority_allows_supersession_helper():
     """The centralized authority comparison: higher/equal may supersede, lower may not."""
     # Higher authority may supersede lower.
-    assert authority_allows_supersession(new_trust=0.9, old_trust=0.5) is True
+    assert authority_allows_supersession(new_authority=50, old_authority=10) is True
     # Equal authority may supersede.
-    assert authority_allows_supersession(new_trust=0.7, old_trust=0.7) is True
+    assert authority_allows_supersession(new_authority=30, old_authority=30) is True
     # Lower authority may not supersede.
-    assert authority_allows_supersession(new_trust=0.3, old_trust=0.9) is False
+    assert authority_allows_supersession(new_authority=10, old_authority=50) is False
 
 
 async def test_endpoint_equal_authority_supersede_allowed():

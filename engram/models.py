@@ -14,6 +14,7 @@ from sqlalchemy import (
     ForeignKey,
     ForeignKeyConstraint,
     Integer,
+    SmallInteger,
     String,
     Text,
     text,
@@ -135,6 +136,9 @@ class MemoryItem(Base):
     review_status: Mapped[str] = mapped_column(String(20), default="proposed")
     memory_confidence: Mapped[float] = mapped_column(Float, default=0.5)
     source_trust: Mapped[float] = mapped_column(Float, default=0.5)
+    authority: Mapped[int] = mapped_column(
+        SmallInteger, default=10, server_default=text("10"), nullable=False
+    )
     human_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     verified_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

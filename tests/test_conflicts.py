@@ -526,8 +526,8 @@ def _resolve_action(*args, **kwargs):
 def test_resolve_action_duplicate():
     action, conflict_type = _resolve_action(
         verdict=ConflictVerdict.DUPLICATE,
-        new_trust=0.5,
-        old_trust=0.9,
+        new_authority=10,
+        old_authority=50,
         classifier_confidence=0.9,
     )
     assert action is ConflictAction.DEDUP
@@ -537,8 +537,8 @@ def test_resolve_action_duplicate():
 def test_resolve_action_refine_auto_supersede():
     action, conflict_type = _resolve_action(
         verdict=ConflictVerdict.REFINE,
-        new_trust=0.9,
-        old_trust=0.9,
+        new_authority=50,
+        old_authority=50,
         classifier_confidence=0.85,
     )
     assert action is ConflictAction.AUTO_SUPERSEDE
@@ -548,8 +548,8 @@ def test_resolve_action_refine_auto_supersede():
 def test_resolve_action_refine_lower_authority():
     action, conflict_type = _resolve_action(
         verdict=ConflictVerdict.REFINE,
-        new_trust=0.5,
-        old_trust=0.9,
+        new_authority=10,
+        old_authority=50,
         classifier_confidence=0.95,
     )
     assert action is ConflictAction.FLAG_SCOPE_OVERLAP
@@ -559,8 +559,8 @@ def test_resolve_action_refine_lower_authority():
 def test_resolve_action_refine_medium_confidence():
     action, conflict_type = _resolve_action(
         verdict=ConflictVerdict.REFINE,
-        new_trust=0.9,
-        old_trust=0.9,
+        new_authority=50,
+        old_authority=50,
         classifier_confidence=0.6,
     )
     assert action is ConflictAction.PROPOSED_SUPERSEDE
@@ -570,9 +570,31 @@ def test_resolve_action_refine_medium_confidence():
 def test_resolve_action_contradict():
     action, conflict_type = _resolve_action(
         verdict=ConflictVerdict.CONTRADICT,
-        new_trust=0.9,
-        old_trust=0.9,
+        new_authority=50,
+        old_authority=50,
         classifier_confidence=0.9,
     )
     assert action is ConflictAction.FLAG_CONTRADICTION
     assert conflict_type == "contradiction"
+
+
+def test_trusted_agent_does_not_auto_supersede() -> None:
+    action, conflict_type = _resolve_action(
+        verdict=ConflictVerdict.REFINE,
+        new_authority=30,
+        old_authority=10,
+        classifier_confidence=1.0,
+    )
+    assert action is ConflictAction.PROPOSED_SUPERSEDE
+    assert conflict_type == "stale"
+
+
+def test_trusted_import_auto_supersedes_independent_of_source_trust() -> None:
+    action, conflict_type = _resolve_action(
+        verdict=ConflictVerdict.REFINE,
+        new_authority=40,
+        old_authority=30,
+        classifier_confidence=0.8,
+    )
+    assert action is ConflictAction.AUTO_SUPERSEDE
+    assert conflict_type is None

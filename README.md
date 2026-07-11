@@ -197,6 +197,11 @@ auto_promote_min_age_hours
 Trust is not binary. Every memory carries:
 
 * **source_trust** — trust in where the memory came from
+* **authority** — immutable governance rank derived from provenance (inferred 10,
+  untrusted agent 20, trusted agent 30, trusted import 40, explicit user 50)
+
+Source trust remains tenant-configurable and affects recall ranking. Authority is fixed by code and
+controls whether one memory may supersede another; tuning recall scores cannot invert that hierarchy.
 * **memory_confidence** — confidence that the memory is accurate
 * **extraction_confidence** — confidence in the extraction process
 * **human_verified** — whether a human has confirmed it
