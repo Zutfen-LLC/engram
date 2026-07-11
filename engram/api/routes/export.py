@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from engram.auth import EXPORT_SCOPE
 from engram.canonicalize import canonicalize
 from engram.db import get_session
 
@@ -23,7 +24,7 @@ router = APIRouter()
 _CCA_KINDS = ("doctrine", "decision", "invariant", "preference")
 
 
-@router.get("/export/cca", response_model=None)
+@router.get("/export/cca", response_model=None, dependencies=[Depends(EXPORT_SCOPE)])
 async def export_cca(
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> dict[str, Any]:

@@ -7,6 +7,8 @@ from enum import StrEnum
 from typing import Literal
 from uuid import UUID
 
+from engram.auth import Scope
+
 ReviewStatus = Literal["proposed", "active", "disputed", "rejected", "archived"]
 
 
@@ -111,3 +113,50 @@ def evaluate_transition(
     ):
         return ReviewTransitionDecision(TransitionOutcome.SELF_WITHDRAWAL)
     return ReviewTransitionDecision(TransitionOutcome.FORBIDDEN)
+
+
+# --- Transition scope classification (V2-BL-004) -----------------------------
+#
+# `POST /v1/items/{item_id}/review` is a mixed-purpose endpoint: collaborative
+# actions (dispute, self-withdrawal) are safe for `write`-scoped agents, but
+# activating/reactivating/rejecting an item is a privileged review decision
+# that must additionally require the `review` scope, even for a human user
+# whose principal-type would otherwise be allowed to perform it (scope and
+# principal-type are orthogonal — see the module docstring / V2-BL-004).
+#
+# This classification is independent of `principal_type`/`evaluate_transition`:
+# it answers "may this credential *attempt* this transition at all," not
+# "may this specific principal perform it." Both checks must pass.
+
+_WRITE_PERMITTED_TRANSITIONS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("proposed", "disputed"),
+        ("active", "disputed"),
+    }
+)
+
+
+def required_scope_for_review_transition(
+    *,
+    current_status: str,
+    requested_status: str,
+    is_author: bool,
+) -> Scope | None:
+    """The scope a caller must hold to attempt this review-status transition.
+
+    Returns ``None`` for a same-state (no-op) request — the endpoint's base
+    admission (``write`` or ``review``) already suffices for that case.
+    Returns ``"write"`` for collaborative actions (dispute, and self-withdrawal
+    via ``proposed -> archived`` by the item's own author). Returns
+    ``"review"`` for every other transition, including archival of another
+    principal's proposal and any structurally invalid or unrecognized pair —
+    the conservative default requires the higher scope rather than silently
+    permitting an unclassified transition under `write` alone.
+    """
+    if current_status == requested_status:
+        return None
+    if (current_status, requested_status) in _WRITE_PERMITTED_TRANSITIONS:
+        return "write"
+    if current_status == "proposed" and requested_status == "archived" and is_author:
+        return "write"
+    return "review"

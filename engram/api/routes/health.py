@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from engram.auth import HEALTH_EXEMPT_SCOPE, READY_EXEMPT_SCOPE
 from engram.db import get_session
 
 router = APIRouter()
@@ -39,13 +40,13 @@ def pgvector_version_satisfies(
     return parsed >= minimum
 
 
-@router.get("/health")
+@router.get("/health", dependencies=[Depends(HEALTH_EXEMPT_SCOPE)])
 async def health() -> dict[str, str]:
     """Liveness probe."""
     return {"status": "ok"}
 
 
-@router.get("/ready", response_model=None)
+@router.get("/ready", response_model=None, dependencies=[Depends(READY_EXEMPT_SCOPE)])
 async def readiness(
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> dict[str, str | None] | JSONResponse:

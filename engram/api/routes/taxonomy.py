@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from engram.auth import READ_SCOPE, WRITE_SCOPE
 from engram.db import get_session
 from engram.models import Tunnel
 
@@ -89,7 +90,7 @@ def _tunnel_to_out(t: Tunnel) -> TunnelOut:
 # ---- Endpoints ----
 
 
-@router.get("/taxonomy", response_model=TaxonomyResponse)
+@router.get("/taxonomy", response_model=TaxonomyResponse, dependencies=[Depends(READ_SCOPE)])
 async def get_taxonomy(
     session: AsyncSession = Depends(get_session),  # noqa: B008
     tenant_id: UUID = Depends(_resolve_tenant_id),  # noqa: B008
@@ -146,7 +147,7 @@ async def get_taxonomy(
     )
 
 
-@router.get("/tunnels", response_model=list[TunnelOut])
+@router.get("/tunnels", response_model=list[TunnelOut], dependencies=[Depends(READ_SCOPE)])
 async def list_tunnels(
     wing: str | None = None,
     session: AsyncSession = Depends(get_session),  # noqa: B008
@@ -161,7 +162,9 @@ async def list_tunnels(
     return [_tunnel_to_out(t) for t in rows]
 
 
-@router.post("/tunnels", response_model=TunnelOut, status_code=201)
+@router.post(
+    "/tunnels", response_model=TunnelOut, status_code=201, dependencies=[Depends(WRITE_SCOPE)]
+)
 async def create_tunnel(
     req: TunnelCreate,
     session: AsyncSession = Depends(get_session),  # noqa: B008

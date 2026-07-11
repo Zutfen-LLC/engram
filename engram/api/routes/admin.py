@@ -11,20 +11,20 @@ import uuid
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.auth import (
+    ADMIN_SCOPE,
     DIGEST_ALGORITHM,
     InternalPrincipalCredentialError,
-    Principal,
     assert_principal_credentialable,
+    canonicalize_scopes,
     digest_api_key_secret,
     generate_api_key,
     parse_api_key,
-    require_scopes,
     validate_principal_name,
     validate_principal_type,
 )
@@ -95,6 +95,15 @@ class ApiKeyCreate(BaseModel):
     principal_id: uuid.UUID | None = None
     scopes: list[str] = Field(default=["read", "write"])
     label: str | None = None
+
+    @field_validator("scopes")
+    @classmethod
+    def _validate_scopes(cls, v: list[str]) -> list[str]:
+        # Validates, dedupes, and canonically orders — the single source of
+        # truth shared with `engram bootstrap-key --scopes` (V2-BL-004).
+        # An unknown scope (including a typo like "reviews") raises here,
+        # which Pydantic turns into a 422 rather than silently persisting it.
+        return canonicalize_scopes(v)
 
 
 class ApiKeyOut(BaseModel):
@@ -186,7 +195,7 @@ class PromotionResponse(BaseModel):
     "/admin/tenants",
     response_model=TenantOut,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_scopes("admin"))],  # noqa: B008
+    dependencies=[Depends(ADMIN_SCOPE)],
 )
 async def create_tenant(
     body: TenantCreate,
@@ -208,7 +217,7 @@ async def create_tenant(
     "/admin/workspaces",
     response_model=WorkspaceOut,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_scopes("admin"))],  # noqa: B008
+    dependencies=[Depends(ADMIN_SCOPE)],
 )
 async def create_workspace(
     body: WorkspaceCreate,
@@ -230,7 +239,7 @@ async def create_workspace(
     "/admin/principals",
     response_model=PrincipalOut,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_scopes("admin"))],  # noqa: B008
+    dependencies=[Depends(ADMIN_SCOPE)],
 )
 async def create_principal(
     body: PrincipalCreate,
@@ -267,7 +276,7 @@ async def create_principal(
     "/admin/api-keys",
     response_model=ApiKeyOut,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_scopes("admin"))],  # noqa: B008
+    dependencies=[Depends(ADMIN_SCOPE)],
 )
 async def create_api_key(
     body: ApiKeyCreate,
@@ -319,12 +328,11 @@ async def create_api_key(
 @router.get(
     "/admin/principals",
     response_model=list[PrincipalOut],
-    dependencies=[Depends(require_scopes("admin"))],  # noqa: B008
+    dependencies=[Depends(ADMIN_SCOPE)],
 )
 async def list_principals(
     tenant_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),  # noqa: B008
-    _pr: Principal = Depends(require_scopes("admin")),  # noqa: B008
 ) -> list[PrincipalOut]:
     result = await session.execute(
         select(PrincipalModel).where(PrincipalModel.tenant_id == tenant_id)
@@ -363,7 +371,7 @@ async def _resolve_tenant_id(session: AsyncSession) -> str:
 @router.get(
     "/admin/memory-kinds",
     response_model=list[MemoryKindOut],
-    dependencies=[Depends(require_scopes("admin"))],  # noqa: B008
+    dependencies=[Depends(ADMIN_SCOPE)],
 )
 async def list_memory_kinds(
     session: AsyncSession = Depends(get_session),  # noqa: B008
@@ -382,7 +390,7 @@ async def list_memory_kinds(
     "/admin/memory-kinds",
     response_model=MemoryKindOut,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_scopes("admin"))],  # noqa: B008
+    dependencies=[Depends(ADMIN_SCOPE)],
 )
 async def create_memory_kind(
     body: MemoryKindCreate,
@@ -435,7 +443,7 @@ async def create_memory_kind(
 @router.patch(
     "/admin/memory-kinds/{name}",
     response_model=MemoryKindOut,
-    dependencies=[Depends(require_scopes("admin"))],  # noqa: B008
+    dependencies=[Depends(ADMIN_SCOPE)],
 )
 async def update_memory_kind(
     name: str,
@@ -471,7 +479,7 @@ async def update_memory_kind(
 @router.post(
     "/admin/promote",
     response_model=PromotionResponse,
-    dependencies=[Depends(require_scopes("admin"))],  # noqa: B008
+    dependencies=[Depends(ADMIN_SCOPE)],
 )
 async def promote_proposed(
     session: AsyncSession = Depends(get_session),  # noqa: B008

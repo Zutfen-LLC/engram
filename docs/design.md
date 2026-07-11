@@ -108,8 +108,25 @@ Every memory item has a simple state machine (`review_status`) plus derived sign
 > `user` principals and administrators may make governed review decisions;
 > restoring an archived item is administrator-only. Path A auto-promotion uses
 > an explicit, server-selected `promotion_service` authority and retains all of
-> its existing gates. Complete API-key route-scope enforcement remains deferred
-> to V2-BL-004.
+> its existing gates.
+>
+> **Scope enforcement (V2-BL-004):** every caller-facing route declares an
+> explicit `ScopeGuard`/`ExemptScopeGuard` policy (`engram.auth`), validated
+> for completeness against the live FastAPI app at startup and in tests — a
+> route added without one fails immediately rather than shipping unprotected.
+> The scope vocabulary is `read`, `write`, `review`, `export`, `admin`, with
+> `admin` acting as a super-scope that satisfies every other requirement.
+> Scope answers "may this credential attempt this class of operation?";
+> principal type and the review-transition policy above still separately
+> answer "may this specific principal perform this specific action?" — neither
+> substitutes for the other. `POST /v1/items/{item_id}/review` requires `write`
+> or `review` at the route level, then `engram.review_policy.
+> required_scope_for_review_transition()` classifies the specific transition
+> (collaborative dispute/self-withdrawal need only `write`; activation,
+> reactivation, rejection, and non-author archival need `review`) before the
+> principal-type policy above is even consulted. `x-engram-scope-policy` in
+> the OpenAPI schema is generated from the same guard objects used at
+> runtime — never a hand-duplicated table.
 >
 > Human verification is separate from activation: it never changes
 > `review_status` or clears a dispute. Only authenticated `user` or `admin`
@@ -193,8 +210,12 @@ Every memory item has a simple state machine (`review_status`) plus derived sign
 > after the lock clears and returns `409` rather than racing to overwrite
 > `verified_by`.
 >
-> V2-BL-004 (API-key route-scope enforcement) remains unimplemented and is not
-> part of this correction.
+> V2-BL-004 (API-key route-scope enforcement, described above) layers scope
+> checks on top of this ordering without changing it: base scope admission
+> (`write`/`review`/`admin`) gates the route before any of the above runs,
+> then eligibility (404) still resolves before the transition-specific scope
+> check (403), which in turn resolves before the principal-type/state-machine
+> policy this section describes.
 
 ```text
 observed → proposed → active → recalled → confirmed/stale → superseded/invalidated/archived

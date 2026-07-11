@@ -138,8 +138,12 @@ def test_baseline_cutoff_against_real_bundled_migrations():
 
 
 def test_parse_scopes_default_full_set():
+    # Canonical order (V2-BL-004) is read, write, review, export, admin — note
+    # this reorders "admin,export" (input order) to "export,admin" (canonical
+    # order), not a regression: parse_scopes now delegates to
+    # engram.auth.canonicalize_scopes for deterministic persistence order.
     scopes = parse_scopes("read,write,admin,export")
-    assert scopes == ["read", "write", "admin", "export"]
+    assert scopes == ["read", "write", "export", "admin"]
 
 
 def test_parse_scopes_strips_whitespace_and_dedups():
@@ -157,8 +161,18 @@ def test_parse_scopes_rejects_unknown():
         parse_scopes("read,superuser")
 
 
+def test_parse_scopes_rejects_typo():
+    with pytest.raises(ValueError, match="unknown scope"):
+        parse_scopes("read,reviews")
+
+
 def test_parse_scopes_single():
     assert parse_scopes("admin") == ["admin"]
+
+
+def test_parse_scopes_accepts_review():
+    assert parse_scopes("review") == ["review"]
+    assert parse_scopes("admin,review,read") == ["read", "review", "admin"]
 
 
 # --- bootstrap-key: material + hash authentication viability -------------

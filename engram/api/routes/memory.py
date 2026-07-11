@@ -19,6 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram import semantic
+from engram.auth import READ_SCOPE, WRITE_SCOPE
 from engram.canonicalize import canonicalize, content_hash
 from engram.classification import ClassificationResult, classify_rules_only
 from engram.classification_trust import blend_memory_confidence, narrow_visibility
@@ -457,7 +458,12 @@ def _rrf_fuse(
 # ---- Endpoints ----
 
 
-@router.post("/remember", response_model=RememberResponse, status_code=201)
+@router.post(
+    "/remember",
+    response_model=RememberResponse,
+    status_code=201,
+    dependencies=[Depends(WRITE_SCOPE)],
+)
 async def remember(
     req: RememberRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
@@ -702,7 +708,7 @@ async def remember(
     )
 
 
-@router.post("/recall", response_model=RecallResponse)
+@router.post("/recall", response_model=RecallResponse, dependencies=[Depends(READ_SCOPE)])
 async def recall(
     req: RecallRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
@@ -763,7 +769,7 @@ async def recall(
     )
 
 
-@router.post("/search", response_model=SearchResponse)
+@router.post("/search", response_model=SearchResponse, dependencies=[Depends(READ_SCOPE)])
 async def search(
     req: SearchRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
@@ -872,7 +878,9 @@ async def search(
     return SearchResponse(results=results, total=len(results))
 
 
-@router.post("/feedback", response_model=None, status_code=201)
+@router.post(
+    "/feedback", response_model=None, status_code=201, dependencies=[Depends(WRITE_SCOPE)]
+)
 async def feedback(
     req: FeedbackRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
@@ -1229,7 +1237,7 @@ async def _require_eligible_item(
     return item
 
 
-@router.get("/items", response_model=None)
+@router.get("/items", response_model=None, dependencies=[Depends(READ_SCOPE)])
 async def list_items(
     workspace: str | None = None,
     kind: str | None = None,
@@ -1299,7 +1307,7 @@ async def list_items(
     }
 
 
-@router.get("/items/{item_id}", response_model=None)
+@router.get("/items/{item_id}", response_model=None, dependencies=[Depends(READ_SCOPE)])
 async def get_item(
     item_id: UUID,
     session: AsyncSession = Depends(get_session),  # noqa: B008
@@ -1328,7 +1336,7 @@ async def get_item(
     }
 
 
-@router.patch("/items/{item_id}", response_model=None)
+@router.patch("/items/{item_id}", response_model=None, dependencies=[Depends(WRITE_SCOPE)])
 async def update_item_metadata(
     item_id: UUID,
     req: ItemMetadataPatchRequest,
@@ -1378,7 +1386,9 @@ async def update_item_metadata(
     return {"item": updated, "event": events[0] if events else None, "events": events}
 
 
-@router.post("/items/{item_id}/supersede", response_model=None)
+@router.post(
+    "/items/{item_id}/supersede", response_model=None, dependencies=[Depends(WRITE_SCOPE)]
+)
 async def supersede_item(
     item_id: UUID,
     req: MutationAuditRequest | None = None,
@@ -1531,7 +1541,9 @@ async def supersede_item(
     }
 
 
-@router.post("/items/{item_id}/invalidate", response_model=None)
+@router.post(
+    "/items/{item_id}/invalidate", response_model=None, dependencies=[Depends(WRITE_SCOPE)]
+)
 async def invalidate_item(
     item_id: UUID,
     req: MutationAuditRequest | None = None,

@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from engram.auth import ADMIN_SCOPE, READ_SCOPE
 from engram.classification import ClassificationResult
 from engram.classification import classify as classify_content
 from engram.db import get_session
@@ -53,7 +54,7 @@ async def _resolve_tenant_id(session: AsyncSession) -> UUID:
     return UUID(str(tenant_id))
 
 
-@router.post("/classify", response_model=ClassifyResponse)
+@router.post("/classify", response_model=ClassifyResponse, dependencies=[Depends(READ_SCOPE)])
 async def classify(
     req: ClassifyRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
@@ -67,19 +68,25 @@ async def classify(
     return ClassifyResponse(**result.model_dump(exclude={"provenance"}))
 
 
-@router.get("/classification/rules", response_model=None)
+@router.get(
+    "/classification/rules", response_model=None, dependencies=[Depends(ADMIN_SCOPE)]
+)
 async def list_rules() -> None:
     """List tenant classification rules."""
     raise NotImplementedError
 
 
-@router.post("/classification/rules", response_model=None)
+@router.post(
+    "/classification/rules", response_model=None, dependencies=[Depends(ADMIN_SCOPE)]
+)
 async def create_rule(req: RuleCreate) -> None:
     """Create or update a classification rule."""
     raise NotImplementedError
 
 
-@router.delete("/classification/rules/{rule_id}", response_model=None)
+@router.delete(
+    "/classification/rules/{rule_id}", response_model=None, dependencies=[Depends(ADMIN_SCOPE)]
+)
 async def delete_rule(rule_id: str) -> None:
     """Delete a classification rule."""
     raise NotImplementedError

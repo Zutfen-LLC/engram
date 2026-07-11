@@ -74,7 +74,9 @@ def main() -> None:
     bootstrap_parser.add_argument(
         "--scopes",
         default="read,write,admin,export",
-        help="Comma-separated scopes for the bootstrap key (default: read,write,admin,export).",
+        help="Comma-separated scopes for the bootstrap key: read, write, review, "
+        "export, admin (default: read,write,admin,export). `admin` is a "
+        "super-scope and already satisfies `review`.",
     )
     bootstrap_parser.add_argument(
         "--database-url",
@@ -501,27 +503,21 @@ class BootstrapKeyMaterial:
 
 
 def parse_scopes(raw: str) -> list[str]:
-    """Parse a comma-separated scope string into a validated, de-duplicated list.
+    """Parse a comma-separated scope string into a validated, canonical list.
 
-    Raises ``ValueError`` if any scope is unknown or the list is empty. The set
-    of valid scopes mirrors :data:`engram.auth.VALID_SCOPES`.
+    Raises ``ValueError`` if any scope is unknown or the list is empty (unlike
+    the JSON admin API, an explicitly empty scope list isn't meaningful for a
+    comma-separated CLI flag). Delegates validation, de-duplication, and
+    canonical ordering to :func:`engram.auth.canonicalize_scopes` — the same
+    function the admin API's key-issuance endpoint uses (V2-BL-004), so both
+    paths reject unknown scopes and order valid ones identically.
     """
-    from engram.auth import VALID_SCOPES
+    from engram.auth import canonicalize_scopes
 
     scopes = [s.strip() for s in raw.split(",") if s.strip()]
     if not scopes:
         raise ValueError("at least one scope is required")
-    invalid = [s for s in scopes if s not in VALID_SCOPES]
-    if invalid:
-        raise ValueError(f"unknown scope(s): {', '.join(invalid)}")
-    # de-duplicate while preserving order
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for s in scopes:
-        if s not in seen:
-            seen.add(s)
-            ordered.append(s)
-    return ordered
+    return canonicalize_scopes(scopes)
 
 
 def make_bootstrap_key(label: str | None, scopes: list[str]) -> BootstrapKeyMaterial:

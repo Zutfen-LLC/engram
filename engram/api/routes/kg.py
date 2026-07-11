@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from engram.auth import READ_SCOPE, WRITE_SCOPE
 from engram.db import get_session
 from engram.memory_access import apply_read_eligibility
 from engram.models import KgTriple, MemoryItem
@@ -121,7 +122,9 @@ def _row_to_triple_out(row: Any) -> KgTripleOut:
     )
 
 
-@router.post("/kg", response_model=KgAddResponse, status_code=201)
+@router.post(
+    "/kg", response_model=KgAddResponse, status_code=201, dependencies=[Depends(WRITE_SCOPE)]
+)
 async def add_triple(
     req: KgAddRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
@@ -209,7 +212,9 @@ async def add_triple(
     )
 
 
-@router.get("/kg/query", response_model=list[KgTripleOut])
+@router.get(
+    "/kg/query", response_model=list[KgTripleOut], dependencies=[Depends(READ_SCOPE)]
+)
 async def query_kg(
     entity: str,
     direction: str = "both",
@@ -272,7 +277,9 @@ async def query_kg(
     return results
 
 
-@router.post("/kg/invalidate", response_model=KgInvalidateResponse)
+@router.post(
+    "/kg/invalidate", response_model=KgInvalidateResponse, dependencies=[Depends(WRITE_SCOPE)]
+)
 async def invalidate_triple(
     req: KgInvalidateRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
@@ -298,7 +305,9 @@ async def invalidate_triple(
     return KgInvalidateResponse(status="invalidated" if count > 0 else "not_found", count=count)
 
 
-@router.get("/kg/timeline", response_model=KgTimelineResponse)
+@router.get(
+    "/kg/timeline", response_model=KgTimelineResponse, dependencies=[Depends(READ_SCOPE)]
+)
 async def kg_timeline(
     entity: str | None = None,
     limit: int = 100,
