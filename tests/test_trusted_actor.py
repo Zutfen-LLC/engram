@@ -71,12 +71,11 @@ async def _clean_db():
     async with _test_engine.begin() as conn:
         await conn.execute(text("DELETE FROM item_events"))
         await conn.execute(text("DELETE FROM memory_items"))
-        # Delete api_keys before principals to avoid FK violation on
-        # api_keys_principal_id_fkey. Only delete test-created keys to avoid
-        # removing bootstrap keys that other tests may depend on.
+        # Delete api_keys first — principals has ON DELETE CASCADE from tenants
+        # but api_keys.principal_id has no CASCADE, so deleting tenants/principals
+        # with api_keys referencing them raises FK violation.
         await conn.execute(text("DELETE FROM api_keys WHERE label LIKE 'test-v2b3b-%'"))
-        # Also delete any api_keys referencing principals we're about to remove
-        # (internal/system principals created by prior test runs).
+        # Delete any api_keys referencing principals we're about to remove.
         await conn.execute(
             text(
                 "DELETE FROM api_keys WHERE principal_id IN ("
@@ -85,11 +84,22 @@ async def _clean_db():
                 ")"
             )
         )
+        # Delete api_keys for non-default tenants (they'll be cascaded by
+        # tenant deletion, but their principals may have api_keys without
+        # CASCADE).
+        await conn.execute(
+            text(
+                "DELETE FROM api_keys WHERE tenant_id IN ("
+                "  SELECT id FROM tenants WHERE slug != 'default'"
+                ")"
+            )
+        )
         await conn.execute(text("DELETE FROM tenants WHERE slug != 'default'"))
         await conn.execute(
             text(
                 "DELETE FROM principals WHERE internal_key IS NOT NULL "
-                "OR (type = 'system' AND tenant_id = (SELECT id FROM tenants WHERE slug = 'default'))"
+                "OR (type = 'system' AND tenant_id = (SELECT id FROM tenants WHERE slug = 'default')) "
+                "OR (name = 'system' AND tenant_id = (SELECT id FROM tenants WHERE slug = 'default'))"
             )
         )
     async with _test_engine.begin() as conn:
@@ -731,6 +741,7 @@ async def test_new_format_key_for_internal_principal_fails_auth(monkeypatch: pyt
     monkeypatch.setattr(db_module, "async_session_factory", _test_session_factory)
     monkeypatch.setattr(db_module, "owner_session_factory", _test_session_factory)
     monkeypatch.setattr(db_module, "read_session_factory", _test_session_factory)
+    monkeypatch.setattr(settings, "auth_enabled", True)
 
     app = create_app()
     transport = ASGITransport(app=app)
@@ -762,6 +773,7 @@ async def test_legacy_key_for_internal_principal_fails_auth(monkeypatch: pytest.
     monkeypatch.setattr(db_module, "async_session_factory", _test_session_factory)
     monkeypatch.setattr(db_module, "owner_session_factory", _test_session_factory)
     monkeypatch.setattr(db_module, "read_session_factory", _test_session_factory)
+    monkeypatch.setattr(settings, "auth_enabled", True)
 
     app = create_app()
     transport = ASGITransport(app=app)

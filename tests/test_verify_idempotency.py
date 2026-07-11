@@ -52,6 +52,7 @@ async def _clean_db():
     async with _test_engine.begin() as conn:
         await conn.execute(text("DELETE FROM item_events"))
         await conn.execute(text("DELETE FROM memory_items"))
+        await conn.execute(text("DELETE FROM api_keys WHERE tenant_id IN (SELECT id FROM tenants WHERE slug != 'default')"))
         await conn.execute(text("DELETE FROM workspace_members"))
         await conn.execute(text("DELETE FROM workspaces WHERE slug != 'general'"))
         await conn.execute(text("DELETE FROM tenants WHERE slug != 'default'"))
