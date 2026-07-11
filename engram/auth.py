@@ -362,9 +362,9 @@ async def _resolve_new_format_key(parsed: ParsedApiKey) -> Principal | None:
                     "       CAST(api_keys.principal_id AS TEXT) AS principal_id, "
                     "       api_keys.scopes AS scopes, "
                     "       api_keys.secret_digest AS secret_digest, "
-                    "       p.internal_key AS principal_internal_key "
+                    "       (SELECT p.internal_key FROM principals p "
+                    "        WHERE p.id = api_keys.principal_id) AS principal_internal_key "
                     "FROM api_keys "
-                    "LEFT JOIN principals p ON p.id = api_keys.principal_id "
                     "WHERE api_keys.key_id = :kid AND api_keys.revoked_at IS NULL"
                 ),
                 {"kid": parsed.key_id},
@@ -426,15 +426,18 @@ async def _resolve_legacy_key(token: str) -> Principal | None:
                 "       CAST(api_keys.principal_id AS TEXT) AS principal_id, "
                 "       api_keys.key_hash AS key_hash, "
                 "       api_keys.scopes AS scopes, "
-                "       p.internal_key AS principal_internal_key "
+                "       (SELECT p.internal_key FROM principals p "
+                "        WHERE p.id = api_keys.principal_id) AS principal_internal_key "
                 "FROM api_keys "
-                "LEFT JOIN principals p ON p.id = api_keys.principal_id "
                 "WHERE api_keys.key_id IS NULL AND api_keys.revoked_at IS NULL"
             )
         )
         for row in result:
             if verify_api_key(token, row.key_hash):
-                if _row_is_internal(row.principal_internal_key):
+                # Fail-closed: internal principals cannot authenticate via API
+                # key. Access defensively — the LEFT JOIN may produce NULL.
+                internal_key = row.principal_internal_key if row.principal_internal_key else None
+                if _row_is_internal(internal_key):
                     return None
                 return Principal(
                     tenant_id=row.tenant_id,

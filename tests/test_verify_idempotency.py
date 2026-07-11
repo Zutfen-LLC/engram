@@ -52,10 +52,20 @@ async def _clean_db():
     async with _test_engine.begin() as conn:
         await conn.execute(text("DELETE FROM item_events"))
         await conn.execute(text("DELETE FROM memory_items"))
-        await conn.execute(text("DELETE FROM api_keys WHERE tenant_id IN (SELECT id FROM tenants WHERE slug != 'default')"))
+        # Delete api_keys before tenants/principals — api_keys.principal_id
+        # has no ON DELETE CASCADE, so deleting principals with api_keys
+        # references raises FK violation.
+        await conn.execute(text("DELETE FROM api_keys"))
         await conn.execute(text("DELETE FROM workspace_members"))
         await conn.execute(text("DELETE FROM workspaces WHERE slug != 'general'"))
         await conn.execute(text("DELETE FROM tenants WHERE slug != 'default'"))
+        # Clean up test-created principals in the default tenant.
+        await conn.execute(
+            text(
+                "DELETE FROM principals WHERE tenant_id = (SELECT id FROM tenants WHERE slug = 'default') "
+                "AND name != 'admin'"
+            )
+        )
 
 
 async def _seed_tenant(name: str) -> str:
