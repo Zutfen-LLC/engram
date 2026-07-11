@@ -9,7 +9,7 @@ import base64
 import json
 import uuid
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Response
@@ -174,7 +174,40 @@ _TRUST_FALLBACKS: dict[str, tuple[float, float]] = {
     "extraction": (0.5, 0.5),
     "sync_turn": (0.4, 0.4),
     "pre_compress": (0.3, 0.3),
+    "session_end": (0.35, 0.35),
 }
+
+_SOURCE_TRUST_KEYS: dict[SourceKind, tuple[str, str]] = {
+    "manual": ("manual_user", "manual_agent"),
+    "import": ("import", "import"),
+    "migration": ("import", "import"),
+    "extraction": ("extraction", "extraction"),
+    "sync_turn": ("sync_turn", "sync_turn"),
+    "pre_compress": ("pre_compress", "pre_compress"),
+    "session_end": ("session_end", "session_end"),
+}
+
+
+def _validate_trust_policy_completeness() -> None:
+    """Fail fast if the public source vocabulary and trust configuration drift."""
+    accepted_sources = set(get_args(SourceKind))
+    if accepted_sources != set(_SOURCE_TRUST_KEYS):
+        raise RuntimeError("SourceKind and trust-default source mappings are inconsistent")
+    config_keys = {key for keys in _SOURCE_TRUST_KEYS.values() for key in keys}
+    missing_fallbacks = config_keys - set(_TRUST_FALLBACKS)
+    missing_columns = {
+        column
+        for key in config_keys
+        for column in (f"trust_{key}", f"confidence_{key}")
+        if not hasattr(TenantConfig, column)
+    }
+    if missing_fallbacks or missing_columns:
+        raise RuntimeError(
+            f"Incomplete trust defaults: fallbacks={missing_fallbacks}, columns={missing_columns}"
+        )
+
+
+_validate_trust_policy_completeness()
 
 
 async def _resolve_trust_defaults(

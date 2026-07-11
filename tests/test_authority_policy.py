@@ -36,7 +36,11 @@ def test_stable_ordinals_and_labels() -> None:
         ("migration", "user", 40), ("migration", "admin", 40),
         ("migration", "system", 40), ("migration", "agent", 20),
         ("extraction", "user", 10), ("sync_turn", "admin", 10),
-        ("pre_compress", "agent", 10), ("session_end", "system", 10),
+        ("pre_compress", "agent", 10),
+        ("session_end", "user", 10),
+        ("session_end", "admin", 10),
+        ("session_end", "agent", 10),
+        ("session_end", "system", 10),
     ],
 )
 def test_derivation(source_type: str, principal_type: str, expected: int) -> None:
