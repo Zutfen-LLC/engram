@@ -94,12 +94,27 @@ async def _clean_db():
                 ")"
             )
         )
+        # Also clean up api_keys and test-created principals in the default
+        # tenant so subsequent test modules don't hit FK violations.
+        await conn.execute(
+            text(
+                "DELETE FROM api_keys WHERE principal_id IN ("
+                "  SELECT id FROM principals WHERE tenant_id = (SELECT id FROM tenants WHERE slug = 'default') "
+                "  AND name != 'admin'"
+                ")"
+            )
+        )
         await conn.execute(text("DELETE FROM tenants WHERE slug != 'default'"))
         await conn.execute(
             text(
                 "DELETE FROM principals WHERE internal_key IS NOT NULL "
                 "OR (type = 'system' AND tenant_id = (SELECT id FROM tenants WHERE slug = 'default')) "
-                "OR (name = 'system' AND tenant_id = (SELECT id FROM tenants WHERE slug = 'default'))"
+                "OR (name = 'system' AND tenant_id = (SELECT id FROM tenants WHERE slug = 'default')) "
+                "OR (name LIKE 'keytarget-%' AND tenant_id = (SELECT id FROM tenants WHERE slug = 'default')) "
+                "OR (name LIKE 'src-%' AND tenant_id = (SELECT id FROM tenants WHERE slug = 'default')) "
+                "OR (name LIKE 'admin-ep-%' AND tenant_id = (SELECT id FROM tenants WHERE slug = 'default')) "
+                "OR (name LIKE 'conflict-author-%' AND tenant_id = (SELECT id FROM tenants WHERE slug = 'default')) "
+                "OR (name LIKE 'proposer-%' AND tenant_id = (SELECT id FROM tenants WHERE slug = 'default'))"
             )
         )
     async with _test_engine.begin() as conn:
@@ -747,7 +762,7 @@ async def test_new_format_key_for_internal_principal_fails_auth(monkeypatch: pyt
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.get(
-            "/v1/workspaces",
+            "/v1/items",
             headers={"Authorization": f"Bearer {plaintext}"},
         )
     assert resp.status_code == 401
@@ -779,7 +794,7 @@ async def test_legacy_key_for_internal_principal_fails_auth(monkeypatch: pytest.
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.get(
-            "/v1/workspaces",
+            "/v1/items",
             headers={"Authorization": f"Bearer {plaintext}"},
         )
     assert resp.status_code == 401
