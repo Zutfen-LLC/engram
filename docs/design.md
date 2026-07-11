@@ -117,30 +117,59 @@ Every memory item has a simple state machine (`review_status`) plus derived sign
 > Caller-supplied verifier identity is not part of the request schema;
 > delegation remains audit metadata and never impersonates the verifier.
 >
-> **Trusted-actor attribution (V2-BL-003A):** Every `item_events` row written
-> by a trusted internal operation (Path A promotion, promotion-time conflict
-> recheck) is attributed to a durable, tenant-scoped **system principal**
-> (`principals.type = 'system'`, `name = 'system'`), resolved or created by
-> `engram.promotion.resolve_trusted_system_actor` — never to the memory's own
-> author. Before this correction, `auto_promote_proposed_memories` selected the
-> item author as the event actor, so an agent-authored proposal that
-> auto-promoted looked, in the audit trail, like the agent had approved its
-> own truth — even though `engram.review_policy` correctly denies agents that
-> authority. The system principal is looked up (or created on first use) with
-> a single atomic `INSERT ... ON CONFLICT (tenant_id, name) DO UPDATE ...
-> RETURNING`, which the existing `principals` unique constraint makes
-> concurrency-safe: concurrent first use from multiple workers/requests cannot
-> create duplicate rows or race a unique-violation. No caller-facing request
-> field selects or influences this principal; it is resolved entirely from the
-> server-derived tenant context. `item_events.reason` continues to name the
-> invocation source (`startup_recall`, `worker`, `cli`, `admin_endpoint`) so
-> the entry point is visible in the audit trail, but the *actor* — not the
-> reason text — is what proves the operation was trusted-internal rather than
-> a human or agent review decision. This is distinct from manual review
-> (actor = the authenticated caller), delegated review (actor = the
-> authenticated admin; the represented principal is metadata only, folded into
-> `reason`), and human verification (`verified_by` = the authenticated
-> caller, never the delegate).
+> **Trusted-actor attribution (V2-BL-003A / V2-BL-003B):** Every
+> `item_events` row written by a trusted internal operation (Path A promotion,
+> promotion-time conflict recheck) is attributed to a durable, tenant-scoped
+> **internal principal** resolved by a server-owned `internal_key`, never to
+> the memory's own author and never by display name. The canonical internal
+> key for the trusted review actor is `review_automation` — one canonical
+> principal per tenant, identified by `(tenant_id, internal_key)`, NOT by
+> `principals.name`. Before this correction, `auto_promote_proposed_memories`
+> selected the item author as the event actor, so an agent-authored proposal
+> that auto-promoted looked, in the audit trail, like the agent had approved
+> its own truth — even though `engram.review_policy` correctly denies agents
+> that authority. V2-BL-003A introduced a `name='system'` upsert to fix this,
+> but that was still name-based: an ordinary agent/user/admin principal named
+> `system` would be returned by the `(tenant_id, name)` upsert, recreating the
+> false self-approval audit trail. V2-BL-003B replaced name-based resolution
+> with `internal_key`-based resolution: the `principals` table has a nullable,
+> server-owned `internal_key` column (CHECK: `internal_key IS NULL OR type =
+> 'system'`; partial unique index on `(tenant_id, internal_key)`), and
+> `engram.promotion.resolve_trusted_system_actor` resolves by
+> `internal_key = 'review_automation'`, creating the canonical row on first
+> use with a generated display name (`__engram_internal_review__:<suffix>`)
+> that cannot collide with ordinary principal names. No caller-facing request
+> field selects or influences this principal; it is resolved entirely from
+> the server-derived tenant context. The principal's `name` is descriptive
+> only and is **not** the security identity. `item_events.reason` continues to
+> name the invocation source (`startup_recall`, `worker`, `cli`,
+> `admin_endpoint`) so the entry point is visible in the audit trail, but the
+> *actor* — not the reason text — is what proves the operation was
+> trusted-internal rather than a human or agent review decision. This is
+> distinct from manual review (actor = the authenticated caller), delegated
+> review (actor = the authenticated admin; the represented principal is
+> metadata only, folded into `reason`), and human verification
+> (`verified_by` = the authenticated caller, never the delegate).
+>
+> **Non-credentialable internal principals (V2-BL-003B):** Internal
+> principals (`internal_key IS NOT NULL`) cannot receive or use API keys.
+> API-key issuance (admin API, bootstrap-key CLI, shared service functions)
+> rejects internal-principal targets through one reusable validation rule
+> (`engram.auth.assert_principal_credentialable`). Every API-key
+> authentication path (new-format indexed lookup, legacy bcrypt fallback,
+> in-process principal cache) fails closed when the resolved principal has
+> `internal_key IS NOT NULL` — returning a normal 401, not a Principal
+> object carrying trusted authority, and not caching the result. This
+> protects against direct database insertion, older application versions,
+> and missed caller-facing issuance paths. `type='system'` alone does not
+> grant trusted-operation authority; a `system`-type principal with
+> `internal_key = NULL` is an ordinary principal. Trusted operations are
+> selected by server code, not authentication.
+>
+> **Historical events are not rewritten:** events written before V2-BL-003B
+> remain attributed to whatever actor they had. New events use the canonical
+> `review_automation` internal identity. Historical correction or annotation
+> is a separate migration decision.
 >
 > **No-op delegation consistency:** `POST /v1/items/{id}/review` validates the
 > authenticated actor and any requested `on_behalf_of_principal_id` delegation
@@ -539,6 +568,15 @@ Principal types include:
 * `agent`
 * `admin`
 * `system`
+
+A principal may carry a server-owned `internal_key` (nullable, permitted only
+for `type='system'`). A non-null `internal_key` marks a trusted internal
+identity that is selected by server code — not by name, type, or API key — and
+is non-credentialable (cannot receive or authenticate via API keys). The
+canonical trusted review actor uses `internal_key='review_automation'`. An
+ordinary principal named `system` (any type, `internal_key=NULL`) is not the
+trusted internal actor. See §3 (Trusted-actor attribution) for the full trust
+model.
 
 Memory items belong to:
 

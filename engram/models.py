@@ -66,6 +66,13 @@ class Principal(Base):
     )
     name: Mapped[str] = mapped_column(Text, nullable=False)
     type: Mapped[str] = mapped_column(String(50), default="agent")
+    # Server-owned internal identity key (V2-BL-003B). NULL for ordinary
+    # principals (agent/user/admin/system created through the caller-facing
+    # API). Non-null marks a trusted internal actor resolved by server code,
+    # never by name/type/api-key. CHECK (internal_key IS NULL OR type='system')
+    # and a partial unique index on (tenant_id, internal_key) are enforced by
+    # migrations/010_internal_key.sql. Never expose as a writable API field.
+    internal_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )

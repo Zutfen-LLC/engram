@@ -18,11 +18,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.auth import (
     DIGEST_ALGORITHM,
+    InternalPrincipalCredentialError,
     Principal,
+    assert_principal_credentialable,
     digest_api_key_secret,
     generate_api_key,
     parse_api_key,
     require_scopes,
+    validate_principal_name,
+    validate_principal_type,
 )
 from engram.classification import invalidate_vocab_cache
 from engram.db import get_session
@@ -67,6 +71,12 @@ class WorkspaceOut(BaseModel):
 
 
 class PrincipalCreate(BaseModel):
+    # ``internal_key`` is deliberately absent — it is a server-owned field that
+    # no caller-facing API may set (V2-BL-003B). Extra/unknown fields are
+    # rejected by model_config so a request attempting to supply
+    # ``internal_key`` is rejected by request validation.
+    model_config = {"extra": "forbid"}
+
     tenant_id: uuid.UUID
     name: str = Field(min_length=1)
     type: str = Field(default="agent", max_length=50)
@@ -77,6 +87,7 @@ class PrincipalOut(BaseModel):
     tenant_id: uuid.UUID
     name: str
     type: str
+    internal_key: str | None = None
 
 
 class ApiKeyCreate(BaseModel):
@@ -225,11 +236,30 @@ async def create_principal(
     body: PrincipalCreate,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> PrincipalOut:
+    # Reject names using the reserved internal prefix so an administrator
+    # cannot create a row that impersonates a server-owned internal actor
+    # (V2-BL-003B). Ordinary names including "system" remain allowed — the
+    # name is no longer the security identity.
+    try:
+        validate_principal_name(body.name)
+        validate_principal_type(body.type)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
     principal = PrincipalModel(
         tenant_id=body.tenant_id, name=body.name, type=body.type,
         created_at=datetime.now(UTC),
     )
     session.add(principal)
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"principal {body.name!r} already exists for this tenant",
+        ) from exc
     await session.commit()
     await session.refresh(principal)
     return PrincipalOut(
@@ -237,6 +267,7 @@ async def create_principal(
         tenant_id=principal.tenant_id,
         name=principal.name,
         type=principal.type,
+        internal_key=principal.internal_key,
     )
 
 
@@ -250,6 +281,21 @@ async def create_api_key(
     body: ApiKeyCreate,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> ApiKeyOut:
+    # Reject key issuance for internal (non-credentialable) principals
+    # (V2-BL-003B). The validation resolves the principal inside the caller's
+    # tenant context; a cross-tenant internal principal ID is not disclosed.
+    if body.principal_id is not None:
+        try:
+            await assert_principal_credentialable(
+                session,
+                tenant_id=body.tenant_id,
+                principal_id=body.principal_id,
+            )
+        except InternalPrincipalCredentialError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="API keys cannot be issued for this principal",
+            ) from exc
     plaintext = generate_api_key()
     parsed = parse_api_key(plaintext)
     assert parsed.key_id is not None  # new-format keys always carry a key_id
@@ -293,7 +339,8 @@ async def list_principals(
     )
     return [
         PrincipalOut(
-            id=p.id, tenant_id=p.tenant_id, name=p.name, type=p.type
+            id=p.id, tenant_id=p.tenant_id, name=p.name, type=p.type,
+            internal_key=p.internal_key,
         )
         for p in result.scalars()
     ]
