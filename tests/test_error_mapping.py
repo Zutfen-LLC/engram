@@ -146,8 +146,9 @@ async def test_remember_invalid_kind_returns_422(client):
 
 
 async def test_admin_principal_invalid_type_returns_422_check_violation(client):
-    """PrincipalCreate.type is a bare str — the DB CHECK constraint on
-    principals.type is the real gate against an invalid enum value."""
+    """PrincipalCreate.type is validated in Python (validate_principal_type)
+    against the allowed vocabulary, returning a 422 before the DB CHECK
+    constraint is reached (V2-BL-003B)."""
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     tenant_id = await _default_tenant_id()
@@ -156,9 +157,6 @@ async def test_admin_principal_invalid_type_returns_422_check_violation(client):
         json={"tenant_id": tenant_id, "name": f"bad-type-{uuid.uuid4().hex}", "type": "superadmin"},
     )
     assert response.status_code == 422
-    detail = response.json()["detail"]
-    assert isinstance(detail, dict)
-    assert detail["code"] == "check_violation"
 
 
 # ---- Foreign-key violations ----

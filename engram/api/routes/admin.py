@@ -252,14 +252,6 @@ async def create_principal(
         created_at=datetime.now(UTC),
     )
     session.add(principal)
-    try:
-        await session.flush()
-    except IntegrityError as exc:
-        await session.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"principal {body.name!r} already exists for this tenant",
-        ) from exc
     await session.commit()
     await session.refresh(principal)
     return PrincipalOut(

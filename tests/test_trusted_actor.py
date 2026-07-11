@@ -71,6 +71,20 @@ async def _clean_db():
     async with _test_engine.begin() as conn:
         await conn.execute(text("DELETE FROM item_events"))
         await conn.execute(text("DELETE FROM memory_items"))
+        # Delete api_keys before principals to avoid FK violation on
+        # api_keys_principal_id_fkey. Only delete test-created keys to avoid
+        # removing bootstrap keys that other tests may depend on.
+        await conn.execute(text("DELETE FROM api_keys WHERE label LIKE 'test-v2b3b-%'"))
+        # Also delete any api_keys referencing principals we're about to remove
+        # (internal/system principals created by prior test runs).
+        await conn.execute(
+            text(
+                "DELETE FROM api_keys WHERE principal_id IN ("
+                "  SELECT id FROM principals WHERE internal_key IS NOT NULL "
+                "  OR (type = 'system' AND tenant_id = (SELECT id FROM tenants WHERE slug = 'default'))"
+                ")"
+            )
+        )
         await conn.execute(text("DELETE FROM tenants WHERE slug != 'default'"))
         await conn.execute(
             text(
@@ -78,7 +92,6 @@ async def _clean_db():
                 "OR (type = 'system' AND tenant_id = (SELECT id FROM tenants WHERE slug = 'default'))"
             )
         )
-        await conn.execute(text("DELETE FROM api_keys WHERE label LIKE 'test-v2b3b-%'"))
     async with _test_engine.begin() as conn:
         await conn.execute(
             text(
@@ -539,13 +552,12 @@ async def test_concurrent_two_tenants_distinct_actors():
 # ===========================================================================
 
 
-async def test_admin_api_rejects_reserved_prefix_principal_name():
+async def test_admin_api_rejects_reserved_prefix_principal_name(monkeypatch: pytest.MonkeyPatch):
     if not await _db_ok():
         _require_db()
-    tenant_id, _ = await _default_tenant_principal()
-    app = create_app()
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    tenant_id, admin_pid = await _default_tenant_principal()
+    client = await _make_admin_client(tenant_id, admin_pid, monkeypatch)
+    async with client:
         resp = await client.post(
             "/v1/admin/principals",
             json={
@@ -557,13 +569,12 @@ async def test_admin_api_rejects_reserved_prefix_principal_name():
     assert resp.status_code == 422
 
 
-async def test_admin_api_allows_ordinary_system_named_principal():
+async def test_admin_api_allows_ordinary_system_named_principal(monkeypatch: pytest.MonkeyPatch):
     if not await _db_ok():
         _require_db()
-    tenant_id, _ = await _default_tenant_principal()
-    app = create_app()
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    tenant_id, admin_pid = await _default_tenant_principal()
+    client = await _make_admin_client(tenant_id, admin_pid, monkeypatch)
+    async with client:
         resp = await client.post(
             "/v1/admin/principals",
             json={"tenant_id": tenant_id, "name": "system", "type": "agent"},
@@ -574,13 +585,12 @@ async def test_admin_api_allows_ordinary_system_named_principal():
     assert body["type"] == "agent"
 
 
-async def test_admin_api_rejects_internal_key_in_request():
+async def test_admin_api_rejects_internal_key_in_request(monkeypatch: pytest.MonkeyPatch):
     if not await _db_ok():
         _require_db()
-    tenant_id, _ = await _default_tenant_principal()
-    app = create_app()
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    tenant_id, admin_pid = await _default_tenant_principal()
+    client = await _make_admin_client(tenant_id, admin_pid, monkeypatch)
+    async with client:
         resp = await client.post(
             "/v1/admin/principals",
             json={
@@ -593,13 +603,12 @@ async def test_admin_api_rejects_internal_key_in_request():
     assert resp.status_code == 422
 
 
-async def test_admin_api_rejects_invalid_principal_type():
+async def test_admin_api_rejects_invalid_principal_type(monkeypatch: pytest.MonkeyPatch):
     if not await _db_ok():
         _require_db()
-    tenant_id, _ = await _default_tenant_principal()
-    app = create_app()
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    tenant_id, admin_pid = await _default_tenant_principal()
+    client = await _make_admin_client(tenant_id, admin_pid, monkeypatch)
+    async with client:
         resp = await client.post(
             "/v1/admin/principals",
             json={"tenant_id": tenant_id, "name": "badtype", "type": "superuser"},
@@ -612,8 +621,17 @@ async def test_admin_api_rejects_invalid_principal_type():
 # ===========================================================================
 
 
-async def _make_admin_client(tenant_id: str, principal_id: str) -> AsyncClient:
-    """Build an ASGI client with the session override pointing at the test DB."""
+async def _make_admin_client(
+    tenant_id: str,
+    principal_id: str,
+    monkeypatch: pytest.MonkeyPatch | None = None,
+) -> AsyncClient:
+    """Build an ASGI client with the session override pointing at the test DB.
+
+    If ``monkeypatch`` is provided, also patches the db module's session
+    factories so the app shares the test event loop's engine (avoids asyncpg
+    cross-loop connection errors).
+    """
     app = create_app()
 
     async def _override_get_session():
@@ -627,16 +645,22 @@ async def _make_admin_client(tenant_id: str, principal_id: str) -> AsyncClient:
             yield session
 
     app.dependency_overrides[get_session] = _override_get_session
+    if monkeypatch is not None:
+        import engram.db as db_module
+
+        monkeypatch.setattr(db_module, "async_session_factory", _test_session_factory)
+        monkeypatch.setattr(db_module, "owner_session_factory", _test_session_factory)
+        monkeypatch.setattr(db_module, "read_session_factory", _test_session_factory)
     transport = ASGITransport(app=app)
     return AsyncClient(transport=transport, base_url="http://test")
 
 
-async def test_api_key_issuance_for_ordinary_agent_succeeds():
+async def test_api_key_issuance_for_ordinary_agent_succeeds(monkeypatch: pytest.MonkeyPatch):
     if not await _db_ok():
         _require_db()
     tenant_id, admin_pid = await _default_tenant_principal()
     agent_id = await _seed_agent_principal(tenant_id, "keytarget-agent")
-    client = await _make_admin_client(tenant_id, admin_pid)
+    client = await _make_admin_client(tenant_id, admin_pid, monkeypatch)
     async with client:
         resp = await client.post(
             "/v1/admin/api-keys",
@@ -649,7 +673,7 @@ async def test_api_key_issuance_for_ordinary_agent_succeeds():
     assert resp.status_code == 201, resp.text
 
 
-async def test_api_key_issuance_for_internal_principal_rejected():
+async def test_api_key_issuance_for_internal_principal_rejected(monkeypatch: pytest.MonkeyPatch):
     if not await _db_ok():
         _require_db()
     tenant_id, admin_pid = await _default_tenant_principal()
@@ -657,7 +681,7 @@ async def test_api_key_issuance_for_internal_principal_rejected():
     async with _test_session_factory() as session:
         internal_id = await resolve_trusted_system_actor(session, tenant_id)
         await session.commit()
-    client = await _make_admin_client(tenant_id, admin_pid)
+    client = await _make_admin_client(tenant_id, admin_pid, monkeypatch)
     async with client:
         resp = await client.post(
             "/v1/admin/api-keys",
@@ -686,10 +710,11 @@ async def test_api_key_issuance_for_internal_principal_rejected():
 # ===========================================================================
 
 
-async def test_new_format_key_for_internal_principal_fails_auth():
+async def test_new_format_key_for_internal_principal_fails_auth(monkeypatch: pytest.MonkeyPatch):
     if not await _db_ok():
         _require_db()
     import engram.auth as auth_mod
+    import engram.db as db_module
 
     tenant_id, _ = await _default_tenant_principal()
     async with _test_session_factory() as session:
@@ -700,27 +725,29 @@ async def test_new_format_key_for_internal_principal_fails_auth():
     )
     reset_principal_cache()
 
-    # Point auth at the test DB.
-    original = auth_mod._get_session_factory
-    auth_mod._get_session_factory = lambda: _test_session_factory  # type: ignore[assignment]
-    try:
-        app = create_app()
-        transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
-            resp = await client.get(
-                "/v1/workspaces",
-                headers={"Authorization": f"Bearer {plaintext}"},
-            )
-        assert resp.status_code == 401
-    finally:
-        auth_mod._get_session_factory = original  # type: ignore[assignment]
-        reset_principal_cache()
+    # Point auth and the app session factories at the test DB so the ASGI
+    # client shares the test event loop's engine.
+    monkeypatch.setattr(auth_mod, "_get_session_factory", lambda: _test_session_factory)
+    monkeypatch.setattr(db_module, "async_session_factory", _test_session_factory)
+    monkeypatch.setattr(db_module, "owner_session_factory", _test_session_factory)
+    monkeypatch.setattr(db_module, "read_session_factory", _test_session_factory)
+
+    app = create_app()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get(
+            "/v1/workspaces",
+            headers={"Authorization": f"Bearer {plaintext}"},
+        )
+    assert resp.status_code == 401
+    reset_principal_cache()
 
 
-async def test_legacy_key_for_internal_principal_fails_auth():
+async def test_legacy_key_for_internal_principal_fails_auth(monkeypatch: pytest.MonkeyPatch):
     if not await _db_ok():
         _require_db()
     import engram.auth as auth_mod
+    import engram.db as db_module
 
     tenant_id, _ = await _default_tenant_principal()
     async with _test_session_factory() as session:
@@ -731,20 +758,20 @@ async def test_legacy_key_for_internal_principal_fails_auth():
     )
     reset_principal_cache()
 
-    original = auth_mod._get_session_factory
-    auth_mod._get_session_factory = lambda: _test_session_factory  # type: ignore[assignment]
-    try:
-        app = create_app()
-        transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
-            resp = await client.get(
-                "/v1/workspaces",
-                headers={"Authorization": f"Bearer {plaintext}"},
-            )
-        assert resp.status_code == 401
-    finally:
-        auth_mod._get_session_factory = original  # type: ignore[assignment]
-        reset_principal_cache()
+    monkeypatch.setattr(auth_mod, "_get_session_factory", lambda: _test_session_factory)
+    monkeypatch.setattr(db_module, "async_session_factory", _test_session_factory)
+    monkeypatch.setattr(db_module, "owner_session_factory", _test_session_factory)
+    monkeypatch.setattr(db_module, "read_session_factory", _test_session_factory)
+
+    app = create_app()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get(
+            "/v1/workspaces",
+            headers={"Authorization": f"Bearer {plaintext}"},
+        )
+    assert resp.status_code == 401
+    reset_principal_cache()
 
 
 # ===========================================================================
@@ -925,7 +952,9 @@ async def test_tenant_isolation_distinct_internal_principals():
     assert row_b["internal_key"] == TRUSTED_REVIEW_INTERNAL_KEY
 
 
-async def test_tenant_isolation_api_key_cross_tenant_internal_non_disclosing():
+async def test_tenant_isolation_api_key_cross_tenant_internal_non_disclosing(
+    monkeypatch: pytest.MonkeyPatch,
+):
     if not await _db_ok():
         _require_db()
     tenant_a, admin_a = await _default_tenant_principal()
@@ -939,7 +968,7 @@ async def test_tenant_isolation_api_key_cross_tenant_internal_non_disclosing():
     # RLS), so the cross-tenant principal is not found — no disclosure that it
     # is internal. The key point: no 409 "internal principal" error that would
     # disclose the cross-tenant principal's internal status.
-    client = await _make_admin_client(tenant_a, admin_a)
+    client = await _make_admin_client(tenant_a, admin_a, monkeypatch)
     async with client:
         resp = await client.post(
             "/v1/admin/api-keys",
