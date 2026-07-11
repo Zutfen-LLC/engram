@@ -1100,6 +1100,75 @@ async def test_own_noise_feedback_does_not_block():
     assert result.skipped_dispute == 0
 
 
+@pytest.mark.parametrize(
+    ("historical", "current", "blocked"),
+    [("noise", "useful", False), ("useful", "noise", True)],
+)
+async def test_path_a_uses_only_current_canonical_feedback(
+    historical: str, current: str, blocked: bool
+):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    tenant_id, principal_id = await _default_tenant_principal()
+    other_id = await _insert_principal(
+        tenant_id, f"canonical-feedback-{historical}-{current}"
+    )
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content=f"historical {historical} current {current}",
+        memory_confidence=0.9,
+        created_at=_default_now() - timedelta(hours=100),
+    )
+    old_id, new_id = str(uuid.uuid4()), str(uuid.uuid4())
+    replacement_time = _default_now() - timedelta(minutes=1)
+    async with _test_session_factory() as session:
+        await session.execute(
+            text(
+                "INSERT INTO feedback_events "
+                "(id, tenant_id, item_id, principal_id, verdict, created_at, superseded_at) "
+                "VALUES (:id, :tid, :iid, :pid, :verdict, :created, :superseded)"
+            ),
+            {
+                "id": old_id,
+                "tid": tenant_id,
+                "iid": item_id,
+                "pid": other_id,
+                "verdict": historical,
+                "created": replacement_time - timedelta(minutes=1),
+                "superseded": replacement_time,
+            },
+        )
+        await session.execute(
+            text(
+                "INSERT INTO feedback_events "
+                "(id, tenant_id, item_id, principal_id, verdict, created_at, "
+                "replaces_feedback_event_id) "
+                "VALUES (:id, :tid, :iid, :pid, :verdict, :created, :old_id)"
+            ),
+            {
+                "id": new_id,
+                "tid": tenant_id,
+                "iid": item_id,
+                "pid": other_id,
+                "verdict": current,
+                "created": replacement_time,
+                "old_id": old_id,
+            },
+        )
+        await session.commit()
+
+    async with _test_session_factory() as session:
+        await session.execute(
+            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
+        )
+        result = await auto_promote_proposed_memories(session)
+
+    assert result.skipped_dispute == int(blocked)
+    assert result.promoted == int(not blocked)
+    assert await _status_of(item_id) == ("proposed" if blocked else "active")
+
+
 # ---- promotion-time conflict recheck + top-k candidates (F13) ----
 
 
