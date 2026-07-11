@@ -8,6 +8,7 @@ import re
 import time
 from collections import OrderedDict
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any, cast
 from uuid import UUID
 
@@ -179,15 +180,15 @@ def invalidate_vocab_cache(tenant_id: UUID | str | None = None) -> None:
 
 async def _load_rules_cached(
     session: AsyncSession, tenant_id: UUID
-) -> list[ClassificationRule]:
+) -> list[RuleSnapshot]:
     cached = _cache_get(_rules_cache, tenant_id)
     if cached is not None:
-        return cast(list[ClassificationRule], cached)
+        return cast(list[RuleSnapshot], cached)
     async with _cache_lock:
         # Re-check under the lock to avoid duplicate loads from racing callers.
         cached = _cache_get(_rules_cache, tenant_id)
         if cached is not None:
-            return cast(list[ClassificationRule], cached)
+            return cast(list[RuleSnapshot], cached)
         rules = await _load_rules(session, tenant_id)
         _cache_put(_rules_cache, tenant_id, rules)
         return rules
@@ -208,7 +209,20 @@ async def _load_vocab_cached(
         return vocab
 
 
-async def _load_rules(session: AsyncSession, tenant_id: UUID) -> list[ClassificationRule]:
+@dataclass(frozen=True)
+class RuleSnapshot:
+    """Session-independent classification rule safe for the process cache."""
+
+    name: str
+    rule_type: str
+    pattern: str
+    target_kind: str | None
+    target_wing: str | None
+    target_room: str | None
+    priority: int
+
+
+async def _load_rules(session: AsyncSession, tenant_id: UUID) -> list[RuleSnapshot]:
     stmt = (
         select(ClassificationRule)
         .where(
@@ -217,7 +231,19 @@ async def _load_rules(session: AsyncSession, tenant_id: UUID) -> list[Classifica
         )
         .order_by(ClassificationRule.priority.asc(), ClassificationRule.created_at.asc())
     )
-    return list((await session.execute(stmt)).scalars().all())
+    rows = (await session.execute(stmt)).scalars().all()
+    return [
+        RuleSnapshot(
+            name=row.name,
+            rule_type=row.rule_type,
+            pattern=row.pattern,
+            target_kind=row.target_kind,
+            target_wing=row.target_wing,
+            target_room=row.target_room,
+            priority=row.priority,
+        )
+        for row in rows
+    ]
 
 
 async def _load_vocab(
@@ -283,11 +309,11 @@ def _merge_vocab(*groups: Iterable[Any]) -> list[str]:
 
 def _classify_rules(
     content: str,
-    rules: list[ClassificationRule],
+    rules: list[RuleSnapshot],
     taxonomy: list[str],
 ) -> ClassificationResult:
     matched_rules: list[str] = []
-    matched_target_rules: list[ClassificationRule] = []
+    matched_target_rules: list[RuleSnapshot] = []
     skip_rules: list[str] = []
 
     for rule in rules:
@@ -361,7 +387,7 @@ def _classify_rules(
 
 
 def _pick_field(
-    rules: list[ClassificationRule],
+    rules: list[RuleSnapshot],
     field_name: str,
     taxonomy: list[str] | None = None,
 ) -> str | None:
@@ -385,7 +411,7 @@ def _build_prompt(
     taxonomy: list[str],
     wings: list[str],
     rooms: list[str],
-    rules: list[ClassificationRule],
+    rules: list[RuleSnapshot],
     rule_result: ClassificationResult,
 ) -> str:
     rules_payload = [
