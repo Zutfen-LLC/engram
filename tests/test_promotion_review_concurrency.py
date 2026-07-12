@@ -537,22 +537,41 @@ async def test_promotion_first_then_review_resumes_from_active(proof: dict[str, 
 # ===========================================================================
 
 
-async def test_competing_activation_one_effective_transition(proof: dict[str, Any]) -> None:
+@pytest.mark.parametrize(
+    "winner",
+    ["promotion_wins", "review_wins"],
+    ids=["promotion_wins", "review_wins"],
+)
+async def test_competing_activation_one_effective_transition(
+    proof: dict[str, Any], winner: str
+) -> None:
     """Path A promotion and a human ``proposed -> active`` review decision race
-    on the same item. Whichever wins the row lock, the final state is active,
-    exactly one effective ``proposed -> active`` transition occurs, exactly one
-    corresponding event persists, the losing operation is a truthful skip or
-    no-op, and attribution identifies the actual winning path. Promotion's
-    result accounting matches whether promotion won.
+    on the same item. Both lock orders are exercised (parametrized by winner),
+    so the winner-agnostic invariants below are proven for each:
 
-    Promotion is paused at its UPDATE (holding the row lock); the review
-    request waits behind it; promotion commits first and wins. The assertions
-    are winner-agnostic — they hold regardless of which path won — and also
-    verify that promotion's accounting matches the actual outcome."""
+      - ``promotion_wins``: promotion is paused at its UPDATE (holding the row
+        lock); the review request waits behind it; promotion commits first.
+      - ``review_wins``: the review request is paused at its UPDATE (holding the
+        row lock); promotion's ``FOR UPDATE SKIP LOCKED`` skips the locked row
+        and completes with ``promoted == 0``; the review then commits first.
+
+    In both cases: the final state is ``active``, exactly one effective
+    ``proposed -> active`` transition occurs, exactly one corresponding event
+    persists, the losing operation is a truthful skip or no-op, attribution
+    identifies the actual winning path, and promotion's result accounting
+    matches whether promotion won."""
     p = proof
-    item_id = await p["insert_proposed"](content="competing-activation")
+    item_id = await p["insert_proposed"](content=f"competing-activation-{winner}")
 
-    trigger = f"promo_pause_{p['tag']}"
+    if winner == "promotion_wins":
+        # Pause promotion's UPDATE so it holds the FOR UPDATE SKIP LOCKED row
+        # lock without committing — the window in which the review waits.
+        trigger = f"promo_pause_{p['tag']}"
+    else:
+        # Pause the review's UPDATE so it holds the SELECT ... FOR UPDATE row
+        # lock without committing — the window in which promotion skips it.
+        trigger = f"review_pause_{p['tag']}"
+
     async with p["owner"].begin() as conn:
         await conn.execute(
             text(
@@ -560,11 +579,17 @@ async def test_competing_activation_one_effective_transition(proof: dict[str, An
                 f"BEGIN PERFORM pg_advisory_xact_lock({p['pause_key']}); RETURN NEW; END $$"
             )
         )
+        # The trigger fires on the paused operation's UPDATE (review for
+        # review_wins, promotion for promotion_wins) — both route their
+        # transition through an UPDATE OF review_status on this item. Scoped
+        # to this item only so a concurrent batch sweep's other rows are
+        # unaffected.
         await conn.execute(
             text(
                 f"CREATE TRIGGER {trigger} BEFORE UPDATE OF review_status "
                 f"ON memory_items FOR EACH ROW WHEN (OLD.tenant_id = '{p['tenant']}' "
-                f"AND OLD.review_status = 'proposed') EXECUTE FUNCTION {trigger}()"
+                f"AND OLD.review_status = 'proposed' AND OLD.id = '{item_id}') "
+                f"EXECUTE FUNCTION {trigger}()"
             )
         )
 
@@ -575,37 +600,46 @@ async def test_competing_activation_one_effective_transition(proof: dict[str, An
         coordinator_pid = await coordinator.scalar(text("SELECT pg_backend_pid()"))
         await coordinator.execute(text("SELECT pg_advisory_lock(:key)"), {"key": p["pause_key"]})
 
-        promo_task = asyncio.create_task(p["promote"]())
-        await _await_blocked_on(coordinator, coordinator_pid, 1)
-
         async def submit_review() -> Any:
             async with AsyncClient(
                 transport=ASGITransport(app=create_app()), base_url="http://test"
             ) as client:
                 return await client.post(
                     f"/v1/items/{item_id}/review",
-                    json={"review_status": "active", "reason": "human activation"},
+                    json={"review_status": "active", "reason": f"human activation ({winner})"},
                     headers=_headers(p, "user_review"),
                 )
 
-        review_task = asyncio.create_task(submit_review())
-        # Prove the review request waits behind promotion's row lock.
-        promo_pid_row = (
-            await coordinator.execute(
-                text(
-                    "SELECT pid FROM pg_stat_activity"
-                    " WHERE :coordinator_pid = ANY(pg_blocking_pids(pid))"
-                    " AND wait_event_type = 'Lock' AND wait_event = 'advisory'"
-                ),
-                {"coordinator_pid": coordinator_pid},
-            )
-        ).first()
-        assert promo_pid_row is not None
-        promo_pid = int(promo_pid_row[0])
-        await _await_blocked_on_pid(coordinator, promo_pid, 1)
-        assert not review_task.done()
+        if winner == "promotion_wins":
+            # Start promotion first; it locks the row and pauses at its UPDATE.
+            promo_task = asyncio.create_task(p["promote"]())
+            await _await_blocked_on(coordinator, coordinator_pid, 1)
+            # The review request waits behind promotion's row lock.
+            review_task = asyncio.create_task(submit_review())
+            promo_pid_row = (
+                await coordinator.execute(
+                    text(
+                        "SELECT pid FROM pg_stat_activity"
+                        " WHERE :coordinator_pid = ANY(pg_blocking_pids(pid))"
+                        " AND wait_event_type = 'Lock' AND wait_event = 'advisory'"
+                    ),
+                    {"coordinator_pid": coordinator_pid},
+                )
+            ).first()
+            assert promo_pid_row is not None, "promotion did not reach the paused UPDATE"
+            promo_pid = int(promo_pid_row[0])
+            await _await_blocked_on_pid(coordinator, promo_pid, 1)
+            assert not review_task.done(), "review must still be waiting behind promotion"
+        else:
+            # Start the review first; it takes FOR UPDATE and pauses at its
+            # UPDATE behind the advisory lock — holding the row lock.
+            review_task = asyncio.create_task(submit_review())
+            await _await_blocked_on(coordinator, coordinator_pid, 1)
+            # Promotion's FOR UPDATE SKIP LOCKED skips the review-locked row, so
+            # it completes immediately with nothing promoted (no overlap wait).
+            promo_task = asyncio.create_task(p["promote"]())
 
-        # Release: promotion commits proposed -> active first (it won the lock).
+        # Release the advisory lock so the paused operation commits.
         await coordinator.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": p["pause_key"]})
         promo_result = await asyncio.wait_for(promo_task, timeout=10)
         review_resp = await asyncio.wait_for(review_task, timeout=10)
@@ -637,20 +671,128 @@ async def test_competing_activation_one_effective_transition(proof: dict[str, An
     assert len(activation_events) == 1, [dict(e) for e in events]
     winning_event = activation_events[0]
 
-    # Promotion won the lock here, so its accounting must match: promoted == 1,
-    # the item is in promoted_ids, and the winning event is the auto-promotion.
-    assert promo_result.promoted == 1
-    assert item_id in promo_result.promoted_ids
-    assert "auto-promotion" in (winning_event["reason"] or "")
-    assert winning_event["actor_principal_id"] != str(p["actors"]["user_review"])
+    if winner == "promotion_wins":
+        # Promotion won the lock: its accounting reports the transition, and the
+        # winning event is the auto-promotion. The losing review is a truthful
+        # no-op (it found the item already active -> 200, event=None).
+        assert promo_result.promoted == 1
+        assert item_id in promo_result.promoted_ids
+        assert "auto-promotion" in (winning_event["reason"] or "")
+        assert winning_event["actor_principal_id"] != str(p["actors"]["user_review"])
+        assert review_resp.status_code == 200, review_resp.text
+        assert review_resp.json()["event"] is None
+    else:
+        # Review won the lock: promotion's SKIP LOCKED skipped the row, so its
+        # accounting reports nothing. The winning event is the human review
+        # (actor = authenticated reviewer), and promotion wrote no event.
+        assert promo_result.promoted == 0
+        assert item_id not in promo_result.promoted_ids
+        assert "auto-promotion" not in (winning_event["reason"] or "")
+        assert winning_event["actor_principal_id"] == str(p["actors"]["user_review"])
+        assert review_resp.status_code == 200, review_resp.text
+        assert review_resp.json()["event"] is not None
 
-    # The losing operation (review) is a truthful no-op: it requested
-    # proposed -> active but found the item already active, so it returns the
-    # canonical no-op response (200 with event=None) and writes no second event.
-    assert review_resp.status_code == 200, review_resp.text
-    assert review_resp.json()["event"] is None
     # No second activation event and no event with an incorrect old state.
     assert len(events) == 1
+
+
+async def test_review_first_activation_then_promotion_skips(proof: dict[str, Any]) -> None:
+    """A human ``proposed -> active`` review owns the row lock (paused at its
+    UPDATE) before promotion can mutate the item. Promotion's
+    ``FOR UPDATE SKIP LOCKED`` skips the locked row (``promoted == 0``, item
+    absent from ``promoted_ids``). After the review commits, the final state is
+    ``active`` with exactly one ``proposed -> active`` event whose actor is the
+    authenticated reviewer — and no auto-promotion event. This is the
+    review-first activation case proved through genuine overlap, distinct from
+    the parametrized competing-activation test (which exercises both orders but
+    asserts on the race outcome) and from the review-first disputed/rejected
+    tests (which assert on a non-active decision)."""
+    p = proof
+    item_id = await p["insert_proposed"](content="review-first-activation")
+
+    # Pause the review's UPDATE so it holds the row lock (FOR UPDATE already
+    # taken) without committing — this is the window in which promotion runs.
+    trigger = f"review_pause_{p['tag']}"
+    async with p["owner"].begin() as conn:
+        await conn.execute(
+            text(
+                f"CREATE FUNCTION {trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ "
+                f"BEGIN PERFORM pg_advisory_xact_lock({p['pause_key']}); RETURN NEW; END $$"
+            )
+        )
+        await conn.execute(
+            text(
+                f"CREATE TRIGGER {trigger} BEFORE UPDATE OF review_status "
+                f"ON memory_items FOR EACH ROW WHEN (OLD.tenant_id = '{p['tenant']}' "
+                f"AND OLD.review_status = 'proposed' AND OLD.id = '{item_id}') "
+                f"EXECUTE FUNCTION {trigger}()"
+            )
+        )
+
+    coordinator = await p["owner"].connect()
+    review_task: asyncio.Task[Any] | None = None
+    try:
+        coordinator_pid = await coordinator.scalar(text("SELECT pg_backend_pid()"))
+        await coordinator.execute(text("SELECT pg_advisory_lock(:key)"), {"key": p["pause_key"]})
+
+        async def submit_review() -> Any:
+            async with AsyncClient(
+                transport=ASGITransport(app=create_app()), base_url="http://test"
+            ) as client:
+                return await client.post(
+                    f"/v1/items/{item_id}/review",
+                    json={"review_status": "active", "reason": "review first activation"},
+                    headers=_headers(p, "user_review"),
+                )
+
+        review_task = asyncio.create_task(submit_review())
+        # Prove the review request is genuinely blocked behind the advisory
+        # lock — it holds the row's FOR UPDATE lock at this point.
+        await _await_blocked_on(coordinator, coordinator_pid, 1)
+
+        # Promotion runs while review holds the row lock. SKIP LOCKED skips the
+        # locked row, so promotion completes immediately with nothing promoted.
+        result = await asyncio.wait_for(p["promote"](), timeout=10)
+        assert result.promoted == 0
+        assert item_id not in result.promoted_ids
+        assert result.scanned == 0  # the locked row is skipped, not scanned
+
+        # Release the advisory lock so review commits its activation.
+        await coordinator.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": p["pause_key"]})
+        review_resp = await asyncio.wait_for(review_task, timeout=10)
+        assert review_resp.status_code == 200, review_resp.text
+    finally:
+        if review_task is not None and not review_task.done():
+            review_task.cancel()
+            await asyncio.gather(review_task, return_exceptions=True)
+        if coordinator.in_transaction():
+            await coordinator.rollback()
+        await coordinator.execute(text("SELECT pg_advisory_unlock_all()"))
+        await coordinator.close()
+        async with p["owner"].begin() as conn:
+            await conn.execute(text(f"DROP TRIGGER IF EXISTS {trigger} ON memory_items"))
+            await conn.execute(text(f"DROP FUNCTION IF EXISTS {trigger}()"))
+
+    st = await p["state"](item_id)
+    # Final state is the review activation; promotion did not overwrite it.
+    assert st["item"]["review_status"] == "active"
+    events = st["events"]
+    # Exactly one proposed -> active event; its actor is the authenticated
+    # reviewer, not the auto-promotion internal actor.
+    activation_events = [
+        e for e in events
+        if e["event_type"] == "review_change"
+        and e["field_name"] == "review_status"
+        and e["old_value"] == "proposed"
+        and e["new_value"] == "active"
+    ]
+    assert len(activation_events) == 1, [dict(e) for e in events]
+    assert activation_events[0]["actor_principal_id"] == str(p["actors"]["user_review"])
+    # No auto-promotion event was written.
+    auto_events = [
+        e for e in st["events"] if "auto-promotion" in (e["reason"] or "")
+    ]
+    assert auto_events == []
 
 
 # ===========================================================================
