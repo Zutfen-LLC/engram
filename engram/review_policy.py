@@ -47,6 +47,16 @@ def can_human_verify(principal_type: str) -> bool:
     return principal_type in {"user", "admin"}
 
 
+def can_resolve_conflict(principal_type: str) -> bool:
+    """Whether this authenticated principal may adjudicate a conflict.
+
+    API scope only admits an attempted operation.  Conflict decisions remain
+    human-governed, so credentialed agents and ordinary system principals are
+    not authorized even when their key carries ``review`` or ``admin`` scope.
+    """
+    return principal_type in {"user", "admin"}
+
+
 _STATUSES: frozenset[str] = frozenset(
     {"proposed", "active", "disputed", "rejected", "archived"}
 )

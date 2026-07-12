@@ -8,7 +8,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select, text, update
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -26,6 +26,7 @@ from engram.models import MemoryItem
 from engram.review_policy import (
     TransitionOutcome,
     can_human_verify,
+    can_resolve_conflict,
     evaluate_transition,
     required_scope_for_review_transition,
 )
@@ -90,8 +91,13 @@ class ConflictListResponse(BaseModel):
 
 class ConflictResolutionResponse(BaseModel):
     id: UUID
-    conflict_resolution_status: str
+    counterpart_id: UUID
+    status: Literal["resolved", "unchanged"]
+    conflict_resolution_status: Literal["accepted", "rejected", "merged"]
     resolved_at: datetime | None = None
+    resolved_by: UUID | None = None
+    resolver_attribution_status: Literal["recorded", "legacy_unknown"]
+    event: dict[str, Any] | None = None
 
 
 class StaleItem(BaseModel):
@@ -511,64 +517,128 @@ async def resolve_conflict(
     req: ConflictResolution,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> ConflictResolutionResponse:
-    """Resolve a conflict (accept/reject/merge).
-
-    Sets ``conflict_resolution_status`` and writes an ``item_event`` audit row
-    whose actor is always the authenticated caller (previously this event was
-    written with no actor at all). Returns 422 if the item has no unresolved
-    conflict.
-    """
+    """Human adjudication of conflict metadata, serialized over the item pair."""
     tenant_id = await _resolve_tenant_id(session)
-    principal_id, _ = await _resolve_principal(session, tenant_id)
+    principal_id, principal_type = await _resolve_principal(session, tenant_id)
+
+    # This first eligible read identifies the candidate pair only.  The locked
+    # rows below are the mutation authority.
     item_data = await _require_eligible_item(
         session, item_id, tenant_id=tenant_id, principal_id=principal_id
     )
     counterpart_id = item_data.get("conflicts_with_item_id")
-    if item_data.get("conflict_resolution_status") != "unresolved" or counterpart_id is None:
-        raise HTTPException(
-            status_code=422, detail="item has no unresolved conflict to resolve"
+    if counterpart_id is None:
+        raise HTTPException(status_code=422, detail="item has no conflict to resolve")
+    candidate_counterpart_id = UUID(str(counterpart_id))
+    if candidate_counterpart_id == item_id:
+        raise HTTPException(status_code=409, detail="conflict changed; retry")
+
+    pair_ids = sorted((item_id, candidate_counterpart_id), key=str)
+    pair_stmt = (
+        select(MemoryItem)
+        .where(
+            MemoryItem.id.in_(pair_ids),
+            MemoryItem.tenant_id == tenant_id,
+            eligibility_expression(principal_id),
         )
-    await _require_eligible_item(
-        session,
-        UUID(str(counterpart_id)),
-        tenant_id=tenant_id,
-        principal_id=principal_id,
+        .order_by(MemoryItem.id)
+        .with_for_update()
     )
+    locked_items = list((await session.execute(pair_stmt)).scalars().all())
+    if len(locked_items) != 2:
+        raise HTTPException(status_code=404, detail="Item not found")
+    locked_by_id = {row.id: row for row in locked_items}
+    target = locked_by_id.get(item_id)
+    counterpart = locked_by_id.get(candidate_counterpart_id)
+    if target is None or counterpart is None:
+        raise HTTPException(status_code=404, detail="Item not found")
+    if (
+        target.tenant_id != tenant_id
+        or counterpart.tenant_id != tenant_id
+        or target.conflicts_with_item_id is None
+        or target.conflicts_with_item_id != candidate_counterpart_id
+        or target.id == target.conflicts_with_item_id
+    ):
+        raise HTTPException(status_code=409, detail="conflict changed; retry")
+
+    # Both resources have been resolved before actor-class authorization is
+    # disclosed. Scope admission remains the route dependency above.
+    if not can_resolve_conflict(principal_type):
+        raise HTTPException(
+            status_code=403, detail="principal type may not resolve conflicts"
+        )
     actor, on_behalf_of = await _resolve_actor_and_delegation(
         session, tenant_id=tenant_id, requested_on_behalf_of=req.on_behalf_of_principal_id
     )
+    if on_behalf_of is not None:
+        represented_internal_key = (
+            await session.execute(
+                text("SELECT internal_key FROM principals WHERE id = :pid"),
+                {"pid": str(on_behalf_of)},
+            )
+        ).scalar_one_or_none()
+        if represented_internal_key is not None:
+            raise HTTPException(status_code=404, detail="principal not found")
 
-    old_status = str(item_data["conflict_resolution_status"])
-    resolved_at = func.now()
+    current_status = target.conflict_resolution_status
+    if current_status in {"accepted", "rejected", "merged"}:
+        if current_status != req.resolution:
+            raise HTTPException(status_code=409, detail="conflict is already resolved")
+        return ConflictResolutionResponse(
+            id=item_id,
+            counterpart_id=candidate_counterpart_id,
+            status="unchanged",
+            conflict_resolution_status=req.resolution,
+            resolved_at=target.conflict_resolved_at,
+            resolved_by=target.conflict_resolved_by,
+            resolver_attribution_status=(
+                "recorded" if target.conflict_resolved_by is not None else "legacy_unknown"
+            ),
+            event=None,
+        )
+    if current_status != "unresolved":
+        raise HTTPException(status_code=409, detail="conflict changed; retry")
 
-    await session.execute(
+    resolved_at = _now_dt()
+    update_result = await session.execute(
         update(MemoryItem)
-        .where(MemoryItem.id == item_id)
+        .where(
+            MemoryItem.id == item_id,
+            MemoryItem.tenant_id == tenant_id,
+            MemoryItem.conflict_resolution_status == "unresolved",
+            MemoryItem.conflicts_with_item_id == candidate_counterpart_id,
+        )
         .values(
             conflict_resolution_status=req.resolution,
+            conflict_resolved_by=actor,
             conflict_resolved_at=resolved_at,
         )
+        .returning(MemoryItem.id)
     )
-    await _insert_item_event(
+    if update_result.scalar_one_or_none() is None:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="conflict changed; retry")
+    event = await _insert_item_event(
         session,
         item_id=item_id,
         event_type="conflict_resolution",
         field_name="conflict_resolution_status",
-        old_value=old_status,
+        old_value="unresolved",
         new_value=req.resolution,
         actor_principal_id=actor,
         on_behalf_of_principal_id=on_behalf_of,
         reason=req.reason,
     )
     await session.commit()
-
-    refreshed = await session.execute(
-        select(MemoryItem.conflict_resolved_at).where(MemoryItem.id == item_id)
-    )
     return ConflictResolutionResponse(
         id=item_id,
+        counterpart_id=candidate_counterpart_id,
+        status="resolved",
         conflict_resolution_status=req.resolution,
-        resolved_at=refreshed.scalar_one(),
+        resolved_at=resolved_at,
+        resolved_by=actor,
+        resolver_attribution_status="recorded",
+        event=event,
     )
 
 

@@ -38,6 +38,7 @@ from engram.review_policy import (
     TransitionOutcome,
     TrustedReviewOperation,
     can_human_verify,
+    can_resolve_conflict,
     evaluate_transition,
 )
 
@@ -79,6 +80,21 @@ STRUCTURALLY_INVALID_PAIRS: frozenset[tuple[str, str]] = (
 HUMAN_TYPES = ("user", "admin")
 NON_HUMAN_TYPES = ("agent", "system")
 ALL_PRINCIPAL_TYPES = (*HUMAN_TYPES, *NON_HUMAN_TYPES)
+
+
+@pytest.mark.parametrize(
+    ("principal_type", "expected"),
+    [
+        ("user", True),
+        ("admin", True),
+        ("agent", False),
+        ("system", False),
+        ("unknown", False),
+        ("", False),
+    ],
+)
+def test_conflict_resolution_actor_policy(principal_type: str, expected: bool) -> None:
+    assert can_resolve_conflict(principal_type) is expected
 
 
 def test_module_transition_set_matches_expected_matrix() -> None:
