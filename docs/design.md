@@ -718,7 +718,18 @@ being inferred or backfilled.
 > overwrites a human review decision (it demotes only `active -> proposed`,
 > preserves `proposed`/`disputed`, and skips `rejected`/`archived`), never
 > silently replaces a different existing conflict relationship, and treats an
-> identical unresolved relationship as an event-free no-op. `DEDUP` and
+> identical unresolved relationship as an event-free no-op. The locked
+> counterpart must remain "live and suitable" for the detected relationship —
+> specifically, it must still satisfy `detect_conflicts`'s current-state
+> eligibility predicate: `review_status = 'active'`, `valid_to IS NULL`, and
+> `superseded_by IS NULL`. A human review transition on the counterpart
+> (`active -> rejected` / `disputed` / `archived`) may land between detection
+> and the pair lock without touching `valid_to` or `superseded_by`, so the
+> active review state is rechecked explicitly under the lock; a non-active
+> counterpart produces a mutation-free, event-free skip (the worker does not
+> flag the job item against a counterpart conflict detection would no longer
+> return). This revalidates the detector's database eligibility facts from
+> the locked rows; it is not a full detector re-execution. `DEDUP` and
 > `AUTO_SUPERSEDE` are separate writers and remain out of scope for this
 > serialization slice.
 
