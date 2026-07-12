@@ -29,6 +29,22 @@ promotion-time conflict recheck get a ``conflict_resolution`` event and are
 marked ``conflict_resolution_status='unresolved'`` so a later scan doesn't
 silently re-attempt (and re-log) the same recheck.
 
+Serialization (P0-FIX-004A): auto-promotion and the caller-facing review
+endpoint (``POST /v1/items/{item_id}/review``) both mutate the same item's
+``review_status``. Promotion obtains mutation authority over each candidate
+with ``SELECT ... FOR UPDATE SKIP LOCKED`` before evaluating any gate that can
+lead to a mutation. A row locked by a concurrent review is skipped this sweep
+(not promoted, not counted, reconsidered later if still eligible) rather than
+blocking the whole batch. The final ``proposed -> active`` (and conflict-marker)
+update is guarded against the expected state (proposed / live / not superseded)
+with ``RETURNING``; a zero-row guarded update is a skip or concurrent-state
+outcome, never permission to write an event. The state transition and its event
+share one transaction, and an event is written only for a row the guarded
+update actually transitioned. This allows either operation to win the lock while
+preserving a valid serial history: a review that commits first is observed by
+promotion (which then skips without overwriting it); a promotion that commits
+first leaves the review to re-evaluate from the committed ``active`` state.
+
 Invocation — three entry points, all sharing this one service function so the
 gates can never drift apart:
   - lazy, bounded, tenant-scoped: ``maybe_auto_promote_for_startup_recall``,
@@ -275,8 +291,14 @@ async def auto_promote_proposed_memories(
 
     age_cutoff = effective_now - timedelta(hours=min_age_hours)
 
-    # Fetch candidates; filter confidence/age/conflict in Python so each skip
-    # reason is recorded distinctly.
+    # Fetch candidates WITH row locks (P0-FIX-004A). ``FOR UPDATE SKIP LOCKED``
+    # is the mutation authority: a row currently locked by a concurrent review
+    # is skipped this sweep (reconsidered later if still eligible) rather than
+    # blocking the whole batch. The values read here are the locked, current
+    # values — the gate evaluation below is revalidation under the lock, not a
+    # stale-snapshot check. A skipped locked row is absent from ``scanned`` and
+    # from every result counter: this invocation did not examine it.
+    dialect_name = session.bind.dialect.name if session.bind is not None else None
     stmt = (
         select(MemoryItem)
         .where(
@@ -286,6 +308,8 @@ async def auto_promote_proposed_memories(
         )
         .order_by(MemoryItem.created_at.asc())
     )
+    if dialect_name == "postgresql":
+        stmt = stmt.with_for_update(skip_locked=True)
     if limit is not None:
         stmt = stmt.limit(limit)
 
@@ -295,6 +319,11 @@ async def auto_promote_proposed_memories(
     to_promote: list[MemoryItem] = []
     blocked_by_conflict: list[tuple[MemoryItem, PromotionConflictCheck]] = []
     for item in candidates:
+        # Revalidation under the row lock — confirm the locked state still
+        # satisfies every Path A gate before any mutation decision. A
+        # concurrently reviewed row that lost the lock race is already absent
+        # from ``candidates`` (SKIP LOCKED); these checks guard the remaining
+        # gates against the locked snapshot.
         # Exclude superseded/terminal states defensively (valid_to IS NULL can
         # coexist with superseded_by transiently during supersession writes).
         if item.superseded_by is not None:
@@ -334,14 +363,28 @@ async def auto_promote_proposed_memories(
     if blocked_by_conflict:
         for item, check in blocked_by_conflict:
             old_conflict_status = item.conflict_resolution_status
-            await session.execute(
+            # Guarded: only mark conflict metadata on a row that is still a
+            # live proposed candidate under our lock. RETURNING confirms the
+            # transition; a zero-row result means the row is no longer
+            # eligible and no event is written.
+            blocking_result = await session.execute(
                 update(MemoryItem)
-                .where(MemoryItem.id == item.id)
+                .where(
+                    MemoryItem.id == item.id,
+                    MemoryItem.tenant_id == tenant_id,
+                    MemoryItem.review_status == "proposed",
+                    MemoryItem.valid_to.is_(None),
+                    MemoryItem.superseded_by.is_(None),
+                )
                 .values(
                     conflict_resolution_status="unresolved",
                     conflicts_with_item_id=check.conflicting_item_id,
                 )
+                .returning(MemoryItem.id),
+                execution_options={"synchronize_session": False},
             )
+            if blocking_result.scalar_one_or_none() is None:
+                continue
             session.add(
                 ItemEvent(
                     item_id=item.id,
@@ -373,30 +416,52 @@ async def auto_promote_proposed_memories(
             if not decision.allowed:
                 raise RuntimeError("review policy rejected trusted Path A promotion")
         promote_ids = [item.id for item in to_promote]
-        await session.execute(
+        # Guarded promotion update (P0-FIX-004A): the WHERE clause re-checks
+        # the expected state (proposed, live, not superseded) even though we
+        # hold the row lock, so a zero-row result is a skip or concurrent-state
+        # outcome — never permission to write an event. RETURNING reports
+        # exactly which rows actually transitioned; events and result counts
+        # are derived solely from that set.
+        promotion_result = await session.execute(
             update(MemoryItem)
-            .where(MemoryItem.id.in_(promote_ids))
-            .values(review_status="active")
-        )
-        reason = (
-            f"auto-promotion Path A ({source}): memory_confidence >= {threshold} "
-            f"and age >= {min_age_hours}h, no unresolved conflict, no external "
-            "dispute event, promotion-time conflict recheck clear"
-        )
-        for item in to_promote:
-            session.add(
-                ItemEvent(
-                    item_id=item.id,
-                    event_type="review_change",
-                    field_name="review_status",
-                    old_value="proposed",
-                    new_value="active",
-                    actor_principal_id=trusted_actor_id,
-                    reason=reason,
-                )
+            .where(
+                MemoryItem.tenant_id == tenant_id,
+                MemoryItem.id.in_(promote_ids),
+                MemoryItem.review_status == "proposed",
+                MemoryItem.valid_to.is_(None),
+                MemoryItem.superseded_by.is_(None),
             )
-        result.promoted = len(to_promote)
-        result.promoted_ids = promote_ids
+            .values(review_status="active")
+            .returning(MemoryItem.id),
+            execution_options={"synchronize_session": False},
+        )
+        actually_promoted: set[uuid.UUID] = {
+            row[0] for row in promotion_result.all()
+        }
+        if actually_promoted:
+            reason = (
+                f"auto-promotion Path A ({source}): memory_confidence >= {threshold} "
+                f"and age >= {min_age_hours}h, no unresolved conflict, no external "
+                "dispute event, promotion-time conflict recheck clear"
+            )
+            promoted_ids: list[uuid.UUID] = []
+            for item in to_promote:
+                if item.id not in actually_promoted:
+                    continue
+                session.add(
+                    ItemEvent(
+                        item_id=item.id,
+                        event_type="review_change",
+                        field_name="review_status",
+                        old_value="proposed",
+                        new_value="active",
+                        actor_principal_id=trusted_actor_id,
+                        reason=reason,
+                    )
+                )
+                promoted_ids.append(item.id)
+            result.promoted = len(promoted_ids)
+            result.promoted_ids = promoted_ids
 
     await session.commit()
     return result
