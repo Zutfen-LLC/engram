@@ -376,15 +376,14 @@ async def test_write_scope_matrix(monkeypatch: pytest.MonkeyPatch):
         assert (
             await client.post(f"/v1/items/{item_id_3}/invalidate", json={}, headers=h)
         ).status_code == 200
-        assert (
-            await client.post(
-                "/v1/kg", json={"subject": "a", "predicate": "b", "object": "c"}, headers=h
-            )
-        ).status_code == 201
+        kg_add = await client.post(
+            "/v1/kg", json={"subject": "a", "predicate": "b", "object": "c"}, headers=h
+        )
+        assert kg_add.status_code == 201
         assert (
             await client.post(
                 "/v1/kg/invalidate",
-                json={"subject": "a", "predicate": "b", "object": "c"},
+                json={"triple_id": kg_add.json()["id"]},
                 headers=h,
             )
         ).status_code == 200

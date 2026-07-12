@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from engram.api.routes.memory import (
     _insert_item_event,
@@ -17,11 +18,10 @@ from engram.api.routes.memory import (
     _require_eligible_item,
     _resolve_actor_and_delegation,
     _resolve_principal,
-    _resolve_workspace_id,
 )
 from engram.auth import REVIEW_SCOPE, WRITE_OR_REVIEW_SCOPE, Principal
 from engram.db import get_session
-from engram.memory_access import eligibility_sql
+from engram.memory_access import eligibility_expression, eligibility_sql, resolve_workspace_scope
 from engram.models import MemoryItem
 from engram.review_policy import (
     TransitionOutcome,
@@ -167,6 +167,8 @@ async def conflict_queue(
 ) -> ConflictListResponse:
     """Items with unresolved conflicts (conflict_resolution_status='unresolved')."""
     tenant_id = await _resolve_tenant_id(session)
+    principal_id, _ = await _resolve_principal(session, tenant_id)
+    counterpart = aliased(MemoryItem)
     stmt = (
         select(
             MemoryItem.id,
@@ -178,12 +180,16 @@ async def conflict_queue(
             MemoryItem.review_status,
             MemoryItem.created_at,
         )
+        .join(counterpart, counterpart.id == MemoryItem.conflicts_with_item_id)
         .where(
             MemoryItem.tenant_id == tenant_id,
+            eligibility_expression(principal_id),
+            counterpart.tenant_id == tenant_id,
+            eligibility_expression(principal_id, item_entity=counterpart),
             MemoryItem.conflict_resolution_status == "unresolved",
             MemoryItem.conflicts_with_item_id.is_not(None),
         )
-        .order_by(MemoryItem.created_at.desc())
+        .order_by(MemoryItem.created_at.desc(), MemoryItem.id.desc())
     )
     rows = (await session.execute(stmt)).mappings().all()
     items = [
@@ -222,19 +228,33 @@ async def stale_items(
     if days < 0:
         raise HTTPException(status_code=422, detail="days must be non-negative")
     tenant_id = await _resolve_tenant_id(session)
+    principal_id, _ = await _resolve_principal(session, tenant_id)
     limit = max(1, min(limit, 500))
     cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
 
     clauses = [
-        "tenant_id = :tenant_id",
+        "tenant_id = :caller_tenant_id",
+        eligibility_sql(),
         "review_status = 'active'",
         "valid_to IS NULL",
         "superseded_by IS NULL",
         "COALESCE(last_recalled_at, valid_from) < :cutoff",
     ]
-    params: dict[str, Any] = {"tenant_id": str(tenant_id), "cutoff": cutoff, "limit": limit}
+    params: dict[str, Any] = {
+        "caller_tenant_id": str(tenant_id),
+        "caller_principal_id": str(principal_id),
+        "cutoff": cutoff,
+        "limit": limit,
+    }
     if workspace is not None:
-        ws_id = await _resolve_workspace_id(session, tenant_id, workspace)
+        ws_id, accessible = await resolve_workspace_scope(
+            session,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            workspace=workspace,
+        )
+        if not accessible:
+            return StaleListResponse(items=[], total=0, days=days)
         clauses.append("workspace_id = :workspace_id")
         params["workspace_id"] = str(ws_id)
     if kind is not None:
@@ -246,7 +266,7 @@ async def stale_items(
         "valid_from, last_verified_at "
         "FROM memory_items WHERE "
         + " AND ".join(clauses)
-        + " ORDER BY COALESCE(last_recalled_at, valid_from) ASC, created_at ASC "
+        + " ORDER BY COALESCE(last_recalled_at, valid_from) ASC, created_at ASC, id ASC "
         "LIMIT :limit"
     )
     rows = (await session.execute(text(sql), params)).mappings().all()
@@ -266,13 +286,18 @@ async def review_stats(
     low (< 0.4), medium (0.4–< 0.7), high (>= 0.7).
     """
     tenant_id = await _resolve_tenant_id(session)
-    params = {"tenant_id": str(tenant_id)}
+    principal_id, _ = await _resolve_principal(session, tenant_id)
+    params = {
+        "caller_tenant_id": str(tenant_id),
+        "caller_principal_id": str(principal_id),
+    }
+    base = f"{eligibility_sql()} AND tenant_id = :caller_tenant_id AND valid_to IS NULL "
 
     status_rows = (
         await session.execute(
             text(
                 "SELECT review_status, count(*) FROM memory_items "
-                "WHERE tenant_id = :tenant_id AND valid_to IS NULL "
+                f"WHERE {base}"
                 "GROUP BY review_status"
             ),
             params,
@@ -284,7 +309,7 @@ async def review_stats(
         await session.execute(
             text(
                 "SELECT kind, count(*) FROM memory_items "
-                "WHERE tenant_id = :tenant_id AND valid_to IS NULL "
+                f"WHERE {base}"
                 "GROUP BY kind"
             ),
             params,
@@ -300,7 +325,7 @@ async def review_stats(
                 "WHEN memory_confidence < 0.7 THEN 'medium' "
                 "ELSE 'high' END AS bucket, count(*) "
                 "FROM memory_items "
-                "WHERE tenant_id = :tenant_id AND valid_to IS NULL "
+                f"WHERE {base}"
                 "GROUP BY bucket"
             ),
             params,

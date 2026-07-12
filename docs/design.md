@@ -666,6 +666,11 @@ One forgotten `WHERE` clause cannot cause a cross-tenant leak.
 
 Application-level filtering is still required for correctness and performance, but database-level RLS is the security backstop.
 
+Review scope grants access to review functionality, not broader memory visibility.
+Review reports apply the canonical item predicate, conflict reports require both
+memories to be eligible, and review statistics are relative to the caller's eligible
+current corpus rather than tenant-global administrative counts.
+
 ---
 
 ## 7. Memory Topology
@@ -790,6 +795,18 @@ valid_to: null
 ```
 
 Triples are backed by memory items so that graph facts retain provenance, confidence, and review state.
+Caller-facing graph query, timeline, and mutation routes require a non-null backing
+memory in the same tenant and apply the canonical memory eligibility predicate to
+that memory. Private ownership and workspace membership therefore work exactly as
+they do for item reads; orphan triples fail closed. PostgreSQL RLS remains the tenant
+backstop, not a substitute for application eligibility.
+
+Invalidation names one triple UUID, locks that row, and is idempotent. Users and
+admins may invalidate any eligible triple. Agents and ordinary system principals may
+invalidate only eligible triples they authored; a null-author triple is restricted to
+users/admins. A real change writes one `item_events` record on the backing memory with
+the authenticated caller as actor and structured triple/validity details. Inaccessible
+and nonexistent IDs both return 404.
 
 ---
 

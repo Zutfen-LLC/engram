@@ -8,6 +8,7 @@ test_health.py. Run locally with ``docker compose up``.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -202,12 +203,13 @@ async def _insert_triple(
     confidence: float = 0.5,
     review_status: str = "proposed",
     tenant_id: str | None = None,
-) -> None:
+) -> str:
     vf = f"({valid_from})" if valid_from else "now()"
     vt = f"({valid_to})" if valid_to else "NULL"
     if tenant_id is None:
         tid_row = await session.execute(text("SELECT current_setting('app.tenant_id', true)"))
         tenant_id = tid_row.scalar()
+    triple_id = str(uuid4())
     await session.execute(
         text(f"""
             INSERT INTO kg_triples (
@@ -219,11 +221,12 @@ async def _insert_triple(
             )
         """),
         {
-            "id": str(uuid4()), "tid": tenant_id, "ws": ws_id, "pid": pid,
+            "id": triple_id, "tid": tenant_id, "ws": ws_id, "pid": pid,
             "subj": subject, "pred": predicate, "obj": object,
             "sid": source_item_id, "conf": confidence, "rs": review_status,
         },
     )
+    return triple_id
 
 
 # ---- Tests ----
@@ -389,7 +392,7 @@ async def test_kg_invalidate(client):
     async with _session_factory() as session:
         await _seed_rls(session)
         ids = await _seed_test_item(session)
-        await _insert_triple(
+        triple_id = await _insert_triple(
             session, ws_id=ids["workspace_id"], pid=ids["principal_id"],
             subject="alice", predicate="knows", object="bob",
             source_item_id=ids["item_id"],
@@ -398,12 +401,35 @@ async def test_kg_invalidate(client):
 
     response = await client.post(
         "/v1/kg/invalidate",
-        json={"subject": "alice", "predicate": "knows", "object": "bob"},
+        json={"triple_id": triple_id, "reason": "test invalidation"},
     )
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "invalidated"
     assert payload["count"] == 1
+    assert payload["triple_id"] == triple_id
+    assert payload["source_item_id"] == ids["item_id"]
+    assert payload["event"]["actor_principal_id"] == ids["principal_id"]
+
+    retry = await client.post(
+        "/v1/kg/invalidate",
+        json={"triple_id": triple_id, "reason": "retry must not write an event"},
+    )
+    assert retry.status_code == 200
+    assert retry.json()["status"] == "unchanged"
+    assert retry.json()["count"] == 0
+    assert retry.json()["event"] is None
+
+    async with _session_factory() as session:
+        await _seed_rls(session)
+        event_count = await session.scalar(
+            text(
+                "SELECT count(*) FROM item_events "
+                "WHERE item_id = :item_id AND event_type = 'kg_invalidate'"
+            ),
+            {"item_id": ids["item_id"]},
+        )
+    assert event_count == 1
 
     response = await client.get("/v1/kg/query", params={"entity": "alice"})
     assert response.status_code == 200
@@ -417,10 +443,9 @@ async def test_kg_invalidate_not_found(client):
 
     response = await client.post(
         "/v1/kg/invalidate",
-        json={"subject": "alice", "predicate": "knows", "object": "bob"},
+        json={"triple_id": str(uuid4())},
     )
-    assert response.status_code == 200
-    assert response.json()["status"] == "not_found"
+    assert response.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -512,15 +537,18 @@ async def test_kg_query_as_of(client):
         )
         await session.commit()
 
+    now = datetime.now(UTC)
     response = await client.get(
-        "/v1/kg/query", params={"entity": "alice", "as_of": "now() - interval '45 minutes'"}
+        "/v1/kg/query",
+        params={"entity": "alice", "as_of": (now - timedelta(minutes=45)).isoformat()},
     )
     assert response.status_code == 200
     payload = response.json()
     assert len(payload) == 1
 
     response = await client.get(
-        "/v1/kg/query", params={"entity": "alice", "as_of": "now() - interval '15 minutes'"}
+        "/v1/kg/query",
+        params={"entity": "alice", "as_of": (now - timedelta(minutes=15)).isoformat()},
     )
     assert response.status_code == 200
     payload = response.json()

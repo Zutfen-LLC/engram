@@ -41,7 +41,11 @@ from engram.auth import check_workspace_membership
 from engram.models import MemoryItem, WorkspaceMember
 
 
-def eligibility_expression(principal_id: str | UUID) -> ColumnElement[bool]:
+def eligibility_expression(
+    principal_id: str | UUID,
+    *,
+    item_entity: Any = MemoryItem,
+) -> ColumnElement[bool]:
     """SQLAlchemy boolean expression: is a ``MemoryItem`` row visible to ``principal_id``?
 
     Does NOT check ``tenant_id`` — callers must additionally filter
@@ -62,14 +66,14 @@ def eligibility_expression(principal_id: str | UUID) -> ColumnElement[bool]:
         .scalar_subquery()
     )
     return or_(
-        MemoryItem.visibility == "tenant",
-        MemoryItem.visibility == "public",
-        and_(MemoryItem.visibility == "private", MemoryItem.principal_id == principal_id),
+        item_entity.visibility == "tenant",
+        item_entity.visibility == "public",
+        and_(item_entity.visibility == "private", item_entity.principal_id == principal_id),
         and_(
-            MemoryItem.visibility == "workspace",
+            item_entity.visibility == "workspace",
             or_(
-                MemoryItem.workspace_id.is_(None),
-                MemoryItem.workspace_id.in_(member_workspaces),
+                item_entity.workspace_id.is_(None),
+                item_entity.workspace_id.in_(member_workspaces),
             ),
         ),
     )
