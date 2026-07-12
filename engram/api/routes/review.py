@@ -230,7 +230,10 @@ async def stale_items(
     tenant_id = await _resolve_tenant_id(session)
     principal_id, _ = await _resolve_principal(session, tenant_id)
     limit = max(1, min(limit, 500))
-    cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    # Keep this as a datetime so asyncpg binds it as TIMESTAMPTZ.  Passing an
+    # ISO string works with permissive test backends but is rejected by the
+    # real PostgreSQL driver once the comparison type is inferred.
+    cutoff = datetime.now(UTC) - timedelta(days=days)
 
     clauses = [
         "tenant_id = :caller_tenant_id",
