@@ -658,6 +658,22 @@ Memory items belong to:
 * principal
 * visibility scope
 
+Diary creation records the authenticated caller separately from the diary
+owner. Modern diary entries therefore report `attribution_status='recorded'`
+and preserve the original actor and representation flag on duplicate writes.
+Diary rows created before actor-bearing `diary_create` events existed report
+`attribution_status='legacy_unknown'`, with a null actor and representation
+flag. This is expected historical uncertainty: it does not imply that the
+owner was or was not the actor. Duplicate requests neither backfill nor create
+retroactive audit events. A present but malformed modern attribution event is
+an integrity error, not legacy state.
+
+Worker automation uses immutable, purpose-specific internal identities
+(`review_automation`, `conflict_automation`, and
+`classification_automation`). These identities cannot receive credentials.
+Enrichment workers treat archived, rejected, invalidated, and superseded
+memories as terminal and do not invoke providers or write events for them.
+
 ### Row Level Security
 
 Row Level Security is enforced at the Postgres level.

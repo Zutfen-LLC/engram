@@ -164,7 +164,8 @@ class DiaryWriteResponse(BaseModel):
     status: str  # created | deduped
     review_status: str
     principal_id: UUID
-    actor_principal_id: UUID
-    represented: bool
+    actor_principal_id: UUID | None
+    represented: bool | None
+    attribution_status: Literal["recorded", "legacy_unknown"]
     authority: int
     authority_label: str

@@ -95,6 +95,7 @@ def build_mock_client() -> AsyncMock:
         principal_id=OTHER_ID,
         actor_principal_id=OTHER_ID,
         represented=False,
+        attribution_status="recorded",
         authority=10,
         authority_label="inferred",
     )

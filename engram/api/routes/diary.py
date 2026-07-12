@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 from uuid import UUID
@@ -56,8 +57,9 @@ class DiaryWriteResponse(BaseModel):
     status: Literal["created", "deduped"]
     review_status: str
     principal_id: UUID
-    actor_principal_id: UUID
-    represented: bool
+    actor_principal_id: UUID | None
+    represented: bool | None
+    attribution_status: Literal["recorded", "legacy_unknown"]
     authority: int
     authority_label: str
 
@@ -101,37 +103,129 @@ async def _principal_by_name(session: AsyncSession, tenant_id: UUID, name: str) 
     return row
 
 
+@dataclass(frozen=True)
+class DiaryAttribution:
+    actor_principal_id: UUID | None
+    represented: bool | None
+    attribution_status: Literal["recorded", "legacy_unknown"]
+
+
+class DiaryAttributionIntegrityError(RuntimeError):
+    """A modern diary attribution event contradicts its durable memory row."""
+
+
 def _response(
-    item: MemoryItem, *, status: Literal["created", "deduped"], actor_id: UUID, represented: bool
+    item: MemoryItem,
+    *,
+    status: Literal["created", "deduped"],
+    attribution: DiaryAttribution,
 ) -> DiaryWriteResponse:
     return DiaryWriteResponse(
         id=item.id,
         status=status,
         review_status=item.review_status,
         principal_id=item.principal_id,
-        actor_principal_id=actor_id,
-        represented=represented,
+        actor_principal_id=attribution.actor_principal_id,
+        represented=attribution.represented,
+        attribution_status=attribution.attribution_status,
         authority=item.authority,
         authority_label=authority_label(item.authority),
     )
 
 
-async def _existing_response(session: AsyncSession, item: MemoryItem) -> DiaryWriteResponse:
-    event = (
-        await session.execute(
-            select(ItemEvent).where(
-                ItemEvent.item_id == item.id, ItemEvent.event_type == "diary_create"
+def _detail_uuid(details: dict[str, object], key: str) -> UUID:
+    value = details.get(key)
+    if not isinstance(value, str):
+        raise DiaryAttributionIntegrityError(f"diary_create {key} is missing or invalid")
+    try:
+        return UUID(value)
+    except ValueError as exc:
+        raise DiaryAttributionIntegrityError(f"diary_create {key} is invalid") from exc
+
+
+async def resolve_diary_attribution(
+    session: AsyncSession, item: MemoryItem
+) -> DiaryAttribution:
+    """Resolve durable diary attribution, preserving explicit legacy uncertainty."""
+    events = list(
+        (
+            await session.execute(
+                select(ItemEvent)
+                .where(ItemEvent.item_id == item.id, ItemEvent.event_type == "diary_create")
+                .order_by(ItemEvent.created_at.asc(), ItemEvent.id.asc())
             )
         )
-    ).scalar_one()
-    details = json.loads(event.new_value or "{}")
+        .scalars()
+        .all()
+    )
+    if not events:
+        return DiaryAttribution(None, None, "legacy_unknown")
+    if len(events) != 1:
+        raise DiaryAttributionIntegrityError("diary item has multiple diary_create events")
+
+    event = events[0]
     if event.actor_principal_id is None:
-        raise RuntimeError("diary_create event is missing its actor")
+        raise DiaryAttributionIntegrityError("diary_create event is missing its actor")
+    try:
+        raw_details = json.loads(event.new_value or "")
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise DiaryAttributionIntegrityError("diary_create details are invalid JSON") from exc
+    if not isinstance(raw_details, dict):
+        raise DiaryAttributionIntegrityError("diary_create details must be a JSON object")
+    details: dict[str, object] = raw_details
+
+    owner_id = _detail_uuid(details, "owner_principal_id")
+    actor_id = _detail_uuid(details, "actor_principal_id")
+    if owner_id != item.principal_id:
+        raise DiaryAttributionIntegrityError("diary_create owner does not match diary row")
+    if actor_id != event.actor_principal_id:
+        raise DiaryAttributionIntegrityError("diary_create actor does not match event actor")
+    represented = details.get("represented")
+    if not isinstance(represented, bool):
+        raise DiaryAttributionIntegrityError("diary_create represented must be boolean")
+    represented_target = details.get("on_behalf_of_principal_id")
+    if represented:
+        if not isinstance(represented_target, str) or _detail_uuid(
+            details, "on_behalf_of_principal_id"
+        ) != item.principal_id:
+            raise DiaryAttributionIntegrityError("represented diary target is incoherent")
+    elif represented_target is not None:
+        raise DiaryAttributionIntegrityError("self-written diary has a represented target")
+
+    authority = details.get("authority")
+    if type(authority) is not int or authority != item.authority:
+        raise DiaryAttributionIntegrityError("diary_create authority does not match diary row")
+    label = details.get("authority_label")
+    if label != authority_label(item.authority):
+        raise DiaryAttributionIntegrityError("diary_create authority label is invalid")
+    durable_fields = {
+        "source_type": item.source_type,
+        "review_status": item.review_status,
+        "topic": item.subject_name,
+    }
+    for key, expected in durable_fields.items():
+        if details.get(key) != expected:
+            raise DiaryAttributionIntegrityError(f"diary_create {key} does not match diary row")
+    numeric_fields: tuple[tuple[str, float], ...] = (
+        ("source_trust", item.source_trust),
+        ("memory_confidence", item.memory_confidence),
+    )
+    for key, expected_numeric in numeric_fields:
+        value = details.get(key)
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or float(value) != expected_numeric
+        ):
+            raise DiaryAttributionIntegrityError(f"diary_create {key} does not match diary row")
+    return DiaryAttribution(event.actor_principal_id, represented, "recorded")
+
+
+async def _existing_response(session: AsyncSession, item: MemoryItem) -> DiaryWriteResponse:
     return _response(
         item,
         status="deduped",
-        actor_id=event.actor_principal_id,
-        represented=bool(details.get("represented", False)),
+        attribution=await resolve_diary_attribution(session, item),
     )
 
 
@@ -197,11 +291,11 @@ async def write_diary(
         authority=authority,
         sensitivity="normal",
     )
-    session.add(item)
     try:
-        await session.flush()
+        async with session.begin_nested():
+            session.add(item)
+            await session.flush()
     except IntegrityError:
-        await session.rollback()
         existing = (
             await session.execute(
                 select(MemoryItem).where(
@@ -244,7 +338,11 @@ async def write_diary(
     )
     await session.commit()
     await session.refresh(item)
-    return _response(item, status="created", actor_id=actor.id, represented=represented)
+    return _response(
+        item,
+        status="created",
+        attribution=DiaryAttribution(actor.id, represented, "recorded"),
+    )
 
 
 @router.get(

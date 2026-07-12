@@ -279,6 +279,11 @@ Persist a memory item. Returns `{id, status, review_status, memory_confidence}`.
 
 ### `engram_diary_write`
 
+The response includes `attribution_status`. Modern entries report `recorded`;
+deduplicated diary rows from before actor-bearing audit events may report
+`legacy_unknown` with null `actor_principal_id` and `represented`. No actor is
+inferred and no retroactive event is created.
+
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `entry` | string | yes | Diary text. |
