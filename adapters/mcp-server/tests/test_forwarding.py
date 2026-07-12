@@ -200,7 +200,11 @@ async def test_diary_write_forwards_shape(mcp_server, mock_client) -> None:
     )
 
     assert mock_client.diary_write.await_args.args == ("explored the search path", "hermes")
-    assert mock_client.diary_write.await_args.kwargs == {"topic": "debug"}
+    assert mock_client.diary_write.await_args.kwargs == {
+        "topic": "debug",
+        "on_behalf_of_principal_id": None,
+        "reason": None,
+    }
     assert result.structuredContent["status"] == "created"
 
 

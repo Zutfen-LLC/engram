@@ -353,12 +353,20 @@ class EngramClient:
     async def diary_write(
         self,
         entry: str,
-        principal: str,
+        principal: str | None = None,
         *,
         topic: str | None = None,
+        on_behalf_of_principal_id: UUID | None = None,
+        reason: str | None = None,
     ) -> DiaryWriteResponse:
-        """Write a private diary entry for ``principal``."""
-        req = DiaryWrite(entry=entry, principal=principal, topic=topic)
+        """Write the caller's diary, or explicitly represent another principal."""
+        req = DiaryWrite(
+            entry=entry,
+            principal=principal,
+            topic=topic,
+            on_behalf_of_principal_id=on_behalf_of_principal_id,
+            reason=reason,
+        )
         return await self._send(
             "POST",
             "/v1/diary",

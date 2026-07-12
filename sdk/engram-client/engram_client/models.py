@@ -153,8 +153,10 @@ class KgTripleOut(BaseModel):
 
 class DiaryWrite(BaseModel):
     entry: str
-    principal: str  # principal name, not UUID
     topic: str | None = None
+    principal: str | None = None
+    on_behalf_of_principal_id: UUID | None = None
+    reason: str | None = None
 
 
 class DiaryWriteResponse(BaseModel):
@@ -162,3 +164,7 @@ class DiaryWriteResponse(BaseModel):
     status: str  # created | deduped
     review_status: str
     principal_id: UUID
+    actor_principal_id: UUID
+    represented: bool
+    authority: int
+    authority_label: str

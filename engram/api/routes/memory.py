@@ -9,7 +9,7 @@ import base64
 import json
 import uuid
 from datetime import UTC, datetime
-from typing import Any, Literal, get_args
+from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Response
@@ -19,7 +19,7 @@ from sqlalchemy import func, insert, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from engram import semantic
+from engram import semantic, trust_policy
 from engram.auth import READ_SCOPE, WRITE_SCOPE
 from engram.authority import authority_allows_supersession, authority_label, derive_memory_authority
 from engram.canonicalize import canonicalize, content_hash
@@ -41,10 +41,15 @@ from engram.memory_kinds import UnknownMemoryKindError, require_enabled_memory_k
 from engram.models import (
     ItemEvent,
     MemoryItem,
-    TenantConfig,
     Workspace,
 )
 from engram.safety import has_secrets
+from engram.trust_policy import resolve_trust_defaults
+
+# Backward-compatible test/import alias; canonical implementation lives in trust_policy.
+_resolve_trust_defaults = resolve_trust_defaults
+_SOURCE_TRUST_KEYS = trust_policy._SOURCE_TRUST_KEYS
+_TRUST_FALLBACKS = trust_policy._TRUST_FALLBACKS
 
 router = APIRouter()
 
@@ -146,105 +151,6 @@ class FeedbackResponse(BaseModel):
     feedback_event_id: UUID
     importance: float
     startup_recall_count: int
-
-
-# ---- Trust model helpers ----
-
-
-def _trust_confidence_key(source_type: str, principal_type: str) -> tuple[str, str]:
-    """Return the (trust_col, confidence_col) suffix pair for a source/principal combo.
-
-    manual + user/admin → manual_user; manual + agent → manual_agent;
-    import/migration → import; extraction → extraction; etc.
-    """
-    if source_type == "manual":
-        if principal_type in ("user", "admin"):
-            return "manual_user", "manual_user"
-        return "manual_agent", "manual_agent"
-    if source_type in ("import", "migration"):
-        return "import", "import"
-    return source_type, source_type
-
-
-# Fallback defaults from design.md Section 4 — used only when no tenant_config row exists.
-_TRUST_FALLBACKS: dict[str, tuple[float, float]] = {
-    "manual_user": (0.9, 0.9),
-    "manual_agent": (0.6, 0.5),
-    "import": (0.8, 0.8),
-    "extraction": (0.5, 0.5),
-    "sync_turn": (0.4, 0.4),
-    "pre_compress": (0.3, 0.3),
-    "session_end": (0.35, 0.35),
-}
-
-_SOURCE_TRUST_KEYS: dict[SourceKind, tuple[str, str]] = {
-    "manual": ("manual_user", "manual_agent"),
-    "import": ("import", "import"),
-    "migration": ("import", "import"),
-    "extraction": ("extraction", "extraction"),
-    "sync_turn": ("sync_turn", "sync_turn"),
-    "pre_compress": ("pre_compress", "pre_compress"),
-    "session_end": ("session_end", "session_end"),
-}
-
-
-def _validate_trust_policy_completeness() -> None:
-    """Fail fast if the public source vocabulary and trust configuration drift."""
-    accepted_sources = set(get_args(SourceKind))
-    if accepted_sources != set(_SOURCE_TRUST_KEYS):
-        raise RuntimeError("SourceKind and trust-default source mappings are inconsistent")
-    config_keys = {key for keys in _SOURCE_TRUST_KEYS.values() for key in keys}
-    missing_fallbacks = config_keys - set(_TRUST_FALLBACKS)
-    missing_columns = {
-        column
-        for key in config_keys
-        for column in (f"trust_{key}", f"confidence_{key}")
-        if not hasattr(TenantConfig, column)
-    }
-    if missing_fallbacks or missing_columns:
-        raise RuntimeError(
-            f"Incomplete trust defaults: fallbacks={missing_fallbacks}, columns={missing_columns}"
-        )
-
-
-_validate_trust_policy_completeness()
-
-
-async def _resolve_trust_defaults(
-    session: AsyncSession,
-    tenant_id: UUID,
-    source_type: str,
-    principal_type: str,
-) -> tuple[float, float, str]:
-    """Read the active tenant_config and return (source_trust, memory_confidence, review_status).
-
-    Values come from the tenant_config table, not hardcoded constants. Falls
-    back to design.md Section 4 defaults if no config row is found.
-    """
-    result = await session.execute(
-        select(TenantConfig).where(
-            TenantConfig.tenant_id == tenant_id,
-            TenantConfig.active.is_(True),
-        )
-    )
-    config = result.scalar_one_or_none()
-
-    trust_key, conf_key = _trust_confidence_key(source_type, principal_type)
-
-    if config is not None:
-        source_trust = float(getattr(config, f"trust_{trust_key}"))
-        memory_confidence = float(getattr(config, f"confidence_{conf_key}"))
-    else:
-        source_trust, memory_confidence = _TRUST_FALLBACKS.get(trust_key, (0.5, 0.5))
-
-    # Review status: active for user/admin manual writes and system imports;
-    # proposed for agent-sourced writes and all inferred sources.
-    if source_type in _ACTIVE_SOURCES and principal_type in ("user", "admin", "system"):
-        review_status = "active"
-    else:
-        review_status = "proposed"
-
-    return source_trust, memory_confidence, review_status
 
 
 async def _resolve_workspace_id(
@@ -573,7 +479,7 @@ async def remember(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     # 4. Trust defaults from tenant_config.
-    source_trust, memory_confidence, review_status = await _resolve_trust_defaults(
+    source_trust, memory_confidence, review_status = await resolve_trust_defaults(
         session, tenant_id, req.source_type, principal_type
     )
     authority = derive_memory_authority(

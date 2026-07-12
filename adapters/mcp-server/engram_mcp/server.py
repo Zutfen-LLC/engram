@@ -258,11 +258,19 @@ def register_tools(mcp: FastMCP[EngramState]) -> None:
     async def diary_write(
         ctx: ToolCtx,
         entry: str,
-        principal: str,
+        principal: str | None = None,
         topic: str | None = None,
+        on_behalf_of_principal_id: str | None = None,
+        reason: str | None = None,
     ) -> dict[str, Any]:
-        """Write a private diary entry for ``principal``."""
-        resp = await _client(ctx).diary_write(entry, principal, topic=topic)
+        """Write the caller's diary; admin representation is explicit by UUID."""
+        resp = await _client(ctx).diary_write(
+            entry,
+            principal,
+            topic=topic,
+            on_behalf_of_principal_id=on_behalf_of_principal_id,
+            reason=reason,
+        )
         return resp.model_dump(mode="json")
 
 

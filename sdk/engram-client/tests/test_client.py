@@ -372,11 +372,16 @@ async def test_diary_write_success() -> None:
             "status": "created",
             "review_status": "proposed",
             "principal_id": OTHER_ID,
+            "actor_principal_id": OTHER_ID,
+            "represented": False,
+            "authority": 10,
+            "authority_label": "inferred",
         },
     )
     async with _client(rec) as client:
         resp = await client.diary_write("explored the search path", "hermes", topic="debugging")
     assert isinstance(resp, DiaryWriteResponse)
+    assert resp.actor_principal_id == UUID(OTHER_ID)
     assert resp.status == "created"
     assert resp.principal_id == UUID(OTHER_ID)
     body = _body(rec.request)

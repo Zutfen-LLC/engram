@@ -38,6 +38,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from engram.config import settings
 from engram.db import _DEFAULT_PRINCIPAL_NAME, apply_rls_context
+from engram.internal_actors import (
+    CLASSIFICATION_AUTOMATION_INTERNAL_KEY,
+    CONFLICT_AUTOMATION_INTERNAL_KEY,
+    resolve_internal_system_actor,
+)
 from engram.jobs import (
     claim_next_job,
     mark_job_failed_or_retry,
@@ -169,6 +174,8 @@ def _is_expired_or_inactive(item: MemoryItem) -> bool:
     if item.valid_to is not None:
         return True
     if item.review_status == "rejected":
+        return True
+    if item.review_status == "archived":
         return True
     return item.superseded_by is not None
 
@@ -356,6 +363,21 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
             return
         # Semantic duplicate — mark the new item rejected + invalidated so it
         # leaves the active/recallable set (append-first: not deleted).
+        actor = await resolve_internal_system_actor(
+            session,
+            tenant_id=job.tenant_id,
+            internal_key=CONFLICT_AUTOMATION_INTERNAL_KEY,
+        )
+        provenance = {
+            "action": action.value,
+            "existing_item_id": str(result.existing_item_id),
+            "reason": result.reason,
+            "worker_operation": "conflict.check",
+            "job_id": str(job.id),
+            "item_author_principal_id": str(item.principal_id),
+            "internal_actor_key": CONFLICT_AUTOMATION_INTERNAL_KEY,
+            **result.provenance,
+        }
         await _insert_event(
             session,
             item_id=item.id,
@@ -363,8 +385,8 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
             field_name="review_status",
             old_value=item.review_status,
             new_value="rejected",
-            actor_principal_id=item.principal_id,
-            reason=f"semantic duplicate of {result.existing_item_id}: {result.reason}",
+            actor_principal_id=actor,
+            reason=json.dumps(provenance, sort_keys=True),
         )
         await session.execute(
             update(MemoryItem)
@@ -385,6 +407,11 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
         if existing is None or existing.superseded_by == item.id:
             await session.commit()
             return
+        actor = await resolve_internal_system_actor(
+            session,
+            tenant_id=job.tenant_id,
+            internal_key=CONFLICT_AUTOMATION_INTERNAL_KEY,
+        )
         await _insert_event(
             session,
             item_id=item.id,
@@ -392,12 +419,16 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
             field_name="superseded_by",
             old_value=None,
             new_value=str(result.existing_item_id),
-            actor_principal_id=item.principal_id,
+            actor_principal_id=actor,
             reason=json.dumps(
                 {
                     "action": action.value,
                     "existing_item_id": str(result.existing_item_id),
                     "reason": result.reason,
+                    "worker_operation": "conflict.check",
+                    "job_id": str(job.id),
+                    "item_author_principal_id": str(item.principal_id),
+                    "internal_actor_key": CONFLICT_AUTOMATION_INTERNAL_KEY,
                     **result.provenance,
                 },
                 sort_keys=True,
@@ -428,8 +459,17 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
         "similarity": result.similarity,
         "existing_item_id": str(result.existing_item_id),
         "reason": result.reason,
+        "worker_operation": "conflict.check",
+        "job_id": str(job.id),
+        "item_author_principal_id": str(item.principal_id),
+        "internal_actor_key": CONFLICT_AUTOMATION_INTERNAL_KEY,
         **result.provenance,
     }
+    actor = await resolve_internal_system_actor(
+        session,
+        tenant_id=job.tenant_id,
+        internal_key=CONFLICT_AUTOMATION_INTERNAL_KEY,
+    )
     await _insert_event(
         session,
         item_id=item.id,
@@ -437,7 +477,7 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
         field_name="conflicts_with_item_id",
         old_value=item.conflicts_with_item_id,
         new_value=str(result.existing_item_id),
-        actor_principal_id=item.principal_id,
+        actor_principal_id=actor,
         reason=json.dumps(payload, sort_keys=True),
     )
     await session.execute(
@@ -488,7 +528,17 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
         raise RuntimeError(f"job tenant {job.tenant_id} != item tenant {item.tenant_id}")
 
     result = await classify(item.content, item.tenant_id, session)
-    actor = item.principal_id
+    actor = await resolve_internal_system_actor(
+        session,
+        tenant_id=job.tenant_id,
+        internal_key=CLASSIFICATION_AUTOMATION_INTERNAL_KEY,
+    )
+    provenance = {
+        "worker_operation": "classification.refine",
+        "job_id": str(job.id),
+        "item_author_principal_id": str(item.principal_id),
+        "internal_actor_key": CLASSIFICATION_AUTOMATION_INTERNAL_KEY,
+    }
     changed = False
 
     # kind/wing/room only above the confidence threshold.
@@ -502,7 +552,7 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
                 old_value=item.kind,
                 new_value=result.suggested_kind,
                 actor_principal_id=actor,
-                reason=f"LLM refine ({result.reason})",
+                reason=json.dumps({**provenance, "reason": result.reason}, sort_keys=True),
             )
             await session.execute(
                 update(MemoryItem)
@@ -519,7 +569,7 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
                 old_value=item.wing,
                 new_value=result.suggested_wing,
                 actor_principal_id=actor,
-                reason=f"LLM refine ({result.reason})",
+                reason=json.dumps({**provenance, "reason": result.reason}, sort_keys=True),
             )
             await session.execute(
                 update(MemoryItem)
@@ -536,7 +586,7 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
                 old_value=item.room,
                 new_value=result.suggested_room,
                 actor_principal_id=actor,
-                reason=f"LLM refine ({result.reason})",
+                reason=json.dumps({**provenance, "reason": result.reason}, sort_keys=True),
             )
             await session.execute(
                 update(MemoryItem)
@@ -560,7 +610,7 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
             old_value=item.memory_confidence,
             new_value=blended,
             actor_principal_id=actor,
-            reason=f"LLM confidence blend ({result.reason})",
+            reason=json.dumps({**provenance, "reason": result.reason}, sort_keys=True),
         )
         await session.execute(
             update(MemoryItem).where(MemoryItem.id == item.id).values(memory_confidence=blended)
@@ -579,7 +629,7 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
             old_value=item.visibility,
             new_value=result.suggested_visibility,
             actor_principal_id=actor,
-            reason=f"LLM visibility narrow ({result.reason})",
+            reason=json.dumps({**provenance, "reason": result.reason}, sort_keys=True),
         )
         await session.execute(
             update(MemoryItem)
@@ -603,11 +653,15 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
                     "provider": result.provenance.get("provider", "openai"),
                     "result": "no_change",
                     "reason": result.reason,
+                    **provenance,
                 },
                 sort_keys=True,
             ),
             actor_principal_id=actor,
-            reason="LLM refine produced no change (idempotent)",
+            reason=json.dumps(
+                {**provenance, "reason": "LLM refine produced no change (idempotent)"},
+                sort_keys=True,
+            ),
         )
 
     await session.commit()

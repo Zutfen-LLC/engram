@@ -93,6 +93,10 @@ def build_mock_client() -> AsyncMock:
         status="created",
         review_status="proposed",
         principal_id=OTHER_ID,
+        actor_principal_id=OTHER_ID,
+        represented=False,
+        authority=10,
+        authority_label="inferred",
     )
     return client
 
