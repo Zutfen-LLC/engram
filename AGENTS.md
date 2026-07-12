@@ -29,9 +29,16 @@ state, running container, local image cache, or installed package version.
 - `docker-compose.yml` runs the PostgreSQL and production service stack.
 - `docker-compose.ci.yml` runs migrations and the complete test suite against
   a real PostgreSQL + pgvector database using the non-owner application role.
-- Run the CI path with
-  `docker compose -f docker-compose.ci.yml up --build --abort-on-container-error`.
-- Tear it down with `docker compose -f docker-compose.ci.yml down -v`.
+- Run the CI path with `make compose-ci`.
+- Tear it down with `make compose-ci-down`.
+- The Make targets prefer direct Docker access and otherwise activate the
+  configured `docker` group for that command with `sg docker -c`. IDE and agent
+  sessions may have a stale supplementary-group list, so a bare `docker ps`
+  socket-permission failure does not by itself mean Docker or the daemon is
+  unavailable. Check configured membership before diagnosing a sandbox issue.
+- The targets use Compose's portable
+  `--abort-on-container-exit --exit-code-from engram-test` behavior. Do not use
+  `--abort-on-container-error`; Compose 5.1.4 does not recognize that spelling.
 - Consult `docs/deployment.md` for supported deployment commands and environment
   configuration.
 
