@@ -1068,3 +1068,306 @@ async def test_reciprocal_worker_pair_no_deadlock(proof: dict[str, Any], iterati
     assert cd_a == []
     # No partial state: item_b has a complete unresolved relationship.
     assert st_b["item"]["conflict_type"] == "contradiction"
+
+
+# ===========================================================================
+# 8. Counterpart already non-active (non-concurrent regression)
+#
+# P0-FIX-004C1A: detection proposes counterpart B, but B is already
+# non-active when the pair is locked. ``_apply_flagging()`` must fail closed —
+# no state change, no event.
+# ===========================================================================
+
+
+@pytest.mark.parametrize("counterpart_status", ["rejected", "disputed", "archived"])
+async def test_counterpart_already_non_active_worker_skips(
+    proof: dict[str, Any], counterpart_status: str
+) -> None:
+    """Detection proposes a counterpart that is already in a non-active review
+    state when the pair is locked. The worker must not flag the job item
+    against a counterpart ``detect_conflicts`` would no longer return."""
+    p = proof
+    old_item = await p["insert_item"](
+        content=f"counterpart-stale-{counterpart_status}-old",
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        review_status=counterpart_status,
+    )
+    new_item = await p["insert_item"](
+        content=f"counterpart-stale-{counterpart_status}-new",
+        created_at=datetime(2026, 1, 2, tzinfo=UTC),
+    )
+    for iid in (old_item, new_item):
+        await p["add_ready_embedding"](iid)
+    p["force_detection"](
+        existing_item_id=old_item, action="flag_contradiction", conflict_type="contradiction"
+    )
+
+    before_new = await p["state"](new_item)
+    before_old = await p["state"](old_item)
+    await p["run_conflict_check"](new_item)
+    after_new = await p["state"](new_item)
+    after_old = await p["state"](old_item)
+
+    # Worker skips all mutation and writes no flagging event on the job item.
+    assert after_new["item"] == before_new["item"]
+    assert after_new["events"] == before_new["events"]
+    cd = _conflict_detected_events(after_new["events"])
+    assert cd == []
+    assert after_new["item"]["conflicts_with_item_id"] is None
+    assert after_new["item"]["review_status"] == "active"
+    # The counterpart is untouched by the worker.
+    assert after_old["item"] == before_old["item"]
+    assert after_old["item"]["review_status"] == counterpart_status
+
+
+# ===========================================================================
+# 9. Human review wins first on the COUNTERPART (rejected / disputed)
+#
+# P0-FIX-004C1A: a Bearer-authenticated human review transitions the
+# detected counterpart B away from active while it owns B's row lock. The
+# worker waits behind the human-held counterpart lock, the human review
+# commits, the worker reloads B under the pair lock and observes the
+# non-active review state, and performs no flagging mutation.
+# ===========================================================================
+
+
+async def _install_counterpart_review_pause_trigger(
+    p: dict[str, Any], *, counterpart_id: uuid.UUID
+) -> str:
+    """Pause a human review's UPDATE on the counterpart row via an advisory lock.
+
+    The trigger fires BEFORE UPDATE OF review_status on the counterpart. The
+    review endpoint has already taken SELECT ... FOR UPDATE on the row (via
+    ``_require_eligible_item(for_update=True)``) before this UPDATE runs, so
+    the row lock is held while the trigger blocks on the advisory lock the
+    coordinator owns.
+    """
+    trigger = f"worker_flag_pause_{p['tag']}"
+    async with p["owner"].begin() as conn:
+        await conn.execute(
+            text(
+                f"CREATE FUNCTION {trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ "
+                f"BEGIN PERFORM pg_advisory_xact_lock({p['pause_key']}); RETURN NEW; END $$"
+            )
+        )
+        await conn.execute(
+            text(
+                f"CREATE TRIGGER {trigger} BEFORE UPDATE OF review_status "
+                f"ON memory_items FOR EACH ROW WHEN (OLD.tenant_id = '{p['tenant']}' "
+                f"AND OLD.id = '{counterpart_id}') "
+                f"EXECUTE FUNCTION {trigger}()"
+            )
+        )
+    return trigger
+
+
+async def _drop_trigger(p: dict[str, Any], trigger: str) -> None:
+    async with p["owner"].begin() as conn:
+        await conn.execute(text(f"DROP TRIGGER IF EXISTS {trigger} ON memory_items"))
+        await conn.execute(text(f"DROP FUNCTION IF EXISTS {trigger}()"))
+
+
+@pytest.mark.parametrize("review_status", ["rejected", "disputed"])
+async def test_counterpart_human_review_first_worker_skips(
+    proof: dict[str, Any], review_status: str
+) -> None:
+    """A Bearer-authenticated human review transitions the counterpart B from
+    active to a non-active state (rejected / disputed) while owning B's row
+    lock. The worker flagging job for A→B starts, waits behind the human-held
+    counterpart lock, the human review commits, the worker reloads B under
+    the pair lock and observes the non-active review state, and performs no
+    flagging mutation — no new counterpart, no conflict type, no resolution
+    status, no review demotion on A, and no ``conflict_detected`` event."""
+    p = proof
+    old_item = await p["insert_item"](
+        content=f"counterpart-review-first-{review_status}-old",
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    new_item = await p["insert_item"](
+        content=f"counterpart-review-first-{review_status}-new",
+        created_at=datetime(2026, 1, 2, tzinfo=UTC),
+    )
+    for iid in (old_item, new_item):
+        await p["add_ready_embedding"](iid)
+    p["force_detection"](
+        existing_item_id=old_item, action="flag_contradiction", conflict_type="contradiction"
+    )
+
+    trigger = await _install_counterpart_review_pause_trigger(p, counterpart_id=old_item)
+    coordinator = await p["owner"].connect()
+    review_task: asyncio.Task[Any] | None = None
+    worker_task: asyncio.Task[None] | None = None
+    try:
+        coordinator_pid = await coordinator.scalar(text("SELECT pg_backend_pid()"))
+        await coordinator.execute(text("SELECT pg_advisory_lock(:key)"), {"key": p["pause_key"]})
+
+        async def submit_review() -> Any:
+            async with AsyncClient(
+                transport=ASGITransport(app=create_app()), base_url="http://test"
+            ) as client:
+                return await client.post(
+                    f"/v1/items/{old_item}/review",
+                    json={"review_status": review_status, "reason": "human first on counterpart"},
+                    headers=_headers(p, "user_review"),
+                )
+
+        review_task = asyncio.create_task(submit_review())
+        # The human review reaches its paused UPDATE on the counterpart,
+        # holding the counterpart's FOR UPDATE row lock.
+        await _await_blocked_on(coordinator, coordinator_pid, 1)
+        reviewer_pid = await _worker_pid_blocked_on_coordinator(coordinator, coordinator_pid)
+
+        # Worker runs while the human owns the counterpart row lock; it waits
+        # for the pair lock (which includes the counterpart row).
+        worker_task = asyncio.create_task(p["run_conflict_check"](new_item))
+        await _await_blocked_on_pid(coordinator, reviewer_pid, 1)
+        assert not worker_task.done(), "worker must wait behind human review on counterpart"
+
+        # Release: human review commits first (active -> rejected/disputed).
+        await coordinator.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": p["pause_key"]})
+        review_resp = await asyncio.wait_for(review_task, timeout=10)
+        assert review_resp.status_code == 200, review_resp.text
+        # Worker resumes, reloads the counterpart under the pair lock, observes
+        # the non-active review state, and skips all mutation.
+        await asyncio.wait_for(worker_task, timeout=10)
+    finally:
+        for task in (worker_task, review_task):
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        if coordinator.in_transaction():
+            await coordinator.rollback()
+        await coordinator.execute(text("SELECT pg_advisory_unlock_all()"))
+        await coordinator.close()
+        await _drop_trigger(p, trigger)
+
+    st_new = await p["state"](new_item)
+    st_old = await p["state"](old_item)
+    # A retains its original review state and no conflict relationship.
+    assert st_new["item"]["review_status"] == "active"
+    assert st_new["item"]["conflicts_with_item_id"] is None
+    assert st_new["item"]["conflict_type"] is None
+    assert st_new["item"]["conflict_resolution_status"] is None
+    # No worker flagging event was written on A.
+    cd = _conflict_detected_events(st_new["events"])
+    assert cd == [], [dict(e) for e in st_new["events"]]
+    # The counterpart B carries the human review decision.
+    assert st_old["item"]["review_status"] == review_status
+    review_events = [
+        e
+        for e in st_old["events"]
+        if e["event_type"] == "review_change" and e["field_name"] == "review_status"
+    ]
+    assert len(review_events) == 1
+    assert review_events[0]["old_value"] == "active"
+    assert review_events[0]["new_value"] == review_status
+    assert review_events[0]["actor_principal_id"] == str(p["actors"]["user_review"])
+
+
+# ===========================================================================
+# 10. Worker wins first, then human reviews the counterpart
+#
+# P0-FIX-004C1A: the worker owns both A and B locks and commits the A→B
+# flag while B is still active. A valid Bearer-authenticated review
+# transition on B starts during the window, waits behind the worker's lock,
+# and after the worker commits applies its normal transition to B. The
+# history represents a valid serial order; neither operation errors. The
+# worker does NOT automatically remove the relationship when B changes
+# afterward (cleanup is separate product work).
+# ===========================================================================
+
+
+async def test_worker_wins_then_counterpart_review_applies_after(
+    proof: dict[str, Any],
+) -> None:
+    """The worker owns both A and B pair locks (paused at its guarded
+    UPDATE), commits the A→B flag while B is still active (writing exactly one
+    truthful event). A Bearer-authenticated review on B starts during the
+    window, waits behind the worker's lock, and after the worker commits
+    applies a valid active→disputed transition to B. The final history is a
+    valid serial order and neither operation encounters a database error."""
+    p = proof
+    old_item = await p["insert_item"](
+        content="worker-wins-counterpart-review-old", created_at=datetime(2026, 1, 1, tzinfo=UTC)
+    )
+    new_item = await p["insert_item"](
+        content="worker-wins-counterpart-review-new", created_at=datetime(2026, 1, 2, tzinfo=UTC)
+    )
+    for iid in (old_item, new_item):
+        await p["add_ready_embedding"](iid)
+    p["force_detection"](
+        existing_item_id=old_item, action="flag_contradiction", conflict_type="contradiction"
+    )
+
+    await _install_worker_pause_trigger(p, item_id=new_item)
+    coordinator = await p["owner"].connect()
+    worker_task: asyncio.Task[None] | None = None
+    review_task: asyncio.Task[Any] | None = None
+    try:
+        coordinator_pid = await coordinator.scalar(text("SELECT pg_backend_pid()"))
+        await coordinator.execute(text("SELECT pg_advisory_lock(:key)"), {"key": p["pause_key"]})
+
+        worker_task = asyncio.create_task(p["run_conflict_check"](new_item))
+        # Worker reaches its paused guarded UPDATE holding both pair locks.
+        await _await_blocked_on(coordinator, coordinator_pid, 1)
+        worker_pid = await _worker_pid_blocked_on_coordinator(coordinator, coordinator_pid)
+
+        async def submit_review() -> Any:
+            async with AsyncClient(
+                transport=ASGITransport(app=create_app()), base_url="http://test"
+            ) as client:
+                return await client.post(
+                    f"/v1/items/{old_item}/review",
+                    json={"review_status": "disputed", "reason": "review counterpart after worker"},
+                    headers=_headers(p, "user_review"),
+                )
+
+        review_task = asyncio.create_task(submit_review())
+        # The human review on B waits behind the worker's pair lock.
+        await _await_blocked_on_pid(coordinator, worker_pid, 1)
+        assert not review_task.done(), "review must wait behind worker"
+
+        # Release: worker commits the A→B flag while B is still active.
+        await coordinator.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": p["pause_key"]})
+        await asyncio.wait_for(worker_task, timeout=10)
+
+        # Review resumes from the committed state and applies active→disputed on B.
+        review_resp = await asyncio.wait_for(review_task, timeout=10)
+        assert review_resp.status_code == 200, review_resp.text
+    finally:
+        for task in (worker_task, review_task):
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        if coordinator.in_transaction():
+            await coordinator.rollback()
+        await coordinator.execute(text("SELECT pg_advisory_unlock_all()"))
+        await coordinator.close()
+        await _drop_worker_pause_trigger(p)
+
+    st_new = await p["state"](new_item)
+    st_old = await p["state"](old_item)
+    # Worker established A→B while B was still active: one unresolved
+    # relationship + one truthful conflict_detected event on A.
+    assert st_new["item"]["conflicts_with_item_id"] == old_item
+    assert st_new["item"]["conflict_resolution_status"] == "unresolved"
+    assert st_new["item"]["review_status"] == "proposed"  # active -> proposed demote
+    cd = _conflict_detected_events(st_new["events"])
+    assert len(cd) == 1
+    assert cd[0]["old_value"] is None
+    assert cd[0]["new_value"] == str(old_item)
+    # After the worker committed, the human review applied active→disputed on B.
+    assert st_old["item"]["review_status"] == "disputed"
+    review_events = [
+        e
+        for e in st_old["events"]
+        if e["event_type"] == "review_change" and e["field_name"] == "review_status"
+    ]
+    assert len(review_events) == 1
+    assert review_events[0]["old_value"] == "active"
+    assert review_events[0]["new_value"] == "disputed"
+    assert review_events[0]["actor_principal_id"] == str(p["actors"]["user_review"])
+    # The relationship is NOT automatically removed when B changes afterward
+    # (cleanup of relationships invalidated by later state changes is separate
+    # product work). The history remains a valid serial order.
+    assert st_new["item"]["conflicts_with_item_id"] == old_item

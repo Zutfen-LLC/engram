@@ -575,7 +575,18 @@ async def _apply_flagging(
         # Terminal review decision first → worker skips all mutation and event.
         return
     # The counterpart must remain live and suitable for the detected
-    # relationship (it was an active neighbour at detection time).
+    # relationship. Conflict detection (``detect_conflicts``) only ever
+    # returns active, non-expired neighbours, so the locked counterpart
+    # must still satisfy that same eligibility predicate: ``review_status
+    # == 'active'``, ``valid_to IS NULL``, and ``superseded_by IS NULL``.
+    # A human review transition on the counterpart (rejected / disputed /
+    # archived) may land between detection and the pair lock without
+    # touching ``valid_to`` or ``superseded_by`` — so the active review
+    # state must be rechecked explicitly here, not inferred from those
+    # columns. The counterpart row remains locked through the target
+    # update and commit, so it cannot change again during this transition.
+    if locked_counterpart.review_status != "active":
+        return
     if locked_counterpart.valid_to is not None or locked_counterpart.superseded_by is not None:
         return
     if str(locked_counterpart.id) != str(result.existing_item_id):
