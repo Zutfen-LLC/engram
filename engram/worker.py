@@ -49,7 +49,7 @@ from engram.jobs import (
     mark_job_failed_or_retry,
     mark_job_succeeded,
 )
-from engram.models import ItemEvent, Job, MemoryItem, Principal
+from engram.models import EmbeddingProfile, ItemEvent, Job, MemoryEmbedding, MemoryItem, Principal
 
 if TYPE_CHECKING:
     from engram.conflicts import ConflictAction, ConflictResult
@@ -374,6 +374,7 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
             job_item=item,
             counterpart_id=result.existing_item_id,
             result=result,
+            profile=profile,
         )
         await session.commit()
         return
@@ -742,6 +743,76 @@ async def _has_human_governance(
     return human_event is not None
 
 
+async def _lock_and_verify_pair_embeddings(
+    session: AsyncSession,
+    *,
+    job_item_id: UUID,
+    counterpart_id: UUID,
+    profile: EmbeddingProfile,
+    tenant_id: str,
+) -> bool:
+    """Lock and revalidate the embedding rows the detector relied on.
+
+    ``detect_conflicts`` requires BOTH items to have a ready, non-null embedding
+    for the job's validated profile and dimensions: the job item's embedding is
+    the query vector, and the original must appear in the same-kind, ready-
+    embedding neighbour query. An embedding's ``embedding_status`` can change
+    concurrently (``handle_embedding_generate`` updates ``memory_embeddings``
+    rows directly) WITHOUT taking the ``memory_items`` row lock that the pair
+    lock holds, so the item lock alone cannot prevent a stale eligibility
+    decision. This helper locks the relevant ``memory_embeddings`` rows with
+    ``SELECT ... FOR UPDATE`` and revalidates readiness from the locked rows.
+
+    Lock order (no deadlock with the embedding job): the caller already holds
+    the ``memory_items`` pair locks; this then locks ``memory_embeddings`` rows
+    in canonical ``memory_item_id`` order. The embedding job updates only
+    ``memory_embeddings`` (it never locks ``memory_items``), so there is no
+    cross-table lock cycle (dedup takes mi→me; the embedding job takes only me).
+
+    Returns ``True`` iff both items still have a ready, non-null embedding row
+    for ``profile.id``/``profile.dimensions`` belonging to ``tenant_id``.
+    """
+    pair_ids = sorted((job_item_id, counterpart_id), key=str)
+    dialect_name = session.bind.dialect.name if session.bind is not None else None
+    stmt = select(MemoryEmbedding).where(
+        MemoryEmbedding.tenant_id == tenant_id,
+        MemoryEmbedding.memory_item_id.in_(pair_ids),
+        MemoryEmbedding.profile_id == profile.id,
+        MemoryEmbedding.embedding_dim == profile.dimensions,
+    )
+    if dialect_name == "postgresql":
+        stmt = stmt.with_for_update()
+    locked = list((await session.execute(stmt)).scalars().all())
+    # One ready embedding row per item/profile (uq_memory_embeddings_item_profile).
+    by_item: dict[UUID, MemoryEmbedding] = {}
+    for row in locked:
+        # Last write wins is harmless: the unique constraint guarantees one row
+        # per (tenant, item, profile); a duplicate would only arise from a
+        # concurrent insert racing this read, which the FOR UPDATE serializes.
+        by_item[row.memory_item_id] = row
+    for needed in (job_item_id, counterpart_id):
+        emb = by_item.get(needed)
+        if emb is None:
+            return False
+        if emb.embedding_status != "ready":
+            return False
+        if emb.embedding is None:
+            return False
+    return True
+
+
+def _workspace_scope_matches(a: MemoryItem, b: MemoryItem) -> bool:
+    """Exact workspace-scope match, including both-null semantics.
+
+    Mirrors ``detect_conflicts``: a workspace-scoped item matches only items in
+    the same workspace, and a tenant/public-scoped item (``workspace_id IS
+    NULL``) matches only other NULL-scope items.
+    """
+    if a.workspace_id is None or b.workspace_id is None:
+        return a.workspace_id is None and b.workspace_id is None
+    return str(a.workspace_id) == str(b.workspace_id)
+
+
 async def _apply_dedup(
     session: AsyncSession,
     *,
@@ -749,6 +820,7 @@ async def _apply_dedup(
     job_item: MemoryItem,
     counterpart_id: UUID,
     result: ConflictResult,
+    profile: EmbeddingProfile,
 ) -> None:
     """Serialize the DEDUP rejection: lock, revalidate, guarded reject, event.
 
@@ -761,6 +833,13 @@ async def _apply_dedup(
     A committed human governance decision (human verification or a human
     review-state decision) outranks later automated dedup rejection: the worker
     skips all mutation and writes no event.
+
+    Under the canonical pair locks the worker revalidates the full detector
+    database-eligibility predicate — not just review-state/validity, but also
+    kind match, exact workspace scope (both-null semantics), and ready non-null
+    embeddings for the job's validated profile on both items. Embedding status
+    can change concurrently without taking the item row lock, so the relevant
+    ``memory_embeddings`` rows are locked and revalidated here too.
     """
     tenant_id = str(job.tenant_id)
     locked = await _lock_conflict_pair(
@@ -813,6 +892,30 @@ async def _apply_dedup(
     if locked_counterpart.review_status != "active":
         return
     if locked_counterpart.valid_to is not None or locked_counterpart.superseded_by is not None:
+        return
+
+    # ---- Detector eligibility: kind, workspace scope, embeddings ----------
+    # ``detect_conflicts`` selects the original via the same-kind, same-
+    # workspace-scope, active, live neighbour query, and requires both items to
+    # carry a ready non-null embedding for the job's validated profile. These
+    # facts can change after detection (e.g. classification refinement can
+    # change an item's kind; an embedding can be re-marked failed), so they are
+    # revalidated from the locked rows. This is database eligibility
+    # revalidation, not a full redetection: no semantic similarity or classifier
+    # is rerun. A mismatch is a mutation-free, event-free skip — the worker must
+    # not reject the newer item as a duplicate of an original the detector would
+    # no longer return.
+    if locked_job_item.kind != locked_counterpart.kind:
+        return
+    if not _workspace_scope_matches(locked_job_item, locked_counterpart):
+        return
+    if not await _lock_and_verify_pair_embeddings(
+        session,
+        job_item_id=locked_job_item.id,
+        counterpart_id=locked_counterpart.id,
+        profile=profile,
+        tenant_id=tenant_id,
+    ):
         return
 
     # ---- Guarded rejection ----------------------------------------------

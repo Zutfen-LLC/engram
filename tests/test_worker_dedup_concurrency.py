@@ -1232,3 +1232,309 @@ async def test_rollback_atomicity_on_event_failure(proof: dict[str, Any]) -> Non
     final_old = await p["state"](old_item)
     assert final_old["item"]["review_status"] == "active"
     assert final_old["item"]["valid_to"] is None
+
+
+# ===========================================================================
+# 9. Detector eligibility regression: kind changed after detection
+#
+# P0-FIX-004C2 follow-up: classification refinement can change an item's kind
+# after detection. The worker must not reject the newer item as a duplicate of
+# an original that detect_conflicts would no longer return (different kind).
+# ===========================================================================
+
+
+@pytest.mark.parametrize("which", ["original", "newer"])
+async def test_kind_changed_after_detection_worker_skips(
+    proof: dict[str, Any], which: str
+) -> None:
+    """Detection proposes a same-kind duplicate pair. After detection but before
+    the worker obtains pair locks, the kind of either item is changed (e.g. by
+    classification refinement) so the two no longer share a kind. The worker
+    revalidates kind under the lock, observes the mismatch, and performs no
+    rejection or event on either item."""
+    p = proof
+    old_item = await p["insert_item"](
+        content=f"dedup-kind-{which}-old", created_at=datetime(2026, 1, 1, tzinfo=UTC)
+    )
+    new_item = await p["insert_item"](
+        content=f"dedup-kind-{which}-new", created_at=datetime(2026, 1, 2, tzinfo=UTC)
+    )
+    for iid in (old_item, new_item):
+        await p["add_ready_embedding"](iid)
+    p["force_detection"](existing_item_id=old_item)
+
+    # Change the kind of the targeted item after detection so the pair no
+    # longer shares a kind. detect_conflicts selected both as 'fact'.
+    target = old_item if which == "original" else new_item
+    async with p["owner"].begin() as conn:
+        await conn.execute(
+            text("UPDATE memory_items SET kind='preference' WHERE id=:id"),
+            {"id": target},
+        )
+
+    await p["run_conflict_check"](new_item)
+    after_new = await p["state"](new_item)
+    after_old = await p["state"](old_item)
+
+    # Worker rejects neither item; no dedup event; neither item's review state
+    # or validity changed.
+    assert after_new["item"]["review_status"] == "active"
+    assert after_new["item"]["valid_to"] is None
+    assert after_old["item"]["review_status"] == "active"
+    assert after_old["item"]["valid_to"] is None
+    assert _dedup_events(after_new["events"]) == []
+    assert _dedup_events(after_old["events"]) == []
+    # The kind change persists.
+    assert after_new["item"]["kind"] == ("preference" if which == "newer" else "fact")
+    assert after_old["item"]["kind"] == ("preference" if which == "original" else "fact")
+
+
+# ===========================================================================
+# 10. Detector eligibility regression: workspace scope no longer matches
+# ===========================================================================
+
+
+@pytest.mark.parametrize("which", ["original", "newer"])
+async def test_workspace_scope_mismatch_after_detection_worker_skips(
+    proof: dict[str, Any], which: str
+) -> None:
+    """Detection proposes a duplicate pair where both items are tenant-scoped
+    (workspace_id IS NULL). After detection, one item is moved into a workspace
+    so the two no longer share workspace scope. The worker revalidates exact
+    workspace scope under the lock (including both-null semantics), observes the
+    mismatch, and performs no rejection or event."""
+    p = proof
+    old_item = await p["insert_item"](
+        content=f"dedup-workspace-{which}-old", created_at=datetime(2026, 1, 1, tzinfo=UTC)
+    )
+    new_item = await p["insert_item"](
+        content=f"dedup-workspace-{which}-new", created_at=datetime(2026, 1, 2, tzinfo=UTC)
+    )
+    for iid in (old_item, new_item):
+        await p["add_ready_embedding"](iid)
+    p["force_detection"](existing_item_id=old_item)
+
+    # Move one item into the restricted workspace (created by the proof
+    # fixture). The other stays tenant-scoped (workspace_id IS NULL), so the
+    # pair no longer shares workspace scope.
+    target = old_item if which == "original" else new_item
+    async with p["owner"].connect() as ws_conn:
+        ws_id = (
+            await ws_conn.execute(
+                text("SELECT id FROM workspaces WHERE tenant_id=:tid LIMIT 1"),
+                {"tid": p["tenant"]},
+            )
+        ).scalar()
+    async with p["owner"].begin() as conn:
+        await conn.execute(
+            text("UPDATE memory_items SET workspace_id=:ws WHERE id=:id"),
+            {"ws": ws_id, "id": target},
+        )
+
+    await p["run_conflict_check"](new_item)
+    after_new = await p["state"](new_item)
+    after_old = await p["state"](old_item)
+
+    # Worker rejects neither; no dedup event.
+    assert after_new["item"]["review_status"] == "active"
+    assert after_new["item"]["valid_to"] is None
+    assert after_old["item"]["review_status"] == "active"
+    assert after_old["item"]["valid_to"] is None
+    assert _dedup_events(after_new["events"]) == []
+    assert _dedup_events(after_old["events"]) == []
+
+
+# ===========================================================================
+# 11. Detector eligibility regression: original embedding no longer ready
+#
+# An embedding's status can change concurrently WITHOUT taking the item row
+# lock (handle_embedding_generate updates memory_embeddings rows directly).
+# The worker must lock and revalidate the embedding rows so a stale-ready
+# eligibility decision cannot drive a rejection.
+# ===========================================================================
+
+
+async def test_original_embedding_not_ready_after_detection_worker_skips(
+    proof: dict[str, Any],
+) -> None:
+    """Detection proposes a duplicate pair (both items had ready embeddings).
+    After detection, the original's embedding is marked non-ready (e.g. a
+    concurrent re-embedding job flips it to 'failed'). The worker locks and
+    revalidates the embedding rows, observes the original's embedding is no
+    longer ready, and performs no rejection or event."""
+    p = proof
+    old_item = await p["insert_item"](
+        content="dedup-embedding-not-ready-old", created_at=datetime(2026, 1, 1, tzinfo=UTC)
+    )
+    new_item = await p["insert_item"](
+        content="dedup-embedding-not-ready-new", created_at=datetime(2026, 1, 2, tzinfo=UTC)
+    )
+    for iid in (old_item, new_item):
+        await p["add_ready_embedding"](iid)
+    p["force_detection"](existing_item_id=old_item)
+
+    # Flip the original's embedding to 'failed' (NULL the vector too, mirroring
+    # a real failed re-embedding) after detection but before the worker locks.
+    async with p["owner"].begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE memory_embeddings SET embedding_status='failed', embedding=NULL "
+                "WHERE memory_item_id=:id"
+            ),
+            {"id": old_item},
+        )
+
+    await p["run_conflict_check"](new_item)
+    after_new = await p["state"](new_item)
+    after_old = await p["state"](old_item)
+
+    # Worker rejects neither; no dedup event; neither item's validity changed.
+    assert after_new["item"]["review_status"] == "active"
+    assert after_new["item"]["valid_to"] is None
+    assert after_old["item"]["review_status"] == "active"
+    assert after_old["item"]["valid_to"] is None
+    assert _dedup_events(after_new["events"]) == []
+    assert _dedup_events(after_old["events"]) == []
+
+
+async def test_newer_embedding_not_ready_after_detection_worker_skips(
+    proof: dict[str, Any],
+) -> None:
+    """Same as above but the NEWER/job item's embedding is the one that loses
+    readiness after detection. The worker must skip for the same reason."""
+    p = proof
+    old_item = await p["insert_item"](
+        content="dedup-embedding-not-ready-newer-old", created_at=datetime(2026, 1, 1, tzinfo=UTC)
+    )
+    new_item = await p["insert_item"](
+        content="dedup-embedding-not-ready-newer-new", created_at=datetime(2026, 1, 2, tzinfo=UTC)
+    )
+    for iid in (old_item, new_item):
+        await p["add_ready_embedding"](iid)
+    p["force_detection"](existing_item_id=old_item)
+
+    async with p["owner"].begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE memory_embeddings SET embedding_status='failed', embedding=NULL "
+                "WHERE memory_item_id=:id"
+            ),
+            {"id": new_item},
+        )
+
+    await p["run_conflict_check"](new_item)
+    after_new = await p["state"](new_item)
+    after_old = await p["state"](old_item)
+
+    assert after_new["item"]["review_status"] == "active"
+    assert after_new["item"]["valid_to"] is None
+    assert after_old["item"]["review_status"] == "active"
+    assert after_old["item"]["valid_to"] is None
+    assert _dedup_events(after_new["events"]) == []
+    assert _dedup_events(after_old["events"]) == []
+
+
+# ===========================================================================
+# 12. Concurrency: embedding flips to failed while worker holds pair locks
+#
+# Proves the embedding-row lock serializes against a concurrent embedding
+# status change. The worker holds the pair (item) locks and reaches its
+# embedding revalidation; a concurrent session flips the original's embedding
+# to 'failed'. Because the worker locks the embedding rows with FOR UPDATE,
+# the concurrent flip waits behind the worker; the worker revalidates the
+# still-ready embedding, commits the rejection, and the flip applies after.
+# (If the flip had landed first, the worker's revalidation would skip.)
+# ===========================================================================
+
+
+async def test_embedding_flip_waits_behind_worker_then_rejection_commits(
+    proof: dict[str, Any],
+) -> None:
+    """The worker holds the pair locks and pauses at its embedding
+    revalidation. A concurrent session attempts to flip the original's
+    embedding to 'failed'. The flip waits behind the worker's embedding-row
+    lock; the worker revalidates the still-ready embedding and commits the
+    rejection atomically; the flip applies afterward (the original's embedding
+    becomes failed, but the newer item was already truthfully rejected)."""
+    p = proof
+    old_item = await p["insert_item"](
+        content="dedup-emb-flip-old", created_at=datetime(2026, 1, 1, tzinfo=UTC)
+    )
+    new_item = await p["insert_item"](
+        content="dedup-emb-flip-new", created_at=datetime(2026, 1, 2, tzinfo=UTC)
+    )
+    for iid in (old_item, new_item):
+        await p["add_ready_embedding"](iid)
+    p["force_detection"](existing_item_id=old_item)
+
+    # Pause the worker at its guarded rejection UPDATE (valid_to) so the
+    # embedding-row lock is already held by the worker when the flip starts.
+    await _install_worker_pause_trigger(p, item_id=new_item)
+    coordinator = await p["owner"].connect()
+    worker_task: asyncio.Task[None] | None = None
+    flip_task: asyncio.Task[Any] | None = None
+    try:
+        coordinator_pid = await coordinator.scalar(text("SELECT pg_backend_pid()"))
+        await coordinator.execute(text("SELECT pg_advisory_lock(:key)"), {"key": p["pause_key"]})
+
+        worker_task = asyncio.create_task(p["run_conflict_check"](new_item))
+        # Worker reaches its paused guarded rejection holding the pair locks
+        # AND the embedding-row locks (embedding revalidation ran first).
+        await _await_blocked_on(coordinator, coordinator_pid, 1)
+        worker_pid = await _worker_pid_blocked_on_coordinator(coordinator, coordinator_pid)
+
+        async def flip_original_embedding() -> Any:
+            # A concurrent embedding-status update on the original's
+            # memory_embeddings row. This UPDATE takes a row lock on the
+            # embedding row the worker already holds with FOR UPDATE, so it
+            # waits behind the worker.
+            async with p["owner_factory"]() as session:
+                await session.execute(
+                    text(
+                        "UPDATE memory_embeddings SET embedding_status='failed', embedding=NULL "
+                        "WHERE memory_item_id=:id"
+                    ),
+                    {"id": old_item},
+                )
+                await session.commit()
+            return True
+
+        flip_task = asyncio.create_task(flip_original_embedding())
+        # The flip waits behind the worker's embedding-row lock (held via the
+        # worker's locked memory_embeddings rows). It cannot change the
+        # embedding while the worker is revalidating it.
+        await _await_blocked_on_pid(coordinator, worker_pid, 1)
+        assert not flip_task.done(), "embedding flip must wait behind worker"
+
+        # Release: worker revalidated the still-ready embedding and commits the
+        # rejection atomically.
+        await coordinator.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": p["pause_key"]})
+        await asyncio.wait_for(worker_task, timeout=10)
+        # The flip now proceeds (the worker released the embedding-row locks on
+        # commit).
+        await asyncio.wait_for(flip_task, timeout=10)
+    finally:
+        for task in (worker_task, flip_task):
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        if coordinator.in_transaction():
+            await coordinator.rollback()
+        await coordinator.execute(text("SELECT pg_advisory_unlock_all()"))
+        await coordinator.close()
+        await _drop_worker_pause_trigger(p)
+
+    # The worker committed the rejection truthfully (the embedding was still
+    # ready at revalidation time under the lock).
+    st_new = await p["state"](new_item)
+    st_old = await p["state"](old_item)
+    assert st_new["item"]["review_status"] == "rejected"
+    assert st_new["item"]["valid_to"] is not None
+    cd = _dedup_events(st_new["events"])
+    assert len(cd) == 1
+    assert cd[0]["old_value"] == "active"
+    assert cd[0]["new_value"] == "rejected"
+    # The original was not rejected by the worker; its embedding is now failed
+    # (the flip applied after the worker committed).
+    assert st_old["item"]["review_status"] == "active"
+    assert st_old["item"]["valid_to"] is None

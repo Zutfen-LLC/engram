@@ -770,7 +770,23 @@ being inferred or backfilled.
 > under `created_at` ordering with a UUID tiebreak when timestamps match. The
 > existing/original item must still exist, belong to the job tenant, match the
 > detected id, have `review_status = 'active'`, `valid_to IS NULL`, and
-> `superseded_by IS NULL` (the detector's database eligibility predicate).
+> `superseded_by IS NULL`. Beyond review-state/validity, the worker revalidates
+> the *full* detector database-eligibility predicate: the two locked items must
+> still share the same `kind` and the same exact workspace scope (including
+> both-`NULL` semantics — a `workspace_id IS NULL` item matches only other
+> `NULL`-scope items), and both must still carry a ready, non-`NULL` embedding
+> for the job's validated profile and dimensions. An embedding's
+> `embedding_status` can change concurrently (the embedding job updates
+> `memory_embeddings` rows directly) *without* taking the `memory_items` row
+> lock, so the item pair lock alone cannot prevent a stale eligibility
+> decision: the relevant `memory_embeddings` rows for both items are locked with
+> `SELECT ... FOR UPDATE` in canonical `memory_item_id` order and revalidated.
+> Lock order is `memory_items` (pair) then `memory_embeddings`; the embedding
+> job locks only `memory_embeddings`, so there is no cross-table deadlock. A
+> kind/scope/embedding mismatch is a mutation-free, event-free skip — the worker
+> does not reject the newer item as a duplicate of an original the detector
+> would no longer return. This is database eligibility revalidation, not a
+> full redetection: no semantic similarity or classifier is rerun.
 >
 > **Guarded rejection.** The `UPDATE ... RETURNING` re-checks tenant, item,
 > `valid_to IS NULL`, `superseded_by IS NULL`, permitted current review state,
