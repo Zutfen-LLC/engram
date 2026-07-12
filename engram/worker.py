@@ -356,44 +356,24 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
     else:
         item_is_newer = False
 
-    # Idempotency: if already in the target state, no-op.
     if action == ConflictAction.DEDUP:
         if not item_is_newer:
             # The job's item is the original; the newer neighbor's own
             # conflict.check will handle the dedup. Avoid acting twice.
             await session.commit()
             return
-        # Semantic duplicate — mark the new item rejected + invalidated so it
-        # leaves the active/recallable set (append-first: not deleted).
-        actor = await resolve_internal_system_actor(
+        # Semantic duplicate — serialize the rejection. Detection is only a
+        # proposal (P0-FIX-004C2): lock both rows in canonical order, revalidate
+        # mutation authority from the locked rows (including human-governance
+        # precedence), perform a guarded rejection, and write the event only
+        # after the transition is confirmed — all in one transaction. The
+        # original item is never mutated.
+        await _apply_dedup(
             session,
-            tenant_id=job.tenant_id,
-            internal_key=CONFLICT_AUTOMATION_INTERNAL_KEY,
-        )
-        provenance = {
-            "action": action.value,
-            "existing_item_id": str(result.existing_item_id),
-            "reason": result.reason,
-            "worker_operation": "conflict.check",
-            "job_id": str(job.id),
-            "item_author_principal_id": str(item.principal_id),
-            "internal_actor_key": CONFLICT_AUTOMATION_INTERNAL_KEY,
-            **result.provenance,
-        }
-        await _insert_event(
-            session,
-            item_id=item.id,
-            event_type="conflict_detected",
-            field_name="review_status",
-            old_value=item.review_status,
-            new_value="rejected",
-            actor_principal_id=actor,
-            reason=json.dumps(provenance, sort_keys=True),
-        )
-        await session.execute(
-            update(MemoryItem)
-            .where(MemoryItem.id == item.id)
-            .values(review_status="rejected", valid_to=_utcnow())
+            job=job,
+            job_item=item,
+            counterpart_id=result.existing_item_id,
+            result=result,
         )
         await session.commit()
         return
@@ -497,6 +477,17 @@ _FLAGGING_ACTION_VALUES: frozenset[str] = frozenset(
 _DEMOTE_PERMITTED_FROM: frozenset[str] = frozenset({"active", "proposed", "disputed"})
 # Completed human conflict decisions the worker must never reopen.
 _COMPLETED_DECISIONS: frozenset[str] = frozenset({"accepted", "rejected", "merged"})
+
+# Review states the DEDUP branch may reject FROM (P0-FIX-004C2). A semantic
+# duplicate may be active, proposed, or disputed when detected; terminal
+# (rejected/archived) and invalidated/superseded rows are skipped. The guarded
+# UPDATE re-checks this set so a concurrent transition out of it is a no-op.
+_DEDUP_PERMITTED_FROM: frozenset[str] = frozenset({"active", "proposed", "disputed"})
+# Authenticated principal types whose review/verification decisions constitute
+# human governance and outrank later automated dedup rejection. Agents and
+# ordinary system principals do NOT become human governors by holding review
+# scope (see P0-FIX-004C2 locked policy).
+_HUMAN_GOVERNOR_TYPES: frozenset[str] = frozenset({"user", "admin"})
 
 
 async def _lock_conflict_pair(
@@ -695,6 +686,190 @@ async def _apply_flagging(
         new_value=str(target_counterpart),
         actor_principal_id=actor,
         reason=json.dumps(payload, sort_keys=True),
+    )
+
+
+async def _has_human_governance(
+    session: AsyncSession,
+    *,
+    item: MemoryItem,
+    tenant_id: str,
+) -> bool:
+    """True if a committed human governance decision protects ``item`` from
+    automated dedup rejection (P0-FIX-004C2).
+
+    Human governance is determined from authoritative stored provenance — never
+    from caller-supplied actor fields or mutable names:
+
+    * ``human_verified = TRUE`` on the locked row (with its authenticated
+      ``verified_by`` attribution written by the verify endpoint, which only
+      admits ``user``/``admin`` principals); or
+    * a committed ``review_change`` event on the item whose authenticated actor
+      principal is of type ``user`` or ``admin`` (the review/bulk-archive
+      endpoints always set the actor to the authenticated caller). Promotion's
+      ``review_change`` events use the ``review_automation`` internal system
+      actor (``type='system'``) and do NOT count as human governance — agents
+      and ordinary systems do not become human governors by holding review scope.
+
+    Must be evaluated while the item's row lock is held: human review and
+    verification both lock the item with ``SELECT ... FOR UPDATE`` before
+    writing their events, so the shared item lock defines the serial order and
+    the predicate cannot be bypassed by the concurrent human path.
+    """
+    if item.human_verified:
+        return True
+    human_event = (
+        await session.execute(
+            select(ItemEvent.id)
+            .join(ItemEvent.item)  # memory_items row (tenant-scoped by RLS)
+            .where(
+                ItemEvent.item_id == item.id,
+                ItemEvent.event_type == "review_change",
+                ItemEvent.field_name == "review_status",
+                ItemEvent.actor_principal_id.is_not(None),
+                # Actor principal type must be a human governor. The join to
+                # principals is tenant-scoped by RLS on principals (FORCE RLS).
+                ItemEvent.actor_principal_id.in_(
+                    select(Principal.id).where(
+                        Principal.tenant_id == tenant_id,
+                        Principal.type.in_(tuple(_HUMAN_GOVERNOR_TYPES)),
+                    )
+                ),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return human_event is not None
+
+
+async def _apply_dedup(
+    session: AsyncSession,
+    *,
+    job: Job,
+    job_item: MemoryItem,
+    counterpart_id: UUID,
+    result: ConflictResult,
+) -> None:
+    """Serialize the DEDUP rejection: lock, revalidate, guarded reject, event.
+
+    Detection snapshots (``job_item``, ``result``) are a *proposal* (P0-FIX-004C2).
+    The locked rows are mutation authority. The guard in the
+    ``UPDATE ... RETURNING`` re-checks every mutation-authority fact, so a
+    zero-row update is a truthful skip (no event, no mutation) — never
+    permission to write a stale event. The original item is never mutated.
+
+    A committed human governance decision (human verification or a human
+    review-state decision) outranks later automated dedup rejection: the worker
+    skips all mutation and writes no event.
+    """
+    tenant_id = str(job.tenant_id)
+    locked = await _lock_conflict_pair(
+        session,
+        job_item_id=job_item.id,
+        counterpart_id=counterpart_id,
+        tenant_id=tenant_id,
+    )
+    if locked is None:
+        return
+    locked_job_item, locked_counterpart = locked
+
+    # ---- Under-lock revalidation: the NEWER/job item ---------------------
+    # Must still be live (valid_to IS NULL, superseded_by IS NULL) and not in a
+    # terminal review state. Terminal (rejected/archived) or invalidated rows
+    # are an idempotent no-op: do not update again, do not replace valid_to,
+    # do not emit another event.
+    if locked_job_item.valid_to is not None or locked_job_item.superseded_by is not None:
+        return
+    if locked_job_item.review_status in {"rejected", "archived"}:
+        return
+    # The job item must remain the newer side per the creation-time + UUID
+    # tiebreak rule, evaluated against the locked counterpart.
+    if locked_job_item.created_at > locked_counterpart.created_at:
+        still_newer = True
+    elif locked_job_item.created_at == locked_counterpart.created_at:
+        still_newer = str(locked_job_item.id) > str(locked_counterpart.id)
+    else:
+        still_newer = False
+    if not still_newer:
+        return
+    # Human-governance precedence: a committed human review/verification
+    # decision protects the item from automated dedup rejection. Evaluated
+    # while the item lock is held.
+    if await _has_human_governance(session, item=locked_job_item, tenant_id=tenant_id):
+        return
+    # The job item must remain in a state eligible for automated dedup.
+    if locked_job_item.review_status not in _DEDUP_PERMITTED_FROM:
+        return
+
+    # ---- Under-lock revalidation: the EXISTING/original item -------------
+    # The original must still satisfy the detector's database eligibility
+    # predicate: review_status='active', valid_to IS NULL. superseded_by IS
+    # NULL is checked defensively (supersession sets valid_to, but be explicit).
+    # A human review transition on the original may land between detection and
+    # the pair lock without touching valid_to, so the active review state is
+    # rechecked explicitly here. The original must match the detected id.
+    if str(locked_counterpart.id) != str(result.existing_item_id):
+        return
+    if locked_counterpart.review_status != "active":
+        return
+    if locked_counterpart.valid_to is not None or locked_counterpart.superseded_by is not None:
+        return
+
+    # ---- Guarded rejection ----------------------------------------------
+    # The guard re-checks every mutation-authority fact so a concurrent change
+    # between revalidation and the write is still caught. The human-governance
+    # row-state (human_verified) is re-checked here; the human-event predicate
+    # is stored outside the item row but was evaluated above under the same
+    # lock, and the human path cannot write its event without first acquiring
+    # this row's FOR UPDATE lock.
+    old_review_status = locked_job_item.review_status
+    reject_at = _utcnow()
+    update_stmt = (
+        update(MemoryItem)
+        .where(
+            MemoryItem.id == locked_job_item.id,
+            MemoryItem.tenant_id == tenant_id,
+            MemoryItem.valid_to.is_(None),
+            MemoryItem.superseded_by.is_(None),
+            MemoryItem.review_status.in_(tuple(_DEDUP_PERMITTED_FROM)),
+            MemoryItem.human_verified.is_(False),
+        )
+        .values(review_status="rejected", valid_to=reject_at)
+        .returning(MemoryItem.id)
+    )
+    guard_result = await session.execute(
+        update_stmt, execution_options={"synchronize_session": False}
+    )
+    if guard_result.scalar_one_or_none() is None:
+        # The transition did not occur — no event is written. The transaction
+        # commits as a no-op; a concurrent writer won the mutation authority.
+        return
+
+    # ---- Event after the guarded rejection succeeds ---------------------
+    actor = await resolve_internal_system_actor(
+        session,
+        tenant_id=tenant_id,
+        internal_key=CONFLICT_AUTOMATION_INTERNAL_KEY,
+    )
+    provenance = {
+        "action": result.action.value,
+        "existing_item_id": str(result.existing_item_id),
+        "reason": result.reason,
+        "worker_operation": "conflict.check",
+        "job_id": str(job.id),
+        "item_author_principal_id": str(locked_job_item.principal_id),
+        "internal_actor_key": CONFLICT_AUTOMATION_INTERNAL_KEY,
+        **result.provenance,
+    }
+    await _insert_event(
+        session,
+        item_id=locked_job_item.id,
+        event_type="conflict_detected",
+        field_name="review_status",
+        old_value=old_review_status,
+        new_value="rejected",
+        actor_principal_id=actor,
+        reason=json.dumps(provenance, sort_keys=True),
     )
 
 

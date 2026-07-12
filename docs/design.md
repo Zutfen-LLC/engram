@@ -733,6 +733,58 @@ being inferred or backfilled.
 > `AUTO_SUPERSEDE` are separate writers and remain out of scope for this
 > serialization slice.
 
+> **Worker DEDUP serialization (P0-FIX-004C2):** The background worker's
+> `conflict.check` `DEDUP` branch (semantic duplicate → reject + invalidate the
+> newer item) uses the same canonical pair-lock strategy as the human resolution
+> route and the flagging branch: both rows are locked with
+> `SELECT ... FOR UPDATE` in deterministic UUID order, mutation authority is
+> revalidated from the locked rows (not the earlier detection snapshot), and a
+> guarded `UPDATE ... RETURNING` precedes event creation in one transaction.
+> Detection may run unlocked because it is expensive and only a proposal. The
+> original item is never mutated.
+>
+> **Human-governance precedence.** A committed human governance decision
+> outranks later automated dedup rejection. The worker must not reject an item
+> when, before it obtains mutation authority, a human user or administrator has
+> human-verified the item or performed a review-state decision on it
+> (activation, dispute, rejection, or archival). Human governance is determined
+> from authoritative stored provenance — never from caller-supplied actor
+> fields or mutable names: `human_verified = TRUE` on the locked row (with its
+> authenticated `verified_by` attribution), or a committed `review_change`
+> event whose authenticated actor principal is of type `user` or `admin`.
+> Promotion's `review_change` events use the `review_automation` internal
+> system actor (`type='system'`) and do NOT count as human governance — agents
+> and ordinary systems do not become human governors merely by holding review
+> scope. The human-event predicate is stored outside the item row, so it is
+> evaluated while the item lock is held; human review and verification both
+> lock the item with `SELECT ... FOR UPDATE` before writing their events, so
+> the shared item lock defines the serial order and the predicate cannot be
+> bypassed by the concurrent human path.
+>
+> **Under-lock revalidation.** From the locked rows, the newer/job item must
+> still exist, belong to the job tenant, have `valid_to IS NULL` and
+> `superseded_by IS NULL`, not be in a terminal review state
+> (`rejected`/`archived`), not be human-verified, have no committed human
+> review/verification governance event, remain in a state eligible for
+> automated dedup (`active`/`proposed`/`disputed`), and remain the newer side
+> under `created_at` ordering with a UUID tiebreak when timestamps match. The
+> existing/original item must still exist, belong to the job tenant, match the
+> detected id, have `review_status = 'active'`, `valid_to IS NULL`, and
+> `superseded_by IS NULL` (the detector's database eligibility predicate).
+>
+> **Guarded rejection.** The `UPDATE ... RETURNING` re-checks tenant, item,
+> `valid_to IS NULL`, `superseded_by IS NULL`, permitted current review state,
+> and absence of human verification. A zero-row result is a mutation-free,
+> event-free skip. The event is written only after the guarded rejection
+> succeeds: it identifies the actual locked old review state, records
+> `new_value = rejected`, uses the `conflict_automation` internal actor,
+> retains the detected original id and existing provenance, and shares one
+> transaction with the rejection. An identical rerun is a state-free,
+> event-free no-op (the already-rejected item fails the guard). Reciprocal
+> dedup jobs cannot deadlock (canonical pair order) and creation ordering
+> allows only the correct newer item to be rejected. `AUTO_SUPERSEDE` remains a
+> separate writer and is out of scope for this slice.
+
 ---
 
 ## 7. Memory Topology
