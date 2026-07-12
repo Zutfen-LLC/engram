@@ -374,6 +374,7 @@ async def test_diary_write_success() -> None:
             "principal_id": OTHER_ID,
             "actor_principal_id": OTHER_ID,
             "represented": False,
+            "attribution_status": "recorded",
             "authority": 10,
             "authority_label": "inferred",
         },
@@ -382,6 +383,7 @@ async def test_diary_write_success() -> None:
         resp = await client.diary_write("explored the search path", "hermes", topic="debugging")
     assert isinstance(resp, DiaryWriteResponse)
     assert resp.actor_principal_id == UUID(OTHER_ID)
+    assert resp.attribution_status == "recorded"
     assert resp.status == "created"
     assert resp.principal_id == UUID(OTHER_ID)
     body = _body(rec.request)

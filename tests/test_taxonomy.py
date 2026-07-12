@@ -286,6 +286,9 @@ async def test_diary_write_creates_diary_entry(client):
     assert resp.status_code == 201
     payload = resp.json()
     assert payload["status"] == "created"
+    assert payload["attribution_status"] == "recorded"
+    assert payload["represented"] is False
+    assert payload["actor_principal_id"] == payload["principal_id"]
     assert "id" in payload
     assert "principal_id" in payload
 
@@ -337,6 +340,9 @@ async def test_diary_write_dedupes(client):
     assert second.status_code == 201
     assert second.json()["status"] == "deduped"
     assert second.json()["id"] == first.json()["id"]
+    assert second.json()["actor_principal_id"] == first.json()["actor_principal_id"]
+    assert second.json()["represented"] is False
+    assert second.json()["attribution_status"] == "recorded"
 
 
 @pytest.mark.asyncio
