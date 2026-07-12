@@ -59,7 +59,7 @@ async def proof(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[dict[str, Any]
         "user_review": (uuid.uuid4(), "user", ["review"], None),
         "admin_review": (uuid.uuid4(), "admin", ["review"], None),
         "agent_review": (uuid.uuid4(), "agent", ["review"], None),
-        "agent_admin": (uuid.uuid4(), "agent", ["admin"], None),
+        "agent_admin": (uuid.uuid4(), "agent", ["review", "admin"], None),
         "system_review": (uuid.uuid4(), "system", ["review"], None),
         "system_admin": (uuid.uuid4(), "system", ["review", "admin"], None),
         "user_no_review": (uuid.uuid4(), "user", ["read"], None),
@@ -103,7 +103,7 @@ async def proof(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[dict[str, Any]
     monkeypatch.setattr(db_module, "async_session_factory", app_factory)
     monkeypatch.setattr(db_module, "read_session_factory", app_factory)
     monkeypatch.setattr(db_module, "owner_session_factory", owner_factory)
-    settings.auth_enabled = True
+    monkeypatch.setattr(settings, "auth_enabled", True)
     reset_principal_cache()
     client = AsyncClient(transport=ASGITransport(app=create_app()), base_url="http://test")
     data: dict[str, Any] = {"owner": owner, "app": app, "tenant": tenant, "workspace": workspace, "actors": {k: v[0] for k, v in actors.items()}, "keys": keys, "pair": pair, "state": state, "client": client}
