@@ -26,14 +26,15 @@ retries (and eventually dead-letters) without taking the process down.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-from sqlalchemy import insert, select, text, update
+from sqlalchemy import insert, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from engram.config import settings
@@ -49,6 +50,9 @@ from engram.jobs import (
     mark_job_succeeded,
 )
 from engram.models import ItemEvent, Job, MemoryItem, Principal
+
+if TYPE_CHECKING:
+    from engram.conflicts import ConflictAction, ConflictResult
 
 logger = logging.getLogger(__name__)
 
@@ -292,8 +296,6 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
     auto-supersede → supersede the old item; contradiction/scope overlap/proposed
     supersede → set conflict metadata and demote to proposed. Idempotent.
     """
-    import json
-
     from engram.conflicts import ConflictAction, detect_conflicts
     from engram.embedding_profiles import get_active_profile, get_profile_by_id
 
@@ -448,10 +450,218 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
     # where the newly-written item is the one marked — so that flagging item1
     # (which demotes it out of the active set) doesn't make it invisible to
     # item2's conflict.check neighbor query (which requires active neighbors).
+    #
+    # P0-FIX-004C1: detection runs unlocked (it is expensive and only a
+    # proposal). Mutation is serialized: lock BOTH rows in canonical UUID order
+    # with SELECT ... FOR UPDATE, reload from the locked rows, revalidate every
+    # mutation authority fact from that locked state, and perform a guarded
+    # UPDATE ... RETURNING. The event is written only after the guarded update
+    # confirms the transition, in the same transaction. The locked rows — not
+    # the detection snapshots — are mutation authority.
+    if action not in (
+        ConflictAction.FLAG_CONTRADICTION,
+        ConflictAction.FLAG_SCOPE_OVERLAP,
+        ConflictAction.PROPOSED_SUPERSEDE,
+    ):
+        # Defensive: an unknown action that is not DEDUP/AUTO_SUPERSEDE/flagging
+        # must not reach the legacy unguarded path.
+        await session.commit()
+        return
     if not item_is_newer:
         await session.commit()
         return
-    new_review = "proposed" if item.review_status == "active" else item.review_status
+
+    await _apply_flagging(
+        session,
+        job=job,
+        job_item=item,
+        counterpart_id=result.existing_item_id,
+        action=action,
+        result=result,
+    )
+    await session.commit()
+
+
+# Flagging actions serialized by this slice (P0-FIX-004C1). Stored as their
+# string values so this module-level constant does not require importing the
+# ``ConflictAction`` enum (which pulls in the openai dependency) at import time.
+# The under-lock revalidation asserts the proposed action's value still belongs
+# to this flagging family.
+_FLAGGING_ACTION_VALUES: frozenset[str] = frozenset(
+    {"flag_contradiction", "flag_scope_overlap", "proposed_supersede"}
+)
+
+# Review states the flagging branch may demote FROM (active -> proposed). Every
+# other permitted-but-non-demoting state is preserved as-is. Terminal/inactive
+# states cause the worker to skip all mutation and event creation.
+_DEMOTE_PERMITTED_FROM: frozenset[str] = frozenset({"active", "proposed", "disputed"})
+# Completed human conflict decisions the worker must never reopen.
+_COMPLETED_DECISIONS: frozenset[str] = frozenset({"accepted", "rejected", "merged"})
+
+
+async def _lock_conflict_pair(
+    session: AsyncSession,
+    *,
+    job_item_id: UUID,
+    counterpart_id: UUID,
+    tenant_id: str,
+) -> tuple[MemoryItem, MemoryItem] | None:
+    """Lock both conflict rows in canonical UUID order (SELECT ... FOR UPDATE).
+
+    Canonical pair locking (mirrors ``resolve_conflict`` in review.py): rows are
+    locked by deterministic ``id`` ordering — independent of detection order — so
+    two reciprocal worker jobs cannot deadlock. Both rows must belong to the job
+    tenant; a missing row or tenant mismatch fails closed (returns ``None``).
+    Self-conflicts are rejected.
+    """
+    if job_item_id == counterpart_id:
+        return None
+    pair_ids = sorted((job_item_id, counterpart_id), key=str)
+    dialect_name = session.bind.dialect.name if session.bind is not None else None
+    stmt = (
+        select(MemoryItem)
+        .where(MemoryItem.id.in_(pair_ids), MemoryItem.tenant_id == tenant_id)
+        .order_by(MemoryItem.id)
+    )
+    if dialect_name == "postgresql":
+        stmt = stmt.with_for_update()
+    locked = list((await session.execute(stmt)).scalars().all())
+    if len(locked) != 2:
+        return None
+    by_id = {row.id: row for row in locked}
+    job_item = by_id.get(job_item_id)
+    counterpart = by_id.get(counterpart_id)
+    if job_item is None or counterpart is None:
+        return None
+    if str(job_item.tenant_id) != tenant_id or str(counterpart.tenant_id) != tenant_id:
+        return None
+    return job_item, counterpart
+
+
+async def _apply_flagging(
+    session: AsyncSession,
+    *,
+    job: Job,
+    job_item: MemoryItem,
+    counterpart_id: UUID,
+    action: ConflictAction,
+    result: ConflictResult,
+) -> None:
+    """Serialize the flagging mutation: lock, revalidate, guarded write, event.
+
+    Detection snapshots (``job_item``, ``result``) are a *proposal*. The locked
+    rows are mutation authority. The guard in the ``UPDATE ... RETURNING``
+    re-checks every mutation authority fact, so a zero-row update is a truthful
+    skip (no event, no mutation) — never permission to write a stale event.
+    """
+    tenant_id = str(job.tenant_id)
+    locked = await _lock_conflict_pair(
+        session,
+        job_item_id=job_item.id,
+        counterpart_id=counterpart_id,
+        tenant_id=tenant_id,
+    )
+    if locked is None:
+        return
+    locked_job_item, locked_counterpart = locked
+
+    # Under-lock revalidation. Each check below is a mutation-authority fact
+    # derived from the locked rows; the detection snapshots are NOT authority.
+    # The job item must still be live (valid_to IS NULL, superseded_by IS NULL,
+    # not rejected/archived).
+    if locked_job_item.valid_to is not None or locked_job_item.superseded_by is not None:
+        return
+    if locked_job_item.review_status in {"rejected", "archived"}:
+        # Terminal review decision first → worker skips all mutation and event.
+        return
+    # The counterpart must remain live and suitable for the detected
+    # relationship (it was an active neighbour at detection time).
+    if locked_counterpart.valid_to is not None or locked_counterpart.superseded_by is not None:
+        return
+    if str(locked_counterpart.id) != str(result.existing_item_id):
+        return
+    # The detected action must still belong to this slice's flagging family.
+    if action.value not in _FLAGGING_ACTION_VALUES:
+        return
+    # The job item must remain the newer side per the creation-time + UUID
+    # tiebreak rule, evaluated against the locked counterpart.
+    if locked_job_item.created_at > locked_counterpart.created_at:
+        still_newer = True
+    elif locked_job_item.created_at == locked_counterpart.created_at:
+        still_newer = str(locked_job_item.id) > str(locked_counterpart.id)
+    else:
+        still_newer = False
+    if not still_newer:
+        return
+
+    review_status = locked_job_item.review_status
+    # Conflict-decision preservation: never overwrite a completed human decision.
+    resolution_status = locked_job_item.conflict_resolution_status
+    if resolution_status in _COMPLETED_DECISIONS:
+        return
+    # Review-state preservation: demote only active -> proposed. Preserve
+    # proposed/disputed. Anything else not in the permitted set skips.
+    if review_status not in _DEMOTE_PERMITTED_FROM:
+        return
+    new_review = "proposed" if review_status == "active" else review_status
+
+    existing_counterpart = locked_job_item.conflicts_with_item_id
+    existing_type = locked_job_item.conflict_type
+    existing_resolution = locked_job_item.conflict_resolution_status
+    target_counterpart = result.existing_item_id
+    target_type = result.conflict_type
+
+    # Existing conflict preservation (single-slot conflict model).
+    if existing_counterpart is not None:
+        if (
+            existing_counterpart == target_counterpart
+            and existing_type == target_type
+            and existing_resolution == "unresolved"
+            and review_status == new_review
+        ):
+            # Same unresolved relationship: idempotent no-op — no event, no mutation.
+            return
+        # A different relationship already occupies the single conflict slot.
+        # Do not silently replace it. Multi-conflict support is later work.
+        return
+
+    # Guarded transition. The guard re-checks every mutation-authority fact so a
+    # concurrent change between revalidation and the write is still caught.
+    update_stmt = (
+        update(MemoryItem)
+        .where(
+            MemoryItem.id == locked_job_item.id,
+            MemoryItem.tenant_id == tenant_id,
+            MemoryItem.valid_to.is_(None),
+            MemoryItem.superseded_by.is_(None),
+            MemoryItem.review_status.in_(tuple(_DEMOTE_PERMITTED_FROM)),
+            or_(
+                MemoryItem.conflict_resolution_status.is_(None),
+                MemoryItem.conflict_resolution_status == "unresolved",
+            ),
+            MemoryItem.conflicts_with_item_id.is_(None),
+        )
+        .values(
+            conflicts_with_item_id=target_counterpart,
+            conflict_type=target_type,
+            conflict_resolution_status="unresolved",
+            review_status=new_review,
+        )
+        .returning(MemoryItem.id)
+    )
+    guard_result = await session.execute(
+        update_stmt, execution_options={"synchronize_session": False}
+    )
+    if guard_result.scalar_one_or_none() is None:
+        # The transition did not occur — no event is written. The transaction
+        # commits as a no-op; a concurrent writer won the mutation authority.
+        return
+
+    actor = await resolve_internal_system_actor(
+        session,
+        tenant_id=tenant_id,
+        internal_key=CONFLICT_AUTOMATION_INTERNAL_KEY,
+    )
     payload = {
         "verdict": result.verdict.value,
         "action": action.value,
@@ -461,36 +671,20 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
         "reason": result.reason,
         "worker_operation": "conflict.check",
         "job_id": str(job.id),
-        "item_author_principal_id": str(item.principal_id),
+        "item_author_principal_id": str(locked_job_item.principal_id),
         "internal_actor_key": CONFLICT_AUTOMATION_INTERNAL_KEY,
         **result.provenance,
     }
-    actor = await resolve_internal_system_actor(
-        session,
-        tenant_id=job.tenant_id,
-        internal_key=CONFLICT_AUTOMATION_INTERNAL_KEY,
-    )
     await _insert_event(
         session,
-        item_id=item.id,
+        item_id=locked_job_item.id,
         event_type="conflict_detected",
         field_name="conflicts_with_item_id",
-        old_value=item.conflicts_with_item_id,
-        new_value=str(result.existing_item_id),
+        old_value=existing_counterpart,
+        new_value=str(target_counterpart),
         actor_principal_id=actor,
         reason=json.dumps(payload, sort_keys=True),
     )
-    await session.execute(
-        update(MemoryItem)
-        .where(MemoryItem.id == item.id)
-        .values(
-            conflicts_with_item_id=result.existing_item_id,
-            conflict_type=result.conflict_type,
-            conflict_resolution_status="unresolved",
-            review_status=new_review,
-        )
-    )
-    await session.commit()
 
 
 # Visibility ordering: a refine job may only narrow, never widen (ENG-AUD-005).

@@ -705,6 +705,23 @@ a conflict until an explicit reconsideration workflow exists. Historical resolve
 rows with no resolver remain honestly attributed as `legacy_unknown` rather than
 being inferred or backfilled.
 
+> **Worker conflict-flagging serialization (P0-FIX-004C1):** The background
+> worker's `conflict.check` flagging branch (`FLAG_CONTRADICTION`,
+> `FLAG_SCOPE_OVERLAP`, `PROPOSED_SUPERSEDE`) uses the same canonical pair-lock
+> strategy as the human resolution route: both rows are locked with
+> `SELECT ... FOR UPDATE` in deterministic UUID order, mutation authority is
+> revalidated from the locked rows (not the earlier detection snapshot), and a
+> guarded `UPDATE ... RETURNING` precedes event creation in one transaction.
+> Detection may run unlocked because it is expensive and only a proposal. The
+> worker never reopens a completed human decision
+> (`conflict_resolution_status in (accepted, rejected, merged)`), never
+> overwrites a human review decision (it demotes only `active -> proposed`,
+> preserves `proposed`/`disputed`, and skips `rejected`/`archived`), never
+> silently replaces a different existing conflict relationship, and treats an
+> identical unresolved relationship as an event-free no-op. `DEDUP` and
+> `AUTO_SUPERSEDE` are separate writers and remain out of scope for this
+> serialization slice.
+
 ---
 
 ## 7. Memory Topology
