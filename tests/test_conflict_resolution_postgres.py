@@ -270,6 +270,7 @@ async def _overlapping_resolutions(
     coordinator = await p["owner"].connect()
     tasks: list[asyncio.Task[Any]] = []
     try:
+        coordinator_pid = await coordinator.scalar(text("SELECT pg_backend_pid()"))
         await coordinator.execute(text("SELECT pg_advisory_lock(:key)"), {"key": p["pause_key"]})
 
         async def submit(actor: str, item_id: uuid.UUID, resolution: str, reason: str) -> Any:
@@ -285,13 +286,24 @@ async def _overlapping_resolutions(
 
         tasks = [asyncio.create_task(submit(*request)) for request in requests]
         blocker_sql = text(
-            "SELECT count(*) AS waiters, "
-            "count(*) FILTER (WHERE wait_event = 'advisory') AS advisory_waiters "
-            "FROM pg_stat_activity WHERE state = 'active' AND wait_event_type = 'Lock'"
+            "WITH RECURSIVE lock_chain(pid) AS ("
+            " SELECT pid FROM pg_stat_activity"
+            " WHERE :coordinator_pid = ANY(pg_blocking_pids(pid))"
+            " AND wait_event_type = 'Lock' AND wait_event = 'advisory'"
+            " UNION"
+            " SELECT activity.pid FROM pg_stat_activity activity"
+            " JOIN lock_chain blocker"
+            " ON blocker.pid = ANY(pg_blocking_pids(activity.pid))"
+            " WHERE activity.wait_event_type = 'Lock'"
+            ") SELECT count(*) AS waiters,"
+            " count(*) FILTER (WHERE activity.wait_event = 'advisory') AS advisory_waiters"
+            " FROM lock_chain JOIN pg_stat_activity activity USING (pid)"
         )
         for _ in range(1000):
             await coordinator.execute(text("SELECT pg_stat_clear_snapshot()"))
-            overlap = (await coordinator.execute(blocker_sql)).one()
+            overlap = (
+                await coordinator.execute(blocker_sql, {"coordinator_pid": coordinator_pid})
+            ).one()
             if overlap == (len(requests), 1):
                 break
             await asyncio.sleep(0.01)
@@ -528,6 +540,8 @@ async def test_concurrent_same_resolution_is_canonical_and_idempotent(
         winning["resolved_at"].replace("Z", "+00:00")
     )
     assert len(state["events"]) == 1
+    assert state["events"][0]["actor_principal_id"] == uuid.UUID(winning["resolved_by"])
+    assert state["events"][0]["new_value"] == winning["conflict_resolution_status"]
 
 
 async def test_concurrent_different_resolutions_preserve_winner(
@@ -583,6 +597,11 @@ async def test_concurrent_three_way_resolution_has_one_side_effect(
         after_target["item"]["conflict_resolved_by"] == proof["actors"][requests[winner_index][0]]
     )
     assert len(after_target["events"]) == 1
+    assert (
+        after_target["events"][0]["actor_principal_id"]
+        == proof["actors"][requests[winner_index][0]]
+    )
+    assert after_target["events"][0]["new_value"] == winner["conflict_resolution_status"]
     assert after_target["events"][0]["reason"] == requests[winner_index][3]
     assert _changed_columns(before_target["item"], after_target["item"]) == {
         "conflict_resolution_status",
@@ -622,6 +641,8 @@ async def test_reciprocal_pair_canonical_lock_order_has_no_deadlock(
         assert state["item"]["conflict_resolution_status"] == resolution
         assert state["item"]["conflict_resolved_by"] == proof["actors"][actor]
         assert len(state["events"]) == 1
+        assert state["events"][0]["actor_principal_id"] == proof["actors"][actor]
+        assert state["events"][0]["new_value"] == resolution
         assert state["events"][0]["reason"] == reason
     after_first = await proof["state"](first)
     after_second = await proof["state"](second)
