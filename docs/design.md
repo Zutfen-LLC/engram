@@ -687,6 +687,24 @@ Review reports apply the canonical item predicate, conflict reports require both
 memories to be eligible, and review statistics are relative to the caller's eligible
 current corpus rather than tenant-global administrative counts.
 
+Caller-facing conflict resolution is a human-governed operation. API `review` scope
+permits an attempt, but only authenticated users and administrators may decide a
+conflict; credentialed agents and ordinary system principals remain forbidden. Both
+the target memory and its counterpart must pass canonical eligibility before actor
+policy is disclosed. The pair is locked in canonical UUID order and its relationship
+is revalidated while locked, so concurrent decisions serialize over a stable pair.
+
+The resolution labels (`accepted`, `rejected`, and `merged`) are adjudication metadata
+only: this endpoint does not change review status, validity, authority, supersession,
+counterpart state, or content, and `merged` does not synthesize a memory. A real
+transition records the authenticated caller in `conflict_resolved_by` and as the event
+actor. Administrator delegation records only the represented party and never replaces
+that resolver. Repeating the same decision is an authorized, event-free no-op that
+preserves its original timestamp and attribution; a different later decision returns
+a conflict until an explicit reconsideration workflow exists. Historical resolved
+rows with no resolver remain honestly attributed as `legacy_unknown` rather than
+being inferred or backfilled.
+
 ---
 
 ## 7. Memory Topology
