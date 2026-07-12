@@ -361,12 +361,12 @@ async def test_diary_read_returns_owner_entries(client):
 
 
 @pytest.mark.asyncio
-async def test_diary_read_unknown_principal_returns_422(client):
+async def test_diary_read_unknown_principal_returns_404(client):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
 
     resp = await client.get("/v1/diary/no-such-principal-xyz")
-    assert resp.status_code == 422
+    assert resp.status_code == 404
 
 
 @pytest.mark.asyncio
