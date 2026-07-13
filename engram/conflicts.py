@@ -33,8 +33,12 @@ _SIMILARITY_THRESHOLD = 0.85
 # recheck (engram.promotion). Bounded so a recheck never scans the full corpus.
 _PROMOTION_CANDIDATE_K = 5
 
-# Classifier confidence at or above this permits auto-supersession.
-_HIGH_CLASSIFIER_CONFIDENCE = 0.8
+# Classifier confidence at or above this permits auto-supersession. Shared
+# with the worker's AUTO_SUPERSEDE under-lock revalidation so the two paths can
+# never drift apart (P0-FIX-004D).
+HIGH_CLASSIFIER_CONFIDENCE = 0.8
+# Backwards-compatible private alias (used within this module).
+_HIGH_CLASSIFIER_CONFIDENCE = HIGH_CLASSIFIER_CONFIDENCE
 
 
 class ConflictVerdict(StrEnum):

@@ -801,6 +801,128 @@ being inferred or backfilled.
 > allows only the correct newer item to be rejected. `AUTO_SUPERSEDE` remains a
 > separate writer and is out of scope for this slice.
 
+> **Worker AUTO_SUPERSEDE serialization (P0-FIX-004D):** The background worker's
+> `conflict.check` `AUTO_SUPERSEDE` branch (refine verdict where the newer item
+> out-ranks the older by authority and the classifier confidence meets the
+> canonical high-confidence threshold) uses the same canonical pair-lock
+> strategy as the human resolution route, the flagging branch, and the DEDUP
+> branch: both rows are locked with `SELECT ... FOR UPDATE` in deterministic UUID
+> order, mutation authority is revalidated from the locked rows (not the
+> earlier detection snapshot), and a guarded `UPDATE ... RETURNING` precedes
+> event creation in one transaction. Detection may run unlocked because it is
+> expensive and only a proposal. The new/job item is never mutated by this
+> branch.
+>
+> **Mutation target.** AUTO_SUPERSEDE mutates only the OLD/counterpart row:
+> `old.superseded_by = new.id` and `old.valid_to = one captured UTC timestamp`.
+> The new item remains live and unchanged. This mirrors the synchronous
+> singleton-supersede write path, where the original is expired and the
+> replacement carries forward.
+>
+> **Unlocked proposal versus locked mutation authority.** Semantic detection
+> and classification (including the LLM) run unlocked over pre-lock snapshots and
+> produce a `ConflictResult` that is only a *proposal*. No expensive classifier
+> or similarity call runs while row locks are held. The locked rows — not the
+> detection snapshots or `result.provenance` — are mutation authority.
+>
+> **Canonical pair lock order.** The job/new item and detected old/counterpart
+> item are locked using the existing deterministic UUID-order pair-lock helper
+> (`_lock_conflict_pair`). No second lock-order convention exists; reciprocal
+> worker jobs cannot deadlock. The full cross-table lock order for AUTO_SUPERSEDE
+> is: `memory_items` pair (canonical UUID order) → `embedding_profiles` row →
+> `memory_embeddings` pair (canonical `memory_item_id` order).
+>
+> **Under-lock revalidation — the NEW/job item.** The new item must still
+> exist, belong to the job tenant, be distinct from the counterpart, remain
+> live (`valid_to IS NULL`, `superseded_by IS NULL`), not be in a terminal
+> review state (`rejected`/`archived`), and remain the newer side under
+> `created_at` ordering with a string-UUID tiebreak. A committed human
+> governance decision (human verification or a human review-state decision)
+> on the new item blocks automatic supersession: the worker skips all mutation
+> and writes no event. The proposed result must still be `AUTO_SUPERSEDE` and
+> meet the canonical high-confidence classifier threshold
+> (`HIGH_CLASSIFIER_CONFIDENCE`, 0.8) — no LLM re-classification runs under
+> lock. The new item's current authority (read from the locked row, never from
+> `result.provenance`) must still allow supersession of the old item
+> (`authority_allows_supersession`) and must still qualify for automatic
+> supersession (`qualifies_for_auto_supersession`, authority >=
+> `trusted_import`/40).
+>
+> **Under-lock revalidation — the OLD/counterpart item.** The locked
+> counterpart must equal `result.existing_item_id`, belong to the job tenant,
+> remain `review_status='active'`, `valid_to IS NULL`, and
+> `superseded_by IS NULL`. Existing terminal, invalidated, archived, disputed,
+> rejected, or superseded state wins; the worker skips without replacing
+> timestamps or links. A committed human governance decision on the old item
+> also blocks automatic supersession.
+>
+> **Detector database eligibility.** Under lock, both rows must still share the
+> same `kind`, the exact same workspace scope (including both-`NULL`
+> semantics), and both must still carry a ready, non-`NULL` embedding for the
+> validated active profile and dimensions. The relevant `memory_embeddings`
+> rows are locked with `SELECT ... FOR UPDATE` in canonical `memory_item_id`
+> order (after the `memory_items` pair locks and the `embedding_profiles` row
+> lock) and revalidated, so a concurrent embedding-status change cannot drive a
+> stale supersession. No semantic similarity or classifier is rerun.
+>
+> **Active profile revalidation at mutation authority.** A conflict result
+> produced using profile P may mutate trust state only while P is still the
+> active profile at mutation-authority time. After the `memory_items` pair lock
+> and before the `memory_embeddings` pair lock, the worker reloads the specific
+> `embedding_profiles` row with `SELECT ... FOR UPDATE` (a core column query
+> that bypasses the ORM identity map, so it reads the locked row's current
+> committed state rather than the pre-lock snapshot instance) and verifies P is
+> still `state='active'` with matching `profile_key`, `dimensions`, `provider`,
+> `model`, and `distance_metric` (the detector-relevant immutable/vector-space
+> fields). If a concurrent profile cutover retired P before the worker obtained
+> profile mutation authority, AUTO_SUPERSEDE is a mutation-free, event-free
+> no-op. Global lock order: `memory_items` pair (canonical UUID order) →
+> `embedding_profiles` row → `memory_embeddings` pair (canonical
+> `memory_item_id` order). `activate_profile` updates profile rows but does
+> NOT acquire `memory_items` row locks, so it cannot introduce a reverse
+> profile→item lock cycle: if the worker obtains the profile lock while P is
+> active first, the cutover waits; the worker completes and then the cutover
+> resumes. This defines a serial order. Detection is not rerun under lock.
+>
+> **REFINE verdict requirement.** AUTO_SUPERSEDE is a valid action only for a
+> `ConflictVerdict.REFINE` proposal. A malformed proposal (any other verdict
+> paired with `AUTO_SUPERSEDE`) is a mutation-free, event-free no-op.
+>
+> **Guarded old-row transition.** The `UPDATE ... RETURNING` on the old row
+> re-checks tenant, id, `review_status='active'`, `valid_to IS NULL`, and
+> `superseded_by IS NULL`. A zero-row result is a truthful no-op and emits no
+> event. Only after `RETURNING` confirms the transition is one automation event
+> inserted in the same transaction.
+>
+> **Truthful event target/value.** The event is attached to the MUTATED OLD
+> item (the row whose `superseded_by` actually changed), with
+> `event_type='conflict_detected'`, `field_name='superseded_by'`,
+> `old_value=None`, `new_value=str(new.id)`, and the `conflict_automation`
+> internal actor. Canonical event-role fields (`old_item_id`, `new_item_id`,
+> `existing_item_id`, `action`, `verdict`, `reason`, `worker_operation`,
+> `job_id`, `item_author_principal_id`, `internal_actor_key`) are authoritative
+> and cannot be overwritten by untrusted/stale detector provenance. Detector
+> provenance is namespaced under `detector_provenance` so hostile/colliding
+> provider data is preserved without replacing canonical fields. (The legacy
+> path attached the event to the new item and recorded
+> `new_value=old_item_id` — the opposite of the actual mutation; this is
+> corrected.)
+>
+> **Atomic rollback and idempotency.** Guarded state mutation and event
+> insertion commit or roll back together: an event failure after the guarded
+> update restores both `valid_to` and `superseded_by` and persists no event.
+> Re-running the same job after a successful supersession does not change
+> `valid_to`, replace `superseded_by`, or add another event (the guard fails on
+> the already-superseded old row).
+>
+> **Remaining dependency — manual invalidation.** This slice handles the case
+> where invalidation commits before AUTO_SUPERSEDE: the worker sees `valid_to`
+> and skips. The reverse race — worker AUTO_SUPERSEDE commits before a manual
+> `invalidate_item` — is *not* fully closed because `invalidate_item` is itself
+> an unlocked, unguarded writer of `valid_to` and is the next separate
+> high-priority writer to serialize (Gate A2). Documented as a remaining
+> boundary; `invalidate_item` is not modified by this PR.
+
 ---
 
 ## 7. Memory Topology
