@@ -1365,11 +1365,13 @@ async def update_item_metadata(
         # concurrent writer that changed this field between the lock-time read
         # and the UPDATE is caught. RETURNING confirms the row was actually
         # mutated before we write the event.
+        # Use IS NOT DISTINCT FROM (not =) so NULL old values match correctly
+        # (wing/room are nullable; = NULL always returns NULL, not true).
         guard_stmt = text(
             f"UPDATE memory_items SET {field} = :new_value "
             "WHERE (id = :item_id OR id = :item_id_hex) "
             "AND tenant_id = :tenant_id "
-            f"AND {field} = :old_value "
+            f"AND {field} IS NOT DISTINCT FROM :old_value "
             "RETURNING id"
         )
         guard_result = await session.execute(

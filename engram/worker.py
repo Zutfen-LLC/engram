@@ -1304,12 +1304,14 @@ async def _guarded_field_update(
     the WHERE clause, uses RETURNING to confirm the mutation, and writes the
     event only after success. Returns True if the field was actually mutated.
     """
+    # Use is_not_distinct_from (not ==) so NULL old values match correctly
+    # (wing/room are nullable; == NULL always returns NULL, not true).
     guard_stmt = (
         update(MemoryItem)
         .where(
             MemoryItem.id == item_id,
             MemoryItem.tenant_id == tenant_id,
-            getattr(MemoryItem, field_name) == old_value,
+            getattr(MemoryItem, field_name).is_not_distinct_from(old_value),
         )
         .values(**{field_name: new_value})
         .returning(MemoryItem.id)
