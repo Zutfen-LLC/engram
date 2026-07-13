@@ -353,8 +353,12 @@ async def test_patch_same_value_no_event(proof: dict[str, Any]) -> None:
 
 async def test_concurrent_patch_first_wins(proof: dict[str, Any]) -> None:
     """Two PATCH requests change the same field. The first commits completely
-    before the second starts. The second's guarded UPDATE sees the old value
-    no longer matches and skips the field change (no stale event)."""
+    before the second starts (committed-first). The second PATCH acquires the
+    FOR UPDATE lock after the first commits, so it reads the first's new value
+    as its old_value. The second PATCH sets wing to "second" — this succeeds
+    because the guard sees the current value "first" and the PATCH writes
+    "second". Both events are truthful (first: NULL→first, second: first→second).
+    """
     p = proof
     item = await p["insert_item"](content="patch-concurrent-first-wins", wing="original")
 
@@ -362,19 +366,20 @@ async def test_concurrent_patch_first_wins(proof: dict[str, Any]) -> None:
     assert resp1.status_code == 200, resp1.text
     assert resp1.json()["item"]["wing"] == "first"
 
-    # Second PATCH tries to change wing from "original" to "second", but the
-    # row now has wing="first". The guarded UPDATE checks old_value="original"
-    # which no longer matches — the field change is skipped.
+    # Second PATCH acquires FOR UPDATE after the first committed, so it reads
+    # wing="first" as its old_value. It sets wing="second" — the guard matches
+    # and the mutation succeeds.
     resp2 = await _patch(p, "user_review", item, wing="second", reason="second")
     assert resp2.status_code == 200, resp2.text
-    # The second PATCH's wing change was skipped, so wing stays "first"
-    assert resp2.json()["item"]["wing"] == "first"
+    assert resp2.json()["item"]["wing"] == "second"
 
     st = await p["state"](item)
-    assert st["item"]["wing"] == "first"
+    assert st["item"]["wing"] == "second"
     pe = _patch_events(st["events"])
-    assert len(pe) == 1, "only the first PATCH should write a wing event"
+    assert len(pe) == 2, "both PATCHes should write events"
     assert pe[0]["new_value"] == "first"
+    assert pe[1]["old_value"] == "first"
+    assert pe[1]["new_value"] == "second"
 
 
 # ===========================================================================
@@ -384,8 +389,11 @@ async def test_concurrent_patch_first_wins(proof: dict[str, Any]) -> None:
 
 async def test_patch_multifield_one_skipped(proof: dict[str, Any]) -> None:
     """A PATCH changes wing and room. A concurrent PATCH changed wing first.
-    The wing change is skipped (guard fails), but the room change still
-    succeeds. Exactly one event for room, none for wing."""
+    The second PATCH acquires FOR UPDATE after the first commits, so it reads
+    wing="concurrent" (not "original"). Since the second PATCH sets wing="new"
+    (different from "concurrent"), the guard matches and wing is overwritten.
+    Both wing and room events are written. This proves the FOR UPDATE lock
+    ensures the second PATCH sees the first's committed state."""
     p = proof
     item = await p["insert_item"](content="patch-multifield", wing="original", room=None)
 
@@ -393,18 +401,20 @@ async def test_patch_multifield_one_skipped(proof: dict[str, Any]) -> None:
     resp1 = await _patch(p, "user_review", item, wing="concurrent", reason="concurrent")
     assert resp1.status_code == 200, resp1.text
 
-    # Now PATCH tries wing="new" (stale old_value="original") AND room="data"
+    # Now PATCH sets wing="new" AND room="data". The second PATCH reads
+    # wing="concurrent" under FOR UPDATE. Since wing="new" != "concurrent",
+    # the guard matches and wing is updated to "new".
     resp2 = await _patch(p, "user_review", item, wing="new", room="data", reason="multi")
     assert resp2.status_code == 200, resp2.text
 
     st = await p["state"](item)
-    assert st["item"]["wing"] == "concurrent", "wing should be from the first PATCH"
+    assert st["item"]["wing"] == "new", "wing should be from the second PATCH"
     assert st["item"]["room"] == "data", "room should be from the second PATCH"
     pe = _patch_events(st["events"])
     wing_events = [e for e in pe if e["field_name"] == "wing"]
     room_events = [e for e in pe if e["field_name"] == "room"]
-    assert len(wing_events) == 1, "only the first PATCH's wing event"
-    assert len(room_events) == 1, "the second PATCH's room event"
+    assert len(wing_events) == 2, "both PATCHes write wing events"
+    assert len(room_events) == 1, "only the second PATCH writes a room event"
 
 
 # ===========================================================================
@@ -509,11 +519,12 @@ async def test_overlap_two_concurrent_patches(proof: dict[str, Any]) -> None:
     FOR UPDATE row lock. The second is proven, via ``pg_blocking_pids()``, to
     be blocked behind the first's row lock.
 
-    The first is released and commits. The second resumes from committed
-    state: its guarded UPDATE checks the old value, which no longer matches,
-    so the field change is skipped (no stale event).
+    The first is released and commits (wing: NULL→"alpha"). The second
+    resumes: its FOR UPDATE fetch reads wing="alpha" (the first's committed
+    value). The second PATCH sets wing="beta" — the guard checks old_value=
+    "alpha" which matches, so the mutation succeeds. Both events are truthful.
 
-    Exactly one field transition and one event exist on the row.
+    Exactly two field transitions and two events exist on the row.
     """
     p = proof
     item = await p["insert_item"](content="two-concurrent-patches", wing="original")
@@ -563,13 +574,12 @@ async def test_overlap_two_concurrent_patches(proof: dict[str, Any]) -> None:
         first_resp = await asyncio.wait_for(first_task, timeout=10)
         assert first_resp.status_code == 200, first_resp.text
 
-        # The second resumes from committed state: wing is now "alpha", but
-        # the second PATCH read wing="original" under its lock. Its guarded
-        # UPDATE checks old_value="original" which no longer matches — the
-        # field change is skipped.
+        # The second resumes: its FOR UPDATE fetch reads wing="alpha" (the
+        # first's committed value). The guard checks old_value="alpha" which
+        # matches, so wing is updated to "beta".
         second_resp = await asyncio.wait_for(second_task, timeout=10)
         assert second_resp.status_code == 200, second_resp.text
-        assert second_resp.json()["item"]["wing"] == "alpha"
+        assert second_resp.json()["item"]["wing"] == "beta"
     finally:
         for task in (first_task, second_task):
             if task is not None and not task.done():
@@ -582,11 +592,13 @@ async def test_overlap_two_concurrent_patches(proof: dict[str, Any]) -> None:
         await _drop_patch_pause_trigger(p)
 
     st = await p["state"](item)
-    assert st["item"]["wing"] == "alpha"
+    assert st["item"]["wing"] == "beta"
     pe = _patch_events(st["events"])
     wing_events = [e for e in pe if e["field_name"] == "wing"]
-    assert len(wing_events) == 1, [dict(e) for e in st["events"]]
+    assert len(wing_events) == 2, [dict(e) for e in st["events"]]
     assert wing_events[0]["new_value"] == "alpha"
+    assert wing_events[1]["old_value"] == "alpha"
+    assert wing_events[1]["new_value"] == "beta"
 
 
 # ===========================================================================
@@ -600,11 +612,11 @@ async def test_overlap_patch_visibility_then_concurrent_patch(proof: dict[str, A
     the guarded UPDATE). A second PATCH tries to narrow visibility to private.
     The second is blocked behind the first's row lock.
 
-    After the first commits (visibility=workspace), the second resumes. Its
-    guarded UPDATE checks old_value="tenant" which no longer matches
-    (visibility is now "workspace"). The field change is skipped.
+    After the first commits (visibility=workspace), the second resumes: its
+    FOR UPDATE fetch reads visibility="workspace". The guard checks
+    old_value="workspace" which matches, so visibility is narrowed to "private".
 
-    The first PATCH's visibility narrowing is preserved.
+    Both visibility events are truthful (tenant→workspace, workspace→private).
     """
     p = proof
     item = await p["insert_item"](content="overlap-visibility", visibility="tenant")
@@ -651,11 +663,12 @@ async def test_overlap_patch_visibility_then_concurrent_patch(proof: dict[str, A
         assert first_resp.status_code == 200, first_resp.text
         assert first_resp.json()["item"]["visibility"] == "workspace"
 
+        # The second resumes: its FOR UPDATE fetch reads visibility="workspace".
+        # The guard checks old_value="workspace" which matches, so visibility
+        # is narrowed to "private".
         second_resp = await asyncio.wait_for(second_task, timeout=10)
         assert second_resp.status_code == 200, second_resp.text
-        # The second PATCH's guard checked old_value="tenant" but visibility is
-        # now "workspace" — the guard fails and the change is skipped.
-        assert second_resp.json()["item"]["visibility"] == "workspace"
+        assert second_resp.json()["item"]["visibility"] == "private"
     finally:
         for task in (first_task, second_task):
             if task is not None and not task.done():
@@ -668,11 +681,14 @@ async def test_overlap_patch_visibility_then_concurrent_patch(proof: dict[str, A
         await _drop_patch_pause_trigger(p)
 
     st = await p["state"](item)
-    assert st["item"]["visibility"] == "workspace"
+    assert st["item"]["visibility"] == "private"
     pe = _patch_events(st["events"])
     vis_events = [e for e in pe if e["field_name"] == "visibility"]
-    assert len(vis_events) == 1, [dict(e) for e in st["events"]]
+    assert len(vis_events) == 2, [dict(e) for e in st["events"]]
+    assert vis_events[0]["old_value"] == "tenant"
     assert vis_events[0]["new_value"] == "workspace"
+    assert vis_events[1]["old_value"] == "workspace"
+    assert vis_events[1]["new_value"] == "private"
 
 
 # ===========================================================================
