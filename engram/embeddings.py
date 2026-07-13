@@ -49,7 +49,7 @@ async def generate_embeddings(
     caller; the backfill batches so a single failed call only fails its batch.
     """
     provider = profile.provider if profile is not None else settings.embedding_provider
-    model = profile.model if profile is not None else EMBEDDING_MODEL
+    model = profile.model if profile is not None else settings.embedding_model
     dimensions = profile.dimensions if profile is not None else settings.embedding_dim
     if provider == "none" or settings.embedding_provider == "none":
         return [None] * len(texts)

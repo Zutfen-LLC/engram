@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     # When set, passed explicitly to the AsyncOpenAI client so it does not
     # depend on the OPENAI_BASE_URL env var being present in the container.
     openai_base_url: str | None = None
+    # Default embedding model name. Used by the setup-embeddings CLI command
+    # and as a fallback when no embedding profile is configured in the DB.
+    embedding_model: str = "text-embedding-3-small"
     embedding_activation_coverage_threshold: float = 95.0
 
     # Classification
