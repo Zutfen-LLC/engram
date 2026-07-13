@@ -63,7 +63,10 @@ async def generate_embeddings(
             "openai package is required when ENGRAM_EMBEDDING_PROVIDER=openai"
         ) from exc
 
-    client = AsyncOpenAI(api_key=settings.openai_api_key)
+    client_kwargs: dict[str, Any] = {"api_key": settings.openai_api_key}
+    if settings.openai_base_url:
+        client_kwargs["base_url"] = settings.openai_base_url
+    client = AsyncOpenAI(**client_kwargs)
     response = await client.embeddings.create(
         model=model,
         input=texts,

@@ -70,6 +70,7 @@ services:
       ENGRAM_AUTH_ENABLED: ${ENGRAM_AUTH_ENABLED:-false}
       ENGRAM_EMBEDDING_PROVIDER: ${ENGRAM_EMBEDDING_PROVIDER:-none}
       ENGRAM_OPENAI_API_KEY: ${ENGRAM_OPENAI_API_KEY:-}
+      ENGRAM_OPENAI_BASE_URL: ${ENGRAM_OPENAI_BASE_URL:-}
     depends_on:
       postgres:
         condition: service_healthy

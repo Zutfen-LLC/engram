@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     # Provider: "openai", "local", or "none" (defer embedding generation)
     embedding_provider: str = "none"
     openai_api_key: str | None = None
+    # Base URL for OpenAI-compatible embedding providers (e.g. OpenRouter).
+    # When set, passed explicitly to the AsyncOpenAI client so it does not
+    # depend on the OPENAI_BASE_URL env var being present in the container.
+    openai_base_url: str | None = None
     embedding_activation_coverage_threshold: float = 95.0
 
     # Classification
