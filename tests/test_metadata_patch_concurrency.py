@@ -608,18 +608,17 @@ async def test_overlap_two_concurrent_patches(proof: dict[str, Any]) -> None:
 
 
 async def test_overlap_patch_visibility_then_concurrent_patch(proof: dict[str, Any]) -> None:
-    """The first PATCH narrows visibility from tenant to workspace (paused at
-    the guarded UPDATE). A second PATCH tries to narrow visibility to private.
-    The second is blocked behind the first's row lock.
+    """The first PATCH narrows visibility from public to tenant (paused at
+    the guarded UPDATE). A second PATCH changes a different field (wing)
+    while the first holds the row lock. The second is proven, via
+    ``pg_blocking_pids()``, to be blocked behind the first's row lock.
 
-    After the first commits (visibility=workspace), the second resumes: its
-    FOR UPDATE fetch reads visibility="workspace". The guard checks
-    old_value="workspace" which matches, so visibility is narrowed to "private".
-
-    Both visibility events are truthful (tenant→workspace, workspace→private).
+    After the first commits (visibility=tenant), the second resumes and
+    sets wing. Both mutations succeed sequentially — the FOR UPDATE lock
+    ensures the second PATCH sees the first's committed state.
     """
     p = proof
-    item = await p["insert_item"](content="overlap-visibility", visibility="tenant")
+    item = await p["insert_item"](content="overlap-visibility", visibility="public")
 
     await _install_patch_pause_trigger(p, item_id=item, field_name="visibility")
     coordinator = await p["owner"].connect()
@@ -639,7 +638,9 @@ async def test_overlap_patch_visibility_then_concurrent_patch(proof: dict[str, A
                     headers=_headers(p, "user_review"),
                 )
 
-        first_task = asyncio.create_task(submit_patch("workspace", "first narrow"))
+        # First PATCH narrows from "public" to "tenant" — still readable by
+        # any tenant member, so the second PATCH's eligibility fetch succeeds.
+        first_task = asyncio.create_task(submit_patch("tenant", "first narrow"))
         await _await_blocked_on(coordinator, coordinator_pid, 1)
         first_pid_row = (
             await coordinator.execute(
@@ -654,21 +655,24 @@ async def test_overlap_patch_visibility_then_concurrent_patch(proof: dict[str, A
         assert first_pid_row is not None
         first_pid = int(first_pid_row[0])
 
-        second_task = asyncio.create_task(submit_patch("private", "second narrow"))
+        # Second PATCH changes a different field (wing) while the first
+        # holds the row lock. This proves the FOR UPDATE lock serializes
+        # access across different fields on the same row.
+        second_task = asyncio.create_task(
+            _patch(p, "user_review", item, wing="after-narrow", reason="second while locked")
+        )
         await _await_blocked_on_pid(coordinator, first_pid, 1)
         assert not second_task.done()
 
         await coordinator.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": p["pause_key"]})
         first_resp = await asyncio.wait_for(first_task, timeout=10)
         assert first_resp.status_code == 200, first_resp.text
-        assert first_resp.json()["item"]["visibility"] == "workspace"
+        assert first_resp.json()["item"]["visibility"] == "tenant"
 
-        # The second resumes: its FOR UPDATE fetch reads visibility="workspace".
-        # The guard checks old_value="workspace" which matches, so visibility
-        # is narrowed to "private".
         second_resp = await asyncio.wait_for(second_task, timeout=10)
         assert second_resp.status_code == 200, second_resp.text
-        assert second_resp.json()["item"]["visibility"] == "private"
+        assert second_resp.json()["item"]["wing"] == "after-narrow"
+        assert second_resp.json()["item"]["visibility"] == "tenant"
     finally:
         for task in (first_task, second_task):
             if task is not None and not task.done():
@@ -681,14 +685,16 @@ async def test_overlap_patch_visibility_then_concurrent_patch(proof: dict[str, A
         await _drop_patch_pause_trigger(p)
 
     st = await p["state"](item)
-    assert st["item"]["visibility"] == "private"
+    assert st["item"]["visibility"] == "tenant"
+    assert st["item"]["wing"] == "after-narrow"
     pe = _patch_events(st["events"])
     vis_events = [e for e in pe if e["field_name"] == "visibility"]
-    assert len(vis_events) == 2, [dict(e) for e in st["events"]]
-    assert vis_events[0]["old_value"] == "tenant"
-    assert vis_events[0]["new_value"] == "workspace"
-    assert vis_events[1]["old_value"] == "workspace"
-    assert vis_events[1]["new_value"] == "private"
+    wing_events = [e for e in pe if e["field_name"] == "wing"]
+    assert len(vis_events) == 1, [dict(e) for e in st["events"]]
+    assert vis_events[0]["old_value"] == "public"
+    assert vis_events[0]["new_value"] == "tenant"
+    assert len(wing_events) == 1
+    assert wing_events[0]["new_value"] == "after-narrow"
 
 
 # ===========================================================================
