@@ -782,8 +782,28 @@ async def test_every_conflict_branch_uses_conflict_actor(
     )
     job = _job(corpus, "conflict.check", new_id)
 
+    # P0-FIX-004C2: the DEDUP branch now revalidates the detector's embedding
+    # eligibility under the pair locks (the embedding job can flip an
+    # embedding's readiness without taking the item row lock). This attribution
+    # test mocks detection entirely, so it must provide the ready embedding rows
+    # and a profile with ``dimensions`` that production detection always
+    # implies. Reuse the real seeded active profile so the embedding FK is
+    # satisfied, and mirror it in the mock.
+    async with owner() as session:
+        prof = (
+            await session.execute(
+                text(
+                    "SELECT id, profile_key, dimensions, state FROM embedding_profiles "
+                    "WHERE state='active' LIMIT 1"
+                )
+            )
+        ).one()
+    profile = SimpleNamespace(
+        id=prof[0], profile_key=prof[1], state=prof[3], dimensions=int(prof[2])
+    )
+
     async def active_profile(_session):
-        return SimpleNamespace(id=uuid4(), profile_key="test", state="active")
+        return profile
 
     async def verdict(_item, _session, *, profile):
         del profile
@@ -797,6 +817,30 @@ async def test_every_conflict_branch_uses_conflict_actor(
             reason="forced branch",
             provenance={"provider": "test", "classifier": "forced"},
         )
+
+    # Insert ready embeddings for both items matching the active profile so the
+    # DEDUP branch's embedding revalidation passes (production detection always
+    # requires both items to carry a ready embedding for the profile).
+    dim = profile.dimensions
+    vec = "[" + ",".join(["1"] + ["0"] * (dim - 1)) + "]"
+    async with owner() as session:
+        for iid in (old_id, new_id):
+            await session.execute(
+                text(
+                    "INSERT INTO memory_embeddings "
+                    "(memory_item_id, tenant_id, profile_id, embedding_model, embedding_dim, "
+                    "embedding, embedding_status) VALUES "
+                    "(:id, :tenant, :profile_id, 'test', :dim, CAST(:vec AS vector), 'ready')"
+                ),
+                {
+                    "id": iid,
+                    "tenant": corpus.tenant_a,
+                    "profile_id": profile.id,
+                    "dim": dim,
+                    "vec": vec,
+                },
+            )
+        await session.commit()
 
     monkeypatch.setattr("engram.embedding_profiles.get_active_profile", active_profile)
     monkeypatch.setattr("engram.conflicts.detect_conflicts", verdict)
