@@ -353,20 +353,58 @@ async def proof(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[dict[str, Any]
             await handle_conflict_check(session, job_obj)
 
     async def run_conflict_check_via_process(item_id: uuid.UUID) -> None:
-        """Enqueue + process a conflict.check job through the production worker loop."""
+        """Enqueue + process a conflict.check job through the production worker loop.
+
+        Returns ``(job_id, processed)`` where ``processed`` is True when the
+        exact enqueued job was claimed and processed through the loop. Because
+        ``process_one_job`` claims globally across tenants under the owner role,
+        stale conflict.check jobs from other test modules may be claimed first;
+        this helper loops until the exact enqueued job is no longer
+        pending/running (draining those stale jobs naturally without deleting
+        unrelated tenants' jobs), then asserts the exact job reached
+        ``succeeded``. The caller asserts the memory mutation separately.
+        """
         async with owner_factory() as session:
-            await enqueue_job(
+            job_id = await enqueue_job(
                 session,
                 tenant_id=str(tenant),
                 job_type="conflict.check",
                 payload={"memory_item_id": str(item_id)},
             )
-        await process_one_job(
-            worker_id="test",
-            session_factory=owner_factory,
-            app_session_factory=app_factory,
-            job_types=["conflict.check"],
-        )
+        processed_any = False
+        for _ in range(50):
+            did = await process_one_job(
+                worker_id="test",
+                session_factory=owner_factory,
+                app_session_factory=app_factory,
+                job_types=["conflict.check"],
+            )
+            if did:
+                processed_any = True
+            # Stop once the exact enqueued job is no longer pending/running.
+            async with owner_factory() as session:
+                status = (
+                    await session.execute(
+                        text("SELECT status FROM jobs WHERE id=:id"),
+                        {"id": job_id},
+                    )
+                ).scalar_one()
+            if status not in ("pending", "running"):
+                break
+        else:
+            raise AssertionError(
+                f"enqueued job {job_id} was not processed within the loop"
+            )
+        # The exact job must have reached 'succeeded'.
+        async with owner_factory() as session:
+            final_status = (
+                await session.execute(
+                    text("SELECT status FROM jobs WHERE id=:id"),
+                    {"id": job_id},
+                )
+            ).scalar_one()
+        assert final_status == "succeeded", f"expected succeeded, got {final_status}"
+        return job_id, processed_any
 
     import engram.db as db_module
 
@@ -375,16 +413,6 @@ async def proof(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[dict[str, Any]
     monkeypatch.setattr(db_module, "owner_session_factory", owner_factory)
     monkeypatch.setattr(settings, "auth_enabled", True)
     reset_principal_cache()
-    # Drain stale pending/running conflict.check jobs left by other test modules
-    # so the ``process_one_job`` dispatch smoke test claims only this fixture's
-    # job (claim is global across tenants under the owner role).
-    async with owner.begin() as conn:
-        await conn.execute(
-            text(
-                "DELETE FROM jobs WHERE job_type='conflict.check' "
-                "AND status IN ('pending','running')"
-            )
-        )
     client = AsyncClient(transport=ASGITransport(app=create_app()), base_url="http://test")
     data: dict[str, Any] = {
         "owner": owner,
@@ -1741,6 +1769,10 @@ async def test_profile_cutover_during_apply_is_noop(proof: dict[str, Any]) -> No
 
     coordinator = await p["owner"].connect()
     worker_task: asyncio.Task[None] | None = None
+    # Initialize before the try so the finally cleanup cannot raise
+    # UnboundLocalError (which would mask the actual concurrency failure) if
+    # blocker detection or setup fails before the replacement is created.
+    repl_id: uuid.UUID | None = None
     try:
         coordinator_pid = await coordinator.scalar(text("SELECT pg_backend_pid()"))
         # 1. Coordinator locks the active profile row. The AsyncConnection
@@ -1804,22 +1836,25 @@ async def test_profile_cutover_during_apply_is_noop(proof: dict[str, Any]) -> No
             await coordinator.rollback()
         await coordinator.close()
         # Restore: re-activate the original profile and drop the replacement so
-        # other tests in this module find a single active profile.
+        # other tests in this module find a single active profile. The
+        # replacement is deleted conditionally (it may not have been created if
+        # setup failed early); the original is always restored safely.
         async with p["owner"].begin() as conn:
-            await conn.execute(
-                text(
-                    "DELETE FROM memory_embeddings WHERE profile_id=:id"
-                ),
-                {"id": repl_id},
-            )
-            await conn.execute(
-                text("DELETE FROM embedding_profiles WHERE id=:id"),
-                {"id": repl_id},
-            )
+            if repl_id is not None:
+                await conn.execute(
+                    text(
+                        "DELETE FROM memory_embeddings WHERE profile_id=:id"
+                    ),
+                    {"id": repl_id},
+                )
+                await conn.execute(
+                    text("DELETE FROM embedding_profiles WHERE id=:id"),
+                    {"id": repl_id},
+                )
             await conn.execute(
                 text(
                     "UPDATE embedding_profiles SET state='active', retired_at=NULL "
-                    "WHERE id=:id"
+                    "WHERE id=:id AND state != 'active'"
                 ),
                 {"id": profile_id},
             )
@@ -1958,14 +1993,22 @@ async def test_dispatch_via_process_one_job_succeeds(proof: dict[str, Any]) -> N
     through the production ``process_one_job`` loop (claim → handler → mark
     succeeded) completes a valid AUTO_SUPERSEDE. Covers the worker-loop dispatch
     path; the deeper concurrency proofs live in the deterministic blocker-graph
-    cases above."""
+    cases above.
+
+    Determinism: the exact enqueued job id is captured and reloaded after the
+    loop, and ``process_one_job`` is asserted to have processed work (returned
+    True). No unrelated tenants' jobs are deleted to isolate queue selection.
+    """
     p = proof
     old_item, new_item = await _setup_pair_with_embeddings(
         p, old_content="supersede-dispatch-old", new_content="supersede-dispatch-new"
     )
 
-    await p["run_conflict_check_via_process"](new_item)
+    job_id, processed = await p["run_conflict_check_via_process"](new_item)
 
+    # The loop processed work and the exact enqueued job reached 'succeeded'
+    # (asserted inside the helper). Confirm the memory mutation here.
+    assert processed is True, "process_one_job did not claim/process any job"
     st_old = await p["state"](old_item)
     assert str(st_old["item"]["superseded_by"]) == str(new_item)
     assert st_old["item"]["valid_to"] is not None
