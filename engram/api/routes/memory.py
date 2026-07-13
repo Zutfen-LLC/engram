@@ -1324,11 +1324,23 @@ async def update_item_metadata(
     req: ItemMetadataPatchRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> dict[str, Any]:
-    """Update metadata (wing, room, visibility, importance, pinned) — not content."""
+    """Update metadata (wing, room, visibility, importance, pinned) — not content.
+
+    Serialized mutation: the target row is locked via SELECT ... FOR UPDATE
+    through the eligibility fetch. Each field change uses a guarded UPDATE
+    whose WHERE clause re-checks the old value, so a concurrent writer that
+    changed the field between the lock-time read and the UPDATE produces a
+    zero-row result and is skipped (no stale event). Events are written only
+    after RETURNING confirms the mutation, in the same transaction.
+    """
     tenant_id = await _resolve_tenant_id(session)
     principal_id, _ = await _resolve_principal(session, tenant_id)
     item = await _require_eligible_item(
-        session, item_id, tenant_id=tenant_id, principal_id=principal_id
+        session,
+        item_id,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        for_update=True,
     )
     actor, on_behalf_of = await _resolve_actor_and_delegation(
         session, tenant_id=tenant_id, requested_on_behalf_of=req.on_behalf_of_principal_id
@@ -1345,22 +1357,49 @@ async def update_item_metadata(
 
     events: list[dict[str, Any]] = []
     for change in changes:
+        field = change["field"]
+        old_val = change["old"]
+        new_val = change["new"]
+
+        # Guarded mutation: re-check the old value in the WHERE clause so a
+        # concurrent writer that changed this field between the lock-time read
+        # and the UPDATE is caught. RETURNING confirms the row was actually
+        # mutated before we write the event.
+        guard_stmt = text(
+            f"UPDATE memory_items SET {field} = :new_value "
+            "WHERE (id = :item_id OR id = :item_id_hex) "
+            "AND tenant_id = :tenant_id "
+            f"AND {field} = :old_value "
+            "RETURNING id"
+        )
+        guard_result = await session.execute(
+            guard_stmt,
+            {
+                "new_value": new_val,
+                "item_id": str(item_id),
+                "item_id_hex": item_id.hex,
+                "tenant_id": str(tenant_id),
+                "old_value": old_val,
+            },
+        )
+        if guard_result.scalar_one_or_none() is None:
+            # A concurrent writer changed this field between our read and the
+            # UPDATE. Skip this field — no event, no stale mutation.
+            continue
+
         event = await _insert_item_event(
             session,
             item_id=item_id,
             event_type="metadata_patch",
-            field_name=change["field"],
-            old_value=change["old"],
-            new_value=change["new"],
+            field_name=field,
+            old_value=old_val,
+            new_value=new_val,
             actor_principal_id=actor,
             on_behalf_of_principal_id=on_behalf_of,
             reason=req.reason,
         )
-        await session.execute(
-            text(f"UPDATE memory_items SET {change['field']} = :value WHERE id = :item_id"),
-            {"value": change["new"], "item_id": str(item_id)},
-        )
         events.append(event)
+
     updated = await _require_eligible_item(
         session, item_id, tenant_id=tenant_id, principal_id=principal_id
     )
