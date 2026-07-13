@@ -307,6 +307,84 @@ def _merge_vocab(*groups: Iterable[Any]) -> list[str]:
     return sorted(values)
 
 
+# Built-in default classification rules. These run before tenant-configured
+# rules and provide a baseline for high-value patterns that are otherwise hard
+# for the LLM to distinguish (especially invariant vs doctrine). Each entry
+# is (name, regex, target_kind). The patterns are intentionally specific to
+# avoid false positives — when in doubt the LLM enrichment handles it.
+_BUILTIN_RULES: tuple[RuleSnapshot, ...] = (
+    # Invariant: "must never", "never store/share/expose", high-stakes prohibition
+    RuleSnapshot(
+        name="builtin_invariant_must_never",
+        rule_type="regex_target",
+        pattern=r"\b(?:must never|never store|never share|never expose|never log|never commit)\b",
+        target_kind="invariant",
+        target_wing=None,
+        target_room=None,
+        priority=1,
+    ),
+    RuleSnapshot(
+        name="builtin_invariant_violations",
+        rule_type="regex_target",
+        pattern=r"\bviolations are (?:high-stakes|catastrophic)\b",
+        target_kind="invariant",
+        target_wing=None,
+        target_room=None,
+        priority=1,
+    ),
+    # Doctrine: standing policies, architectural rules, "must", "always", "all X must"
+    RuleSnapshot(
+        name="builtin_doctrine_policy",
+        rule_type="regex_target",
+        pattern=r"\b(?:all \w+s? must|every \w+ must|must (?:always )?be|is a (?:core|strict) (?:architectural )?(?:constraint|requirement|rule|policy))\b",  # noqa: E501
+        target_kind="doctrine",
+        target_wing=None,
+        target_room=None,
+        priority=5,
+    ),
+    # Procedure: how-to, runbook, step-by-step instructions
+    RuleSnapshot(
+        name="builtin_procedure_steps",
+        rule_type="regex_target",
+        pattern=r"\b(?:to (?:deploy|install|upgrade|configure|set up|run)|step \d|^\d+\.\s|runbook|how-to)\b",  # noqa: E501
+        target_kind="procedure",
+        target_wing=None,
+        target_room=None,
+        priority=5,
+    ),
+    # Summary: condensed output from sessions/events
+    RuleSnapshot(
+        name="builtin_summary",
+        rule_type="regex_target",
+        pattern=r"\b(?:session summary|condensed summary|we (?:closed|shipped|completed|finished)|sprint summary|retro summary)\b",  # noqa: E501
+        target_kind="summary",
+        target_wing=None,
+        target_room=None,
+        priority=5,
+    ),
+    # Decision: explicit decision language
+    RuleSnapshot(
+        name="builtin_decision",
+        rule_type="regex_target",
+        pattern=r"\b(?:we (?:decided|chose|selected|opted|agreed)|(?:the )?decision (?:was|is) to|we (?:went with|will use|will adopt))\b",  # noqa: E501
+        target_kind="decision",
+        target_wing=None,
+        target_room=None,
+        priority=10,
+    ),
+    # Observation: tentative, unverified, "seemed", "maybe", "appeared to"
+    RuleSnapshot(
+        name="builtin_observation",
+        rule_type="regex_target",
+        pattern=r"\b(?:seemed to|appeared to|maybe|might be|not yet (?:verified|confirmed)|unclear whether)\b",  # noqa: E501
+        target_kind="observation",
+        target_wing=None,
+        target_room=None,
+        priority=10,
+    ),
+)
+
+
 def _classify_rules(
     content: str,
     rules: list[RuleSnapshot],
@@ -316,7 +394,16 @@ def _classify_rules(
     matched_target_rules: list[RuleSnapshot] = []
     skip_rules: list[str] = []
 
-    for rule in rules:
+    # Built-in rules run first (lower priority numbers), then tenant rules.
+    # Filter built-ins to the tenant's active taxonomy so they don't fire
+    # on kinds the tenant has disabled.
+    builtin_active = [
+        r for r in _BUILTIN_RULES
+        if r.target_kind is None or r.target_kind in taxonomy
+    ]
+    all_rules = list(builtin_active) + list(rules)
+
+    for rule in all_rules:
         try:
             matched = re.search(rule.pattern, content, flags=re.IGNORECASE | re.MULTILINE)
         except re.error:
