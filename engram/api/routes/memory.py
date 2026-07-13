@@ -1531,33 +1531,89 @@ async def invalidate_item(
     req: MutationAuditRequest | None = None,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> dict[str, Any]:
-    """Mark invalid (set valid_to)."""
+    """Mark invalid (set valid_to).
+
+    Serialized mutation: the target row is locked via SELECT ... FOR UPDATE
+    through the eligibility fetch, revalidated for active-live state, and
+    mutated with a guarded UPDATE ... RETURNING whose WHERE clause repeats the
+    mutation-authoritative predicates (tenant, id, valid_to IS NULL,
+    superseded_by IS NULL). The audit event is written only after RETURNING
+    confirms the row was actually mutated, in the same transaction. A
+    concurrent writer that committed a terminal state (supersession, prior
+    invalidation, review rejection/archival) wins; this route returns 409 and
+    writes no event.
+    """
     tenant_id = await _resolve_tenant_id(session)
     principal_id, _ = await _resolve_principal(session, tenant_id)
     item = await _require_eligible_item(
-        session, item_id, tenant_id=tenant_id, principal_id=principal_id
+        session,
+        item_id,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        for_update=True,
     )
     actor, on_behalf_of = await _resolve_actor_and_delegation(
         session,
         tenant_id=tenant_id,
         requested_on_behalf_of=req.on_behalf_of_principal_id if req else None,
     )
+
+    # Under-lock revalidation: if the item is already invalidated or
+    # superseded, it has left the active-live set. A concurrent terminal
+    # writer wins; this route is a 409 and writes no event.
+    if item.get("valid_to") is not None or item.get("superseded_by") is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Item is already invalidated or superseded and cannot be invalidated",
+        )
+
     now = _now_dt()
     reason = req.reason if req else None
+    old_valid_to = item.get("valid_to")
+
+    # Guarded mutation: the WHERE clause repeats every mutation-authoritative
+    # fact so a concurrent change between revalidation and the write is still
+    # caught. A zero-row RETURNING means a concurrent writer committed a
+    # terminal state between the lock-holding revalidation and the UPDATE —
+    # which can only happen if the competing writer was already holding a
+    # conflicting lock that our FOR UPDATE waited for. Return 409 with no
+    # event.
+    guard_stmt = text(
+        "UPDATE memory_items SET valid_to = :valid_to "
+        "WHERE (id = :item_id OR id = :item_id_hex) "
+        "AND tenant_id = :tenant_id "
+        "AND valid_to IS NULL "
+        "AND superseded_by IS NULL "
+        "RETURNING id"
+    )
+    guard_result = await session.execute(
+        guard_stmt,
+        {
+            "valid_to": now,
+            "item_id": str(item_id),
+            "item_id_hex": item_id.hex,
+            "tenant_id": str(tenant_id),
+        },
+    )
+    if guard_result.scalar_one_or_none() is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Item was concurrently modified and cannot be invalidated",
+        )
+
+    # Truthful event only after RETURNING confirms the transition, in the same
+    # transaction. If the event INSERT fails, the transaction rolls back both
+    # the valid_to mutation and the event.
     event = await _insert_item_event(
         session,
         item_id=item_id,
         event_type="invalidate",
         field_name="valid_to",
-        old_value=item.get("valid_to"),
+        old_value=old_valid_to,
         new_value=now,
         actor_principal_id=actor,
         on_behalf_of_principal_id=on_behalf_of,
         reason=reason,
-    )
-    await session.execute(
-        text("UPDATE memory_items SET valid_to = :valid_to WHERE id = :item_id"),
-        {"valid_to": now, "item_id": str(item_id)},
     )
     updated = await _require_eligible_item(
         session, item_id, tenant_id=tenant_id, principal_id=principal_id

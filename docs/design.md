@@ -915,13 +915,24 @@ being inferred or backfilled.
 > `valid_to`, replace `superseded_by`, or add another event (the guard fails on
 > the already-superseded old row).
 >
-> **Remaining dependency — manual invalidation.** This slice handles the case
-> where invalidation commits before AUTO_SUPERSEDE: the worker sees `valid_to`
-> and skips. The reverse race — worker AUTO_SUPERSEDE commits before a manual
-> `invalidate_item` — is *not* fully closed because `invalidate_item` is itself
-> an unlocked, unguarded writer of `valid_to` and is the next separate
-> high-priority writer to serialize (Gate A2). Documented as a remaining
-> boundary; `invalidate_item` is not modified by this PR.
+> **Manual invalidation serialization (Gate A2, closed).** The reverse race
+> described below is now closed. `POST /v1/items/{item_id}/invalidate` locks
+> the target row via `SELECT ... FOR UPDATE` through the eligibility fetch,
+> revalidates `valid_to IS NULL` and `superseded_by IS NULL` under the lock
+> (returning 409 if a concurrent terminal writer won), and uses a guarded
+> `UPDATE ... RETURNING` whose WHERE clause repeats the mutation-authoritative
+> predicates. The audit event is written only after RETURNING confirms the
+> transition, in the same transaction. Both directions of the
+> invalidation/AUTO_SUPERSEDE race are now serialized. See
+> `tests/test_manual_invalidation_concurrency.py` for 12 focused PostgreSQL
+> proof cases including deterministic blocker-graph overlap.
+>
+> **Historical note (pre-A2):** The AUTO_SUPERSEDE slice (#77) handled only
+> the case where invalidation commits before AUTO_SUPERSEDE: the worker saw
+> `valid_to` and skipped. The reverse race — worker AUTO_SUPERSEDE commits
+> before a manual `invalidate_item` — was *not* fully closed because
+> `invalidate_item` was itself an unlocked, unguarded writer of `valid_to`.
+> This was documented as Gate A2 and is now resolved.
 
 ---
 
