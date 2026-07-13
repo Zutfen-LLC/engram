@@ -64,7 +64,15 @@ async def generate_embeddings(
         ) from exc
 
     client = AsyncOpenAI(api_key=settings.openai_api_key)
-    response = await client.embeddings.create(model=model, input=texts, dimensions=dimensions)
+    response = await client.embeddings.create(
+        model=model,
+        input=texts,
+        dimensions=dimensions,
+        # Explicitly request float format: the SDK defaults to "base64" which
+        # some OpenAI-compatible providers (e.g. OpenRouter) do not support,
+        # causing a silent "No embedding data received" error.
+        encoding_format="float",
+    )
     # The API returns exactly one embedding per input, in input order.
     vectors: list[list[float] | None] = [
         [float(value) for value in item.embedding] for item in response.data
