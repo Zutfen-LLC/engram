@@ -1,0 +1,125 @@
+{
+  "version": 2,
+  "description": "Recall relevance golden set v2 — 12 queries designed to exercise semantic, keyword, and hybrid search across the corpus_v2.json seed corpus. Each query has fragments that must appear in relevant results.",
+  "samples": [
+    {
+      "id": "rec-001",
+      "query": "database security row level security RLS tenant isolation",
+      "relevant_content_fragments": [
+        "RLS is enforced at the database level",
+        "We must never bypass Row Level Security",
+        "Multi-tenant isolation: every table has tenant_id"
+      ],
+      "k": 5
+    },
+    {
+      "id": "rec-002",
+      "query": "how to deploy Engram installation setup",
+      "relevant_content_fragments": [
+        "docker compose up -d",
+        "engram bootstrap-key"
+      ],
+      "k": 5
+    },
+    {
+      "id": "rec-003",
+      "query": "trust model review status proposed active promotion confidence",
+      "relevant_content_fragments": [
+        "review_status='proposed'",
+        "Auto-promotion Path A",
+        "memory lifecycle states"
+      ],
+      "k": 5
+    },
+    {
+      "id": "rec-004",
+      "query": "embedding provider configuration OpenRouter encoding format",
+      "relevant_content_fragments": [
+        "encoding_format='float'",
+        "OpenRouter",
+        "embedding_provider config"
+      ],
+      "k": 5
+    },
+    {
+      "id": "rec-005",
+      "query": "append-first content model audit trail item_events",
+      "relevant_content_fragments": [
+        "Content is append-first",
+        "never UPDATE memory item content",
+        "item_events"
+      ],
+      "k": 5
+    },
+    {
+      "id": "rec-006",
+      "query": "user preferences dark mode concise responses notifications",
+      "relevant_content_fragments": [
+        "prefers dark mode",
+        "concise responses",
+        "never wants email notifications"
+      ],
+      "k": 5
+    },
+    {
+      "id": "rec-007",
+      "query": "conflict detection dedup supersession content hash",
+      "relevant_content_fragments": [
+        "Dedup is enforced",
+        "content_hash",
+        "cosine > 0.85"
+      ],
+      "k": 5
+    },
+    {
+      "id": "rec-008",
+      "query": "multi-tenant workspace membership roles agent groups",
+      "relevant_content_fragments": [
+        "workspace_members controls agent group membership",
+        "roles (owner/admin/member/viewer)",
+        "Multi-tenant isolation"
+      ],
+      "k": 5
+    },
+    {
+      "id": "rec-009",
+      "query": "recall scoring formula importance trust confidence budget",
+      "relevant_content_fragments": [
+        "score = (importance * 0.30)",
+        "source_trust * 0.25",
+        "Pinned items bypass the formula"
+      ],
+      "k": 5
+    },
+    {
+      "id": "rec-010",
+      "query": "knowledge graph tunnels topology relationships cross-domain",
+      "relevant_content_fragments": [
+        "Tunnels are cross-wing links",
+        "knowledge graph stores triples",
+        "memory_edges and tunnels"
+      ],
+      "k": 5
+    },
+    {
+      "id": "rec-011",
+      "query": "SSH hardening multi-user security password authentication",
+      "relevant_content_fragments": [
+        "Match User block",
+        "PasswordAuthentication no locks out",
+        "restrict changes to the specific user"
+      ],
+      "k": 5
+    },
+    {
+      "id": "rec-012",
+      "query": "Hermes plugin memory provider lifecycle hooks integration",
+      "relevant_content_fragments": [
+        "engram_memory Hermes plugin",
+        "prepare_memory_write",
+        "intercept durable writes"
+      ],
+      "k": 5
+    }
+  ]
+}

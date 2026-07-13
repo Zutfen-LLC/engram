@@ -203,7 +203,7 @@ async def eval_classification_live(
         try:
             import urllib.error
 
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=60) as resp:
                 body = json.loads(resp.read())
         except urllib.error.HTTPError as e:
             print(
@@ -263,21 +263,87 @@ async def eval_classification_live(
 
 
 # ---------------------------------------------------------------------------
+# Corpus seeding
+# ---------------------------------------------------------------------------
+
+
+async def seed_corpus(base_url: str, api_key: str, corpus_file: str = "corpus_v2.json") -> int:
+    """Seed a corpus of memories into a live instance. Returns count written."""
+    import urllib.error
+    import urllib.request
+
+    corpus = load_golden(corpus_file)
+    memories = corpus["memories"]
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    written = 0
+    for item in memories:
+        payload = {
+            "content": item["content"],
+            "kind": item.get("kind", "fact"),
+            "wing": item.get("wing"),
+            "room": item.get("room"),
+            "source_type": "import",
+        }
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            f"{base_url}/v1/remember", data=data, headers=headers
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                json.loads(resp.read())  # consume response
+                written += 1
+        except urllib.error.HTTPError as e:
+            err = e.read().decode()[:100]
+            print(f"  SEED ERROR: {e.code} {err}", file=sys.stderr)
+
+    return written
+
+
+async def promote_all_proposed(base_url: str, api_key: str) -> int:
+    """Promote all proposed items to active so they're visible to search."""
+    import urllib.error
+    import urllib.request
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    # Get all items — need to find proposed ones via DB since /v1/items
+    # doesn't expose review_status filtering reliably
+    promoted = 0
+    # Try the admin promote endpoint
+    try:
+        req = urllib.request.Request(
+            f"{base_url}/v1/admin/promote", method="POST",
+            headers=headers, data=b"{}",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read())
+            promoted = body.get("promoted", 0)
+    except urllib.error.HTTPError:
+        pass
+
+    return promoted
+
+
+# ---------------------------------------------------------------------------
 # Recall eval — live API
 # ---------------------------------------------------------------------------
 
 
-async def eval_recall_live(base_url: str, api_key: str) -> RecallReport:
-    """Run recall relevance evaluation against a live instance.
-
-    Uses the existing corpus in the instance (does not seed its own —
-    the caller should ensure the corpus contains content matching the
-    golden set fragments).
-    """
+async def eval_recall_live(
+    base_url: str, api_key: str, version: int = 2
+) -> RecallReport:
+    """Run recall relevance evaluation against a live instance."""
     import urllib.error
     import urllib.request
 
-    golden = load_golden("recall_v1.json")
+    golden = load_golden(f"recall_v{version}.json")
     samples = golden["samples"]
     version = golden["version"]
 
@@ -299,7 +365,7 @@ async def eval_recall_live(base_url: str, api_key: str) -> RecallReport:
             f"{base_url}/v1/search", data=data, headers=headers
         )
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=60) as resp:
                 body = json.loads(resp.read())
         except urllib.error.HTTPError as e:
             print(
@@ -446,6 +512,17 @@ async def main() -> None:
         help="Run only the recall eval (skip classification)",
     )
     parser.add_argument(
+        "--seed",
+        action="store_true",
+        help="Seed the corpus before running recall eval",
+    )
+    parser.add_argument(
+        "--recall-version",
+        type=int,
+        default=2,
+        help="Recall golden set version (default: 2)",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Output results as JSON",
@@ -453,6 +530,18 @@ async def main() -> None:
     args = parser.parse_args()
 
     reports: dict[str, object] = {}
+
+    if args.seed and args.base_url and args.api_key:
+        count = await seed_corpus(args.base_url, args.api_key)
+        print(f"Seeded {count} memories")
+        # Promote proposed items so they're visible to search
+        promoted = await promote_all_proposed(args.base_url, args.api_key)
+        if promoted:
+            print(f"Promoted {promoted} items to active")
+        # Wait for embedding jobs to process
+        print("Waiting 10s for embeddings...")
+        import time as _time
+        _time.sleep(10)
 
     if not args.recall_only:
         if args.rules_only:
@@ -470,7 +559,9 @@ async def main() -> None:
             reports["classification_rules"] = report
 
     if args.base_url and args.api_key and not args.rules_only:
-        report = await eval_recall_live(args.base_url, args.api_key)
+        report = await eval_recall_live(
+            args.base_url, args.api_key, version=args.recall_version
+        )
         print_recall_report(report)
         reports["recall"] = report
 
