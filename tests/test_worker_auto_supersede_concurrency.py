@@ -3,53 +3,47 @@
 
 Proves that the worker's ``handle_conflict_check`` AUTO_SUPERSEDE branch
 (``ConflictAction.AUTO_SUPERSEDE``) serializes safely against concurrent human
-review, human verification, manual supersession, manual invalidation, and
-reciprocal/competing worker jobs. Covers the twenty required proofs:
+review, human verification, manual supersession, manual invalidation, profile
+cutover, and competing worker jobs.
 
-  1. normal AUTO_SUPERSEDE mutates only the old row and writes one truthful
-     event on the old row (``superseded_by = new.id``, ``valid_to`` set once).
-  2. idempotent rerun preserves the original ``valid_to``/``superseded_by`` and
-     event count.
-  3. old item manually superseded first -> worker no-op.
-  4. old item invalidated first -> worker no-op.
-  5. old item human-reviewed first (disputed/rejected/archived) -> worker
-     no-op.
-  6. old item human-verified first -> worker no-op.
-  7. new item human-governed first -> worker no-op.
-  8. authority changes before lock so supersession is no longer allowed ->
-     worker no-op.
-  9. kind changes before lock -> worker no-op.
- 10. workspace scope changes before lock -> worker no-op.
- 11. either embedding becomes missing/not-ready before the embedding lock ->
-     worker no-op.
- 12. old item ceases to be active/live before lock -> worker no-op.
- 13. new item ceases to be live/eligible before lock -> worker no-op.
- 14. reciprocal worker jobs complete without deadlock and only the valid
-     creation direction acts.
- 15. two new items race to supersede one old item -> exactly one guarded winner,
-     one truthful link/event.
- 16. worker wins before a lock-respecting human/manual supersession path ->
-     waiting path resumes from committed state and follows its canonical
-     response without corrupting the worker link/event.
- 17. event insertion failure after the guarded update rolls back
-     ``valid_to``, ``superseded_by``, and the event atomically.
- 18. retry after rollback succeeds exactly once.
- 19. cross-tenant/missing counterpart fails closed under app-role RLS.
- 20. attribution test still proves the conflict automation actor and now
-     asserts event target/value truth (event on the old row,
-     ``new_value = new.id``).
+Proof categories (do not conflate these — they exercise different evidence
+levels):
 
-The production worker handler is invoked directly over an independent app-role
-session with FORCE RLS. Conflict detection is deterministically controlled by
-monkeypatching ``engram.conflicts.detect_conflicts`` so the tests exercise the
-production mutation branch without a live embedding provider. Human requests use
-real Bearer credentials through ASGI. Synchronization is deterministic and
-database-level: a test-only trigger calls ``pg_advisory_xact_lock`` at the
-worker's guarded old-row UPDATE point, and the coordinator holds the matching
-advisory lock to pause the worker while the human request runs. Overlap is
-proven via PostgreSQL's blocker graph (``pg_blocking_pids``), not sleeps. The
-owner connection is used only to arrange state, install triggers, and inspect
-committed state.
+* **Ordinary behavior / idempotency** (cases 1, 2, 20): the production
+  ``handle_conflict_check`` is invoked directly over a real app-role
+  PostgreSQL transaction with FORCE RLS and a deterministic forced
+  ``ConflictResult``. They prove the truthful mutation/event shape and
+  idempotency, not concurrency overlap.
+* **Committed-first stale-state revalidation** (cases 3–13): a human/owner
+  mutation commits *completely* before the worker starts. The worker then
+  revalidates from the locked rows and is a no-op. These prove stale-proposal
+  revalidation, *not* concurrent overlap — the worker never contends with the
+  other writer.
+* **Deterministic blocker-graph overlap** (cases 15, 16, 21): a test-only
+  trigger calls ``pg_advisory_xact_lock`` at the worker's guarded old-row
+  UPDATE (or the profile-row lock) and a coordinator holds the matching
+  advisory/row lock. Overlap is proven via PostgreSQL's blocker graph
+  (``pg_blocking_pids``), not sleeps or task scheduling order.
+* **Rollback / failure injection** (case 17): a PostgreSQL trigger raises
+  during event INSERT after the guarded UPDATE; the transaction rolls back
+  atomically.
+* **Concurrent scheduling without observed contention** (case 14): two
+  reciprocal proposals are scheduled concurrently, but creation-direction
+  means only the newer side reaches ``_apply_auto_supersede``. This proves
+  concurrent scheduling completes and creation direction is invariant to
+  task order; it does *not* prove pair-lock contention or observed blocking
+  (both handlers cannot contend for the pair lock in the current path).
+
+Almost all cases invoke the production ``handle_conflict_check`` directly
+(the same function ``process_one_job`` dispatches to). Case 22 is a focused
+dispatch smoke test that runs through the production ``process_one_job``
+loop (claim → handler → mark succeeded) to cover the dispatch path.
+
+Conflict detection is deterministically controlled by monkeypatching
+``engram.conflicts.detect_conflicts`` so the tests exercise the production
+mutation branch without a live embedding provider. Human requests use real
+Bearer credentials through ASGI. The owner connection is used only to arrange
+state, install triggers, and inspect committed state.
 
 Requires a live PostgreSQL with the v2 schema and the non-owner application
 role; skips automatically when unreachable.
@@ -298,25 +292,27 @@ async def proof(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[dict[str, Any]
         *,
         existing_item_id: uuid.UUID,
         action: str = "auto_supersede",
+        verdict: str | None = None,
         conflict_type: str | None = None,
         classifier_confidence: float = 0.95,
+        provenance: dict[str, Any] | None = None,
     ) -> None:
         from engram.conflicts import ConflictAction, ConflictResult, ConflictVerdict
 
-        verdict = (
-            ConflictVerdict.REFINE
-            if action == "auto_supersede"
-            else ConflictVerdict.DUPLICATE
+        resolved_verdict = (
+            ConflictVerdict(verdict)
+            if verdict is not None
+            else (ConflictVerdict.REFINE if action == "auto_supersede" else ConflictVerdict.DUPLICATE)
         )
         result = ConflictResult(
-            verdict=verdict,
+            verdict=resolved_verdict,
             action=ConflictAction(action),
             existing_item_id=existing_item_id,
             similarity=0.97,
             classifier_confidence=classifier_confidence,
             conflict_type=conflict_type,
             reason=f"forced {action}",
-            provenance={"provider": "test", "mode": "forced"},
+            provenance=provenance if provenance is not None else {"provider": "test", "mode": "forced"},
         )
 
         async def fake_detect(_item: MemoryItem, _session: AsyncSession, **_kw: Any) -> Any:
@@ -379,6 +375,16 @@ async def proof(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[dict[str, Any]
     monkeypatch.setattr(db_module, "owner_session_factory", owner_factory)
     monkeypatch.setattr(settings, "auth_enabled", True)
     reset_principal_cache()
+    # Drain stale pending/running conflict.check jobs left by other test modules
+    # so the ``process_one_job`` dispatch smoke test claims only this fixture's
+    # job (claim is global across tenants under the owner role).
+    async with owner.begin() as conn:
+        await conn.execute(
+            text(
+                "DELETE FROM jobs WHERE job_type='conflict.check' "
+                "AND status IN ('pending','running')"
+            )
+        )
     client = AsyncClient(transport=ASGITransport(app=create_app()), base_url="http://test")
     data: dict[str, Any] = {
         "owner": owner,
@@ -1101,19 +1107,38 @@ async def test_new_item_ceases_live_before_lock_worker_noop(
 
 
 # ===========================================================================
-# 14. Reciprocal worker jobs complete without deadlock
+# 14. Reciprocal proposals: concurrent scheduling, creation-direction acts
 # ===========================================================================
 
 
 @pytest.mark.parametrize("iteration", range(3))
-async def test_reciprocal_supersede_pair_no_deadlock(
+async def test_reciprocal_proposals_concurrent_scheduling_creation_direction(
     proof: dict[str, Any], iteration: int
 ) -> None:
-    """Run concurrent AUTO_SUPERSEDE jobs for opposite sides of the same pair.
-    Both complete within an explicit timeout; no deadlock; canonical pair order
-    is used; creation ordering allows only the newer item to supersede; the
-    older item remains active and unchanged; exactly one effective supersession
-    and event occur. Reversing task order does not change the invariant."""
+    """Schedule two reciprocal AUTO_SUPERSEDE proposals concurrently for opposite
+    sides of the same pair and assert the final state/event are invariant to
+    task creation order.
+
+    This is a concurrent *scheduling* and *creation-direction* test, NOT a
+    pair-lock contention test. The creation-order guard in
+    ``handle_conflict_check`` exits the older-side job before
+    ``_apply_auto_supersede`` (the older item's job detects the newer item, sees
+    it is not the newer side, and commits without entering the pair lock). So
+    both reciprocal handlers cannot contend for the pair lock in the current
+    production path, and no observed blocking is expected or claimed here. The
+    general code-level canonical pair-lock order (deterministic UUID order) is
+    documented in ``docs/design.md`` as architectural deadlock prevention, but
+    this test does not prove reciprocal pair-lock contention or observed
+    blocking.
+
+    What this test proves:
+
+    * concurrent reciprocal proposals complete within an explicit timeout;
+    * creation direction permits only the newer side to act (the older item is
+      superseded by the newer item, the newer item remains live);
+    * final state and event are invariant to task creation order (reversing the
+      gather order does not change the outcome).
+    """
     p = proof
     item_a = await p["insert_item"](
         content=f"supersede-reciprocal-a-{iteration}",
@@ -1193,18 +1218,35 @@ async def test_reciprocal_supersede_pair_no_deadlock(
 
 
 # ===========================================================================
-# 15. Two new items race to supersede one old item -> exactly one winner
+# 15. Two new items contend for one old item -> exactly one winner (deterministic blocker graph)
 # ===========================================================================
 
 
-async def test_two_new_items_race_one_old_exactly_one_winner(
+async def test_two_new_items_contend_one_old_exactly_one_winner(
     proof: dict[str, Any],
 ) -> None:
     """Two newer items both detect the same old item as the supersession target.
     Both have qualifying authority and ready embeddings. Both AUTO_SUPERSEDE
-    jobs run concurrently against the same old item. Exactly one wins the
-    guarded UPDATE (the other observes superseded_by is set and skips). The old
-    item ends with exactly one superseded_by link and one event."""
+    handlers run concurrently against the same old item and contend for the
+    canonical pair lock on the old row.
+
+    Deterministic overlap proof (no sleeps, no reliance on task scheduling
+    order):
+
+    * A test-only trigger pauses worker A at its guarded old-row UPDATE via an
+      advisory lock the coordinator holds, so worker A holds the pair locks
+      (including the old row) but does not commit.
+    * Worker B is then started and proven, via ``pg_blocking_pids()``, to be
+      blocked behind worker A on the shared old-item row/pair lock —
+      establishing real lock contention before release.
+    * Worker A is released, commits the supersession atomically (one link +
+      one event on the old row).
+    * Worker B resumes, observes the old row is superseded, and is a truthful
+      no-op (no second link, no second event).
+    * Exactly one old-row transition occurs; exactly one truthful event
+      exists; the event's ``new_value`` equals the winning
+      ``superseded_by``; both new items remain unchanged.
+    """
     p = proof
     old_item = await p["insert_item"](
         content="supersede-race-old",
@@ -1259,22 +1301,50 @@ async def test_two_new_items_race_one_old_exactly_one_winner(
     import engram.conflicts as cm
 
     cm.detect_conflicts = detect_dispatch  # type: ignore[assignment]  # noqa: SLF001
+
+    await _install_worker_pause_trigger(p, item_id=old_item)
+    coordinator = await p["owner"].connect()
+    worker_a_task: asyncio.Task[None] | None = None
+    worker_b_task: asyncio.Task[None] | None = None
     try:
-        await asyncio.wait_for(
-            asyncio.gather(
-                p["run_conflict_check"](new_a), p["run_conflict_check"](new_b)
-            ),
-            timeout=20,
-        )
+        coordinator_pid = await coordinator.scalar(text("SELECT pg_backend_pid()"))
+        await coordinator.execute(text("SELECT pg_advisory_lock(:key)"), {"key": p["pause_key"]})
+
+        worker_a_task = asyncio.create_task(p["run_conflict_check"](new_a))
+        # Worker A reaches its paused guarded supersession holding the pair locks.
+        await _await_blocked_on(coordinator, coordinator_pid, 1)
+        worker_a_pid = await _worker_pid_blocked_on_coordinator(coordinator, coordinator_pid)
+
+        worker_b_task = asyncio.create_task(p["run_conflict_check"](new_b))
+        # Worker B is blocked behind worker A on the shared old-item row/pair
+        # lock — real lock contention, proven via the blocker graph.
+        await _await_blocked_on_pid(coordinator, worker_a_pid, 1)
+        assert worker_b_task is not None and not worker_b_task.done(), "worker B must wait behind A"
+
+        # Release worker A: it commits the supersession atomically (one event).
+        await coordinator.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": p["pause_key"]})
+        await asyncio.wait_for(worker_a_task, timeout=10)
+        # Worker B resumes and is a truthful no-op (old row already superseded).
+        await asyncio.wait_for(worker_b_task, timeout=10)
     finally:
         cm.detect_conflicts = original_detect  # noqa: SLF001
+        for task in (worker_a_task, worker_b_task):
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        if coordinator.in_transaction():
+            await coordinator.rollback()
+        await coordinator.execute(text("SELECT pg_advisory_unlock_all()"))
+        await coordinator.close()
+        await _drop_worker_pause_trigger(p)
 
     st_old = await p["state"](old_item)
     # Exactly one superseded_by link and one event.
     assert st_old["item"]["valid_to"] is not None
     assert str(st_old["item"]["superseded_by"]) in (str(new_a), str(new_b))
     cd = _supersede_events(st_old["events"])
-    assert len(cd) == 1
+    assert len(cd) == 1, [dict(e) for e in st_old["events"]]
+    assert cd[0]["old_value"] is None
     assert cd[0]["new_value"] == str(st_old["item"]["superseded_by"])
     # The winner new item is unchanged; the loser new item is also unchanged.
     winner = new_a if str(st_old["item"]["superseded_by"]) == str(new_a) else new_b
@@ -1619,3 +1689,289 @@ async def test_attribution_event_target_and_value_truth(proof: dict[str, Any]) -
     assert provenance["old_item_id"] == str(old_item)
     assert provenance["new_item_id"] == str(new_item)
     assert provenance["existing_item_id"] == str(old_item)
+
+# ===========================================================================
+# 21. Active profile cutover while worker holds pair locks -> worker no-op
+#     (deterministic blocker graph: pg_blocking_pids on the profile row lock)
+# ===========================================================================
+
+
+async def test_profile_cutover_during_apply_is_noop(proof: dict[str, Any]) -> None:
+    """A conflict result produced using profile P may mutate trust state only
+    while P is still the active profile at mutation-authority time.
+
+    Deterministic overlap proof (no sleeps):
+
+    1. A coordinator transaction locks the currently active profile row with
+       ``SELECT ... FOR UPDATE``.
+    2. The production AUTO_SUPERSEDE handler runs in a separate app-role
+       session. After locking the ``memory_items`` pair, it attempts to lock
+       the profile row and blocks.
+    3. ``pg_blocking_pids()`` proves the worker is blocked on the
+       coordinator/profile lock after obtaining (or attempting) its mutation
+       path — establishing real cutover overlap before release.
+    4. In the coordinator transaction, P is retired (and a replacement profile
+       is activated so the schema's single-active invariant holds), then the
+       coordinator commits.
+    5. The worker resumes, observes P is no longer active, and performs no item
+       mutation/event.
+    6. The old/new items and their events remain unchanged.
+    """
+    p = proof
+    old_item, new_item = await _setup_pair_with_embeddings(
+        p, old_content="supersede-cutover-old", new_content="supersede-cutover-new"
+    )
+
+    # Resolve the currently active profile P (the one the worker will use).
+    async with p["owner"].connect() as conn:
+        prof = (
+            await conn.execute(
+                text(
+                    "SELECT id, profile_key, dimensions, provider, model, distance_metric "
+                    "FROM embedding_profiles WHERE state='active' LIMIT 1"
+                )
+            )
+        ).one()
+    profile_id = prof[0]
+
+    before_old = await p["state"](old_item)
+    before_new = await p["state"](new_item)
+    assert before_old["item"]["valid_to"] is None
+    assert before_old["item"]["superseded_by"] is None
+
+    coordinator = await p["owner"].connect()
+    worker_task: asyncio.Task[None] | None = None
+    try:
+        coordinator_pid = await coordinator.scalar(text("SELECT pg_backend_pid()"))
+        # 1. Coordinator locks the active profile row. The AsyncConnection
+        # auto-begins a transaction on the first execute; hold it open (do not
+        # commit) so the FOR UPDATE row lock persists until the explicit commit
+        # below, after the worker is proven blocked.
+        await coordinator.execute(
+            text("SELECT id FROM embedding_profiles WHERE id=:id FOR UPDATE"),
+            {"id": profile_id},
+        )
+
+        # 2. Start the production handler in a separate app-role session.
+        worker_task = asyncio.create_task(p["run_conflict_check"](new_item))
+        # 3. Prove the worker is blocked on the coordinator/profile lock.
+        await _await_blocked_on_pid(coordinator, coordinator_pid, 1)
+        # The worker holds the pair locks but has NOT committed the supersession
+        # yet (it is paused at the profile-row lock). Confirm the old item is
+        # still live while the worker is blocked.
+        async with p["owner"].connect() as check_conn:
+            live = (
+                await check_conn.execute(
+                    text("SELECT valid_to, superseded_by FROM memory_items WHERE id=:id"),
+                    {"id": old_item},
+                )
+            ).one()
+        assert live[0] is None and live[1] is None, "worker must not commit before profile lock"
+
+        # 4. Retire P and activate a replacement profile (single-active invariant).
+        #    The schema's partial unique index ``idx_embedding_profiles_one_active``
+        #    allows only one row with ``state='active'``, so retire P first (the
+        #    coordinator holds P's row lock and may update it), then insert the
+        #    replacement as active in the same locked transaction.
+        repl_id = uuid.uuid4()
+        repl_key = f"openai:text-embedding-3-small:1536:cutover-{p['tag']}"
+        await coordinator.execute(
+            text(
+                "UPDATE embedding_profiles SET state='retired', retired_at=NOW() "
+                "WHERE id=:id"
+            ),
+            {"id": profile_id},
+        )
+        await coordinator.execute(
+            text(
+                "INSERT INTO embedding_profiles "
+                "(id, profile_key, provider, model, dimensions, distance_metric, state, "
+                "index_status, index_name) VALUES "
+                "(:id,:key,'openai','text-embedding-3-small',1536,'cosine','active',"
+                "'ready','idx_cutover')"
+            ),
+            {"id": repl_id, "key": repl_key},
+        )
+        await coordinator.execute(text("COMMIT"))
+
+        # 5. Worker resumes and is a mutation-free, event-free no-op.
+        await asyncio.wait_for(worker_task, timeout=10)
+    finally:
+        if worker_task is not None and not worker_task.done():
+            worker_task.cancel()
+            await asyncio.gather(worker_task, return_exceptions=True)
+        if coordinator.in_transaction():
+            await coordinator.rollback()
+        await coordinator.close()
+        # Restore: re-activate the original profile and drop the replacement so
+        # other tests in this module find a single active profile.
+        async with p["owner"].begin() as conn:
+            await conn.execute(
+                text(
+                    "DELETE FROM memory_embeddings WHERE profile_id=:id"
+                ),
+                {"id": repl_id},
+            )
+            await conn.execute(
+                text("DELETE FROM embedding_profiles WHERE id=:id"),
+                {"id": repl_id},
+            )
+            await conn.execute(
+                text(
+                    "UPDATE embedding_profiles SET state='active', retired_at=NULL "
+                    "WHERE id=:id"
+                ),
+                {"id": profile_id},
+            )
+
+    # 6. Old/new items and events remain unchanged.
+    after_old = await p["state"](old_item)
+    after_new = await p["state"](new_item)
+    assert after_old["item"] == before_old["item"]
+    assert after_old["events"] == before_old["events"]
+    assert after_new["item"] == before_new["item"]
+    assert after_new["events"] == before_new["events"]
+    assert _supersede_events(after_old["events"]) == []
+    assert after_old["item"]["valid_to"] is None
+    assert after_old["item"]["superseded_by"] is None
+
+
+# ===========================================================================
+# 22. Malformed verdict/action proposal is a mutation-free no-op
+# ===========================================================================
+
+
+async def test_malformed_verdict_action_proposal_is_noop(proof: dict[str, Any]) -> None:
+    """AUTO_SUPERSEDE is a valid action only for ``ConflictVerdict.REFINE``. A
+    malformed proposal (``verdict=DUPLICATE`` paired with
+    ``action=AUTO_SUPERSEDE``) reaches ``_apply_auto_supersede`` but is a
+    mutation-free, event-free no-op: no item mutation, no event."""
+    p = proof
+    old_item, new_item = await _setup_pair_with_embeddings(
+        p, old_content="supersede-malformed-old", new_content="supersede-malformed-new"
+    )
+
+    # Force a malformed proposal: DUPLICATE verdict + AUTO_SUPERSEDE action.
+    p["force_detection"](
+        existing_item_id=old_item,
+        action="auto_supersede",
+        verdict="duplicate",
+    )
+
+    before_old = await p["state"](old_item)
+    before_new = await p["state"](new_item)
+    await p["run_conflict_check"](new_item)
+    after_old = await p["state"](old_item)
+    after_new = await p["state"](new_item)
+
+    assert after_old["item"] == before_old["item"]
+    assert after_old["events"] == before_old["events"]
+    assert after_new["item"] == before_new["item"]
+    assert after_new["events"] == before_new["events"]
+    assert _supersede_events(after_old["events"]) == []
+    assert after_old["item"]["valid_to"] is None
+    assert after_old["item"]["superseded_by"] is None
+
+
+# ===========================================================================
+# 23. Hostile detector provenance cannot overwrite canonical event fields
+# ===========================================================================
+
+
+async def test_hostile_provenance_cannot_overwrite_canonical_event_fields(
+    proof: dict[str, Any],
+) -> None:
+    """Detector provenance is untrusted/stale. Supply provenance containing
+    deliberately false values for every canonical event-role/security field.
+    Complete a valid AUTO_SUPERSEDE and parse the stored event reason JSON.
+
+    Assert the canonical top-level values describe the committed transition
+    and cannot be replaced, and the hostile/colliding provenance remains only
+    under ``detector_provenance`` (namespaced).
+    """
+    p = proof
+    old_item, new_item = await _setup_pair_with_embeddings(
+        p, old_content="supersede-hostile-old", new_content="supersede-hostile-new"
+    )
+
+    hostile = {
+        "provider": "hostile",
+        "action": "dedup",
+        "verdict": "duplicate",
+        "old_item_id": str(uuid.uuid4()),
+        "new_item_id": str(uuid.uuid4()),
+        "existing_item_id": str(uuid.uuid4()),
+        "reason": "hostile reason",
+        "worker_operation": "hostile.op",
+        "job_id": str(uuid.uuid4()),
+        "item_author_principal_id": str(uuid.uuid4()),
+        "internal_actor_key": "hostile_actor",
+    }
+    p["force_detection"](
+        existing_item_id=old_item,
+        action="auto_supersede",
+        provenance=hostile,
+    )
+
+    await p["run_conflict_check"](new_item)
+
+    st_old = await p["state"](old_item)
+    cd = _supersede_events(st_old["events"])
+    assert len(cd) == 1
+    event = cd[0]
+    # Canonical event row fields are truthful and cannot be replaced.
+    assert event["field_name"] == "superseded_by"
+    assert event["old_value"] is None
+    assert event["new_value"] == str(new_item)
+
+    import json
+
+    payload = json.loads(event["reason"])
+    # Canonical top-level fields describe the committed transition.
+    assert payload["action"] == "auto_supersede"
+    assert payload["verdict"] == "refine"
+    assert payload["old_item_id"] == str(old_item)
+    assert payload["new_item_id"] == str(new_item)
+    assert payload["existing_item_id"] == str(old_item)
+    assert payload["reason"] == "forced auto_supersede"
+    assert payload["worker_operation"] == "conflict.check"
+    assert payload["internal_actor_key"] == "conflict_automation"
+    # Hostile values are NOT at the top level.
+    assert "provider" not in payload
+    assert payload["action"] != hostile["action"]
+    assert payload["old_item_id"] != hostile["old_item_id"]
+    assert payload["new_item_id"] != hostile["new_item_id"]
+    assert payload["internal_actor_key"] != hostile["internal_actor_key"]
+    # Hostile provenance is preserved only under the namespaced key.
+    assert payload["detector_provenance"] == hostile
+    assert payload["detector_provenance"]["provider"] == "hostile"
+    assert payload["detector_provenance"]["action"] == "dedup"
+
+
+# ===========================================================================
+# 24. Production dispatch smoke test through process_one_job
+# ===========================================================================
+
+
+async def test_dispatch_via_process_one_job_succeeds(proof: dict[str, Any]) -> None:
+    """Focused dispatch smoke test: a conflict.check job enqueued and processed
+    through the production ``process_one_job`` loop (claim → handler → mark
+    succeeded) completes a valid AUTO_SUPERSEDE. Covers the worker-loop dispatch
+    path; the deeper concurrency proofs live in the deterministic blocker-graph
+    cases above."""
+    p = proof
+    old_item, new_item = await _setup_pair_with_embeddings(
+        p, old_content="supersede-dispatch-old", new_content="supersede-dispatch-new"
+    )
+
+    await p["run_conflict_check_via_process"](new_item)
+
+    st_old = await p["state"](old_item)
+    assert str(st_old["item"]["superseded_by"]) == str(new_item)
+    assert st_old["item"]["valid_to"] is not None
+    cd = _supersede_events(st_old["events"])
+    assert len(cd) == 1
+    assert cd[0]["new_value"] == str(new_item)
+    st_new = await p["state"](new_item)
+    assert st_new["item"]["valid_to"] is None
+    assert st_new["item"]["superseded_by"] is None

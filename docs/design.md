@@ -828,7 +828,9 @@ being inferred or backfilled.
 > **Canonical pair lock order.** The job/new item and detected old/counterpart
 > item are locked using the existing deterministic UUID-order pair-lock helper
 > (`_lock_conflict_pair`). No second lock-order convention exists; reciprocal
-> worker jobs cannot deadlock.
+> worker jobs cannot deadlock. The full cross-table lock order for AUTO_SUPERSEDE
+> is: `memory_items` pair (canonical UUID order) → `embedding_profiles` row →
+> `memory_embeddings` pair (canonical `memory_item_id` order).
 >
 > **Under-lock revalidation — the NEW/job item.** The new item must still
 > exist, belong to the job tenant, be distinct from the counterpart, remain
@@ -859,9 +861,32 @@ being inferred or backfilled.
 > semantics), and both must still carry a ready, non-`NULL` embedding for the
 > validated active profile and dimensions. The relevant `memory_embeddings`
 > rows are locked with `SELECT ... FOR UPDATE` in canonical `memory_item_id`
-> order (after the `memory_items` pair locks) and revalidated, so a concurrent
-> embedding-status change cannot drive a stale supersession. No semantic
-> similarity or classifier is rerun.
+> order (after the `memory_items` pair locks and the `embedding_profiles` row
+> lock) and revalidated, so a concurrent embedding-status change cannot drive a
+> stale supersession. No semantic similarity or classifier is rerun.
+>
+> **Active profile revalidation at mutation authority.** A conflict result
+> produced using profile P may mutate trust state only while P is still the
+> active profile at mutation-authority time. After the `memory_items` pair lock
+> and before the `memory_embeddings` pair lock, the worker reloads the specific
+> `embedding_profiles` row with `SELECT ... FOR UPDATE` (a core column query
+> that bypasses the ORM identity map, so it reads the locked row's current
+> committed state rather than the pre-lock snapshot instance) and verifies P is
+> still `state='active'` with matching `profile_key`, `dimensions`, `provider`,
+> `model`, and `distance_metric` (the detector-relevant immutable/vector-space
+> fields). If a concurrent profile cutover retired P before the worker obtained
+> profile mutation authority, AUTO_SUPERSEDE is a mutation-free, event-free
+> no-op. Global lock order: `memory_items` pair (canonical UUID order) →
+> `embedding_profiles` row → `memory_embeddings` pair (canonical
+> `memory_item_id` order). `activate_profile` updates profile rows but does
+> NOT acquire `memory_items` row locks, so it cannot introduce a reverse
+> profile→item lock cycle: if the worker obtains the profile lock while P is
+> active first, the cutover waits; the worker completes and then the cutover
+> resumes. This defines a serial order. Detection is not rerun under lock.
+>
+> **REFINE verdict requirement.** AUTO_SUPERSEDE is a valid action only for a
+> `ConflictVerdict.REFINE` proposal. A malformed proposal (any other verdict
+> paired with `AUTO_SUPERSEDE`) is a mutation-free, event-free no-op.
 >
 > **Guarded old-row transition.** The `UPDATE ... RETURNING` on the old row
 > re-checks tenant, id, `review_status='active'`, `valid_to IS NULL`, and
@@ -873,9 +898,12 @@ being inferred or backfilled.
 > item (the row whose `superseded_by` actually changed), with
 > `event_type='conflict_detected'`, `field_name='superseded_by'`,
 > `old_value=None`, `new_value=str(new.id)`, and the `conflict_automation`
-> internal actor. The payload names old and new roles unambiguously
-> (`old_item_id`, `new_item_id`) and preserves job id, classifier reason,
-> existing_item_id, author id, action, and existing provenance. (The legacy
+> internal actor. Canonical event-role fields (`old_item_id`, `new_item_id`,
+> `existing_item_id`, `action`, `verdict`, `reason`, `worker_operation`,
+> `job_id`, `item_author_principal_id`, `internal_actor_key`) are authoritative
+> and cannot be overwritten by untrusted/stale detector provenance. Detector
+> provenance is namespaced under `detector_provenance` so hostile/colliding
+> provider data is preserved without replacing canonical fields. (The legacy
 > path attached the event to the new item and recorded
 > `new_value=old_item_id` — the opposite of the actual mutation; this is
 > corrected.)

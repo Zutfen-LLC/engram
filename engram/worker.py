@@ -722,6 +722,80 @@ async def _has_human_governance(
     return human_event is not None
 
 
+async def _lock_and_verify_active_profile(
+    session: AsyncSession,
+    *,
+    profile: EmbeddingProfile,
+) -> bool:
+    """Lock and revalidate the active embedding profile row at mutation authority.
+
+    A conflict result produced using profile P may mutate trust state only
+    while P is still the active profile at mutation-authority time. The detector
+    ran unlocked with a pre-lock snapshot of P (``state == "active"`` plus the
+    detector-relevant immutable/vector-space fields). A concurrent profile
+    cutover (``activate_profile`` retires the active row and activates a
+    replacement) can retire P before the worker obtains profile mutation
+    authority, in which case AUTO_SUPERSEDE is a mutation-free, event-free
+    no-op.
+
+    This helper reloads the specific ``EmbeddingProfile`` row with
+    ``SELECT ... FOR UPDATE`` on PostgreSQL and verifies:
+
+    * the row still exists;
+    * ``id == profile.id``;
+    * ``state == "active"``;
+    * ``profile_key``, ``dimensions``, ``provider``, ``model`` and
+      ``distance_metric`` still match the validated proposal object (the
+      detector-relevant immutable/vector-space fields).
+
+    Returns ``True`` iff P is still the active profile under the lock.
+
+    Global lock order: ``memory_items`` pair (canonical UUID order) →
+    ``embedding_profiles`` row → ``memory_embeddings`` pair (canonical
+    ``memory_item_id`` order). ``activate_profile`` updates profile rows but
+    does NOT acquire ``memory_items`` row locks, so a worker that already holds
+    the item pair lock and then locks the profile row cannot deadlock with a
+    cutover that takes only the profile row lock — the item lock is not on the
+    cutover's lock path, so there is no reverse profile→item lock cycle. If the
+    worker obtains the profile lock while P is active first, the cutover waits;
+    the worker completes and then the cutover resumes. This defines a serial
+    order. Do not rerun semantic detection or classification under lock.
+    """
+    dialect_name = session.bind.dialect.name if session.bind is not None else None
+    # Use a core SELECT that returns a fresh row mapping (not the ORM identity
+    # map): the session already holds the pre-lock ``EmbeddingProfile`` instance
+    # from ``get_active_profile``, so an ORM ``select(EmbeddingProfile)`` would
+    # return the stale identity-mapped instance. ``populate_existing()`` would
+    # also work, but a core column query is unambiguous about reading the
+    # locked DB row's current committed state.
+    cols = (
+        EmbeddingProfile.id,
+        EmbeddingProfile.state,
+        EmbeddingProfile.profile_key,
+        EmbeddingProfile.dimensions,
+        EmbeddingProfile.provider,
+        EmbeddingProfile.model,
+        EmbeddingProfile.distance_metric,
+    )
+    stmt = select(*cols).where(EmbeddingProfile.id == profile.id)
+    if dialect_name == "postgresql":
+        stmt = stmt.with_for_update()
+    row = (await session.execute(stmt)).mappings().one_or_none()
+    if row is None:
+        return False
+    if row["state"] != "active":
+        return False
+    if row["profile_key"] != profile.profile_key:
+        return False
+    if int(row["dimensions"]) != int(profile.dimensions):
+        return False
+    if row["provider"] != profile.provider:
+        return False
+    if row["model"] != profile.model:
+        return False
+    return str(row["distance_metric"]) == profile.distance_metric
+
+
 async def _lock_and_verify_pair_embeddings(
     session: AsyncSession,
     *,
@@ -753,11 +827,15 @@ async def _lock_and_verify_pair_embeddings(
     """
     pair_ids = sorted((job_item_id, counterpart_id), key=str)
     dialect_name = session.bind.dialect.name if session.bind is not None else None
-    stmt = select(MemoryEmbedding).where(
-        MemoryEmbedding.tenant_id == tenant_id,
-        MemoryEmbedding.memory_item_id.in_(pair_ids),
-        MemoryEmbedding.profile_id == profile.id,
-        MemoryEmbedding.embedding_dim == profile.dimensions,
+    stmt = (
+        select(MemoryEmbedding)
+        .where(
+            MemoryEmbedding.tenant_id == tenant_id,
+            MemoryEmbedding.memory_item_id.in_(pair_ids),
+            MemoryEmbedding.profile_id == profile.id,
+            MemoryEmbedding.embedding_dim == profile.dimensions,
+        )
+        .order_by(MemoryEmbedding.memory_item_id)
     )
     if dialect_name == "postgresql":
         stmt = stmt.with_for_update()
@@ -955,13 +1033,6 @@ async def _apply_dedup(
     )
 
 
-# AUTO_SUPERSEDE-eligible action values (P0-FIX-004D). Only AUTO_SUPERSEDE and
-# REFINE (which resolves to AUTO_SUPERSEDE when authority qualifies) may drive
-# automatic supersession. Stored as string values so this constant does not
-# require importing the ``ConflictAction`` enum at import time.
-_AUTO_SUPERSEDE_ACTION_VALUES: frozenset[str] = frozenset({"auto_supersede"})
-
-
 async def _apply_auto_supersede(
     session: AsyncSession,
     *,
@@ -994,8 +1065,24 @@ async def _apply_auto_supersede(
     authority hierarchy and the canonical high-confidence classifier threshold.
     Authority is rechecked from the locked rows, never from
     ``result.provenance`` (which captures the pre-lock detection snapshot).
+
+    AUTO_SUPERSEDE is a valid action only for ``ConflictVerdict.REFINE``: a
+    proposal whose verdict is not REFINE is a malformed proposal and is a
+    mutation-free, event-free no-op.
+
+    The active embedding profile is revalidated at mutation-authority time
+    (between the ``memory_items`` pair lock and the ``memory_embeddings`` pair
+    lock) by locking the specific ``embedding_profiles`` row with
+    ``SELECT ... FOR UPDATE`` and verifying it is still active with matching
+    detector-relevant immutable/vector-space fields. If the profile has been
+    retired by a concurrent cutover, AUTO_SUPERSEDE is a mutation-free,
+    event-free no-op. Global lock order: ``memory_items`` pair (canonical UUID
+    order) → ``embedding_profiles`` row → ``memory_embeddings`` pair (canonical
+    ``memory_item_id`` order). ``activate_profile`` updates profile rows but
+    does not acquire ``memory_items`` row locks, so no reverse profile→item
+    lock cycle is introduced.
     """
-    from engram.conflicts import HIGH_CLASSIFIER_CONFIDENCE
+    from engram.conflicts import HIGH_CLASSIFIER_CONFIDENCE, ConflictAction, ConflictVerdict
 
     tenant_id = str(job.tenant_id)
     locked = await _lock_conflict_pair(
@@ -1033,9 +1120,14 @@ async def _apply_auto_supersede(
     # supersession authority. Evaluated while the item lock is held.
     if await _has_human_governance(session, item=locked_job_item, tenant_id=tenant_id):
         return
-    # The proposed result must still be AUTO_SUPERSEDE and meet the canonical
-    # high-confidence classifier threshold. No LLM re-classification under lock.
-    if result.action.value not in _AUTO_SUPERSEDE_ACTION_VALUES:
+    # The proposed result must still be AUTO_SUPERSEDE derived from a REFINE
+    # verdict, and meet the canonical high-confidence classifier threshold.
+    # AUTO_SUPERSEDE is only a valid derivation of REFINE; a malformed proposal
+    # (any other verdict paired with AUTO_SUPERSEDE) is a mutation-free,
+    # event-free no-op. No LLM re-classification runs under lock.
+    if result.verdict is not ConflictVerdict.REFINE:
+        return
+    if result.action is not ConflictAction.AUTO_SUPERSEDE:
         return
     if result.classifier_confidence < HIGH_CLASSIFIER_CONFIDENCE:
         return
@@ -1066,6 +1158,19 @@ async def _apply_auto_supersede(
     # verification or human review-state decision protects it from being
     # auto-superseded.
     if await _has_human_governance(session, item=locked_counterpart, tenant_id=tenant_id):
+        return
+
+    # ---- Active profile revalidation at mutation authority ---------------
+    # The detector ran unlocked with a pre-lock snapshot of profile P. A
+    # concurrent profile cutover can retire P before the worker obtains profile
+    # mutation authority. Lock the specific ``embedding_profiles`` row with
+    # SELECT ... FOR UPDATE and verify P is still active with matching
+    # detector-relevant immutable/vector-space fields. Lock order:
+    # memory_items pair → embedding_profiles row → memory_embeddings pair.
+    # If P is no longer active, AUTO_SUPERSEDE is a mutation-free, event-free
+    # no-op. activate_profile does not take memory_items row locks, so no
+    # reverse profile→item lock cycle is introduced.
+    if not await _lock_and_verify_active_profile(session, profile=profile):
         return
 
     # ---- Detector eligibility: kind, workspace scope, embeddings ----------
@@ -1130,8 +1235,14 @@ async def _apply_auto_supersede(
         tenant_id=tenant_id,
         internal_key=CONFLICT_AUTOMATION_INTERNAL_KEY,
     )
+    # Canonical event-role fields are authoritative and cannot be overwritten
+    # by untrusted/stale detector provenance. Provenance is namespaced under
+    # ``detector_provenance`` so hostile/colliding provider data is preserved
+    # without namespace collision and can never replace old_item_id,
+    # new_item_id, action, job id, reason, actor key, or author identity.
     payload = {
         "action": result.action.value,
+        "verdict": result.verdict.value,
         "old_item_id": str(locked_counterpart.id),
         "new_item_id": str(new_id),
         "existing_item_id": str(result.existing_item_id),
@@ -1140,7 +1251,7 @@ async def _apply_auto_supersede(
         "job_id": str(job.id),
         "item_author_principal_id": str(locked_job_item.principal_id),
         "internal_actor_key": CONFLICT_AUTOMATION_INTERNAL_KEY,
-        **result.provenance,
+        "detector_provenance": result.provenance,
     }
     await _insert_event(
         session,

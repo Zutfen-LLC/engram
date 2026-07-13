@@ -803,13 +803,20 @@ async def test_every_conflict_branch_uses_conflict_actor(
         prof = (
             await session.execute(
                 text(
-                    "SELECT id, profile_key, dimensions, state FROM embedding_profiles "
+                    "SELECT id, profile_key, dimensions, state, provider, model, "
+                    "distance_metric FROM embedding_profiles "
                     "WHERE state='active' LIMIT 1"
                 )
             )
         ).one()
     profile = SimpleNamespace(
-        id=prof[0], profile_key=prof[1], state=prof[3], dimensions=int(prof[2])
+        id=prof[0],
+        profile_key=prof[1],
+        state=prof[3],
+        dimensions=int(prof[2]),
+        provider=prof[4],
+        model=prof[5],
+        distance_metric=prof[6],
     )
 
     async def active_profile(_session):
@@ -864,7 +871,10 @@ async def test_every_conflict_branch_uses_conflict_actor(
     async with owner() as session:
         event = (
             await session.execute(
-                text("SELECT actor_principal_id,reason FROM item_events WHERE item_id=:id"),
+                text(
+                    "SELECT event_type, field_name, old_value, new_value, "
+                    "actor_principal_id, reason FROM item_events WHERE item_id=:id"
+                ),
                 {"id": event_item_id},
             )
         ).mappings().one()
@@ -883,13 +893,24 @@ async def test_every_conflict_branch_uses_conflict_actor(
     assert provenance["internal_actor_key"] == CONFLICT_AUTOMATION_INTERNAL_KEY
     assert provenance["action"] == action.value
     assert provenance["existing_item_id"] == str(old_id)
-    assert provenance["provider"] == "test"
+    # Detector provenance: AUTO_SUPERSEDE namespaces untrusted provider data
+    # under ``detector_provenance`` so it cannot overwrite canonical fields;
+    # the other conflict branches still merge provenance at the top level.
+    if action == ConflictAction.AUTO_SUPERSEDE:
+        assert provenance["detector_provenance"]["provider"] == "test"
+    else:
+        assert provenance["provider"] == "test"
     # P0-FIX-004D: AUTO_SUPERSEDE event describes the mutated old row
     # unambiguously — it records the old/new item roles and the actual
-    # superseded_by value (the new item id).
+    # superseded_by value (the new item id), and the event row carries the
+    # truthful field_name/old_value/new_value on the mutated OLD item.
     if action == ConflictAction.AUTO_SUPERSEDE:
         assert provenance["old_item_id"] == str(old_id)
         assert provenance["new_item_id"] == str(new_id)
+        assert event["event_type"] == "conflict_detected"
+        assert event["field_name"] == "superseded_by"
+        assert event["old_value"] is None
+        assert event["new_value"] == str(new_id)
 
 
 @pytest.mark.asyncio
