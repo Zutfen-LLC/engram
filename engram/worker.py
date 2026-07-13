@@ -1278,6 +1278,65 @@ def _can_narrow(current: str, proposed: str) -> bool:
     return _VISIBILITY_RANK.get(proposed, 1) < _VISIBILITY_RANK.get(current, 1)
 
 
+async def _reload_item_for_update(session: AsyncSession, item_id: UUID) -> MemoryItem | None:
+    """Reload an item with SELECT ... FOR UPDATE for serialized mutation."""
+    return (
+        await session.execute(
+            select(MemoryItem).where(MemoryItem.id == item_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+
+
+async def _guarded_field_update(
+    session: AsyncSession,
+    *,
+    item_id: UUID,
+    tenant_id: UUID,
+    field_name: str,
+    old_value: Any,
+    new_value: Any,
+    actor: UUID,
+    reason: str | None,
+    provenance: dict[str, Any],
+    result_reason: str,
+) -> bool:
+    """Guarded UPDATE for a single metadata field. Re-checks the old value in
+    the WHERE clause, uses RETURNING to confirm the mutation, and writes the
+    event only after success. Returns True if the field was actually mutated.
+    """
+    # Use is_not_distinct_from (not ==) so NULL old values match correctly
+    # (wing/room are nullable; == NULL always returns NULL, not true).
+    guard_stmt = (
+        update(MemoryItem)
+        .where(
+            MemoryItem.id == item_id,
+            MemoryItem.tenant_id == tenant_id,
+            getattr(MemoryItem, field_name).is_not_distinct_from(old_value),
+        )
+        .values(**{field_name: new_value})
+        .returning(MemoryItem.id)
+    )
+    guard_result = await session.execute(
+        guard_stmt, execution_options={"synchronize_session": False}
+    )
+    if guard_result.scalar_one_or_none() is None:
+        return False
+
+    import json
+
+    await _insert_event(
+        session,
+        item_id=item_id,
+        event_type="metadata_patch",
+        field_name=field_name,
+        old_value=old_value,
+        new_value=new_value,
+        actor_principal_id=actor,
+        reason=json.dumps({**provenance, "reason": result_reason}, sort_keys=True),
+    )
+    return True
+
+
 async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
     """Refine kind/wing/room/confidence/visibility via an LLM, conservatively.
 
@@ -1286,12 +1345,21 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
     memory_confidence (source-authority-capped, monotonic-up so it never
     destabilizes), and NARROW visibility (never widen). Never mutates content.
     Idempotent: equal proposed values record provenance but change nothing.
+
+    Serialization: the expensive LLM classification runs unlocked on a stale
+    snapshot. The row is then locked via SELECT ... FOR UPDATE and each
+    proposed change is revalidated against the locked row's current values.
+    Each mutation uses a guarded UPDATE ... RETURNING that re-checks the old
+    value; a concurrent writer that changed the field between detection and
+    mutation produces a zero-row result and the change is skipped (no stale
+    event). Events are written only after RETURNING confirms the mutation.
     """
     import json
 
     from engram.classification import classify
 
     item_id = _payload_item_id(job)
+    # Phase 1: unlocked detection on a stale snapshot.
     item = await _reload_item(session, item_id)
     if item is None or _is_expired_or_inactive(item):
         logger.info("classification.refine id=%s skipped: item gone/inactive", item_id)
@@ -1313,109 +1381,109 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
     }
     changed = False
 
+    # Phase 2: lock the row and revalidate against current state.
+    locked_item = await _reload_item_for_update(session, item_id)
+    if locked_item is None or _is_expired_or_inactive(locked_item):
+        logger.info(
+            "classification.refine id=%s skipped: item gone/inactive after lock", item_id
+        )
+        return
+    if str(locked_item.tenant_id) != str(job.tenant_id):
+        return
+
     # kind/wing/room only above the confidence threshold.
     if result.confidence >= settings.classification_confidence_threshold:
-        if result.suggested_kind and result.suggested_kind != item.kind:
-            await _insert_event(
+        if result.suggested_kind and result.suggested_kind != locked_item.kind:  # noqa: SIM102
+            if await _guarded_field_update(
                 session,
-                item_id=item.id,
-                event_type="metadata_patch",
+                item_id=item_id,
+                tenant_id=job.tenant_id,
                 field_name="kind",
-                old_value=item.kind,
+                old_value=locked_item.kind,
                 new_value=result.suggested_kind,
-                actor_principal_id=actor,
-                reason=json.dumps({**provenance, "reason": result.reason}, sort_keys=True),
-            )
-            await session.execute(
-                update(MemoryItem)
-                .where(MemoryItem.id == item.id)
-                .values(kind=result.suggested_kind)
-            )
-            changed = True
-        if result.suggested_wing and result.suggested_wing != (item.wing or ""):
-            await _insert_event(
+                actor=actor,
+                reason=None,
+                provenance=provenance,
+                result_reason=result.reason,
+            ):
+                changed = True
+        if result.suggested_wing and result.suggested_wing != (locked_item.wing or ""):  # noqa: SIM102
+            if await _guarded_field_update(
                 session,
-                item_id=item.id,
-                event_type="metadata_patch",
+                item_id=item_id,
+                tenant_id=job.tenant_id,
                 field_name="wing",
-                old_value=item.wing,
+                old_value=locked_item.wing,
                 new_value=result.suggested_wing,
-                actor_principal_id=actor,
-                reason=json.dumps({**provenance, "reason": result.reason}, sort_keys=True),
-            )
-            await session.execute(
-                update(MemoryItem)
-                .where(MemoryItem.id == item.id)
-                .values(wing=result.suggested_wing)
-            )
-            changed = True
-        if result.suggested_room and result.suggested_room != (item.room or ""):
-            await _insert_event(
+                actor=actor,
+                reason=None,
+                provenance=provenance,
+                result_reason=result.reason,
+            ):
+                changed = True
+        if result.suggested_room and result.suggested_room != (locked_item.room or ""):  # noqa: SIM102
+            if await _guarded_field_update(
                 session,
-                item_id=item.id,
-                event_type="metadata_patch",
+                item_id=item_id,
+                tenant_id=job.tenant_id,
                 field_name="room",
-                old_value=item.room,
+                old_value=locked_item.room,
                 new_value=result.suggested_room,
-                actor_principal_id=actor,
-                reason=json.dumps({**provenance, "reason": result.reason}, sort_keys=True),
-            )
-            await session.execute(
-                update(MemoryItem)
-                .where(MemoryItem.id == item.id)
-                .values(room=result.suggested_room)
-            )
-            changed = True
+                actor=actor,
+                reason=None,
+                provenance=provenance,
+                result_reason=result.reason,
+            ):
+                changed = True
 
     # memory_confidence: source-authority-capped candidate, monotonic-up (max)
-    # so refinement never destabilizes (ENG-AUD-005) AND is idempotent —
-    # re-running with the same candidate is a no-op (max is stable), so a refine
-    # job cannot oscillate the value.
-    candidate = min(item.source_trust, result.confidence)
-    blended = max(item.memory_confidence, candidate)
-    if blended - item.memory_confidence > settings.classification_refine_min_delta:
-        await _insert_event(
+    # so refinement never destabilizes (ENG-AUD-005) AND is idempotent.
+    # Revalidate against the locked row's current memory_confidence — a
+    # concurrent PATCH may have changed importance, which does not directly
+    # set memory_confidence, but a concurrent refine or other writer could.
+    candidate = min(locked_item.source_trust, result.confidence)
+    blended = max(locked_item.memory_confidence, candidate)
+    if blended - locked_item.memory_confidence > settings.classification_refine_min_delta:  # noqa: SIM102
+        if await _guarded_field_update(
             session,
-            item_id=item.id,
-            event_type="metadata_patch",
+            item_id=item_id,
+            tenant_id=job.tenant_id,
             field_name="memory_confidence",
-            old_value=item.memory_confidence,
+            old_value=locked_item.memory_confidence,
             new_value=blended,
-            actor_principal_id=actor,
-            reason=json.dumps({**provenance, "reason": result.reason}, sort_keys=True),
-        )
-        await session.execute(
-            update(MemoryItem).where(MemoryItem.id == item.id).values(memory_confidence=blended)
-        )
-        changed = True
+            actor=actor,
+            reason=None,
+            provenance=provenance,
+            result_reason=result.reason,
+        ):
+            changed = True
 
     # Visibility: NARROW only (never widen). ENG-AUD-005.
-    if result.suggested_visibility is not None and _can_narrow(
-        item.visibility, result.suggested_visibility
+    # Revalidate against the locked row's current visibility — a concurrent
+    # PATCH may have already widened or narrowed it.
+    if result.suggested_visibility is not None and _can_narrow(  # noqa: SIM102
+        locked_item.visibility, result.suggested_visibility
     ):
-        await _insert_event(
+        if await _guarded_field_update(
             session,
-            item_id=item.id,
-            event_type="metadata_patch",
+            item_id=item_id,
+            tenant_id=job.tenant_id,
             field_name="visibility",
-            old_value=item.visibility,
+            old_value=locked_item.visibility,
             new_value=result.suggested_visibility,
-            actor_principal_id=actor,
-            reason=json.dumps({**provenance, "reason": result.reason}, sort_keys=True),
-        )
-        await session.execute(
-            update(MemoryItem)
-            .where(MemoryItem.id == item.id)
-            .values(visibility=result.suggested_visibility)
-        )
-        changed = True
+            actor=actor,
+            reason=None,
+            provenance=provenance,
+            result_reason=result.reason,
+        ):
+            changed = True
 
     if not changed:
         # Record provenance that refinement ran and decided to change nothing,
         # so a rerun is observably idempotent.
         await _insert_event(
             session,
-            item_id=item.id,
+            item_id=item_id,
             event_type="classification",
             field_name="kind",
             old_value=None,

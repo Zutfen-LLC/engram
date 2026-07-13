@@ -651,11 +651,18 @@ async def bulk_archive(
 ) -> BulkArchiveResponse:
     """Archive multiple items: set review_status='archived'.
 
-    Writes an ``item_events`` audit row per changed item, then updates the
-    column. Items already in a terminal state (``archived``/``rejected``) and
-    items not found in the caller's tenant are skipped. Archival excludes
-    items from default recall without invalidating them (they're still true,
-    just not actively useful).
+    Writes an ``item_events`` audit row per changed item. Items already in a
+    terminal state (``archived``/``rejected``) and items not found in the
+    caller's tenant are skipped. Archival excludes items from default recall
+    without invalidating them (they're still true, just not actively useful).
+
+    Serialized mutation: rows are locked via SELECT ... FOR UPDATE in
+    canonical UUID order (preventing deadlocks between concurrent bulk-archive
+    operations with overlapping item sets). The bulk UPDATE re-checks
+    ``review_status NOT IN ('archived', 'rejected')`` so a concurrent writer
+    that changed a row's status between the lock-time read and the UPDATE
+    produces a zero-row result for that row and it is skipped. Events are
+    written only after the UPDATE confirms the mutation.
     """
     tenant_id = await _resolve_tenant_id(session)
     principal_id, _ = await _resolve_principal(session, tenant_id)
@@ -665,20 +672,26 @@ async def bulk_archive(
             archived=[], archived_count=0, skipped=[], skipped_count=0
         )
 
+    # Sort item IDs canonically (UUID order) so concurrent bulk-archive
+    # operations acquire row locks in the same order, preventing deadlocks.
+    sorted_ids = sorted(requested)
+
     fetch_placeholders: list[str] = []
     fetch_params: dict[str, Any] = {
         "tenant_id": str(tenant_id),
         "caller_principal_id": str(principal_id),
     }
-    for i, item_id in enumerate(requested):
+    for i, item_id in enumerate(sorted_ids):
         fetch_placeholders.append(f":id{i}")
         fetch_params[f"id{i}"] = str(item_id)
     lock_suffix = " FOR UPDATE" if session.bind.dialect.name == "postgresql" else ""
+    # ORDER BY id ensures canonical lock acquisition order.
     fetch_sql = text(
         "SELECT id, review_status, principal_id FROM memory_items "
         "WHERE tenant_id = :tenant_id AND "
         f"{eligibility_sql()} AND "
-        f"CAST(id AS TEXT) IN ({', '.join(fetch_placeholders)}){lock_suffix}"
+        f"CAST(id AS TEXT) IN ({', '.join(fetch_placeholders)})"
+        f" ORDER BY id{lock_suffix}"
     )
     rows = (await session.execute(fetch_sql, fetch_params)).all()
     found: dict[str, tuple[str, object]] = {
@@ -712,34 +725,53 @@ async def bulk_archive(
         session, tenant_id=tenant_id, requested_on_behalf_of=req.on_behalf_of_principal_id
     )
 
-    for item_id in to_archive:
-        old_status, _principal_id = found[str(item_id)]
-        await _insert_item_event(
-            session,
-            item_id=item_id,
-            event_type="review_change",
-            field_name="review_status",
-            old_value=old_status,
-            new_value="archived",
-            actor_principal_id=actor,
-            on_behalf_of_principal_id=on_behalf_of,
-            reason=req.reason,
-        )
-
     if to_archive:
+        # Guarded bulk UPDATE: re-check review_status so a concurrent writer
+        # that changed a row's status between the lock-time read and the UPDATE
+        # produces a zero-row result for that row (it is skipped, no stale
+        # event). RETURNING id tells us exactly which rows were actually
+        # archived.
         update_placeholders: list[str] = []
         update_params: dict[str, Any] = {"tenant_id": str(tenant_id)}
         for i, item_id in enumerate(to_archive):
             update_placeholders.append(f":uid{i}")
             update_params[f"uid{i}"] = str(item_id)
-        await session.execute(
+        guard_result = await session.execute(
             text(
                 "UPDATE memory_items SET review_status = 'archived' "
                 "WHERE tenant_id = :tenant_id AND "
-                f"CAST(id AS TEXT) IN ({', '.join(update_placeholders)})"
+                "review_status NOT IN ('archived', 'rejected') AND "
+                f"CAST(id AS TEXT) IN ({', '.join(update_placeholders)}) "
+                "RETURNING CAST(id AS TEXT)"
             ),
             update_params,
         )
+        actually_archived: set[str] = {
+            row[0] for row in guard_result.all()
+        }
+
+        # Write events only for rows that were actually mutated.
+        for item_id in to_archive:
+            if str(item_id) not in actually_archived:
+                # Concurrent writer changed this row's status between our
+                # lock-time read and the guarded UPDATE. Skip — no event.
+                skipped.append(item_id)
+                continue
+            old_status, _principal_id = found[str(item_id)]
+            await _insert_item_event(
+                session,
+                item_id=item_id,
+                event_type="review_change",
+                field_name="review_status",
+                old_value=old_status,
+                new_value="archived",
+                actor_principal_id=actor,
+                on_behalf_of_principal_id=on_behalf_of,
+                reason=req.reason,
+            )
+
+        # Update to_archive to only include items that were actually archived.
+        to_archive = [iid for iid in to_archive if str(iid) in actually_archived]
 
     await session.commit()
     return BulkArchiveResponse(

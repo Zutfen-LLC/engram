@@ -24,9 +24,9 @@ The trust-state writer audit nevertheless found two remaining high-severity conc
 
 1. ~~Worker `AUTO_SUPERSEDE` is still an unlocked, unguarded writer of `valid_to` and `superseded_by`.~~ **Closed (#77).**
 2. ~~Manual invalidation can overwrite concurrent terminal or supersession state.~~ **Closed (#78).**
-3. Classification refinement can widen visibility relative to a concurrent PATCH and can lose a newer confidence value.
-4. Metadata PATCH writers do not serialize truthful old/new audit events.
-5. Bulk archive locks multiple rows without an explicit canonical order.
+3. ~~Classification refinement can widen visibility relative to a concurrent PATCH and can lose a newer confidence value.~~ **Closed (#79).**
+4. ~~Metadata PATCH writers do not serialize truthful old/new audit events.~~ **Closed (#79).**
+5. ~~Bulk archive locks multiple rows without an explicit canonical order.~~ **Closed (#79).**
 
 The next engineering work is to close these writers, then run the consolidated trust gate. Real Hermes lifecycle capture, live embeddings, quality evals, and OSS readiness follow in that order.
 
@@ -81,9 +81,9 @@ Proof labels are cumulative only when explicitly listed. `CI` means the test is 
 | Worker DEDUP vs. review/verification | #75 | 22 focused PostgreSQL cases plus full Compose CI | Closed in CI |
 | Worker AUTO_SUPERSEDE | #77 | canonical pair-lock, authority/human-governance/eligibility revalidation, active-profile revalidation, guarded old-row transition, namespaced provenance, 32 focused PostgreSQL cases | Implemented, Postgres-proven; CI-pending | **Implemented** |
 | Manual invalidation | #78 (this PR) | guarded UPDATE...RETURNING, FOR UPDATE row lock, under-lock revalidation (valid_to/superseded_by), event-after-mutation, 12 focused PostgreSQL cases (ordinary, 404, double-invalidate 409, superseded-first 409, verified-then-invalidate, concurrent-first-wins, cross-tenant 404, deterministic blocker-graph overlap x3, rollback atomicity) | Implemented, Postgres-proven; CI-pending | **Implemented** |
-| Classification refinement vs. PATCH | — | functional/attribution tests only | **Open medium** |
-| Concurrent metadata PATCH | — | no expected-state or locking proof | **Open medium** |
-| Bulk archive lock order | — | locks rows, but query lacks canonical ordering | **Open medium** |
+| Classification refinement vs. PATCH | #79 (this PR) | FOR UPDATE row lock on both PATCH route and refine worker, guarded UPDATE...RETURNING with old-value recheck, event-after-mutation, stale-snapshot revalidation against locked row, 9 focused PostgreSQL cases | Implemented, Postgres-proven; CI-pending | **Implemented** |
+| Concurrent metadata PATCH | #79 (this PR) | same fix as above — PATCH route now uses for_update=True, guarded UPDATE with old-value recheck per field, event-after-mutation | Implemented, Postgres-proven; CI-pending | **Implemented** |
+| Bulk archive lock order | #79 (this PR) | canonical UUID ordering on FOR UPDATE fetch (ORDER BY id), guarded bulk UPDATE with RETURNING, event-after-mutation, concurrent-status-change skip | Implemented, Postgres-proven; CI-pending | **Implemented** |
 
 ## 5. Required next execution slices
 
@@ -137,10 +137,26 @@ Implement as separate logical PRs:
    - Preserve the invariant that automated classification may narrow but never widen current visibility.
    - Preserve monotonic confidence relative to committed state.
    - Emit audit old/new values from mutation-authoritative state.
+   - **Status:** Implemented and Postgres-proven (9 focused cases in
+     `tests/test_metadata_patch_concurrency.py`). Both the PATCH route
+     (`update_item_metadata`) and the classification refine worker
+     (`handle_classification_refine`) now use FOR UPDATE row locks and
+     guarded UPDATE...RETURNING with old-value rechecks. The refine worker
+     runs LLM classification unlocked (expensive), then locks the row and
+     revalidates all proposed changes against the locked row's current
+     values — a concurrent PATCH that changed a field between detection and
+     mutation produces a zero-row RETURNING and the change is skipped. CI
+     pending.
 
 4. **Bulk archive canonical lock order**
    - Add deterministic UUID ordering to the lock query.
    - Prove overlapping bulk operations and interaction with pair-locking paths do not deadlock.
+   - **Status:** Implemented. The SELECT ... FOR UPDATE fetch now sorts
+     item IDs canonically (`ORDER BY id`) so concurrent bulk-archive
+     operations acquire row locks in the same order. The bulk UPDATE uses
+     a guarded WHERE clause (`review_status NOT IN ('archived',
+     'rejected')`) with RETURNING to identify exactly which rows were
+     mutated; events are written only for those rows. CI pending.
 
 **Gate:** repeated real-Postgres adversarial suites, no database skips, full CI green.
 
