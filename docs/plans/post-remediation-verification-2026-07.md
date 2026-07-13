@@ -20,10 +20,10 @@ No implementation should be called live-verified merely because an older deploym
 
 The original audit's known P0 defects and most implementation P1 defects are closed in code. The post-#51 trust-integrity sequence also added authenticated attribution, route scopes, governed review and verification, canonical feedback, stable authority, resource eligibility, and serialization of conflict resolution, promotion, conflict flagging, and DEDUP.
 
-The trust-state writer audit nevertheless found two remaining high-severity concurrency holes and three medium hardening items. Therefore the trust workflow is feature-complete but **not yet release-closed**:
+The trust-state writer audit nevertheless found two remaining high-severity concurrency holes and three medium hardening items. Worker `AUTO_SUPERSEDE` (finding 1) and manual invalidation (finding 2) are now closed. Therefore the trust workflow is feature-complete with two of the five residual writers closed, and **not yet release-closed**:
 
-1. Worker `AUTO_SUPERSEDE` is still an unlocked, unguarded writer of `valid_to` and `superseded_by`.
-2. Manual invalidation can overwrite concurrent terminal or supersession state.
+1. ~~Worker `AUTO_SUPERSEDE` is still an unlocked, unguarded writer of `valid_to` and `superseded_by`.~~ **Closed (#77).**
+2. ~~Manual invalidation can overwrite concurrent terminal or supersession state.~~ **Closed (#78).**
 3. Classification refinement can widen visibility relative to a concurrent PATCH and can lose a newer confidence value.
 4. Metadata PATCH writers do not serialize truthful old/new audit events.
 5. Bulk archive locks multiple rows without an explicit canonical order.
@@ -80,7 +80,7 @@ Proof labels are cumulative only when explicitly listed. `CI` means the test is 
 | Worker flagging vs. human governance | #73–#74 | canonical pair-lock and counterpart revalidation proofs | Closed in CI |
 | Worker DEDUP vs. review/verification | #75 | 22 focused PostgreSQL cases plus full Compose CI | Closed in CI |
 | Worker AUTO_SUPERSEDE | #77 | canonical pair-lock, authority/human-governance/eligibility revalidation, active-profile revalidation, guarded old-row transition, namespaced provenance, 32 focused PostgreSQL cases | Implemented, Postgres-proven; CI-pending | **Implemented** |
-| Manual invalidation | — | ordinary behavior only; no concurrent terminal-writer proof | **Open high** |
+| Manual invalidation | #78 (this PR) | guarded UPDATE...RETURNING, FOR UPDATE row lock, under-lock revalidation (valid_to/superseded_by), event-after-mutation, 12 focused PostgreSQL cases (ordinary, 404, double-invalidate 409, superseded-first 409, verified-then-invalidate, concurrent-first-wins, cross-tenant 404, deterministic blocker-graph overlap x3, rollback atomicity) | Implemented, Postgres-proven; CI-pending | **Implemented** |
 | Classification refinement vs. PATCH | — | functional/attribution tests only | **Open medium** |
 | Concurrent metadata PATCH | — | no expected-state or locking proof | **Open medium** |
 | Bulk archive lock order | — | locks rows, but query lacks canonical ordering | **Open medium** |
@@ -117,6 +117,20 @@ Implement as separate logical PRs:
    - Define precedence against rejection, archival, explicit/automatic supersession, and verification.
    - Use expected-state guarded update and event-after-success.
    - Prove each competing outcome and rollback.
+   - **Status:** Implemented and Postgres-proven (12 focused cases in
+     `tests/test_manual_invalidation_concurrency.py` covering ordinary
+     invalidation with truthful event, missing-item 404, double-invalidate 409
+     (idempotent re-invalidation), superseded-first 409 (committed-first
+     revalidation), rejected-then-invalidate (orthogonal lifecycle dimensions),
+     verified-then-invalidate (verification does not block invalidation),
+     concurrent-first-wins 409, cross-tenant 404, deterministic blocker-graph
+     overlap for invalidation-vs-supersede contention in both directions and
+     two-concurrent-invalidation contention, and rollback atomicity on event
+     INSERT failure). CI-proven status is pending current-head Compose CI.
+     The reverse-race boundary documented in the AUTO_SUPERSEDE test suite
+     (test_old_item_invalidated_first_worker_noop, line 744: "The reverse race
+     — worker invalidates before manual invalidation — remains an open
+     boundary") is now closed: both directions are serialized.
 
 3. **Metadata/classification writer serialization**
    - Share an item lock or guarded compare-and-set policy between PATCH and classification refinement.
