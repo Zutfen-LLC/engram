@@ -702,6 +702,7 @@ async def _worker_item(
     review_status: str = "active",
     valid_to: datetime | None = None,
     superseded_by: UUID | None = None,
+    authority: int = 10,
 ) -> UUID:
     item_id = uuid4()
     async with owner() as session:
@@ -712,7 +713,7 @@ async def _worker_item(
                 "memory_confidence,source_trust,importance,source_type,authority,sensitivity,"
                 "created_at,valid_to,superseded_by) VALUES "
                 "(:id,:tenant,:principal,:content,:hash,'fact','workspace',:review,.2,.9,.4,"
-                "'extraction',10,'normal',:created,:valid_to,:superseded_by)"
+                "'extraction',:authority,'normal',:created,:valid_to,:superseded_by)"
             ),
             {
                 "id": item_id,
@@ -721,6 +722,7 @@ async def _worker_item(
                 "content": content,
                 "hash": f"sha256:{uuid4().hex}",
                 "review": review_status,
+                "authority": authority,
                 "created": created_at or datetime.now(UTC),
                 "valid_to": valid_to,
                 "superseded_by": superseded_by,
@@ -766,12 +768,19 @@ async def test_every_conflict_branch_uses_conflict_actor(
     database, corpus, monkeypatch: pytest.MonkeyPatch, action: ConflictAction, author: str
 ):
     owner, app = database
+    # AUTO_SUPERSEDE requires the new item to qualify for automatic supersession
+    # (authority >= trusted_import=40) and to out-rank the old item. DEDUP and
+    # flagging actions do not depend on authority, so keep the default (inferred=
+    # 10) for those to preserve the original attribution fixture shape.
+    new_authority = 40 if action == ConflictAction.AUTO_SUPERSEDE else 10
+    old_authority = 10
     old_id = await _worker_item(
         owner,
         corpus,
         author=author,
         content=f"old {action} {uuid4()}",
         created_at=datetime.now(UTC) - timedelta(days=1),
+        authority=old_authority,
     )
     new_id = await _worker_item(
         owner,
@@ -779,6 +788,7 @@ async def test_every_conflict_branch_uses_conflict_actor(
         author=author,
         content=f"new {action} {uuid4()}",
         created_at=datetime.now(UTC),
+        authority=new_authority,
     )
     job = _job(corpus, "conflict.check", new_id)
 
@@ -847,11 +857,15 @@ async def test_every_conflict_branch_uses_conflict_actor(
     async for session in _app_session(app, corpus):
         await handle_conflict_check(session, job)
 
+    # P0-FIX-004D: AUTO_SUPERSEDE mutates the OLD row (sets superseded_by) and
+    # attaches its truthful event to the OLD item. Every other conflict branch
+    # mutates and records its event on the NEW/job item.
+    event_item_id = old_id if action == ConflictAction.AUTO_SUPERSEDE else new_id
     async with owner() as session:
         event = (
             await session.execute(
                 text("SELECT actor_principal_id,reason FROM item_events WHERE item_id=:id"),
-                {"id": new_id},
+                {"id": event_item_id},
             )
         ).mappings().one()
         actor = (
@@ -870,6 +884,12 @@ async def test_every_conflict_branch_uses_conflict_actor(
     assert provenance["action"] == action.value
     assert provenance["existing_item_id"] == str(old_id)
     assert provenance["provider"] == "test"
+    # P0-FIX-004D: AUTO_SUPERSEDE event describes the mutated old row
+    # unambiguously — it records the old/new item roles and the actual
+    # superseded_by value (the new item id).
+    if action == ConflictAction.AUTO_SUPERSEDE:
+        assert provenance["old_item_id"] == str(old_id)
+        assert provenance["new_item_id"] == str(new_id)
 
 
 @pytest.mark.asyncio

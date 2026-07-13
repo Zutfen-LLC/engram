@@ -37,6 +37,7 @@ from uuid import UUID
 from sqlalchemy import insert, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from engram.authority import authority_allows_supersession, qualifies_for_auto_supersession
 from engram.config import settings
 from engram.db import _DEFAULT_PRINCIPAL_NAME, apply_rls_context
 from engram.internal_actors import (
@@ -385,42 +386,20 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
         if not item_is_newer:
             await session.commit()
             return
-        # Supersede the OLD item with the new one. Idempotent.
-        existing = await _reload_item(session, result.existing_item_id)
-        if existing is None or existing.superseded_by == item.id:
-            await session.commit()
-            return
-        actor = await resolve_internal_system_actor(
+        # Serialize the supersession (P0-FIX-004D): detection is only a
+        # proposal. Lock both rows in canonical order, revalidate mutation
+        # authority from the locked rows (authority, human-governance
+        # precedence, current detector eligibility, creation direction), and
+        # perform a guarded UPDATE ... RETURNING on the OLD row before writing
+        # a truthful event — all in one transaction. The new item is never
+        # mutated by this branch.
+        await _apply_auto_supersede(
             session,
-            tenant_id=job.tenant_id,
-            internal_key=CONFLICT_AUTOMATION_INTERNAL_KEY,
-        )
-        await _insert_event(
-            session,
-            item_id=item.id,
-            event_type="conflict_detected",
-            field_name="superseded_by",
-            old_value=None,
-            new_value=str(result.existing_item_id),
-            actor_principal_id=actor,
-            reason=json.dumps(
-                {
-                    "action": action.value,
-                    "existing_item_id": str(result.existing_item_id),
-                    "reason": result.reason,
-                    "worker_operation": "conflict.check",
-                    "job_id": str(job.id),
-                    "item_author_principal_id": str(item.principal_id),
-                    "internal_actor_key": CONFLICT_AUTOMATION_INTERNAL_KEY,
-                    **result.provenance,
-                },
-                sort_keys=True,
-            ),
-        )
-        await session.execute(
-            update(MemoryItem)
-            .where(MemoryItem.id == result.existing_item_id)
-            .values(superseded_by=item.id, valid_to=_utcnow())
+            job=job,
+            job_item=item,
+            counterpart_id=result.existing_item_id,
+            result=result,
+            profile=profile,
         )
         await session.commit()
         return
@@ -973,6 +952,205 @@ async def _apply_dedup(
         new_value="rejected",
         actor_principal_id=actor,
         reason=json.dumps(provenance, sort_keys=True),
+    )
+
+
+# AUTO_SUPERSEDE-eligible action values (P0-FIX-004D). Only AUTO_SUPERSEDE and
+# REFINE (which resolves to AUTO_SUPERSEDE when authority qualifies) may drive
+# automatic supersession. Stored as string values so this constant does not
+# require importing the ``ConflictAction`` enum at import time.
+_AUTO_SUPERSEDE_ACTION_VALUES: frozenset[str] = frozenset({"auto_supersede"})
+
+
+async def _apply_auto_supersede(
+    session: AsyncSession,
+    *,
+    job: Job,
+    job_item: MemoryItem,
+    counterpart_id: UUID,
+    result: ConflictResult,
+    profile: EmbeddingProfile,
+) -> None:
+    """Serialize the AUTO_SUPERSEDE mutation: lock, revalidate, guarded write,
+    truthful event.
+
+    Detection snapshots (``job_item``, ``result``) are a *proposal*
+    (P0-FIX-004D). The locked rows are mutation authority. AUTO_SUPERSEDE
+    mutates only the OLD/counterpart row:
+
+        old.superseded_by = new.id
+        old.valid_to = one captured UTC timestamp
+
+    The new/job item remains live and is never mutated by this branch.
+
+    A committed human governance decision (human verification or a human
+    review-state decision) on EITHER row outranks later automated supersession:
+    the worker skips all mutation and writes no event.
+
+    Under the canonical pair locks the worker revalidates the full detector
+    database-eligibility predicate — not just review-state/validity, but also
+    kind match, exact workspace scope (both-null semantics), and ready non-null
+    embeddings for the job's validated profile on both items — plus the current
+    authority hierarchy and the canonical high-confidence classifier threshold.
+    Authority is rechecked from the locked rows, never from
+    ``result.provenance`` (which captures the pre-lock detection snapshot).
+    """
+    from engram.conflicts import HIGH_CLASSIFIER_CONFIDENCE
+
+    tenant_id = str(job.tenant_id)
+    locked = await _lock_conflict_pair(
+        session,
+        job_item_id=job_item.id,
+        counterpart_id=counterpart_id,
+        tenant_id=tenant_id,
+    )
+    if locked is None:
+        return
+    locked_job_item, locked_counterpart = locked
+
+    # ---- Under-lock revalidation: the NEWER/job item ------------------------
+    # The new item is the superseder; it must remain live, unsuperseded, not
+    # rejected/archived, and otherwise eligible for the detected conflict
+    # path. The new item is NOT mutated, but if it has since left the eligible
+    # set the supersession is no longer meaningful.
+    if locked_job_item.valid_to is not None or locked_job_item.superseded_by is not None:
+        return
+    if locked_job_item.review_status in {"rejected", "archived"}:
+        return
+    # The job item must remain the newer side per the creation-time + UUID
+    # tiebreak rule, evaluated against the locked counterpart. A stale
+    # pre-lock direction check is not mutation authority.
+    if locked_job_item.created_at > locked_counterpart.created_at:
+        still_newer = True
+    elif locked_job_item.created_at == locked_counterpart.created_at:
+        still_newer = str(locked_job_item.id) > str(locked_counterpart.id)
+    else:
+        still_newer = False
+    if not still_newer:
+        return
+    # Human-governance precedence on the NEW item: a committed human
+    # verification or human review-state decision protects it from automated
+    # supersession authority. Evaluated while the item lock is held.
+    if await _has_human_governance(session, item=locked_job_item, tenant_id=tenant_id):
+        return
+    # The proposed result must still be AUTO_SUPERSEDE and meet the canonical
+    # high-confidence classifier threshold. No LLM re-classification under lock.
+    if result.action.value not in _AUTO_SUPERSEDE_ACTION_VALUES:
+        return
+    if result.classifier_confidence < HIGH_CLASSIFIER_CONFIDENCE:
+        return
+    # Authority revalidation from the locked rows (not result.provenance). The
+    # new item's current authority must still allow supersession of the old
+    # item, and must still qualify for automatic supersession.
+    new_authority = int(locked_job_item.authority)
+    old_authority = int(locked_counterpart.authority)
+    if not authority_allows_supersession(new_authority=new_authority, old_authority=old_authority):
+        return
+    if not qualifies_for_auto_supersession(new_authority):
+        return
+
+    # ---- Under-lock revalidation: the OLD/counterpart item ----------------
+    # The old item is the mutation target. The locked counterpart must equal
+    # the detected id, belong to the job tenant (already checked by the pair
+    # lock), be distinct (already checked), and remain in the detector's
+    # active-live eligibility predicate. Existing terminal, invalidated,
+    # archived, disputed, rejected, or superseded state wins; skip without
+    # replacing timestamps or links.
+    if str(locked_counterpart.id) != str(result.existing_item_id):
+        return
+    if locked_counterpart.review_status != "active":
+        return
+    if locked_counterpart.valid_to is not None or locked_counterpart.superseded_by is not None:
+        return
+    # Human-governance precedence on the OLD item: a committed human
+    # verification or human review-state decision protects it from being
+    # auto-superseded.
+    if await _has_human_governance(session, item=locked_counterpart, tenant_id=tenant_id):
+        return
+
+    # ---- Detector eligibility: kind, workspace scope, embeddings ----------
+    # ``detect_conflicts`` selects the counterpart via the same-kind, same-
+    # workspace-scope, active, live neighbour query, and requires both items to
+    # carry a ready non-null embedding for the job's validated profile. These
+    # facts can change after detection, so they are revalidated from the locked
+    # rows. This is database eligibility revalidation, not a full redetection:
+    # no semantic similarity or classifier is rerun. A mismatch is a
+    # mutation-free, event-free skip — the worker must not supersede an old
+    # item the detector would no longer return.
+    if locked_job_item.kind != locked_counterpart.kind:
+        return
+    if not _workspace_scope_matches(locked_job_item, locked_counterpart):
+        return
+    if not await _lock_and_verify_pair_embeddings(
+        session,
+        job_item_id=locked_job_item.id,
+        counterpart_id=locked_counterpart.id,
+        profile=profile,
+        tenant_id=tenant_id,
+    ):
+        return
+
+    # ---- Guarded supersession of the OLD row -------------------------------
+    # The guard re-checks every mutation-authority fact so a concurrent change
+    # between revalidation and the write is still caught. At minimum the guard
+    # repeats tenant, id, active review state, valid_to IS NULL, and
+    # superseded_by IS NULL. A zero-row result is a truthful no-op and emits no
+    # event.
+    new_id = locked_job_item.id
+    supersede_at = _utcnow()
+    update_stmt = (
+        update(MemoryItem)
+        .where(
+            MemoryItem.id == locked_counterpart.id,
+            MemoryItem.tenant_id == tenant_id,
+            MemoryItem.valid_to.is_(None),
+            MemoryItem.superseded_by.is_(None),
+            MemoryItem.review_status == "active",
+        )
+        .values(superseded_by=new_id, valid_to=supersede_at)
+        .returning(MemoryItem.id)
+    )
+    guard_result = await session.execute(
+        update_stmt, execution_options={"synchronize_session": False}
+    )
+    if guard_result.scalar_one_or_none() is None:
+        # The transition did not occur — no event is written. The transaction
+        # commits as a no-op; a concurrent writer won the mutation authority.
+        return
+
+    # ---- Truthful event after mutation confirmation ------------------------
+    # Only after RETURNING confirms the transition, insert one automation event
+    # in the same transaction. The event is attached to the MUTATED OLD item
+    # (the row whose superseded_by actually changed), records the actual new
+    # superseded_by value (the new item id), and uses the conflict_automation
+    # internal actor. State/event rollback is atomic: if the event INSERT
+    # fails, the transaction rolls back both valid_to and superseded_by.
+    actor = await resolve_internal_system_actor(
+        session,
+        tenant_id=tenant_id,
+        internal_key=CONFLICT_AUTOMATION_INTERNAL_KEY,
+    )
+    payload = {
+        "action": result.action.value,
+        "old_item_id": str(locked_counterpart.id),
+        "new_item_id": str(new_id),
+        "existing_item_id": str(result.existing_item_id),
+        "reason": result.reason,
+        "worker_operation": "conflict.check",
+        "job_id": str(job.id),
+        "item_author_principal_id": str(locked_job_item.principal_id),
+        "internal_actor_key": CONFLICT_AUTOMATION_INTERNAL_KEY,
+        **result.provenance,
+    }
+    await _insert_event(
+        session,
+        item_id=locked_counterpart.id,
+        event_type="conflict_detected",
+        field_name="superseded_by",
+        old_value=None,
+        new_value=str(new_id),
+        actor_principal_id=actor,
+        reason=json.dumps(payload, sort_keys=True),
     )
 
 

@@ -79,7 +79,7 @@ Proof labels are cumulative only when explicitly listed. `CI` means the test is 
 | Promotion vs. review and feedback | #71–#72 | real-Postgres row-lock concurrency proofs | Closed in CI |
 | Worker flagging vs. human governance | #73–#74 | canonical pair-lock and counterpart revalidation proofs | Closed in CI |
 | Worker DEDUP vs. review/verification | #75 | 22 focused PostgreSQL cases plus full Compose CI | Closed in CI |
-| Worker AUTO_SUPERSEDE | — | no serialization/atomicity proof | **Open high** |
+| Worker AUTO_SUPERSEDE | #77 | canonical pair-lock, authority/human-governance/eligibility revalidation, guarded old-row transition, truthful event, 28 focused PostgreSQL cases | Implemented, Postgres-proven; CI-pending | **Implemented** |
 | Manual invalidation | — | ordinary behavior only; no concurrent terminal-writer proof | **Open high** |
 | Classification refinement vs. PATCH | — | functional/attribution tests only | **Open medium** |
 | Concurrent metadata PATCH | — | no expected-state or locking proof | **Open medium** |
@@ -96,6 +96,15 @@ Implement as separate logical PRs:
    - Revalidate both rows, authority, human governance, detector eligibility, and creation direction.
    - Guarded transition before truthful events.
    - Prove worker/human, reciprocal, rollback, and stale-eligibility outcomes on PostgreSQL.
+   - **Status:** Implemented and Postgres-proven (28 focused cases in
+     `tests/test_worker_auto_supersede_concurrency.py` covering normal
+     supersession, idempotency, manual-supersede/invalidation/review/verification
+     precedence, human governance on both rows, authority/kind/workspace/embedding
+     eligibility revalidation, reciprocal and competing-new-item stress,
+     worker-wins-before-human-supersession ordering, rollback atomicity, retry,
+     cross-tenant RLS, and truthful event target/value attribution). CI-proven
+     status is pending current-head Compose CI. Manual invalidation remains
+     open high (Gate A2) — see the remaining dependency in `docs/design.md`.
 
 2. **Manual invalidation serialization**
    - Lock the item.
