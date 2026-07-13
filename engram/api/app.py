@@ -13,7 +13,28 @@ from engram.api.errors import data_error_handler, integrity_error_handler
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    # Startup: could warm connection pool, check DB readiness
+    # Startup: validate embedding config if enabled.
+    from engram.config import settings
+
+    if settings.embedding_provider != "none":
+        if not settings.openai_api_key:
+            import logging
+
+            logging.getLogger("engram").warning(
+                "ENGRAM_EMBEDDING_PROVIDER is '%s' but ENGRAM_OPENAI_API_KEY is not set. "
+                "Semantic search will fail silently. Run 'engram setup-embeddings' to diagnose.",
+                settings.embedding_provider,
+            )
+        elif not settings.openai_base_url:
+            import logging
+
+            logging.getLogger("engram").warning(
+                "ENGRAM_EMBEDDING_PROVIDER is '%s' but ENGRAM_OPENAI_BASE_URL is not set. "
+                "The OpenAI SDK will default to api.openai.com — if you are using "
+                "OpenRouter, DeepInfra, or another provider, semantic search will fail with 401. "
+                "Run 'engram setup-embeddings' to diagnose.",
+                settings.embedding_provider,
+            )
     yield
     # Shutdown: clean up resources
 

@@ -229,6 +229,20 @@ def main() -> None:
         help="Identifier recorded on claimed jobs (default: <hostname>:<pid>).",
     )
 
+    # --- setup-embeddings ---------------------------------------------------
+    setup_parser = sub.add_parser(
+        "setup-embeddings",
+        help="Validate the embedding provider configuration by generating a "
+        "test embedding. Exits 0 on success, 1 on failure with a diagnostic "
+        "message. Run this after configuring ENGRAM_EMBEDDING_PROVIDER, "
+        "ENGRAM_OPENAI_API_KEY, and ENGRAM_OPENAI_BASE_URL.",
+    )
+    setup_parser.add_argument(
+        "--text",
+        default="The quick brown fox jumps over the lazy dog.",
+        help="Text to embed for the validation test (default: a pangram).",
+    )
+
     args = parser.parse_args()
     if args.command == "serve":
         import uvicorn
@@ -331,6 +345,8 @@ def main() -> None:
                 )
             )
         )
+    elif args.command == "setup-embeddings":
+        raise SystemExit(asyncio.run(_run_setup_embeddings(args.text)))
     else:
         parser.print_help()
 
@@ -964,6 +980,95 @@ async def _run_worker(
         job_types=job_types,
         max_jobs=max_jobs,
     )
+
+
+async def _run_setup_embeddings(test_text: str) -> int:
+    """Validate the embedding provider configuration.
+
+    Checks that:
+    1. The provider is not 'none' (embeddings enabled).
+    2. An API key is configured.
+    3. A base URL is configured (the most common misconfiguration — without
+       it, the OpenAI SDK defaults to api.openai.com).
+    4. The provider accepts the test text and returns a vector of the
+       expected dimension.
+    """
+    from engram.config import settings
+
+    print("Engram embedding configuration check")
+    print("=" * 50)
+
+    # 1. Provider
+    provider = settings.embedding_provider
+    print(f"  provider: {provider}")
+    if provider == "none":
+        print("\n  FAIL: ENGRAM_EMBEDDING_PROVIDER is 'none'.")
+        print("  Set it to 'openai' to enable embeddings.")
+        print("  Example .env:")
+        print("    ENGRAM_EMBEDDING_PROVIDER=openai")
+        return 1
+
+    # 2. API key
+    api_key = settings.openai_api_key
+    if not api_key:
+        print("\n  FAIL: No API key configured.")
+        print("  Set ENGRAM_OPENAI_API_KEY in your .env.")
+        return 1
+    key_preview = api_key[:8] + "..." + api_key[-4:] if len(api_key) > 12 else "***"
+    print(f"  api_key:  {key_preview}")
+
+    # 3. Base URL
+    base_url = settings.openai_base_url
+    if not base_url:
+        print("\n  WARNING: No base URL configured.")
+        print("  Without ENGRAM_OPENAI_BASE_URL, the OpenAI SDK defaults to")
+        print("  https://api.openai.com. This will fail with 401 if you are")
+        print("  using OpenRouter, DeepInfra, or another OpenAI-compatible provider.")
+        print("  Set ENGRAM_OPENAI_BASE_URL in your .env.")
+        print("  Example:")
+        print("    ENGRAM_OPENAI_BASE_URL=https://openrouter.ai/api/v1")
+        print("    ENGRAM_OPENAI_BASE_URL=https://api.deepinfra.com/v1/openai")
+    else:
+        print(f"  base_url: {base_url}")
+
+    # 4. Dimension
+    print(f"  dimensions: {settings.embedding_dim}")
+
+    # 5. Test embedding generation
+    print(f"\n  Generating test embedding for: \"{test_text[:60]}...\"")
+    try:
+        from engram.embeddings import generate_embedding
+
+        vec = await generate_embedding(test_text)
+    except Exception as exc:
+        print("\n  FAIL: Embedding generation raised an error:")
+        print(f"    {type(exc).__name__}: {exc}")
+        if "401" in str(exc) or "AuthenticationError" in type(exc).__name__:
+            print("\n  This is an authentication error. Check that:")
+            print("  - The API key is valid for the provider")
+            print("  - The base_url points to the correct provider endpoint")
+            print("  - You are not sending an OpenRouter key to OpenAI (or vice versa)")
+        elif "connection" in str(exc).lower() or "timeout" in str(exc).lower():
+            print("\n  This is a connection error. Check that:")
+            print("  - The base_url is reachable from this host")
+            print("  - The model name is correct for the provider")
+        return 1
+
+    if vec is None:
+        print("\n  FAIL: generate_embedding() returned None.")
+        print("  This happens when the provider is 'none'. Check your config.")
+        return 1
+
+    if len(vec) != settings.embedding_dim:
+        print("\n  FAIL: Dimension mismatch.")
+        print(f"  Expected {settings.embedding_dim}, got {len(vec)}.")
+        print("  Update ENGRAM_EMBEDDING_DIM or use a different model.")
+        return 1
+
+    print(f"\n  SUCCESS: Generated {len(vec)}-dimensional embedding.")
+    print(f"  First 5 values: {vec[:5]}")
+    print("\n  Embedding configuration is valid.")
+    return 0
 
 
 if __name__ == "__main__":
