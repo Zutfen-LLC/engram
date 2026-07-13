@@ -31,6 +31,7 @@ def create_app() -> FastAPI:
 
     from engram.api.routes import (
         admin,
+        agents,
         classify,
         diary,
         export,
@@ -43,6 +44,7 @@ def create_app() -> FastAPI:
 
     app.include_router(health.router, tags=["health"])
     app.include_router(memory.router, prefix="/v1", tags=["memory"])
+    app.include_router(agents.router, prefix="/v1", tags=["agents"])
     app.include_router(classify.router, prefix="/v1", tags=["classification"])
     app.include_router(review.router, prefix="/v1", tags=["review"])
     app.include_router(kg.router, prefix="/v1", tags=["knowledge-graph"])
