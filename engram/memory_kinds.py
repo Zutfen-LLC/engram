@@ -195,6 +195,22 @@ class _CacheEntry:
         self.fetched_at = fetched_at
 
 
+@dataclass(frozen=True)
+class KindSnapshot:
+    """Session-independent memory-kind snapshot safe for the process cache."""
+
+    name: str
+    display_name: str
+    description: str | None
+    is_builtin: bool
+    enabled: bool
+    singleton: bool
+    stays_in_recall_when_disputed: bool
+    requires_review: bool
+    default_importance: float | None
+    sort_order: int
+
+
 _kinds_cache: OrderedDict[str, _CacheEntry] = OrderedDict()
 _cache_lock: asyncio.Lock = asyncio.Lock()
 
@@ -206,7 +222,7 @@ def _cache_expired(fetched_at: float) -> bool:
     return (time.monotonic() - fetched_at) > ttl
 
 
-def _cache_get(tenant_id: UUID | str) -> list[MemoryKind] | None:
+def _cache_get(tenant_id: UUID | str) -> list[KindSnapshot] | None:
     key = str(tenant_id)
     entry = _kinds_cache.get(key)
     if entry is None:
@@ -218,7 +234,7 @@ def _cache_get(tenant_id: UUID | str) -> list[MemoryKind] | None:
     return entry.value  # type: ignore[return-value]
 
 
-def _cache_put(tenant_id: UUID | str, value: list[MemoryKind]) -> None:
+def _cache_put(tenant_id: UUID | str, value: list[KindSnapshot]) -> None:
     key = str(tenant_id)
     max_tenants = settings.vocab_cache_max_tenants
     _kinds_cache[key] = _CacheEntry(value, time.monotonic())
@@ -253,7 +269,7 @@ async def _load_enabled_kinds(session: AsyncSession, tenant_id: UUID | str) -> l
 async def get_enabled_memory_kinds(
     session: AsyncSession,
     tenant_id: UUID | str,
-) -> list[MemoryKind]:
+) -> list[KindSnapshot]:
     """Return the tenant's enabled kinds (cached, TTL matches vocab cache).
 
     Empty only means the tenant genuinely has zero enabled kinds (e.g. every
@@ -261,6 +277,9 @@ async def get_enabled_memory_kinds(
     Callers that need a non-empty taxonomy should fall back to
     :data:`DEFAULT_KIND_TAXONOMY` themselves; this function never injects the
     fallback so callers can distinguish "empty" from "unknown".
+
+    Returns session-independent :class:`KindSnapshot` objects, safe to cache
+    across requests.
     """
     cached = _cache_get(tenant_id)
     if cached is not None:
@@ -270,16 +289,31 @@ async def get_enabled_memory_kinds(
         if cached is not None:
             return cached
         kinds = await _load_enabled_kinds(session, tenant_id)
-        _cache_put(tenant_id, kinds)
-        return kinds
+        snapshots = [
+            KindSnapshot(
+                name=k.name,
+                display_name=k.display_name,
+                description=k.description,
+                is_builtin=k.is_builtin,
+                enabled=k.enabled,
+                singleton=k.singleton,
+                stays_in_recall_when_disputed=k.stays_in_recall_when_disputed,
+                requires_review=k.requires_review,
+                default_importance=k.default_importance,
+                sort_order=k.sort_order,
+            )
+            for k in kinds
+        ]
+        _cache_put(tenant_id, snapshots)
+        return snapshots
 
 
 async def require_enabled_memory_kind(
     session: AsyncSession,
     tenant_id: UUID | str,
     kind: str,
-) -> MemoryKind:
-    """Return the tenant's enabled :class:`MemoryKind` row for ``kind``.
+) -> KindSnapshot:
+    """Return the tenant's enabled :class:`KindSnapshot` for ``kind``.
 
     Raises :class:`UnknownMemoryKindError` if the kind is not registered or is
     disabled for this tenant. Callers (routes) map this to a 422 — an unknown
@@ -311,6 +345,7 @@ __all__ = [
     "DEFAULT_KIND_TAXONOMY",
     "NAME_PATTERN",
     "BuiltinKindSpec",
+    "KindSnapshot",
     "UnknownMemoryKindError",
     "get_disputed_stay_kind_names",
     "get_enabled_memory_kinds",
