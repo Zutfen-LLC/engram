@@ -160,7 +160,7 @@ async def create_agent(
             "da": DIGEST_ALGORITHM,
             "sc": scopes_value,
             "lbl": key_label,
-            "ts": datetime.now(UTC).isoformat(),
+            "ts": datetime.now(UTC),
         },
     )
     await session.commit()
@@ -245,6 +245,6 @@ async def delete_agent(
             "UPDATE api_keys SET revoked_at = :ts "
             "WHERE principal_id = :pid AND revoked_at IS NULL"
         ),
-        {"ts": now.isoformat(), "pid": str(agent_id)},
+        {"ts": now, "pid": str(agent_id)},
     )
     await session.commit()
