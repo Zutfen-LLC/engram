@@ -352,17 +352,16 @@ async def proof(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[dict[str, Any]
             assert job_obj is not None
             await handle_conflict_check(session, job_obj)
 
-    async def run_conflict_check_via_process(item_id: uuid.UUID) -> None:
-        """Enqueue + process a conflict.check job through the production worker loop.
+    async def run_conflict_check_via_process(
+        item_id: uuid.UUID,
+    ) -> tuple[uuid.UUID, bool]:
+        """Enqueue and process exactly this job through the production worker loop.
 
-        Returns ``(job_id, processed)`` where ``processed`` is True when the
-        exact enqueued job was claimed and processed through the loop. Because
-        ``process_one_job`` claims globally across tenants under the owner role,
-        stale conflict.check jobs from other test modules may be claimed first;
-        this helper loops until the exact enqueued job is no longer
-        pending/running (draining those stale jobs naturally without deleting
-        unrelated tenants' jobs), then asserts the exact job reached
-        ``succeeded``. The caller asserts the memory mutation separately.
+        ``claim_next_job`` orders due jobs by ``run_after``, then ``priority``,
+        then ``created_at``. Give this fixture job the earliest timestamp
+        representable by Python and the minimum PostgreSQL INTEGER priority so
+        one ``process_one_job`` call deterministically claims it without
+        deleting, claiming, or executing unrelated tenants' queued work.
         """
         async with owner_factory() as session:
             job_id = await enqueue_job(
@@ -370,32 +369,18 @@ async def proof(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[dict[str, Any]
                 tenant_id=str(tenant),
                 job_type="conflict.check",
                 payload={"memory_item_id": str(item_id)},
+                run_after=datetime.min.replace(tzinfo=UTC),
+                priority=-(2**31),
             )
-        processed_any = False
-        for _ in range(50):
-            did = await process_one_job(
-                worker_id="test",
-                session_factory=owner_factory,
-                app_session_factory=app_factory,
-                job_types=["conflict.check"],
-            )
-            if did:
-                processed_any = True
-            # Stop once the exact enqueued job is no longer pending/running.
-            async with owner_factory() as session:
-                status = (
-                    await session.execute(
-                        text("SELECT status FROM jobs WHERE id=:id"),
-                        {"id": job_id},
-                    )
-                ).scalar_one()
-            if status not in ("pending", "running"):
-                break
-        else:
-            raise AssertionError(
-                f"enqueued job {job_id} was not processed within the loop"
-            )
-        # The exact job must have reached 'succeeded'.
+        processed = await process_one_job(
+            worker_id="test",
+            session_factory=owner_factory,
+            app_session_factory=app_factory,
+            job_types=["conflict.check"],
+        )
+        assert processed is True, "process_one_job did not claim/process the fixture job"
+
+        # The single claim must have selected this exact job and completed it.
         async with owner_factory() as session:
             final_status = (
                 await session.execute(
@@ -404,7 +389,7 @@ async def proof(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[dict[str, Any]
                 )
             ).scalar_one()
         assert final_status == "succeeded", f"expected succeeded, got {final_status}"
-        return job_id, processed_any
+        return job_id, processed
 
     import engram.db as db_module
 
