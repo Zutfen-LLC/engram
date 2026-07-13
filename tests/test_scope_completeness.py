@@ -37,6 +37,7 @@ from engram.auth import (
 EXPECTED_MATRIX: dict[tuple[str, str], dict] = {
     ("GET", "/health"): {"exempt": True},
     ("GET", "/ready"): {"exempt": True},
+    ("GET", "/whoami"): {"all_of": ("read",)},
     ("POST", "/v1/remember"): {"all_of": ("write",)},
     ("POST", "/v1/recall"): {"all_of": ("read",)},
     ("POST", "/v1/search"): {"all_of": ("read",)},

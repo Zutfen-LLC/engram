@@ -9,7 +9,13 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from engram.auth import HEALTH_EXEMPT_SCOPE, READY_EXEMPT_SCOPE
+from engram.auth import (
+    HEALTH_EXEMPT_SCOPE,
+    READ_SCOPE,
+    READY_EXEMPT_SCOPE,
+    Principal,
+    get_current_principal,
+)
 from engram.db import get_session
 
 router = APIRouter()
@@ -103,3 +109,19 @@ async def readiness(
             status_code=503,
             content={"status": "not_ready", "database": str(e)},
         )
+
+
+@router.get("/whoami", response_model=None, dependencies=[Depends(READ_SCOPE)])
+async def whoami(
+    principal: Principal = Depends(get_current_principal),  # noqa: B008
+) -> dict[str, str | list[str]]:
+    """Return the caller's resolved principal and tenant.
+
+    Lets API clients discover their own tenant_id from their API key,
+    without needing to pass it as a query parameter or know it out of band.
+    """
+    return {
+        "principal_id": principal.principal_id,
+        "tenant_id": principal.tenant_id,
+        "scopes": list(principal.scopes),
+    }

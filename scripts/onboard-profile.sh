@@ -93,32 +93,23 @@ echo ""
 
 echo "[1/4] Setting up principal '$PRINCIPAL_NAME'..."
 
-# Auto-discover tenant_id if not provided
+# Auto-discover tenant_id from the admin key via /whoami
 if [[ -z "$TENANT_ID" ]]; then
-    # The /v1/ready endpoint returns the caller's principal info including tenant_id
-    TENANT_ID=$(curl -sf "$ADMIN_URL/ready" \
+    TENANT_ID=$(curl -sf "$ADMIN_URL/whoami" \
         -H "Authorization: Bearer $ADMIN_KEY" \
         | python3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
-    print(d.get('tenant_id', d.get('principal', {}).get('tenant_id', '')))
+    print(d.get('tenant_id', ''))
 except Exception:
     pass
 " 2>/dev/null || echo "")
 
-    # Fallback: query principals (needs tenant_id as query param — try empty string)
     if [[ -z "$TENANT_ID" ]]; then
-        # Try the admin key's own resolved principal via /v1/whoami or similar
-        TENANT_ID=$(curl -sf "$ADMIN_URL/v1/admin/principals?tenant_id=00000000-0000-0000-0000-000000000000" \
-            -H "Authorization: Bearer $ADMIN_KEY" 2>/dev/null \
-            | python3 -c "import sys; pass" 2>/dev/null || echo "")
-    fi
-
-    # Last resort: read from the database via the service CLI
-    if [[ -z "$TENANT_ID" ]]; then
-        echo "  Could not auto-discover tenant_id from API."
-        echo "  Please provide --tenant-id (find it with: ssh engram01 'sudo docker exec engram-db psql -U engram -d engram -t -c \"SELECT id FROM tenants LIMIT 1;\"')"
+        echo "  ERROR: Could not auto-discover tenant_id from /whoami."
+        echo "  Check that the admin URL ($ADMIN_URL) is reachable and the key has read scope."
+        echo "  Or provide --tenant-id explicitly."
         exit 1
     fi
 fi
