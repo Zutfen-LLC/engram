@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal, NoReturn
+from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -160,9 +160,56 @@ async def review_queue(
     kind: str | None = None,
     workspace: str | None = None,
     limit: int = 50,
-) -> NoReturn:
-    """Items awaiting review (review_status='proposed')."""
-    raise NotImplementedError
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> list[dict[str, Any]]:
+    """Items awaiting review (review_status='proposed').
+
+    Returns proposed items newest-first, optionally filtered by kind or
+    workspace. Each entry includes the item id, content preview, kind,
+    source trust, memory confidence, and created timestamp.
+    """
+    tenant_id = await _resolve_tenant_id(session)
+    principal_id, _ = await _resolve_principal(session, tenant_id)
+
+    stmt = (
+        select(
+            MemoryItem.id,
+            MemoryItem.content,
+            MemoryItem.kind,
+            MemoryItem.wing,
+            MemoryItem.room,
+            MemoryItem.source_trust,
+            MemoryItem.memory_confidence,
+            MemoryItem.created_at,
+        )
+        .where(
+            MemoryItem.tenant_id == tenant_id,
+            MemoryItem.review_status == "proposed",
+            MemoryItem.valid_to.is_(None),
+            MemoryItem.superseded_by.is_(None),
+        )
+        .order_by(MemoryItem.created_at.desc())
+        .limit(min(limit, 200))
+    )
+    if kind is not None:
+        stmt = stmt.where(MemoryItem.kind == kind)
+    if workspace is not None:
+        stmt = stmt.where(MemoryItem.workspace_id == UUID(workspace))
+
+    rows = (await session.execute(stmt)).all()
+    return [
+        {
+            "id": str(row.id),
+            "content": row.content[:200] if row.content else "",
+            "kind": row.kind,
+            "wing": row.wing,
+            "room": row.room,
+            "source_trust": row.source_trust,
+            "memory_confidence": row.memory_confidence,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        }
+        for row in rows
+    ]
 
 
 @router.get(

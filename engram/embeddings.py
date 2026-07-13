@@ -559,8 +559,9 @@ async def _stream_missing(
         last_key = (page[-1].created_at, page[-1].id)
 
         new_rows = []
-        for row in page:
-            new_rows.append(await create_embedding_placeholder(session, row.id, row.tenant_id))
+        with session.no_autoflush:
+            for row in page:
+                new_rows.append(await create_embedding_placeholder(session, row.id, row.tenant_id))
         try:
             await session.flush()  # INSERT the batch; populates ids
         except IntegrityError:
