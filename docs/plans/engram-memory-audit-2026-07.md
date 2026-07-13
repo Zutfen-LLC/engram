@@ -1,5 +1,10 @@
 # Engram Memory Audit — Classification, Storage, Recall, and the Path to Default
 
+> **Historical baseline:** This audit drove remediation through PR #75, but its
+> findings table and prioritized roadmap are no longer current execution truth.
+> Use `docs/plans/post-remediation-verification-2026-07.md` for closure status,
+> proof levels, residual trust-state writers, and the active release gates.
+
 **Date:** 2026-07-08
 **Scope:** Full audit of the implemented service (`engram/`, `migrations/`, auth, adapters at surface level) with special focus on memory classification, storage, and recall. Includes a prioritized improvement plan for the self-hosted product and a long-term plan for the hosted service.
 **Method:** Line-level read of the core service (schema, write path, classification, conflicts, recall, search, promotion, auth, RLS plumbing), cross-checked against `docs/design.md` v2.3, `README.md`, and the MVP backlog. Findings cite `file:line` where they anchor to code. The Hermes hooks adapter and importers were reviewed at surface level only.

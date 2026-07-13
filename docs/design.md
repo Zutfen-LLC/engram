@@ -1364,6 +1364,9 @@ Includes:
 * pre-compression memory capture
 * sync-turn ingestion
 * coding-agent context patterns
+* guided first-agent onboarding, targeting Hermes first
+* native `prepare_memory_write` detection with compatibility shim fallback
+* least-privilege API-key configuration and verified install/rollback
 
 ### Phase 3 — Open-source readiness
 
@@ -1392,11 +1395,19 @@ Goal: managed Engram for users and teams that do not want to self-host.
 Includes:
 
 * hosted tenant provisioning
-* auth and billing
+* customer identity, auth, and billing
+* tenant/workspace membership and agent-group administration
+* agent principal provisioning and least-privilege API-key lifecycle
+* memory visibility and permission policy management
 * managed backups
 * hosted admin UI
 * usage metering
 * organizational controls
+
+The hosted admin UI is deliberately post-core. Self-hosted operators can use the
+CLI and governed admin API directly; the managed-service portal turns those same
+audited APIs into a non-developer onboarding and administration experience. The
+portal must not introduce portal-only authorization or key-management logic.
 
 ---
 
