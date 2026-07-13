@@ -464,11 +464,10 @@ def _build_prompt(
 
 
 async def _call_openai_classification(prompt: str) -> dict[str, Any]:
-    client = (
-        AsyncOpenAI()
-        if settings.openai_api_key is None
-        else AsyncOpenAI(api_key=settings.openai_api_key)
-    )
+    client_kwargs: dict[str, Any] = {"api_key": settings.openai_api_key}
+    if settings.openai_base_url:
+        client_kwargs["base_url"] = settings.openai_base_url
+    client = AsyncOpenAI(**client_kwargs)
     response = await client.chat.completions.create(
         model=settings.classification_model,
         messages=[
