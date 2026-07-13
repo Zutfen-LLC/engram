@@ -64,6 +64,14 @@ from engram.config import settings
 pytestmark = pytest.mark.asyncio
 
 
+def _parse_ts(val: Any) -> datetime:
+    """Parse a datetime from either a datetime object or a string
+    (handles both ISO 'T' separator and Postgres space separator)."""
+    if isinstance(val, datetime):
+        return val
+    return datetime.fromisoformat(str(val).replace(" ", "T"))
+
+
 @pytest.fixture
 async def proof(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[dict[str, Any]]:
     owner_url = os.getenv("ENGRAM_OWNER_DATABASE_URL") or os.getenv("ENGRAM_DATABASE_URL")
@@ -346,7 +354,11 @@ async def test_invalidate_succeeds_with_event(proof: dict[str, Any]) -> None:
     inv_events = _invalidate_events(st["events"])
     assert len(inv_events) == 1, [dict(e) for e in st["events"]]
     assert inv_events[0]["old_value"] is None
-    assert inv_events[0]["new_value"] == str(st["item"]["valid_to"])
+    # Normalize datetime format: the event stores .isoformat() (T separator)
+    # while the raw Postgres row str uses a space separator.
+    _event_ts = datetime.fromisoformat(inv_events[0]["new_value"])
+    _item_ts = _parse_ts(st["item"]["valid_to"])
+    assert _event_ts == _item_ts
 
 
 # ===========================================================================
@@ -383,8 +395,11 @@ async def test_double_invalidate_returns_409(proof: dict[str, Any]) -> None:
     st = await p["state"](item)
     inv_events = _invalidate_events(st["events"])
     assert len(inv_events) == 1, "second invalidation must not write an event"
-    first_ts = resp1.json()["item"]["valid_to"]
-    assert str(st["item"]["valid_to"]) == first_ts, "valid_to must be unchanged"
+    # valid_to is unchanged (compare timestamps, not string representations,
+    # because the JSON response and raw Postgres row use different formats).
+    first_ts = datetime.fromisoformat(resp1.json()["item"]["valid_to"])
+    db_ts = _parse_ts(st["item"]["valid_to"])
+    assert first_ts == db_ts, "valid_to must be unchanged"
 
 
 # ===========================================================================
@@ -920,10 +935,11 @@ async def test_rollback_atomicity_on_event_failure(proof: dict[str, Any]) -> Non
     before = await p["state"](item)
     assert before["item"]["valid_to"] is None
 
-    # The invalidation must fail (the event INSERT raises); the valid_to
-    # mutation rolls back with the event.
-    resp = await _invalidate(p, "user_review", item, reason="will fail")
-    assert resp.status_code == 500, resp.text
+    # The invalidation must fail (the event INSERT raises a DB exception that
+    # propagates through the ASGI transport as a raised exception, not a clean
+    # 500 response). The valid_to mutation rolls back with the event.
+    with pytest.raises(Exception, match="injected event failure for invalidation rollback"):
+        await _invalidate(p, "user_review", item, reason="will fail")
 
     after = await p["state"](item)
     assert after["item"]["valid_to"] is None, "valid_to must be rolled back"
