@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     classification_provider: str = "none"
     classification_model: str = "gpt-4o-mini"
     classification_confidence_threshold: float = 0.5
+    # Dedicated API key/base URL for classification. When set, used instead of
+    # the shared openai_* settings — allows classification on a different
+    # provider (e.g. DeepInfra) while embeddings use OpenRouter.
+    classification_api_key: str | None = None
+    classification_base_url: str | None = None
 
     # Auth
     # When false, auth is skipped (dev mode). Production must set True.

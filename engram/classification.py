@@ -464,9 +464,14 @@ def _build_prompt(
 
 
 async def _call_openai_classification(prompt: str) -> dict[str, Any]:
-    client_kwargs: dict[str, Any] = {"api_key": settings.openai_api_key}
-    if settings.openai_base_url:
-        client_kwargs["base_url"] = settings.openai_base_url
+    # Classification may use a different provider (e.g. DeepInfra) than
+    # embeddings. Fall back to the shared openai_* settings for backward
+    # compatibility.
+    api_key = settings.classification_api_key or settings.openai_api_key
+    base_url = settings.classification_base_url or settings.openai_base_url
+    client_kwargs: dict[str, Any] = {"api_key": api_key}
+    if base_url:
+        client_kwargs["base_url"] = base_url
     client = AsyncOpenAI(**client_kwargs)
     response = await client.chat.completions.create(
         model=settings.classification_model,
