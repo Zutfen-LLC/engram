@@ -1521,6 +1521,13 @@ Includes:
 * example integrations
 * release packaging
 
+Quality improvements (from Gate E baselines, 2026-07-13):
+
+* enable LLM classification by default (provider is currently `none` on dogfood; rule-only accuracy is 20%, rule+LLM is 50%)
+* ship built-in keyword classification rules for doctrine, invariant, procedure, and summary (currently all default to "fact")
+* expand the recall eval corpus to ~50 diverse memories for stable precision@K/MRR baselines
+* evaluate stronger embedding models (e.g. Qwen3 Embedding 4B) against the recall golden set and re-run baselines after any model change
+
 ### Phase 4 — Hosted future
 
 Goal: managed Engram for users and teams that do not want to self-host.

@@ -253,6 +253,27 @@ Enable a bounded-cost embedding profile and record real backfill, dual-write, se
 
 Build a versioned classification golden set and recall replay harness. Publish baseline per-kind classification metrics and recall precision@K/MRR (or a justified equivalent). Treat any scope/authority leak as a catastrophic failure rather than a ranking miss.
 
+**Infrastructure: delivered (2026-07-13).** Golden sets (`evals/golden/classification_v1.json`, `evals/golden/recall_v1.json`) and harness (`evals/run_evals.py`) are landed. Baselines recorded in `evals/BASELINE-2026-07-13.md`.
+
+**Baselines:**
+
+| Metric | Rule-only | Live (rule+LLM) |
+|--------|-----------|-----------------|
+| Classification accuracy | 20% (4/20) | 50% (10/20) |
+| Recall precision@5 | — | 0.125 |
+| Recall MRR | — | 0.271 |
+| Recall@5 | — | 0.250 |
+
+**Quality improvement work (ongoing):**
+
+1. **Enable LLM classification on dogfood.** `classification_provider` is `none`; enabling it (OpenRouter model) should lift doctrine, invariant, procedure, and summary accuracy — currently all at 0%.
+
+2. **Add default keyword classification rules.** Ship built-in regex rules for high-value patterns: "must never"/"never" → invariant, "we decided"/"chose" → decision, "to deploy"/"run" → procedure, "session summary" → summary. These make rule-only classification useful out of the box without LLM.
+
+3. **Richer recall eval corpus.** The 14-item seed corpus is too small for stable precision/MRR. Target ~50 diverse memories (mix of kinds, wings, rooms) for a corpus that exercises semantic, keyword, and hybrid search meaningfully.
+
+4. **Evaluate stronger embedding models.** The current free Nemotron model produces weak semantic similarity for technical content. Evaluate Qwen3 Embedding 4B or similar mid-tier models against the recall golden set; re-run baselines after any model change.
+
 ### Gate F — Agent onboarding and OSS readiness
 
 Only after Gates A–E, make first-agent installation a release requirement rather
