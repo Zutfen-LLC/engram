@@ -495,8 +495,10 @@ Engram uses evocative naming drawn from memory palace traditions.
 ## Status
 
 Engram's MVP is **implemented and dogfood-deployed** — not a skeleton or a plan.
-The canonical memory service, the full trust workflow, and the agent adapters
-all exist and are exercised by a live, network-verified deployment.
+The canonical memory service and agent adapters are exercised by a live,
+network-verified deployment. The current trust workflow is extensively covered
+by PostgreSQL-backed CI; deployment verification predates the latest trust and
+concurrency remediation, so those changes are not yet claimed as live-proven.
 
 > **What "verified" means here:** implemented = code exists and is unit/integration
 > tested (CI runs the full suite against Postgres 16 + pgvector 0.8);
@@ -508,7 +510,7 @@ all exist and are exercised by a live, network-verified deployment.
 
 | Capability                                                              | Implemented | Dogfood-verified |
 | ----------------------------------------------------------------------- | :---------: | :--------------: |
-| Schema + migrations (15 tables), RLS, FTS, pgvector storage            |     yes     |       yes        |
+| Schema + migrations (19 tables), RLS, FTS, pgvector storage            |     yes     |       yes        |
 | `POST /v1/remember` (trust fields, dedup, supersession, secret guard)   |     yes     |       yes        |
 | Startup recall (scoring, pinned bypass, anti-feedback loop, reasons)    |     yes     |       yes        |
 | Semantic recall (`mode=semantic`, proposed items tagged `unreviewed`)   |     yes     |   over FTS\*     |
@@ -591,9 +593,11 @@ Engram is being built in layers. The first four are largely landed; layer five
    lifecycle capture (`engram-hooks`) written but unverified (post-MVP).*
    MCP, SDK, startup + semantic recall, and pre-compression/sync-turn capture
    (the latter awaiting engram-hooks verification).
-5. **Open-source readiness** — *in progress.*
-   Documentation pass, examples, deployment hardening, security review, and
-   hosted-service preparation.
+5. **Verification and open-source readiness** — *in progress.*
+   Post-remediation trust closure, real Hermes lifecycle capture, live
+   embeddings, quality evaluations, examples, deployment hardening, security
+   review, and hosted-service preparation. See the active verification ledger
+   in `docs/plans/post-remediation-verification-2026-07.md`.
 
 See [`docs/design.md`](docs/design.md) for the full design document and
 [`docs/plans/engram-mvp-backlog.md`](docs/plans/engram-mvp-backlog.md) for the

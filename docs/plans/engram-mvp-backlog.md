@@ -1,5 +1,10 @@
 # Engram MVP Backlog
 
+> **MVP historical record:** BL-001–BL-010 document the completed MVP sequence;
+> BL-011 and BL-012 retain useful operational detail. Current finding closure,
+> residual trust-integrity work, and release-gate ordering live in
+> `docs/plans/post-remediation-verification-2026-07.md`.
+
 > **Execution status (updated 2026-07-08 by the BL-010 documentation truth
 > pass):** **BL-001 through BL-010 are complete.** The MVP execution backlog is
 > closed — the service is implemented, dogfood-deployed, network-verified, and
