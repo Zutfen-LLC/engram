@@ -117,6 +117,13 @@ def main() -> int:
     env["ENGRAM_FAIL_ON_DB_SKIP"] = "1"
     _run("pytest", "-q", "tests", env=env)
 
+    # NOTE: The canonical trust-proof selector (scripts/trust_proof_files.py)
+    # selects the Gate B invariant subset from the same suite above. It is
+    # available as ``make trust-proof`` and ``make compose-trust-proof`` for
+    # operators who want to verify only the trust invariants. CI runs the
+    # full suite (which is a superset of the trust proofs) so a separate
+    # in-CI re-run would be redundant.
+
     _section("SDK Tests")
     _run("pytest", "-q", "-c", "sdk/engram-client/pyproject.toml", "sdk/engram-client/tests")
 
