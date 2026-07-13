@@ -1,0 +1,86 @@
+{
+  "version": 1,
+  "description": "Recall relevance golden set for Engram. Each query has a list of content snippets that SHOULD appear in the top-K results when the corpus is seeded into a fresh instance. Used to measure precision@K and MRR.",
+  "samples": [
+    {
+      "id": "rec-001",
+      "query": "database security RLS row level security",
+      "relevant_content_fragments": [
+        "RLS is enforced at the database level",
+        "Row Level Security",
+        "application role NOBYPASSRLS"
+      ],
+      "k": 5
+    },
+    {
+      "id": "rec-002",
+      "query": "how to deploy Engram",
+      "relevant_content_fragments": [
+        "docker compose up",
+        "engram bootstrap-key"
+      ],
+      "k": 5
+    },
+    {
+      "id": "rec-003",
+      "query": "trust model review status proposed active",
+      "relevant_content_fragments": [
+        "review_status='proposed'",
+        "source_trust",
+        "auto-promotion",
+        "memory_confidence"
+      ],
+      "k": 5
+    },
+    {
+      "id": "rec-004",
+      "query": "embedding provider configuration",
+      "relevant_content_fragments": [
+        "encoding_format",
+        "OpenRouter",
+        "embedding_provider"
+      ],
+      "k": 5
+    },
+    {
+      "id": "rec-005",
+      "query": "append-first content model audit events",
+      "relevant_content_fragments": [
+        "append-first",
+        "item_events",
+        "never UPDATE memory item content"
+      ],
+      "k": 5
+    },
+    {
+      "id": "rec-006",
+      "query": "user preferences dark mode concise responses",
+      "relevant_content_fragments": [
+        "prefers dark mode",
+        "concise responses"
+      ],
+      "k": 5
+    },
+    {
+      "id": "rec-007",
+      "query": "conflict detection dedup supersession",
+      "relevant_content_fragments": [
+        "dedup",
+        "content_hash",
+        "supersession",
+        "conflict"
+      ],
+      "k": 5
+    },
+    {
+      "id": "rec-008",
+      "query": "multi-tenant isolation workspace membership",
+      "relevant_content_fragments": [
+        "tenant_id",
+        "workspace_members",
+        "tenant isolation"
+      ],
+      "k": 5
+    }
+  ]
+}

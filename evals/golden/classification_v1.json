@@ -1,0 +1,166 @@
+{
+  "version": 1,
+  "description": "Classification golden set for Engram memory kind/wing/room classification. Each sample is a realistic memory write with expected classification. Used to measure rule-based and LLM classification accuracy.",
+  "samples": [
+    {
+      "id": "cls-001",
+      "content": "User prefers dark mode and never wants email notifications.",
+      "expected_kind": "preference",
+      "expected_wing": null,
+      "expected_room": null,
+      "notes": "Stated preference with 'prefers' keyword"
+    },
+    {
+      "id": "cls-002",
+      "content": "Never store API keys, passwords, or credentials in memory items. The safety module checks before every write.",
+      "expected_kind": "invariant",
+      "expected_wing": null,
+      "expected_room": null,
+      "notes": "Security rule that must always hold"
+    },
+    {
+      "id": "cls-003",
+      "content": "We decided to use PostgreSQL with pgvector for all storage instead of Redis.",
+      "expected_kind": "decision",
+      "expected_wing": null,
+      "expected_room": null,
+      "notes": "Past-tense decision verb"
+    },
+    {
+      "id": "cls-004",
+      "content": "The production database is running on engram01 at 10.0.0.22 port 5432.",
+      "expected_kind": "fact",
+      "expected_wing": null,
+      "expected_room": null,
+      "notes": "Stated fact, neutral observation"
+    },
+    {
+      "id": "cls-005",
+      "content": "All PRs must pass CI before merge. No exceptions, even for trivial docs changes.",
+      "expected_kind": "doctrine",
+      "expected_wing": null,
+      "expected_room": null,
+      "notes": "Standing policy governing behavior"
+    },
+    {
+      "id": "cls-006",
+      "content": "The API response time seemed slow today around 3pm, maybe 2-3 seconds per request.",
+      "expected_kind": "observation",
+      "expected_wing": null,
+      "expected_room": null,
+      "notes": "Noticed but not verified"
+    },
+    {
+      "id": "cls-007",
+      "content": "To deploy Engram: docker compose up -d, then run engram bootstrap-key to get the first API key.",
+      "expected_kind": "procedure",
+      "expected_wing": null,
+      "expected_room": null,
+      "notes": "How-to / runbook"
+    },
+    {
+      "id": "cls-008",
+      "content": "Session summary: we closed the RLS isolation bug, shipped the trust-state writer fixes, and upgraded the dogfood database with zero data loss.",
+      "expected_kind": "summary",
+      "expected_wing": null,
+      "expected_room": null,
+      "notes": "Condensed summary from other events"
+    },
+    {
+      "id": "cls-009",
+      "content": "User prefers concise responses without excessive hedging or disclaimers.",
+      "expected_kind": "preference",
+      "expected_wing": null,
+      "expected_room": null,
+      "notes": "Communication style preference"
+    },
+    {
+      "id": "cls-010",
+      "content": "The remember endpoint validates content_hash using SHA-256 and enforces dedup via a partial unique index on (tenant_id, workspace_id, principal_id, content_hash) WHERE valid_to IS NULL AND review_status != 'rejected'.",
+      "expected_kind": "fact",
+      "expected_wing": null,
+      "expected_room": null,
+      "notes": "Technical implementation detail — a fact, not a procedure"
+    },
+    {
+      "id": "cls-011",
+      "content": "Content is append-first: never UPDATE memory item content. Metadata changes go through PATCH which writes to item_events first, then updates the column.",
+      "expected_kind": "doctrine",
+      "expected_wing": null,
+      "expected_room": null,
+      "notes": "Architectural rule governing how code must behave"
+    },
+    {
+      "id": "cls-012",
+      "content": "The meeting went well — stakeholders agreed to prioritize the trust model over the UI for the first release.",
+      "expected_kind": "decision",
+      "expected_wing": null,
+      "expected_room": null,
+      "notes": "Decision recorded from a meeting"
+    },
+    {
+      "id": "cls-013",
+      "content": "We must never bypass Row Level Security. RLS is enforced at the database level on all tenant-scoped tables. Application-level WHERE clauses are defense-in-depth, not a substitute.",
+      "expected_kind": "invariant",
+      "expected_wing": null,
+      "expected_room": null,
+      "notes": "Security invariant — violations are high-stakes"
+    },
+    {
+      "id": "cls-014",
+      "content": "Agent-sourced manual writes default to review_status='proposed' at 0.6 trust, preventing agents from getting user-level trust automatically.",
+      "expected_kind": "fact",
+      "expected_wing": null,
+      "expected_room": null,
+      "notes": "Implementation fact about trust defaults"
+    },
+    {
+      "id": "cls-015",
+      "content": "User wants low-downtime migrations and prefers consolidating idle power-hungry hosts to save electricity.",
+      "expected_kind": "preference",
+      "expected_wing": null,
+      "expected_room": null,
+      "notes": "Infrastructure preferences"
+    },
+    {
+      "id": "cls-016",
+      "content": "To upgrade the dogfood database: back up first with pg_dump, start a temporary pgvector container on the data volume, apply migrations 003-013 in sequence via psql, verify table counts and RLS, then baseline the migration tracker.",
+      "expected_kind": "procedure",
+      "expected_wing": null,
+      "expected_room": null,
+      "notes": "Multi-step operational runbook"
+    },
+    {
+      "id": "cls-017",
+      "content": "The service appeared to work but semantic search returned empty results because the embedding worker was failing silently with a 401 authentication error.",
+      "expected_kind": "observation",
+      "expected_wing": null,
+      "expected_room": null,
+      "notes": "Observed problem, not yet fixed"
+    },
+    {
+      "id": "cls-018",
+      "content": "Startup recall is deterministic given state: same corpus, item states, and config produce the same output. It is NOT deterministic across time because recall mutates last_recalled_at and recall_count.",
+      "expected_kind": "fact",
+      "expected_wing": null,
+      "expected_room": null,
+      "notes": "Design contract — a fact about the system"
+    },
+    {
+      "id": "cls-019",
+      "content": "All trust defaults and scoring weights are stored in tenant_config, not hardcoded. The remember and recall endpoints must read the active tenant_config to get current values.",
+      "expected_kind": "doctrine",
+      "expected_wing": null,
+      "expected_room": null,
+      "notes": "Architectural rule — governs implementation behavior"
+    },
+    {
+      "id": "cls-020",
+      "content": "We chose FastAPI over Flask because async support and Pydantic v2 validation were critical for the trust model's request validation needs.",
+      "expected_kind": "decision",
+      "expected_wing": null,
+      "expected_room": null,
+      "notes": "Technology choice with rationale"
+    }
+  ]
+}
