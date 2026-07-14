@@ -231,6 +231,98 @@ async def test_receipt_content_and_kind_mismatch_are_rejected(client):
     assert kind_mismatch.status_code == 422
 
 
+async def test_receipt_binds_to_preexisting_unbound_dedup_item(client):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    content = "Preexisting unbound receipt dedup"
+    existing = await client.post(
+        "/v1/remember", json={"content": content, "kind": "fact"}
+    )
+    classified = await client.post("/v1/classify", json={"content": content})
+    receipt_id = classified.json()["classification_run_id"]
+    deduped = await client.post(
+        "/v1/remember",
+        json={"content": content, "classification_run_id": receipt_id},
+    )
+    assert deduped.status_code == 201
+    assert deduped.json()["status"] == "deduped"
+    assert deduped.json()["id"] == existing.json()["id"]
+    async with _test_engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT r.memory_item_id,m.retention_disposition "
+                    "FROM classification_runs r JOIN memory_items m ON m.id=r.memory_item_id "
+                    "WHERE r.id=:id"
+                ),
+                {"id": receipt_id},
+            )
+        ).one()
+    assert str(row.memory_item_id) == existing.json()["id"]
+    assert row.retention_disposition == "uncertain"
+
+
+async def test_expired_unbound_rejected_but_bound_replay_survives_expiry(client):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    expired_content = "Expired unbound receipt"
+    expired = await client.post("/v1/classify", json={"content": expired_content})
+    async with _test_engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE classification_runs SET expires_at=now()-interval '1 second' "
+                "WHERE id=:id"
+            ),
+            {"id": expired.json()["classification_run_id"]},
+        )
+    rejected = await client.post(
+        "/v1/remember",
+        json={
+            "content": expired_content,
+            "classification_run_id": expired.json()["classification_run_id"],
+        },
+    )
+    assert rejected.status_code == 422
+
+    content = "Bound replay after expiry"
+    classified = await client.post("/v1/classify", json={"content": content})
+    receipt_id = classified.json()["classification_run_id"]
+    created = await client.post(
+        "/v1/remember", json={"content": content, "classification_run_id": receipt_id}
+    )
+    async with _test_engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE classification_runs SET expires_at=now()-interval '1 second' "
+                "WHERE id=:id"
+            ),
+            {"id": receipt_id},
+        )
+    replay = await client.post(
+        "/v1/remember", json={"content": content, "classification_run_id": receipt_id}
+    )
+    assert replay.status_code == 201
+    assert replay.json()["id"] == created.json()["id"]
+
+
+async def test_receipt_source_mismatch_is_rejected(client):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    content = "Source-bound receipt"
+    classified = await client.post(
+        "/v1/classify", json={"content": content, "source_type": "sync_turn"}
+    )
+    response = await client.post(
+        "/v1/remember",
+        json={
+            "content": content,
+            "source_type": "manual",
+            "classification_run_id": classified.json()["classification_run_id"],
+        },
+    )
+    assert response.status_code == 422
+
+
 async def test_concurrent_same_receipt_is_idempotent(client):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
