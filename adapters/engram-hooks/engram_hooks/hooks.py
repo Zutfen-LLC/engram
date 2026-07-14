@@ -149,7 +149,7 @@ class HookResult:
     event: str
     extracted: int = 0
     rejected: int = 0
-    promoted: int = 0       # written to Engram as proposed
+    promoted: int = 0       # compatibility counter: remembered as proposed
     parked: int = 0         # parked in the local volatile store
     errors: int = 0
     details: list[dict[str, Any]] = field(default_factory=list)
@@ -338,13 +338,14 @@ class LifecycleHooks:
         if client is not None and retention_disposition == "noise":
             return {"content": content, "route": "rejected", **detail_evidence}
 
-        # 3. Promotion gate. At/above threshold → remember as proposed. The
-        #    server applies its own 0.7 auto-promotion gate on top; we just
-        #    decide whether the candidate is worth a server round-trip at all.
+        # 3. Durable-storage gate. At/above threshold → remember as proposed.
+        #    This decides whether the candidate is worth a server round-trip.
+        store_threshold = self.config.store_confidence_threshold
+        assert store_threshold is not None
         if (
             client is not None
             and retention_disposition == "retain"
-            and retention_confidence >= (self.config.store_confidence_threshold or 0.65)
+            and retention_confidence >= store_threshold
         ):
             try:
                 await client.remember(
@@ -421,9 +422,13 @@ class LifecycleHooks:
 
             result.details.append(detail)
         logger.info(
-            "engram-hooks %s: extracted=%d rejected=%d promoted=%d parked=%d errors=%d",
-            event, result.extracted, result.rejected, result.promoted,
-            result.parked, result.errors,
+            "engram-hooks %s: extracted=%d rejected=%d remembered=%d parked=%d errors=%d",
+            event,
+            result.extracted,
+            result.rejected,
+            result.remembered,
+            result.parked,
+            result.errors,
         )
         return result
 

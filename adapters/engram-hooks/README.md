@@ -198,18 +198,18 @@ print(detect_prepare_memory_write())
 # {'hermes_present': False, 'hook_present': False, 'provider': None, 'error': ...}
 ```
 
-## Promotion gates
+## Durable-storage gate
 
 Routing mirrors [design.md](../../../docs/design.md) §4 source-trust defaults:
 
 - `sync_turn` and `pre_compress` are low-trust inferred sources
-  (`memory_confidence` 0.4 / 0.3). They stay `proposed` on the server until an
-  LLM classification or human review raises their confidence above the 0.7
-  auto-promotion gate.
-- This library adds a **client-side** gate on top: candidates below
-  `ENGRAM_HOOKS_PROMOTE_THRESHOLD` (default `0.6`) never reach the server at all
-  — they park locally. This keeps chatty sources from flooding the proposed
-  queue while still preserving potentially-useful observations for ~14 days.
+  (`memory_confidence` 0.4 / 0.3). Remembered candidates remain `proposed` for
+  later evidence scoring or human review.
+- This library applies a client-side durable-storage gate: candidates below
+  `ENGRAM_HOOKS_STORE_THRESHOLD` (default `0.65`) never reach the server and
+  park locally. The deprecated `ENGRAM_HOOKS_PROMOTE_THRESHOLD` remains a
+  fallback alias. The canonical variable takes precedence, and an explicit
+  threshold of `0` is honored.
 
 ## See also
 

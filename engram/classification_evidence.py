@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 from uuid import UUID
 
 from sqlalchemy import delete, select
@@ -17,6 +19,56 @@ CANONICALIZATION_VERSION = "canonical-v1"
 CLASSIFICATION_OUTPUT_VERSION = "classification-v2"
 RETENTION_POLICY_VERSION = "retention-v1"
 UNBOUND_RECEIPT_TTL = timedelta(hours=1)
+CONTEXT_REDACTION_MARKER = "[context redacted]"
+
+
+class ClassificationRunBindingError(RuntimeError):
+    """The receipt is already consumed or is in an invalid binding state."""
+
+
+def _redact_context(value: Any, context: str | None) -> Any:
+    """Return a deep, context-redacted copy of a durable value."""
+    if isinstance(value, str):
+        if context:
+            return value.replace(context, CONTEXT_REDACTION_MARKER)
+        return value
+    if isinstance(value, dict):
+        return {str(key): _redact_context(item, context) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_context(item, context) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_context(item, context) for item in value]
+    return copy.deepcopy(value)
+
+
+def durable_provenance(
+    result: ClassificationResult, *, context: str | None
+) -> dict[str, Any]:
+    """Build allowlisted, normalized provenance safe for durable storage."""
+    source = result.provenance
+    provenance: dict[str, Any] = {
+        "provider": str(source.get("provider", "none")),
+        "mode": str(source.get("mode", "unknown")),
+        "suggested_taxonomy": {
+            "kind": result.suggested_kind,
+            "wing": result.suggested_wing,
+            "room": result.suggested_room,
+        },
+        "suggested_visibility": result.suggested_visibility,
+        "taxonomy_confidence": result.taxonomy_confidence,
+        "retention_confidence": result.retention_confidence,
+        "retention_disposition": result.retention_disposition,
+        "rules_matched": list(result.rules_matched),
+        "classification_version": CLASSIFICATION_OUTPUT_VERSION,
+        "retention_policy_version": RETENTION_POLICY_VERSION,
+    }
+    if source.get("model") is not None:
+        provenance["model"] = str(source["model"])
+    if source.get("threshold") is not None:
+        provenance["taxonomy_threshold"] = source["threshold"]
+    if source.get("error_type") is not None:
+        provenance["provider_error"] = {"type": str(source["error_type"])}
+    return cast(dict[str, Any], _redact_context(provenance, context))
 
 
 def hash_context(context: str | None) -> tuple[str | None, int | None]:
@@ -39,15 +91,15 @@ def new_run(
     workspace_id: UUID | None,
     context: str | None,
     result: ClassificationResult,
-    memory_item_id: UUID | None = None,
     now: datetime | None = None,
 ) -> ClassificationRun:
     created_at = now or datetime.now(UTC)
     context_hash, context_length = hash_context(context)
+    persisted_reason = _redact_context(result.reason, context)
+    persisted_provenance = durable_provenance(result, context=context)
     return ClassificationRun(
         tenant_id=tenant_id,
         principal_id=principal_id,
-        memory_item_id=memory_item_id,
         content_hash=hash_content(content),
         canonicalization_version=CANONICALIZATION_VERSION,
         source_type=source_type,
@@ -61,8 +113,8 @@ def new_run(
         taxonomy_confidence=result.taxonomy_confidence,
         retention_confidence=result.retention_confidence,
         retention_disposition=result.retention_disposition,
-        reason=result.reason,
-        provenance=result.provenance,
+        reason=persisted_reason,
+        provenance=persisted_provenance,
         classification_version=CLASSIFICATION_OUTPUT_VERSION,
         retention_policy_version=RETENTION_POLICY_VERSION,
         created_at=created_at,
@@ -89,11 +141,19 @@ async def bound_run_for_item(
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
-def bind_run(run: ClassificationRun, item: MemoryItem) -> None:
+def bind_run(
+    run: ClassificationRun, item: MemoryItem, *, bound_at: datetime | None = None
+) -> datetime:
+    """Consume a receipt once and attach its retention evidence atomically."""
+    if run.bound_at is not None or run.memory_item_id is not None:
+        raise ClassificationRunBindingError("classification run is already bound")
+    binding_time = bound_at or datetime.now(UTC)
     run.memory_item_id = item.id
+    run.bound_at = binding_time
     item.retention_confidence = run.retention_confidence
     item.retention_disposition = run.retention_disposition
     item.retention_evidence_at = run.created_at
+    return binding_time
 
 
 async def cleanup_expired_unbound_runs(
@@ -104,7 +164,7 @@ async def cleanup_expired_unbound_runs(
             select(ClassificationRun.id)
             .where(
                 ClassificationRun.tenant_id == tenant_id,
-                ClassificationRun.memory_item_id.is_(None),
+                ClassificationRun.bound_at.is_(None),
                 ClassificationRun.expires_at < datetime.now(UTC),
             )
             .order_by(ClassificationRun.expires_at)
@@ -116,7 +176,7 @@ async def cleanup_expired_unbound_runs(
         await session.execute(
             delete(ClassificationRun).where(
                 ClassificationRun.id.in_(ids),
-                ClassificationRun.memory_item_id.is_(None),
+                ClassificationRun.bound_at.is_(None),
             )
         )
     return len(ids)

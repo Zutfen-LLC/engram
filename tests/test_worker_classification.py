@@ -66,9 +66,7 @@ async def _get_test_session() -> AsyncSession:
                     ),
                     {"slug": _DEFAULT_TENANT_SLUG, "principal": _DEFAULT_PRINCIPAL_NAME},
                 )
-            )
-            .mappings()
-            .one()
+            ).mappings().one()
         )
         await apply_rls_context(
             session, tenant_id=row["tenant_id"], principal_id=row["principal_id"]
@@ -157,7 +155,9 @@ async def _run_refine_job(item_id: str) -> None:
                     ),
                     {"slug": _DEFAULT_TENANT_SLUG, "principal": _DEFAULT_PRINCIPAL_NAME},
                 )
-            ).mappings().one()
+            )
+            .mappings()
+            .one()
         )
         await apply_rls_context(
             session, tenant_id=row["tenant_id"], principal_id=row["principal_id"]
@@ -285,6 +285,12 @@ async def test_refinement_writes_item_events(client, monkeypatch):
     await _run_refine_job(item_id)
     after = await _event_count(item_id)
     assert after > before, "refinement must write at least one item event"
+    async with _test_engine.connect() as conn:
+        bound_at = await conn.scalar(
+            text("SELECT bound_at FROM classification_runs WHERE memory_item_id=:id"),
+            {"id": item_id},
+        )
+    assert bound_at is not None
 
 
 async def test_refinement_rerun_is_idempotent(client, monkeypatch):

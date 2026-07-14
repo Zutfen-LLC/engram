@@ -410,15 +410,20 @@ Two endpoints serve classification with distinct roles:
 * **`POST /v1/classify`** returns taxonomy suggestions plus independent retention evidence and stores a one-hour, server-attested receipt. `confidence` remains a deprecated alias of `taxonomy_confidence`.
 * **`POST /v1/remember`** may bind that receipt with `classification_run_id`; write scope is still required and the server validates principal, content, source, workspace, expiry, and kind.
 
-Taxonomy and retention confidences are separately clamped to `0.0–0.95`. Retention dispositions are
-`retain`, `transient`, `noise`, or `uncertain`. Retention evidence is not external-truth verification,
-does not affect recall ranking, and does not authorize a write.
+Taxonomy and retention confidences are separately clamped to `0.0–0.95`. Retention dispositions are:
+`retain` for atomic information useful beyond the current working moment; `transient` for session-local
+utility; `noise` for acknowledgements, status/process chatter, and repeated tool output; and `uncertain`
+when durable value cannot be judged safely. Retention confidence measures only the positive case for
+durable retention, so confidence that content is noise does not raise it. Retention evidence is not
+external-truth verification, does not affect recall ranking, and does not authorize a write.
 
 The classifier's `suggested_visibility` is applied **downward only** — it may narrow the requested scope (e.g. `tenant` → `private`) but never widen it. Invalid or absent suggestions preserve the caller's requested visibility unchanged.
 
 Every receipt-bound write records its receipt/version, both confidence layers, source prior,
-visibility decision, reason, and provider provenance. Content is never mutated. Promotion Path A v2
-scoring and evidence gates are intentionally deferred to the next program PR.
+visibility decision, reason, and allowlisted, context-sanitized provider provenance. A receipt is
+permanently consumed even if its bound item is later deleted. Dedup binding requires matching source and
+governed kind and can only narrow the existing visibility. Content is never mutated. Promotion Path A
+v2 scoring and evidence gates are intentionally deferred to the next program PR.
 
 Seed classification rules are intentionally conservative: "skip" rules are whole-message *status-only* matchers (bare `ok`, `done`, `passed`) that don't fire on status words inside meaningful sentences, and doctrine classification requires explicit policy/invariant phrasing rather than casual modal verbs.
 
