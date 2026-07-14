@@ -52,23 +52,20 @@ compose-ci-down:
 .PHONY: trust-proof compose-trust-proof
 
 trust-proof:
-	TRUST_FILES=$$($(VENV_BIN)/python scripts/trust_proof_files.py); \
-	ENGRAM_FAIL_ON_DB_SKIP=1 $(VENV_BIN)/pytest -q $$TRUST_FILES
+	ENGRAM_FAIL_ON_DB_SKIP=1 $(VENV_BIN)/python scripts/run_trust_proof.py
 
 # Compose-backed variant: runs the trust proofs inside the CI Docker stack
 # against a fresh PostgreSQL 16 + pgvector instance with the non-owner
 # application role.
 compose-trust-proof:
 	@if docker info >/dev/null 2>&1; then \
-		TRUST_FILES=$$(python scripts/trust_proof_files.py); \
-		docker compose -f docker-compose.ci.yml run --rm \
+		docker compose -f docker-compose.ci.yml run --build --rm \
 			-e ENGRAM_FAIL_ON_DB_SKIP=1 \
-			engram-test pytest -q $$TRUST_FILES; \
+			engram-test python scripts/run_trust_proof.py; \
 	elif getent group docker | cut -d: -f4 | tr ',' '\n' | grep -Fxq "$$(id -un)"; then \
-		TRUST_FILES=$$(python scripts/trust_proof_files.py); \
-		sg docker -c 'docker compose -f docker-compose.ci.yml run --rm \
+		sg docker -c 'docker compose -f docker-compose.ci.yml run --build --rm \
 			-e ENGRAM_FAIL_ON_DB_SKIP=1 \
-			engram-test pytest -q $$TRUST_FILES'; \
+			engram-test python scripts/run_trust_proof.py'; \
 	else \
 		echo "Docker is not accessible and $$(id -un) is not configured in the docker group." >&2; \
 		exit 1; \
