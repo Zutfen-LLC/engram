@@ -102,6 +102,7 @@ CREATE_STATEMENTS = [
         singleton INTEGER NOT NULL DEFAULT 0,
         stays_in_recall_when_disputed INTEGER NOT NULL DEFAULT 0,
         requires_review INTEGER NOT NULL DEFAULT 0,
+        auto_promote_from_inferred INTEGER NOT NULL DEFAULT 0,
         default_importance REAL,
         sort_order INTEGER NOT NULL DEFAULT 100,
         created_at TEXT NOT NULL,
