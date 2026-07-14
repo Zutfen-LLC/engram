@@ -198,6 +198,7 @@ class EngramClient:
         sensitivity: SensitivityKind = "normal",
         external_id: str | None = None,
         external_source: str | None = None,
+        classification_run_id: UUID | None = None,
     ) -> RememberResponse:
         """Write a memory item with dedup, trust defaults, and supersession."""
         req = RememberRequest(
@@ -217,6 +218,7 @@ class EngramClient:
             sensitivity=sensitivity,
             external_id=external_id,
             external_source=external_source,
+            classification_run_id=classification_run_id,
         )
         return await self._send(
             "POST",
@@ -289,9 +291,12 @@ class EngramClient:
         *,
         context: str | None = None,
         workspace: str | None = None,
+        source_type: SourceKind = "manual",
     ) -> ClassifyResponse:
         """Classify raw text: suggest kind, wing, room, visibility."""
-        req = ClassifyRequest(content=content, context=context, workspace=workspace)
+        req = ClassifyRequest(
+            content=content, context=context, workspace=workspace, source_type=source_type
+        )
         return await self._send(
             "POST",
             "/v1/classify",

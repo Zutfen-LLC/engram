@@ -17,6 +17,7 @@ from engram.authority import MemoryAuthority
 from engram.db import get_session
 from engram.memory_access import apply_read_eligibility, eligibility_expression
 from engram.models import KgTriple, MemoryItem, Principal
+from engram.trust_policy import resolve_trust_defaults
 
 router = APIRouter()
 
@@ -164,6 +165,9 @@ async def add_triple(
         if existing is None:
             raise HTTPException(status_code=404, detail="Item not found")
     else:
+        source_trust, source_prior, _ = await resolve_trust_defaults(
+            session, tenant_id, "extraction", principal[1]
+        )
         item = MemoryItem(
             tenant_id=tenant_id,
             workspace_id=workspace_id,
@@ -173,8 +177,9 @@ async def add_triple(
             kind="fact",
             visibility="workspace",
             review_status="proposed",
-            memory_confidence=req.confidence,
-            source_trust=0.5,
+            memory_confidence=source_prior,
+            source_trust=source_trust,
+            source_confidence_prior=source_prior,
             importance=0.5,
             source_type="extraction",
             authority=MemoryAuthority.INFERRED,

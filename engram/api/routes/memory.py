@@ -24,7 +24,8 @@ from engram.auth import READ_SCOPE, WRITE_SCOPE
 from engram.authority import authority_allows_supersession, authority_label, derive_memory_authority
 from engram.canonicalize import canonicalize, content_hash
 from engram.classification import ClassificationResult, classify_rules_only
-from engram.classification_trust import blend_memory_confidence, narrow_visibility
+from engram.classification_evidence import bind_run, lock_run
+from engram.classification_trust import narrow_visibility
 from engram.config import settings
 from engram.db import get_session
 from engram.embeddings import create_embedding_placeholder, generate_embedding
@@ -39,8 +40,10 @@ from engram.jobs import enqueue_job
 from engram.memory_access import eligibility_sql, resolve_workspace_scope, tenant_sql
 from engram.memory_kinds import UnknownMemoryKindError, require_enabled_memory_kind
 from engram.models import (
+    ClassificationRun,
     ItemEvent,
     MemoryItem,
+    Principal,
     Workspace,
 )
 from engram.safety import has_secrets
@@ -89,6 +92,7 @@ class RememberRequest(BaseModel):
     # External linkage (for imports)
     external_id: str | None = None
     external_source: str | None = None
+    classification_run_id: UUID | None = None
 
 
 class RememberResponse(BaseModel):
@@ -470,11 +474,51 @@ async def remember(
     principal_id, principal_type = await _resolve_principal(session, tenant_id)
     workspace_id = await _resolve_workspace_id(session, tenant_id, req.workspace)
 
+    receipt: ClassificationRun | None = None
+    if req.classification_run_id is not None:
+        receipt = await lock_run(session, req.classification_run_id)
+        if receipt is None or receipt.principal_id != principal_id:
+            raise HTTPException(status_code=404, detail="classification run not found")
+        if receipt.memory_item_id is not None:
+            bound_item = await session.scalar(
+                select(MemoryItem).where(MemoryItem.id == receipt.memory_item_id)
+            )
+            if bound_item is None:
+                raise HTTPException(status_code=409, detail="classification run is already bound")
+            if (
+                bound_item.content_hash != chash
+                or bound_item.source_type != req.source_type
+                or bound_item.workspace_id != workspace_id
+                or bound_item.principal_id != principal_id
+                or (req.kind is not None and req.kind != receipt.suggested_kind)
+            ):
+                raise HTTPException(status_code=409, detail="classification run is already bound")
+            return RememberResponse(
+                id=bound_item.id,
+                status="deduped",
+                review_status=bound_item.review_status,
+                memory_confidence=bound_item.memory_confidence,
+                deduped_existing_id=bound_item.id,
+            )
+        if (
+            receipt.expires_at <= datetime.now(UTC)
+            or receipt.content_hash != chash
+            or receipt.source_type != req.source_type
+            or receipt.workspace_id != workspace_id
+        ):
+            raise HTTPException(status_code=422, detail="classification run does not match request")
+
     kind = req.kind
     wing = req.wing
     room = req.room
     classification_result: ClassificationResult | None = None
-    if kind is None:
+    if receipt is not None:
+        if kind is not None and kind != receipt.suggested_kind:
+            raise HTTPException(status_code=422, detail="kind does not match classification run")
+        kind = receipt.suggested_kind
+        wing = wing or receipt.suggested_wing
+        room = room or receipt.suggested_room
+    elif kind is None:
         # Synchronous rule-based classification only (ENG-AUD-008 / F20): the
         # OpenAI LLM refinement runs later via an async classification.refine
         # job, so the request path never blocks on a provider call. The
@@ -509,26 +553,20 @@ async def remember(
     if kind_row.requires_review:
         review_status = "proposed"
 
-    # 4b. Classification → trust/visibility wiring (only when classification ran).
-    # The classifier may refine memory_confidence (capped by source authority so
-    # weak automated sources can't self-promote) and narrow — never widen — the
-    # requested visibility. Explicit-kind writes skip classification entirely, so
-    # their confidence/visibility come straight from the request/defaults.
+    # Taxonomy confidence never mutates overall memory confidence. Classification
+    # may only narrow visibility; source policy remains the immutable write prior.
     default_confidence = memory_confidence
     final_visibility = req.visibility
     suggested_visibility: str | None = None
     visibility_narrowed = False
-    memory_confidence_blended = False
-    if classification_result is not None:
+    if receipt is not None:
+        suggested_visibility = receipt.suggested_visibility
+        final_visibility = narrow_visibility(req.visibility, suggested_visibility)
+        visibility_narrowed = final_visibility != req.visibility
+    elif classification_result is not None:
         suggested_visibility = classification_result.suggested_visibility
         final_visibility = narrow_visibility(req.visibility, suggested_visibility)
         visibility_narrowed = final_visibility != req.visibility
-        memory_confidence, memory_confidence_blended = blend_memory_confidence(
-            source_default_confidence=default_confidence,
-            classifier_confidence=classification_result.confidence,
-            source_trust=source_trust,
-            source_type=req.source_type,
-        )
 
     # 5. Supersession check for singleton kinds.
     superseded_id, withheld_singleton = await _check_supersession(
@@ -562,6 +600,7 @@ async def remember(
         review_status=review_status,
         memory_confidence=memory_confidence,
         source_trust=source_trust,
+        source_confidence_prior=default_confidence,
         authority=authority,
         importance=req.importance,
         source_type=req.source_type,
@@ -576,16 +615,18 @@ async def remember(
         conflict_resolution_status="unresolved" if withheld_singleton is not None else None,
     )
 
-    session.add(item)
-
     # 7. Attempt flush — catches dedup via unique index idx_memitems_dedup.
     try:
-        await session.flush()
+        async with session.begin_nested():
+            session.add(item)
+            await session.flush()
+            if receipt is not None:
+                bind_run(receipt, item)
+                await session.flush()
     except IntegrityError:
-        await session.rollback()
         # Re-query for the existing item to verify this was a dedup, not
         # a CHECK constraint violation or other integrity error.
-        dedup_stmt = select(MemoryItem.id).where(
+        dedup_stmt = select(MemoryItem).where(
             MemoryItem.tenant_id == tenant_id,
             MemoryItem.content_hash == chash,
             MemoryItem.principal_id == principal_id,
@@ -596,28 +637,78 @@ async def remember(
             dedup_stmt = dedup_stmt.where(MemoryItem.workspace_id.is_(None))
         else:
             dedup_stmt = dedup_stmt.where(MemoryItem.workspace_id == workspace_id)
-        existing_id = (await session.execute(dedup_stmt)).scalar_one_or_none()
-        if existing_id is None:
+        existing = (await session.execute(dedup_stmt.with_for_update())).scalar_one_or_none()
+        if existing is None:
             # Not a dedup — some other constraint rejected the request shape
             # (e.g. a CHECK/enum value or FK reference that slipped past
             # Pydantic). Re-raise so the centralized DB-error handler
             # classifies it by SQLSTATE into the right 4xx/5xx.
             raise
+        if receipt is not None:
+            competing = await session.scalar(
+                select(ClassificationRun).where(
+                    ClassificationRun.memory_item_id == existing.id
+                )
+            )
+            if competing is not None and competing.id != receipt.id:
+                raise HTTPException(
+                    status_code=409, detail="memory item already has classification evidence"
+                ) from None
+            bind_run(receipt, existing)
+            session.add(
+                ItemEvent(
+                    item_id=existing.id,
+                    event_type="classification",
+                    field_name="kind",
+                    old_value=None,
+                    new_value=json.dumps(
+                        {
+                            "source": "classification_receipt_dedup",
+                            "classification_run_id": str(receipt.id),
+                            "classification_version": receipt.classification_version,
+                            "retention_policy_version": receipt.retention_policy_version,
+                            "source_type": req.source_type,
+                            "source_trust": existing.source_trust,
+                            "source_confidence_prior": existing.source_confidence_prior,
+                            "default_memory_confidence": existing.source_confidence_prior,
+                            "final_memory_confidence": existing.memory_confidence,
+                            "taxonomy_confidence": receipt.taxonomy_confidence,
+                            "confidence": receipt.taxonomy_confidence,
+                            "retention_confidence": receipt.retention_confidence,
+                            "retention_disposition": receipt.retention_disposition,
+                            "requested_visibility": req.visibility,
+                            "suggested_visibility": receipt.suggested_visibility,
+                            "final_visibility": existing.visibility,
+                            "visibility_narrowed": existing.visibility != req.visibility,
+                            "reason": receipt.reason,
+                            "classification_provenance": receipt.provenance,
+                        },
+                        sort_keys=True,
+                    ),
+                    actor_principal_id=principal_id,
+                    reason=receipt.reason,
+                )
+            )
+            await session.commit()
         return RememberResponse(
-            id=existing_id,
+            id=existing.id,
             status="deduped",
-            review_status=review_status,
-            memory_confidence=memory_confidence,
-            deduped_existing_id=existing_id,
+            review_status=existing.review_status,
+            memory_confidence=existing.memory_confidence,
+            deduped_existing_id=existing.id,
         )
 
-    provider = (
-        "caller"
-        if classification_result is None
-        else classification_result.provenance.get("provider", "rule")
-    )
+    provider = "caller"
+    if receipt is not None:
+        provider = str(receipt.provenance.get("provider", "rule"))
+    elif classification_result is not None:
+        provider = str(classification_result.provenance.get("provider", "rule"))
     provenance_payload: dict[str, Any] = {
-        "source": "explicit_kind" if classification_result is None else "auto_classified",
+        "source": (
+            "classification_receipt"
+            if receipt is not None
+            else "explicit_kind" if classification_result is None else "auto_classified"
+        ),
         "kind": kind,
         "wing": wing,
         "room": room,
@@ -627,22 +718,38 @@ async def remember(
         # classifier did not run and these are the untouched request/defaults).
         "source_type": req.source_type,
         "source_trust": source_trust,
+        "source_confidence_prior": default_confidence,
         "authority": int(authority),
         "authority_label": authority_label(authority),
         "default_memory_confidence": default_confidence,
         "final_memory_confidence": memory_confidence,
-        "memory_confidence_blended": memory_confidence_blended,
         "requested_visibility": req.visibility,
         "suggested_visibility": suggested_visibility,
         "final_visibility": final_visibility,
         "visibility_narrowed": visibility_narrowed,
     }
+    if receipt is not None:
+        provenance_payload.update(
+            {
+                "classification_run_id": str(receipt.id),
+                "classification_version": receipt.classification_version,
+                "retention_policy_version": receipt.retention_policy_version,
+                "taxonomy_confidence": receipt.taxonomy_confidence,
+                "confidence": receipt.taxonomy_confidence,
+                "retention_confidence": receipt.retention_confidence,
+                "retention_disposition": receipt.retention_disposition,
+                "classification_provenance": receipt.provenance,
+                "reason": receipt.reason,
+            }
+        )
     if classification_result is not None:
         classification_dump = classification_result.model_dump(exclude={"provenance"})
         provenance_payload["classification"] = classification_dump
         provenance_payload["classification_provenance"] = classification_result.provenance
         provenance_payload["reason"] = classification_result.reason
-    if classification_result is None:
+    if receipt is not None:
+        reason = receipt.reason
+    elif classification_result is None:
         reason = "explicit kind override"
     else:
         reason = classification_result.reason
@@ -1498,6 +1605,22 @@ async def supersede_item(
             "valid_to": None,
             "superseded_by": None,
             "created_at": now,
+        }
+    )
+    author_type = await session.scalar(
+        select(Principal.type).where(Principal.id == UUID(str(item["principal_id"])))
+    )
+    if author_type is None:
+        raise HTTPException(status_code=409, detail="Memory author no longer exists")
+    _, replacement_prior, _ = await resolve_trust_defaults(
+        session, tenant_id, str(item["source_type"]), author_type
+    )
+    replacement.update(
+        {
+            "source_confidence_prior": replacement_prior,
+            "retention_confidence": None,
+            "retention_disposition": None,
+            "retention_evidence_at": None,
         }
     )
     for key in (

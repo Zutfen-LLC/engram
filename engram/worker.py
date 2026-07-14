@@ -1357,6 +1357,11 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
     import json
 
     from engram.classification import classify
+    from engram.classification_evidence import (
+        bind_run,
+        bound_run_for_item,
+        new_run,
+    )
 
     item_id = _payload_item_id(job)
     # Phase 1: unlocked detection on a stale snapshot.
@@ -1366,6 +1371,9 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
         return
     if str(item.tenant_id) != str(job.tenant_id):
         raise RuntimeError(f"job tenant {job.tenant_id} != item tenant {item.tenant_id}")
+    if await bound_run_for_item(session, item_id) is not None:
+        logger.info("classification.refine id=%s skipped: evidence already bound", item_id)
+        return
 
     result = await classify(item.content, item.tenant_id, session)
     actor = await resolve_internal_system_actor(
@@ -1390,6 +1398,24 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
         return
     if str(locked_item.tenant_id) != str(job.tenant_id):
         return
+    if await bound_run_for_item(session, item_id, for_update=True) is not None:
+        logger.info(
+            "classification.refine id=%s skipped after lock: evidence already bound", item_id
+        )
+        return
+
+    run = new_run(
+        tenant_id=locked_item.tenant_id,
+        principal_id=actor,
+        memory_item_id=locked_item.id,
+        content=locked_item.content,
+        source_type=locked_item.source_type,
+        workspace_id=locked_item.workspace_id,
+        context=None,
+        result=result,
+    )
+    session.add(run)
+    bind_run(run, locked_item)
 
     # kind/wing/room only above the confidence threshold.
     if result.confidence >= settings.classification_confidence_threshold:
@@ -1436,28 +1462,6 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
             ):
                 changed = True
 
-    # memory_confidence: source-authority-capped candidate, monotonic-up (max)
-    # so refinement never destabilizes (ENG-AUD-005) AND is idempotent.
-    # Revalidate against the locked row's current memory_confidence — a
-    # concurrent PATCH may have changed importance, which does not directly
-    # set memory_confidence, but a concurrent refine or other writer could.
-    candidate = min(locked_item.source_trust, result.confidence)
-    blended = max(locked_item.memory_confidence, candidate)
-    if blended - locked_item.memory_confidence > settings.classification_refine_min_delta:  # noqa: SIM102
-        if await _guarded_field_update(
-            session,
-            item_id=item_id,
-            tenant_id=job.tenant_id,
-            field_name="memory_confidence",
-            old_value=locked_item.memory_confidence,
-            new_value=blended,
-            actor=actor,
-            reason=None,
-            provenance=provenance,
-            result_reason=result.reason,
-        ):
-            changed = True
-
     # Visibility: NARROW only (never widen). ENG-AUD-005.
     # Revalidate against the locked row's current visibility — a concurrent
     # PATCH may have already widened or narrowed it.
@@ -1478,31 +1482,49 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
         ):
             changed = True
 
-    if not changed:
-        # Record provenance that refinement ran and decided to change nothing,
-        # so a rerun is observably idempotent.
-        await _insert_event(
-            session,
-            item_id=item_id,
-            event_type="classification",
-            field_name="kind",
-            old_value=None,
-            new_value=json.dumps(
-                {
-                    "source": "llm_refine",
-                    "provider": result.provenance.get("provider", "openai"),
-                    "result": "no_change",
-                    "reason": result.reason,
-                    **provenance,
-                },
-                sort_keys=True,
-            ),
-            actor_principal_id=actor,
-            reason=json.dumps(
-                {**provenance, "reason": "LLM refine produced no change (idempotent)"},
-                sort_keys=True,
-            ),
-        )
+    final_visibility = (
+        result.suggested_visibility
+        if result.suggested_visibility is not None
+        and _can_narrow(locked_item.visibility, result.suggested_visibility)
+        else locked_item.visibility
+    )
+    await session.flush()
+    await _insert_event(
+        session,
+        item_id=item_id,
+        event_type="classification",
+        field_name="kind",
+        old_value=None,
+        new_value=json.dumps(
+            {
+                "source": "llm_refine",
+                "classification_run_id": str(run.id),
+                "classification_version": run.classification_version,
+                "retention_policy_version": run.retention_policy_version,
+                "source_type": locked_item.source_type,
+                "source_trust": locked_item.source_trust,
+                "source_confidence_prior": locked_item.source_confidence_prior,
+                "default_memory_confidence": locked_item.source_confidence_prior,
+                "final_memory_confidence": locked_item.memory_confidence,
+                "taxonomy_confidence": result.taxonomy_confidence,
+                "confidence": result.taxonomy_confidence,
+                "retention_confidence": result.retention_confidence,
+                "retention_disposition": result.retention_disposition,
+                "requested_visibility": locked_item.visibility,
+                "suggested_visibility": result.suggested_visibility,
+                "final_visibility": final_visibility,
+                "visibility_narrowed": final_visibility != locked_item.visibility,
+                "classification_provenance": result.provenance,
+                "provider": result.provenance.get("provider", "openai"),
+                "result": "changed" if changed else "no_change",
+                "reason": result.reason,
+                **provenance,
+            },
+            sort_keys=True,
+        ),
+        actor_principal_id=actor,
+        reason=json.dumps({**provenance, "reason": result.reason}, sort_keys=True),
+    )
 
     await session.commit()
 
@@ -1521,10 +1543,15 @@ async def handle_promotion_path_a(session: AsyncSession, job: Job) -> None:
 
 
 async def handle_retention_sweep(session: AsyncSession, job: Job) -> None:
-    """Retention sweep stub (retention logic not implemented). Idempotent no-op."""
+    """Boundedly remove expired, unbound classification receipts."""
+    from engram.classification_evidence import cleanup_expired_unbound_runs
+
+    removed = await cleanup_expired_unbound_runs(session, job.tenant_id)
+    await session.commit()
     logger.info(
-        "retention.sweep tenant=%s: no-op (retention logic deferred)",
+        "retention.sweep tenant=%s: removed_expired_classification_runs=%s",
         job.tenant_id,
+        removed,
     )
 
 

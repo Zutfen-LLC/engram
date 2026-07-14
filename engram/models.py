@@ -136,6 +136,12 @@ class MemoryItem(Base):
     review_status: Mapped[str] = mapped_column(String(20), default="proposed")
     memory_confidence: Mapped[float] = mapped_column(Float, default=0.5)
     source_trust: Mapped[float] = mapped_column(Float, default=0.5)
+    source_confidence_prior: Mapped[float | None] = mapped_column(Float, nullable=True)
+    retention_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    retention_disposition: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    retention_evidence_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     authority: Mapped[int] = mapped_column(
         SmallInteger, default=10, server_default=text("10"), nullable=False
     )
@@ -362,6 +368,49 @@ class ItemEvent(Base):
     )
 
     item: Mapped[MemoryItem] = relationship(back_populates="events")
+
+
+class ClassificationRun(Base):
+    """Server-attested, tenant-scoped classification and retention evidence."""
+
+    __tablename__ = "classification_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    principal_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("principals.id", ondelete="CASCADE"), nullable=False
+    )
+    memory_item_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("memory_items.id", ondelete="SET NULL"),
+        nullable=True,
+        unique=True,
+    )
+    content_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    canonicalization_version: Mapped[str] = mapped_column(Text, nullable=False)
+    source_type: Mapped[str] = mapped_column(Text, nullable=False)
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True
+    )
+    context_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    context_length: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    suggested_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    suggested_wing: Mapped[str | None] = mapped_column(Text, nullable=True)
+    suggested_room: Mapped[str | None] = mapped_column(Text, nullable=True)
+    suggested_visibility: Mapped[str | None] = mapped_column(Text, nullable=True)
+    taxonomy_confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    retention_confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    retention_disposition: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    provenance: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    classification_version: Mapped[str] = mapped_column(Text, nullable=False)
+    retention_policy_version: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class ClassificationRule(Base):

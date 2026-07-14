@@ -197,6 +197,9 @@ auto_promote_min_age_hours
 Trust is not binary. Every memory carries:
 
 * **source_trust** — trust in where the memory came from
+* **source_confidence_prior** — immutable write-time confidence selected from source policy
+* **taxonomy_confidence** — confidence that kind/wing/room classification is correct
+* **retention_confidence** — positive evidence that content is atomic, faithful, and durable
 * **authority** — immutable governance rank derived from provenance (inferred 10,
   untrusted agent 20, trusted agent 30, trusted import 40, explicit user 50)
 
@@ -211,7 +214,9 @@ Authority hierarchy governs supersession. A lower-authority source can never sil
 
 Supersession is **atomic**: expiring the original and inserting the replacement happen in one transaction (the original is expired *before* the replacement is inserted, so the dedup unique index can never see both as active), and a failure between the two rolls back the original's expiration. The original points forward to its replacement (`superseded_by`), the replacement records what it replaced (`item_events`), and supersede behavior is covered by Postgres-backed tests that enforce the real unique index and RLS policies.
 
-`memory_confidence` starts from source-type defaults (see the table in [`docs/design.md`](docs/design.md) §4). When `/v1/remember` auto-classifies a write, the classifier's confidence **refines** that default — but source authority caps how far a low-trust automated source can promote itself, so a confident classifier can pull a weak capture *down* without letting it self-promote *up*. See [Classification](#classification) below.
+`memory_confidence` starts from source-type defaults (see [`docs/design.md`](docs/design.md)
+§4). Taxonomy classification does not change it. New writes also preserve that selected default in
+`source_confidence_prior`; existing rows remain `NULL` rather than being historically reinterpreted.
 
 ### Recall
 
@@ -402,18 +407,18 @@ integration.
 
 Two endpoints serve classification with distinct roles:
 
-* **`POST /v1/classify`** returns *suggestions* — suggested kind, wing, room, an advisory `suggested_visibility`, and the classifier's true `confidence`. It never stores anything or applies trust policy.
-* **`POST /v1/remember`** applies the *safe storage policy* when it auto-classifies a write (i.e. when the caller omits `kind`).
+* **`POST /v1/classify`** returns taxonomy suggestions plus independent retention evidence and stores a one-hour, server-attested receipt. `confidence` remains a deprecated alias of `taxonomy_confidence`.
+* **`POST /v1/remember`** may bind that receipt with `classification_run_id`; write scope is still required and the server validates principal, content, source, workspace, expiry, and kind.
 
-Classifier confidence is a real `0.0–0.95` signal — low values are preserved rather than floored, so a doubtful classification can actually lower a memory's confidence. When `/v1/remember` classifies, it blends classifier confidence into the stored `memory_confidence`:
-
-* **Automated sources** (`sync_turn`, `pre_compress`, `extraction`) feel classification strongly (0.5·default + 0.5·classifier) — a confident classifier is their main quality signal.
-* **Authoritative sources** (`manual`, `import`, `migration`) are barely moved by uncertain taxonomy classification (0.85·default + 0.15·classifier), so a high-trust manual write isn't downrated just because the classifier was unsure about *kind*.
-* The result is **capped by source authority** (`max(default, source_trust)`), so a low-trust automated source can never self-promote past a safe ceiling, then clamped to `[0, 1]`.
+Taxonomy and retention confidences are separately clamped to `0.0–0.95`. Retention dispositions are
+`retain`, `transient`, `noise`, or `uncertain`. Retention evidence is not external-truth verification,
+does not affect recall ranking, and does not authorize a write.
 
 The classifier's `suggested_visibility` is applied **downward only** — it may narrow the requested scope (e.g. `tenant` → `private`) but never widen it. Invalid or absent suggestions preserve the caller's requested visibility unchanged.
 
-Every classified write records a `classification` event with full provenance: classifier confidence and raw confidence, default vs. final `memory_confidence`, requested/suggested/final visibility, whether visibility was narrowed, and whether confidence was blended. Content is never mutated.
+Every receipt-bound write records its receipt/version, both confidence layers, source prior,
+visibility decision, reason, and provider provenance. Content is never mutated. Promotion Path A v2
+scoring and evidence gates are intentionally deferred to the next program PR.
 
 Seed classification rules are intentionally conservative: "skip" rules are whole-message *status-only* matchers (bare `ok`, `done`, `passed`) that don't fire on status words inside meaningful sentences, and doctrine classification requires explicit policy/invariant phrasing rather than casual modal verbs.
 

@@ -35,7 +35,10 @@ class ContextRecordingClient:
     ) -> SimpleNamespace:
         self.classify_calls.append({"content": content, "context": context, **kw})
         return SimpleNamespace(
-            confidence=self._confidence,
+            taxonomy_confidence=self._confidence,
+            retention_confidence=self._confidence,
+            retention_disposition="retain",
+            classification_run_id="run-id",
             suggested_kind="fact",
             suggested_wing=None,
             suggested_room=None,

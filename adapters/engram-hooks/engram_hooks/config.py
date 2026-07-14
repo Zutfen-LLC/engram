@@ -115,13 +115,10 @@ class HooksConfig:
     )
     volatile_cap: int = field(default_factory=lambda: _env_int("ENGRAM_HOOKS_VOLATILE_CAP", 2000))
 
-    # Promotion gate. classify() returns a confidence in [0,1]; items at or above
-    # this threshold are written to Engram as ``proposed`` (the service then
-    # applies its own auto-promotion gate at 0.7). Below it, candidates land in
-    # the local volatile store instead — matching the "promotion gates" AC.
-    promote_confidence_threshold: float = field(
-        default_factory=lambda: _env_float("ENGRAM_HOOKS_PROMOTE_THRESHOLD", 0.6)
-    )
+    # Durable-storage gate. The old promote name is accepted for one release;
+    # it was misleading because this layer only remembers items as proposed.
+    store_confidence_threshold: float | None = None
+    promote_confidence_threshold: float | None = None
 
     # Workspace/visibility defaults applied when Engram classify doesn't supply
     # wing/room/visibility. ``workspace`` is forwarded to remember() so writes
@@ -149,6 +146,22 @@ class HooksConfig:
     require_automatic_capture: bool = field(
         default_factory=lambda: _env_bool("ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE", False)
     )
+
+    def __post_init__(self) -> None:
+        import os
+
+        if self.store_confidence_threshold is None:
+            if "ENGRAM_HOOKS_STORE_THRESHOLD" in os.environ:
+                self.store_confidence_threshold = _env_float(
+                    "ENGRAM_HOOKS_STORE_THRESHOLD", 0.65
+                )
+            elif self.promote_confidence_threshold is not None:
+                self.store_confidence_threshold = self.promote_confidence_threshold
+            else:
+                self.store_confidence_threshold = _env_float(
+                    "ENGRAM_HOOKS_PROMOTE_THRESHOLD", 0.65
+                )
+        self.promote_confidence_threshold = self.store_confidence_threshold
 
     def source_type_for(
         self, event: str

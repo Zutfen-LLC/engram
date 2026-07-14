@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 SourceKind = Literal[
     "manual", "import", "migration", "extraction", "sync_turn", "pre_compress", "session_end"
@@ -41,6 +41,7 @@ class RememberRequest(BaseModel):
     sensitivity: SensitivityKind = "normal"
     external_id: str | None = None
     external_source: str | None = None
+    classification_run_id: UUID | None = None
 
 
 class RememberResponse(BaseModel):
@@ -102,16 +103,27 @@ class ClassifyRequest(BaseModel):
     content: str
     context: str | None = None
     workspace: str | None = None
+    source_type: SourceKind = "manual"
 
 
 class ClassifyResponse(BaseModel):
+    classification_run_id: UUID
+    expires_at: datetime
     suggested_kind: str
     suggested_wing: str | None = None
     suggested_room: str | None = None
     suggested_visibility: str | None = None
+    taxonomy_confidence: float
     confidence: float
+    retention_confidence: float
+    retention_disposition: Literal["retain", "transient", "noise", "uncertain"]
     reason: str
     rules_matched: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def keep_legacy_confidence_alias_equal(self) -> ClassifyResponse:
+        self.confidence = self.taxonomy_confidence
+        return self
 
 
 # ---- /v1/kg ----

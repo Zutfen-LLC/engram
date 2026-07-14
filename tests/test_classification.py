@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
+from datetime import UTC, datetime
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -77,6 +80,7 @@ async def _clean_db():
     async with _test_engine.begin() as conn:
         await conn.execute(text("DELETE FROM item_events"))
         await conn.execute(text("DELETE FROM memory_embeddings"))
+        await conn.execute(text("DELETE FROM classification_runs"))
         await conn.execute(text("DELETE FROM memory_items"))
 
 
@@ -127,6 +131,170 @@ async def test_rule_based_classification_without_llm(client):
     assert "kind_preference" in body["rules_matched"]
     assert body["suggested_visibility"] is None
     assert body["reason"]
+
+
+async def test_classify_persists_attested_receipt_without_raw_context(client):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    settings.classification_provider = "none"
+    context = "exact context that must not be stored"
+    before = datetime.now(UTC)
+    response = await client.post(
+        "/v1/classify",
+        json={
+            "content": "User prefers dark mode",
+            "context": context,
+            "source_type": "sync_turn",
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["confidence"] == body["taxonomy_confidence"]
+    assert body["retention_disposition"] == "uncertain"
+    async with _test_engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text("SELECT * FROM classification_runs WHERE id = :id"),
+                {"id": body["classification_run_id"]},
+            )
+        ).mappings().one()
+    assert row["source_type"] == "sync_turn"
+    assert row["context_hash"] == hashlib.sha256(context.encode()).hexdigest()
+    assert row["context_length"] == len(context)
+    assert row["canonicalization_version"] == "canonical-v1"
+    assert row["classification_version"] == "classification-v2"
+    assert row["retention_policy_version"] == "retention-v1"
+    assert row["expires_at"] >= before
+    assert (row["expires_at"] - row["created_at"]).total_seconds() == 3600
+    assert context not in json.dumps(row["provenance"])
+
+
+async def test_receipt_bound_remember_uses_server_evidence_and_source_prior(client):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    settings.classification_provider = "none"
+    classified = await client.post(
+        "/v1/classify",
+        json={"content": "User prefers dark mode", "source_type": "sync_turn"},
+    )
+    receipt_id = classified.json()["classification_run_id"]
+    remembered = await client.post(
+        "/v1/remember",
+        json={
+            "content": "User prefers dark mode",
+            "source_type": "sync_turn",
+            "classification_run_id": receipt_id,
+            "retention_confidence": 0.95,
+            "retention_disposition": "retain",
+        },
+    )
+    assert remembered.status_code == 201
+    assert remembered.json()["memory_confidence"] == pytest.approx(0.4)
+    async with _test_engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT m.source_confidence_prior,m.retention_confidence,"
+                    "m.retention_disposition,r.memory_item_id "
+                    "FROM memory_items m JOIN classification_runs r ON r.memory_item_id=m.id "
+                    "WHERE r.id=:id"
+                ),
+                {"id": receipt_id},
+            )
+        ).mappings().one()
+    assert row["source_confidence_prior"] == pytest.approx(0.4)
+    assert row["retention_confidence"] == 0.0
+    assert row["retention_disposition"] == "uncertain"
+
+
+async def test_receipt_content_and_kind_mismatch_are_rejected(client):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    settings.classification_provider = "none"
+    classified = await client.post(
+        "/v1/classify", json={"content": "User prefers dark mode"}
+    )
+    receipt_id = classified.json()["classification_run_id"]
+    content_mismatch = await client.post(
+        "/v1/remember",
+        json={"content": "different", "classification_run_id": receipt_id},
+    )
+    assert content_mismatch.status_code == 422
+    kind_mismatch = await client.post(
+        "/v1/remember",
+        json={
+            "content": "User prefers dark mode",
+            "kind": "fact",
+            "classification_run_id": receipt_id,
+        },
+    )
+    assert kind_mismatch.status_code == 422
+
+
+async def test_concurrent_same_receipt_is_idempotent(client):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    classified = await client.post(
+        "/v1/classify", json={"content": "Concurrent receipt identity"}
+    )
+    receipt_id = classified.json()["classification_run_id"]
+    payload = {
+        "content": "Concurrent receipt identity",
+        "classification_run_id": receipt_id,
+    }
+    first, second = await asyncio.gather(
+        client.post("/v1/remember", json=payload),
+        client.post("/v1/remember", json=payload),
+    )
+    assert first.status_code == second.status_code == 201
+    assert first.json()["id"] == second.json()["id"]
+    async with _test_engine.connect() as conn:
+        counts = (
+            await conn.execute(
+                text(
+                    "SELECT (SELECT count(*) FROM memory_items WHERE content_hash=("
+                    "SELECT content_hash FROM classification_runs WHERE id=:id)), "
+                    "(SELECT count(*) FROM item_events WHERE item_id=("
+                    "SELECT memory_item_id FROM classification_runs WHERE id=:id) "
+                    "AND event_type='classification')"
+                ),
+                {"id": receipt_id},
+            )
+        ).one()
+    assert tuple(counts) == (1, 1)
+
+
+async def test_concurrent_different_receipts_have_one_conflict_loser(client):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    content = "Two receipts one dedup identity"
+    one, two = await asyncio.gather(
+        client.post("/v1/classify", json={"content": content}),
+        client.post("/v1/classify", json={"content": content}),
+    )
+    responses = await asyncio.gather(
+        client.post(
+            "/v1/remember",
+            json={"content": content, "classification_run_id": one.json()["classification_run_id"]},
+        ),
+        client.post(
+            "/v1/remember",
+            json={"content": content, "classification_run_id": two.json()["classification_run_id"]},
+        ),
+    )
+    assert sorted(response.status_code for response in responses) == [201, 409]
+    async with _test_engine.connect() as conn:
+        bound = await conn.scalar(
+            text(
+                "SELECT count(*) FROM classification_runs "
+                "WHERE id IN (:one,:two) AND memory_item_id IS NOT NULL"
+            ),
+            {
+                "one": one.json()["classification_run_id"],
+                "two": two.json()["classification_run_id"],
+            },
+        )
+    assert bound == 1
 
 
 async def test_llm_enriched_classification_uses_taxonomy_and_vocab(client, monkeypatch):

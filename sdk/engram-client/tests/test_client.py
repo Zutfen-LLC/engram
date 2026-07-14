@@ -283,22 +283,31 @@ async def test_search_success() -> None:
 async def test_classify_success() -> None:
     rec = _Recorder(
         payload={
+            "classification_run_id": ITEM_ID,
+            "expires_at": "2026-07-14T13:00:00Z",
             "suggested_kind": "invariant",
             "suggested_wing": "engineering",
             "suggested_room": "conventions",
+            "taxonomy_confidence": 0.82,
             "confidence": 0.82,
+            "retention_confidence": 0.91,
+            "retention_disposition": "retain",
             "reason": "rule: 'always'",
             "rules_matched": ["always_keyword"],
         },
     )
     async with _client(rec) as client:
-        resp = await client.classify("always use lowercase", context="chat excerpt")
+        resp = await client.classify(
+            "always use lowercase", context="chat excerpt", source_type="sync_turn"
+        )
     assert isinstance(resp, ClassifyResponse)
     assert resp.suggested_kind == "invariant"
     assert resp.confidence == pytest.approx(0.82)
+    assert resp.taxonomy_confidence == resp.confidence
     body = _body(rec.request)
     assert body["content"] == "always use lowercase"
     assert body["context"] == "chat excerpt"
+    assert body["source_type"] == "sync_turn"
 
 
 # ---- kg_add ----

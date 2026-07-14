@@ -13,7 +13,13 @@ class RecordingClient:
 
     async def classify(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
         return SimpleNamespace(
-            confidence=0.9, suggested_kind="fact", suggested_wing=None, suggested_room=None
+            taxonomy_confidence=0.9,
+            retention_confidence=0.9,
+            retention_disposition="retain",
+            classification_run_id="run-id",
+            suggested_kind="fact",
+            suggested_wing=None,
+            suggested_room=None,
         )
 
     async def remember(self, content: str, **kwargs: Any) -> SimpleNamespace:
@@ -42,5 +48,6 @@ async def test_session_end_routes_dedicated_source_type(tmp_path) -> None:
             "room": None,
             "workspace": None,
             "source_type": "session_end",
+            "classification_run_id": "run-id",
         }
     ]

@@ -570,6 +570,10 @@ have `BYPASSRLS`) so cross-tenant CLI scans (`promote-proposed`,
 `backfill-embeddings`) and `bootstrap-key` work — `FORCE ROW LEVEL SECURITY`
 applies to the owner too, and only superusers / `BYPASSRLS` roles bypass it.
 
+Hermes lifecycle deployments should set `ENGRAM_HOOKS_STORE_THRESHOLD` (default `0.65`) to
+the minimum retention confidence for remembering a `retain` candidate as proposed.
+`ENGRAM_HOOKS_PROMOTE_THRESHOLD` is accepted as a deprecated fallback for one release.
+
 ---
 
 ## 9. Troubleshooting

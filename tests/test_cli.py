@@ -279,7 +279,8 @@ async def test_cli_worker_once_processes_one_job():
             tenant_id = (
                 await session.execute(text("SELECT id::text FROM tenants WHERE slug = 'default'"))
             ).scalar_one()
-            # retention.sweep is a documented no-op handler, ideal for a smoke test.
+            # retention.sweep performs bounded expired-receipt cleanup and is
+            # still a safe, idempotent worker smoke target.
             await enqueue_job(
                 session,
                 tenant_id=tenant_id,
@@ -292,6 +293,7 @@ async def test_cli_worker_once_processes_one_job():
             session_factory=factory,
             app_session_factory=factory,
             worker_id="cli-test",
+            job_types=["retention.sweep"],
         )
         assert rc == 0
 
@@ -402,4 +404,3 @@ def test_configure_worker_logging_falls_back_on_invalid_level(
     _configure_worker_logging()
 
     assert logger.level == logging.INFO
-

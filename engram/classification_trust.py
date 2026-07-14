@@ -1,8 +1,9 @@
 """Write-path trust policy for classification output.
 
 Pure functions — no DB or FastAPI dependencies. These decide how a
-``ClassificationResult`` is allowed to influence stored trust when ``/v1/remember``
-auto-classifies a memory:
+``ClassificationResult`` historically influenced stored trust when ``/v1/remember``
+auto-classified a memory. The blend helper remains import-compatible but production
+classification no longer calls it:
 
 * classifier ``confidence`` may **refine** ``memory_confidence``, but source
   authority caps how far a low-trust automated source can self-promote;
@@ -66,7 +67,7 @@ def blend_memory_confidence(
     source_trust: float,
     source_type: str,
 ) -> tuple[float, bool]:
-    """Blend classifier confidence into the source-default ``memory_confidence``.
+    """Deprecated compatibility helper; production classification does not call it.
 
     Policy:
     * Automated sources (``sync_turn`` / ``pre_compress`` / ``extraction``) feel

@@ -9,11 +9,11 @@ import time
 from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, Literal, cast
 from uuid import UUID
 
 from openai import AsyncOpenAI
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, computed_field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,6 +21,8 @@ from engram.config import settings
 from engram.memory_kinds import DEFAULT_KIND_TAXONOMY as _DEFAULT_KIND_TAXONOMY
 from engram.memory_kinds import get_enabled_memory_kinds
 from engram.models import ClassificationRule, MemoryItem
+
+RetentionDisposition = Literal["retain", "transient", "noise", "uncertain"]
 
 
 class ClassificationResult(BaseModel):
@@ -33,10 +35,22 @@ class ClassificationResult(BaseModel):
     # ``/v1/classify`` returns it as a suggestion. ``None`` means "no suggestion"
     # and the caller's requested visibility is preserved.
     suggested_visibility: str | None = None
-    confidence: float = Field(ge=0.0, le=1.0)
+    taxonomy_confidence: float = Field(
+        ge=0.0,
+        le=0.95,
+        validation_alias=AliasChoices("taxonomy_confidence", "confidence"),
+    )
+    retention_confidence: float = Field(default=0.0, ge=0.0, le=0.95)
+    retention_disposition: RetentionDisposition = "uncertain"
     reason: str
     rules_matched: list[str] = Field(default_factory=list)
     provenance: dict[str, Any] = Field(default_factory=dict)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def confidence(self) -> float:
+        """Deprecated compatibility alias for taxonomy confidence."""
+        return self.taxonomy_confidence
 
 
 async def classify(
@@ -74,7 +88,13 @@ async def classify(
     except Exception as exc:  # pragma: no cover - defensive fallback
         fallback = dict(rule_result.provenance)
         fallback.update({"provider": "openai", "mode": "fallback", "error": str(exc)})
-        return rule_result.model_copy(update={"provenance": fallback})
+        return rule_result.model_copy(
+            update={
+                "retention_confidence": 0.0,
+                "retention_disposition": "uncertain",
+                "provenance": fallback,
+            }
+        )
 
     return _apply_llm_payload(
         llm_payload,
@@ -430,7 +450,9 @@ def _classify_rules(
             suggested_kind="fact",
             suggested_wing=None,
             suggested_room=None,
-            confidence=0.6,
+            taxonomy_confidence=0.6,
+            retention_confidence=0.0,
+            retention_disposition="noise",
             reason=reason,
             rules_matched=matched_rules,
             provenance=provenance,
@@ -449,7 +471,9 @@ def _classify_rules(
             suggested_kind="fact",
             suggested_wing=None,
             suggested_room=None,
-            confidence=0.6,
+            taxonomy_confidence=0.6,
+            retention_confidence=0.0,
+            retention_disposition="uncertain",
             reason=reason,
             rules_matched=matched_rules,
             provenance=provenance,
@@ -468,7 +492,9 @@ def _classify_rules(
         suggested_kind=kind or "fact",
         suggested_wing=wing,
         suggested_room=room,
-        confidence=confidence,
+        taxonomy_confidence=min(confidence, 0.95),
+        retention_confidence=0.0,
+        retention_disposition="uncertain",
         reason=reason,
         rules_matched=matched_rules,
         provenance=provenance,
@@ -518,7 +544,12 @@ def _build_prompt(
     payload = {
         "task": (
             "Classify a memory item. Be conservative: if uncertain, choose kind='fact' "
-            "with lower confidence rather than over-promoting."
+            "with lower taxonomy confidence rather than over-promoting. "
+            "Estimate how strongly this candidate deserves durable memory. It must be an "
+            "atomic, faithful representation of the supplied context, remain useful beyond "
+            "the current turn or command, and not merely report transient status, tool "
+            "chatter, or an uncommitted possibility. Do not assess whether it is externally "
+            "true beyond the supplied context."
         ),
         "taxonomy": {
             "kinds": taxonomy,
@@ -534,7 +565,9 @@ def _build_prompt(
             "suggested_wing": "str|null",
             "suggested_room": "str|null",
             "suggested_visibility": "one of private|workspace|tenant|public, or null",
-            "confidence": "number 0.0-0.95 (low values are allowed and meaningful)",
+            "taxonomy_confidence": "number 0.0-0.95",
+            "retention_confidence": "number 0.0-0.95; positive case for durable retention",
+            "retention_disposition": "one of retain|transient|noise|uncertain",
             "reason": "str",
             "rules_matched": "list[str]",
         },
@@ -544,7 +577,7 @@ def _build_prompt(
             "Use wing/room values from the provided vocabulary when possible.",
             "suggested_visibility is advisory; narrow it when the content looks "
             "sensitive/personal, or null when you have no opinion.",
-            "Confidence may be any value in 0.0-0.95. Low confidence is a real "
+            "Taxonomy confidence may be any value in 0.0-0.95. Low confidence is a real "
             "signal — express doubt rather than flooring it.",
             "If uncertain, prefer fact and a lower confidence.",
             "Kind definitions:",
@@ -612,16 +645,34 @@ def _apply_llm_payload(
     wing = _normalize_vocab_value(raw_wing, wings)
     room = _normalize_vocab_value(raw_room, rooms)
 
-    # Confidence is a real 0.0-0.95 signal: it is no longer floored to 0.7, so a
-    # doubtful classifier result (e.g. 0.35) survives and can lower the stored
-    # memory_confidence downstream. Missing/unparseable confidence defaults to a
-    # neutral 0.5 rather than the old 0.7 floor.
+    # Taxonomy confidence is independent from retention evidence. Accept the
+    # legacy provider key during the output-schema transition.
     raw_confidence: float | None
     try:
-        raw_confidence = float(payload.get("confidence", 0.5))
+        raw_confidence = float(
+            payload.get("taxonomy_confidence", payload.get("confidence", 0.5))
+        )
     except (TypeError, ValueError):
         raw_confidence = 0.5
     confidence = _clamp(raw_confidence, 0.0, 0.95)
+
+    raw_retention = payload.get("retention_confidence")
+    retention_valid = True
+    try:
+        if raw_retention is None:
+            raise TypeError
+        retention_confidence = _clamp(float(raw_retention), 0.0, 0.95)
+    except (TypeError, ValueError):
+        retention_valid = False
+        retention_confidence = 0.0
+    raw_disposition = payload.get("retention_disposition")
+    disposition: RetentionDisposition
+    if raw_disposition in {"retain", "transient", "noise", "uncertain"}:
+        disposition = cast(RetentionDisposition, raw_disposition)
+    else:
+        disposition = "uncertain"
+    if disposition == "retain" and not retention_valid:
+        disposition = "uncertain"
 
     # Suggested visibility is advisory; validated against the enum. Invalid /
     # unknown values are dropped to None so the caller preserves the requested
@@ -640,13 +691,18 @@ def _apply_llm_payload(
             "mode": "llm",
             "model": settings.classification_model,
             "threshold": settings.classification_confidence_threshold,
+            "raw_provider_payload": payload,
             "llm_payload": {
                 "suggested_kind": kind,
                 "suggested_wing": wing,
                 "suggested_room": room,
                 "suggested_visibility": suggested_visibility,
-                "raw_confidence": raw_confidence,
+                "raw_taxonomy_confidence": raw_confidence,
+                "taxonomy_confidence": confidence,
                 "confidence": confidence,
+                "raw_retention_confidence": raw_retention,
+                "retention_confidence": retention_confidence,
+                "retention_disposition": disposition,
                 "rules_matched": rules_matched,
             },
         }
@@ -661,9 +717,8 @@ def _apply_llm_payload(
         kind = "fact"
         wing = rule_result.suggested_wing or wing
         room = rule_result.suggested_room or room
-        # Do NOT re-floor confidence above the threshold. The whole point of
-        # removing the 0.7 floor is that a doubtful result stays doubtful, so the
-        # downstream confidence blend can lower memory_confidence appropriately.
+        # Do not re-floor confidence above the threshold. A doubtful taxonomy
+        # result remains doubtful without changing overall memory confidence.
 
     # Rule precedence: when a priority-1 builtin rule matched a non-fact kind
     # (e.g. invariant) and the LLM disagreed, defer to the rule.  Priority-1
@@ -692,7 +747,9 @@ def _apply_llm_payload(
         suggested_wing=wing,
         suggested_room=room,
         suggested_visibility=suggested_visibility,
-        confidence=confidence,
+        taxonomy_confidence=confidence,
+        retention_confidence=retention_confidence,
+        retention_disposition=disposition,
         reason=reason,
         rules_matched=rules_matched,
         provenance=provenance,

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import UTC, datetime, timedelta
 from typing import cast
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -65,10 +66,15 @@ def build_mock_client() -> AsyncMock:
         total=1,
     )
     client.classify.return_value = engram_client.ClassifyResponse(
+        classification_run_id=OTHER_ID,
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
         suggested_kind="invariant",
         suggested_wing="engineering",
         suggested_room="conventions",
+        taxonomy_confidence=0.82,
         confidence=0.82,
+        retention_confidence=0.9,
+        retention_disposition="retain",
         reason="rule: 'always'",
         rules_matched=["always_keyword"],
     )

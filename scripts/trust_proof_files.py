@@ -123,6 +123,7 @@ WORKER_CONCURRENCY_PROOFS = (
 # ── Classification ──────────────────────────────────────────────────
 # Trust policy, LLM refinement, async worker
 CLASSIFICATION_PROOFS = (
+    "tests/test_classification_evidence_migration.py",
     "tests/test_classification_trust.py",
     "tests/test_classification.py",
     "tests/test_worker_classification.py",
