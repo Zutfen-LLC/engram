@@ -49,22 +49,22 @@ jobs:
             exit 1
           fi
 
-          # The worker command must be 'engram worker' (no inline poll-interval).
-          WORKER_CMD=$(docker compose config --json engram-worker \
-            | python -c "import sys,json; d=json.load(sys.stdin); print(' '.join(d.get('command',[])))")
-          echo "Worker command: $WORKER_CMD"
-          if [ "$WORKER_CMD" != "engram worker" ]; then
-            echo "ERROR: engram-worker command should be 'engram worker', got '$WORKER_CMD'"
-            exit 1
-          fi
+          # The worker command must be 'engram worker' (no inline poll-interval)
+          # and it must not publish any ports. Parse the resolved YAML with
+          # python3 (python is not guaranteed on the runner).
+          docker compose config \
+            | python3 -c "
+          import sys, yaml
+          cfg = yaml.safe_load(sys.stdin)
+          worker = cfg['services']['engram-worker']
 
-          # The worker must not publish any ports.
-          PORTS=$(docker compose config --json engram-worker \
-            | python -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('ports',[])))")
-          echo "Worker published ports: $PORTS"
-          if [ "$PORTS" != "0" ]; then
-            echo "ERROR: engram-worker should not publish any ports"
-            exit 1
-          fi
+          cmd = ' '.join(worker.get('command', []))
+          print(f'Worker command: {cmd}')
+          assert cmd == 'engram worker', f'expected \"engram worker\", got \"{cmd}\"'
+
+          ports = worker.get('ports', [])
+          print(f'Worker published ports: {len(ports)}')
+          assert len(ports) == 0, f'expected no ports, got {ports}'
+          "
 
           echo "All worker assertions passed."
