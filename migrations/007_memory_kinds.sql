@@ -71,32 +71,34 @@ CREATE INDEX IF NOT EXISTS idx_memory_kinds_tenant_enabled
 INSERT INTO memory_kinds (
     tenant_id, name, display_name, description, is_builtin, enabled,
     singleton, stays_in_recall_when_disputed, requires_review,
-    default_importance, sort_order
+    auto_promote_from_inferred, default_importance, sort_order
 )
 SELECT
     t.id, k.name, k.display_name, k.description, TRUE, TRUE,
-    k.singleton, k.stays, k.requires_review, k.default_importance, k.sort_order
+    k.singleton, k.stays, k.requires_review, k.auto_promote,
+    k.default_importance, k.sort_order
 FROM tenants t
 CROSS JOIN (VALUES
     ('fact',        'Fact',        'An observed or stated fact.',
-        FALSE, FALSE, FALSE, 0.5::double precision, 10),
+        FALSE, FALSE, FALSE, TRUE, 0.5::double precision, 10),
     ('preference',  'Preference',  'A stated preference or convention.',
-        TRUE,  FALSE, FALSE, 0.5, 20),
+        TRUE,  FALSE, FALSE, FALSE, 0.5, 20),
     ('doctrine',    'Doctrine',    'A standing policy or rule that governs behavior.',
-        FALSE, TRUE,  TRUE,  0.7, 30),
+        FALSE, TRUE,  TRUE,  FALSE, 0.7, 30),
     ('decision',    'Decision',    'A decision that was made and should be remembered.',
-        FALSE, FALSE, TRUE,  0.6, 40),
+        FALSE, FALSE, TRUE,  TRUE, 0.6, 40),
     ('invariant',   'Invariant',   'A rule that must always hold; violations are high-stakes.',
-        TRUE,  TRUE,  TRUE,  0.8, 50),
+        TRUE,  TRUE,  TRUE,  FALSE, 0.8, 50),
     ('observation', 'Observation', 'Something noticed but not yet trusted or reviewed.',
-        FALSE, FALSE, FALSE, 0.4, 60),
+        FALSE, FALSE, FALSE, TRUE, 0.4, 60),
     ('diary_entry', 'Diary Entry', 'A private agent diary entry.',
-        FALSE, FALSE, FALSE, 0.4, 70),
+        FALSE, FALSE, FALSE, FALSE, 0.4, 70),
     ('procedure',   'Procedure',   'A how-to, runbook, or operational procedure.',
-        FALSE, FALSE, FALSE, 0.5, 80),
+        FALSE, FALSE, FALSE, TRUE, 0.5, 80),
     ('summary',     'Summary',     'A condensed summary derived from other memories.',
-        FALSE, FALSE, FALSE, 0.4, 90)
-) AS k(name, display_name, description, singleton, stays, requires_review, default_importance, sort_order)
+        FALSE, FALSE, FALSE, TRUE, 0.4, 90)
+) AS k(name, display_name, description, singleton, stays, requires_review,
+       auto_promote, default_importance, sort_order)
 ON CONFLICT (tenant_id, name) DO NOTHING;
 
 -- ============ 2b. Auto-seed builtin kinds for every FUTURE tenant ============
@@ -114,31 +116,33 @@ BEGIN
     INSERT INTO memory_kinds (
         tenant_id, name, display_name, description, is_builtin, enabled,
         singleton, stays_in_recall_when_disputed, requires_review,
-        default_importance, sort_order
+        auto_promote_from_inferred, default_importance, sort_order
     )
     SELECT
         NEW.id, k.name, k.display_name, k.description, TRUE, TRUE,
-        k.singleton, k.stays, k.requires_review, k.default_importance, k.sort_order
+        k.singleton, k.stays, k.requires_review, k.auto_promote,
+        k.default_importance, k.sort_order
     FROM (VALUES
         ('fact',        'Fact',        'An observed or stated fact.',
-            FALSE, FALSE, FALSE, 0.5::double precision, 10),
+            FALSE, FALSE, FALSE, TRUE, 0.5::double precision, 10),
         ('preference',  'Preference',  'A stated preference or convention.',
-            TRUE,  FALSE, FALSE, 0.5, 20),
+            TRUE,  FALSE, FALSE, FALSE, 0.5, 20),
         ('doctrine',    'Doctrine',    'A standing policy or rule that governs behavior.',
-            FALSE, TRUE,  TRUE,  0.7, 30),
+            FALSE, TRUE,  TRUE,  FALSE, 0.7, 30),
         ('decision',    'Decision',    'A decision that was made and should be remembered.',
-            FALSE, FALSE, TRUE,  0.6, 40),
+            FALSE, FALSE, TRUE,  TRUE, 0.6, 40),
         ('invariant',   'Invariant',   'A rule that must always hold; violations are high-stakes.',
-            TRUE,  TRUE,  TRUE,  0.8, 50),
+            TRUE,  TRUE,  TRUE,  FALSE, 0.8, 50),
         ('observation', 'Observation', 'Something noticed but not yet trusted or reviewed.',
-            FALSE, FALSE, FALSE, 0.4, 60),
+            FALSE, FALSE, FALSE, TRUE, 0.4, 60),
         ('diary_entry', 'Diary Entry', 'A private agent diary entry.',
-            FALSE, FALSE, FALSE, 0.4, 70),
+            FALSE, FALSE, FALSE, FALSE, 0.4, 70),
         ('procedure',   'Procedure',   'A how-to, runbook, or operational procedure.',
-            FALSE, FALSE, FALSE, 0.5, 80),
+            FALSE, FALSE, FALSE, TRUE, 0.5, 80),
         ('summary',     'Summary',     'A condensed summary derived from other memories.',
-            FALSE, FALSE, FALSE, 0.4, 90)
-    ) AS k(name, display_name, description, singleton, stays, requires_review, default_importance, sort_order)
+            FALSE, FALSE, FALSE, TRUE, 0.4, 90)
+    ) AS k(name, display_name, description, singleton, stays, requires_review,
+           auto_promote, default_importance, sort_order)
     ON CONFLICT (tenant_id, name) DO NOTHING;
     RETURN NEW;
 END;
@@ -158,12 +162,12 @@ CREATE TRIGGER trg_seed_builtin_memory_kinds
 INSERT INTO memory_kinds (
     tenant_id, name, display_name, description, is_builtin, enabled,
     singleton, stays_in_recall_when_disputed, requires_review,
-    default_importance, sort_order
+    auto_promote_from_inferred, default_importance, sort_order
 )
 SELECT DISTINCT
     mi.tenant_id, mi.kind, initcap(replace(mi.kind, '_', ' ')),
     'Auto-registered from existing data during ENG-AUD-010 migration.',
-    FALSE, TRUE, FALSE, FALSE, FALSE, NULL::double precision, 100
+    FALSE, TRUE, FALSE, FALSE, FALSE, FALSE, NULL::double precision, 100
 FROM memory_items mi
 WHERE NOT EXISTS (
     SELECT 1 FROM memory_kinds mk

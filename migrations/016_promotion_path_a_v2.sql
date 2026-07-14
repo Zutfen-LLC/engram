@@ -41,3 +41,45 @@ WHERE is_builtin = TRUE
 UPDATE memory_kinds
 SET auto_promote_from_inferred = FALSE
 WHERE NOT (is_builtin = TRUE AND name IN ('fact', 'decision', 'procedure', 'summary', 'observation'));
+
+-- Installations upgrading from migration 015 still have migration 007's old
+-- tenant trigger function. Replace it so future tenants receive the governed
+-- builtin defaults instead of the column default (FALSE) for every kind.
+CREATE OR REPLACE FUNCTION seed_builtin_memory_kinds() RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO memory_kinds (
+        tenant_id, name, display_name, description, is_builtin, enabled,
+        singleton, stays_in_recall_when_disputed, requires_review,
+        auto_promote_from_inferred, default_importance, sort_order
+    )
+    SELECT
+        NEW.id, k.name, k.display_name, k.description, TRUE, TRUE,
+        k.singleton, k.stays, k.requires_review, k.auto_promote,
+        k.default_importance, k.sort_order
+    FROM (VALUES
+        ('fact', 'Fact', 'An observed or stated fact.',
+            FALSE, FALSE, FALSE, TRUE, 0.5::double precision, 10),
+        ('preference', 'Preference', 'A stated preference or convention.',
+            TRUE, FALSE, FALSE, FALSE, 0.5, 20),
+        ('doctrine', 'Doctrine', 'A standing policy or rule that governs behavior.',
+            FALSE, TRUE, TRUE, FALSE, 0.7, 30),
+        ('decision', 'Decision', 'A decision that was made and should be remembered.',
+            FALSE, FALSE, TRUE, TRUE, 0.6, 40),
+        ('invariant', 'Invariant',
+            'A rule that must always hold; violations are high-stakes.',
+            TRUE, TRUE, TRUE, FALSE, 0.8, 50),
+        ('observation', 'Observation',
+            'Something noticed but not yet trusted or reviewed.',
+            FALSE, FALSE, FALSE, TRUE, 0.4, 60),
+        ('diary_entry', 'Diary Entry', 'A private agent diary entry.',
+            FALSE, FALSE, FALSE, FALSE, 0.4, 70),
+        ('procedure', 'Procedure', 'A how-to, runbook, or operational procedure.',
+            FALSE, FALSE, FALSE, TRUE, 0.5, 80),
+        ('summary', 'Summary', 'A condensed summary derived from other memories.',
+            FALSE, FALSE, FALSE, TRUE, 0.4, 90)
+    ) AS k(name, display_name, description, singleton, stays, requires_review,
+           auto_promote, default_importance, sort_order)
+    ON CONFLICT (tenant_id, name) DO NOTHING;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
