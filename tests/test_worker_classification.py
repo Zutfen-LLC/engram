@@ -365,13 +365,38 @@ async def test_refinement_schedules_from_reloaded_final_kind_and_reports_final_s
         visibility="tenant",
     )
     async with _test_session_factory() as session:
+        from engram.db import (
+            _DEFAULT_PRINCIPAL_NAME,
+            _DEFAULT_TENANT_SLUG,
+            apply_rls_context,
+        )
+
+        context = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT t.id::text AS tenant_id, p.id::text AS principal_id "
+                        "FROM tenants t JOIN principals p "
+                        "ON p.tenant_id = t.id AND p.name = :principal "
+                        "WHERE t.slug = :slug"
+                    ),
+                    {"slug": _DEFAULT_TENANT_SLUG, "principal": _DEFAULT_PRINCIPAL_NAME},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        await apply_rls_context(
+            session,
+            tenant_id=context["tenant_id"],
+            principal_id=context["principal_id"],
+        )
         await session.execute(
             text(
                 "UPDATE tenant_config SET auto_promote_evidence_enabled = TRUE "
-                "WHERE tenant_id = (SELECT tenant_id FROM memory_items WHERE id = :id) "
-                "AND active = TRUE"
+                "WHERE tenant_id = :tenant_id AND active = TRUE"
             ),
-            {"id": item_id},
+            {"tenant_id": context["tenant_id"]},
         )
         await session.commit()
 
@@ -390,6 +415,11 @@ async def test_refinement_schedules_from_reloaded_final_kind_and_reports_final_s
     monkeypatch.setattr("engram.classification.classify", qualifying_decision)
     await _run_refine_job(item_id)
     async with _test_session_factory() as session:
+        await apply_rls_context(
+            session,
+            tenant_id=context["tenant_id"],
+            principal_id=context["principal_id"],
+        )
         jobs = (
             (
                 await session.execute(
@@ -420,6 +450,11 @@ async def test_refinement_schedules_from_reloaded_final_kind_and_reports_final_s
 
     await _run_refine_job(item_id)
     async with _test_session_factory() as session:
+        await apply_rls_context(
+            session,
+            tenant_id=context["tenant_id"],
+            principal_id=context["principal_id"],
+        )
         count = (
             await session.execute(
                 text(
@@ -429,4 +464,12 @@ async def test_refinement_schedules_from_reloaded_final_kind_and_reports_final_s
                 {"id": item_id},
             )
         ).scalar_one()
+        await session.execute(
+            text(
+                "UPDATE tenant_config SET auto_promote_evidence_enabled = FALSE "
+                "WHERE tenant_id = :tenant_id AND active = TRUE"
+            ),
+            {"tenant_id": context["tenant_id"]},
+        )
+        await session.commit()
     assert count == 1
