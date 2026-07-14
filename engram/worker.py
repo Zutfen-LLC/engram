@@ -1501,10 +1501,14 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
         and current_item.kind == current_run.suggested_kind
     )
     promotion_job_id: UUID | None = None
+    promotion_schedule: dict[str, str] = {}
     if receipt_matches_item:
         assert current_run is not None
         promotion_job_id = await schedule_evidence_promotion_if_qualified(
-            session, current_item, current_run
+            session,
+            current_item,
+            current_run,
+            diagnostics=promotion_schedule,
         )
     await session.flush()
     await _insert_event(
@@ -1538,6 +1542,8 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
                 "visibility_narrowed": current_item.visibility != initial_visibility,
                 "promotion_receipt_matches_item": receipt_matches_item,
                 "promotion_job_id": str(promotion_job_id) if promotion_job_id else None,
+                "promotion_schedule_status": promotion_schedule.get("status", "not_scheduled"),
+                "promotion_schedule_blocker": promotion_schedule.get("blocker"),
                 "classification_provenance": run.provenance,
                 "provider": run.provenance.get("provider", "openai"),
                 "result": "changed" if changed else "no_change",

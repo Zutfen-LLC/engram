@@ -739,18 +739,34 @@ async def auto_promote_item(
 
 
 async def schedule_evidence_promotion_if_qualified(
-    session: AsyncSession, item: MemoryItem, run: ClassificationRun
+    session: AsyncSession,
+    item: MemoryItem,
+    run: ClassificationRun,
+    *,
+    diagnostics: dict[str, str] | None = None,
 ) -> uuid.UUID | None:
     """Atomically enqueue the delayed targeted job for statically qualified evidence."""
+    def blocked(reason: str) -> None:
+        if diagnostics is not None:
+            diagnostics["blocker"] = reason
+
     if (
         item.review_status != "proposed"
         or item.valid_to is not None
         or item.superseded_by is not None
     ):
+        blocked("item_state")
         return None
     config = await _config(session, str(item.tenant_id))
     enabled, _, min_age, evidence_enabled, evidence_threshold = _config_values(config)
-    if not enabled or not evidence_enabled or item.conflict_resolution_status == "unresolved":
+    if not enabled:
+        blocked("promotion_disabled")
+        return None
+    if not evidence_enabled:
+        blocked("evidence_disabled")
+        return None
+    if item.conflict_resolution_status == "unresolved":
+        blocked("conflict")
         return None
     support = (await load_promotion_support(session, [item]))[item.id]
     kind = support.kind
@@ -762,20 +778,26 @@ async def schedule_evidence_promotion_if_qualified(
         or bound_run is None
         or bound_run.id != run.id
     ):
+        blocked("kind_or_receipt")
         return None
     evidence_blockers, score, _ = _evidence_state(item, run)
-    if evidence_blockers or score is None or score < evidence_threshold:
+    if evidence_blockers:
+        blocked(",".join(evidence_blockers))
+        return None
+    if score is None or score < evidence_threshold:
+        blocked("evidence_score")
         return None
     # Do not test the cooling clock here: the point of this delayed job is to
     # wake at its end. Dynamic dispute and semantic-conflict gates remain the
     # target job's responsibility.
     if item.retention_disposition != "retain":
+        blocked("retention_disposition")
         return None
     from engram.jobs import enqueue_job_in_transaction
 
     assert item.retention_evidence_at is not None
     run_after = max(item.created_at, item.retention_evidence_at) + timedelta(hours=min_age)
-    return await enqueue_job_in_transaction(
+    job_id = await enqueue_job_in_transaction(
         session,
         tenant_id=item.tenant_id,
         job_type="promotion.path_a",
@@ -783,6 +805,9 @@ async def schedule_evidence_promotion_if_qualified(
         run_after=run_after,
         dedupe_key=f"promotion.path_a:{item.id}:{run.id}",
     )
+    if diagnostics is not None:
+        diagnostics["status"] = "scheduled"
+    return job_id
 
 
 async def maybe_auto_promote_for_startup_recall(

@@ -393,13 +393,22 @@ async def test_refinement_schedules_from_reloaded_final_kind_and_reports_final_s
         )
         enabled = await session.execute(
             text(
-                "UPDATE tenant_config SET auto_promote_evidence_enabled = TRUE "
+                "UPDATE tenant_config SET auto_promote_enabled = TRUE, "
+                "auto_promote_evidence_enabled = TRUE, "
+                "auto_promote_evidence_threshold = 0.7, auto_promote_min_age_hours = 72 "
                 "WHERE tenant_id = :tenant_id AND active = TRUE "
                 "RETURNING auto_promote_evidence_enabled"
             ),
             {"tenant_id": context["tenant_id"]},
         )
         assert enabled.scalar_one() is True
+        await session.execute(
+            text(
+                "UPDATE memory_kinds SET enabled = TRUE, auto_promote_from_inferred = TRUE "
+                "WHERE tenant_id = :tenant_id AND name = 'decision'"
+            ),
+            {"tenant_id": context["tenant_id"]},
+        )
         await session.commit()
 
     async def qualifying_decision(content, tenant_id, session, context=None):
@@ -436,6 +445,8 @@ async def test_refinement_schedules_from_reloaded_final_kind_and_reports_final_s
     assert event_payload["final_review_status"] == "proposed"
     assert event_payload["final_visibility"] == "workspace"
     assert event_payload["promotion_receipt_matches_item"] is True
+    assert event_payload["promotion_schedule_blocker"] is None
+    assert event_payload["promotion_schedule_status"] == "scheduled"
     assert event_payload["promotion_job_id"] is not None
     async with _test_session_factory() as session:
         await apply_rls_context(
