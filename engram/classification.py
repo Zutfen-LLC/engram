@@ -394,14 +394,16 @@ def _classify_rules(
     matched_target_rules: list[RuleSnapshot] = []
     skip_rules: list[str] = []
 
-    # Built-in rules run first (lower priority numbers), then tenant rules.
-    # Filter built-ins to the tenant's active taxonomy so they don't fire
-    # on kinds the tenant has disabled.
+    # Tenant rules run first (take precedence), then built-in rules as a
+    # fallback. This ensures tenant-configured rules (e.g. kind_doctrine with
+    # an explicit "policy:" pattern) win over builtins that match the same
+    # content (e.g. builtin_invariant_must_never matching "must never").
+    # Both lists are already priority-sorted within their own group.
     builtin_active = [
         r for r in _BUILTIN_RULES
         if r.target_kind is None or r.target_kind in taxonomy
     ]
-    all_rules = list(builtin_active) + list(rules)
+    all_rules = list(rules) + list(builtin_active)
 
     for rule in all_rules:
         try:
