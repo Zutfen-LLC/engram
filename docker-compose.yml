@@ -2,7 +2,7 @@
 #
 # Quickstart:
 #   1. cp .env.example .env   # then edit .env (set POSTGRES_PASSWORD, etc.)
-#   2. docker compose up -d
+#   2. docker compose up -d   # starts Postgres, API, and worker
 #   3. docker compose exec engram-service engram bootstrap-key   # first API key
 #
 # The service is reachable at http://localhost:8000
@@ -26,6 +26,51 @@
 #       connects as at runtime (subject to RLS; no table ownership, no
 #       BYPASSRLS). Created by migrations/003_app_role_and_force_rls.sql; its
 #       password is set on first boot by migrations/app_role_password.sh.
+#
+# --- Worker ---------------------------------------------------------------
+# The standard stack includes a long-lived background worker (engram-worker)
+# that processes the job queue: embedding generation, conflict checks,
+# classification refinement, promotion, retention sweeps, and recall telemetry.
+# See docs/deployment.md (Background worker) for details.
+
+# --- Shared build configuration ------------------------------------------
+x-build: &build-config
+  context: .
+  target: runtime
+
+# --- Shared environment ---------------------------------------------------
+# Every setting the API enqueues work for must be present here so the worker
+# processes jobs with the same provider/database configuration. API-only
+# settings (host, port, auth) stay on engram-service.
+x-env: &engram-env
+  # Runtime: connect as the non-owner app role (RLS-enforced).
+  ENGRAM_DATABASE_URL: postgresql+asyncpg://${POSTGRES_APP_USER:-engram_app}:${POSTGRES_APP_PASSWORD:-engram_app}@postgres:5432/${POSTGRES_DB:-engram}
+  # Migrations/admin: connect as the owner (bypasses RLS for DDL + cross-
+  # tenant CLI paths). Used by `engram init-db`, `engram bootstrap-key`, and
+  # `engram promote-proposed` / `engram backfill-embeddings`.
+  ENGRAM_OWNER_DATABASE_URL: postgresql+asyncpg://${POSTGRES_OWNER_USER:-${POSTGRES_USER:-engram}}:${POSTGRES_OWNER_PASSWORD:-${POSTGRES_PASSWORD:-engram}}@postgres:5432/${POSTGRES_DB:-engram}
+  ENGRAM_LOG_LEVEL: ${ENGRAM_LOG_LEVEL:-info}
+  # Embeddings — the API gates enqueue on EMBEDDING_PROVIDER; the worker calls
+  # the provider to generate vectors.
+  ENGRAM_EMBEDDING_PROVIDER: ${ENGRAM_EMBEDDING_PROVIDER:-none}
+  ENGRAM_EMBEDDING_DIM: ${ENGRAM_EMBEDDING_DIM:-1536}
+  ENGRAM_EMBEDDING_MODEL: ${ENGRAM_EMBEDDING_MODEL:-text-embedding-3-small}
+  ENGRAM_OPENAI_API_KEY: ${ENGRAM_OPENAI_API_KEY:-}
+  ENGRAM_OPENAI_BASE_URL: ${ENGRAM_OPENAI_BASE_URL:-}
+  # Classification — the API enqueues classification.refine jobs; the worker
+  # calls the LLM to refine kind/confidence asynchronously.
+  ENGRAM_CLASSIFICATION_PROVIDER: ${ENGRAM_CLASSIFICATION_PROVIDER:-none}
+  ENGRAM_CLASSIFICATION_MODEL: ${ENGRAM_CLASSIFICATION_MODEL:-gpt-4o-mini}
+  ENGRAM_CLASSIFICATION_CONFIDENCE_THRESHOLD: ${ENGRAM_CLASSIFICATION_CONFIDENCE_THRESHOLD:-0.5}
+  ENGRAM_CLASSIFICATION_API_KEY: ${ENGRAM_CLASSIFICATION_API_KEY:-}
+  ENGRAM_CLASSIFICATION_BASE_URL: ${ENGRAM_CLASSIFICATION_BASE_URL:-}
+  # Write-path cost control — the worker's handle_embedding_generate reads this
+  # to decide whether to enqueue a follow-up conflict.check job.
+  ENGRAM_CONFLICT_CHECK_ON_WRITE: ${ENGRAM_CONFLICT_CHECK_ON_WRITE:-true}
+  # Background worker / job queue tunables.
+  ENGRAM_JOB_POLL_INTERVAL_SECONDS: ${ENGRAM_JOB_POLL_INTERVAL_SECONDS:-2}
+  ENGRAM_JOB_MAX_ATTEMPTS: ${ENGRAM_JOB_MAX_ATTEMPTS:-5}
+  ENGRAM_JOB_LEASE_STALE_AFTER_SECONDS: ${ENGRAM_JOB_LEASE_STALE_AFTER_SECONDS:-300}
 
 services:
   postgres:
@@ -53,29 +98,14 @@ services:
     restart: unless-stopped
 
   engram-service:
-    build:
-      context: .
-      target: runtime
+    build: *build-config
     container_name: engram-service
     environment:
-      # Runtime: connect as the non-owner app role (RLS-enforced).
-      ENGRAM_DATABASE_URL: postgresql+asyncpg://${POSTGRES_APP_USER:-engram_app}:${POSTGRES_APP_PASSWORD:-engram_app}@postgres:5432/${POSTGRES_DB:-engram}
-      # Migrations/admin: connect as the owner (bypasses RLS for DDL + cross-
-      # tenant CLI paths). Used by `engram init-db`, `engram bootstrap-key`, and
-      # `engram promote-proposed` / `engram backfill-embeddings`.
-      ENGRAM_OWNER_DATABASE_URL: postgresql+asyncpg://${POSTGRES_OWNER_USER:-${POSTGRES_USER:-engram}}:${POSTGRES_OWNER_PASSWORD:-${POSTGRES_PASSWORD:-engram}}@postgres:5432/${POSTGRES_DB:-engram}
+      <<: *engram-env
+      # API-only settings (not needed by the worker).
       ENGRAM_HOST: 0.0.0.0
       ENGRAM_PORT: 8000
-      ENGRAM_LOG_LEVEL: ${ENGRAM_LOG_LEVEL:-info}
       ENGRAM_AUTH_ENABLED: ${ENGRAM_AUTH_ENABLED:-false}
-      ENGRAM_EMBEDDING_PROVIDER: ${ENGRAM_EMBEDDING_PROVIDER:-none}
-      ENGRAM_OPENAI_API_KEY: ${ENGRAM_OPENAI_API_KEY:-}
-      ENGRAM_OPENAI_BASE_URL: ${ENGRAM_OPENAI_BASE_URL:-}
-      ENGRAM_EMBEDDING_MODEL: ${ENGRAM_EMBEDDING_MODEL:-text-embedding-3-small}
-      ENGRAM_CLASSIFICATION_PROVIDER: ${ENGRAM_CLASSIFICATION_PROVIDER:-none}
-      ENGRAM_CLASSIFICATION_MODEL: ${ENGRAM_CLASSIFICATION_MODEL:-gpt-4o-mini}
-      ENGRAM_CLASSIFICATION_API_KEY: ${ENGRAM_CLASSIFICATION_API_KEY:-}
-      ENGRAM_CLASSIFICATION_BASE_URL: ${ENGRAM_CLASSIFICATION_BASE_URL:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -96,6 +126,16 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+    restart: unless-stopped
+
+  engram-worker:
+    build: *build-config
+    command: ["engram", "worker"]
+    environment:
+      <<: *engram-env
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

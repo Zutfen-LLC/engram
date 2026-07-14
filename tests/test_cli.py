@@ -309,3 +309,77 @@ async def test_cli_worker_once_processes_one_job():
         async with engine.begin() as conn:
             await conn.execute(text("DELETE FROM jobs WHERE job_type = 'retention.sweep'"))
         await engine.dispose()
+
+
+# --- worker logging -------------------------------------------------------
+
+
+def test_configure_worker_logging_sets_level():
+    """_configure_worker_logging sets the engram logger to INFO by default."""
+    import logging
+
+    from engram.cli import _configure_worker_logging
+
+    logger = logging.getLogger("engram")
+    # Reset to known state.
+    logger.handlers.clear()
+    logger.setLevel(logging.WARNING)
+    logger.propagate = True
+
+    _configure_worker_logging()
+
+    assert logger.level == logging.INFO
+    assert len(logger.handlers) == 1
+    assert isinstance(logger.handlers[0], logging.StreamHandler)
+    assert logger.propagate is False
+
+
+def test_configure_worker_logging_respects_log_level(monkeypatch):
+    """_configure_worker_logging respects ENGRAM_LOG_LEVEL."""
+    import logging
+
+    from engram.cli import _configure_worker_logging
+    from engram.config import Settings
+
+    # Create a Settings with debug level and monkeypatch the module-level settings.
+    monkeypatch.setattr("engram.config.settings", Settings(log_level="debug"))
+
+    logger = logging.getLogger("engram")
+    logger.handlers.clear()
+
+    _configure_worker_logging()
+
+    assert logger.level == logging.DEBUG
+
+
+def test_configure_worker_logging_idempotent():
+    """Calling _configure_worker_logging twice does not duplicate handlers."""
+    import logging
+
+    from engram.cli import _configure_worker_logging
+
+    logger = logging.getLogger("engram")
+    logger.handlers.clear()
+
+    _configure_worker_logging()
+    _configure_worker_logging()
+
+    assert len(logger.handlers) == 1
+
+
+def test_configure_worker_logging_falls_back_on_invalid_level(monkeypatch):
+    """An invalid log level falls back to INFO."""
+    import logging
+
+    from engram.cli import _configure_worker_logging
+    from engram.config import Settings
+
+    monkeypatch.setattr("engram.config.settings", Settings(log_level="not-a-level"))
+
+    logger = logging.getLogger("engram")
+    logger.handlers.clear()
+
+    _configure_worker_logging()
+
+    assert logger.level == logging.INFO
+

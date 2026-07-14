@@ -334,6 +334,7 @@ def main() -> None:
     elif args.command == "embedding-profiles":
         raise SystemExit(asyncio.run(_run_embedding_profiles(args)))
     elif args.command == "worker":
+        _configure_worker_logging()
         raise SystemExit(
             asyncio.run(
                 _run_worker(
@@ -933,6 +934,38 @@ async def _run_embedding_profiles(
             print(f"retired {profile.profile_key}; vectors and index retained")
             return 0
     return 1
+
+
+def _configure_worker_logging() -> None:
+    """Configure logging for the ``engram worker`` CLI path.
+
+    Unlike the API server (which relies on Uvicorn's logging setup), the CLI
+    entry point does not initialize Python logging. Without this call the
+    worker's INFO-level startup, job-completion, retry, and failure messages
+    are invisible in container logs.
+
+    Only the ``engram`` logger is configured — library consumers and other
+    loggers are not affected.
+    """
+    import logging
+
+    from engram.config import settings
+
+    level_name = (settings.log_level or "info").lower()
+    level = getattr(logging, level_name.upper(), logging.INFO)
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(levelname)s [%(name)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    logger = logging.getLogger("engram")
+    logger.setLevel(level)
+    # Avoid duplicate handlers if called more than once (e.g. in tests).
+    if not logger.handlers:
+        logger.addHandler(handler)
+    logger.propagate = False
 
 
 async def _run_worker(
