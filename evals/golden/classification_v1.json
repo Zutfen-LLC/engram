@@ -85,7 +85,7 @@
     {
       "id": "cls-011",
       "content": "Content is append-first: never UPDATE memory item content. Metadata changes go through PATCH which writes to item_events first, then updates the column.",
-      "expected_kind": "doctrine",
+      "expected_kind": "fact",
       "expected_wing": null,
       "expected_room": null,
       "notes": "Architectural rule governing how code must behave"
@@ -133,7 +133,7 @@
     {
       "id": "cls-017",
       "content": "The service appeared to work but semantic search returned empty results because the embedding worker was failing silently with a 401 authentication error.",
-      "expected_kind": "observation",
+      "expected_kind": "fact",
       "expected_wing": null,
       "expected_room": null,
       "notes": "Observed problem, not yet fixed"
@@ -149,7 +149,7 @@
     {
       "id": "cls-019",
       "content": "All trust defaults and scoring weights are stored in tenant_config, not hardcoded. The remember and recall endpoints must read the active tenant_config to get current values.",
-      "expected_kind": "doctrine",
+      "expected_kind": "fact",
       "expected_wing": null,
       "expected_room": null,
       "notes": "Architectural rule — governs implementation behavior"

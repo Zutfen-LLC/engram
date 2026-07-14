@@ -391,16 +391,33 @@ def _rrf_fuse(
     *,
     limit: int,
 ) -> list[dict[str, Any]]:
+    """Reciprocal Rank Fusion (pure rank-based).
+
+    Uses only rank positions — raw per-modality scores (ts_rank, cosine
+    distance) do NOT bleed into the fused score.  This is critical because
+    keyword ts_rank scores (~0.01) and semantic similarity scores (~0.5)
+    operate on completely different scales; letting them carry through via
+    ``setdefault`` would let semantic-only items dominate items that matched
+    in both modalities.
+    """
     fused: dict[str, dict[str, Any]] = {}
     for rank, result in enumerate(keyword_results, start=1):
         entry = fused.setdefault(result["id"], dict(result))
-        entry["score"] = float(entry.get("score", 0.0)) + 1.0 / (_RRF_K + rank)
+        # Overwrite raw score with pure RRF score — do NOT accumulate on top
+        # of the raw per-modality score that came from the result dict.
+        if entry.get("_rrf_score") is None:
+            entry["_rrf_score"] = 0.0
+        entry["_rrf_score"] += 1.0 / (_RRF_K + rank)
+        entry["score"] = entry["_rrf_score"]
         entry["keyword_rank"] = rank
         entry.setdefault("semantic_rank", None)
         entry["mode"] = "hybrid"
     for rank, result in enumerate(semantic_results, start=1):
         entry = fused.setdefault(result["id"], dict(result))
-        entry["score"] = float(entry.get("score", 0.0)) + 1.0 / (_RRF_K + rank)
+        if entry.get("_rrf_score") is None:
+            entry["_rrf_score"] = 0.0
+        entry["_rrf_score"] += 1.0 / (_RRF_K + rank)
+        entry["score"] = entry["_rrf_score"]
         entry["semantic_rank"] = rank
         entry.setdefault("keyword_rank", None)
         entry["mode"] = "hybrid"

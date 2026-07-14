@@ -547,6 +547,25 @@ def _build_prompt(
             "Confidence may be any value in 0.0-0.95. Low confidence is a real "
             "signal — express doubt rather than flooring it.",
             "If uncertain, prefer fact and a lower confidence.",
+            "Kind definitions:",
+            "  invariant: non-negotiable safety or integrity prohibition — "
+            "violations cause data loss, security breaches, or corruption. "
+            "e.g. 'never store secrets', 'must never bypass RLS'.",
+            "  doctrine: standing policy or architectural decision the team "
+            "agreed to follow — important but violations are process errors, "
+            "not catastrophes. e.g. 'all PRs must pass CI', 'append-first "
+            "content model'.",
+            "  fact: a factual statement about how the system works, what "
+            "something is, or where something is. e.g. 'the database is at "
+            "10.0.0.40', 'agent writes default to proposed at 0.6 trust'.",
+            "  preference: a user's personal likes/dislikes or working style.",
+            "  decision: a deliberate choice between alternatives.",
+            "  procedure: step-by-step how-to instructions.",
+            "  observation: a tentative, unverified, or time-bound note.",
+            "  summary: a condensed recap of a session, sprint, or event.",
+            "When the content describes how the system works (even if it uses "
+            "words like 'must' or 'default'), prefer fact over doctrine unless "
+            "it states a policy the team chose to enforce.",
         ],
     }
     return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
@@ -645,6 +664,28 @@ def _apply_llm_payload(
         # Do NOT re-floor confidence above the threshold. The whole point of
         # removing the 0.7 floor is that a doubtful result stays doubtful, so the
         # downstream confidence blend can lower memory_confidence appropriately.
+
+    # Rule precedence: when a priority-1 builtin rule matched a non-fact kind
+    # (e.g. invariant) and the LLM disagreed, defer to the rule.  Priority-1
+    # rules encode high-stakes patterns (safety prohibitions) that the LLM
+    # systematically over-promotes to doctrine.  The LLM may only override a
+    # priority-1 rule match when its own confidence is very high (>= 0.85).
+    rule_kind = rule_result.suggested_kind
+    if (
+        rule_kind
+        and rule_kind != "fact"
+        and rule_kind != kind
+        and rule_result.confidence >= 0.7
+        and confidence < 0.85
+    ):
+        provenance["mode"] = "llm_rule_guarded"
+        kind = rule_kind
+        wing = rule_result.suggested_wing or wing
+        room = rule_result.suggested_room or room
+        reason = (
+            f"LLM suggested {kind} but rule baseline matched {rule_kind} "
+            f"(rules: {rule_result.rules_matched}); deferring to rule match."
+        )
 
     return ClassificationResult(
         suggested_kind=kind,
