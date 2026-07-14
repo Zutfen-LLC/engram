@@ -40,8 +40,6 @@ jobs:
       - name: Validate deployment compose content
         run: |
           set -euo pipefail
-          pip3 install --quiet pyyaml
-
           SERVICES=$(docker compose config --services)
           echo "Services: $SERVICES"
 
@@ -64,57 +62,112 @@ jobs:
           export ENGRAM_RECALL_BYTE_BUDGET=555
           export ENGRAM_STARTUP_PROMOTION_LIMIT=444
 
-          docker compose config \
-            | python3 -c "
-          import sys, yaml
+          API_CONFIG=$(docker compose config engram-service)
+          WORKER_CONFIG=$(docker compose config engram-worker)
 
-          cfg = yaml.safe_load(sys.stdin)
-          svc = cfg['services']
-          api_env = svc['engram-service']['environment']
-          worker_env = svc['engram-worker']['environment']
-
-          # Worker command and ports.
-          cmd = ' '.join(svc['engram-worker'].get('command', []))
-          print(f'Worker command: {cmd}')
-          assert cmd == 'engram worker', f'expected \"engram worker\", got \"{cmd}\"'
-
-          ports = svc['engram-worker'].get('ports', [])
-          print(f'Worker published ports: {len(ports)}')
-          assert len(ports) == 0, f'expected no ports, got {ports}'
-
-          # Shared sentinels must appear on both services.
-          shared_sentinels = {
-              'ENGRAM_VOCAB_CACHE_TTL_SECONDS': '999',
-              'ENGRAM_VOCAB_CACHE_MAX_TENANTS': '888',
-              'ENGRAM_PROMOTION_CONFLICT_CANDIDATE_K': '777',
+          require_env() {
+            service=$1
+            config=$2
+            key=$3
+            expected=$4
+            if ! printf '%s\n' "$config" | awk -v key="$key" -v expected="$expected" '
+              $1 == key ":" {
+                value = substr($0, index($0, ":") + 1)
+                sub(/^[[:space:]]+/, "", value)
+                sub(/[[:space:]]+$/, "", value)
+                if ((substr(value, 1, 1) == "\"" && substr(value, length(value), 1) == "\"") ||
+                    (substr(value, 1, 1) == "\047" && substr(value, length(value), 1) == "\047")) {
+                  value = substr(value, 2, length(value) - 2)
+                }
+                found = (value == expected)
+              }
+              END { exit !found }
+            '; then
+              echo "ERROR: $key=$expected missing/wrong on $service"
+              exit 1
+            fi
           }
-          for key, expected in shared_sentinels.items():
-              assert api_env.get(key) == expected, \\
-              f'{key}={api_env.get(key)!r} missing/wrong on engram-service'
-              assert worker_env.get(key) == expected, \\
-              f'{key}={worker_env.get(key)!r} missing/wrong on engram-worker'
-          print(f'Shared sentinel checks: {len(shared_sentinels)} passed')
 
-          # API-only sentinels must appear on engram-service only.
-          api_only_sentinels = {
-              'ENGRAM_API_KEY_CACHE_TTL_SECONDS': '666',
-              'ENGRAM_READ_DATABASE_URL': 'postgresql+asyncpg://sentinel-read',
-              'ENGRAM_RECALL_BYTE_BUDGET': '555',
-              'ENGRAM_STARTUP_PROMOTION_LIMIT': '444',
+          reject_env() {
+            service=$1
+            config=$2
+            key=$3
+            if printf '%s\n' "$config" | awk -v key="$key" '$1 == key ":" { found = 1 } END { exit !found }'; then
+              echo "ERROR: $key should NOT be on $service"
+              exit 1
+            fi
           }
-          for key, expected in api_only_sentinels.items():
-              assert api_env.get(key) == expected, \\
-              f'{key}={api_env.get(key)!r} missing/wrong on engram-service'
-              assert key not in worker_env, \\
-              f'{key} should NOT be on engram-worker (got {worker_env.get(key)!r})'
-          print(f'API-only sentinel checks: {len(api_only_sentinels)} passed')
 
-          # ENGRAM_JOB_MAX_ATTEMPTS must be present on both (enqueued by API,
-          # used by worker).
-          for name, env in [('engram-service', api_env), ('engram-worker', worker_env)]:
-              assert 'ENGRAM_JOB_MAX_ATTEMPTS' in env, \\
-              f'ENGRAM_JOB_MAX_ATTEMPTS missing from {name}'
-          print('ENGRAM_JOB_MAX_ATTEMPTS present on both services')
-          "
+          # Compose emits command in block-list form; bound collection to the
+          # command field so unrelated YAML list items cannot satisfy it.
+          WORKER_COMMAND=$(printf '%s\n' "$WORKER_CONFIG" | awk '
+            /^[[:space:]]+command:[[:space:]]*$/ {
+              in_command = 1
+              command_indent = index($0, "c") - 1
+              next
+            }
+            in_command {
+              match($0, /^[[:space:]]*/)
+              if (RLENGTH <= command_indent) { exit }
+              if ($1 == "-") {
+                value = substr($0, index($0, "-") + 1)
+                sub(/^[[:space:]]+/, "", value)
+                gsub(/^[\047"]|[\047"]$/, "", value)
+                command = command (command ? " " : "") value
+              }
+            }
+            END { print command }
+          ')
+          if [ "$WORKER_COMMAND" != "engram worker" ]; then
+            echo "ERROR: expected worker command 'engram worker', got '$WORKER_COMMAND'"
+            exit 1
+          fi
+          echo "Worker command: $WORKER_COMMAND"
+
+          # Reject a ports key at the worker service's immediate child depth.
+          if printf '%s\n' "$WORKER_CONFIG" | awk '
+            /^[[:space:]]+engram-worker:[[:space:]]*$/ {
+              service_indent = index($0, "e") - 1
+              in_service = 1
+              next
+            }
+            in_service {
+              match($0, /^[[:space:]]*/)
+              if (NF && RLENGTH <= service_indent) { exit }
+              if (RLENGTH == service_indent + 2 && $1 == "ports:") { found = 1 }
+            }
+            END { exit !found }
+          '; then
+            echo "ERROR: engram-worker must not publish ports"
+            exit 1
+          fi
+          echo "Worker published ports: 0"
+
+          for entry in \
+            'ENGRAM_VOCAB_CACHE_TTL_SECONDS=999' \
+            'ENGRAM_VOCAB_CACHE_MAX_TENANTS=888' \
+            'ENGRAM_PROMOTION_CONFLICT_CANDIDATE_K=777'; do
+            key=${entry%%=*}
+            expected=${entry#*=}
+            require_env engram-service "$API_CONFIG" "$key" "$expected"
+            require_env engram-worker "$WORKER_CONFIG" "$key" "$expected"
+          done
+          echo "Shared sentinel checks: 3 passed"
+
+          for entry in \
+            'ENGRAM_API_KEY_CACHE_TTL_SECONDS=666' \
+            'ENGRAM_READ_DATABASE_URL=postgresql+asyncpg://sentinel-read' \
+            'ENGRAM_RECALL_BYTE_BUDGET=555' \
+            'ENGRAM_STARTUP_PROMOTION_LIMIT=444'; do
+            key=${entry%%=*}
+            expected=${entry#*=}
+            require_env engram-service "$API_CONFIG" "$key" "$expected"
+            reject_env engram-worker "$WORKER_CONFIG" "$key"
+          done
+          echo "API-only sentinel checks: 4 passed"
+
+          require_env engram-service "$API_CONFIG" ENGRAM_JOB_MAX_ATTEMPTS 5
+          require_env engram-worker "$WORKER_CONFIG" ENGRAM_JOB_MAX_ATTEMPTS 5
+          echo "ENGRAM_JOB_MAX_ATTEMPTS present on both services"
 
           echo "All compose content assertions passed."

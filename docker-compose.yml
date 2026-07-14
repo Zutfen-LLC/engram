@@ -84,9 +84,8 @@ x-env: &engram-env
   # handle_classification_refine handler.
   ENGRAM_CLASSIFICATION_REFINE_MIN_DELTA: ${ENGRAM_CLASSIFICATION_REFINE_MIN_DELTA:-0.0}
 
-  # Promotion — accessed by the worker's handle_promotion_path_a handler via
-  # promotion.auto_promote_proposed_memories.
-  ENGRAM_STARTUP_PROMOTION_LIMIT: ${ENGRAM_STARTUP_PROMOTION_LIMIT:-20}
+  # Promotion conflict checks — accessed by the worker's
+  # handle_promotion_path_a handler via promotion.auto_promote_proposed_memories.
   ENGRAM_PROMOTION_CONFLICT_CANDIDATE_K: ${ENGRAM_PROMOTION_CONFLICT_CANDIDATE_K:-5}
 
   # Background worker / job queue tunables.
@@ -145,6 +144,8 @@ services:
       # Bounded SQL candidate selection for startup recall.
       ENGRAM_STARTUP_RECALL_CANDIDATE_LIMIT: ${ENGRAM_STARTUP_RECALL_CANDIDATE_LIMIT:-500}
       ENGRAM_STARTUP_RECALL_CANDIDATE_LIMIT_MAX: ${ENGRAM_STARTUP_RECALL_CANDIDATE_LIMIT_MAX:-5000}
+      # Lazy promotion is initiated only by startup recall on the API path.
+      ENGRAM_STARTUP_PROMOTION_LIMIT: ${ENGRAM_STARTUP_PROMOTION_LIMIT:-20}
     depends_on:
       postgres:
         condition: service_healthy
