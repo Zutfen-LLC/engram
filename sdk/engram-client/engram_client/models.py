@@ -108,7 +108,7 @@ class ClassifyResponse(BaseModel):
     suggested_kind: str
     suggested_wing: str | None = None
     suggested_room: str | None = None
-    suggested_visibility: str = "workspace"
+    suggested_visibility: str | None = None
     confidence: float
     reason: str
     rules_matched: list[str] = Field(default_factory=list)

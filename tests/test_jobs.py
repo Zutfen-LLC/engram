@@ -304,3 +304,72 @@ async def test_dedupe_key_is_idempotent():
             )
         ).scalar_one()
         assert count == 1
+
+
+# --- max_attempts / ENGRAM_JOB_MAX_ATTEMPTS -------------------------------
+
+
+async def test_enqueue_default_max_attempts():
+    """With default settings, enqueue without explicit override persists 5."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    tenant = await _default_tenant_id()
+    async with _test_session_factory() as session:
+        job_id = await enqueue_job(
+            session, tenant_id=tenant, job_type="test.max_attempts", payload={}
+        )
+
+    async with _test_session_factory() as session:
+        row = (
+            await session.execute(
+                text("SELECT max_attempts FROM jobs WHERE id = :id"),
+                {"id": str(job_id)},
+            )
+        ).scalar_one()
+        assert row == 5
+
+
+async def test_enqueue_uses_configured_job_max_attempts(monkeypatch):
+    """When settings.job_max_attempts is changed, enqueue uses that value."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    monkeypatch.setattr("engram.config.settings.job_max_attempts", 10)
+    tenant = await _default_tenant_id()
+    async with _test_session_factory() as session:
+        job_id = await enqueue_job(
+            session, tenant_id=tenant, job_type="test.max_attempts_configured", payload={}
+        )
+
+    async with _test_session_factory() as session:
+        row = (
+            await session.execute(
+                text("SELECT max_attempts FROM jobs WHERE id = :id"),
+                {"id": str(job_id)},
+            )
+        ).scalar_one()
+        assert row == 10
+
+
+async def test_enqueue_explicit_max_attempts_overrides_config(monkeypatch):
+    """An explicit max_attempts overrides the configured default."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    monkeypatch.setattr("engram.config.settings.job_max_attempts", 10)
+    tenant = await _default_tenant_id()
+    async with _test_session_factory() as session:
+        job_id = await enqueue_job(
+            session,
+            tenant_id=tenant,
+            job_type="test.max_attempts_explicit",
+            payload={},
+            max_attempts=3,
+        )
+
+    async with _test_session_factory() as session:
+        row = (
+            await session.execute(
+                text("SELECT max_attempts FROM jobs WHERE id = :id"),
+                {"id": str(job_id)},
+            )
+        ).scalar_one()
+        assert row == 3

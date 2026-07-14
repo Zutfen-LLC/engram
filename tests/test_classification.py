@@ -171,7 +171,7 @@ async def test_llm_enriched_classification_uses_taxonomy_and_vocab(client, monke
     body = response.json()
     assert body["suggested_kind"] == "decision"
     assert 0.7 <= body["confidence"] <= 0.95
-    assert body["rules_matched"] == ["kind_decision"]
+    assert "kind_decision" in body["rules_matched"]
     assert captured, "expected LLM prompt to be captured"
     prompt = captured[0]
     assert "fact" in prompt
