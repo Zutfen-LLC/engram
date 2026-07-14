@@ -2,7 +2,7 @@
 #
 # Quickstart:
 #   1. cp .env.example .env   # then edit .env (set POSTGRES_PASSWORD, etc.)
-#   2. docker compose up -d
+#   2. docker compose up -d   # starts Postgres, API, and worker
 #   3. docker compose exec engram-service engram bootstrap-key   # first API key
 #
 # The service is reachable at http://localhost:8000
@@ -26,6 +26,72 @@
 #       connects as at runtime (subject to RLS; no table ownership, no
 #       BYPASSRLS). Created by migrations/003_app_role_and_force_rls.sql; its
 #       password is set on first boot by migrations/app_role_password.sh.
+#
+# --- Worker ---------------------------------------------------------------
+# The standard stack includes a long-lived background worker (engram-worker)
+# that processes the job queue: embedding generation, conflict checks,
+# classification refinement, promotion, retention sweeps, and recall telemetry.
+# See docs/deployment.md (Background worker) for details.
+#
+# --- Configuration contract ------------------------------------------------
+# The Dockerfile's COPY and .dockerignore exclude .env from the image. Every
+# ENGRAM_* setting documented in .env.example must therefore be explicitly
+# propagated here so it reaches the container at runtime. Shared settings that
+# both the API and worker need live in x-env (the anchor). API-only settings
+# that the worker does not access stay on engram-service. This split is derived
+# from code inspection of engram/config.py, the worker handlers, and the modules
+# they call (embeddings.py, classification.py, conflicts.py, promotion.py).
+
+# --- Shared build configuration ------------------------------------------
+x-build: &build-config
+  context: .
+  target: runtime
+
+# --- Shared environment (API + worker) ------------------------------------
+# Settings the API uses to enqueue work and the worker uses to process it.
+x-env: &engram-env
+  # Database
+  ENGRAM_DATABASE_URL: postgresql+asyncpg://${POSTGRES_APP_USER:-engram_app}:${POSTGRES_APP_PASSWORD:-engram_app}@postgres:5432/${POSTGRES_DB:-engram}
+  ENGRAM_OWNER_DATABASE_URL: postgresql+asyncpg://${POSTGRES_OWNER_USER:-${POSTGRES_USER:-engram}}:${POSTGRES_OWNER_PASSWORD:-${POSTGRES_PASSWORD:-engram}}@postgres:5432/${POSTGRES_DB:-engram}
+  ENGRAM_LOG_LEVEL: ${ENGRAM_LOG_LEVEL:-info}
+
+  # Embeddings — the API gates enqueue on EMBEDDING_PROVIDER; the worker calls
+  # the provider to generate vectors.
+  ENGRAM_EMBEDDING_PROVIDER: ${ENGRAM_EMBEDDING_PROVIDER:-none}
+  ENGRAM_EMBEDDING_DIM: ${ENGRAM_EMBEDDING_DIM:-1536}
+  ENGRAM_EMBEDDING_MODEL: ${ENGRAM_EMBEDDING_MODEL:-text-embedding-3-small}
+  ENGRAM_OPENAI_API_KEY: ${ENGRAM_OPENAI_API_KEY:-}
+  ENGRAM_OPENAI_BASE_URL: ${ENGRAM_OPENAI_BASE_URL:-}
+
+  # Classification — the API enqueues classification.refine jobs; the worker
+  # calls the LLM to refine kind/confidence asynchronously.
+  ENGRAM_CLASSIFICATION_PROVIDER: ${ENGRAM_CLASSIFICATION_PROVIDER:-none}
+  ENGRAM_CLASSIFICATION_MODEL: ${ENGRAM_CLASSIFICATION_MODEL:-gpt-4o-mini}
+  ENGRAM_CLASSIFICATION_CONFIDENCE_THRESHOLD: ${ENGRAM_CLASSIFICATION_CONFIDENCE_THRESHOLD:-0.5}
+  ENGRAM_CLASSIFICATION_API_KEY: ${ENGRAM_CLASSIFICATION_API_KEY:-}
+  ENGRAM_CLASSIFICATION_BASE_URL: ${ENGRAM_CLASSIFICATION_BASE_URL:-}
+
+  # Write-path cost control — the worker's handle_embedding_generate reads this
+  # to decide whether to enqueue a follow-up conflict.check job.
+  ENGRAM_CONFLICT_CHECK_ON_WRITE: ${ENGRAM_CONFLICT_CHECK_ON_WRITE:-true}
+
+  # Classification vocabulary cache — used by classification.py which is called
+  # by the worker's classification.refine handler.
+  ENGRAM_VOCAB_CACHE_TTL_SECONDS: ${ENGRAM_VOCAB_CACHE_TTL_SECONDS:-120}
+  ENGRAM_VOCAB_CACHE_MAX_TENANTS: ${ENGRAM_VOCAB_CACHE_MAX_TENANTS:-256}
+
+  # Classification refinement tuning — accessed by the worker's
+  # handle_classification_refine handler.
+  ENGRAM_CLASSIFICATION_REFINE_MIN_DELTA: ${ENGRAM_CLASSIFICATION_REFINE_MIN_DELTA:-0.0}
+
+  # Promotion conflict checks — accessed by the worker's
+  # handle_promotion_path_a handler via promotion.auto_promote_proposed_memories.
+  ENGRAM_PROMOTION_CONFLICT_CANDIDATE_K: ${ENGRAM_PROMOTION_CONFLICT_CANDIDATE_K:-5}
+
+  # Background worker / job queue tunables.
+  ENGRAM_JOB_POLL_INTERVAL_SECONDS: ${ENGRAM_JOB_POLL_INTERVAL_SECONDS:-2}
+  ENGRAM_JOB_MAX_ATTEMPTS: ${ENGRAM_JOB_MAX_ATTEMPTS:-5}
+  ENGRAM_JOB_LEASE_STALE_AFTER_SECONDS: ${ENGRAM_JOB_LEASE_STALE_AFTER_SECONDS:-300}
 
 services:
   postgres:
@@ -53,29 +119,33 @@ services:
     restart: unless-stopped
 
   engram-service:
-    build:
-      context: .
-      target: runtime
+    build: *build-config
     container_name: engram-service
     environment:
-      # Runtime: connect as the non-owner app role (RLS-enforced).
-      ENGRAM_DATABASE_URL: postgresql+asyncpg://${POSTGRES_APP_USER:-engram_app}:${POSTGRES_APP_PASSWORD:-engram_app}@postgres:5432/${POSTGRES_DB:-engram}
-      # Migrations/admin: connect as the owner (bypasses RLS for DDL + cross-
-      # tenant CLI paths). Used by `engram init-db`, `engram bootstrap-key`, and
-      # `engram promote-proposed` / `engram backfill-embeddings`.
-      ENGRAM_OWNER_DATABASE_URL: postgresql+asyncpg://${POSTGRES_OWNER_USER:-${POSTGRES_USER:-engram}}:${POSTGRES_OWNER_PASSWORD:-${POSTGRES_PASSWORD:-engram}}@postgres:5432/${POSTGRES_DB:-engram}
+      <<: *engram-env
+      # --- API-only settings (not accessed by worker handlers) ---
       ENGRAM_HOST: 0.0.0.0
       ENGRAM_PORT: 8000
-      ENGRAM_LOG_LEVEL: ${ENGRAM_LOG_LEVEL:-info}
       ENGRAM_AUTH_ENABLED: ${ENGRAM_AUTH_ENABLED:-false}
-      ENGRAM_EMBEDDING_PROVIDER: ${ENGRAM_EMBEDDING_PROVIDER:-none}
-      ENGRAM_OPENAI_API_KEY: ${ENGRAM_OPENAI_API_KEY:-}
-      ENGRAM_OPENAI_BASE_URL: ${ENGRAM_OPENAI_BASE_URL:-}
-      ENGRAM_EMBEDDING_MODEL: ${ENGRAM_EMBEDDING_MODEL:-text-embedding-3-small}
-      ENGRAM_CLASSIFICATION_PROVIDER: ${ENGRAM_CLASSIFICATION_PROVIDER:-none}
-      ENGRAM_CLASSIFICATION_MODEL: ${ENGRAM_CLASSIFICATION_MODEL:-gpt-4o-mini}
-      ENGRAM_CLASSIFICATION_API_KEY: ${ENGRAM_CLASSIFICATION_API_KEY:-}
-      ENGRAM_CLASSIFICATION_BASE_URL: ${ENGRAM_CLASSIFICATION_BASE_URL:-}
+      # API key cache — used by the auth middleware on the API request path.
+      ENGRAM_API_KEY_CACHE_TTL_SECONDS: ${ENGRAM_API_KEY_CACHE_TTL_SECONDS:-60}
+      ENGRAM_API_KEY_CACHE_MAX_SIZE: ${ENGRAM_API_KEY_CACHE_MAX_SIZE:-4096}
+      # Read-replica URL — used by startup recall candidate selection in the API.
+      # Empty string falls back to ENGRAM_DATABASE_URL (see engram/db.py).
+      ENGRAM_READ_DATABASE_URL: ${ENGRAM_READ_DATABASE_URL:-}
+      # Embedding activation threshold — used by the embedding-profiles activate
+      # CLI command, normally invoked through engram-service.
+      ENGRAM_EMBEDDING_ACTIVATION_COVERAGE_THRESHOLD: ${ENGRAM_EMBEDDING_ACTIVATION_COVERAGE_THRESHOLD:-95.0}
+      # Recall defaults — used by startup/semantic recall on the API path.
+      ENGRAM_RECALL_BYTE_BUDGET: ${ENGRAM_RECALL_BYTE_BUDGET:-4096}
+      ENGRAM_RECALL_ITEM_BUDGET: ${ENGRAM_RECALL_ITEM_BUDGET:-50}
+      ENGRAM_MAX_PINNED_TOKENS: ${ENGRAM_MAX_PINNED_TOKENS:-2048}
+      ENGRAM_STALE_AFTER_DAYS: ${ENGRAM_STALE_AFTER_DAYS:-90}
+      # Bounded SQL candidate selection for startup recall.
+      ENGRAM_STARTUP_RECALL_CANDIDATE_LIMIT: ${ENGRAM_STARTUP_RECALL_CANDIDATE_LIMIT:-500}
+      ENGRAM_STARTUP_RECALL_CANDIDATE_LIMIT_MAX: ${ENGRAM_STARTUP_RECALL_CANDIDATE_LIMIT_MAX:-5000}
+      # Lazy promotion is initiated only by startup recall on the API path.
+      ENGRAM_STARTUP_PROMOTION_LIMIT: ${ENGRAM_STARTUP_PROMOTION_LIMIT:-20}
     depends_on:
       postgres:
         condition: service_healthy
@@ -96,6 +166,16 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+    restart: unless-stopped
+
+  engram-worker:
+    build: *build-config
+    command: ["engram", "worker"]
+    environment:
+      <<: *engram-env
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

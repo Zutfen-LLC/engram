@@ -92,7 +92,7 @@ cp .env.example .env  # set your passwords
 docker compose up -d
 ```
 
-This starts Postgres 16 with pgvector and the Engram service. The schema migrates automatically on first boot.
+This starts Postgres 16 with pgvector, the Engram API service, and a background worker that processes the job queue (embeddings, classification, conflict detection, recall telemetry). The schema migrates automatically on first boot.
 
 Verify that the service is running:
 
