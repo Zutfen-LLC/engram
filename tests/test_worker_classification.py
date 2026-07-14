@@ -391,13 +391,15 @@ async def test_refinement_schedules_from_reloaded_final_kind_and_reports_final_s
             tenant_id=context["tenant_id"],
             principal_id=context["principal_id"],
         )
-        await session.execute(
+        enabled = await session.execute(
             text(
                 "UPDATE tenant_config SET auto_promote_evidence_enabled = TRUE "
-                "WHERE tenant_id = :tenant_id AND active = TRUE"
+                "WHERE tenant_id = :tenant_id AND active = TRUE "
+                "RETURNING auto_promote_evidence_enabled"
             ),
             {"tenant_id": context["tenant_id"]},
         )
+        assert enabled.scalar_one() is True
         await session.commit()
 
     async def qualifying_decision(content, tenant_id, session, context=None):
@@ -420,19 +422,6 @@ async def test_refinement_schedules_from_reloaded_final_kind_and_reports_final_s
             tenant_id=context["tenant_id"],
             principal_id=context["principal_id"],
         )
-        jobs = (
-            (
-                await session.execute(
-                    text(
-                    "SELECT payload, payload->>'dedupe_key' AS dedupe_key FROM jobs "
-                        "WHERE job_type = 'promotion.path_a' AND payload->>'memory_item_id' = :id"
-                    ),
-                    {"id": item_id},
-                )
-            )
-            .mappings()
-            .all()
-        )
         event_payload = (
             await session.execute(
                 text(
@@ -442,11 +431,34 @@ async def test_refinement_schedules_from_reloaded_final_kind_and_reports_final_s
                 {"id": item_id},
             )
         ).scalar_one()
-    assert len(jobs) == 1
-    assert jobs[0]["dedupe_key"].startswith(f"promotion.path_a:{item_id}:")
     assert event_payload["previous_kind"] == "fact"
     assert event_payload["final_kind"] == "decision"
+    assert event_payload["final_review_status"] == "proposed"
     assert event_payload["final_visibility"] == "workspace"
+    assert event_payload["promotion_receipt_matches_item"] is True
+    assert event_payload["promotion_job_id"] is not None
+    async with _test_session_factory() as session:
+        await apply_rls_context(
+            session,
+            tenant_id=context["tenant_id"],
+            principal_id=context["principal_id"],
+        )
+        jobs = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT payload, payload->>'dedupe_key' AS dedupe_key FROM jobs "
+                        "WHERE id = :job_id AND job_type = 'promotion.path_a'"
+                    ),
+                    {"job_id": event_payload["promotion_job_id"]},
+                )
+            )
+            .mappings()
+            .all()
+        )
+    assert len(jobs) == 1
+    assert jobs[0]["payload"]["memory_item_id"] == item_id
+    assert jobs[0]["dedupe_key"].startswith(f"promotion.path_a:{item_id}:")
 
     await _run_refine_job(item_id)
     async with _test_session_factory() as session:
@@ -458,10 +470,8 @@ async def test_refinement_schedules_from_reloaded_final_kind_and_reports_final_s
         count = (
             await session.execute(
                 text(
-                    "SELECT count(*) FROM jobs WHERE job_type = 'promotion.path_a' "
-                    "AND payload->>'memory_item_id' = :id"
+                    "SELECT count(*) FROM jobs WHERE job_type = 'promotion.path_a'"
                 ),
-                {"id": item_id},
             )
         ).scalar_one()
         await session.execute(
