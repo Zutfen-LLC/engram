@@ -1,4 +1,4 @@
-"""Lifecycle hook implementations + Hermes compatibility shim.
+r"""engram_hooks.hooks — lifecycle hook implementations + Hermes compatibility shim.
 
 This module is the heart of the engram-hooks companion library. It wires three
 Hermes lifecycle events (``pre_compress``, ``sync_turn``, ``session_end``) to a
@@ -44,6 +44,74 @@ from .guards import GuardVerdict, is_allowed, prepare_memory_write_guard
 from .volatile import VolatileEntry, VolatileStore, store_from_config
 
 logger = logging.getLogger("engram_hooks")
+
+
+# ---------------------------------------------------------------------------
+# Per-session context accumulator.
+#
+# The classifier on the server receives one candidate at a time. Without
+# conversation context, a candidate like "we chose pgvector" is ambiguous —
+# is it a decision? a fact? an observation? With context ("we're migrating
+# the DB", "evaluating vector stores"), the LLM can correctly classify it as
+# a decision in the infrastructure wing.
+#
+# This accumulator keeps a rolling window of recently-routed candidate
+# strings (post-guard, so only quality candidates make it in). It's bounded
+# by both entry count and character budget. The context_string() output is
+# passed to the server's classify API via the ``context`` parameter, which
+# flows into the LLM prompt's ``context`` field.
+#
+# Design choice: no LLM summarization here. The raw candidate strings are
+# already short (sentence-split by _extract_candidates). Sending the last N
+# as context is cheap and gives the classifier real signal. This is a
+# client-side concern (design.md §2 principle 8) — the server stays generic.
+# ---------------------------------------------------------------------------
+
+
+class _SessionContext:
+    """Rolling window of recently-extracted candidates for this session.
+
+    Thread-safe via a lock — ``sync_turn`` can fire concurrently from a
+    background task while ``session_end`` runs on the main thread.
+    """
+
+    def __init__(self, max_entries: int = 10, max_chars: int = 800) -> None:
+        self._max_entries = max_entries
+        self._max_chars = max_chars
+        self._entries: list[str] = []
+        import threading
+        self._lock = threading.Lock()
+
+    def add(self, content: str) -> None:
+        """Record a candidate that was routed (promoted or parked)."""
+        with self._lock:
+            self._entries.append(content)
+            # Entry-count limit: keep the most recent N.
+            if len(self._entries) > self._max_entries:
+                self._entries = self._entries[-self._max_entries:]
+            # Char budget: trim oldest entries until under the limit.
+            while (
+                sum(len(e) for e in self._entries) > self._max_chars
+                and len(self._entries) > 1
+            ):
+                self._entries.pop(0)
+
+    def reset(self) -> None:
+        """Clear all context — called on new session / initialize()."""
+        with self._lock:
+            self._entries.clear()
+
+    def context_string(self) -> str:
+        """Build a context string for the classify API's ``context`` field.
+
+        Returns "" when empty — the caller passes None in that case so the
+        server treats it as "no context" rather than an empty string.
+        """
+        with self._lock:
+            if not self._entries:
+                return ""
+            return "\n".join(f"- {e}" for e in self._entries)
+
 
 # PR #59898 adds prepare_memory_write to the Hermes MemoryProvider ABC. We point
 # users here from every shim log line so the reason for the monkey-patch is one
@@ -106,6 +174,7 @@ class LifecycleHooks:
         self._client: Any = None  # engram_client.EngramClient, lazily created
         self._client_failed = False
         self.volatile: VolatileStore = store_from_config(self.config)
+        self._session_context = _SessionContext()
 
     # ---- client lifecycle ----
 
@@ -144,6 +213,14 @@ class LifecycleHooks:
         if self._client is not None:
             await self._client.close()
             self._client = None
+
+    def reset_session_context(self) -> None:
+        """Clear accumulated session context — call on new session start.
+
+        Without this, context from a previous session bleeds into the next
+        one's classification, causing cross-topic contamination.
+        """
+        self._session_context.reset()
 
     # ---- candidate extraction ----
 
@@ -222,8 +299,11 @@ class LifecycleHooks:
 
         if client is not None:
             try:
+                # Build context from accumulated session history so the
+                # classifier sees this candidate in conversation context.
+                ctx = self._session_context.context_string() or None
                 resp = await client.classify(
-                    content, context=source_type, workspace=self.config.default_workspace
+                    content, context=ctx, workspace=self.config.default_workspace
                 )
                 confidence = resp.confidence
                 # Enrich with the classifier's suggestions if the guard didn't
@@ -301,6 +381,13 @@ class LifecycleHooks:
                 result.promoted += 1
             elif route == "parked":
                 result.parked += 1
+
+            # Accumulate non-rejected candidates into session context so the
+            # next classify call sees conversation history. Rejected candidates
+            # are ephemeral noise — don't pollute the context window.
+            if route != "rejected":
+                self._session_context.add(content)
+
             result.details.append(detail)
         logger.info(
             "engram-hooks %s: extracted=%d rejected=%d promoted=%d parked=%d errors=%d",
