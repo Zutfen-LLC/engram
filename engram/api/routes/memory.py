@@ -559,9 +559,7 @@ async def remember(
     source_trust, memory_confidence, review_status = await resolve_trust_defaults(
         session, tenant_id, req.source_type, principal_type
     )
-    authority = derive_memory_authority(
-        source_type=req.source_type, principal_type=principal_type
-    )
+    authority = derive_memory_authority(source_type=req.source_type, principal_type=principal_type)
     # The kind's governance flag decides whether a write must begin as
     # proposed — regardless of whether the kind came from an explicit request
     # or the classifier (generalizes the old classifier-only
@@ -674,9 +672,7 @@ async def remember(
                     detail="existing memory is incompatible with classification run",
                 ) from None
             competing = await session.scalar(
-                select(ClassificationRun).where(
-                    ClassificationRun.memory_item_id == existing.id
-                )
+                select(ClassificationRun).where(ClassificationRun.memory_item_id == existing.id)
             )
             if competing is not None and competing.id != receipt.id:
                 raise HTTPException(
@@ -732,6 +728,9 @@ async def remember(
                 )
 
             bind_run(receipt, existing)
+            from engram.promotion import schedule_evidence_promotion_if_qualified
+
+            await schedule_evidence_promotion_if_qualified(session, existing, receipt)
             session.add(
                 ItemEvent(
                     item_id=existing.id,
@@ -785,7 +784,9 @@ async def remember(
         "source": (
             "classification_receipt"
             if receipt is not None
-            else "explicit_kind" if classification_result is None else "auto_classified"
+            else "explicit_kind"
+            if classification_result is None
+            else "auto_classified"
         ),
         "kind": kind,
         "wing": wing,
@@ -877,6 +878,11 @@ async def remember(
                 superseded_by=item.id,
             )
         )
+
+    if receipt is not None:
+        from engram.promotion import schedule_evidence_promotion_if_qualified
+
+        await schedule_evidence_promotion_if_qualified(session, item, receipt)
 
     # 9. Embeddings are generated OFF the request path (ENG-AUD-008 / F20).
     # Create the pending placeholder synchronously so the row exists, then
@@ -1353,9 +1359,7 @@ async def _resolve_actor_and_delegation(
             status_code=403, detail="on_behalf_of_principal_id requires admin authority"
         )
     represented = await session.execute(
-        text(
-            "SELECT 1 FROM principals WHERE (id = :pid OR id = :pid_hex) AND tenant_id = :tid"
-        ),
+        text("SELECT 1 FROM principals WHERE (id = :pid OR id = :pid_hex) AND tenant_id = :tid"),
         {
             "pid": str(requested_on_behalf_of),
             "pid_hex": requested_on_behalf_of.hex,
@@ -1612,9 +1616,7 @@ async def update_item_metadata(
     return {"item": updated, "event": events[0] if events else None, "events": events}
 
 
-@router.post(
-    "/items/{item_id}/supersede", response_model=None, dependencies=[Depends(WRITE_SCOPE)]
-)
+@router.post("/items/{item_id}/supersede", response_model=None, dependencies=[Depends(WRITE_SCOPE)])
 async def supersede_item(
     item_id: UUID,
     req: MutationAuditRequest | None = None,

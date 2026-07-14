@@ -276,6 +276,8 @@ CREATE TABLE tenant_config (
     auto_promote_enabled        BOOLEAN NOT NULL DEFAULT TRUE,
     auto_promote_confidence_threshold REAL NOT NULL DEFAULT 0.7,
     auto_promote_min_age_hours  INTEGER NOT NULL DEFAULT 72,
+    auto_promote_evidence_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    auto_promote_evidence_threshold REAL NOT NULL DEFAULT 0.70,
     -- Recall limits
     max_pinned_tokens           INTEGER NOT NULL DEFAULT 2048,
     stale_after_days            INTEGER NOT NULL DEFAULT 90,
@@ -297,6 +299,8 @@ CREATE TABLE tenant_config (
     confidence_pre_compress     REAL NOT NULL DEFAULT 0.3,
     active                      BOOLEAN NOT NULL DEFAULT TRUE,  -- only one active config per tenant
     created_at                  TIMESTAMPTZ NOT NULL DEFAULT now()
+    ,CONSTRAINT chk_auto_promote_evidence_threshold
+        CHECK (auto_promote_evidence_threshold >= 0.0 AND auto_promote_evidence_threshold <= 1.0)
 );
 
 CREATE UNIQUE INDEX idx_tenant_config_active ON tenant_config(tenant_id) WHERE active = TRUE;

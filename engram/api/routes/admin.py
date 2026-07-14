@@ -36,7 +36,7 @@ from engram.memory_kinds import (
     invalidate_memory_kind_cache,
     seed_builtin_kinds,
 )
-from engram.models import ApiKey, MemoryKind, Tenant, Workspace
+from engram.models import ApiKey, MemoryKind, Tenant, TenantConfig, Workspace
 from engram.models import Principal as PrincipalModel
 from engram.promotion import auto_promote_proposed_memories, summarize
 
@@ -124,6 +124,7 @@ class MemoryKindCreate(BaseModel):
     singleton: bool = False
     stays_in_recall_when_disputed: bool = False
     requires_review: bool = False
+    auto_promote_from_inferred: bool = False
     default_importance: float | None = Field(default=None, ge=0.0, le=1.0)
     sort_order: int = 100
 
@@ -135,6 +136,7 @@ class MemoryKindPatch(BaseModel):
     singleton: bool | None = None
     stays_in_recall_when_disputed: bool | None = None
     requires_review: bool | None = None
+    auto_promote_from_inferred: bool | None = None
     default_importance: float | None = Field(default=None, ge=0.0, le=1.0)
     sort_order: int | None = None
 
@@ -149,6 +151,7 @@ class MemoryKindOut(BaseModel):
     singleton: bool
     stays_in_recall_when_disputed: bool
     requires_review: bool
+    auto_promote_from_inferred: bool
     default_importance: float | None
     sort_order: int
 
@@ -164,6 +167,7 @@ def _kind_to_out(kind: MemoryKind) -> MemoryKindOut:
         singleton=kind.singleton,
         stays_in_recall_when_disputed=kind.stays_in_recall_when_disputed,
         requires_review=kind.requires_review,
+        auto_promote_from_inferred=kind.auto_promote_from_inferred,
         default_importance=kind.default_importance,
         sort_order=kind.sort_order,
     )
@@ -176,6 +180,9 @@ class PromotionResponse(BaseModel):
     enabled: bool
     confidence_threshold: float
     min_age_hours: int
+    evidence_enabled: bool = False
+    evidence_threshold: float = 0.70
+    dry_run: bool = False
     scanned: int = 0
     promoted: int = 0
     skipped_confidence: int = 0
@@ -185,6 +192,13 @@ class PromotionResponse(BaseModel):
     skipped_dispute: int = 0
     skipped_conflict_recheck: int = 0
     promoted_ids: list[uuid.UUID] = Field(default_factory=list)
+    promoted_legacy_confidence: int = 0
+    promoted_retention_evidence: int = 0
+    would_promote: int = 0
+    would_promote_legacy_confidence: int = 0
+    would_promote_retention_evidence: int = 0
+    would_promote_ids: list[uuid.UUID] = Field(default_factory=list)
+    candidates: list[dict[str, object]] = Field(default_factory=list)
     summary: str
 
 
@@ -208,6 +222,17 @@ async def create_tenant(
     # write memory items immediately — memory_items.kind is now FK-governed by
     # memory_kinds, so a tenant with zero registry rows could write nothing.
     await seed_builtin_kinds(session, tenant.id)
+    # Unlike legacy rows upgraded by migration 016, a newly created tenant is
+    # intentionally enrolled in the evidence lane by its real config row.
+    config = await session.scalar(
+        select(TenantConfig).where(
+            TenantConfig.tenant_id == tenant.id, TenantConfig.active.is_(True)
+        )
+    )
+    if config is None:
+        session.add(
+            TenantConfig(tenant_id=tenant.id, active=True, auto_promote_evidence_enabled=True)
+        )
     await session.commit()
     await session.refresh(tenant)
     return TenantOut(id=tenant.id, name=tenant.name, slug=tenant.slug)
@@ -224,15 +249,15 @@ async def create_workspace(
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> WorkspaceOut:
     ws = Workspace(
-        tenant_id=body.tenant_id, name=body.name, slug=body.slug,
+        tenant_id=body.tenant_id,
+        name=body.name,
+        slug=body.slug,
         created_at=datetime.now(UTC),
     )
     session.add(ws)
     await session.commit()
     await session.refresh(ws)
-    return WorkspaceOut(
-        id=ws.id, tenant_id=ws.tenant_id, name=ws.name, slug=ws.slug
-    )
+    return WorkspaceOut(id=ws.id, tenant_id=ws.tenant_id, name=ws.name, slug=ws.slug)
 
 
 @router.post(
@@ -257,7 +282,9 @@ async def create_principal(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
         ) from exc
     principal = PrincipalModel(
-        tenant_id=body.tenant_id, name=body.name, type=body.type,
+        tenant_id=body.tenant_id,
+        name=body.name,
+        type=body.type,
         created_at=datetime.now(UTC),
     )
     session.add(principal)
@@ -339,7 +366,10 @@ async def list_principals(
     )
     return [
         PrincipalOut(
-            id=p.id, tenant_id=p.tenant_id, name=p.name, type=p.type,
+            id=p.id,
+            tenant_id=p.tenant_id,
+            name=p.name,
+            type=p.type,
             internal_key=p.internal_key,
         )
         for p in result.scalars()
@@ -423,6 +453,7 @@ async def create_memory_kind(
         singleton=body.singleton,
         stays_in_recall_when_disputed=body.stays_in_recall_when_disputed,
         requires_review=body.requires_review,
+        auto_promote_from_inferred=body.auto_promote_from_inferred,
         default_importance=body.default_importance,
         sort_order=body.sort_order,
     )
@@ -482,6 +513,8 @@ async def update_memory_kind(
     dependencies=[Depends(ADMIN_SCOPE)],
 )
 async def promote_proposed(
+    dry_run: bool = False,
+    limit: int | None = None,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> PromotionResponse:
     """Run auto-promotion Path A for the caller's tenant.
@@ -495,12 +528,17 @@ async def promote_proposed(
     promotion pass (``engram.promotion.auto_promote_proposed_memories``).
     """
     tenant_id = await _resolve_tenant_id(session)
-    result = await auto_promote_proposed_memories(session, tenant_id, source="admin_endpoint")
+    result = await auto_promote_proposed_memories(
+        session, tenant_id, source="admin_endpoint", dry_run=dry_run, limit=limit
+    )
     return PromotionResponse(
         tenant_id=result.tenant_id,
         enabled=result.enabled,
         confidence_threshold=result.confidence_threshold,
         min_age_hours=result.min_age_hours,
+        evidence_enabled=result.evidence_enabled,
+        evidence_threshold=result.evidence_threshold,
+        dry_run=result.dry_run,
         scanned=result.scanned,
         promoted=result.promoted,
         skipped_confidence=result.skipped_confidence,
@@ -510,5 +548,12 @@ async def promote_proposed(
         skipped_dispute=result.skipped_dispute,
         skipped_conflict_recheck=result.skipped_conflict_recheck,
         promoted_ids=result.promoted_ids,
+        promoted_legacy_confidence=result.promoted_legacy_confidence,
+        promoted_retention_evidence=result.promoted_retention_evidence,
+        would_promote=result.would_promote,
+        would_promote_legacy_confidence=result.would_promote_legacy_confidence,
+        would_promote_retention_evidence=result.would_promote_retention_evidence,
+        would_promote_ids=result.would_promote_ids,
+        candidates=[candidate.__dict__ for candidate in result.candidates],
         summary=summarize(result),
     )

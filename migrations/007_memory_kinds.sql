@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS memory_kinds (
     singleton       BOOLEAN NOT NULL DEFAULT FALSE,
     stays_in_recall_when_disputed BOOLEAN NOT NULL DEFAULT FALSE,
     requires_review BOOLEAN NOT NULL DEFAULT FALSE,
+    auto_promote_from_inferred BOOLEAN NOT NULL DEFAULT FALSE,
     default_importance DOUBLE PRECISION,
     sort_order      INTEGER NOT NULL DEFAULT 100,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),

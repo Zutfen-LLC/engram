@@ -153,7 +153,10 @@ written → proposed → active → disputed → resolved → superseded/archive
 * **Disputed** memories remain available with warnings where appropriate.
 * **Archived** and superseded memories are preserved for audit but excluded from default recall.
 
-Auto-promotion is available for memories that meet tenant-configurable confidence, age, conflict, dispute, and feedback thresholds.
+Auto-promotion has independent legacy-confidence and server-attested retention-evidence lanes.
+The evidence lane uses `min(0.85, 0.20 * source_confidence_prior + 0.80 *
+retention_confidence)` for governed kinds only; it changes only `proposed → active`,
+never provenance, authority, confidence, or human-verification fields.
 
 `POST /v1/recall` with `mode=startup` runs a bounded, tenant-scoped promotion pass automatically before building the working set (capped at `settings.startup_promotion_limit`, default 20 proposed items per call) — no separate trigger needed for day-to-day recall. For full sweeps of a large proposed backlog, wire the CLI to cron/systemd, or call the admin endpoint on demand:
 
@@ -163,6 +166,9 @@ engram promote-proposed
 
 # Single tenant, capped at 1000 candidates:
 engram promote-proposed --tenant <tenant-id> --limit 1000
+
+# Exact evaluation with no writes, audit events, or actor creation:
+engram promote-proposed --dry-run
 ```
 
 ```text
@@ -188,6 +194,8 @@ Thresholds come from `tenant_config`:
 
 ```text
 auto_promote_enabled
+auto_promote_evidence_enabled       # existing tenants migrate as false
+auto_promote_evidence_threshold     # default 0.70
 auto_promote_confidence_threshold
 auto_promote_min_age_hours
 ```

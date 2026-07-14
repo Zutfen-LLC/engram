@@ -248,8 +248,10 @@ class MemoryEmbedding(Base):
         UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
     )
     profile_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("embedding_profiles.id"),
-        server_default=text("active_embedding_profile_id()"), nullable=False
+        UUID(as_uuid=True),
+        ForeignKey("embedding_profiles.id"),
+        server_default=text("active_embedding_profile_id()"),
+        nullable=False,
     )
     embedding_model: Mapped[str] = mapped_column(Text, nullable=False)
     embedding_dim: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -460,6 +462,7 @@ class MemoryKind(Base):
         Boolean, default=False, nullable=False
     )
     requires_review: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    auto_promote_from_inferred: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     default_importance: Mapped[float | None] = mapped_column(Float, nullable=True)
     sort_order: Mapped[int] = mapped_column(Integer, default=100, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -555,6 +558,10 @@ class TenantConfig(Base):
     auto_promote_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     auto_promote_confidence_threshold: Mapped[float] = mapped_column(Float, default=0.7)
     auto_promote_min_age_hours: Mapped[int] = mapped_column(Integer, default=72)
+    # New installations enable the evidence lane. Migration 016 deliberately
+    # backfills existing tenants as disabled for an explicit rollout.
+    auto_promote_evidence_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    auto_promote_evidence_threshold: Mapped[float] = mapped_column(Float, default=0.70)
 
     # Recall limits
     max_pinned_tokens: Mapped[int] = mapped_column(Integer, default=2048)

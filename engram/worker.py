@@ -1281,9 +1281,7 @@ def _can_narrow(current: str, proposed: str) -> bool:
 async def _reload_item_for_update(session: AsyncSession, item_id: UUID) -> MemoryItem | None:
     """Reload an item with SELECT ... FOR UPDATE for serialized mutation."""
     return (
-        await session.execute(
-            select(MemoryItem).where(MemoryItem.id == item_id).with_for_update()
-        )
+        await session.execute(select(MemoryItem).where(MemoryItem.id == item_id).with_for_update())
     ).scalar_one_or_none()
 
 
@@ -1392,9 +1390,7 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
     # Phase 2: lock the row and revalidate against current state.
     locked_item = await _reload_item_for_update(session, item_id)
     if locked_item is None or _is_expired_or_inactive(locked_item):
-        logger.info(
-            "classification.refine id=%s skipped: item gone/inactive after lock", item_id
-        )
+        logger.info("classification.refine id=%s skipped: item gone/inactive after lock", item_id)
         return
     if str(locked_item.tenant_id) != str(job.tenant_id):
         return
@@ -1487,6 +1483,12 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
         and _can_narrow(locked_item.visibility, result.suggested_visibility)
         else locked_item.visibility
     )
+    # The receipt, item evidence, classification event, and targeted delayed
+    # promotion job share this transaction.
+    from engram.promotion import schedule_evidence_promotion_if_qualified
+
+    await session.flush()
+    await schedule_evidence_promotion_if_qualified(session, locked_item, run)
     await session.flush()
     await _insert_event(
         session,
@@ -1530,10 +1532,19 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
 
 
 async def handle_promotion_path_a(session: AsyncSession, job: Job) -> None:
-    """Run Path A auto-promotion for the job's tenant. Thin wrapper."""
-    from engram.promotion import auto_promote_proposed_memories
+    """Run a compatible full sweep or a fail-closed targeted Path A job."""
+    from engram.promotion import auto_promote_item, auto_promote_proposed_memories
 
-    result = await auto_promote_proposed_memories(session, str(job.tenant_id), source="worker")
+    raw_item_id = job.payload.get("memory_item_id")
+    if raw_item_id is None:
+        result = await auto_promote_proposed_memories(session, str(job.tenant_id), source="worker")
+    else:
+        raw_run_id = job.payload.get("classification_run_id")
+        if raw_run_id is None:
+            raise ValueError("targeted promotion job missing classification_run_id")
+        result = await auto_promote_item(
+            session, str(job.tenant_id), _parse_uuid(raw_item_id), _parse_uuid(raw_run_id)
+        )
     logger.info(
         "promotion.path_a tenant=%s scanned=%s promoted=%s",
         job.tenant_id,
@@ -1611,9 +1622,7 @@ async def handle_recall_telemetry(session: AsyncSession, job: Job) -> None:
         # Already applied by a prior successful run of this job (or a
         # concurrent worker that won the race) — safe no-op.
         await session.commit()
-        logger.info(
-            "recall.telemetry recall_log_id=%s already applied, no-op", recall_log_id
-        )
+        logger.info("recall.telemetry recall_log_id=%s already applied, no-op", recall_log_id)
         return
 
     values: dict[str, Any] = {

@@ -46,6 +46,7 @@ class BuiltinKindSpec:
     singleton: bool
     stays_in_recall_when_disputed: bool
     requires_review: bool
+    auto_promote_from_inferred: bool
     default_importance: float
     sort_order: int
 
@@ -54,13 +55,14 @@ class BuiltinKindSpec:
 # see that file's comment block for the audited behavior mapping.
 BUILTIN_KINDS: tuple[BuiltinKindSpec, ...] = (
     BuiltinKindSpec(
-        "fact", "Fact", "An observed or stated fact.", False, False, False, 0.5, 10
+        "fact", "Fact", "An observed or stated fact.", False, False, False, True, 0.5, 10
     ),
     BuiltinKindSpec(
         "preference",
         "Preference",
         "A stated preference or convention.",
         True,
+        False,
         False,
         False,
         0.5,
@@ -73,6 +75,7 @@ BUILTIN_KINDS: tuple[BuiltinKindSpec, ...] = (
         False,
         True,
         True,
+        False,
         0.7,
         30,
     ),
@@ -82,6 +85,7 @@ BUILTIN_KINDS: tuple[BuiltinKindSpec, ...] = (
         "A decision that was made and should be remembered.",
         False,
         False,
+        True,
         True,
         0.6,
         40,
@@ -93,6 +97,7 @@ BUILTIN_KINDS: tuple[BuiltinKindSpec, ...] = (
         True,
         True,
         True,
+        False,
         0.8,
         50,
     ),
@@ -103,11 +108,20 @@ BUILTIN_KINDS: tuple[BuiltinKindSpec, ...] = (
         False,
         False,
         False,
+        True,
         0.4,
         60,
     ),
     BuiltinKindSpec(
-        "diary_entry", "Diary Entry", "A private agent diary entry.", False, False, False, 0.4, 70
+        "diary_entry",
+        "Diary Entry",
+        "A private agent diary entry.",
+        False,
+        False,
+        False,
+        False,
+        0.4,
+        70,
     ),
     BuiltinKindSpec(
         "procedure",
@@ -116,6 +130,7 @@ BUILTIN_KINDS: tuple[BuiltinKindSpec, ...] = (
         False,
         False,
         False,
+        True,
         0.5,
         80,
     ),
@@ -126,6 +141,7 @@ BUILTIN_KINDS: tuple[BuiltinKindSpec, ...] = (
         False,
         False,
         False,
+        True,
         0.4,
         90,
     ),
@@ -169,6 +185,7 @@ async def seed_builtin_kinds(session: AsyncSession, tenant_id: UUID | str) -> No
                 singleton=spec.singleton,
                 stays_in_recall_when_disputed=spec.stays_in_recall_when_disputed,
                 requires_review=spec.requires_review,
+                auto_promote_from_inferred=spec.auto_promote_from_inferred,
                 default_importance=spec.default_importance,
                 sort_order=spec.sort_order,
                 created_at=now,
@@ -207,6 +224,7 @@ class KindSnapshot:
     singleton: bool
     stays_in_recall_when_disputed: bool
     requires_review: bool
+    auto_promote_from_inferred: bool
     default_importance: float | None
     sort_order: int
 
@@ -299,6 +317,7 @@ async def get_enabled_memory_kinds(
                 singleton=k.singleton,
                 stays_in_recall_when_disputed=k.stays_in_recall_when_disputed,
                 requires_review=k.requires_review,
+                auto_promote_from_inferred=k.auto_promote_from_inferred,
                 default_importance=k.default_importance,
                 sort_order=k.sort_order,
             )
@@ -322,9 +341,7 @@ async def require_enabled_memory_kind(
     for candidate in await get_enabled_memory_kinds(session, tenant_id):
         if candidate.name == kind:
             return candidate
-    raise UnknownMemoryKindError(
-        f"kind {kind!r} is not a registered, enabled kind for this tenant"
-    )
+    raise UnknownMemoryKindError(f"kind {kind!r} is not a registered, enabled kind for this tenant")
 
 
 async def get_singleton_kind_names(session: AsyncSession, tenant_id: UUID | str) -> set[str]:
