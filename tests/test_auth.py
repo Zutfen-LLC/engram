@@ -380,14 +380,14 @@ def test_parse_api_key_rejects_bare_prefix():
         parse_api_key("eng_")
 
 
-def test_parse_api_key_rejects_empty_key_id_segment():
-    with pytest.raises(ValueError):
-        parse_api_key("eng__secret")  # key_id empty
+def test_parse_api_key_treats_leading_separator_as_legacy():
+    parsed = parse_api_key("eng__secret")
+    assert parsed == ParsedApiKey(key_id=None, secret="_secret", is_legacy=True)
 
 
-def test_parse_api_key_rejects_empty_secret_segment():
-    with pytest.raises(ValueError):
-        parse_api_key("eng_kid_")  # secret empty
+def test_parse_api_key_treats_trailing_separator_as_legacy():
+    parsed = parse_api_key("eng_kid_")
+    assert parsed == ParsedApiKey(key_id=None, secret="kid_", is_legacy=True)
 
 
 # === New-format digest helpers ===
