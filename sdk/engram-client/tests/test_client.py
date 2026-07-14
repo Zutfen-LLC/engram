@@ -29,6 +29,7 @@ from engram_client import (
     EngramValidationError,
     KgAddResponse,
     KgTripleOut,
+    LifecycleSummaryResponse,
     RecallResponse,
     RememberResponse,
     SearchResponse,
@@ -564,3 +565,81 @@ async def test_plaintext_http_warns_for_non_loopback_only() -> None:
             "http://engram.test/", api_key=None, transport=httpx.MockTransport(rec)
         )
     await client.close()
+
+
+# ---- correlation_id threading (ENG-METER-001) ----
+
+
+async def test_remember_forwards_correlation_id() -> None:
+    rec = _Recorder(status_code=201, payload=_REMEMBER_CREATED)
+    correlation_id = UUID("33333333-3333-3333-3333-333333333333")
+    async with _client(rec) as client:
+        await client.remember("x", correlation_id=correlation_id)
+    assert rec.request is not None
+    assert _body(rec.request)["correlation_id"] == str(correlation_id)
+
+
+async def test_remember_omits_correlation_id_when_not_given() -> None:
+    rec = _Recorder(status_code=201, payload=_REMEMBER_CREATED)
+    async with _client(rec) as client:
+        await client.remember("x")
+    assert rec.request is not None
+    assert "correlation_id" not in _body(rec.request)
+
+
+async def test_classify_forwards_correlation_id() -> None:
+    correlation_id = UUID("44444444-4444-4444-4444-444444444444")
+    rec = _Recorder(
+        payload={
+            "classification_run_id": ITEM_ID,
+            "expires_at": "2026-07-14T13:00:00Z",
+            "correlation_id": str(correlation_id),
+            "suggested_kind": "fact",
+            "taxonomy_confidence": 0.5,
+            "confidence": 0.5,
+            "retention_confidence": 0.5,
+            "retention_disposition": "retain",
+            "reason": "test",
+        },
+    )
+    async with _client(rec) as client:
+        resp = await client.classify("x", correlation_id=correlation_id)
+    assert resp.correlation_id == correlation_id
+    assert rec.request is not None
+    assert _body(rec.request)["correlation_id"] == str(correlation_id)
+
+
+# ---- report_lifecycle_summary ----
+
+
+async def test_report_lifecycle_summary_success() -> None:
+    invocation_id = UUID("55555555-5555-5555-5555-555555555555")
+    rec = _Recorder(
+        status_code=202,
+        payload={"status": "succeeded", "invocation_id": str(invocation_id)},
+    )
+    async with _client(rec) as client:
+        resp = await client.report_lifecycle_summary(
+            invocation_id=invocation_id,
+            event="sync_turn",
+            extracted=5,
+            guard_rejected=1,
+            classified=3,
+            promoted=2,
+            parked=1,
+            errors=0,
+            candidate_bytes=128,
+            latency_ms=42,
+        )
+    assert isinstance(resp, LifecycleSummaryResponse)
+    assert resp.status == "succeeded"
+    assert resp.invocation_id == invocation_id
+    assert rec.request is not None
+    assert rec.request.url.path == "/v1/telemetry/lifecycle"
+    body = _body(rec.request)
+    assert body["invocation_id"] == str(invocation_id)
+    assert body["event"] == "sync_turn"
+    assert body["extracted"] == 5
+    assert body["candidate_bytes"] == 128
+    # No candidate text field exists on this request at all.
+    assert "content" not in body

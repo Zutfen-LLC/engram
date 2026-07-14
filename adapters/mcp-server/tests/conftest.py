@@ -52,6 +52,7 @@ def build_mock_client() -> AsyncMock:
         status="created",
         review_status="active",
         memory_confidence=0.9,
+        correlation_id=OTHER_ID,
     )
     client.recall.return_value = engram_client.RecallResponse(
         working_set="- [invariant] always use lowercase table names",
@@ -68,6 +69,7 @@ def build_mock_client() -> AsyncMock:
     client.classify.return_value = engram_client.ClassifyResponse(
         classification_run_id=OTHER_ID,
         expires_at=datetime.now(UTC) + timedelta(hours=1),
+        correlation_id=OTHER_ID,
         suggested_kind="invariant",
         suggested_wing="engineering",
         suggested_room="conventions",
