@@ -394,7 +394,7 @@ async def test_refinement_schedules_from_reloaded_final_kind_and_reports_final_s
             (
                 await session.execute(
                     text(
-                        "SELECT payload, dedupe_key FROM jobs "
+                    "SELECT payload, payload->>'dedupe_key' AS dedupe_key FROM jobs "
                         "WHERE job_type = 'promotion.path_a' AND payload->>'memory_item_id' = :id"
                     ),
                     {"id": item_id},

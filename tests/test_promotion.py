@@ -1252,7 +1252,7 @@ async def test_evidence_negative_matrix_fails_closed(case: str, expected_blocker
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     tenant_id, principal_id = await _default_tenant_principal()
     now = _default_now()
-    evidence_at = now - timedelta(hours=80)
+    evidence_at = now - timedelta(hours=1 if case == "fresh" else 80)
     item_id = await _insert_item(
         tenant_id=tenant_id,
         principal_id=principal_id,
@@ -1368,15 +1368,6 @@ async def test_evidence_negative_matrix_fails_closed(case: str, expected_blocker
                     "WHERE id = :run_id"
                 ),
                 {"run_id": run_id},
-            )
-        elif case == "fresh":
-            await session.execute(
-                text("UPDATE memory_items SET retention_evidence_at = :fresh WHERE id = :id"),
-                {"id": item_id, "fresh": now - timedelta(hours=1)},
-            )
-            await session.execute(
-                text("UPDATE classification_runs SET created_at = :fresh WHERE id = :run_id"),
-                {"run_id": run_id, "fresh": now - timedelta(hours=1)},
             )
         result = await auto_promote_proposed_memories(session, tenant_id, now=now, dry_run=True)
     assert result.would_promote == 0
