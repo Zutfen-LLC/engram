@@ -40,6 +40,8 @@ jobs:
       - name: Validate deployment compose content
         run: |
           set -euo pipefail
+          pip3 install --quiet pyyaml
+
           SERVICES=$(docker compose config --services)
           echo "Services: $SERVICES"
 
