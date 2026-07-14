@@ -958,7 +958,13 @@ async def execute_semantic_recall(
 
     active_profile = await get_active_profile(session)
     if len(inspect.signature(generate_embedding).parameters) >= 2:
-        query_embedding = await generate_embedding(query, active_profile)
+        query_embedding = await generate_embedding(
+            query,
+            active_profile,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            operation="embedding_query_recall",
+        )
     else:
         query_embedding = await generate_embedding(query)
 

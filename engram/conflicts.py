@@ -25,6 +25,13 @@ from engram.authority import (
 )
 from engram.config import settings
 from engram.models import EmbeddingProfile, MemoryEmbedding, MemoryItem
+from engram.usage import (
+    Timer,
+    extract_openai_compatible_usage,
+    record_provider_call,
+    safe_provider_identity,
+    utf8_byte_len,
+)
 
 # Cosine similarity above this triggers conflict classification.
 _SIMILARITY_THRESHOLD = 0.85
@@ -162,6 +169,9 @@ async def detect_conflicts(
         old_content=str(row["content"]),
         new_content=new_item.content,
         similarity=similarity,
+        tenant_id=new_item.tenant_id,
+        principal_id=new_item.principal_id,
+        workspace_id=new_item.workspace_id,
     )
 
     # 4. Resolve the action based on verdict + authority hierarchy.
@@ -224,12 +234,40 @@ async def _classify_relationship(
     old_content: str,
     new_content: str,
     similarity: float,
+    *,
+    tenant_id: UUID | None = None,
+    principal_id: UUID | None = None,
+    workspace_id: UUID | None = None,
 ) -> tuple[ConflictVerdict, float, str, dict[str, Any]]:
-    """Classify how new content relates to existing content."""
+    """Classify how new content relates to existing content.
+
+    ``tenant_id``/``principal_id``/``workspace_id`` are optional
+    usage-telemetry context (ENG-METER-001) for the resulting
+    ``conflict_classification`` provider.call event.
+    """
     if settings.classification_provider != "openai":
+        if tenant_id is not None:
+            await record_provider_call(
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                workspace_id=workspace_id,
+                operation="conflict_classification",
+                status="disabled",
+                provider_adapter=settings.classification_provider or "none",
+                model=settings.classification_model,
+                input_count=1,
+                input_bytes=utf8_byte_len(old_content) + utf8_byte_len(new_content),
+            )
         return _classify_relationship_fallback(similarity)
     try:
-        return await _classify_relationship_llm(old_content, new_content, similarity)
+        return await _classify_relationship_llm(
+            old_content,
+            new_content,
+            similarity,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            workspace_id=workspace_id,
+        )
     except Exception as exc:  # pragma: no cover - defensive fallback
         verdict, confidence, reason, _ = _classify_relationship_fallback(similarity)
         provenance = {"provider": "openai", "mode": "fallback", "error": str(exc)}
@@ -268,6 +306,10 @@ async def _classify_relationship_llm(
     old_content: str,
     new_content: str,
     similarity: float,
+    *,
+    tenant_id: UUID | None = None,
+    principal_id: UUID | None = None,
+    workspace_id: UUID | None = None,
 ) -> tuple[ConflictVerdict, float, str, dict[str, Any]]:
     """LLM-backed classification of the relationship between two items."""
     prompt = json.dumps(
@@ -300,17 +342,51 @@ async def _classify_relationship_llm(
         if settings.openai_api_key is None
         else AsyncOpenAI(api_key=settings.openai_api_key)
     )
-    response = await client.chat.completions.create(
-        model=settings.classification_model,
-        messages=[
-            {"role": "system", "content": "Return only valid JSON."},
-            {"role": "user", "content": prompt},
-        ],
-        response_format={"type": "json_object"},
-    )
+    adapter, host = safe_provider_identity("openai", None)
+    input_bytes = utf8_byte_len(old_content) + utf8_byte_len(new_content)
+    timer = Timer()
+    try:
+        response = await client.chat.completions.create(
+            model=settings.classification_model,
+            messages=[
+                {"role": "system", "content": "Return only valid JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+        )
+    except Exception:
+        if tenant_id is not None:
+            await record_provider_call(
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                workspace_id=workspace_id,
+                operation="conflict_classification",
+                status="fallback",
+                provider_adapter=adapter,
+                provider_host=host,
+                model=settings.classification_model,
+                input_count=1,
+                input_bytes=input_bytes,
+                latency_ms=timer.elapsed_ms(),
+            )
+        raise
     message = response.choices[0].message.content or "{}"
     payload = json.loads(message)
     if not isinstance(payload, dict):
+        if tenant_id is not None:
+            await record_provider_call(
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                workspace_id=workspace_id,
+                operation="conflict_classification",
+                status="fallback",
+                provider_adapter=adapter,
+                provider_host=host,
+                model=settings.classification_model,
+                input_count=1,
+                input_bytes=input_bytes,
+                latency_ms=timer.elapsed_ms(),
+            )
         raise ValueError("conflict classification response was not a JSON object")
 
     verdict = _parse_verdict(payload.get("verdict"))
@@ -327,6 +403,28 @@ async def _classify_relationship_llm(
         "model": settings.classification_model,
         "llm_payload": payload,
     }
+
+    if tenant_id is not None:
+        usage = extract_openai_compatible_usage(response)
+        await record_provider_call(
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            workspace_id=workspace_id,
+            operation="conflict_classification",
+            status="succeeded" if usage.total_tokens is not None else "no_usage",
+            provider_adapter=adapter,
+            provider_host=host,
+            model=settings.classification_model,
+            input_count=1,
+            input_bytes=input_bytes,
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+            total_tokens=usage.total_tokens,
+            reported_cost_usd=usage.reported_cost_usd,
+            latency_ms=timer.elapsed_ms(),
+            metadata={"verdict": verdict.value, "confidence": confidence},
+        )
+
     return verdict, confidence, reason, provenance
 
 
@@ -580,6 +678,9 @@ async def check_promotion_conflict(
                 old_content=candidate.content,
                 new_content=item.content,
                 similarity=candidate.similarity,
+                tenant_id=item.tenant_id,
+                principal_id=item.principal_id,
+                workspace_id=item.workspace_id,
             )
             if verdict is ConflictVerdict.CONTRADICT:
                 return PromotionConflictCheck(candidate.id, verdict.value, reason, True)

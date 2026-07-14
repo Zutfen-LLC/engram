@@ -42,6 +42,7 @@ _REMEMBER_CREATED: dict[str, Any] = {
     "status": "created",
     "review_status": "active",
     "memory_confidence": 0.9,
+    "correlation_id": ITEM_ID,
 }
 
 
@@ -94,6 +95,7 @@ async def test_remember_success() -> None:
             "status": "created",
             "review_status": "active",
             "memory_confidence": 0.9,
+            "correlation_id": ITEM_ID,
         },
     )
     client = _client(rec)
@@ -132,6 +134,7 @@ async def test_remember_forwards_session_end_source_type() -> None:
             "status": "created",
             "review_status": "proposed",
             "memory_confidence": 0.35,
+            "correlation_id": ITEM_ID,
         },
     )
     client = _client(rec)
@@ -152,6 +155,7 @@ async def test_remember_deduped_response() -> None:
             "review_status": "active",
             "memory_confidence": 0.9,
             "deduped_existing_id": OTHER_ID,
+            "correlation_id": ITEM_ID,
         },
     )
     async with _client(rec) as client:
@@ -285,6 +289,7 @@ async def test_classify_success() -> None:
         payload={
             "classification_run_id": ITEM_ID,
             "expires_at": "2026-07-14T13:00:00Z",
+            "correlation_id": ITEM_ID,
             "suggested_kind": "invariant",
             "suggested_wing": "engineering",
             "suggested_room": "conventions",

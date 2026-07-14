@@ -42,6 +42,10 @@ class RememberRequest(BaseModel):
     external_id: str | None = None
     external_source: str | None = None
     classification_run_id: UUID | None = None
+    # Optional correlation id shared with a preceding classify() call for the
+    # same candidate. When omitted the server generates one (see
+    # RememberResponse.correlation_id).
+    correlation_id: UUID | None = None
 
 
 class RememberResponse(BaseModel):
@@ -51,6 +55,7 @@ class RememberResponse(BaseModel):
     memory_confidence: float
     deduped_existing_id: UUID | None = None
     superseded_id: UUID | None = None
+    correlation_id: UUID
 
 
 # ---- /v1/recall ----
@@ -104,11 +109,16 @@ class ClassifyRequest(BaseModel):
     context: str | None = None
     workspace: str | None = None
     source_type: SourceKind = "manual"
+    # Optional correlation id shared with a subsequent remember() call for the
+    # same candidate. When omitted the server generates one (see
+    # ClassifyResponse.correlation_id).
+    correlation_id: UUID | None = None
 
 
 class ClassifyResponse(BaseModel):
     classification_run_id: UUID
     expires_at: datetime
+    correlation_id: UUID
     suggested_kind: str
     suggested_wing: str | None = None
     suggested_room: str | None = None
@@ -124,6 +134,37 @@ class ClassifyResponse(BaseModel):
     def keep_legacy_confidence_alias_equal(self) -> ClassifyResponse:
         self.confidence = self.taxonomy_confidence
         return self
+
+
+# ---- /v1/telemetry/lifecycle ----
+
+LifecycleEvent = Literal["sync_turn", "pre_compress", "session_end"]
+
+
+class LifecycleSummaryRequest(BaseModel):
+    """Diagnostic, client-reported aggregate for one lifecycle-hook invocation.
+
+    Never carries candidate text — only counts and aggregate byte totals.
+    Tenant/principal are derived from authentication server-side, never from
+    this body.
+    """
+
+    invocation_id: UUID
+    event: LifecycleEvent
+    extracted: int = 0
+    guard_rejected: int = 0
+    classified: int = 0
+    promoted: int = 0
+    parked: int = 0
+    errors: int = 0
+    candidate_bytes: int = 0
+    latency_ms: int | None = None
+    adapter_version: str | None = None
+
+
+class LifecycleSummaryResponse(BaseModel):
+    status: Literal["succeeded", "partial"]
+    invocation_id: UUID
 
 
 # ---- /v1/kg ----

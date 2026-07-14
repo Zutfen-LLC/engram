@@ -8,12 +8,14 @@ from typing import Any
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     Float,
     ForeignKey,
     ForeignKeyConstraint,
     Integer,
+    Numeric,
     SmallInteger,
     String,
     Text,
@@ -675,3 +677,62 @@ class Job(Base):
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class UsageEvent(Base):
+    """Append-only metering/usage telemetry ledger (ENG-METER-001).
+
+    Diagnostic observability data for dogfood economics, not a billing record.
+    Distinct from ``ItemEvent`` (trust/audit history of one memory item):
+    covers operations — rejected candidates, provider calls, retrieval
+    requests, client-reported lifecycle summaries — that never create a
+    memory item. Written by :mod:`engram.usage` via a short-lived app-role
+    session; RLS is FORCE-enabled and the app role has no UPDATE/DELETE grant
+    (see migrations/017_usage_events.sql), so it is append-only from the
+    application's perspective.
+    """
+
+    __tablename__ = "usage_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    principal_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("principals.id", ondelete="SET NULL"), nullable=True
+    )
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True
+    )
+
+    event_type: Mapped[str] = mapped_column(Text, nullable=False)
+    operation: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+
+    correlation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    dedupe_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    job_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+
+    source_type: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    provider_adapter: Mapped[str | None] = mapped_column(Text, nullable=True)
+    provider_host: Mapped[str | None] = mapped_column(Text, nullable=True)
+    model: Mapped[str | None] = mapped_column(Text, nullable=True)
+    embedding_profile: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    input_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    input_bytes: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+
+    prompt_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    completion_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    total_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reported_cost_usd: Mapped[float | None] = mapped_column(Numeric(20, 10), nullable=True)
+
+    event_metadata: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, nullable=False, default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )

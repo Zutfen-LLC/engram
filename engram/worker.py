@@ -235,7 +235,14 @@ async def handle_embedding_generate(session: AsyncSession, job: Job) -> None:
         # Compatibility with one-argument test/provider shims while the public
         # implementation receives the durable profile contract explicitly.
         if len(inspect.signature(generate_embedding).parameters) >= 2:
-            vector = await generate_embedding(item.content, profile)
+            vector = await generate_embedding(
+                item.content,
+                profile,
+                tenant_id=item.tenant_id,
+                principal_id=item.principal_id,
+                workspace_id=item.workspace_id,
+                operation="embedding_document",
+            )
         else:
             vector = await generate_embedding(item.content)
     except Exception:

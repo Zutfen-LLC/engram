@@ -114,7 +114,7 @@ def _enable_embeddings(monkeypatch):
     """
     settings.embedding_provider = "openai"
 
-    async def fake_embedding(text_value: str):
+    async def fake_embedding(text_value: str, *_args: object, **_kwargs: object):
         # Items we want to look similar share vector A.
         if "dup" in text_value or "same" in text_value or "refine" in text_value:
             return _VECTOR_A
@@ -155,7 +155,7 @@ def _stub_verdict(monkeypatch, verdict: ConflictVerdict, confidence: float = 0.9
     detect_conflicts() similarity search runs, but the verdict is controlled.
     """
 
-    async def fake_classify(old_content: str, new_content: str, similarity: float):
+    async def fake_classify(old_content, new_content, similarity, **_kwargs):
         return verdict, confidence, f"forced verdict: {verdict.value}", {"provider": "test"}
 
     monkeypatch.setattr("engram.conflicts._classify_relationship", fake_classify)
@@ -389,7 +389,7 @@ async def test_no_conflict_below_similarity_threshold(client, monkeypatch):
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     settings.embedding_provider = "openai"
 
-    async def fake_embedding(text_value: str):
+    async def fake_embedding(text_value: str, *_args: object, **_kwargs: object):
         # Every item gets a distinct orthogonal vector → near-zero similarity.
         idx = abs(hash(text_value)) % 1536
         vec = [0.0] * 1536

@@ -108,6 +108,13 @@ class Settings(BaseSettings):
     # if False, low-trust writes defer conflict check to promotion
     conflict_check_on_write: bool = True
 
+    # Usage/metering telemetry (ENG-METER-001). Observability only — never
+    # gates or throttles a request. Defaults to False for the open-source/
+    # self-hosted distribution; dogfood/operator deployments opt in
+    # explicitly. When False, engram.usage helpers are cheap no-ops that never
+    # open a database session.
+    usage_telemetry_enabled: bool = False
+
     # Background worker / job queue (ENG-AUD-008). The service still works
     # without a worker running; pending jobs simply queue and semantic recall /
     # LLM refinement lag until processed.

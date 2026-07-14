@@ -152,13 +152,14 @@ jobs:
           for entry in \
             'ENGRAM_VOCAB_CACHE_TTL_SECONDS=999' \
             'ENGRAM_VOCAB_CACHE_MAX_TENANTS=888' \
-            'ENGRAM_PROMOTION_CONFLICT_CANDIDATE_K=777'; do
+            'ENGRAM_PROMOTION_CONFLICT_CANDIDATE_K=777' \
+            'ENGRAM_USAGE_TELEMETRY_ENABLED=true'; do
             key=${entry%%=*}
             expected=${entry#*=}
             require_env engram-service "$API_CONFIG" "$key" "$expected"
             require_env engram-worker "$WORKER_CONFIG" "$key" "$expected"
           done
-          echo "Shared sentinel checks: 3 passed"
+          echo "Shared sentinel checks: 4 passed"
 
           for entry in \
             'ENGRAM_API_KEY_CACHE_TTL_SECONDS=666' \

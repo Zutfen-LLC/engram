@@ -928,7 +928,7 @@ async def test_conflict_recheck_event_uses_internal_actor():
 
     import engram.conflicts as conflicts_mod
 
-    async def fake_classify(old_content, new_content, similarity):
+    async def fake_classify(old_content, new_content, similarity, **_kwargs):
         return ConflictVerdict.CONTRADICT, 0.9, "forced contradiction", {}
 
     monkeypatch = pytest.MonkeyPatch()

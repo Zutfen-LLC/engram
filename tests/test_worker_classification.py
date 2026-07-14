@@ -194,10 +194,10 @@ async def test_remember_omitted_kind_does_not_call_openai(client, monkeypatch):
     original = classification_mod._call_openai_classification
     called = False
 
-    async def spy(prompt: str):
+    async def spy(prompt: str, **kwargs: object):
         nonlocal called
         called = True
-        return await original(prompt)  # type: ignore[misc]
+        return await original(prompt, **kwargs)  # type: ignore[misc]
 
     monkeypatch.setattr(classification_mod, "_call_openai_classification", spy)
     settings.classification_provider = "openai"
