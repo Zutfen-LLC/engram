@@ -110,6 +110,45 @@ CREATE_STATEMENTS = [
         PRIMARY KEY (tenant_id, name)
     )
     """,
+    """
+    CREATE TABLE tenant_config (
+        id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        config_version TEXT,
+        weight_importance REAL,
+        weight_source_trust REAL,
+        weight_memory_confidence REAL,
+        weight_recency REAL,
+        weight_verified REAL,
+        auto_promote_enabled INTEGER,
+        auto_promote_confidence_threshold REAL,
+        auto_promote_min_age_hours INTEGER,
+        auto_promote_evidence_enabled INTEGER,
+        auto_promote_evidence_threshold REAL,
+        max_pinned_tokens INTEGER,
+        stale_after_days INTEGER,
+        startup_recall_penalty_threshold INTEGER,
+        startup_recall_penalty_factor REAL,
+        feedback_daily_limit INTEGER,
+        trust_manual_user REAL,
+        trust_manual_agent REAL,
+        trust_import REAL,
+        trust_extraction REAL,
+        trust_sync_turn REAL,
+        trust_pre_compress REAL,
+        trust_session_end REAL,
+        confidence_manual_user REAL,
+        confidence_manual_agent REAL,
+        confidence_import REAL,
+        confidence_extraction REAL,
+        confidence_sync_turn REAL,
+        confidence_pre_compress REAL,
+        confidence_session_end REAL,
+        active INTEGER,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+
 ]
 
 
