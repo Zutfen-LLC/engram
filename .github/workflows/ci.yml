@@ -17,6 +17,12 @@ jobs:
       - name: Validate Compose Config
         run: docker compose -f docker-compose.ci.yml config -q
 
+      - name: Run Canonical Trust Proof
+        run: make compose-trust-proof
+
+      - name: Reset Trust-Proof Stack
+        run: docker compose -f docker-compose.ci.yml down -v --remove-orphans
+
       - name: Run Compose Real-DB CI Stack
         run: docker compose -f docker-compose.ci.yml up --build --abort-on-container-exit --exit-code-from engram-test
 
