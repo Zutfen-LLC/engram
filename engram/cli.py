@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -106,6 +107,11 @@ def main() -> None:
         type=int,
         default=None,
         help="Cap candidates scanned per tenant (safety valve for very large queues).",
+    )
+    promote_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Evaluate both promotion lanes without writing state or audit events.",
     )
 
     backfill_parser = sub.add_parser(
@@ -300,7 +306,7 @@ def main() -> None:
             )
         )
     elif args.command == "promote-proposed":
-        raise SystemExit(asyncio.run(_run_promotion(args.tenant, args.limit)))
+        raise SystemExit(asyncio.run(_run_promotion(args.tenant, args.limit, dry_run=args.dry_run)))
     elif args.command == "backfill-embeddings":
         from engram.embeddings import MAX_PROVIDER_BATCH_SIZE
 
@@ -680,6 +686,7 @@ async def _run_bootstrap_key(
 async def _run_promotion(
     tenant_id: str | None,
     limit: int | None,
+    dry_run: bool = False,
     session_factory: Any | None = None,
 ) -> int:
     """Run Path A auto-promotion and print a per-tenant summary.
@@ -714,12 +721,44 @@ async def _run_promotion(
         total_promoted = 0
         total_scanned = 0
         for tid in tenant_ids:
-            result = await auto_promote_proposed_memories(session, tid, limit=limit, source="cli")
+            result = await auto_promote_proposed_memories(
+                session, tid, limit=limit, source="cli", dry_run=dry_run
+            )
             print(summarize(result))
-            total_promoted += result.promoted
+            if dry_run:
+                blockers = Counter(
+                    blocker
+                    for candidate in result.candidates
+                    for blocker in set(candidate.blockers)
+                )
+                blocker_text = " ".join(
+                    f"{name}={count}" for name, count in sorted(blockers.items())
+                )
+                print(f"  blockers: {blocker_text or 'none'}")
+                detail_limit = 20
+                for candidate in result.candidates[:detail_limit]:
+                    if candidate.would_promote:
+                        eligible_at = (
+                            candidate.eligible_at.isoformat() if candidate.eligible_at else None
+                        )
+                        print(
+                            f"  would-promote item_id={candidate.item_id} "
+                            f"basis={candidate.selected_basis} "
+                            f"eligible_at={eligible_at}"
+                        )
+                    else:
+                        print(
+                            f"  blocked item_id={candidate.item_id} kind={candidate.kind} "
+                            f"blockers={','.join(candidate.blockers) or 'none'}"
+                        )
+                omitted = len(result.candidates) - detail_limit
+                if omitted > 0:
+                    print(f"  ... {omitted} candidate detail rows omitted")
+            total_promoted += result.would_promote if dry_run else result.promoted
             total_scanned += result.scanned
 
-        print(f"\nTotal: scanned={total_scanned} promoted={total_promoted}")
+        action = "would_promote" if dry_run else "promoted"
+        print(f"\nTotal: scanned={total_scanned} {action}={total_promoted}")
         return 0
 
 
@@ -1068,7 +1107,7 @@ async def _run_setup_embeddings(test_text: str) -> int:
     print(f"  dimensions: {settings.embedding_dim}")
 
     # 5. Test embedding generation
-    print(f"\n  Generating test embedding for: \"{test_text[:60]}...\"")
+    print(f'\n  Generating test embedding for: "{test_text[:60]}..."')
     try:
         from engram.embeddings import generate_embedding
 

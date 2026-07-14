@@ -153,7 +153,10 @@ written → proposed → active → disputed → resolved → superseded/archive
 * **Disputed** memories remain available with warnings where appropriate.
 * **Archived** and superseded memories are preserved for audit but excluded from default recall.
 
-Auto-promotion is available for memories that meet tenant-configurable confidence, age, conflict, dispute, and feedback thresholds.
+Auto-promotion has independent legacy-confidence and server-attested retention-evidence lanes.
+The evidence lane uses `min(0.85, 0.20 * source_confidence_prior + 0.80 *
+retention_confidence)` for governed kinds only; it changes only `proposed → active`,
+never provenance, authority, confidence, or human-verification fields.
 
 `POST /v1/recall` with `mode=startup` runs a bounded, tenant-scoped promotion pass automatically before building the working set (capped at `settings.startup_promotion_limit`, default 20 proposed items per call) — no separate trigger needed for day-to-day recall. For full sweeps of a large proposed backlog, wire the CLI to cron/systemd, or call the admin endpoint on demand:
 
@@ -163,6 +166,9 @@ engram promote-proposed
 
 # Single tenant, capped at 1000 candidates:
 engram promote-proposed --tenant <tenant-id> --limit 1000
+
+# Exact evaluation with no writes, audit events, or actor creation:
+engram promote-proposed --dry-run
 ```
 
 ```text
@@ -182,12 +188,24 @@ skipped_conflict
 skipped_dispute            # blocked by another principal's dispute/negative feedback
 skipped_conflict_recheck   # blocked by a promotion-time conflict recheck
 skipped_disabled
+skipped_kind_policy
+skipped_evidence_disabled
+skipped_no_retention_evidence
+skipped_missing_source_prior
+skipped_retention_disposition
+skipped_taxonomy_confidence
+skipped_evidence_score
+skipped_evidence_version
+skipped_evidence_inconsistent
+skipped_review_policy
 ```
 
 Thresholds come from `tenant_config`:
 
 ```text
 auto_promote_enabled
+auto_promote_evidence_enabled       # existing tenants migrate as false
+auto_promote_evidence_threshold     # default 0.70
 auto_promote_confidence_threshold
 auto_promote_min_age_hours
 ```
@@ -423,7 +441,7 @@ Every receipt-bound write records its receipt/version, both confidence layers, s
 visibility decision, reason, and allowlisted, context-sanitized provider provenance. A receipt is
 permanently consumed even if its bound item is later deleted. Dedup binding requires matching source and
 governed kind and can only narrow the existing visibility. Content is never mutated. Promotion Path A
-v2 scoring and evidence gates are intentionally deferred to the next program PR.
+v2 consumes this bound evidence through its independently gated retention-evidence lane.
 
 Seed classification rules are intentionally conservative: "skip" rules are whole-message *status-only* matchers (bare `ok`, `done`, `passed`) that don't fire on status words inside meaningful sentences, and doctrine classification requires explicit policy/invariant phrasing rather than casual modal verbs.
 

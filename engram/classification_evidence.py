@@ -137,7 +137,12 @@ async def bound_run_for_item(
 ) -> ClassificationRun | None:
     stmt = select(ClassificationRun).where(ClassificationRun.memory_item_id == item_id)
     if for_update:
-        stmt = stmt.with_for_update()
+        # The caller is asking for authoritative persisted evidence, not a
+        # possibly pre-flush identity-map snapshot. This matters for REAL
+        # confidence columns: PostgreSQL stores them at single precision, so
+        # an unrefreshed Python value (for example 0.9) can differ from the
+        # value copied into the bound memory item after a database round trip.
+        stmt = stmt.with_for_update().execution_options(populate_existing=True)
     return (await session.execute(stmt)).scalar_one_or_none()
 
 

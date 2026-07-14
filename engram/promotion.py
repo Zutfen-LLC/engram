@@ -1,71 +1,13 @@
-"""Auto-promotion Path A for proposed memories.
-
-Design.md §3 — an item promotes when ALL of the following hold:
-  - ``review_status = 'proposed'``
-  - ``memory_confidence >= auto_promote_confidence_threshold`` (default 0.7)
-  - ``created_at`` is older than ``auto_promote_min_age_hours`` (default 72h)
-  - no unresolved conflict at write time
-    (``conflict_resolution_status IS NULL OR = 'accepted'``)
-  - no dispute event in ``item_events``/``feedback_events`` from another
-    principal (:func:`has_external_dispute_event`)
-  - a promotion-time conflict recheck against live active memories finds
-    nothing that blocks promotion (:func:`engram.conflicts.check_promotion_conflict`)
-  - ``tenant_config.auto_promote_enabled`` is true
-
-The service reads thresholds from the active ``tenant_config`` row — never
-hardcoded constants — with fallbacks that match the schema defaults so a
-misconfigured/missing tenant_config still promotes conservatively.
-
-This slice implements Path A only (age + confidence + no conflict + no
-dispute + conflict recheck). Path B (quorum-based, ``feedback_events``
-"useful" counts) is intentionally out of scope — see design.md §3.
-
-Audit: each promotion writes an ``item_events`` row with
-``event_type='review_change'``, ``field_name='review_status'``,
-``old_value='proposed'``, ``new_value='active'`` and a reason that names
-auto-promotion, the invocation ``source``, and which gates were checked —
-mirroring the manual ``POST /items/{id}/review`` path. Items blocked by the
-promotion-time conflict recheck get a ``conflict_resolution`` event and are
-marked ``conflict_resolution_status='unresolved'`` so a later scan doesn't
-silently re-attempt (and re-log) the same recheck.
-
-Serialization (P0-FIX-004A): auto-promotion and the caller-facing review
-endpoint (``POST /v1/items/{item_id}/review``) both mutate the same item's
-``review_status``. Promotion obtains mutation authority over each candidate
-with ``SELECT ... FOR UPDATE SKIP LOCKED`` before evaluating any gate that can
-lead to a mutation. A row locked by a concurrent review is skipped this sweep
-(not promoted, not counted, reconsidered later if still eligible) rather than
-blocking the whole batch. The final ``proposed -> active`` (and conflict-marker)
-update is guarded against the expected state (proposed / live / not superseded)
-with ``RETURNING``; a zero-row guarded update is a skip or concurrent-state
-outcome, never permission to write an event. The state transition and its event
-share one transaction, and an event is written only for a row the guarded
-update actually transitioned. This allows either operation to win the lock while
-preserving a valid serial history: a review that commits first is observed by
-promotion (which then skips without overwriting it); a promotion that commits
-first leaves the review to re-evaluate from the committed ``active`` state.
-
-Invocation — three entry points, all sharing this one service function so the
-gates can never drift apart:
-  - lazy, bounded, tenant-scoped: ``maybe_auto_promote_for_startup_recall``,
-    called from ``engram.recall.execute_startup_recall`` before active items
-    are selected (source=``startup_recall``);
-  - a thin CLI command (``engram promote-proposed``, source=``cli``) that
-    loops every tenant;
-  - a thin admin endpoint (``POST /v1/admin/promote``, source=``admin_endpoint``)
-    that handles the caller's tenant.
-None of these add a scheduler or job queue — deployment runs the CLI on cron
-or systemd for full sweeps; the startup-recall hook keeps day-to-day recall
-current between sweeps.
-"""
+"""Guarded two-lane Promotion Path A service."""
 
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select, text, update
+from sqlalchemy import exists, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.config import settings
@@ -76,96 +18,151 @@ from engram.internal_actors import (
     InternalActorInvariantError,
     resolve_internal_system_actor,
 )
-from engram.models import FeedbackEvent, ItemEvent, MemoryItem, TenantConfig
+from engram.models import (
+    ClassificationRun,
+    FeedbackEvent,
+    ItemEvent,
+    MemoryItem,
+    MemoryKind,
+    TenantConfig,
+)
+from engram.promotion_policy import (
+    DEFAULT_EVIDENCE_THRESHOLD,
+    EVIDENCE_PROMOTION_POLICY_VERSION,
+    EVIDENCE_RETENTION_WEIGHT,
+    EVIDENCE_SCORE_CEILING,
+    EVIDENCE_SOURCE_PRIOR_WEIGHT,
+    EVIDENCE_TAXONOMY_MINIMUM,
+    LEGACY_PROMOTION_POLICY_VERSION,
+    PromotionBasis,
+    PromotionPolicyError,
+    choose_basis,
+    evidence_score_v1,
+)
 from engram.review_policy import TrustedReviewOperation, evaluate_transition
 
-# Fallbacks match the schema defaults in migrations/001_init.sql. Used only
-# when a tenant has no active tenant_config row — the normal path reads live
-# values from tenant_config.
 _FALLBACK_CONFIDENCE_THRESHOLD = 0.7
 _FALLBACK_MIN_AGE_HOURS = 72
-
-# --- Trusted internal review actor identity (V2-BL-003B) -------------------
-#
-# The trusted review actor is identified by a server-owned ``internal_key``
-# column on ``principals``, NOT by its mutable display name. This replaces the
-# V2-BL-003A name-based resolution (``name = 'system'``) which was vulnerable to
-# collision: an agent/user/admin principal named ``system`` would be returned by
-# the old ``(tenant_id, name)`` upsert, recreating false self-approval audit
-# trails.
-#
-# The canonical internal key for the trusted review and promotion actor:
 TRUSTED_REVIEW_INTERNAL_KEY = REVIEW_AUTOMATION_INTERNAL_KEY
 TrustedActorInvariantError = InternalActorInvariantError
 
+BLOCK_KIND_POLICY = "kind_policy"
+BLOCK_EVIDENCE_DISABLED = "evidence_disabled"
+BLOCK_NO_EVIDENCE = "no_retention_evidence"
+BLOCK_SOURCE_PRIOR = "missing_source_prior"
+BLOCK_DISPOSITION = "retention_disposition"
+BLOCK_TAXONOMY = "taxonomy_confidence"
+BLOCK_SCORE = "evidence_score"
+BLOCK_VERSION = "evidence_version"
+BLOCK_INCONSISTENT = "evidence_inconsistent"
+BLOCK_CONFIDENCE = "confidence"
+BLOCK_AGE = "age"
+BLOCK_CONFLICT = "conflict"
+BLOCK_DISPUTE = "external_dispute"
+BLOCK_RECHECK = "conflict_recheck"
+BLOCK_REVIEW_POLICY = "review_policy"
+
 
 async def resolve_trusted_system_actor(session: AsyncSession, tenant_id: str) -> uuid.UUID:
-    """Compatibility wrapper for the review-automation actor resolver."""
     return await resolve_internal_system_actor(
         session, tenant_id=tenant_id, internal_key=REVIEW_AUTOMATION_INTERNAL_KEY
     )
 
 
 @dataclass
-class PromotionResult:
-    """Summary of one auto-promotion invocation for a single tenant."""
+class PromotionCandidate:
+    item_id: uuid.UUID
+    would_promote: bool
+    selected_basis: PromotionBasis | None
+    blockers: list[str]
+    legacy_confidence: float
+    legacy_threshold: float
+    evidence_score: float | None
+    evidence_threshold: float
+    taxonomy_confidence: float | None
+    retention_disposition: str | None
+    classification_run_id: uuid.UUID | None
+    cooling_period_start: datetime | None
+    eligible_at: datetime | None
+    legacy_eligible_at: datetime
+    evidence_cooling_period_start: datetime | None
+    evidence_eligible_at: datetime | None
+    kind: str
+    kind_auto_promote_allowed: bool
+    conflict_recheck_status: str
 
+
+@dataclass(frozen=True)
+class PromotionSupport:
+    """Preloaded, database-independent support for one candidate assessment."""
+
+    kind: MemoryKind | None
+    classification_run: ClassificationRun | None
+    has_external_dispute: bool = False
+    has_external_noise_feedback: bool = False
+
+
+@dataclass
+class PromotionResult:
     tenant_id: str
     enabled: bool
     confidence_threshold: float
     min_age_hours: int
+    evidence_enabled: bool = False
+    evidence_threshold: float = DEFAULT_EVIDENCE_THRESHOLD
+    dry_run: bool = False
     scanned: int = 0
     promoted: int = 0
+    promoted_legacy_confidence: int = 0
+    promoted_retention_evidence: int = 0
+    would_promote: int = 0
+    would_promote_legacy_confidence: int = 0
+    would_promote_retention_evidence: int = 0
     skipped_confidence: int = 0
     skipped_age: int = 0
     skipped_conflict: int = 0
     skipped_disabled: int = 0
-    # New in ENG-AUD-007.
     skipped_dispute: int = 0
     skipped_conflict_recheck: int = 0
+    skipped_kind_policy: int = 0
+    skipped_evidence_disabled: int = 0
+    skipped_no_retention_evidence: int = 0
+    skipped_missing_source_prior: int = 0
+    skipped_retention_disposition: int = 0
+    skipped_taxonomy_confidence: int = 0
+    skipped_evidence_score: int = 0
+    skipped_evidence_version: int = 0
+    skipped_evidence_inconsistent: int = 0
+    skipped_review_policy: int = 0
     promoted_ids: list[uuid.UUID] = field(default_factory=list)
+    would_promote_ids: list[uuid.UUID] = field(default_factory=list)
+    candidates: list[PromotionCandidate] = field(default_factory=list)
 
 
 def summarize(result: PromotionResult) -> str:
-    """Human-readable single-tenant summary for CLI output / endpoint response."""
-    if not result.enabled:
-        return (
-            f"tenant={result.tenant_id} auto-promotion disabled; "
-            f"scanned={result.scanned} promoted=0"
-        )
+    action = "would_promote" if result.dry_run else "promoted"
+    lane_legacy = (
+        result.would_promote_legacy_confidence
+        if result.dry_run
+        else result.promoted_legacy_confidence
+    )
+    lane_evidence = (
+        result.would_promote_retention_evidence
+        if result.dry_run
+        else result.promoted_retention_evidence
+    )
+    action_count = result.would_promote if result.dry_run else result.promoted
     return (
-        f"tenant={result.tenant_id} "
-        f"threshold={result.confidence_threshold} "
-        f"min_age_hours={result.min_age_hours} "
-        f"scanned={result.scanned} promoted={result.promoted} "
-        f"skipped_confidence={result.skipped_confidence} "
-        f"skipped_age={result.skipped_age} "
-        f"skipped_conflict={result.skipped_conflict} "
-        f"skipped_dispute={result.skipped_dispute} "
-        f"skipped_conflict_recheck={result.skipped_conflict_recheck} "
-        f"skipped_disabled={result.skipped_disabled}"
+        f"tenant={result.tenant_id} threshold={result.confidence_threshold} "
+        f"evidence_enabled={result.evidence_enabled} "
+        f"evidence_threshold={result.evidence_threshold} "
+        f"min_age_hours={result.min_age_hours} scanned={result.scanned} {action}="
+        f"{action_count} legacy={lane_legacy} evidence={lane_evidence}"
     )
 
 
 async def has_external_dispute_event(session: AsyncSession, item: MemoryItem) -> bool:
-    """True if a principal other than ``item.principal_id`` has disputed this item.
-
-    A "dispute event" is defined as either of:
-      - an ``item_events`` row with ``event_type='review_change'``,
-        ``field_name='review_status'``, ``new_value='disputed'``, whose
-        ``actor_principal_id`` is not the item's own ``principal_id`` — i.e.
-        someone else moved this item's review status to ``disputed`` at some
-        point (even if it was later reset back to ``proposed``);
-      - a ``feedback_events`` row with ``verdict='noise'`` whose
-        ``principal_id`` is not the item's own ``principal_id`` — i.e.
-        another principal recalled this item and flagged it as noise.
-
-    The item creator's own uncertainty — self-disputing their own item, or
-    giving their own item "noise" feedback — never counts; only an *external*
-    signal blocks Path A. Manual/admin review can still promote or reject
-    outside Path A regardless of this gate.
-    """
-    dispute_event = (
+    dispute = (
         await session.execute(
             select(ItemEvent.id)
             .where(
@@ -179,10 +176,9 @@ async def has_external_dispute_event(session: AsyncSession, item: MemoryItem) ->
             .limit(1)
         )
     ).scalar_one_or_none()
-    if dispute_event is not None:
+    if dispute is not None:
         return True
-
-    negative_feedback = (
+    noise = (
         await session.execute(
             select(FeedbackEvent.id)
             .where(
@@ -194,217 +190,233 @@ async def has_external_dispute_event(session: AsyncSession, item: MemoryItem) ->
             .limit(1)
         )
     ).scalar_one_or_none()
-    return negative_feedback is not None
+    return noise is not None
 
 
-def _resolve_thresholds(config: TenantConfig | None) -> tuple[float, int]:
-    """Read (confidence_threshold, min_age_hours) from tenant_config or fallback."""
-    if config is not None:
-        return config.auto_promote_confidence_threshold, config.auto_promote_min_age_hours
-    return _FALLBACK_CONFIDENCE_THRESHOLD, _FALLBACK_MIN_AGE_HOURS
-
-
-async def _fetch_config_for_tenant(
-    session: AsyncSession, tenant_id: str
-) -> TenantConfig | None:
-    result = await session.execute(
-        select(TenantConfig).where(
-            TenantConfig.tenant_id == tenant_id,
-            TenantConfig.active.is_(True),
+async def _config(session: AsyncSession, tenant_id: str) -> TenantConfig | None:
+    return (
+        await session.execute(
+            select(TenantConfig).where(
+                TenantConfig.tenant_id == tenant_id, TenantConfig.active.is_(True)
+            )
         )
+    ).scalar_one_or_none()
+
+
+def _config_values(config: TenantConfig | None) -> tuple[bool, float, int, bool, float]:
+    if config is None:
+        return (
+            True,
+            _FALLBACK_CONFIDENCE_THRESHOLD,
+            _FALLBACK_MIN_AGE_HOURS,
+            False,
+            DEFAULT_EVIDENCE_THRESHOLD,
+        )
+    return (
+        bool(config.auto_promote_enabled),
+        config.auto_promote_confidence_threshold,
+        config.auto_promote_min_age_hours,
+        bool(config.auto_promote_evidence_enabled),
+        config.auto_promote_evidence_threshold,
     )
-    return result.scalar_one_or_none()
 
 
-async def auto_promote_proposed_memories(
-    session: AsyncSession,
-    tenant_id: str | None = None,
+def _supported(run: ClassificationRun) -> bool:
+    # These are the only currently supported receipt versions; unknown values
+    # intentionally fail closed rather than assuming compatibility.
+    return (
+        run.classification_version == "classification-v2"
+        and run.retention_policy_version == "retention-v1"
+    )
+
+
+async def load_promotion_support(
+    session: AsyncSession, items: list[MemoryItem]
+) -> dict[uuid.UUID, PromotionSupport]:
+    """Load kind, receipt, dispute, and noise support in four bounded queries."""
+    if not items:
+        return {}
+    tenant_id = items[0].tenant_id
+    item_ids = [item.id for item in items]
+    kinds = {
+        row.name: row
+        for row in (
+            await session.execute(
+                select(MemoryKind).where(
+                    MemoryKind.tenant_id == tenant_id,
+                    MemoryKind.name.in_({item.kind for item in items}),
+                )
+            )
+        ).scalars()
+    }
+    runs = {
+        row.memory_item_id: row
+        for row in (
+            await session.execute(
+                select(ClassificationRun).where(ClassificationRun.memory_item_id.in_(item_ids))
+            )
+        ).scalars()
+        if row.memory_item_id is not None
+    }
+    dispute_rows = (
+        await session.execute(
+            select(ItemEvent.item_id, ItemEvent.actor_principal_id).where(
+                ItemEvent.item_id.in_(item_ids),
+                ItemEvent.event_type == "review_change",
+                ItemEvent.field_name == "review_status",
+                ItemEvent.new_value == "disputed",
+                ItemEvent.actor_principal_id.is_not(None),
+            )
+        )
+    ).all()
+    noise_rows = (
+        await session.execute(
+            select(FeedbackEvent.item_id, FeedbackEvent.principal_id).where(
+                FeedbackEvent.item_id.in_(item_ids),
+                FeedbackEvent.verdict == "noise",
+                current_feedback_predicate(),
+            )
+        )
+    ).all()
+    authors = {item.id: item.principal_id for item in items}
+    disputed = {item_id for item_id, actor in dispute_rows if actor != authors[item_id]}
+    noisy = {item_id for item_id, actor in noise_rows if actor != authors[item_id]}
+    return {
+        item.id: PromotionSupport(
+            kind=kinds.get(item.kind),
+            classification_run=runs.get(item.id),
+            has_external_dispute=item.id in disputed,
+            has_external_noise_feedback=item.id in noisy,
+        )
+        for item in items
+    }
+
+
+def _evidence_state(
+    item: MemoryItem, run: ClassificationRun | None
+) -> tuple[list[str], float | None, datetime | None]:
+    blockers: list[str] = []
+    if item.source_confidence_prior is None:
+        blockers.append(BLOCK_SOURCE_PRIOR)
+    if (
+        item.retention_confidence is None
+        or item.retention_disposition is None
+        or item.retention_evidence_at is None
+    ):
+        blockers.append(BLOCK_NO_EVIDENCE)
+    if item.retention_disposition != "retain":
+        blockers.append(BLOCK_DISPOSITION)
+    if run is None:
+        blockers.append(BLOCK_NO_EVIDENCE)
+        return blockers, None, None
+    if not _supported(run):
+        blockers.append(BLOCK_VERSION)
+    if (
+        run.tenant_id != item.tenant_id
+        or run.memory_item_id != item.id
+        or run.bound_at is None
+        or run.content_hash != item.content_hash
+        or run.source_type != item.source_type
+        or run.suggested_kind != item.kind
+        or run.retention_confidence != item.retention_confidence
+        or run.retention_disposition != item.retention_disposition
+        or run.created_at != item.retention_evidence_at
+    ):
+        blockers.append(BLOCK_INCONSISTENT)
+    if run.taxonomy_confidence < EVIDENCE_TAXONOMY_MINIMUM:
+        blockers.append(BLOCK_TAXONOMY)
+    if blockers:
+        return blockers, None, None
+    assert (
+        item.source_confidence_prior is not None
+        and item.retention_confidence is not None
+        and item.retention_evidence_at is not None
+    )
+    try:
+        score = evidence_score_v1(item.source_confidence_prior, item.retention_confidence)
+    except PromotionPolicyError:
+        return [BLOCK_INCONSISTENT], None, None
+    return [], score, max(item.created_at, item.retention_evidence_at, run.created_at)
+
+
+def _count_blockers(result: PromotionResult, blockers: list[str]) -> None:
+    mapping = {
+        BLOCK_KIND_POLICY: "skipped_kind_policy",
+        BLOCK_EVIDENCE_DISABLED: "skipped_evidence_disabled",
+        BLOCK_NO_EVIDENCE: "skipped_no_retention_evidence",
+        BLOCK_SOURCE_PRIOR: "skipped_missing_source_prior",
+        BLOCK_DISPOSITION: "skipped_retention_disposition",
+        BLOCK_TAXONOMY: "skipped_taxonomy_confidence",
+        BLOCK_SCORE: "skipped_evidence_score",
+        BLOCK_VERSION: "skipped_evidence_version",
+        BLOCK_INCONSISTENT: "skipped_evidence_inconsistent",
+        BLOCK_CONFIDENCE: "skipped_confidence",
+        BLOCK_AGE: "skipped_age",
+        BLOCK_CONFLICT: "skipped_conflict",
+        BLOCK_DISPUTE: "skipped_dispute",
+        BLOCK_RECHECK: "skipped_conflict_recheck",
+        BLOCK_REVIEW_POLICY: "skipped_review_policy",
+    }
+    for blocker in set(blockers):
+        attr = mapping.get(blocker)
+        if attr:
+            setattr(result, attr, getattr(result, attr) + 1)
+
+
+def assess_promotion_candidate(
+    item: MemoryItem,
+    support: PromotionSupport,
     *,
-    now: datetime | None = None,
-    limit: int | None = None,
-    source: str = "cli",
-) -> PromotionResult:
-    """Promote eligible proposed memories for a tenant (Path A).
-
-    When ``tenant_id`` is None the tenant is read from the session's RLS
-    context (``app.tenant_id``) the same way the route layer does.
-
-    ``source`` identifies the caller for provenance in the promotion event's
-    ``reason`` — one of ``"startup_recall"``, ``"cli"``, or ``"admin_endpoint"``.
-    It does not change promotion behavior; all three entry points use the
-    same gates.
-
-    Returns a :class:`PromotionResult` with per-reason skip counts.
-
-    The function commits on success so callers (CLI / endpoint) don't need to
-    manage transaction boundaries. It is idempotent: a second run re-scans the
-    same set but finds nothing left to promote (those rows are now ``active``
-    or ``conflict_resolution_status='unresolved'``).
-    """
-    effective_now = now or datetime.now(UTC)
-
-    if tenant_id is None:
-        # Resolve tenant from RLS session context (mirrors _resolve_tenant_id
-        # in the route layer, but treats missing context as empty rather than
-        # raising since this is also a pure service function).
-        tid = (
-            await session.execute(text("SELECT current_setting('app.tenant_id', true)::text"))
-        ).scalar_one_or_none()
-        if not tid:
-            return PromotionResult(
-                tenant_id="",
-                enabled=False,
-                confidence_threshold=_FALLBACK_CONFIDENCE_THRESHOLD,
-                min_age_hours=_FALLBACK_MIN_AGE_HOURS,
-                scanned=0,
-                promoted=0,
-                skipped_disabled=0,
-            )
-        tenant_id = tid
-
-    config = await _fetch_config_for_tenant(session, tenant_id)
-    threshold, min_age_hours = _resolve_thresholds(config)
-    enabled = bool(config.auto_promote_enabled) if config is not None else True
-
-    result = PromotionResult(
-        tenant_id=tenant_id,
-        enabled=enabled,
-        confidence_threshold=threshold,
-        min_age_hours=min_age_hours,
+    confidence_threshold: float,
+    min_age_hours: int,
+    evidence_enabled: bool,
+    evidence_threshold: float,
+    now: datetime,
+    conflict_recheck_status: str = "not_run",
+) -> PromotionCandidate:
+    kind = support.kind
+    run = support.classification_run
+    allowed_kind = bool(kind and kind.enabled and kind.auto_promote_from_inferred)
+    blockers: list[str] = [] if allowed_kind else [BLOCK_KIND_POLICY]
+    evidence_blockers, score, cooling_start = _evidence_state(item, run)
+    if not evidence_enabled:
+        evidence_blockers.append(BLOCK_EVIDENCE_DISABLED)
+    evidence_trust = not evidence_blockers and score is not None and score >= evidence_threshold
+    if not evidence_blockers and score is not None and score < evidence_threshold:
+        evidence_blockers.append(BLOCK_SCORE)
+    legacy_trust = item.memory_confidence >= confidence_threshold
+    legacy_age = item.created_at + timedelta(hours=min_age_hours) <= now
+    evidence_age = (
+        cooling_start is not None and cooling_start + timedelta(hours=min_age_hours) <= now
     )
-
-    # Count candidates even when disabled so the summary stays informative.
-    if not enabled:
-        count_stmt = (
-            select(MemoryItem.id)
-            .where(
-                MemoryItem.tenant_id == tenant_id,
-                MemoryItem.review_status == "proposed",
-                MemoryItem.valid_to.is_(None),
-            )
-        )
-        disabled_rows = (await session.execute(count_stmt)).all()
-        result.scanned = len(disabled_rows)
-        result.skipped_disabled = len(disabled_rows)
-        await session.commit()
-        return result
-
-    age_cutoff = effective_now - timedelta(hours=min_age_hours)
-
-    # Fetch candidates WITH row locks (P0-FIX-004A). ``FOR UPDATE SKIP LOCKED``
-    # is the mutation authority: a row currently locked by a concurrent review
-    # is skipped this sweep (reconsidered later if still eligible) rather than
-    # blocking the whole batch. The values read here are the locked, current
-    # values — the gate evaluation below is revalidation under the lock, not a
-    # stale-snapshot check. A skipped locked row is absent from ``scanned`` and
-    # from every result counter: this invocation did not examine it.
-    dialect_name = session.bind.dialect.name if session.bind is not None else None
-    stmt = (
-        select(MemoryItem)
-        .where(
-            MemoryItem.tenant_id == tenant_id,
-            MemoryItem.review_status == "proposed",
-            MemoryItem.valid_to.is_(None),
-        )
-        .order_by(MemoryItem.created_at.asc())
+    selected = (
+        choose_basis(
+            legacy_trust_qualified=legacy_trust,
+            legacy_age_qualified=legacy_age,
+            evidence_trust_qualified=evidence_trust,
+            evidence_age_qualified=evidence_age,
+            legacy_score=item.memory_confidence,
+            legacy_threshold=confidence_threshold,
+            evidence_score=score,
+            evidence_threshold=evidence_threshold,
+        ).selected_basis
+        if allowed_kind
+        else None
     )
-    if dialect_name == "postgresql":
-        stmt = stmt.with_for_update(skip_locked=True)
-    if limit is not None:
-        stmt = stmt.limit(limit)
-
-    candidates = list((await session.execute(stmt)).scalars().all())
-    result.scanned = len(candidates)
-
-    to_promote: list[MemoryItem] = []
-    blocked_by_conflict: list[tuple[MemoryItem, PromotionConflictCheck]] = []
-    for item in candidates:
-        # Revalidation under the row lock — confirm the locked state still
-        # satisfies every Path A gate before any mutation decision. A
-        # concurrently reviewed row that lost the lock race is already absent
-        # from ``candidates`` (SKIP LOCKED); these checks guard the remaining
-        # gates against the locked snapshot.
-        # Exclude superseded/terminal states defensively (valid_to IS NULL can
-        # coexist with superseded_by transiently during supersession writes).
-        if item.superseded_by is not None:
-            continue
-        if item.memory_confidence < threshold:
-            result.skipped_confidence += 1
-            continue
-        if item.created_at > age_cutoff:
-            result.skipped_age += 1
-            continue
-        # No unresolved conflict at write time: status must be NULL or
-        # 'accepted'.
+    if selected is None:
+        if not legacy_trust:
+            blockers.append(BLOCK_CONFIDENCE)
+        if legacy_trust and not legacy_age:
+            blockers.append(BLOCK_AGE)
+        blockers.extend(evidence_blockers)
+        if evidence_trust and not evidence_age:
+            blockers.append(BLOCK_AGE)
+    if selected is not None:
         if item.conflict_resolution_status == "unresolved":
-            result.skipped_conflict += 1
-            continue
-        # No dispute event from another principal.
-        if await has_external_dispute_event(session, item):
-            result.skipped_dispute += 1
-            continue
-        # Promotion-time conflict recheck: don't rely solely on the
-        # write-time conflict status, since a later active write can create a
-        # conflict this item never saw.
-        conflict_check = await check_promotion_conflict(session, item)
-        if conflict_check is not None:
-            result.skipped_conflict_recheck += 1
-            blocked_by_conflict.append((item, conflict_check))
-            continue
-        to_promote.append(item)
-
-    # Trusted internal events (conflict recheck + promotion below) share one
-    # actor per invocation, resolved lazily so a scan with nothing to write
-    # never touches the principals table.
-    trusted_actor_id: uuid.UUID | None = None
-    if blocked_by_conflict or to_promote:
-        trusted_actor_id = await resolve_trusted_system_actor(session, tenant_id)
-
-    if blocked_by_conflict:
-        for item, check in blocked_by_conflict:
-            old_conflict_status = item.conflict_resolution_status
-            # Guarded: only mark conflict metadata on a row that is still a
-            # live proposed candidate under our lock. RETURNING confirms the
-            # transition; a zero-row result means the row is no longer
-            # eligible and no event is written.
-            blocking_result = await session.execute(
-                update(MemoryItem)
-                .where(
-                    MemoryItem.id == item.id,
-                    MemoryItem.tenant_id == tenant_id,
-                    MemoryItem.review_status == "proposed",
-                    MemoryItem.valid_to.is_(None),
-                    MemoryItem.superseded_by.is_(None),
-                )
-                .values(
-                    conflict_resolution_status="unresolved",
-                    conflicts_with_item_id=check.conflicting_item_id,
-                )
-                .returning(MemoryItem.id),
-                execution_options={"synchronize_session": False},
-            )
-            if blocking_result.scalar_one_or_none() is None:
-                continue
-            session.add(
-                ItemEvent(
-                    item_id=item.id,
-                    event_type="conflict_resolution",
-                    field_name="conflict_resolution_status",
-                    old_value=old_conflict_status,
-                    new_value="unresolved",
-                    actor_principal_id=trusted_actor_id,
-                    reason=(
-                        f"auto-promotion Path A conflict recheck ({source}): "
-                        f"blocked by {check.verdict} against item "
-                        f"{check.conflicting_item_id} "
-                        f"({'embedding' if check.used_embeddings else 'heuristic fallback'}) "
-                        f"— {check.reason}"
-                    ),
-                )
-            )
-
-    if to_promote:
-        for item in to_promote:
+            blockers.append(BLOCK_CONFLICT)
+        elif support.has_external_dispute or support.has_external_noise_feedback:
+            blockers.append(BLOCK_DISPUTE)
+        else:
             decision = evaluate_transition(
                 principal_id=item.principal_id,
                 principal_type="system",
@@ -414,83 +426,393 @@ async def auto_promote_proposed_memories(
                 trusted_operation=TrustedReviewOperation.PROMOTION,
             )
             if not decision.allowed:
-                raise RuntimeError("review policy rejected trusted Path A promotion")
-        promote_ids = [item.id for item in to_promote]
-        # Guarded promotion update (P0-FIX-004A): the WHERE clause re-checks
-        # the expected state (proposed, live, not superseded) even though we
-        # hold the row lock, so a zero-row result is a skip or concurrent-state
-        # outcome — never permission to write an event. RETURNING reports
-        # exactly which rows actually transitioned; events and result counts
-        # are derived solely from that set.
-        promotion_result = await session.execute(
+                blockers.append(BLOCK_REVIEW_POLICY)
+    legacy_eligible_at = item.created_at + timedelta(hours=min_age_hours)
+    evidence_eligible_at = cooling_start + timedelta(hours=min_age_hours) if cooling_start else None
+    selected_start = (
+        cooling_start
+        if selected == "retention_evidence"
+        else item.created_at
+        if selected == "legacy_confidence"
+        else None
+    )
+    selected_eligible = (
+        evidence_eligible_at
+        if selected == "retention_evidence"
+        else legacy_eligible_at
+        if selected == "legacy_confidence"
+        else None
+    )
+    return PromotionCandidate(
+        item.id,
+        selected is not None and not blockers,
+        selected,
+        list(dict.fromkeys(blockers)),
+        item.memory_confidence,
+        confidence_threshold,
+        score,
+        evidence_threshold,
+        run.taxonomy_confidence if run else None,
+        item.retention_disposition,
+        run.id if run else None,
+        selected_start,
+        selected_eligible,
+        legacy_eligible_at,
+        cooling_start,
+        evidence_eligible_at,
+        item.kind,
+        allowed_kind,
+        conflict_recheck_status,
+    )
+
+
+def _audit(
+    item: MemoryItem, candidate: PromotionCandidate, source: str, now: datetime, min_age_hours: int
+) -> str:
+    basis = candidate.selected_basis
+    assert basis is not None
+    reason: dict[str, object] = {
+        "operation": "auto-promotion",
+        "invocation_source": source,
+        "basis": basis,
+        "promotion_policy_version": EVIDENCE_PROMOTION_POLICY_VERSION
+        if basis == "retention_evidence"
+        else LEGACY_PROMOTION_POLICY_VERSION,
+        "min_age_hours": min_age_hours,
+        "cooling_period_start": candidate.cooling_period_start.isoformat()
+        if candidate.cooling_period_start
+        else None,
+        "eligible_at": candidate.eligible_at.isoformat() if candidate.eligible_at else None,
+        "promoted_at": now.isoformat(),
+        "kind": item.kind,
+        "kind_auto_promote_allowed": True,
+        "conflict_status": item.conflict_resolution_status,
+        "external_dispute": False,
+        "external_noise_feedback": False,
+        "conflict_recheck": "clear",
+        "source_type": item.source_type,
+        "source_trust": item.source_trust,
+        "authority": item.authority,
+        "human_verified": item.human_verified,
+    }
+    if basis == "legacy_confidence":
+        reason.update(
+            memory_confidence=item.memory_confidence,
+            legacy_confidence_threshold=candidate.legacy_threshold,
+        )
+    else:
+        reason.update(
+            classification_run_id=str(candidate.classification_run_id),
+            classification_version="classification-v2",
+            retention_policy_version="retention-v1",
+            source_confidence_prior=item.source_confidence_prior,
+            retention_confidence=item.retention_confidence,
+            retention_disposition=item.retention_disposition,
+            taxonomy_confidence=candidate.taxonomy_confidence,
+            evidence_score=candidate.evidence_score,
+            evidence_threshold=candidate.evidence_threshold,
+            evidence_score_ceiling=EVIDENCE_SCORE_CEILING,
+            evidence_weights={
+                "source_confidence_prior": EVIDENCE_SOURCE_PRIOR_WEIGHT,
+                "retention_confidence": EVIDENCE_RETENTION_WEIGHT,
+            },
+        )
+    return json.dumps(reason, sort_keys=True)
+
+
+async def auto_promote_proposed_memories(
+    session: AsyncSession,
+    tenant_id: str | None = None,
+    *,
+    now: datetime | None = None,
+    limit: int | None = None,
+    source: str = "cli",
+    dry_run: bool = False,
+    item_id: uuid.UUID | None = None,
+    classification_run_id: uuid.UUID | None = None,
+) -> PromotionResult:
+    moment = now or datetime.now(UTC)
+    if tenant_id is None:
+        tenant_id = (
+            await session.execute(text("SELECT current_setting('app.tenant_id', true)::text"))
+        ).scalar_one_or_none()
+        if not tenant_id:
+            result = PromotionResult(
+                "", False, _FALLBACK_CONFIDENCE_THRESHOLD, _FALLBACK_MIN_AGE_HOURS
+            )
+            if dry_run:
+                await session.rollback()
+            return result
+    config = await _config(session, str(tenant_id))
+    enabled, threshold, min_age, evidence_enabled, evidence_threshold = _config_values(config)
+    result = PromotionResult(
+        str(tenant_id), enabled, threshold, min_age, evidence_enabled, evidence_threshold, dry_run
+    )
+    base_stmt = select(MemoryItem).where(
+        MemoryItem.tenant_id == tenant_id,
+        MemoryItem.review_status == "proposed",
+        MemoryItem.valid_to.is_(None),
+    )
+    if item_id is not None:
+        base_stmt = base_stmt.where(MemoryItem.id == item_id)
+    else:
+        base_stmt = base_stmt.order_by(MemoryItem.created_at.asc())
+        if limit is not None:
+            base_stmt = base_stmt.limit(limit)
+    if not enabled:
+        items = list((await session.execute(base_stmt)).scalars())
+        result.scanned = len(items)
+        result.skipped_disabled = len(items)
+        if dry_run:
+            await session.rollback()
+        else:
+            await session.commit()
+        return result
+    stmt = base_stmt
+    if session.bind is not None and session.bind.dialect.name == "postgresql":
+        stmt = stmt.with_for_update(skip_locked=item_id is None)
+    items = list((await session.execute(stmt)).scalars())
+    result.scanned = len(items)
+    support_map = await load_promotion_support(session, items)
+    for item in items:
+        if classification_run_id is not None:
+            bound_run = support_map[item.id].classification_run
+            if bound_run is None or bound_run.id != classification_run_id:
+                continue
+        if item.superseded_by is not None:
+            continue
+        candidate = assess_promotion_candidate(
+            item,
+            support_map[item.id],
+            confidence_threshold=threshold,
+            min_age_hours=min_age,
+            evidence_enabled=evidence_enabled,
+            evidence_threshold=evidence_threshold,
+            now=moment,
+        )
+        conflict: PromotionConflictCheck | None = None
+        if candidate.would_promote:
+            conflict = await check_promotion_conflict(session, item)
+            candidate.conflict_recheck_status = "blocked" if conflict else "clear"
+            if conflict is not None:
+                candidate.blockers.append(BLOCK_RECHECK)
+                candidate.would_promote = False
+        result.candidates.append(candidate)
+        _count_blockers(result, candidate.blockers)
+        if not candidate.would_promote:
+            if conflict and not dry_run:
+                actor = await resolve_trusted_system_actor(session, str(tenant_id))
+                marked = await session.execute(
+                    update(MemoryItem)
+                    .where(
+                        MemoryItem.id == item.id,
+                        MemoryItem.review_status == "proposed",
+                        MemoryItem.valid_to.is_(None),
+                        MemoryItem.superseded_by.is_(None),
+                    )
+                    .values(
+                        conflict_resolution_status="unresolved",
+                        conflicts_with_item_id=conflict.conflicting_item_id,
+                    )
+                    .returning(MemoryItem.id)
+                )
+                if marked.scalar_one_or_none() is not None:
+                    session.add(
+                        ItemEvent(
+                            item_id=item.id,
+                            event_type="conflict_resolution",
+                            field_name="conflict_resolution_status",
+                            old_value=item.conflict_resolution_status,
+                            new_value="unresolved",
+                            actor_principal_id=actor,
+                            reason=json.dumps(
+                                {
+                                    "operation": "auto-promotion",
+                                    "invocation_source": source,
+                                    "selected_basis": candidate.selected_basis,
+                                    "promotion_policy_version": (
+                                        EVIDENCE_PROMOTION_POLICY_VERSION
+                                        if candidate.selected_basis == "retention_evidence"
+                                        else LEGACY_PROMOTION_POLICY_VERSION
+                                    ),
+                                    "conflict_recheck": "blocked",
+                                    "conflicting_item_id": str(conflict.conflicting_item_id),
+                                    "conflict_verdict": conflict.verdict,
+                                    "conflict_reason": conflict.reason,
+                                    "conflict_detection_mode": (
+                                        "embedding"
+                                        if conflict.used_embeddings
+                                        else "heuristic_fallback"
+                                    ),
+                                    "source_item_id": str(item.id),
+                                    "kind": item.kind,
+                                    "source_type": item.source_type,
+                                    "classification_run_id": (
+                                        str(candidate.classification_run_id)
+                                        if candidate.classification_run_id
+                                        else None
+                                    ),
+                                    "evidence_score": candidate.evidence_score,
+                                    "legacy_confidence": candidate.legacy_confidence,
+                                    "evidence_threshold": candidate.evidence_threshold,
+                                    "legacy_threshold": candidate.legacy_threshold,
+                                },
+                                sort_keys=True,
+                            ),
+                        )
+                    )
+            continue
+        result.would_promote += 1
+        result.would_promote_ids.append(item.id)
+        if candidate.selected_basis == "retention_evidence":
+            result.would_promote_retention_evidence += 1
+        else:
+            result.would_promote_legacy_confidence += 1
+        if dry_run:
+            continue
+        kind_allowed = exists(
+            select(MemoryKind.name).where(
+                MemoryKind.tenant_id == tenant_id,
+                MemoryKind.name == item.kind,
+                MemoryKind.enabled.is_(True),
+                MemoryKind.auto_promote_from_inferred.is_(True),
+            )
+        )
+        changed = await session.execute(
             update(MemoryItem)
             .where(
+                MemoryItem.id == item.id,
                 MemoryItem.tenant_id == tenant_id,
-                MemoryItem.id.in_(promote_ids),
                 MemoryItem.review_status == "proposed",
                 MemoryItem.valid_to.is_(None),
                 MemoryItem.superseded_by.is_(None),
+                kind_allowed,
             )
             .values(review_status="active")
-            .returning(MemoryItem.id),
-            execution_options={"synchronize_session": False},
+            .returning(MemoryItem.id)
         )
-        actually_promoted: set[uuid.UUID] = {
-            row[0] for row in promotion_result.all()
-        }
-        if actually_promoted:
-            reason = (
-                f"auto-promotion Path A ({source}): memory_confidence >= {threshold} "
-                f"and age >= {min_age_hours}h, no unresolved conflict, no external "
-                "dispute event, promotion-time conflict recheck clear"
+        if changed.scalar_one_or_none() is None:
+            continue
+        actor = await resolve_trusted_system_actor(session, str(tenant_id))
+        session.add(
+            ItemEvent(
+                item_id=item.id,
+                event_type="review_change",
+                field_name="review_status",
+                old_value="proposed",
+                new_value="active",
+                actor_principal_id=actor,
+                reason=_audit(item, candidate, source, moment, min_age),
             )
-            promoted_ids: list[uuid.UUID] = []
-            for item in to_promote:
-                if item.id not in actually_promoted:
-                    continue
-                session.add(
-                    ItemEvent(
-                        item_id=item.id,
-                        event_type="review_change",
-                        field_name="review_status",
-                        old_value="proposed",
-                        new_value="active",
-                        actor_principal_id=trusted_actor_id,
-                        reason=reason,
-                    )
-                )
-                promoted_ids.append(item.id)
-            result.promoted = len(promoted_ids)
-            result.promoted_ids = promoted_ids
-
-    await session.commit()
+        )
+        result.promoted += 1
+        result.promoted_ids.append(item.id)
+        if candidate.selected_basis == "retention_evidence":
+            result.promoted_retention_evidence += 1
+        else:
+            result.promoted_legacy_confidence += 1
+    if not dry_run:
+        await session.commit()
+    else:
+        await session.rollback()
     return result
 
 
-async def maybe_auto_promote_for_startup_recall(
+async def auto_promote_item(
     session: AsyncSession,
     tenant_id: str,
+    item_id: uuid.UUID,
+    classification_run_id: uuid.UUID,
     *,
     now: datetime | None = None,
+    dry_run: bool = False,
 ) -> PromotionResult:
-    """Bounded, tenant-scoped Path A promotion pass invoked lazily from
-    ``POST /v1/recall`` (``mode='startup'``), before active items are
-    selected (design.md §3, ENG-AUD-007 F11).
-
-    Delegates entirely to :func:`auto_promote_proposed_memories` — no
-    promotion logic is duplicated here — bounded by
-    ``settings.startup_promotion_limit`` so a request handler never scans an
-    unbounded proposed-item backlog. ``tenant_config.auto_promote_enabled`` is
-    honored by the shared service function; when disabled this is a cheap
-    no-op (one count query, no writes).
-
-    Not invoked for semantic recall in this slice (see design.md — Path A
-    promotion is a startup-recall concern only for now).
-    """
     return await auto_promote_proposed_memories(
         session,
         tenant_id,
         now=now,
-        limit=settings.startup_promotion_limit,
-        source="startup_recall",
+        source="worker",
+        dry_run=dry_run,
+        item_id=item_id,
+        classification_run_id=classification_run_id,
+    )
+
+
+async def schedule_evidence_promotion_if_qualified(
+    session: AsyncSession,
+    item: MemoryItem,
+    run: ClassificationRun,
+    *,
+    diagnostics: dict[str, str] | None = None,
+) -> uuid.UUID | None:
+    """Atomically enqueue the delayed targeted job for statically qualified evidence."""
+    def blocked(reason: str) -> None:
+        if diagnostics is not None:
+            diagnostics["blocker"] = reason
+
+    if (
+        item.review_status != "proposed"
+        or item.valid_to is not None
+        or item.superseded_by is not None
+    ):
+        blocked("item_state")
+        return None
+    config = await _config(session, str(item.tenant_id))
+    enabled, _, min_age, evidence_enabled, evidence_threshold = _config_values(config)
+    if not enabled:
+        blocked("promotion_disabled")
+        return None
+    if not evidence_enabled:
+        blocked("evidence_disabled")
+        return None
+    if item.conflict_resolution_status == "unresolved":
+        blocked("conflict")
+        return None
+    support = (await load_promotion_support(session, [item]))[item.id]
+    kind = support.kind
+    bound_run = support.classification_run
+    if (
+        kind is None
+        or not kind.enabled
+        or not kind.auto_promote_from_inferred
+        or bound_run is None
+        or bound_run.id != run.id
+    ):
+        blocked("kind_or_receipt")
+        return None
+    evidence_blockers, score, _ = _evidence_state(item, run)
+    if evidence_blockers:
+        blocked(",".join(evidence_blockers))
+        return None
+    if score is None or score < evidence_threshold:
+        blocked("evidence_score")
+        return None
+    # Do not test the cooling clock here: the point of this delayed job is to
+    # wake at its end. Dynamic dispute and semantic-conflict gates remain the
+    # target job's responsibility.
+    if item.retention_disposition != "retain":
+        blocked("retention_disposition")
+        return None
+    from engram.jobs import enqueue_job_in_transaction
+
+    assert item.retention_evidence_at is not None
+    run_after = max(item.created_at, item.retention_evidence_at) + timedelta(hours=min_age)
+    job_id = await enqueue_job_in_transaction(
+        session,
+        tenant_id=item.tenant_id,
+        job_type="promotion.path_a",
+        payload={"memory_item_id": str(item.id), "classification_run_id": str(run.id)},
+        run_after=run_after,
+        dedupe_key=f"promotion.path_a:{item.id}:{run.id}",
+    )
+    if diagnostics is not None:
+        diagnostics["status"] = "scheduled"
+    return job_id
+
+
+async def maybe_auto_promote_for_startup_recall(
+    session: AsyncSession, tenant_id: str, *, now: datetime | None = None
+) -> PromotionResult:
+    return await auto_promote_proposed_memories(
+        session, tenant_id, now=now, limit=settings.startup_promotion_limit, source="startup_recall"
     )

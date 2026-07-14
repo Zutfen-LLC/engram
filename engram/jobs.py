@@ -99,15 +99,42 @@ async def enqueue_job(
     that is the app-role session for the request's tenant, which the jobs
     WITH CHECK policy permits.
     """
+    job_id = await enqueue_job_in_transaction(
+        session,
+        tenant_id=tenant_id,
+        job_type=job_type,
+        payload=payload,
+        priority=priority,
+        run_after=run_after,
+        dedupe_key=dedupe_key,
+        max_attempts=max_attempts,
+    )
+    await session.commit()
+    return job_id
+
+
+async def enqueue_job_in_transaction(
+    session: AsyncSession,
+    *,
+    tenant_id: UUID | str,
+    job_type: str,
+    payload: dict[str, object],
+    priority: int = 100,
+    run_after: datetime | None = None,
+    dedupe_key: str | None = None,
+    max_attempts: int | None = None,
+) -> UUID:
+    """Enqueue without changing the caller's outer transaction.
+
+    Dedupe conflicts are contained in a savepoint; other errors propagate and
+    therefore roll back the enclosing receipt-binding transaction.
+    """
     from engram.config import settings
 
-    effective_max_attempts = (
-        settings.job_max_attempts if max_attempts is None else max_attempts
-    )
-    final_payload: dict[str, object] = dict(payload)
+    effective_max_attempts = settings.job_max_attempts if max_attempts is None else max_attempts
+    final_payload = dict(payload)
     if dedupe_key is not None:
         final_payload["dedupe_key"] = dedupe_key
-
     job = Job(
         tenant_id=str(tenant_id),
         job_type=job_type,
@@ -117,16 +144,15 @@ async def enqueue_job(
         max_attempts=effective_max_attempts,
         payload=final_payload,
     )
-    session.add(job)
-
     try:
-        await session.flush()
+        async with session.begin_nested():
+            session.add(job)
+            await session.flush()
     except IntegrityError:
         # A dedupe-key collision (partial unique index) means an equivalent job
         # is already pending/running. Return that job's id idempotently.
         if dedupe_key is None:
             raise
-        await session.rollback()
         existing = (
             await session.execute(
                 select(Job.id)
@@ -152,10 +178,7 @@ async def enqueue_job(
             dedupe_key,
             existing,
         )
-        await session.commit()
         return existing
-
-    await session.commit()
     logger.info(
         "enqueue_job tenant=%s type=%s id=%s priority=%s",
         tenant_id,
@@ -266,9 +289,7 @@ async def mark_job_failed_or_retry(
     message = _truncate(str(error))
 
     job = (
-        await session.execute(
-            select(Job.attempts, Job.max_attempts).where(Job.id == job_id_str)
-        )
+        await session.execute(select(Job.attempts, Job.max_attempts).where(Job.id == job_id_str))
     ).one_or_none()
     if job is None:
         await session.rollback()

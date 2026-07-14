@@ -96,6 +96,8 @@ FEEDBACK_PROOFS = (
 # ── Promotion lifecycle ─────────────────────────────────────────────
 # Lazy promotion Path A, vs review/feedback serialization
 PROMOTION_PROOFS = (
+    "tests/test_promotion_policy.py",
+    "tests/test_promotion_v2_migration.py",
     "tests/test_promotion.py",
     "tests/test_promotion_review_concurrency.py",
     "tests/test_promotion_feedback_concurrency.py",

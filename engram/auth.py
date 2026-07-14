@@ -195,8 +195,13 @@ def parse_api_key(token: str) -> ParsedApiKey:
         raise ValueError("API key has no key material")
     if "_" in rest:
         key_id, secret = rest.split("_", 1)
+        # Legacy url-safe random material may itself start or end with ``_``.
+        # Those tokens are ambiguous with a malformed new-format token, but
+        # treating them as legacy is safe: resolution still requires an exact
+        # bcrypt match against a pre-existing legacy row. Rejecting them here
+        # probabilistically locks out valid pre-AUD-003 credentials.
         if not key_id or not secret:
-            raise ValueError("malformed API key")
+            return ParsedApiKey(key_id=None, secret=rest, is_legacy=True)
         return ParsedApiKey(key_id=key_id, secret=secret, is_legacy=False)
     return ParsedApiKey(key_id=None, secret=rest, is_legacy=True)
 

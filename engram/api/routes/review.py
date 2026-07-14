@@ -22,7 +22,8 @@ from engram.api.routes.memory import (
 from engram.auth import REVIEW_SCOPE, WRITE_OR_REVIEW_SCOPE, Principal
 from engram.db import get_session
 from engram.memory_access import eligibility_expression, eligibility_sql, resolve_workspace_scope
-from engram.models import MemoryItem
+from engram.models import MemoryItem, TenantConfig
+from engram.promotion import _config_values, assess_promotion_candidate, load_promotion_support
 from engram.review_policy import (
     TransitionOutcome,
     can_human_verify,
@@ -165,23 +166,16 @@ async def review_queue(
     """Items awaiting review (review_status='proposed').
 
     Returns proposed items newest-first, optionally filtered by kind or
-    workspace. Each entry includes the item id, content preview, kind,
-    source trust, memory confidence, and created timestamp.
+    workspace. Each entry includes legacy and receipt evidence, the selected
+    promotion basis and eligibility clock, stable blockers, kind policy, and
+    an explicit ``promotion_conflict_recheck_status='not_run'``. Previewing
+    never performs a semantic conflict check or mutates state.
     """
     tenant_id = await _resolve_tenant_id(session)
     principal_id, _ = await _resolve_principal(session, tenant_id)
 
     stmt = (
-        select(
-            MemoryItem.id,
-            MemoryItem.content,
-            MemoryItem.kind,
-            MemoryItem.wing,
-            MemoryItem.room,
-            MemoryItem.source_trust,
-            MemoryItem.memory_confidence,
-            MemoryItem.created_at,
-        )
+        select(MemoryItem)
         .where(
             MemoryItem.tenant_id == tenant_id,
             MemoryItem.review_status == "proposed",
@@ -196,20 +190,73 @@ async def review_queue(
     if workspace is not None:
         stmt = stmt.where(MemoryItem.workspace_id == UUID(workspace))
 
-    rows = (await session.execute(stmt)).all()
-    return [
-        {
-            "id": str(row.id),
-            "content": row.content[:200] if row.content else "",
-            "kind": row.kind,
-            "wing": row.wing,
-            "room": row.room,
-            "source_trust": row.source_trust,
-            "memory_confidence": row.memory_confidence,
-            "created_at": row.created_at.isoformat() if row.created_at else None,
-        }
-        for row in rows
-    ]
+    items = list((await session.execute(stmt)).scalars())
+    config = (
+        await session.execute(
+            select(TenantConfig).where(
+                TenantConfig.tenant_id == tenant_id, TenantConfig.active.is_(True)
+            )
+        )
+    ).scalar_one_or_none()
+    _, threshold, min_age, evidence_enabled, evidence_threshold = _config_values(config)
+    support_map = await load_promotion_support(session, items)
+    output: list[dict[str, Any]] = []
+    for item in items:
+        # A lightweight item-shaped object lets the shared evaluator make the
+        # lane decision. Review queue deliberately does not run semantic
+        # conflict rechecks; exact output belongs to promotion dry-run.
+        candidate = assess_promotion_candidate(
+            item,
+            support_map[item.id],
+            confidence_threshold=threshold,
+            min_age_hours=min_age,
+            evidence_enabled=evidence_enabled,
+            evidence_threshold=evidence_threshold,
+            now=datetime.now(UTC),
+        )
+        run = support_map[item.id].classification_run
+        kind_support = support_map[item.id].kind
+        output.append(
+            {
+                "id": str(item.id),
+                "content": item.content[:200] if item.content else "",
+                "kind": item.kind,
+                "wing": item.wing,
+                "room": item.room,
+                "source_trust": item.source_trust,
+                "memory_confidence": item.memory_confidence,
+                "created_at": item.created_at.isoformat() if item.created_at else None,
+                "source_confidence_prior": item.source_confidence_prior,
+                "retention_confidence": item.retention_confidence,
+                "retention_disposition": item.retention_disposition,
+                "retention_evidence_at": item.retention_evidence_at.isoformat()
+                if item.retention_evidence_at
+                else None,
+                "classification_run_id": str(run.id) if run else None,
+                "classification_version": run.classification_version if run else None,
+                "retention_policy_version": run.retention_policy_version if run else None,
+                "taxonomy_confidence": run.taxonomy_confidence if run else None,
+                "legacy_confidence_threshold": threshold,
+                "evidence_enabled": evidence_enabled,
+                "evidence_threshold": evidence_threshold,
+                "promotion_score_preview": candidate.evidence_score,
+                "promotion_basis_preview": candidate.selected_basis,
+                "promotion_eligible_at": candidate.eligible_at.isoformat()
+                if candidate.eligible_at
+                else None,
+                "promotion_blockers": candidate.blockers + ["conflict_recheck_not_run"],
+                "kind_auto_promote_allowed": bool(
+                    kind_support
+                    and kind_support.enabled
+                    and kind_support.auto_promote_from_inferred
+                ),
+                "promotion_policy_version": "promotion-evidence-v1"
+                if candidate.selected_basis == "retention_evidence"
+                else "promotion-legacy-v1",
+                "promotion_conflict_recheck_status": "not_run",
+            }
+        )
+    return output
 
 
 @router.get(
@@ -261,9 +308,7 @@ async def conflict_queue(
     return ConflictListResponse(items=items, total=len(items))
 
 
-@router.get(
-    "/review/stale", response_model=StaleListResponse, dependencies=[Depends(REVIEW_SCOPE)]
-)
+@router.get("/review/stale", response_model=StaleListResponse, dependencies=[Depends(REVIEW_SCOPE)])
 async def stale_items(
     days: int = 90,
     workspace: str | None = None,
@@ -363,11 +408,7 @@ async def review_stats(
 
     kind_rows = (
         await session.execute(
-            text(
-                "SELECT kind, count(*) FROM memory_items "
-                f"WHERE {base}"
-                "GROUP BY kind"
-            ),
+            text(f"SELECT kind, count(*) FROM memory_items WHERE {base}GROUP BY kind"),
             params,
         )
     ).all()
@@ -439,9 +480,7 @@ async def change_review_status(
         is_author=is_author,
     )
     if required_scope is not None and not caller.has_scope(required_scope):
-        raise HTTPException(
-            status_code=403, detail=f"Requires scope: {required_scope}"
-        )
+        raise HTTPException(status_code=403, detail=f"Requires scope: {required_scope}")
     decision = evaluate_transition(
         principal_id=principal_id,
         principal_type=principal_type,
@@ -492,9 +531,7 @@ async def change_review_status(
     return {"item": updated, "event": event}
 
 
-@router.post(
-    "/items/{item_id}/verify", response_model=None, dependencies=[Depends(REVIEW_SCOPE)]
-)
+@router.post("/items/{item_id}/verify", response_model=None, dependencies=[Depends(REVIEW_SCOPE)])
 async def verify_item(
     item_id: UUID,
     req: VerifyRequest | None = None,
@@ -611,9 +648,7 @@ async def resolve_conflict(
     # Both resources have been resolved before actor-class authorization is
     # disclosed. Scope admission remains the route dependency above.
     if not can_resolve_conflict(principal_type):
-        raise HTTPException(
-            status_code=403, detail="principal type may not resolve conflicts"
-        )
+        raise HTTPException(status_code=403, detail="principal type may not resolve conflicts")
     actor, on_behalf_of = await _resolve_actor_and_delegation(
         session, tenant_id=tenant_id, requested_on_behalf_of=req.on_behalf_of_principal_id
     )
@@ -715,9 +750,7 @@ async def bulk_archive(
     principal_id, _ = await _resolve_principal(session, tenant_id)
     requested = list(dict.fromkeys(req.item_ids))  # de-dup, preserve order
     if not requested:
-        return BulkArchiveResponse(
-            archived=[], archived_count=0, skipped=[], skipped_count=0
-        )
+        return BulkArchiveResponse(archived=[], archived_count=0, skipped=[], skipped_count=0)
 
     # Sort item IDs canonically (UUID order) so concurrent bulk-archive
     # operations acquire row locks in the same order, preventing deadlocks.
@@ -741,9 +774,7 @@ async def bulk_archive(
         f" ORDER BY id{lock_suffix}"
     )
     rows = (await session.execute(fetch_sql, fetch_params)).all()
-    found: dict[str, tuple[str, object]] = {
-        str(row[0]): (str(row[1]), row[2]) for row in rows
-    }
+    found: dict[str, tuple[str, object]] = {str(row[0]): (str(row[1]), row[2]) for row in rows}
 
     _, principal_type = await _resolve_principal(session, tenant_id)
     to_archive: list[UUID] = []
@@ -793,9 +824,7 @@ async def bulk_archive(
             ),
             update_params,
         )
-        actually_archived: set[str] = {
-            row[0] for row in guard_result.all()
-        }
+        actually_archived: set[str] = {row[0] for row in guard_result.all()}
 
         # Write events only for rows that were actually mutated.
         for item_id in to_archive:

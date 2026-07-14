@@ -154,11 +154,12 @@ async def _clean_db():
     # this file or a prior test module, since cleanup only runs before each
     # test) has an item with an event.
     async with _test_engine.begin() as conn:
+        await conn.execute(text("DELETE FROM jobs"))
+        await conn.execute(text("DELETE FROM feedback_events"))
         await conn.execute(text("DELETE FROM item_events"))
+        await conn.execute(text("DELETE FROM classification_runs"))
         await conn.execute(text("DELETE FROM memory_items"))
-        await conn.execute(
-            text("DELETE FROM tenants WHERE slug != 'default'")
-        )
+        await conn.execute(text("DELETE FROM tenants WHERE slug != 'default'"))
     # Reset the default tenant's config to migration defaults between tests.
     async with _test_engine.begin() as conn:
         await conn.execute(
@@ -166,7 +167,9 @@ async def _clean_db():
                 "UPDATE tenant_config SET "
                 "auto_promote_enabled = TRUE, "
                 "auto_promote_confidence_threshold = 0.7, "
-                "auto_promote_min_age_hours = 72 "
+                "auto_promote_min_age_hours = 72, "
+                "auto_promote_evidence_enabled = FALSE, "
+                "auto_promote_evidence_threshold = 0.7 "
                 "WHERE tenant_id = (SELECT id FROM tenants WHERE slug = 'default')"
             )
         )
@@ -220,6 +223,14 @@ async def _insert_item(
     valid_to: datetime | None = None,
     superseded_by: str | None = None,
     content_hash: str | None = None,
+    kind: str = "fact",
+    source_type: str = "manual",
+    source_trust: float = 0.5,
+    source_confidence_prior: float | None = None,
+    retention_confidence: float | None = None,
+    retention_disposition: str | None = None,
+    retention_evidence_at: datetime | None = None,
+    authority: int = 10,
 ) -> str:
     """Insert a memory_items row with explicit control over promotion inputs."""
     item_id = str(uuid.uuid4())
@@ -232,12 +243,16 @@ async def _insert_item(
                 "INSERT INTO memory_items ("
                 "id, tenant_id, principal_id, content, content_hash, kind, "
                 "visibility, review_status, memory_confidence, source_trust, "
+                "source_confidence_prior, retention_confidence, retention_disposition, "
+                "retention_evidence_at, authority, "
                 "importance, source_type, conflict_resolution_status, "
                 "conflicts_with_item_id, valid_to, superseded_by, created_at, valid_from"
                 ") VALUES ("
-                ":id, :tenant_id, :principal_id, :content, :content_hash, 'fact', "
-                "'workspace', :review_status, :memory_confidence, 0.5, "
-                "0.5, 'manual', :conflict_resolution_status, "
+                ":id, :tenant_id, :principal_id, :content, :content_hash, :kind, "
+                "'workspace', :review_status, :memory_confidence, :source_trust, "
+                ":source_confidence_prior, :retention_confidence, :retention_disposition, "
+                ":retention_evidence_at, :authority, 0.5, :source_type, "
+                ":conflict_resolution_status, "
                 ":conflicts_with_item_id, :valid_to, :superseded_by, "
                 ":created_at, :created_at"
                 ")"
@@ -250,6 +265,14 @@ async def _insert_item(
                 "content_hash": content_hash or f"sha256:{uuid.uuid4().hex}",
                 "review_status": review_status,
                 "memory_confidence": memory_confidence,
+                "kind": kind,
+                "source_type": source_type,
+                "source_trust": source_trust,
+                "source_confidence_prior": source_confidence_prior,
+                "retention_confidence": retention_confidence,
+                "retention_disposition": retention_disposition,
+                "retention_evidence_at": retention_evidence_at,
+                "authority": authority,
                 "conflict_resolution_status": conflict_resolution_status,
                 "conflicts_with_item_id": conflicts_with_item_id,
                 "valid_to": valid_to,
@@ -259,6 +282,68 @@ async def _insert_item(
         )
         await session.commit()
     return item_id
+
+
+async def _insert_bound_evidence(
+    item_id: str,
+    *,
+    tenant_id: str,
+    principal_id: str,
+    created_at: datetime,
+    taxonomy_confidence: float = 0.9,
+    classification_version: str = "classification-v2",
+    retention_policy_version: str = "retention-v1",
+) -> str:
+    """Bind a server-shaped receipt matching the item's stored evidence."""
+    run_id = str(uuid.uuid4())
+    async with _test_session_factory() as session:
+        item = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT content_hash, source_type, kind, retention_confidence, "
+                        "retention_disposition FROM memory_items WHERE id = :id"
+                    ),
+                    {"id": item_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        await session.execute(
+            text(
+                "INSERT INTO classification_runs ("
+                "id, tenant_id, principal_id, memory_item_id, bound_at, content_hash, "
+                "canonicalization_version, source_type, suggested_kind, taxonomy_confidence, "
+                "retention_confidence, retention_disposition, reason, provenance, "
+                "classification_version, retention_policy_version, created_at, expires_at"
+                ") VALUES ("
+                ":id, :tenant_id, :principal_id, :item_id, :created_at, :content_hash, "
+                "'canonical-v1', :source_type, :kind, :taxonomy_confidence, "
+                ":retention_confidence, :retention_disposition, 'test evidence', "
+                "'{}'::jsonb, :classification_version, :retention_policy_version, "
+                ":created_at, :expires_at"
+                ")"
+            ),
+            {
+                "id": run_id,
+                "tenant_id": tenant_id,
+                "principal_id": principal_id,
+                "item_id": item_id,
+                "created_at": created_at,
+                "content_hash": item["content_hash"],
+                "source_type": item["source_type"],
+                "kind": item["kind"],
+                "taxonomy_confidence": taxonomy_confidence,
+                "retention_confidence": item["retention_confidence"],
+                "retention_disposition": item["retention_disposition"],
+                "classification_version": classification_version,
+                "retention_policy_version": retention_policy_version,
+                "expires_at": created_at + timedelta(hours=1),
+            },
+        )
+        await session.commit()
+    return run_id
 
 
 async def _status_of(item_id: str) -> str:
@@ -276,15 +361,19 @@ async def _status_of(item_id: str) -> str:
 async def _events_for(item_id: str) -> list[dict[str, Any]]:
     async with _test_session_factory() as session:
         rows = (
-            await session.execute(
-                text(
-                    "SELECT event_type, field_name, old_value, new_value, reason "
-                    "FROM item_events WHERE item_id = :id "
-                    "ORDER BY created_at ASC, id ASC"
-                ),
-                {"id": item_id},
+            (
+                await session.execute(
+                    text(
+                        "SELECT event_type, field_name, old_value, new_value, reason "
+                        "FROM item_events WHERE item_id = :id "
+                        "ORDER BY created_at ASC, id ASC"
+                    ),
+                    {"id": item_id},
+                )
             )
-        ).mappings().all()
+            .mappings()
+            .all()
+        )
     return [dict(r) for r in rows]
 
 
@@ -332,10 +421,7 @@ async def test_disabled_config_promotes_nothing():
     tenant_id, principal_id = await _default_tenant_principal()
     async with _test_session_factory() as session:
         await session.execute(
-            text(
-                "UPDATE tenant_config SET auto_promote_enabled = FALSE "
-                "WHERE tenant_id = :tid"
-            ),
+            text("UPDATE tenant_config SET auto_promote_enabled = FALSE WHERE tenant_id = :tid"),
             {"tid": tenant_id},
         )
         await session.commit()
@@ -520,29 +606,46 @@ async def test_rejected_archived_expired_superseded_not_promoted():
     old = _default_now() - timedelta(hours=100)
 
     rejected = await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id,
-        content="rejected", review_status="rejected", created_at=old,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="rejected",
+        review_status="rejected",
+        created_at=old,
     )
     archived = await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id,
-        content="archived", review_status="archived", created_at=old,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="archived",
+        review_status="archived",
+        created_at=old,
     )
     disputed = await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id,
-        content="disputed", review_status="disputed", created_at=old,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="disputed",
+        review_status="disputed",
+        created_at=old,
     )
     expired = await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id,
-        content="expired", review_status="proposed", created_at=old,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="expired",
+        review_status="proposed",
+        created_at=old,
         valid_to=_default_now() - timedelta(hours=1),
     )
     # superseded: a proposed-but-superseded row should not promote.
     repl = await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id, content="replacement",
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="replacement",
     )
     superseded = await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id,
-        content="superseded", review_status="proposed", created_at=old,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="superseded",
+        review_status="proposed",
+        created_at=old,
         superseded_by=uuid.UUID(repl),
     )
 
@@ -564,9 +667,7 @@ async def test_idempotent_second_run_promotes_zero():
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     tenant_id, principal_id = await _default_tenant_principal()
-    await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id, content="idempotent fact"
-    )
+    await _insert_item(tenant_id=tenant_id, principal_id=principal_id, content="idempotent fact")
 
     async with _test_session_factory() as session:
         await session.execute(
@@ -595,9 +696,7 @@ async def test_tenant_isolation():
     pid_b = str(uuid.uuid4())
     async with _test_session_factory() as session:
         await session.execute(
-            text(
-                "INSERT INTO tenants (id, name, slug) VALUES (:id, 'B', :slug)"
-            ),
+            text("INSERT INTO tenants (id, name, slug) VALUES (:id, 'B', :slug)"),
             {"id": tid_b, "slug": f"tenant-b-{tid_b[:8]}"},
         )
         await session.execute(
@@ -616,12 +715,8 @@ async def test_tenant_isolation():
         )
         await session.commit()
 
-    item_a = await _insert_item(
-        tenant_id=tid_a, principal_id=pid_a, content="tenant A eligible"
-    )
-    item_b = await _insert_item(
-        tenant_id=tid_b, principal_id=pid_b, content="tenant B eligible"
-    )
+    item_a = await _insert_item(tenant_id=tid_a, principal_id=pid_a, content="tenant A eligible")
+    item_b = await _insert_item(tenant_id=tid_b, principal_id=pid_b, content="tenant B eligible")
 
     # Promote only tenant A.
     async with _test_session_factory() as session:
@@ -640,9 +735,7 @@ async def test_admin_endpoint_returns_summary(client):
     # Setup via helper sessions, then a single client call to the endpoint —
     # mirrors the passing test_startup_recall_* structure (helper-then-client).
     tenant_id, principal_id = await _default_tenant_principal()
-    await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id, content="endpoint fact"
-    )
+    await _insert_item(tenant_id=tenant_id, principal_id=principal_id, content="endpoint fact")
 
     resp = await client.post("/v1/admin/promote")
     assert resp.status_code == 200, resp.text
@@ -663,18 +756,44 @@ async def test_cli_promote_single_tenant(capsys):
     from engram.cli import _run_promotion
 
     tenant_id, principal_id = await _default_tenant_principal()
-    await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id, content="cli fact"
-    )
+    await _insert_item(tenant_id=tenant_id, principal_id=principal_id, content="cli fact")
 
-    rc = await _run_promotion(
-        tenant_id, limit=None, session_factory=_test_session_factory
-    )
+    rc = await _run_promotion(tenant_id, limit=None, session_factory=_test_session_factory)
     out = capsys.readouterr().out
     assert rc == 0
     assert "promoted=1" in out
     assert f"tenant={tenant_id}" in out
     assert "Total:" in out
+    assert "would-promote" not in out
+
+
+async def test_cli_dry_run_prints_lane_and_blocker_summaries(capsys):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    from engram.cli import _run_promotion
+
+    tenant_id, principal_id = await _default_tenant_principal()
+    await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="CLI blocked preview",
+        memory_confidence=0.2,
+    )
+    rc = await _run_promotion(
+        tenant_id,
+        limit=1,
+        dry_run=True,
+        session_factory=_test_session_factory,
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "evidence_enabled=False" in out
+    assert "legacy=0 evidence=0" in out
+    assert "blockers:" in out
+    assert "confidence=1" in out
+    assert "blocked item_id=" in out
+    assert "content" not in out
+
 
 # ---- startup + semantic recall integration (acceptance criteria) ----
 
@@ -761,12 +880,18 @@ async def test_startup_recall_promotion_respects_limit(client, monkeypatch):
     tenant_id, principal_id = await _default_tenant_principal()
     old = _default_now() - timedelta(hours=100)
     item_a = await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id,
-        content="bounded lazy fact A", memory_confidence=0.9, created_at=old,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="bounded lazy fact A",
+        memory_confidence=0.9,
+        created_at=old,
     )
     item_b = await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id,
-        content="bounded lazy fact B", memory_confidence=0.9, created_at=old,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="bounded lazy fact B",
+        memory_confidence=0.9,
+        created_at=old,
     )
 
     resp = await client.post("/v1/recall", json={"mode": "startup"})
@@ -848,17 +973,14 @@ async def test_semantic_recall_warning_changes_after_promotion(client, monkeypat
     async with _test_session_factory() as session:
         await session.execute(
             text(
-                "UPDATE memory_items SET memory_confidence = 0.9, "
-                "created_at = :old WHERE id = :id"
+                "UPDATE memory_items SET memory_confidence = 0.9, created_at = :old WHERE id = :id"
             ),
             {"old": _default_now() - timedelta(hours=100), "id": item_id},
         )
         await session.commit()
 
     # Before promotion: proposed + unreviewed warning.
-    resp = await client.post(
-        "/v1/recall", json={"mode": "semantic", "query": "semantic query"}
-    )
+    resp = await client.post("/v1/recall", json={"mode": "semantic", "query": "semantic query"})
     assert resp.status_code == 200, resp.text
     body = resp.json()
     matched = [i for i in body["items"] if i["id"] == item_id]
@@ -872,9 +994,7 @@ async def test_semantic_recall_warning_changes_after_promotion(client, monkeypat
     assert promote_resp.json()["promoted"] == 1
 
     # After promotion: active, no unreviewed warning.
-    resp = await client.post(
-        "/v1/recall", json={"mode": "semantic", "query": "semantic query"}
-    )
+    resp = await client.post("/v1/recall", json={"mode": "semantic", "query": "semantic query"})
     assert resp.status_code == 200, resp.text
     body = resp.json()
     matched = [i for i in body["items"] if i["id"] == item_id]
@@ -903,14 +1023,18 @@ async def test_custom_tenant_config_thresholds_respected():
 
     # 0.9 confidence < 0.95 → skipped_confidence.
     low = await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id,
-        content="below custom threshold", memory_confidence=0.9,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="below custom threshold",
+        memory_confidence=0.9,
         created_at=_default_now() - timedelta(hours=5),
     )
     # 0.97 confidence >= 0.95, age 5h >= 1h → promoted.
     high = await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id,
-        content="above custom threshold", memory_confidence=0.97,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="above custom threshold",
+        memory_confidence=0.97,
         created_at=_default_now() - timedelta(hours=5),
     )
 
@@ -1017,6 +1141,402 @@ async def test_dispute_by_other_principal_blocks_promotion():
     assert await _status_of(item_id) == "proposed"
 
 
+# ---- Path A v2 evidence, clocks, dry-run, and operator surfaces ----
+
+
+async def test_low_trust_session_end_evidence_promotes_without_mutating_trust_fields():
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    tenant_id, principal_id = await _default_tenant_principal()
+    now = _default_now()
+    evidence_at = now - timedelta(hours=80)
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="retained low-trust session summary",
+        created_at=now - timedelta(hours=100),
+        memory_confidence=0.35,
+        source_type="session_end",
+        source_trust=0.35,
+        source_confidence_prior=0.35,
+        retention_confidence=0.90,
+        retention_disposition="retain",
+        retention_evidence_at=evidence_at,
+        authority=10,
+    )
+    run_id = await _insert_bound_evidence(
+        item_id,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        created_at=evidence_at,
+    )
+    async with _test_session_factory() as session:
+        await session.execute(
+            text(
+                "UPDATE tenant_config SET auto_promote_evidence_enabled = TRUE "
+                "WHERE tenant_id = :tenant_id AND active = TRUE"
+            ),
+            {"tenant_id": tenant_id},
+        )
+        before = (
+            await session.execute(
+                text(
+                    "SELECT source_trust, source_confidence_prior, memory_confidence, authority, "
+                    "human_verified, verified_by, verified_at, retention_confidence, "
+                    "retention_disposition, retention_evidence_at "
+                    "FROM memory_items WHERE id = :id"
+                ),
+                {"id": item_id},
+            )
+        ).one()
+        result = await auto_promote_proposed_memories(session, tenant_id, now=now)
+    assert result.promoted == 1
+    assert result.promoted_retention_evidence == 1
+    assert result.promoted_legacy_confidence == 0
+    candidate = result.candidates[0]
+    assert candidate.selected_basis == "retention_evidence"
+    assert candidate.classification_run_id == uuid.UUID(run_id)
+    assert candidate.cooling_period_start == evidence_at
+    assert candidate.eligible_at == evidence_at + timedelta(hours=72)
+    async with _test_session_factory() as session:
+        after = (
+            await session.execute(
+                text(
+                    "SELECT source_trust, source_confidence_prior, memory_confidence, authority, "
+                    "human_verified, verified_by, verified_at, retention_confidence, "
+                    "retention_disposition, retention_evidence_at "
+                    "FROM memory_items WHERE id = :id"
+                ),
+                {"id": item_id},
+            )
+        ).one()
+        reason = (
+            await session.execute(
+                text(
+                    "SELECT reason FROM item_events WHERE item_id = :id "
+                    "AND event_type = 'review_change'"
+                ),
+                {"id": item_id},
+            )
+        ).scalar_one()
+    assert after == before
+    assert '"basis": "retention_evidence"' in reason
+    assert f'"classification_run_id": "{run_id}"' in reason
+    assert f'"cooling_period_start": "{evidence_at.isoformat()}"' in reason
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_blocker"),
+    [
+        ("transient", "retention_disposition"),
+        ("noise", "retention_disposition"),
+        ("uncertain", "retention_disposition"),
+        ("missing_source_prior", "missing_source_prior"),
+        ("missing_receipt", "no_retention_evidence"),
+        ("unbound_receipt", "no_retention_evidence"),
+        ("classification_version", "evidence_version"),
+        ("retention_version", "evidence_version"),
+        ("content_hash", "evidence_inconsistent"),
+        ("source_type", "evidence_inconsistent"),
+        ("kind", "evidence_inconsistent"),
+        ("retention_confidence", "evidence_inconsistent"),
+        ("evidence_timestamp", "evidence_inconsistent"),
+        ("taxonomy", "taxonomy_confidence"),
+        ("score", "evidence_score"),
+        ("fresh", "age"),
+        ("disabled", "evidence_disabled"),
+    ],
+)
+async def test_evidence_negative_matrix_fails_closed(case: str, expected_blocker: str):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    tenant_id, principal_id = await _default_tenant_principal()
+    now = _default_now()
+    evidence_at = now - timedelta(hours=1 if case == "fresh" else 80)
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content=f"negative evidence {case}",
+        created_at=now - timedelta(hours=100),
+        memory_confidence=0.35,
+        source_type="session_end",
+        source_trust=0.35,
+        source_confidence_prior=0.35,
+        retention_confidence=0.90,
+        retention_disposition="retain",
+        retention_evidence_at=evidence_at,
+    )
+    run_id = None
+    if case != "missing_receipt":
+        run_id = await _insert_bound_evidence(
+            item_id,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            created_at=evidence_at,
+        )
+    async with _test_session_factory() as session:
+        await session.execute(
+            text(
+                "UPDATE tenant_config SET auto_promote_evidence_enabled = :enabled "
+                "WHERE tenant_id = :tenant_id AND active = TRUE"
+            ),
+            {"tenant_id": tenant_id, "enabled": case != "disabled"},
+        )
+        if case in {"transient", "noise", "uncertain"}:
+            await session.execute(
+                text("UPDATE memory_items SET retention_disposition = :value WHERE id = :id"),
+                {"id": item_id, "value": case},
+            )
+            await session.execute(
+                text(
+                    "UPDATE classification_runs SET retention_disposition = :value "
+                    "WHERE id = :run_id"
+                ),
+                {"run_id": run_id, "value": case},
+            )
+        elif case == "missing_source_prior":
+            await session.execute(
+                text("UPDATE memory_items SET source_confidence_prior = NULL WHERE id = :id"),
+                {"id": item_id},
+            )
+        elif case == "unbound_receipt":
+            await session.execute(
+                text("UPDATE classification_runs SET memory_item_id = NULL WHERE id = :run_id"),
+                {"run_id": run_id},
+            )
+        elif case == "classification_version":
+            await session.execute(
+                text(
+                    "UPDATE classification_runs SET classification_version = 'unsupported' "
+                    "WHERE id = :run_id"
+                ),
+                {"run_id": run_id},
+            )
+        elif case == "retention_version":
+            await session.execute(
+                text(
+                    "UPDATE classification_runs SET retention_policy_version = 'unsupported' "
+                    "WHERE id = :run_id"
+                ),
+                {"run_id": run_id},
+            )
+        elif case in {"content_hash", "source_type", "kind"}:
+            column = {
+                "content_hash": "content_hash",
+                "source_type": "source_type",
+                "kind": "suggested_kind",
+            }[case]
+            await session.execute(
+                text(f"UPDATE classification_runs SET {column} = 'mismatch' WHERE id = :run_id"),
+                {"run_id": run_id},
+            )
+        elif case == "retention_confidence":
+            await session.execute(
+                text(
+                    "UPDATE classification_runs SET retention_confidence = 0.89 "
+                    "WHERE id = :run_id"
+                ),
+                {"run_id": run_id},
+            )
+        elif case == "evidence_timestamp":
+            await session.execute(
+                text(
+                    "UPDATE memory_items SET retention_evidence_at = retention_evidence_at "
+                    "+ interval '1 second' WHERE id = :id"
+                ),
+                {"id": item_id},
+            )
+        elif case == "taxonomy":
+            await session.execute(
+                text(
+                    "UPDATE classification_runs SET taxonomy_confidence = 0.69 "
+                    "WHERE id = :run_id"
+                ),
+                {"run_id": run_id},
+            )
+        elif case == "score":
+            await session.execute(
+                text(
+                    "UPDATE memory_items SET source_confidence_prior = 0.1, "
+                    "retention_confidence = 0.5 WHERE id = :id"
+                ),
+                {"id": item_id},
+            )
+            await session.execute(
+                text(
+                    "UPDATE classification_runs SET retention_confidence = 0.5 "
+                    "WHERE id = :run_id"
+                ),
+                {"run_id": run_id},
+            )
+        result = await auto_promote_proposed_memories(session, tenant_id, now=now, dry_run=True)
+    assert result.would_promote == 0
+    assert result.promoted == 0
+    assert expected_blocker in result.candidates[0].blockers
+    assert await _status_of(item_id) == "proposed"
+
+
+async def test_legacy_clock_is_independent_of_fresh_malformed_evidence():
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    tenant_id, principal_id = await _default_tenant_principal()
+    now = _default_now()
+    created_at = now - timedelta(hours=100)
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="legacy remains independently eligible",
+        created_at=created_at,
+        memory_confidence=0.9,
+        source_confidence_prior=0.35,
+        retention_confidence=0.9,
+        retention_disposition="retain",
+        retention_evidence_at=now - timedelta(hours=1),
+    )
+    async with _test_session_factory() as session:
+        result = await auto_promote_proposed_memories(session, tenant_id, now=now, dry_run=True)
+    candidate = result.candidates[0]
+    assert candidate.would_promote is True
+    assert candidate.selected_basis == "legacy_confidence"
+    assert candidate.cooling_period_start == created_at
+    assert candidate.eligible_at == created_at + timedelta(hours=72)
+    assert candidate.evidence_cooling_period_start is None
+    assert await _status_of(item_id) == "proposed"
+
+
+async def test_repeated_dry_run_is_deterministic_and_creates_no_state():
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    tenant_id, principal_id = await _default_tenant_principal()
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="state-free dry run",
+    )
+    async with _test_session_factory() as session:
+        principals_before = (
+            await session.execute(text("SELECT count(*) FROM principals"))
+        ).scalar_one()
+        events_before = (
+            await session.execute(text("SELECT count(*) FROM item_events"))
+        ).scalar_one()
+        jobs_before = (await session.execute(text("SELECT count(*) FROM jobs"))).scalar_one()
+    now = _default_now()
+    async with _test_session_factory() as session:
+        first = await auto_promote_proposed_memories(
+            session, tenant_id, now=now, dry_run=True, source="admin_endpoint"
+        )
+        assert not session.in_transaction()
+    async with _test_session_factory() as session:
+        second = await auto_promote_proposed_memories(
+            session, tenant_id, now=now, dry_run=True, source="admin_endpoint"
+        )
+        assert not session.in_transaction()
+        principals_after = (
+            await session.execute(text("SELECT count(*) FROM principals"))
+        ).scalar_one()
+        events_after = (
+            await session.execute(text("SELECT count(*) FROM item_events"))
+        ).scalar_one()
+        jobs_after = (await session.execute(text("SELECT count(*) FROM jobs"))).scalar_one()
+    assert first.would_promote_ids == second.would_promote_ids == [uuid.UUID(item_id)]
+    assert first.candidates == second.candidates
+    assert (principals_after, events_after, jobs_after) == (
+        principals_before,
+        events_before,
+        jobs_before,
+    )
+    assert await _status_of(item_id) == "proposed"
+
+
+async def test_admin_dry_run_serializes_complete_v2_response(client):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    tenant_id, principal_id = await _default_tenant_principal()
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="typed admin preview",
+    )
+    response = await client.post("/v1/admin/promote?dry_run=true&limit=1")
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    for counter in (
+        "skipped_kind_policy",
+        "skipped_evidence_disabled",
+        "skipped_no_retention_evidence",
+        "skipped_missing_source_prior",
+        "skipped_retention_disposition",
+        "skipped_taxonomy_confidence",
+        "skipped_evidence_score",
+        "skipped_evidence_version",
+        "skipped_evidence_inconsistent",
+        "skipped_review_policy",
+    ):
+        assert counter in payload
+    assert payload["dry_run"] is True
+    assert payload["would_promote_ids"] == [item_id]
+    assert payload["candidates"][0]["item_id"] == item_id
+    assert payload["candidates"][0]["eligible_at"].endswith("Z")
+
+
+async def test_review_queue_previews_evidence_clock_without_mutation(client):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    tenant_id, principal_id = await _default_tenant_principal()
+    now = _default_now()
+    evidence_at = now - timedelta(hours=80)
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="review queue evidence preview",
+        created_at=now - timedelta(hours=100),
+        memory_confidence=0.35,
+        source_type="session_end",
+        source_confidence_prior=0.35,
+        retention_confidence=0.9,
+        retention_disposition="retain",
+        retention_evidence_at=evidence_at,
+    )
+    await _insert_bound_evidence(
+        item_id,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        created_at=evidence_at,
+    )
+    async with _test_session_factory() as session:
+        await session.execute(
+            text(
+                "UPDATE tenant_config SET auto_promote_evidence_enabled = TRUE "
+                "WHERE tenant_id = :tenant_id AND active = TRUE"
+            ),
+            {"tenant_id": tenant_id},
+        )
+        await session.commit()
+        events_before = (
+            await session.execute(text("SELECT count(*) FROM item_events"))
+        ).scalar_one()
+        principals_before = (
+            await session.execute(text("SELECT count(*) FROM principals"))
+        ).scalar_one()
+    response = await client.get("/v1/review/queue?limit=1")
+    assert response.status_code == 200, response.text
+    preview = response.json()[0]
+    assert preview["id"] == item_id
+    assert preview["promotion_basis_preview"] == "retention_evidence"
+    assert preview["promotion_eligible_at"] == (evidence_at + timedelta(hours=72)).isoformat()
+    assert preview["promotion_conflict_recheck_status"] == "not_run"
+    assert "conflict_recheck_not_run" in preview["promotion_blockers"]
+    async with _test_session_factory() as session:
+        assert (
+            await session.execute(text("SELECT count(*) FROM item_events"))
+        ).scalar_one() == events_before
+        assert (
+            await session.execute(text("SELECT count(*) FROM principals"))
+        ).scalar_one() == principals_before
+    assert await _status_of(item_id) == "proposed"
+
+
 async def test_dispute_by_creator_self_does_not_block():
     """The item's own creator disputing their own item is not an external
     dispute — Path A still promotes (design.md §3: only another principal's
@@ -1110,9 +1630,7 @@ async def test_path_a_uses_only_current_canonical_feedback(
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     tenant_id, principal_id = await _default_tenant_principal()
-    other_id = await _insert_principal(
-        tenant_id, f"canonical-feedback-{historical}-{current}"
-    )
+    other_id = await _insert_principal(tenant_id, f"canonical-feedback-{historical}-{current}")
     item_id = await _insert_item(
         tenant_id=tenant_id,
         principal_id=principal_id,
@@ -1172,9 +1690,7 @@ async def test_path_a_uses_only_current_canonical_feedback(
 # ---- promotion-time conflict recheck + top-k candidates (F13) ----
 
 
-async def _insert_embedding(
-    *, item_id: str, tenant_id: str, vector: list[float]
-) -> None:
+async def _insert_embedding(*, item_id: str, tenant_id: str, vector: list[float]) -> None:
     from engram.embeddings import EMBEDDING_MODEL
 
     async with _test_session_factory() as session:
@@ -1227,12 +1743,8 @@ async def test_conflict_recheck_blocks_when_active_item_conflicts_later(monkeypa
         content="later active conflicting memory",
         review_status="active",
     )
-    await _insert_embedding(
-        item_id=proposed_id, tenant_id=tenant_id, vector=_unit_vector_2d(0)
-    )
-    await _insert_embedding(
-        item_id=active_id, tenant_id=tenant_id, vector=_unit_vector_2d(5)
-    )
+    await _insert_embedding(item_id=proposed_id, tenant_id=tenant_id, vector=_unit_vector_2d(0))
+    await _insert_embedding(item_id=active_id, tenant_id=tenant_id, vector=_unit_vector_2d(5))
 
     import engram.conflicts as conflicts_mod
 
@@ -1295,16 +1807,22 @@ async def test_topk_conflict_candidate_third_nearest_detected(monkeypatch):
     # Three active items, all above the 0.85 similarity threshold, ordered
     # nearest (cand1) -> farthest (cand3) by embedding angle.
     cand1 = await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id,
-        content="cand1 nearest duplicate", review_status="active",
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="cand1 nearest duplicate",
+        review_status="active",
     )
     cand2 = await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id,
-        content="cand2 middle refine", review_status="active",
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="cand2 middle refine",
+        review_status="active",
     )
     cand3 = await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id,
-        content="cand3 farthest contradiction", review_status="active",
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="cand3 farthest contradiction",
+        review_status="active",
     )
     await _insert_embedding(item_id=proposed_id, tenant_id=tenant_id, vector=_unit_vector_2d(0))
     await _insert_embedding(item_id=cand1, tenant_id=tenant_id, vector=_unit_vector_2d(2))
@@ -1354,12 +1872,12 @@ async def test_topk_candidate_count_bounded(monkeypatch):
     # 8 active candidates, all within the similarity threshold — more than k.
     for i in range(8):
         cand_id = await _insert_item(
-            tenant_id=tenant_id, principal_id=principal_id,
-            content=f"bounded candidate {i}", review_status="active",
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            content=f"bounded candidate {i}",
+            review_status="active",
         )
-        await _insert_embedding(
-            item_id=cand_id, tenant_id=tenant_id, vector=_unit_vector_2d(1 + i)
-        )
+        await _insert_embedding(item_id=cand_id, tenant_id=tenant_id, vector=_unit_vector_2d(1 + i))
 
     async with _test_session_factory() as session:
         await session.execute(

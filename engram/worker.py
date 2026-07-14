@@ -1281,9 +1281,7 @@ def _can_narrow(current: str, proposed: str) -> bool:
 async def _reload_item_for_update(session: AsyncSession, item_id: UUID) -> MemoryItem | None:
     """Reload an item with SELECT ... FOR UPDATE for serialized mutation."""
     return (
-        await session.execute(
-            select(MemoryItem).where(MemoryItem.id == item_id).with_for_update()
-        )
+        await session.execute(select(MemoryItem).where(MemoryItem.id == item_id).with_for_update())
     ).scalar_one_or_none()
 
 
@@ -1392,9 +1390,7 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
     # Phase 2: lock the row and revalidate against current state.
     locked_item = await _reload_item_for_update(session, item_id)
     if locked_item is None or _is_expired_or_inactive(locked_item):
-        logger.info(
-            "classification.refine id=%s skipped: item gone/inactive after lock", item_id
-        )
+        logger.info("classification.refine id=%s skipped: item gone/inactive after lock", item_id)
         return
     if str(locked_item.tenant_id) != str(job.tenant_id):
         return
@@ -1403,6 +1399,8 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
             "classification.refine id=%s skipped after lock: evidence already bound", item_id
         )
         return
+    initial_kind = locked_item.kind
+    initial_visibility = locked_item.visibility
 
     run = new_run(
         tenant_id=locked_item.tenant_id,
@@ -1481,12 +1479,37 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
         ):
             changed = True
 
-    final_visibility = (
-        result.suggested_visibility
-        if result.suggested_visibility is not None
-        and _can_narrow(locked_item.visibility, result.suggested_visibility)
-        else locked_item.visibility
+    # The receipt, item evidence, classification event, and targeted delayed
+    # promotion job share this transaction.
+    from engram.promotion import schedule_evidence_promotion_if_qualified
+
+    await session.flush()
+    current_item = (
+        await session.execute(
+            select(MemoryItem)
+            .where(MemoryItem.id == item_id, MemoryItem.tenant_id == job.tenant_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if current_item is None or _is_expired_or_inactive(current_item):
+        return
+    current_run = await bound_run_for_item(session, item_id, for_update=True)
+    receipt_matches_item = (
+        current_run is not None
+        and current_run.id == run.id
+        and current_item.kind == current_run.suggested_kind
     )
+    promotion_job_id: UUID | None = None
+    promotion_schedule: dict[str, str] = {}
+    if receipt_matches_item:
+        assert current_run is not None
+        promotion_job_id = await schedule_evidence_promotion_if_qualified(
+            session,
+            current_item,
+            current_run,
+            diagnostics=promotion_schedule,
+        )
     await session.flush()
     await _insert_event(
         session,
@@ -1500,20 +1523,27 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
                 "classification_run_id": str(run.id),
                 "classification_version": run.classification_version,
                 "retention_policy_version": run.retention_policy_version,
-                "source_type": locked_item.source_type,
-                "source_trust": locked_item.source_trust,
-                "source_confidence_prior": locked_item.source_confidence_prior,
-                "default_memory_confidence": locked_item.source_confidence_prior,
-                "final_memory_confidence": locked_item.memory_confidence,
+                "source_type": current_item.source_type,
+                "source_trust": current_item.source_trust,
+                "source_confidence_prior": current_item.source_confidence_prior,
+                "default_memory_confidence": current_item.source_confidence_prior,
+                "final_memory_confidence": current_item.memory_confidence,
                 "taxonomy_confidence": result.taxonomy_confidence,
                 "confidence": result.taxonomy_confidence,
                 "retention_confidence": result.retention_confidence,
                 "retention_disposition": result.retention_disposition,
-                "requested_visibility": locked_item.visibility,
+                "requested_visibility": initial_visibility,
                 "suggested_visibility": result.suggested_visibility,
-                "previous_visibility": locked_item.visibility,
-                "final_visibility": final_visibility,
-                "visibility_narrowed": final_visibility != locked_item.visibility,
+                "previous_kind": initial_kind,
+                "final_kind": current_item.kind,
+                "final_review_status": current_item.review_status,
+                "previous_visibility": initial_visibility,
+                "final_visibility": current_item.visibility,
+                "visibility_narrowed": current_item.visibility != initial_visibility,
+                "promotion_receipt_matches_item": receipt_matches_item,
+                "promotion_job_id": str(promotion_job_id) if promotion_job_id else None,
+                "promotion_schedule_status": promotion_schedule.get("status", "not_scheduled"),
+                "promotion_schedule_blocker": promotion_schedule.get("blocker"),
                 "classification_provenance": run.provenance,
                 "provider": run.provenance.get("provider", "openai"),
                 "result": "changed" if changed else "no_change",
@@ -1530,10 +1560,19 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
 
 
 async def handle_promotion_path_a(session: AsyncSession, job: Job) -> None:
-    """Run Path A auto-promotion for the job's tenant. Thin wrapper."""
-    from engram.promotion import auto_promote_proposed_memories
+    """Run a compatible full sweep or a fail-closed targeted Path A job."""
+    from engram.promotion import auto_promote_item, auto_promote_proposed_memories
 
-    result = await auto_promote_proposed_memories(session, str(job.tenant_id), source="worker")
+    raw_item_id = job.payload.get("memory_item_id")
+    if raw_item_id is None:
+        result = await auto_promote_proposed_memories(session, str(job.tenant_id), source="worker")
+    else:
+        raw_run_id = job.payload.get("classification_run_id")
+        if raw_run_id is None:
+            raise ValueError("targeted promotion job missing classification_run_id")
+        result = await auto_promote_item(
+            session, str(job.tenant_id), _parse_uuid(raw_item_id), _parse_uuid(raw_run_id)
+        )
     logger.info(
         "promotion.path_a tenant=%s scanned=%s promoted=%s",
         job.tenant_id,
@@ -1611,9 +1650,7 @@ async def handle_recall_telemetry(session: AsyncSession, job: Job) -> None:
         # Already applied by a prior successful run of this job (or a
         # concurrent worker that won the race) — safe no-op.
         await session.commit()
-        logger.info(
-            "recall.telemetry recall_log_id=%s already applied, no-op", recall_log_id
-        )
+        logger.info("recall.telemetry recall_log_id=%s already applied, no-op", recall_log_id)
         return
 
     values: dict[str, Any] = {

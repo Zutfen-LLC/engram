@@ -102,6 +102,7 @@ CREATE_STATEMENTS = [
         singleton INTEGER NOT NULL DEFAULT 0,
         stays_in_recall_when_disputed INTEGER NOT NULL DEFAULT 0,
         requires_review INTEGER NOT NULL DEFAULT 0,
+        auto_promote_from_inferred INTEGER NOT NULL DEFAULT 0,
         default_importance REAL,
         sort_order INTEGER NOT NULL DEFAULT 100,
         created_at TEXT NOT NULL,
@@ -109,6 +110,45 @@ CREATE_STATEMENTS = [
         PRIMARY KEY (tenant_id, name)
     )
     """,
+    """
+    CREATE TABLE tenant_config (
+        id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        config_version TEXT,
+        weight_importance REAL,
+        weight_source_trust REAL,
+        weight_memory_confidence REAL,
+        weight_recency REAL,
+        weight_verified REAL,
+        auto_promote_enabled INTEGER,
+        auto_promote_confidence_threshold REAL,
+        auto_promote_min_age_hours INTEGER,
+        auto_promote_evidence_enabled INTEGER,
+        auto_promote_evidence_threshold REAL,
+        max_pinned_tokens INTEGER,
+        stale_after_days INTEGER,
+        startup_recall_penalty_threshold INTEGER,
+        startup_recall_penalty_factor REAL,
+        feedback_daily_limit INTEGER,
+        trust_manual_user REAL,
+        trust_manual_agent REAL,
+        trust_import REAL,
+        trust_extraction REAL,
+        trust_sync_turn REAL,
+        trust_pre_compress REAL,
+        trust_session_end REAL,
+        confidence_manual_user REAL,
+        confidence_manual_agent REAL,
+        confidence_import REAL,
+        confidence_extraction REAL,
+        confidence_sync_turn REAL,
+        confidence_pre_compress REAL,
+        confidence_session_end REAL,
+        active INTEGER,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+
 ]
 
 
@@ -340,14 +380,14 @@ def test_parse_api_key_rejects_bare_prefix():
         parse_api_key("eng_")
 
 
-def test_parse_api_key_rejects_empty_key_id_segment():
-    with pytest.raises(ValueError):
-        parse_api_key("eng__secret")  # key_id empty
+def test_parse_api_key_treats_leading_separator_as_legacy():
+    parsed = parse_api_key("eng__secret")
+    assert parsed == ParsedApiKey(key_id=None, secret="_secret", is_legacy=True)
 
 
-def test_parse_api_key_rejects_empty_secret_segment():
-    with pytest.raises(ValueError):
-        parse_api_key("eng_kid_")  # secret empty
+def test_parse_api_key_treats_trailing_separator_as_legacy():
+    parsed = parse_api_key("eng_kid_")
+    assert parsed == ParsedApiKey(key_id=None, secret="kid_", is_legacy=True)
 
 
 # === New-format digest helpers ===
