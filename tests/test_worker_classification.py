@@ -66,7 +66,9 @@ async def _get_test_session() -> AsyncSession:
                     ),
                     {"slug": _DEFAULT_TENANT_SLUG, "principal": _DEFAULT_PRINCIPAL_NAME},
                 )
-            ).mappings().one()
+            )
+            .mappings()
+            .one()
         )
         await apply_rls_context(
             session, tenant_id=row["tenant_id"], principal_id=row["principal_id"]
@@ -98,6 +100,12 @@ async def _clean_db():
         await conn.execute(text("DELETE FROM memory_embeddings"))
         await conn.execute(text("DELETE FROM classification_runs"))
         await conn.execute(text("DELETE FROM memory_items"))
+        await conn.execute(
+            text(
+                "UPDATE tenant_config SET auto_promote_evidence_enabled = FALSE, "
+                "auto_promote_evidence_threshold = 0.7 WHERE active = TRUE"
+            )
+        )
 
 
 async def _remember(client, **fields) -> str:
@@ -194,9 +202,7 @@ async def test_remember_omitted_kind_does_not_call_openai(client, monkeypatch):
     monkeypatch.setattr(classification_mod, "_call_openai_classification", spy)
     settings.classification_provider = "openai"
 
-    response = await client.post(
-        "/v1/remember", json={"content": "rule-based only on write path"}
-    )
+    response = await client.post("/v1/remember", json={"content": "rule-based only on write path"})
     assert response.status_code == 201
     assert not called, "the write path must not call OpenAI synchronously"
 
@@ -343,3 +349,84 @@ async def test_refinement_skips_below_threshold(client, monkeypatch):
     after = await _fetch_item(item_id)
     # kind/wing/room unchanged because confidence < threshold.
     assert after["kind"] == before["kind"]
+
+
+async def test_refinement_schedules_from_reloaded_final_kind_and_reports_final_state(
+    client, monkeypatch
+):
+    """A fact -> decision mutation qualifies from persisted state, exactly once."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    item_id = await _remember(
+        client,
+        content="we decided to retain this deployment choice",
+        source_type="session_end",
+        kind="fact",
+        visibility="tenant",
+    )
+    async with _test_session_factory() as session:
+        await session.execute(
+            text(
+                "UPDATE tenant_config SET auto_promote_evidence_enabled = TRUE "
+                "WHERE tenant_id = (SELECT tenant_id FROM memory_items WHERE id = :id) "
+                "AND active = TRUE"
+            ),
+            {"id": item_id},
+        )
+        await session.commit()
+
+    async def qualifying_decision(content, tenant_id, session, context=None):
+        return ClassificationResult(
+            suggested_kind="decision",
+            suggested_visibility="workspace",
+            taxonomy_confidence=0.9,
+            retention_confidence=0.9,
+            retention_disposition="retain",
+            reason="durable decision",
+            rules_matched=[],
+            provenance={"provider": "test", "mode": "fixture"},
+        )
+
+    monkeypatch.setattr("engram.classification.classify", qualifying_decision)
+    await _run_refine_job(item_id)
+    async with _test_session_factory() as session:
+        jobs = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT payload, dedupe_key FROM jobs "
+                        "WHERE job_type = 'promotion.path_a' AND payload->>'memory_item_id' = :id"
+                    ),
+                    {"id": item_id},
+                )
+            )
+            .mappings()
+            .all()
+        )
+        event_payload = (
+            await session.execute(
+                text(
+                    "SELECT new_value::jsonb FROM item_events WHERE item_id = :id "
+                    "AND event_type = 'classification' ORDER BY created_at DESC LIMIT 1"
+                ),
+                {"id": item_id},
+            )
+        ).scalar_one()
+    assert len(jobs) == 1
+    assert jobs[0]["dedupe_key"].startswith(f"promotion.path_a:{item_id}:")
+    assert event_payload["previous_kind"] == "fact"
+    assert event_payload["final_kind"] == "decision"
+    assert event_payload["final_visibility"] == "workspace"
+
+    await _run_refine_job(item_id)
+    async with _test_session_factory() as session:
+        count = (
+            await session.execute(
+                text(
+                    "SELECT count(*) FROM jobs WHERE job_type = 'promotion.path_a' "
+                    "AND payload->>'memory_item_id' = :id"
+                ),
+                {"id": item_id},
+            )
+        ).scalar_one()
+    assert count == 1

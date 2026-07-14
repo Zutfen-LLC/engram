@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
@@ -173,6 +174,28 @@ def _kind_to_out(kind: MemoryKind) -> MemoryKindOut:
     )
 
 
+class PromotionCandidateResponse(BaseModel):
+    item_id: uuid.UUID
+    would_promote: bool
+    selected_basis: Literal["legacy_confidence", "retention_evidence"] | None
+    blockers: list[str]
+    legacy_confidence: float
+    legacy_threshold: float
+    evidence_score: float | None
+    evidence_threshold: float
+    taxonomy_confidence: float | None
+    retention_disposition: str | None
+    classification_run_id: uuid.UUID | None
+    cooling_period_start: datetime | None
+    eligible_at: datetime | None
+    legacy_eligible_at: datetime
+    evidence_cooling_period_start: datetime | None
+    evidence_eligible_at: datetime | None
+    kind: str
+    kind_auto_promote_allowed: bool
+    conflict_recheck_status: str
+
+
 class PromotionResponse(BaseModel):
     """Result of running auto-promotion Path A for the caller's tenant."""
 
@@ -191,6 +214,16 @@ class PromotionResponse(BaseModel):
     skipped_disabled: int = 0
     skipped_dispute: int = 0
     skipped_conflict_recheck: int = 0
+    skipped_kind_policy: int = 0
+    skipped_evidence_disabled: int = 0
+    skipped_no_retention_evidence: int = 0
+    skipped_missing_source_prior: int = 0
+    skipped_retention_disposition: int = 0
+    skipped_taxonomy_confidence: int = 0
+    skipped_evidence_score: int = 0
+    skipped_evidence_version: int = 0
+    skipped_evidence_inconsistent: int = 0
+    skipped_review_policy: int = 0
     promoted_ids: list[uuid.UUID] = Field(default_factory=list)
     promoted_legacy_confidence: int = 0
     promoted_retention_evidence: int = 0
@@ -198,7 +231,7 @@ class PromotionResponse(BaseModel):
     would_promote_legacy_confidence: int = 0
     would_promote_retention_evidence: int = 0
     would_promote_ids: list[uuid.UUID] = Field(default_factory=list)
-    candidates: list[dict[str, object]] = Field(default_factory=list)
+    candidates: list[PromotionCandidateResponse] = Field(default_factory=list)
     summary: str
 
 
@@ -519,13 +552,10 @@ async def promote_proposed(
 ) -> PromotionResponse:
     """Run auto-promotion Path A for the caller's tenant.
 
-    Promotes ``proposed`` items whose ``memory_confidence`` meets the tenant
-    threshold, whose age meets ``auto_promote_min_age_hours``, which have no
-    unresolved conflict, no dispute event from another principal, and pass a
-    promotion-time conflict recheck. Each promotion writes an ``item_events``
-    audit row. Idempotent — safe to call repeatedly. Returns per-reason skip
-    counts. Uses the same gates as the CLI and the lazy startup-recall
-    promotion pass (``engram.promotion.auto_promote_proposed_memories``).
+    Evaluates independent legacy-confidence and server-attested retention-
+    evidence lanes, followed by shared kind, age, liveness, dispute, review-
+    policy, and conflict gates. ``dry_run=true`` performs an exact state-free
+    preview. A no-body request preserves actual-promotion behavior.
     """
     tenant_id = await _resolve_tenant_id(session)
     result = await auto_promote_proposed_memories(
@@ -547,6 +577,16 @@ async def promote_proposed(
         skipped_disabled=result.skipped_disabled,
         skipped_dispute=result.skipped_dispute,
         skipped_conflict_recheck=result.skipped_conflict_recheck,
+        skipped_kind_policy=result.skipped_kind_policy,
+        skipped_evidence_disabled=result.skipped_evidence_disabled,
+        skipped_no_retention_evidence=result.skipped_no_retention_evidence,
+        skipped_missing_source_prior=result.skipped_missing_source_prior,
+        skipped_retention_disposition=result.skipped_retention_disposition,
+        skipped_taxonomy_confidence=result.skipped_taxonomy_confidence,
+        skipped_evidence_score=result.skipped_evidence_score,
+        skipped_evidence_version=result.skipped_evidence_version,
+        skipped_evidence_inconsistent=result.skipped_evidence_inconsistent,
+        skipped_review_policy=result.skipped_review_policy,
         promoted_ids=result.promoted_ids,
         promoted_legacy_confidence=result.promoted_legacy_confidence,
         promoted_retention_evidence=result.promoted_retention_evidence,
@@ -554,6 +594,8 @@ async def promote_proposed(
         would_promote_legacy_confidence=result.would_promote_legacy_confidence,
         would_promote_retention_evidence=result.would_promote_retention_evidence,
         would_promote_ids=result.would_promote_ids,
-        candidates=[candidate.__dict__ for candidate in result.candidates],
+        candidates=[
+            PromotionCandidateResponse(**candidate.__dict__) for candidate in result.candidates
+        ],
         summary=summarize(result),
     )

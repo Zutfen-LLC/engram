@@ -188,6 +188,16 @@ skipped_conflict
 skipped_dispute            # blocked by another principal's dispute/negative feedback
 skipped_conflict_recheck   # blocked by a promotion-time conflict recheck
 skipped_disabled
+skipped_kind_policy
+skipped_evidence_disabled
+skipped_no_retention_evidence
+skipped_missing_source_prior
+skipped_retention_disposition
+skipped_taxonomy_confidence
+skipped_evidence_score
+skipped_evidence_version
+skipped_evidence_inconsistent
+skipped_review_policy
 ```
 
 Thresholds come from `tenant_config`:
@@ -431,7 +441,7 @@ Every receipt-bound write records its receipt/version, both confidence layers, s
 visibility decision, reason, and allowlisted, context-sanitized provider provenance. A receipt is
 permanently consumed even if its bound item is later deleted. Dedup binding requires matching source and
 governed kind and can only narrow the existing visibility. Content is never mutated. Promotion Path A
-v2 scoring and evidence gates are intentionally deferred to the next program PR.
+v2 consumes this bound evidence through its independently gated retention-evidence lane.
 
 Seed classification rules are intentionally conservative: "skip" rules are whole-message *status-only* matchers (bare `ok`, `done`, `passed`) that don't fire on status words inside meaningful sentences, and doctrine classification requires explicit policy/invariant phrasing rather than casual modal verbs.
 

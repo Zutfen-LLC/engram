@@ -266,16 +266,40 @@ For multi-agent deployments, this becomes critical: one agent's guess should not
 
 Without auto-promotion, the proposed queue grows unboundedly while the working set stays frozen — agents write all day but their knowledge never reaches recall. Auto-promotion makes human review exception handling, not the pipeline.
 
-**Auto-promotion conditions** are tenant-configurable and on by default with conservative thresholds. An item promotes if it meets either path.
+**Auto-promotion conditions** are tenant-configurable. The legacy lane keeps its existing rollout;
+migration 016 leaves the evidence lane disabled for existing tenants and enables it by default only
+for new tenant configurations. An item promotes when either independent lane passes and all common
+gates pass.
 
-#### Path A — Confidence + age
+#### Path A v2 — Independent legacy and retention-evidence lanes
 
-All of the following must hold (ENG-AUD-007 closes F11/F12/F13 against this
-list — every gate below is enforced, not aspirational):
+The legacy lane requires `memory_confidence >= auto_promote_confidence_threshold` and uses
+`created_at` as its cooling-period start. The evidence lane requires enabled tenant policy, a
+consistent bound classification receipt, `retention_disposition='retain'`, taxonomy confidence at
+least `0.70`, supported `classification-v2` / `retention-v1` versions, and this fixed score:
+
+```text
+min(0.85, 0.20 * source_confidence_prior + 0.80 * retention_confidence)
+```
+
+The evidence cooling-period start is the newest of item creation, retention evidence, and receipt
+creation. Each lane adds `auto_promote_min_age_hours` to its own start. Fresh evidence therefore does
+not delay a legacy-qualified item. When both lanes qualify, retention evidence is the sole selected
+and audited basis.
+
+Both lanes require a live, unsuperseded `proposed` item, global promotion enabled, an enabled kind
+whose `auto_promote_from_inferred` policy is true, no unresolved conflict, no external dispute or
+current external noise feedback, trusted review-policy admission, and a clear promotion-time
+conflict recheck. The final guarded update revalidates liveness, status, and kind policy. Built-in
+`fact`, `decision`, `procedure`, `summary`, and `observation` kinds allow inferred promotion by
+default; `preference`, `doctrine`, `invariant`, `diary_entry`, disabled/missing kinds, and custom
+kinds default to blocked.
+
+The legacy lane and common conflict/dispute hardening retain these enforced details:
 
 * `review_status = 'proposed'`
-* `memory_confidence >= auto_promote_confidence_threshold`, default `0.7`
-* Age >= `auto_promote_min_age_hours`, default 72 hours unchallenged
+* The legacy lane requires `memory_confidence >= auto_promote_confidence_threshold`, default `0.7`.
+* The selected lane's basis-specific age is at least `auto_promote_min_age_hours`, default 72 hours.
 * No unresolved conflict at write time: `conflict_resolution_status IS NULL OR = 'accepted'`
 * No dispute event from another principal (`engram.promotion.has_external_dispute_event`) —
   either an `item_events` row with `event_type='review_change'`,
@@ -296,6 +320,22 @@ list — every gate below is enforced, not aspirational):
   idempotent (a later scan sees the write-time `skipped_conflict` gate instead
   of re-running the recheck).
 * `tenant_config.auto_promote_enabled` is true
+
+Successful events record the selected basis and policy version, invocation source, basis-correct
+cooling and eligibility timestamps, thresholds, kind/source provenance, and the lane's score inputs.
+Conflict blocks additionally record the counterpart, detector verdict/reason, and whether detection
+used embeddings or the heuristic fallback. Promotion changes only `review_status` from `proposed` to
+`active`; it never changes trust, confidence, authority, verification, receipt, or retention fields.
+
+`--dry-run` and the admin `dry_run=true` mode execute the same pure lane and review-policy admission,
+perform conflict checks, create no actor/event/job/marker, and explicitly roll back every return path.
+Candidate support (kind, bound receipt, historical external disputes, and current external noise) is
+bulk-loaded in a bounded number of queries. The review queue reuses that evaluator without semantic
+conflict checks and reports the conflict recheck as `not_run`.
+
+Qualifying bound evidence enqueues a deduplicated `promotion.path_a` job for the evidence eligibility
+time. Worker-created evidence reloads the locked item after guarded classification mutations and
+schedules only from that mutation-authoritative row and its currently bound receipt.
 
 **Lazy startup-recall promotion** (F11): every `POST /v1/recall` call with
 `mode=startup` runs `engram.promotion.maybe_auto_promote_for_startup_recall`
@@ -401,8 +441,8 @@ source type, and governed kind match the receipt. Visibility becomes the narrowe
 the caller's current request, and the receipt suggestion; a metadata event is written only after a
 guarded mutation succeeds. Taxonomy confidence never changes `memory_confidence`; retention confidence
 is not a recall signal or governance authority.
-This receipt substrate does not implement Promotion Path A v2 scoring or promotion gates; those remain
-PR 2 work.
+This receipt substrate feeds Promotion Path A v2's evidence lane; receipt consistency and version
+checks fail closed before evidence can authorize promotion.
 
 ### Source trust and stable authority
 
@@ -440,9 +480,9 @@ raising their configured source trust never grants supersession authority.
 
 This is intentional: chatty low-confidence sources should not auto-promote without some signal that the memory is actually useful.
 
-**Promotion-path status:** the legacy Path A machinery remains in place. The trusted retention-evidence
-substrate is implemented here, while evidence scoring, kind gates, tenant evidence thresholds, and
-delayed promotion jobs are explicitly deferred to Promotion Path A v2 PR 2.
+**Promotion-path status:** Path A v2 implements independent legacy and trusted retention-evidence
+lanes, governed kind gates, tenant evidence thresholds, basis-specific clocks, and delayed targeted
+promotion jobs. PR 3 calibration, dogfood enablement, and live cooling-period proof remain deferred.
 
 All defaults are tenant-configurable through the `tenant_config` table.
 

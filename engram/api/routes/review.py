@@ -22,8 +22,8 @@ from engram.api.routes.memory import (
 from engram.auth import REVIEW_SCOPE, WRITE_OR_REVIEW_SCOPE, Principal
 from engram.db import get_session
 from engram.memory_access import eligibility_expression, eligibility_sql, resolve_workspace_scope
-from engram.models import ClassificationRun, MemoryItem, MemoryKind, TenantConfig
-from engram.promotion import _assess, _config_values
+from engram.models import MemoryItem, TenantConfig
+from engram.promotion import _config_values, assess_promotion_candidate, load_promotion_support
 from engram.review_policy import (
     TransitionOutcome,
     can_human_verify,
@@ -166,27 +166,16 @@ async def review_queue(
     """Items awaiting review (review_status='proposed').
 
     Returns proposed items newest-first, optionally filtered by kind or
-    workspace. Each entry includes the item id, content preview, kind,
-    source trust, memory confidence, and created timestamp.
+    workspace. Each entry includes legacy and receipt evidence, the selected
+    promotion basis and eligibility clock, stable blockers, kind policy, and
+    an explicit ``promotion_conflict_recheck_status='not_run'``. Previewing
+    never performs a semantic conflict check or mutates state.
     """
     tenant_id = await _resolve_tenant_id(session)
     principal_id, _ = await _resolve_principal(session, tenant_id)
 
     stmt = (
-        select(
-            MemoryItem.id,
-            MemoryItem.content,
-            MemoryItem.kind,
-            MemoryItem.wing,
-            MemoryItem.room,
-            MemoryItem.source_trust,
-            MemoryItem.memory_confidence,
-            MemoryItem.created_at,
-            MemoryItem.source_confidence_prior,
-            MemoryItem.retention_confidence,
-            MemoryItem.retention_disposition,
-            MemoryItem.retention_evidence_at,
-        )
+        select(MemoryItem)
         .where(
             MemoryItem.tenant_id == tenant_id,
             MemoryItem.review_status == "proposed",
@@ -201,7 +190,7 @@ async def review_queue(
     if workspace is not None:
         stmt = stmt.where(MemoryItem.workspace_id == UUID(workspace))
 
-    rows = (await session.execute(stmt)).all()
+    items = list((await session.execute(stmt)).scalars())
     config = (
         await session.execute(
             select(TenantConfig).where(
@@ -210,66 +199,38 @@ async def review_queue(
         )
     ).scalar_one_or_none()
     _, threshold, min_age, evidence_enabled, evidence_threshold = _config_values(config)
-    item_ids = [row.id for row in rows]
-    runs = {
-        run.memory_item_id: run
-        for run in (
-            await session.execute(
-                select(ClassificationRun).where(ClassificationRun.memory_item_id.in_(item_ids))
-            )
-        ).scalars()
-    }
-    kinds = {
-        kind.name: kind
-        for kind in (
-            await session.execute(
-                select(MemoryKind).where(
-                    MemoryKind.tenant_id == tenant_id,
-                    MemoryKind.name.in_([row.kind for row in rows]),
-                )
-            )
-        ).scalars()
-    }
-    items = {
-        item.id: item
-        for item in (
-            await session.execute(select(MemoryItem).where(MemoryItem.id.in_(item_ids)))
-        ).scalars()
-    }
+    support_map = await load_promotion_support(session, items)
     output: list[dict[str, Any]] = []
-    for row in rows:
+    for item in items:
         # A lightweight item-shaped object lets the shared evaluator make the
         # lane decision. Review queue deliberately does not run semantic
         # conflict rechecks; exact output belongs to promotion dry-run.
-        item = items.get(row.id)
-        if item is None:
-            continue
-        candidate, _ = await _assess(
-            session,
+        candidate = assess_promotion_candidate(
             item,
+            support_map[item.id],
             confidence_threshold=threshold,
             min_age_hours=min_age,
             evidence_enabled=evidence_enabled,
             evidence_threshold=evidence_threshold,
             now=datetime.now(UTC),
-            run_recheck=False,
         )
-        run = runs.get(row.id)
+        run = support_map[item.id].classification_run
+        kind_support = support_map[item.id].kind
         output.append(
             {
-                "id": str(row.id),
-                "content": row.content[:200] if row.content else "",
-                "kind": row.kind,
-                "wing": row.wing,
-                "room": row.room,
-                "source_trust": row.source_trust,
-                "memory_confidence": row.memory_confidence,
-                "created_at": row.created_at.isoformat() if row.created_at else None,
-                "source_confidence_prior": row.source_confidence_prior,
-                "retention_confidence": row.retention_confidence,
-                "retention_disposition": row.retention_disposition,
-                "retention_evidence_at": row.retention_evidence_at.isoformat()
-                if row.retention_evidence_at
+                "id": str(item.id),
+                "content": item.content[:200] if item.content else "",
+                "kind": item.kind,
+                "wing": item.wing,
+                "room": item.room,
+                "source_trust": item.source_trust,
+                "memory_confidence": item.memory_confidence,
+                "created_at": item.created_at.isoformat() if item.created_at else None,
+                "source_confidence_prior": item.source_confidence_prior,
+                "retention_confidence": item.retention_confidence,
+                "retention_disposition": item.retention_disposition,
+                "retention_evidence_at": item.retention_evidence_at.isoformat()
+                if item.retention_evidence_at
                 else None,
                 "classification_run_id": str(run.id) if run else None,
                 "classification_version": run.classification_version if run else None,
@@ -285,9 +246,9 @@ async def review_queue(
                 else None,
                 "promotion_blockers": candidate.blockers + ["conflict_recheck_not_run"],
                 "kind_auto_promote_allowed": bool(
-                    kinds.get(row.kind)
-                    and kinds[row.kind].enabled
-                    and kinds[row.kind].auto_promote_from_inferred
+                    kind_support
+                    and kind_support.enabled
+                    and kind_support.auto_promote_from_inferred
                 ),
                 "promotion_policy_version": "promotion-evidence-v1"
                 if candidate.selected_basis == "retention_evidence"

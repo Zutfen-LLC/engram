@@ -578,6 +578,8 @@ Promotion Path A v2 adds `tenant_config.auto_promote_evidence_enabled` and
 `auto_promote_evidence_threshold` (default `0.70`). Migration 016 leaves existing
 tenants disabled; newly-created tenants receive an enabled config row. Operators should
 run `engram promote-proposed --dry-run` before explicitly enabling an existing tenant.
+Dry-run applies the same policy admission as execution, rolls its transaction back, and prints
+per-lane totals plus stable blocker counts and bounded candidate details without memory content.
 Qualifying bound evidence also creates a delayed `promotion.path_a` worker job, so the
 worker must be running for scheduled promotion; startup recall and manual CLI/admin runs
 remain supported triggers.

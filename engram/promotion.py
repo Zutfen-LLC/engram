@@ -60,6 +60,7 @@ BLOCK_AGE = "age"
 BLOCK_CONFLICT = "conflict"
 BLOCK_DISPUTE = "external_dispute"
 BLOCK_RECHECK = "conflict_recheck"
+BLOCK_REVIEW_POLICY = "review_policy"
 
 
 async def resolve_trusted_system_actor(session: AsyncSession, tenant_id: str) -> uuid.UUID:
@@ -83,9 +84,22 @@ class PromotionCandidate:
     classification_run_id: uuid.UUID | None
     cooling_period_start: datetime | None
     eligible_at: datetime | None
+    legacy_eligible_at: datetime
+    evidence_cooling_period_start: datetime | None
+    evidence_eligible_at: datetime | None
     kind: str
     kind_auto_promote_allowed: bool
     conflict_recheck_status: str
+
+
+@dataclass(frozen=True)
+class PromotionSupport:
+    """Preloaded, database-independent support for one candidate assessment."""
+
+    kind: MemoryKind | None
+    classification_run: ClassificationRun | None
+    has_external_dispute: bool = False
+    has_external_noise_feedback: bool = False
 
 
 @dataclass
@@ -119,6 +133,7 @@ class PromotionResult:
     skipped_evidence_score: int = 0
     skipped_evidence_version: int = 0
     skipped_evidence_inconsistent: int = 0
+    skipped_review_policy: int = 0
     promoted_ids: list[uuid.UUID] = field(default_factory=list)
     would_promote_ids: list[uuid.UUID] = field(default_factory=list)
     candidates: list[PromotionCandidate] = field(default_factory=list)
@@ -215,22 +230,66 @@ def _supported(run: ClassificationRun) -> bool:
     )
 
 
-async def _support(
-    session: AsyncSession, item: MemoryItem
-) -> tuple[MemoryKind | None, ClassificationRun | None]:
-    kind = (
+async def load_promotion_support(
+    session: AsyncSession, items: list[MemoryItem]
+) -> dict[uuid.UUID, PromotionSupport]:
+    """Load kind, receipt, dispute, and noise support in four bounded queries."""
+    if not items:
+        return {}
+    tenant_id = items[0].tenant_id
+    item_ids = [item.id for item in items]
+    kinds = {
+        row.name: row
+        for row in (
+            await session.execute(
+                select(MemoryKind).where(
+                    MemoryKind.tenant_id == tenant_id,
+                    MemoryKind.name.in_({item.kind for item in items}),
+                )
+            )
+        ).scalars()
+    }
+    runs = {
+        row.memory_item_id: row
+        for row in (
+            await session.execute(
+                select(ClassificationRun).where(ClassificationRun.memory_item_id.in_(item_ids))
+            )
+        ).scalars()
+        if row.memory_item_id is not None
+    }
+    dispute_rows = (
         await session.execute(
-            select(MemoryKind).where(
-                MemoryKind.tenant_id == item.tenant_id, MemoryKind.name == item.kind
+            select(ItemEvent.item_id, ItemEvent.actor_principal_id).where(
+                ItemEvent.item_id.in_(item_ids),
+                ItemEvent.event_type == "review_change",
+                ItemEvent.field_name == "review_status",
+                ItemEvent.new_value == "disputed",
+                ItemEvent.actor_principal_id.is_not(None),
             )
         )
-    ).scalar_one_or_none()
-    run = (
+    ).all()
+    noise_rows = (
         await session.execute(
-            select(ClassificationRun).where(ClassificationRun.memory_item_id == item.id)
+            select(FeedbackEvent.item_id, FeedbackEvent.principal_id).where(
+                FeedbackEvent.item_id.in_(item_ids),
+                FeedbackEvent.verdict == "noise",
+                current_feedback_predicate(),
+            )
         )
-    ).scalar_one_or_none()
-    return kind, run
+    ).all()
+    authors = {item.id: item.principal_id for item in items}
+    disputed = {item_id for item_id, actor in dispute_rows if actor != authors[item_id]}
+    noisy = {item_id for item_id, actor in noise_rows if actor != authors[item_id]}
+    return {
+        item.id: PromotionSupport(
+            kind=kinds.get(item.kind),
+            classification_run=runs.get(item.id),
+            has_external_dispute=item.id in disputed,
+            has_external_noise_feedback=item.id in noisy,
+        )
+        for item in items
+    }
 
 
 def _evidence_state(
@@ -296,6 +355,7 @@ def _count_blockers(result: PromotionResult, blockers: list[str]) -> None:
         BLOCK_CONFLICT: "skipped_conflict",
         BLOCK_DISPUTE: "skipped_dispute",
         BLOCK_RECHECK: "skipped_conflict_recheck",
+        BLOCK_REVIEW_POLICY: "skipped_review_policy",
     }
     for blocker in set(blockers):
         attr = mapping.get(blocker)
@@ -303,18 +363,19 @@ def _count_blockers(result: PromotionResult, blockers: list[str]) -> None:
             setattr(result, attr, getattr(result, attr) + 1)
 
 
-async def _assess(
-    session: AsyncSession,
+def assess_promotion_candidate(
     item: MemoryItem,
+    support: PromotionSupport,
     *,
     confidence_threshold: float,
     min_age_hours: int,
     evidence_enabled: bool,
     evidence_threshold: float,
     now: datetime,
-    run_recheck: bool,
-) -> tuple[PromotionCandidate, PromotionConflictCheck | None]:
-    kind, run = await _support(session, item)
+    conflict_recheck_status: str = "not_run",
+) -> PromotionCandidate:
+    kind = support.kind
+    run = support.classification_run
     allowed_kind = bool(kind and kind.enabled and kind.auto_promote_from_inferred)
     blockers: list[str] = [] if allowed_kind else [BLOCK_KIND_POLICY]
     evidence_blockers, score, cooling_start = _evidence_state(item, run)
@@ -350,21 +411,38 @@ async def _assess(
         blockers.extend(evidence_blockers)
         if evidence_trust and not evidence_age:
             blockers.append(BLOCK_AGE)
-    conflict: PromotionConflictCheck | None = None
-    recheck_status = "not_run"
     if selected is not None:
         if item.conflict_resolution_status == "unresolved":
             blockers.append(BLOCK_CONFLICT)
-        elif await has_external_dispute_event(session, item):
+        elif support.has_external_dispute or support.has_external_noise_feedback:
             blockers.append(BLOCK_DISPUTE)
-        elif run_recheck:
-            conflict = await check_promotion_conflict(session, item)
-            recheck_status = "blocked" if conflict else "clear"
-            if conflict:
-                blockers.append(BLOCK_RECHECK)
-    eligible_at = cooling_start if selected == "retention_evidence" else item.created_at
-    if eligible_at is not None:
-        eligible_at += timedelta(hours=min_age_hours)
+        else:
+            decision = evaluate_transition(
+                principal_id=item.principal_id,
+                principal_type="system",
+                item_author_principal_id=item.principal_id,
+                current_status=item.review_status,
+                requested_status="active",
+                trusted_operation=TrustedReviewOperation.PROMOTION,
+            )
+            if not decision.allowed:
+                blockers.append(BLOCK_REVIEW_POLICY)
+    legacy_eligible_at = item.created_at + timedelta(hours=min_age_hours)
+    evidence_eligible_at = cooling_start + timedelta(hours=min_age_hours) if cooling_start else None
+    selected_start = (
+        cooling_start
+        if selected == "retention_evidence"
+        else item.created_at
+        if selected == "legacy_confidence"
+        else None
+    )
+    selected_eligible = (
+        evidence_eligible_at
+        if selected == "retention_evidence"
+        else legacy_eligible_at
+        if selected == "legacy_confidence"
+        else None
+    )
     return PromotionCandidate(
         item.id,
         selected is not None and not blockers,
@@ -377,12 +455,15 @@ async def _assess(
         run.taxonomy_confidence if run else None,
         item.retention_disposition,
         run.id if run else None,
+        selected_start,
+        selected_eligible,
+        legacy_eligible_at,
         cooling_start,
-        eligible_at,
+        evidence_eligible_at,
         item.kind,
         allowed_kind,
-        recheck_status,
-    ), conflict
+        conflict_recheck_status,
+    )
 
 
 def _audit(
@@ -456,55 +537,66 @@ async def auto_promote_proposed_memories(
             await session.execute(text("SELECT current_setting('app.tenant_id', true)::text"))
         ).scalar_one_or_none()
         if not tenant_id:
-            return PromotionResult(
+            result = PromotionResult(
                 "", False, _FALLBACK_CONFIDENCE_THRESHOLD, _FALLBACK_MIN_AGE_HOURS
             )
+            if dry_run:
+                await session.rollback()
+            return result
     config = await _config(session, str(tenant_id))
     enabled, threshold, min_age, evidence_enabled, evidence_threshold = _config_values(config)
     result = PromotionResult(
         str(tenant_id), enabled, threshold, min_age, evidence_enabled, evidence_threshold, dry_run
     )
-    stmt = select(MemoryItem).where(
+    base_stmt = select(MemoryItem).where(
         MemoryItem.tenant_id == tenant_id,
         MemoryItem.review_status == "proposed",
         MemoryItem.valid_to.is_(None),
     )
     if item_id is not None:
-        stmt = stmt.where(MemoryItem.id == item_id)
+        base_stmt = base_stmt.where(MemoryItem.id == item_id)
     else:
-        stmt = stmt.order_by(MemoryItem.created_at.asc())
+        base_stmt = base_stmt.order_by(MemoryItem.created_at.asc())
         if limit is not None:
-            stmt = stmt.limit(limit)
+            base_stmt = base_stmt.limit(limit)
+    if not enabled:
+        items = list((await session.execute(base_stmt)).scalars())
+        result.scanned = len(items)
+        result.skipped_disabled = len(items)
+        if dry_run:
+            await session.rollback()
+        else:
+            await session.commit()
+        return result
+    stmt = base_stmt
     if session.bind is not None and session.bind.dialect.name == "postgresql":
         stmt = stmt.with_for_update(skip_locked=item_id is None)
     items = list((await session.execute(stmt)).scalars())
     result.scanned = len(items)
-    if not enabled:
-        result.skipped_disabled = len(items)
-        if not dry_run:
-            await session.commit()
-        return result
+    support_map = await load_promotion_support(session, items)
     for item in items:
         if classification_run_id is not None:
-            bound = (
-                await session.execute(
-                    select(ClassificationRun.id).where(ClassificationRun.memory_item_id == item.id)
-                )
-            ).scalar_one_or_none()
-            if bound != classification_run_id:
+            bound_run = support_map[item.id].classification_run
+            if bound_run is None or bound_run.id != classification_run_id:
                 continue
         if item.superseded_by is not None:
             continue
-        candidate, conflict = await _assess(
-            session,
+        candidate = assess_promotion_candidate(
             item,
+            support_map[item.id],
             confidence_threshold=threshold,
             min_age_hours=min_age,
             evidence_enabled=evidence_enabled,
             evidence_threshold=evidence_threshold,
             now=moment,
-            run_recheck=True,
         )
+        conflict: PromotionConflictCheck | None = None
+        if candidate.would_promote:
+            conflict = await check_promotion_conflict(session, item)
+            candidate.conflict_recheck_status = "blocked" if conflict else "clear"
+            if conflict is not None:
+                candidate.blockers.append(BLOCK_RECHECK)
+                candidate.would_promote = False
         result.candidates.append(candidate)
         _count_blockers(result, candidate.blockers)
         if not candidate.would_promote:
@@ -536,9 +628,36 @@ async def auto_promote_proposed_memories(
                             reason=json.dumps(
                                 {
                                     "operation": "auto-promotion",
-                                    "basis": candidate.selected_basis,
+                                    "invocation_source": source,
+                                    "selected_basis": candidate.selected_basis,
+                                    "promotion_policy_version": (
+                                        EVIDENCE_PROMOTION_POLICY_VERSION
+                                        if candidate.selected_basis == "retention_evidence"
+                                        else LEGACY_PROMOTION_POLICY_VERSION
+                                    ),
                                     "conflict_recheck": "blocked",
-                                }
+                                    "conflicting_item_id": str(conflict.conflicting_item_id),
+                                    "conflict_verdict": conflict.verdict,
+                                    "conflict_reason": conflict.reason,
+                                    "conflict_detection_mode": (
+                                        "embedding"
+                                        if conflict.used_embeddings
+                                        else "heuristic_fallback"
+                                    ),
+                                    "source_item_id": str(item.id),
+                                    "kind": item.kind,
+                                    "source_type": item.source_type,
+                                    "classification_run_id": (
+                                        str(candidate.classification_run_id)
+                                        if candidate.classification_run_id
+                                        else None
+                                    ),
+                                    "evidence_score": candidate.evidence_score,
+                                    "legacy_confidence": candidate.legacy_confidence,
+                                    "evidence_threshold": candidate.evidence_threshold,
+                                    "legacy_threshold": candidate.legacy_threshold,
+                                },
+                                sort_keys=True,
                             ),
                         )
                     )
@@ -550,16 +669,6 @@ async def auto_promote_proposed_memories(
         else:
             result.would_promote_legacy_confidence += 1
         if dry_run:
-            continue
-        decision = evaluate_transition(
-            principal_id=item.principal_id,
-            principal_type="system",
-            item_author_principal_id=item.principal_id,
-            current_status="proposed",
-            requested_status="active",
-            trusted_operation=TrustedReviewOperation.PROMOTION,
-        )
-        if not decision.allowed:
             continue
         kind_allowed = exists(
             select(MemoryKind.name).where(
@@ -643,7 +752,9 @@ async def schedule_evidence_promotion_if_qualified(
     enabled, _, min_age, evidence_enabled, evidence_threshold = _config_values(config)
     if not enabled or not evidence_enabled or item.conflict_resolution_status == "unresolved":
         return None
-    kind, bound_run = await _support(session, item)
+    support = (await load_promotion_support(session, [item]))[item.id]
+    kind = support.kind
+    bound_run = support.classification_run
     if (
         kind is None
         or not kind.enabled

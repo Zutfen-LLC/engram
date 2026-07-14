@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -724,6 +725,35 @@ async def _run_promotion(
                 session, tid, limit=limit, source="cli", dry_run=dry_run
             )
             print(summarize(result))
+            if dry_run:
+                blockers = Counter(
+                    blocker
+                    for candidate in result.candidates
+                    for blocker in set(candidate.blockers)
+                )
+                blocker_text = " ".join(
+                    f"{name}={count}" for name, count in sorted(blockers.items())
+                )
+                print(f"  blockers: {blocker_text or 'none'}")
+                detail_limit = 20
+                for candidate in result.candidates[:detail_limit]:
+                    if candidate.would_promote:
+                        eligible_at = (
+                            candidate.eligible_at.isoformat() if candidate.eligible_at else None
+                        )
+                        print(
+                            f"  would-promote item_id={candidate.item_id} "
+                            f"basis={candidate.selected_basis} "
+                            f"eligible_at={eligible_at}"
+                        )
+                    else:
+                        print(
+                            f"  blocked item_id={candidate.item_id} kind={candidate.kind} "
+                            f"blockers={','.join(candidate.blockers) or 'none'}"
+                        )
+                omitted = len(result.candidates) - detail_limit
+                if omitted > 0:
+                    print(f"  ... {omitted} candidate detail rows omitted")
             total_promoted += result.would_promote if dry_run else result.promoted
             total_scanned += result.scanned
 
