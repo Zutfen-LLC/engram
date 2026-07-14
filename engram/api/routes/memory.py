@@ -477,19 +477,34 @@ async def remember(
     receipt: ClassificationRun | None = None
     if req.classification_run_id is not None:
         receipt = await lock_run(session, req.classification_run_id)
-        if receipt is None or receipt.principal_id != principal_id:
+        if (
+            receipt is None
+            or receipt.tenant_id != tenant_id
+            or receipt.principal_id != principal_id
+        ):
             raise HTTPException(status_code=404, detail="classification run not found")
-        if receipt.memory_item_id is not None:
+        if receipt.bound_at is None and receipt.memory_item_id is not None:
+            raise HTTPException(status_code=409, detail="classification run has invalid state")
+        if receipt.bound_at is not None:
+            if receipt.memory_item_id is None:
+                raise HTTPException(status_code=409, detail="classification run is already bound")
             bound_item = await session.scalar(
                 select(MemoryItem).where(MemoryItem.id == receipt.memory_item_id)
             )
             if bound_item is None:
                 raise HTTPException(status_code=409, detail="classification run is already bound")
             if (
-                bound_item.content_hash != chash
+                bound_item.tenant_id != receipt.tenant_id
+                or bound_item.principal_id != receipt.principal_id
+                or bound_item.workspace_id != receipt.workspace_id
+                or bound_item.content_hash != chash
                 or bound_item.source_type != req.source_type
                 or bound_item.workspace_id != workspace_id
                 or bound_item.principal_id != principal_id
+                or bound_item.kind != receipt.suggested_kind
+                or receipt.content_hash != chash
+                or receipt.source_type != req.source_type
+                or receipt.workspace_id != workspace_id
                 or (req.kind is not None and req.kind != receipt.suggested_kind)
             ):
                 raise HTTPException(status_code=409, detail="classification run is already bound")
@@ -502,6 +517,7 @@ async def remember(
             )
         if (
             receipt.expires_at <= datetime.now(UTC)
+            or receipt.tenant_id != tenant_id
             or receipt.content_hash != chash
             or receipt.source_type != req.source_type
             or receipt.workspace_id != workspace_id
@@ -645,6 +661,18 @@ async def remember(
             # classifies it by SQLSTATE into the right 4xx/5xx.
             raise
         if receipt is not None:
+            if (
+                existing.tenant_id != receipt.tenant_id
+                or existing.principal_id != receipt.principal_id
+                or existing.workspace_id != receipt.workspace_id
+                or existing.content_hash != receipt.content_hash
+                or existing.source_type != receipt.source_type
+                or existing.kind != receipt.suggested_kind
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="existing memory is incompatible with classification run",
+                ) from None
             competing = await session.scalar(
                 select(ClassificationRun).where(
                     ClassificationRun.memory_item_id == existing.id
@@ -654,6 +682,55 @@ async def remember(
                 raise HTTPException(
                     status_code=409, detail="memory item already has classification evidence"
                 ) from None
+
+            previous_visibility = existing.visibility
+            receipt_requested_visibility = narrow_visibility(
+                req.visibility, receipt.suggested_visibility
+            )
+            dedup_final_visibility = narrow_visibility(
+                previous_visibility, receipt_requested_visibility
+            )
+            if dedup_final_visibility != previous_visibility:
+                visibility_guard = (
+                    update(MemoryItem)
+                    .where(
+                        MemoryItem.id == existing.id,
+                        MemoryItem.tenant_id == tenant_id,
+                        MemoryItem.principal_id == principal_id,
+                        MemoryItem.workspace_id == workspace_id,
+                        MemoryItem.content_hash == chash,
+                        MemoryItem.source_type == receipt.source_type,
+                        MemoryItem.kind == receipt.suggested_kind,
+                        MemoryItem.visibility == previous_visibility,
+                        MemoryItem.valid_to.is_(None),
+                        MemoryItem.superseded_by.is_(None),
+                        MemoryItem.review_status != "rejected",
+                    )
+                    .values(visibility=dedup_final_visibility)
+                    .returning(MemoryItem.id)
+                )
+                changed_id = (
+                    await session.execute(
+                        visibility_guard.execution_options(synchronize_session=False)
+                    )
+                ).scalar_one_or_none()
+                if changed_id is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="existing memory changed during receipt binding",
+                    ) from None
+                session.add(
+                    ItemEvent(
+                        item_id=existing.id,
+                        event_type="metadata_patch",
+                        field_name="visibility",
+                        old_value=previous_visibility,
+                        new_value=dedup_final_visibility,
+                        actor_principal_id=principal_id,
+                        reason="classification receipt narrowed visibility",
+                    )
+                )
+
             bind_run(receipt, existing)
             session.add(
                 ItemEvent(
@@ -678,8 +755,9 @@ async def remember(
                             "retention_disposition": receipt.retention_disposition,
                             "requested_visibility": req.visibility,
                             "suggested_visibility": receipt.suggested_visibility,
-                            "final_visibility": existing.visibility,
-                            "visibility_narrowed": existing.visibility != req.visibility,
+                            "previous_visibility": previous_visibility,
+                            "final_visibility": dedup_final_visibility,
+                            "visibility_narrowed": (dedup_final_visibility != previous_visibility),
                             "reason": receipt.reason,
                             "classification_provenance": receipt.provenance,
                         },
@@ -725,6 +803,7 @@ async def remember(
         "final_memory_confidence": memory_confidence,
         "requested_visibility": req.visibility,
         "suggested_visibility": suggested_visibility,
+        "previous_visibility": req.visibility,
         "final_visibility": final_visibility,
         "visibility_narrowed": visibility_narrowed,
     }

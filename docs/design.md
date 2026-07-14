@@ -390,10 +390,17 @@ Trust is not binary. It is layered so that Engram can distinguish between:
 
 `POST /v1/classify` persists a tenant- and principal-scoped `classification_runs` receipt containing
 canonical content identity, source/workspace binding, taxonomy output, retention disposition, version
-constants, and provider provenance. Raw context is never stored; only its SHA-256 and character length
-are retained. Unbound receipts expire after one hour. Binding is transactional with the memory item and
-classification event, and v1 permits one attested retention assessment per item. Taxonomy confidence
-never changes `memory_confidence`; retention confidence is not a recall signal or governance authority.
+constants, and allowlisted, normalized provider provenance. Raw context is never stored; only its SHA-256
+and character length are retained, and exact context echoes in durable reason/provenance fields are
+redacted. Unbound receipts expire after one hour. The immutable `bound_at` timestamp records permanent
+receipt consumption; `memory_item_id` may later become `NULL` through `ON DELETE SET NULL`, but that does
+not make the receipt reusable or cleanup-eligible. Binding is transactional with the memory item and
+classification event, and v1 permits one attested retention assessment per item. On a dedup collision,
+receipt evidence may bind only when the existing item's tenant, principal, workspace, content hash,
+source type, and governed kind match the receipt. Visibility becomes the narrowest of the existing scope,
+the caller's current request, and the receipt suggestion; a metadata event is written only after a
+guarded mutation succeeds. Taxonomy confidence never changes `memory_confidence`; retention confidence
+is not a recall signal or governance authority.
 This receipt substrate does not implement Promotion Path A v2 scoring or promotion gates; those remain
 PR 2 work.
 

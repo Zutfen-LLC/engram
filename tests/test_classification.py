@@ -10,12 +10,14 @@ from datetime import UTC, datetime
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from engram.api.app import create_app
 from engram.api.routes import memory as memory_routes
 from engram.classification import ClassificationResult
+from engram.classification_evidence import cleanup_expired_unbound_runs
 from engram.config import settings
 from engram.db import get_session
 
@@ -41,16 +43,20 @@ async def _get_test_session() -> AsyncSession:
         from engram.db import _DEFAULT_PRINCIPAL_NAME, _DEFAULT_TENANT_SLUG
 
         row = (
-            await session.execute(
-                sa_text(
-                    "SELECT t.id::text AS tenant_id, p.id::text AS principal_id "
-                    "FROM tenants t "
-                    "JOIN principals p ON p.tenant_id = t.id AND p.name = :principal "
-                    "WHERE t.slug = :slug"
-                ),
-                {"slug": _DEFAULT_TENANT_SLUG, "principal": _DEFAULT_PRINCIPAL_NAME},
+            (
+                await session.execute(
+                    sa_text(
+                        "SELECT t.id::text AS tenant_id, p.id::text AS principal_id "
+                        "FROM tenants t "
+                        "JOIN principals p ON p.tenant_id = t.id AND p.name = :principal "
+                        "WHERE t.slug = :slug"
+                    ),
+                    {"slug": _DEFAULT_TENANT_SLUG, "principal": _DEFAULT_PRINCIPAL_NAME},
+                )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
         from engram.db import apply_rls_context
 
         await apply_rls_context(
@@ -153,11 +159,15 @@ async def test_classify_persists_attested_receipt_without_raw_context(client):
     assert body["retention_disposition"] == "uncertain"
     async with _test_engine.connect() as conn:
         row = (
-            await conn.execute(
-                text("SELECT * FROM classification_runs WHERE id = :id"),
-                {"id": body["classification_run_id"]},
+            (
+                await conn.execute(
+                    text("SELECT * FROM classification_runs WHERE id = :id"),
+                    {"id": body["classification_run_id"]},
+                )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
     assert row["source_type"] == "sync_turn"
     assert row["context_hash"] == hashlib.sha256(context.encode()).hexdigest()
     assert row["context_length"] == len(context)
@@ -167,6 +177,82 @@ async def test_classify_persists_attested_receipt_without_raw_context(client):
     assert row["expires_at"] >= before
     assert (row["expires_at"] - row["created_at"]).total_seconds() == 3600
     assert context not in json.dumps(row["provenance"])
+
+
+async def test_hostile_provider_context_echo_is_absent_from_receipt_and_event(client, monkeypatch):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    context = "PRIVATE-CONTEXT-echo-sentinel-948271"
+    content = "Durable candidate for hostile provider test"
+
+    async def hostile_provider(_prompt: str) -> dict[str, object]:
+        return {
+            "suggested_kind": "fact",
+            "suggested_visibility": "private",
+            "taxonomy_confidence": 0.88,
+            "retention_confidence": 0.81,
+            "retention_disposition": "retain",
+            "reason": f"provider echoed {context}",
+            "rules_matched": ["normalized_rule"],
+            "unexpected_extra": {"raw_context": context},
+        }
+
+    monkeypatch.setattr("engram.classification._call_openai_classification", hostile_provider)
+    settings.classification_provider = "openai"
+    settings.classification_model = "configured-test-model"
+    classified = await client.post(
+        "/v1/classify",
+        json={"content": content, "context": context, "source_type": "manual"},
+    )
+    assert classified.status_code == 200
+    receipt_id = classified.json()["classification_run_id"]
+    remembered = await client.post(
+        "/v1/remember",
+        json={"content": content, "classification_run_id": receipt_id},
+    )
+    assert remembered.status_code == 201
+
+    async with _test_engine.connect() as conn:
+        receipt = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT context_hash,context_length,reason,provenance "
+                        "FROM classification_runs WHERE id=:id"
+                    ),
+                    {"id": receipt_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        event = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT reason,new_value FROM item_events "
+                        "WHERE item_id=:id AND event_type='classification'"
+                    ),
+                    {"id": remembered.json()["id"]},
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert receipt["context_hash"] == hashlib.sha256(context.encode()).hexdigest()
+    assert receipt["context_length"] == len(context)
+    durable_text = json.dumps(
+        {
+            "receipt_reason": receipt["reason"],
+            "receipt_provenance": receipt["provenance"],
+            "event_reason": event["reason"],
+            "event_new_value": event["new_value"],
+        }
+    )
+    assert context not in durable_text
+    assert "unexpected_extra" not in durable_text
+    assert receipt["provenance"]["provider"] == "openai"
+    assert receipt["provenance"]["model"] == "configured-test-model"
 
 
 async def test_receipt_bound_remember_uses_server_evidence_and_source_prior(client):
@@ -192,16 +278,20 @@ async def test_receipt_bound_remember_uses_server_evidence_and_source_prior(clie
     assert remembered.json()["memory_confidence"] == pytest.approx(0.4)
     async with _test_engine.connect() as conn:
         row = (
-            await conn.execute(
-                text(
-                    "SELECT m.source_confidence_prior,m.retention_confidence,"
-                    "m.retention_disposition,r.memory_item_id "
-                    "FROM memory_items m JOIN classification_runs r ON r.memory_item_id=m.id "
-                    "WHERE r.id=:id"
-                ),
-                {"id": receipt_id},
+            (
+                await conn.execute(
+                    text(
+                        "SELECT m.source_confidence_prior,m.retention_confidence,"
+                        "m.retention_disposition,r.memory_item_id "
+                        "FROM memory_items m JOIN classification_runs r ON r.memory_item_id=m.id "
+                        "WHERE r.id=:id"
+                    ),
+                    {"id": receipt_id},
+                )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
     assert row["source_confidence_prior"] == pytest.approx(0.4)
     assert row["retention_confidence"] == 0.0
     assert row["retention_disposition"] == "uncertain"
@@ -211,9 +301,7 @@ async def test_receipt_content_and_kind_mismatch_are_rejected(client):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     settings.classification_provider = "none"
-    classified = await client.post(
-        "/v1/classify", json={"content": "User prefers dark mode"}
-    )
+    classified = await client.post("/v1/classify", json={"content": "User prefers dark mode"})
     receipt_id = classified.json()["classification_run_id"]
     content_mismatch = await client.post(
         "/v1/remember",
@@ -235,9 +323,7 @@ async def test_receipt_binds_to_preexisting_unbound_dedup_item(client):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     content = "Preexisting unbound receipt dedup"
-    existing = await client.post(
-        "/v1/remember", json={"content": content, "kind": "fact"}
-    )
+    existing = await client.post("/v1/remember", json={"content": content, "kind": "fact"})
     classified = await client.post("/v1/classify", json={"content": content})
     receipt_id = classified.json()["classification_run_id"]
     deduped = await client.post(
@@ -262,6 +348,309 @@ async def test_receipt_binds_to_preexisting_unbound_dedup_item(client):
     assert row.retention_disposition == "uncertain"
 
 
+@pytest.mark.parametrize(
+    ("existing_kind", "receipt_kind", "existing_source", "receipt_source"),
+    [
+        ("fact", "doctrine", "manual", "manual"),
+        ("doctrine", "fact", "manual", "manual"),
+        ("fact", "fact", "sync_turn", "session_end"),
+        ("fact", "fact", "manual", "sync_turn"),
+    ],
+)
+async def test_dedup_receipt_rejects_source_or_kind_mismatch_without_mutation(
+    client,
+    existing_kind: str,
+    receipt_kind: str,
+    existing_source: str,
+    receipt_source: str,
+):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    content = f"Receipt mismatch {existing_kind} {receipt_kind} {existing_source} {receipt_source}"
+    existing = await client.post(
+        "/v1/remember",
+        json={"content": content, "kind": existing_kind, "source_type": existing_source},
+    )
+    classified = await client.post(
+        "/v1/classify", json={"content": content, "source_type": receipt_source}
+    )
+    receipt_id = classified.json()["classification_run_id"]
+    async with _test_engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE classification_runs SET suggested_kind=:kind WHERE id=:id"),
+            {"kind": receipt_kind, "id": receipt_id},
+        )
+    before_events = await _event_count(existing.json()["id"])
+    response = await client.post(
+        "/v1/remember",
+        json={
+            "content": content,
+            "source_type": receipt_source,
+            "classification_run_id": receipt_id,
+        },
+    )
+    assert response.status_code == 409
+    async with _test_engine.connect() as conn:
+        run = (
+            await conn.execute(
+                text("SELECT memory_item_id,bound_at FROM classification_runs WHERE id=:id"),
+                {"id": receipt_id},
+            )
+        ).one()
+        item = (
+            await conn.execute(
+                text(
+                    "SELECT kind,source_type,visibility,retention_confidence "
+                    "FROM memory_items WHERE id=:id"
+                ),
+                {"id": existing.json()["id"]},
+            )
+        ).one()
+    assert tuple(run) == (None, None)
+    assert item.kind == existing_kind
+    assert item.source_type == existing_source
+    assert item.retention_confidence is None
+    assert await _event_count(existing.json()["id"]) == before_events
+
+
+@pytest.mark.parametrize(
+    ("existing_visibility", "requested_visibility", "suggested_visibility", "expected"),
+    [
+        ("public", "workspace", "private", "private"),
+        ("public", "workspace", None, "workspace"),
+        ("private", "public", "tenant", "private"),
+        ("workspace", "workspace", "public", "workspace"),
+    ],
+)
+async def test_dedup_receipt_visibility_uses_narrowest_scope_and_truthful_events(
+    client,
+    existing_visibility: str,
+    requested_visibility: str,
+    suggested_visibility: str | None,
+    expected: str,
+):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    content = (
+        f"Receipt visibility {existing_visibility} {requested_visibility} {suggested_visibility}"
+    )
+    existing = await client.post(
+        "/v1/remember",
+        json={"content": content, "kind": "fact", "visibility": existing_visibility},
+    )
+    classified = await client.post("/v1/classify", json={"content": content})
+    receipt_id = classified.json()["classification_run_id"]
+    async with _test_engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE classification_runs SET suggested_kind='fact', "
+                "suggested_visibility=:visibility WHERE id=:id"
+            ),
+            {"visibility": suggested_visibility, "id": receipt_id},
+        )
+    response = await client.post(
+        "/v1/remember",
+        json={
+            "content": content,
+            "visibility": requested_visibility,
+            "classification_run_id": receipt_id,
+        },
+    )
+    assert response.status_code == 201
+    async with _test_engine.connect() as conn:
+        visibility = await conn.scalar(
+            text("SELECT visibility FROM memory_items WHERE id=:id"),
+            {"id": existing.json()["id"]},
+        )
+        rows = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT event_type,field_name,old_value,new_value FROM item_events "
+                        "WHERE item_id=:id ORDER BY created_at"
+                    ),
+                    {"id": existing.json()["id"]},
+                )
+            )
+            .mappings()
+            .all()
+        )
+    assert visibility == expected
+    visibility_events = [
+        row
+        for row in rows
+        if row["event_type"] == "metadata_patch" and row["field_name"] == "visibility"
+    ]
+    assert len(visibility_events) == int(expected != existing_visibility)
+    classification_event = next(
+        row for row in reversed(rows) if row["event_type"] == "classification"
+    )
+    payload = json.loads(classification_event["new_value"])
+    assert payload["previous_visibility"] == existing_visibility
+    assert payload["final_visibility"] == expected
+    assert payload["visibility_narrowed"] is (expected != existing_visibility)
+
+
+async def _event_count(item_id: str) -> int:
+    async with _test_engine.connect() as conn:
+        return int(
+            await conn.scalar(
+                text("SELECT count(*) FROM item_events WHERE item_id=:id"), {"id": item_id}
+            )
+        )
+
+
+async def _set_classification_event_rejection(enabled: bool) -> None:
+    async with _test_engine.begin() as conn:
+        if enabled:
+            await conn.execute(
+                text(
+                    """
+                    CREATE OR REPLACE FUNCTION test_reject_classification_event()
+                    RETURNS trigger LANGUAGE plpgsql AS $$
+                    BEGIN
+                        RAISE EXCEPTION 'classification event rejected by test';
+                    END;
+                    $$;
+                    """
+                )
+            )
+            await conn.execute(
+                text("DROP TRIGGER IF EXISTS test_reject_classification_event ON item_events")
+            )
+            await conn.execute(
+                text(
+                    """
+                    CREATE TRIGGER test_reject_classification_event
+                    BEFORE INSERT ON item_events
+                    FOR EACH ROW WHEN (NEW.event_type = 'classification')
+                    EXECUTE FUNCTION test_reject_classification_event();
+                    """
+                )
+            )
+        else:
+            await conn.execute(
+                text("DROP TRIGGER IF EXISTS test_reject_classification_event ON item_events")
+            )
+            await conn.execute(text("DROP FUNCTION IF EXISTS test_reject_classification_event()"))
+
+
+async def test_new_item_receipt_binding_rolls_back_when_classification_event_fails(client):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    content = "Atomic new receipt event failure"
+    classified = await client.post("/v1/classify", json={"content": content})
+    receipt_id = classified.json()["classification_run_id"]
+    await _set_classification_event_rejection(True)
+    try:
+        with pytest.raises(DBAPIError):
+            await client.post(
+                "/v1/remember",
+                json={"content": content, "classification_run_id": receipt_id},
+            )
+    finally:
+        await _set_classification_event_rejection(False)
+
+    async with _test_engine.connect() as conn:
+        state = (
+            await conn.execute(
+                text("SELECT memory_item_id,bound_at FROM classification_runs WHERE id=:id"),
+                {"id": receipt_id},
+            )
+        ).one()
+        item_count = await conn.scalar(
+            text("SELECT count(*) FROM memory_items WHERE content=:content"),
+            {"content": content},
+        )
+        event_count = await conn.scalar(
+            text("SELECT count(*) FROM item_events WHERE new_value LIKE :needle"),
+            {"needle": f"%{receipt_id}%"},
+        )
+    assert tuple(state) == (None, None)
+    assert item_count == 0
+    assert event_count == 0
+
+    retry = await client.post(
+        "/v1/remember", json={"content": content, "classification_run_id": receipt_id}
+    )
+    assert retry.status_code == 201
+    assert await _event_count(retry.json()["id"]) == 1
+
+
+async def test_dedup_receipt_binding_rolls_back_visibility_and_evidence_on_event_failure(
+    client,
+):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    content = "Atomic dedup receipt event failure"
+    existing = await client.post(
+        "/v1/remember",
+        json={"content": content, "kind": "fact", "visibility": "public"},
+    )
+    item_id = existing.json()["id"]
+    original_events = await _event_count(item_id)
+    classified = await client.post("/v1/classify", json={"content": content})
+    receipt_id = classified.json()["classification_run_id"]
+    async with _test_engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE classification_runs SET suggested_kind='fact', "
+                "suggested_visibility='private' WHERE id=:id"
+            ),
+            {"id": receipt_id},
+        )
+
+    await _set_classification_event_rejection(True)
+    try:
+        with pytest.raises(DBAPIError):
+            await client.post(
+                "/v1/remember",
+                json={
+                    "content": content,
+                    "visibility": "workspace",
+                    "classification_run_id": receipt_id,
+                },
+            )
+    finally:
+        await _set_classification_event_rejection(False)
+
+    async with _test_engine.connect() as conn:
+        item = (
+            await conn.execute(
+                text(
+                    "SELECT visibility,retention_confidence,retention_disposition "
+                    "FROM memory_items WHERE id=:id"
+                ),
+                {"id": item_id},
+            )
+        ).one()
+        run = (
+            await conn.execute(
+                text("SELECT memory_item_id,bound_at FROM classification_runs WHERE id=:id"),
+                {"id": receipt_id},
+            )
+        ).one()
+    assert tuple(item) == ("public", None, None)
+    assert tuple(run) == (None, None)
+    assert await _event_count(item_id) == original_events
+
+    retry = await client.post(
+        "/v1/remember",
+        json={
+            "content": content,
+            "visibility": "workspace",
+            "classification_run_id": receipt_id,
+        },
+    )
+    assert retry.status_code == 201
+    async with _test_engine.connect() as conn:
+        visibility = await conn.scalar(
+            text("SELECT visibility FROM memory_items WHERE id=:id"), {"id": item_id}
+        )
+    assert visibility == "private"
+    assert await _event_count(item_id) == original_events + 2
+
+
 async def test_expired_unbound_rejected_but_bound_replay_survives_expiry(client):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
@@ -270,8 +659,7 @@ async def test_expired_unbound_rejected_but_bound_replay_survives_expiry(client)
     async with _test_engine.begin() as conn:
         await conn.execute(
             text(
-                "UPDATE classification_runs SET expires_at=now()-interval '1 second' "
-                "WHERE id=:id"
+                "UPDATE classification_runs SET expires_at=now()-interval '1 second' WHERE id=:id"
             ),
             {"id": expired.json()["classification_run_id"]},
         )
@@ -293,8 +681,7 @@ async def test_expired_unbound_rejected_but_bound_replay_survives_expiry(client)
     async with _test_engine.begin() as conn:
         await conn.execute(
             text(
-                "UPDATE classification_runs SET expires_at=now()-interval '1 second' "
-                "WHERE id=:id"
+                "UPDATE classification_runs SET expires_at=now()-interval '1 second' WHERE id=:id"
             ),
             {"id": receipt_id},
         )
@@ -303,6 +690,75 @@ async def test_expired_unbound_rejected_but_bound_replay_survives_expiry(client)
     )
     assert replay.status_code == 201
     assert replay.json()["id"] == created.json()["id"]
+
+
+async def test_bound_state_survives_item_deletion_and_cleanup_and_cannot_be_reused(client):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    content = "Permanently consumed receipt"
+    classified = await client.post("/v1/classify", json={"content": content})
+    receipt_id = classified.json()["classification_run_id"]
+    created = await client.post(
+        "/v1/remember", json={"content": content, "classification_run_id": receipt_id}
+    )
+    assert created.status_code == 201
+    async with _test_engine.connect() as conn:
+        original_bound_at = await conn.scalar(
+            text("SELECT bound_at FROM classification_runs WHERE id=:id"),
+            {"id": receipt_id},
+        )
+    assert original_bound_at is not None
+
+    replay = await client.post(
+        "/v1/remember", json={"content": content, "classification_run_id": receipt_id}
+    )
+    assert replay.status_code == 201
+    async with _test_engine.connect() as conn:
+        replay_bound_at = await conn.scalar(
+            text("SELECT bound_at FROM classification_runs WHERE id=:id"),
+            {"id": receipt_id},
+        )
+    assert replay_bound_at == original_bound_at
+
+    never_bound = await client.post("/v1/classify", json={"content": "Never-bound expired receipt"})
+    never_bound_id = never_bound.json()["classification_run_id"]
+    async with _test_engine.begin() as conn:
+        await conn.execute(
+            text("DELETE FROM memory_items WHERE id=:id"), {"id": created.json()["id"]}
+        )
+        await conn.execute(
+            text(
+                "UPDATE classification_runs SET expires_at=now()-interval '1 second' "
+                "WHERE id IN (:bound,:unbound)"
+            ),
+            {"bound": receipt_id, "unbound": never_bound_id},
+        )
+
+    async for session in _get_test_session():
+        removed = await cleanup_expired_unbound_runs(
+            session, await memory_routes._resolve_tenant_id(session)
+        )
+        await session.commit()
+    assert removed == 1
+    async with _test_engine.connect() as conn:
+        formerly_bound = (
+            await conn.execute(
+                text("SELECT memory_item_id,bound_at FROM classification_runs WHERE id=:id"),
+                {"id": receipt_id},
+            )
+        ).one()
+        unbound_count = await conn.scalar(
+            text("SELECT count(*) FROM classification_runs WHERE id=:id"),
+            {"id": never_bound_id},
+        )
+    assert formerly_bound.memory_item_id is None
+    assert formerly_bound.bound_at == original_bound_at
+    assert unbound_count == 0
+
+    reuse = await client.post(
+        "/v1/remember", json={"content": content, "classification_run_id": receipt_id}
+    )
+    assert reuse.status_code == 409
 
 
 async def test_receipt_source_mismatch_is_rejected(client):
@@ -323,12 +779,53 @@ async def test_receipt_source_mismatch_is_rejected(client):
     assert response.status_code == 422
 
 
+async def test_receipt_workspace_mismatch_is_rejected_without_mutation(client):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    async with _test_engine.connect() as conn:
+        tenant_id = await conn.scalar(text("SELECT id FROM tenants WHERE slug='default'"))
+    suffix = hashlib.sha256(str(datetime.now(UTC)).encode()).hexdigest()[:10]
+    workspace_a = f"receipt-a-{suffix}"
+    workspace_b = f"receipt-b-{suffix}"
+    for slug in (workspace_a, workspace_b):
+        created = await client.post(
+            "/v1/admin/workspaces",
+            json={"tenant_id": str(tenant_id), "name": slug, "slug": slug},
+        )
+        assert created.status_code == 201
+    content = "Workspace-bound classification receipt"
+    classified = await client.post(
+        "/v1/classify", json={"content": content, "workspace": workspace_a}
+    )
+    receipt_id = classified.json()["classification_run_id"]
+    response = await client.post(
+        "/v1/remember",
+        json={
+            "content": content,
+            "workspace": workspace_b,
+            "classification_run_id": receipt_id,
+        },
+    )
+    assert response.status_code == 422
+    async with _test_engine.connect() as conn:
+        run = (
+            await conn.execute(
+                text("SELECT memory_item_id,bound_at FROM classification_runs WHERE id=:id"),
+                {"id": receipt_id},
+            )
+        ).one()
+        item_count = await conn.scalar(
+            text("SELECT count(*) FROM memory_items WHERE content=:content"),
+            {"content": content},
+        )
+    assert tuple(run) == (None, None)
+    assert item_count == 0
+
+
 async def test_concurrent_same_receipt_is_idempotent(client):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
-    classified = await client.post(
-        "/v1/classify", json={"content": "Concurrent receipt identity"}
-    )
+    classified = await client.post("/v1/classify", json={"content": "Concurrent receipt identity"})
     receipt_id = classified.json()["classification_run_id"]
     payload = {
         "content": "Concurrent receipt identity",
@@ -354,6 +851,15 @@ async def test_concurrent_same_receipt_is_idempotent(client):
             )
         ).one()
     assert tuple(counts) == (1, 1)
+    async with _test_engine.connect() as conn:
+        bound_state = (
+            await conn.execute(
+                text("SELECT memory_item_id,bound_at FROM classification_runs WHERE id=:id"),
+                {"id": receipt_id},
+            )
+        ).one()
+    assert bound_state.memory_item_id is not None
+    assert bound_state.bound_at is not None
 
 
 async def test_concurrent_different_receipts_have_one_conflict_loser(client):

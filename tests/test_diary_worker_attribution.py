@@ -259,6 +259,53 @@ async def test_application_role_posture_force_rls_and_cross_tenant_isolation(dat
         assert (await session.execute(text("SELECT id FROM principals WHERE id=:id"), {"id": corpus.actors["user_c"].id})).scalar_one()
 
 
+async def test_cross_principal_classification_receipt_is_non_disclosing_and_unmodified(
+    database, corpus, client
+):
+    owner, _ = database
+    content = "Cross-principal receipt access proof"
+    classified = await client.post(
+        "/v1/classify",
+        headers=_auth(corpus.actors["user_a"]),
+        json={"content": content, "source_type": "manual"},
+    )
+    assert classified.status_code == 200
+    receipt_id = classified.json()["classification_run_id"]
+
+    attempted = await client.post(
+        "/v1/remember",
+        headers=_auth(corpus.actors["user_b"]),
+        json={
+            "content": content,
+            "source_type": "manual",
+            "classification_run_id": receipt_id,
+        },
+    )
+    assert attempted.status_code == 404
+    async with owner() as session:
+        run = (
+            await session.execute(
+                text(
+                    "SELECT memory_item_id,bound_at FROM classification_runs WHERE id=:id"
+                ),
+                {"id": receipt_id},
+            )
+        ).one()
+        item_count = await session.scalar(
+            text("SELECT count(*) FROM memory_items WHERE content=:content"),
+            {"content": content},
+        )
+        event_count = await session.scalar(
+            text(
+                "SELECT count(*) FROM item_events WHERE actor_principal_id=:principal"
+            ),
+            {"principal": corpus.actors["user_b"].id},
+        )
+    assert tuple(run) == (None, None)
+    assert item_count == 0
+    assert event_count == 0
+
+
 @pytest.mark.asyncio
 async def test_real_auth_self_write_matrix_and_configured_trust(client, database, corpus):
     owner, _ = database

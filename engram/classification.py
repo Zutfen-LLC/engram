@@ -87,7 +87,9 @@ async def classify(
         llm_payload = await _call_openai_classification(prompt)
     except Exception as exc:  # pragma: no cover - defensive fallback
         fallback = dict(rule_result.provenance)
-        fallback.update({"provider": "openai", "mode": "fallback", "error": str(exc)})
+        fallback.update(
+            {"provider": "openai", "mode": "fallback", "error_type": type(exc).__name__}
+        )
         return rule_result.model_copy(
             update={
                 "retention_confidence": 0.0,
@@ -549,7 +551,9 @@ def _build_prompt(
             "atomic, faithful representation of the supplied context, remain useful beyond "
             "the current turn or command, and not merely report transient status, tool "
             "chatter, or an uncommitted possibility. Do not assess whether it is externally "
-            "true beyond the supplied context."
+            "true beyond the supplied context. Taxonomy confidence and retention "
+            "confidence are independent. Retention confidence measures only the positive "
+            "case for durable retention; confidence that text is noise must not increase it."
         ),
         "taxonomy": {
             "kinds": taxonomy,
@@ -571,6 +575,26 @@ def _build_prompt(
             "reason": "str",
             "rules_matched": "list[str]",
         },
+        "retention_dispositions": {
+            "retain": (
+                "The candidate is an atomic, faithful representation of information that "
+                "should remain useful beyond the current command or working moment and "
+                "deserves durable memory."
+            ),
+            "transient": (
+                "The candidate may be useful during the current working period or session "
+                "but is unlikely to remain useful as durable memory."
+            ),
+            "noise": (
+                "The candidate is acknowledgement text, status chatter, repeated tool "
+                "output, routine CI/process narration, or other content that should not "
+                "become memory."
+            ),
+            "uncertain": (
+                "There is insufficient evidence to decide whether the candidate deserves "
+                "durable retention, or the output cannot safely make that judgment."
+            ),
+        },
         "constraints": [
             "Return valid JSON only.",
             "Use only kinds from the taxonomy; otherwise choose fact.",
@@ -580,6 +604,12 @@ def _build_prompt(
             "Taxonomy confidence may be any value in 0.0-0.95. Low confidence is a real "
             "signal — express doubt rather than flooring it.",
             "If uncertain, prefer fact and a lower confidence.",
+            "Retention confidence measures the positive case for durable retention.",
+            "High confidence that text is noise must not produce high retention confidence; "
+            "noise should normally have low retention confidence.",
+            "Retention confidence does not assess external truth beyond supplied content "
+            "and context.",
+            "Taxonomy confidence and retention confidence are independent.",
             "Kind definitions:",
             "  invariant: non-negotiable safety or integrity prohibition — "
             "violations cause data loss, security breaches, or corruption. "
@@ -691,7 +721,6 @@ def _apply_llm_payload(
             "mode": "llm",
             "model": settings.classification_model,
             "threshold": settings.classification_confidence_threshold,
-            "raw_provider_payload": payload,
             "llm_payload": {
                 "suggested_kind": kind,
                 "suggested_wing": wing,

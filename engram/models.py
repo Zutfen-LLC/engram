@@ -388,6 +388,7 @@ class ClassificationRun(Base):
         nullable=True,
         unique=True,
     )
+    bound_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     content_hash: Mapped[str] = mapped_column(Text, nullable=False)
     canonicalization_version: Mapped[str] = mapped_column(Text, nullable=False)
     source_type: Mapped[str] = mapped_column(Text, nullable=False)

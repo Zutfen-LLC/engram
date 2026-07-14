@@ -1,14 +1,13 @@
 """Env-driven configuration for the engram-hooks companion library.
 
 Maps Hermes lifecycle events to hook entry points and Engram ``source_type``
-values, and reads connection + promotion thresholds from the environment.
+values, and reads connection + durable-storage thresholds from the environment.
 
 Design references
 -----------------
 - ``docs/design.md`` §4 (Source trust defaults): ``sync_turn``/``pre_compress``
   are low-trust, inferred sources (memory_confidence 0.4 / 0.3). They default to
-  ``review_status='proposed'`` and stay below the 0.7 auto-promotion gate until
-  an LLM classification (1B) or human review raises their confidence.
+  ``review_status='proposed'`` for later evidence scoring or human review.
 - The Hermes lifecycle events we hook are ``pre_compress``, ``sync_turn``, and
   ``session_end``. Each maps to one of our hook entry points and to an Engram
   ``source_type`` so the service can apply the right trust defaults.

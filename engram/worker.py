@@ -1407,7 +1407,6 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
     run = new_run(
         tenant_id=locked_item.tenant_id,
         principal_id=actor,
-        memory_item_id=locked_item.id,
         content=locked_item.content,
         source_type=locked_item.source_type,
         workspace_id=locked_item.workspace_id,
@@ -1512,18 +1511,19 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
                 "retention_disposition": result.retention_disposition,
                 "requested_visibility": locked_item.visibility,
                 "suggested_visibility": result.suggested_visibility,
+                "previous_visibility": locked_item.visibility,
                 "final_visibility": final_visibility,
                 "visibility_narrowed": final_visibility != locked_item.visibility,
-                "classification_provenance": result.provenance,
-                "provider": result.provenance.get("provider", "openai"),
+                "classification_provenance": run.provenance,
+                "provider": run.provenance.get("provider", "openai"),
                 "result": "changed" if changed else "no_change",
-                "reason": result.reason,
+                "reason": run.reason,
                 **provenance,
             },
             sort_keys=True,
         ),
         actor_principal_id=actor,
-        reason=json.dumps({**provenance, "reason": result.reason}, sort_keys=True),
+        reason=json.dumps({**provenance, "reason": run.reason}, sort_keys=True),
     )
 
     await session.commit()

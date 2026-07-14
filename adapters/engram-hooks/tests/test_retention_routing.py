@@ -56,6 +56,14 @@ async def test_retain_above_threshold_remembers_receipt_and_server_taxonomy(tmp_
     assert client.remember_calls[0]["kind"] == "decision"
 
 
+async def test_zero_threshold_remembers_zero_confidence_retain(tmp_path: Any) -> None:
+    client = Client("retain", 0.0)
+    hooks = _hooks(tmp_path, client, threshold=0.0)
+    detail = await hooks._route_candidate("Durable candidate text", source_type="sync_turn")
+    assert detail["route"] == "remembered"
+    assert len(client.remember_calls) == 1
+
+
 @pytest.mark.parametrize(
     ("disposition", "confidence", "route"),
     [
@@ -84,3 +92,12 @@ def test_store_env_precedence_and_deprecated_config_compat(monkeypatch: Any) -> 
     monkeypatch.delenv("ENGRAM_HOOKS_STORE_THRESHOLD")
     assert HooksConfig().store_confidence_threshold == pytest.approx(0.5)
     assert HooksConfig(promote_confidence_threshold=0.7).store_confidence_threshold == 0.7
+
+
+def test_explicit_zero_store_threshold_is_preserved(monkeypatch: Any) -> None:
+    assert HooksConfig(store_confidence_threshold=0.0).store_confidence_threshold == 0.0
+    monkeypatch.setenv("ENGRAM_HOOKS_PROMOTE_THRESHOLD", "0.5")
+    monkeypatch.setenv("ENGRAM_HOOKS_STORE_THRESHOLD", "0")
+    config = HooksConfig()
+    assert config.store_confidence_threshold == 0.0
+    assert config.promote_confidence_threshold == 0.0
