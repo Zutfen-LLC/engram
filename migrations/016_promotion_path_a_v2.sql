@@ -26,23 +26,9 @@ ALTER TABLE tenant_config
 ALTER TABLE tenant_config
     ALTER COLUMN auto_promote_evidence_enabled SET DEFAULT TRUE;
 
--- Keep every future tenant on a real, explicitly enabled config row.  The
--- migration backfill above is intentionally false and is never rewritten.
-CREATE OR REPLACE FUNCTION seed_tenant_config_for_promotion_v2() RETURNS TRIGGER AS $$
-BEGIN
-    INSERT INTO tenant_config (
-        tenant_id, config_version, active, auto_promote_evidence_enabled,
-        auto_promote_evidence_threshold
-    ) VALUES (NEW.id, 'v1', TRUE, TRUE, 0.70)
-    ON CONFLICT DO NOTHING;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS trg_seed_tenant_config_for_promotion_v2 ON tenants;
-CREATE TRIGGER trg_seed_tenant_config_for_promotion_v2
-    AFTER INSERT ON tenants
-    FOR EACH ROW EXECUTE FUNCTION seed_tenant_config_for_promotion_v2();
+-- New tenants receive an explicit enabled config from the application tenant
+-- creation path. A database trigger would race with existing import and test
+-- helpers that already create their own active configuration.
 
 ALTER TABLE memory_kinds
     ADD COLUMN IF NOT EXISTS auto_promote_from_inferred BOOLEAN NOT NULL DEFAULT FALSE;
