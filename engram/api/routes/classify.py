@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
-from sqlalchemy import text
+from pydantic import BaseModel, Field, model_validator
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.auth import ADMIN_SCOPE, READ_SCOPE
-from engram.classification import ClassificationResult
+from engram.classification import ClassificationResult, RetentionDisposition
 from engram.classification import classify as classify_content
+from engram.classification_evidence import new_run
 from engram.db import get_session
+from engram.models import Principal, Workspace
 
 router = APIRouter()
 
@@ -21,9 +25,14 @@ class ClassifyRequest(BaseModel):
     content: str
     context: str | None = None  # optional conversation excerpt or source_type hint
     workspace: str | None = None
+    source_type: Literal[
+        "manual", "import", "migration", "extraction", "sync_turn", "pre_compress", "session_end"
+    ] = "manual"
 
 
 class ClassifyResponse(BaseModel):
+    classification_run_id: UUID
+    expires_at: datetime
     suggested_kind: str
     suggested_wing: str | None = None
     suggested_room: str | None = None
@@ -31,9 +40,17 @@ class ClassifyResponse(BaseModel):
     # downward-only narrowing happens on ``/v1/remember``. ``None`` means the
     # classifier has no opinion and the caller's visibility should be preserved.
     suggested_visibility: str | None = None
-    confidence: float = Field(ge=0.0, le=1.0)
+    taxonomy_confidence: float = Field(ge=0.0, le=0.95)
+    confidence: float = Field(ge=0.0, le=0.95)
+    retention_confidence: float = Field(ge=0.0, le=0.95)
+    retention_disposition: RetentionDisposition
     reason: str
     rules_matched: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def keep_legacy_confidence_alias_equal(self) -> ClassifyResponse:
+        self.confidence = self.taxonomy_confidence
+        return self
 
 
 class RuleCreate(BaseModel):
@@ -54,6 +71,35 @@ async def _resolve_tenant_id(session: AsyncSession) -> UUID:
     return UUID(str(tenant_id))
 
 
+async def _resolve_principal_id(session: AsyncSession, tenant_id: UUID) -> UUID:
+    row = await session.execute(text("SELECT current_setting('app.principal_id', true)"))
+    value = row.scalar()
+    if not value:
+        raise HTTPException(status_code=403, detail="no principal context")
+    principal_id = UUID(str(value))
+    exists = await session.scalar(
+        select(Principal.id).where(
+            Principal.id == principal_id, Principal.tenant_id == tenant_id
+        )
+    )
+    if exists is None:
+        raise HTTPException(status_code=403, detail="invalid principal context")
+    return principal_id
+
+
+async def _resolve_workspace_id(
+    session: AsyncSession, tenant_id: UUID, slug: str | None
+) -> UUID | None:
+    if slug is None:
+        return None
+    workspace_id = await session.scalar(
+        select(Workspace.id).where(Workspace.tenant_id == tenant_id, Workspace.slug == slug)
+    )
+    if workspace_id is None:
+        raise HTTPException(status_code=422, detail=f"workspace '{slug}' not found")
+    return workspace_id
+
+
 @router.post("/classify", response_model=ClassifyResponse, dependencies=[Depends(READ_SCOPE)])
 async def classify(
     req: ClassifyRequest,
@@ -62,10 +108,27 @@ async def classify(
     """Classify raw text: suggest kind, wing, room, visibility."""
 
     tenant_id = await _resolve_tenant_id(session)
+    principal_id = await _resolve_principal_id(session, tenant_id)
+    workspace_id = await _resolve_workspace_id(session, tenant_id, req.workspace)
     result: ClassificationResult = await classify_content(
         req.content, tenant_id, session, context=req.context
     )
-    return ClassifyResponse(**result.model_dump(exclude={"provenance"}))
+    run = new_run(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content=req.content,
+        source_type=req.source_type,
+        workspace_id=workspace_id,
+        context=req.context,
+        result=result,
+    )
+    session.add(run)
+    await session.commit()
+    return ClassifyResponse(
+        classification_run_id=run.id,
+        expires_at=run.expires_at,
+        **result.model_dump(exclude={"provenance"}),
+    )
 
 
 @router.get(

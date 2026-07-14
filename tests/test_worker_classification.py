@@ -98,6 +98,7 @@ async def _clean_db():
         await conn.execute(text("DELETE FROM jobs"))
         await conn.execute(text("DELETE FROM item_events"))
         await conn.execute(text("DELETE FROM memory_embeddings"))
+        await conn.execute(text("DELETE FROM classification_runs"))
         await conn.execute(text("DELETE FROM memory_items"))
 
 
@@ -306,16 +307,14 @@ async def test_refinement_rerun_is_idempotent(client, monkeypatch):
     state_after_first = await _fetch_item(item_id)
     events_after_first = await _event_count(item_id)
 
-    # Run again with the SAME suggestion: state must not change (no oscillation).
+    # Run again with the SAME suggestion: bound evidence makes the job a no-op.
     await _run_refine_job(item_id)
     state_after_second = await _fetch_item(item_id)
 
     assert state_after_second == state_after_first
-    # The second run records a provenance "no_change" event but does not mutate
-    # the item further, so confidence/visibility/kind are stable.
     assert state_after_second["memory_confidence"] == state_after_first["memory_confidence"]
     events_after_second = await _event_count(item_id)
-    assert events_after_second >= events_after_first
+    assert events_after_second == events_after_first
 
 
 async def test_refinement_skips_below_threshold(client, monkeypatch):

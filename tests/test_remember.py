@@ -91,6 +91,7 @@ async def _clean_db():
         return
     async with _test_engine.begin() as conn:
         await conn.execute(text("DELETE FROM memory_embeddings"))
+        await conn.execute(text("DELETE FROM classification_runs"))
         await conn.execute(text("DELETE FROM memory_items"))
 
 
@@ -648,8 +649,7 @@ def _patch_classifier(monkeypatch, **result_kwargs):
     monkeypatch.setattr(memory_routes, "classify_rules_only", fake_classifier)
 
 
-async def test_blend_weak_source_low_classifier_lowers_stored_confidence(client, monkeypatch):
-    """sync_turn + low classifier confidence → stored memory_confidence is blended down."""
+async def test_low_taxonomy_confidence_does_not_lower_memory_confidence(client, monkeypatch):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     _patch_classifier(monkeypatch, confidence=0.2)
@@ -658,12 +658,10 @@ async def test_blend_weak_source_low_classifier_lowers_stored_confidence(client,
         json={"content": "Turn summary from sync", "source_type": "sync_turn"},
     )
     assert response.status_code == 201
-    # 0.5*0.4 + 0.5*0.2 = 0.30, authority cap = 0.4
-    assert response.json()["memory_confidence"] == pytest.approx(0.30)
+    assert response.json()["memory_confidence"] == pytest.approx(0.40)
 
 
-async def test_blend_weak_source_high_classifier_capped_by_authority(client, monkeypatch):
-    """sync_turn + high classifier confidence cannot self-promote past source authority."""
+async def test_high_taxonomy_confidence_does_not_raise_memory_confidence(client, monkeypatch):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     _patch_classifier(monkeypatch, confidence=0.9)
@@ -672,12 +670,10 @@ async def test_blend_weak_source_high_classifier_capped_by_authority(client, mon
         json={"content": "Turn summary from sync", "source_type": "sync_turn"},
     )
     assert response.status_code == 201
-    # blended = 0.65 but cap = max(0.4, 0.4) = 0.4
     assert response.json()["memory_confidence"] == pytest.approx(0.40)
 
 
-async def test_blend_manual_source_modest_drop_on_uncertain_classification(client, monkeypatch):
-    """manual_user + low classifier confidence → modest drop, not aggressive."""
+async def test_manual_taxonomy_confidence_does_not_change_source_default(client, monkeypatch):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     _patch_classifier(monkeypatch, confidence=0.2)
@@ -686,8 +682,7 @@ async def test_blend_manual_source_modest_drop_on_uncertain_classification(clien
         json={"content": "A manually recorded fact", "source_type": "manual"},
     )
     assert response.status_code == 201
-    # 0.85*0.9 + 0.15*0.2 = 0.795
-    assert response.json()["memory_confidence"] == pytest.approx(0.795)
+    assert response.json()["memory_confidence"] == pytest.approx(0.9)
 
 
 async def test_explicit_kind_preserves_default_confidence_and_visibility(client, monkeypatch):
@@ -772,7 +767,7 @@ async def test_visibility_preserved_when_classifier_has_no_suggestion(client, mo
 
 async def test_classification_event_records_trust_and_visibility_audit(client, monkeypatch):
     """The classification event JSON records requested/suggested/final visibility
-    and default/final memory_confidence plus the applied policy flags."""
+    and identical source-default/final memory confidence."""
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     _patch_classifier(monkeypatch, confidence=0.2, suggested_visibility="private")
@@ -793,8 +788,9 @@ async def test_classification_event_records_trust_and_visibility_audit(client, m
     assert payload["final_visibility"] == "private"
     assert payload["visibility_narrowed"] is True
     assert payload["default_memory_confidence"] == pytest.approx(0.4)
-    assert payload["final_memory_confidence"] == pytest.approx(0.30)
-    assert payload["memory_confidence_blended"] is True
+    assert payload["final_memory_confidence"] == pytest.approx(0.4)
+    assert payload["source_confidence_prior"] == pytest.approx(0.4)
+    assert "memory_confidence_blended" not in payload
     # The classifier dump carries its own confidence/visibility for traceability.
     assert payload["classification"]["confidence"] == pytest.approx(0.2)
     assert payload["classification"]["suggested_visibility"] == "private"

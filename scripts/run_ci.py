@@ -17,6 +17,7 @@ DB_TABLES: Final[tuple[str, ...]] = (
     "memory_embeddings",
     "kg_triples",
     "tenant_config",
+    "classification_runs",
 )
 
 # Tables that must have FORCE ROW LEVEL SECURITY (ENG-AUD-002).
@@ -28,6 +29,7 @@ RLS_FORCED_TABLES: Final[tuple[str, ...]] = (
     "api_keys",
     "workspace_members",
     "jobs",
+    "classification_runs",
 )
 
 

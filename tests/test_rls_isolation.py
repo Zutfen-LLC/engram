@@ -48,6 +48,7 @@ RLS_TABLES: tuple[str, ...] = (
     "kg_triples",
     "tunnels",
     "classification_rules",
+    "classification_runs",
     "tenant_config",
     "deletion_events",
     "feedback_events",

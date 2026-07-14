@@ -128,7 +128,9 @@ class Settings(BaseSettings):
     vocab_cache_max_tenants: int = 256
 
     # LLM classification refinement (async, classification.refine jobs).
-    # Blend weight for memory_confidence: candidate = min(source_default,
+    # Deprecated compatibility setting. Taxonomy refinement no longer mutates
+    # memory_confidence; retained so existing deployment configuration still loads.
+    # Historical blend policy: candidate = min(source_default,
     # classifier_confidence); new_confidence blends toward candidate by this.
     classification_confidence_blend: float = 0.5
     # Minimum confidence delta before a refine job records a change (idempotency

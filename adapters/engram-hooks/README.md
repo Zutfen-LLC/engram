@@ -31,9 +31,9 @@ candidate → write-boundary guard → (reject) drop
            (allow)
               │
               ▼
-        Engram classify → confidence ≥ threshold → remember (proposed)
+        Engram classify → retain + retention confidence ≥ threshold → remember (proposed)
               │
-        confidence < threshold
+        transient / uncertain / retain below threshold
               │
               ▼
         local volatile store (14-day retention, 2000-entry cap)
@@ -57,7 +57,8 @@ Rejected categories:
 
 ### Volatile store
 
-Low-confidence candidates (below `ENGRAM_HOOKS_PROMOTE_THRESHOLD`, default `0.6`)
+Candidates without sufficient durable-retention evidence (below
+`ENGRAM_HOOKS_STORE_THRESHOLD`, default `0.65`)
 park in a local JSONL file instead of hitting Engram. Defaults: 14-day
 retention, 2000-entry cap, oldest evicted first. Recall is dumb substring
 search — embeddings are the service's job.
@@ -97,7 +98,8 @@ through to spawned processes).
 | `ENGRAM_HOOKS_VOLATILE_PATH` | no | `$HERMES_DATA_DIR/engram-volatile.jsonl` (else `~/.hermes/…`, else temp dir) | Volatile store file. |
 | `ENGRAM_HOOKS_VOLATILE_RETENTION_DAYS` | no | `14` | Volatile entry retention. |
 | `ENGRAM_HOOKS_VOLATILE_CAP` | no | `2000` | Max volatile entries. |
-| `ENGRAM_HOOKS_PROMOTE_THRESHOLD` | no | `0.6` | classify() confidence ≥ this → `remember` (proposed). |
+| `ENGRAM_HOOKS_STORE_THRESHOLD` | no | `0.65` | `retain` disposition at/above this retention confidence → remember as proposed. |
+| `ENGRAM_HOOKS_PROMOTE_THRESHOLD` | no | `0.65` | Deprecated fallback name, used only when the canonical variable is absent. |
 | `ENGRAM_HOOKS_WORKSPACE` | no | — | Default workspace for writes. |
 | `ENGRAM_HOOKS_COMPAT_SHIM` | no | `true` | Apply the `prepare_memory_write` compat shim on install. Set `false` to disable automatic capture entirely (lifecycle hooks/MCP still work). |
 | `ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE` | no | `false` | If `true`, `install()` raises `AutomaticCaptureUnavailable` instead of degrading quietly when neither the native hook nor the compat shim ends up active. |

@@ -371,8 +371,11 @@ This allows agents to rediscover their own observations without treating them as
 | Field                   | What it means                              | Example                                   |
 | ----------------------- | ------------------------------------------ | ----------------------------------------- |
 | `source_trust`          | Trust in where this came from              | User said it = 0.9; agent guessed = 0.4   |
+| `source_confidence_prior` | Immutable source-policy prior at write time | Automated capture = configured default |
 | `authority`             | Fixed governance ordinal from provenance   | Explicit user = 50; inferred = 10         |
 | `memory_confidence`     | Overall confidence this memory is accurate | Verified fact = 0.95; LLM inference = 0.6 |
+| `taxonomy_confidence`   | Confidence in kind/wing/room classification | Decision vs. fact = 0.8                  |
+| `retention_confidence`  | Positive evidence for atomic, faithful, durable storage | Durable decision = 0.9          |
 | `extraction_confidence` | Confidence of the extraction process       | Direct quote = 0.9; LLM summary = 0.5     |
 | `human_verified`        | A human has confirmed this is true         | Boolean                                   |
 
@@ -384,6 +387,15 @@ Trust is not binary. It is layered so that Engram can distinguish between:
 * how confident the system is
 * whether a human verified it
 * whether it has been challenged or superseded
+
+`POST /v1/classify` persists a tenant- and principal-scoped `classification_runs` receipt containing
+canonical content identity, source/workspace binding, taxonomy output, retention disposition, version
+constants, and provider provenance. Raw context is never stored; only its SHA-256 and character length
+are retained. Unbound receipts expire after one hour. Binding is transactional with the memory item and
+classification event, and v1 permits one attested retention assessment per item. Taxonomy confidence
+never changes `memory_confidence`; retention confidence is not a recall signal or governance authority.
+This receipt substrate does not implement Promotion Path A v2 scoring or promotion gates; those remain
+PR 2 work.
 
 ### Source trust and stable authority
 
@@ -415,14 +427,15 @@ The complete fixed authority mapping is:
 | `extraction`, `sync_turn`, `pre_compress`, `session_end` | any supported type | `inferred` (10) |
 
 Lifecycle defaults (`sync_turn`, `pre_compress`, and `session_end`) are independently configurable
-and have confidence below the default 0.7 auto-promotion threshold. They stay `proposed` until LLM
-classification or human review raises their confidence, or until a quorum of 2+ distinct non-author
-principals marks the item useful via `/v1/feedback`. Lifecycle captures always retain inferred
-authority; raising their configured source trust never grants supersession authority.
+and have confidence below the legacy 0.7 auto-promotion threshold. Taxonomy classification no longer
+raises or lowers that overall confidence. Lifecycle captures always retain inferred authority;
+raising their configured source trust never grants supersession authority.
 
 This is intentional: chatty low-confidence sources should not auto-promote without some signal that the memory is actually useful.
 
-**Phase 1A phasing note:** In practice, the frozen-queue concern is resolved by sequencing. Phase 1A's only writers are imports and manual user actions, both of which default to `active`. Agent write paths such as `sync_turn` and `pre_compress` arrive with Engram hooks in Phase 2, by which point Phase 1B's LLM classification refines confidence above the gate. The auto-promotion machinery is ready for when agent writers come online.
+**Promotion-path status:** the legacy Path A machinery remains in place. The trusted retention-evidence
+substrate is implemented here, while evidence scoring, kind gates, tenant evidence thresholds, and
+delayed promotion jobs are explicitly deferred to Promotion Path A v2 PR 2.
 
 All defaults are tenant-configurable through the `tenant_config` table.
 

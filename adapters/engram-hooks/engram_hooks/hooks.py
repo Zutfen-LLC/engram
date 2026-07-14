@@ -154,6 +154,11 @@ class HookResult:
     errors: int = 0
     details: list[dict[str, Any]] = field(default_factory=list)
 
+    @property
+    def remembered(self) -> int:
+        """Memories written as proposed (``promoted`` compatibility alias)."""
+        return self.promoted
+
 
 # ---------------------------------------------------------------------------
 # Lifecycle hook engine
@@ -195,7 +200,7 @@ class LifecycleHooks:
             )
             return None
         try:
-            import engram_client  # type: ignore[import-not-found]
+            import engram_client
         except ImportError:
             self._client_failed = True
             logger.warning(
@@ -295,7 +300,10 @@ class LifecycleHooks:
         kind: str | None = verdict.get("kind")
         wing: str | None = verdict.get("wing")
         room: str | None = verdict.get("room")
-        confidence: float = 0.0
+        taxonomy_confidence = 0.0
+        retention_confidence = 0.0
+        retention_disposition = "uncertain"
+        classification_run_id: Any = None
 
         if client is not None:
             try:
@@ -303,23 +311,41 @@ class LifecycleHooks:
                 # classifier sees this candidate in conversation context.
                 ctx = self._session_context.context_string() or None
                 resp = await client.classify(
-                    content, context=ctx, workspace=self.config.default_workspace
+                    content,
+                    context=ctx,
+                    workspace=self.config.default_workspace,
+                    source_type=source_type,
                 )
-                confidence = resp.confidence
-                # Enrich with the classifier's suggestions if the guard didn't
-                # already supply taxonomy. Guard taxonomy wins (it's explicit).
-                kind = kind or resp.suggested_kind
-                wing = wing or resp.suggested_wing
-                room = room or resp.suggested_room
+                taxonomy_confidence = resp.taxonomy_confidence
+                retention_confidence = resp.retention_confidence
+                retention_disposition = resp.retention_disposition
+                classification_run_id = resp.classification_run_id
+                # A receipt makes the server taxonomy authoritative.
+                kind = resp.suggested_kind
+                wing = resp.suggested_wing
+                room = resp.suggested_room
             except Exception as exc:  # noqa: BLE001 — classify failures park locally
                 logger.warning("classify failed for candidate, parking locally: %s", exc)
-                confidence = 0.0
-        # else: confidence stays 0.0 → always parks locally, which is correct.
+        # else: uncertain at 0.0 always parks locally, which is correct.
+
+        detail_evidence = {
+            "taxonomy_confidence": taxonomy_confidence,
+            "retention_confidence": retention_confidence,
+            "retention_disposition": retention_disposition,
+            "classification_run_id": classification_run_id,
+        }
+
+        if client is not None and retention_disposition == "noise":
+            return {"content": content, "route": "rejected", **detail_evidence}
 
         # 3. Promotion gate. At/above threshold → remember as proposed. The
         #    server applies its own 0.7 auto-promotion gate on top; we just
         #    decide whether the candidate is worth a server round-trip at all.
-        if client is not None and confidence >= self.config.promote_confidence_threshold:
+        if (
+            client is not None
+            and retention_disposition == "retain"
+            and retention_confidence >= (self.config.store_confidence_threshold or 0.65)
+        ):
             try:
                 await client.remember(
                     content,
@@ -328,12 +354,13 @@ class LifecycleHooks:
                     room=room,
                     workspace=self.config.default_workspace,
                     source_type=source_type,
+                    classification_run_id=classification_run_id,
                 )
                 return {
                     "content": content,
-                    "route": "promoted",
-                    "confidence": confidence,
+                    "route": "remembered",
                     "kind": kind,
+                    **detail_evidence,
                 }
             except Exception as exc:  # noqa: BLE001 — remember failure → volatile fallback
                 logger.warning("remember failed, parking candidate locally: %s", exc)
@@ -347,12 +374,16 @@ class LifecycleHooks:
                 kind=kind,
                 wing=wing,
                 room=room,
-                confidence=confidence or None,
+                confidence=retention_confidence or None,
                 workspace=self.config.default_workspace,
-                reason="below promotion threshold" if client is not None else "no engram client",
+                reason=(
+                    "not durable retention evidence"
+                    if client is not None
+                    else "no engram client"
+                ),
             )
         )
-        return {"content": content, "route": "parked", "confidence": confidence}
+        return {"content": content, "route": "parked", **detail_evidence}
 
     # ---- public lifecycle hook entry points ----
 
@@ -377,7 +408,7 @@ class LifecycleHooks:
             route = detail.get("route")
             if route == "rejected":
                 result.rejected += 1
-            elif route == "promoted":
+            elif route == "remembered":
                 result.promoted += 1
             elif route == "parked":
                 result.parked += 1
