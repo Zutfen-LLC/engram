@@ -34,7 +34,11 @@ The next engineering work is to close these writers, then run the consolidated t
 
 **Gate B (consolidated trust proof and upgrade verification) is closed** (2026-07-13) — full CI green against PostgreSQL 16 + pgvector with `ENGRAM_FAIL_ON_DB_SKIP=1` (1226+33+34+40 tests passed), canonical trust-proof selector delivered (`scripts/trust_proof_files.py`), fresh bootstrap and upgrade from dogfood migration level verified (1373 items preserved, zero data loss), and the dogfood deployment upgraded to the audited revision with focused smoke evidence recorded. See §5 Gate B for details.
 
-The next engineering work is Gate C (real Hermes lifecycle E2E), Gate D (embeddings and worker dogfood), Gate E (quality evals), and Gate F (agent onboarding and OSS readiness), in that order.
+Gates A, B, and E are closed. Gate C (Hermes lifecycle E2E) is in progress —
+this session is dogfooding the lifecycle chain. Gate D (embeddings) is
+substantially delivered with Qwen3-4B live on engram01. The remaining formal
+work is recording the Gate C evidence (accepted/rejected capture, attribution,
+restart persistence) and filling the Gate D embeddings checklist.
 
 ## 3. F1–F20 closure matrix
 
@@ -244,6 +248,14 @@ Record:
 `Hermes startup → native hook or compat shim → guard → classify/remember → proposed memory → review/promotion → startup recall`
 
 Prove accepted capture, rejected ephemeral capture, truthful attribution, idempotent installation, restart persistence, and subsequent startup recall.
+
+**In progress (2026-07-13).** The Hermes profile running this session has the
+Engram MCP adapter and lifecycle hooks active — memories are being captured
+from live agent sessions against the dogfood on engram01. Startup recall is
+injecting Engram context into session turns. The lifecycle chain is
+operationally functional but not yet formally verified end-to-end with recorded
+evidence for all required cases (accepted capture, rejected ephemeral, truthful
+attribution, restart persistence).
 
 ### Gate D — Embeddings and worker dogfood
 
