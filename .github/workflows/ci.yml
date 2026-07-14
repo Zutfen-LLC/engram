@@ -49,22 +49,70 @@ jobs:
             exit 1
           fi
 
-          # The worker command must be 'engram worker' (no inline poll-interval)
-          # and it must not publish any ports. Parse the resolved YAML with
-          # python3 (python is not guaranteed on the runner).
+          # Resolve compose with sentinel values for representative shared and
+          # API-only settings, then verify the configuration contract:
+          #   - shared sentinels reach BOTH engram-service and engram-worker
+          #   - API-only sentinels reach engram-service ONLY
+          #   - worker command is 'engram worker' with no published ports
+          export ENGRAM_VOCAB_CACHE_TTL_SECONDS=999
+          export ENGRAM_VOCAB_CACHE_MAX_TENANTS=888
+          export ENGRAM_PROMOTION_CONFLICT_CANDIDATE_K=777
+          export ENGRAM_API_KEY_CACHE_TTL_SECONDS=666
+          export ENGRAM_READ_DATABASE_URL='postgresql+asyncpg://sentinel-read'
+          export ENGRAM_RECALL_BYTE_BUDGET=555
+          export ENGRAM_STARTUP_PROMOTION_LIMIT=444
+
           docker compose config \
             | python3 -c "
           import sys, yaml
-          cfg = yaml.safe_load(sys.stdin)
-          worker = cfg['services']['engram-worker']
 
-          cmd = ' '.join(worker.get('command', []))
+          cfg = yaml.safe_load(sys.stdin)
+          svc = cfg['services']
+          api_env = svc['engram-service']['environment']
+          worker_env = svc['engram-worker']['environment']
+
+          # Worker command and ports.
+          cmd = ' '.join(svc['engram-worker'].get('command', []))
           print(f'Worker command: {cmd}')
           assert cmd == 'engram worker', f'expected \"engram worker\", got \"{cmd}\"'
 
-          ports = worker.get('ports', [])
+          ports = svc['engram-worker'].get('ports', [])
           print(f'Worker published ports: {len(ports)}')
           assert len(ports) == 0, f'expected no ports, got {ports}'
+
+          # Shared sentinels must appear on both services.
+          shared_sentinels = {
+              'ENGRAM_VOCAB_CACHE_TTL_SECONDS': '999',
+              'ENGRAM_VOCAB_CACHE_MAX_TENANTS': '888',
+              'ENGRAM_PROMOTION_CONFLICT_CANDIDATE_K': '777',
+          }
+          for key, expected in shared_sentinels.items():
+              assert api_env.get(key) == expected, \\
+              f'{key}={api_env.get(key)!r} missing/wrong on engram-service'
+              assert worker_env.get(key) == expected, \\
+              f'{key}={worker_env.get(key)!r} missing/wrong on engram-worker'
+          print(f'Shared sentinel checks: {len(shared_sentinels)} passed')
+
+          # API-only sentinels must appear on engram-service only.
+          api_only_sentinels = {
+              'ENGRAM_API_KEY_CACHE_TTL_SECONDS': '666',
+              'ENGRAM_READ_DATABASE_URL': 'postgresql+asyncpg://sentinel-read',
+              'ENGRAM_RECALL_BYTE_BUDGET': '555',
+              'ENGRAM_STARTUP_PROMOTION_LIMIT': '444',
+          }
+          for key, expected in api_only_sentinels.items():
+              assert api_env.get(key) == expected, \\
+              f'{key}={api_env.get(key)!r} missing/wrong on engram-service'
+              assert key not in worker_env, \\
+              f'{key} should NOT be on engram-worker (got {worker_env.get(key)!r})'
+          print(f'API-only sentinel checks: {len(api_only_sentinels)} passed')
+
+          # ENGRAM_JOB_MAX_ATTEMPTS must be present on both (enqueued by API,
+          # used by worker).
+          for name, env in [('engram-service', api_env), ('engram-worker', worker_env)]:
+              assert 'ENGRAM_JOB_MAX_ATTEMPTS' in env, \\
+              f'ENGRAM_JOB_MAX_ATTEMPTS missing from {name}'
+          print('ENGRAM_JOB_MAX_ATTEMPTS present on both services')
           "
 
-          echo "All worker assertions passed."
+          echo "All compose content assertions passed."

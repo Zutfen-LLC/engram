@@ -314,15 +314,41 @@ async def test_cli_worker_once_processes_one_job():
 # --- worker logging -------------------------------------------------------
 
 
-def test_configure_worker_logging_sets_level():
+@pytest.fixture
+def engram_logger_snapshot():
+    """Snapshot and restore the global 'engram' logger state.
+
+    The worker-logging tests mutate the logger's handlers, level, and
+    propagation. This fixture captures the original state, yields, then
+    restores everything and closes any handlers created by the test.
+    """
+    import logging
+
+    logger = logging.getLogger("engram")
+    original_level = logger.level
+    original_propagate = logger.propagate
+    original_handlers = list(logger.handlers)
+
+    yield logger
+
+    # Close handlers created during the test, then restore originals.
+    for h in logger.handlers:
+        if h not in original_handlers:
+            h.close()
+    logger.handlers.clear()
+    for h in original_handlers:
+        logger.addHandler(h)
+    logger.setLevel(original_level)
+    logger.propagate = original_propagate
+
+
+def test_configure_worker_logging_sets_level(engram_logger_snapshot):
     """_configure_worker_logging sets the engram logger to INFO by default."""
     import logging
 
     from engram.cli import _configure_worker_logging
 
-    logger = logging.getLogger("engram")
-    # Reset to known state.
-    logger.handlers.clear()
+    logger = engram_logger_snapshot
     logger.setLevel(logging.WARNING)
     logger.propagate = True
 
@@ -334,32 +360,26 @@ def test_configure_worker_logging_sets_level():
     assert logger.propagate is False
 
 
-def test_configure_worker_logging_respects_log_level(monkeypatch):
+def test_configure_worker_logging_respects_log_level(engram_logger_snapshot, monkeypatch):
     """_configure_worker_logging respects ENGRAM_LOG_LEVEL."""
     import logging
 
     from engram.cli import _configure_worker_logging
     from engram.config import Settings
 
-    # Create a Settings with debug level and monkeypatch the module-level settings.
     monkeypatch.setattr("engram.config.settings", Settings(log_level="debug"))
 
-    logger = logging.getLogger("engram")
-    logger.handlers.clear()
-
+    logger = engram_logger_snapshot
     _configure_worker_logging()
 
     assert logger.level == logging.DEBUG
 
 
-def test_configure_worker_logging_idempotent():
+def test_configure_worker_logging_idempotent(engram_logger_snapshot):
     """Calling _configure_worker_logging twice does not duplicate handlers."""
-    import logging
-
     from engram.cli import _configure_worker_logging
 
-    logger = logging.getLogger("engram")
-    logger.handlers.clear()
+    logger = engram_logger_snapshot
 
     _configure_worker_logging()
     _configure_worker_logging()
@@ -367,7 +387,9 @@ def test_configure_worker_logging_idempotent():
     assert len(logger.handlers) == 1
 
 
-def test_configure_worker_logging_falls_back_on_invalid_level(monkeypatch):
+def test_configure_worker_logging_falls_back_on_invalid_level(
+    engram_logger_snapshot, monkeypatch
+):
     """An invalid log level falls back to INFO."""
     import logging
 
@@ -376,9 +398,7 @@ def test_configure_worker_logging_falls_back_on_invalid_level(monkeypatch):
 
     monkeypatch.setattr("engram.config.settings", Settings(log_level="not-a-level"))
 
-    logger = logging.getLogger("engram")
-    logger.handlers.clear()
-
+    logger = engram_logger_snapshot
     _configure_worker_logging()
 
     assert logger.level == logging.INFO

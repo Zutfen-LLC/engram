@@ -81,7 +81,7 @@ async def enqueue_job(
     priority: int = 100,
     run_after: datetime | None = None,
     dedupe_key: str | None = None,
-    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    max_attempts: int | None = None,
 ) -> UUID:
     """Insert a job row and commit.
 
@@ -91,10 +91,19 @@ async def enqueue_job(
     enqueue returns the id of the existing pending/running job (idempotent)
     instead of raising.
 
+    ``max_attempts`` defaults to ``settings.job_max_attempts`` (which itself
+    defaults to ``DEFAULT_MAX_ATTEMPTS`` = 5). An explicit per-job value
+    overrides the deployment-level setting.
+
     Runs under the caller's session/transaction context. On the request path
     that is the app-role session for the request's tenant, which the jobs
     WITH CHECK policy permits.
     """
+    from engram.config import settings
+
+    effective_max_attempts = (
+        settings.job_max_attempts if max_attempts is None else max_attempts
+    )
     final_payload: dict[str, object] = dict(payload)
     if dedupe_key is not None:
         final_payload["dedupe_key"] = dedupe_key
@@ -105,7 +114,7 @@ async def enqueue_job(
         status=STATUS_PENDING,
         priority=priority,
         run_after=run_after or _utcnow(),
-        max_attempts=max_attempts,
+        max_attempts=effective_max_attempts,
         payload=final_payload,
     )
     session.add(job)
