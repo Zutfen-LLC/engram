@@ -142,14 +142,32 @@ class EngramMemoryProvider(MemoryProvider):
             }
 
         # Content passed the guard — route to Engram instead of native store.
+        # Always fire-and-forget: the tool return value is already set below.
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
                 asyncio.ensure_future(self._async_remember(content, metadata))
             else:
-                loop.run_until_complete(self._async_remember(content, metadata))
+                # No running loop — run in a daemon thread, don't block.
+                import threading
+
+                def _bg_remember() -> None:
+                    try:
+                        asyncio.run(self._async_remember(content, metadata))
+                    except Exception as e:
+                        logger.debug("engram remember failed (background): %s", e)
+
+                threading.Thread(target=_bg_remember, daemon=True).start()
         except RuntimeError:
-            asyncio.run(self._async_remember(content, metadata))
+            import threading
+
+            def _bg_remember_re() -> None:
+                try:
+                    asyncio.run(self._async_remember(content, metadata))
+                except Exception as e:
+                    logger.debug("engram remember failed (background): %s", e)
+
+            threading.Thread(target=_bg_remember_re, daemon=True).start()
 
         return {
             "handled": True,
@@ -182,28 +200,100 @@ class EngramMemoryProvider(MemoryProvider):
     # ---- Lifecycle hooks ----
 
     def on_pre_compress(self, messages: list[dict[str, Any]]) -> str:
-        """Extract durable facts before context compression."""
+        """Extract durable facts before context compression.
+
+        Same non-blocking pattern as ``on_session_end``: fire-and-forget
+        on a running loop, bounded-time on a stopped loop, daemon-thread
+        fallback with no loop. Never block compression — or worse, the
+        conversation loop — on HTTP round-trips to Engram.
+        """
         import asyncio
+        import threading
 
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
                 asyncio.ensure_future(self._hooks.pre_compress(messages))
             else:
-                loop.run_until_complete(self._hooks.pre_compress(messages))
+                loop.run_until_complete(
+                    asyncio.wait_for(
+                        self._hooks.pre_compress(messages),
+                        timeout=5.0,
+                    )
+                )
         except RuntimeError:
-            asyncio.run(self._hooks.pre_compress(messages))
+            def _bg_pre_compress() -> None:
+                try:
+                    asyncio.run(
+                        asyncio.wait_for(
+                            self._hooks.pre_compress(messages),
+                            timeout=10.0,
+                        )
+                    )
+                except TimeoutError:
+                    logger.debug("engram-hooks pre_compress timed out (background)")
+                except Exception as e:
+                    logger.debug("engram-hooks pre_compress failed (background): %s", e)
+
+            t = threading.Thread(target=_bg_pre_compress, daemon=True)
+            t.start()
+        except TimeoutError:
+            logger.debug("engram-hooks pre_compress timed out")
         except Exception as e:
             logger.error("engram-hooks pre_compress failed: %s", e)
 
         return ""  # no injection into compression summary
 
     def on_session_end(self, messages: list[dict[str, Any]]) -> None:
-        """Extract durable facts at session end."""
+        """Extract durable facts at session end — fire-and-forget, never block.
+
+        Session end is called during /new, /quit, and CLI shutdown. Blocking
+        here freezes the CLI for the duration of the extraction, which can
+        take minutes for long sessions (each candidate requires an HTTP
+        round-trip to Engram for classify + remember). Instead we schedule
+        the extraction as a background task and return immediately.
+
+        If there's no running event loop (e.g. shutdown path), we run in a
+        daemon thread with a hard timeout so we never block exit.
+        """
         import asyncio
+        import threading
 
         try:
-            asyncio.run(self._hooks.session_end(messages))
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Fire-and-forget on the existing loop.
+                asyncio.ensure_future(self._hooks.session_end(messages))
+            else:
+                # Loop exists but not running — run with a timeout so we
+                # don't block indefinitely on hundreds of HTTP calls.
+                loop.run_until_complete(
+                    asyncio.wait_for(
+                        self._hooks.session_end(messages),
+                        timeout=5.0,
+                    )
+                )
+        except RuntimeError:
+            # No event loop in this thread — run in a daemon thread so it
+            # doesn't block exit. The process may terminate before it
+            # completes, which is acceptable for session-end extraction.
+            def _bg_session_end() -> None:
+                try:
+                    asyncio.run(
+                        asyncio.wait_for(
+                            self._hooks.session_end(messages),
+                            timeout=10.0,
+                        )
+                    )
+                except TimeoutError:
+                    logger.debug("engram-hooks session_end timed out (background)")
+                except Exception as e:
+                    logger.debug("engram-hooks session_end failed (background): %s", e)
+
+            t = threading.Thread(target=_bg_session_end, daemon=True)
+            t.start()
+        except TimeoutError:
+            logger.debug("engram-hooks session_end timed out")
         except Exception as e:
             logger.error("engram-hooks session_end failed: %s", e)
 
