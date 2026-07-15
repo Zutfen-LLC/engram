@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sqlite3
 import sys
 from collections import Counter
@@ -397,7 +398,16 @@ def main() -> int:
         default=30.0,
         help="HTTP request timeout in seconds (default: 30).",
     )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="Engram API key (Bearer token). Required for auth-enabled deployments.",
+    )
     args = parser.parse_args()
+
+    # Resolve API key from env if not given on CLI
+    if args.api_key is None:
+        args.api_key = os.environ.get("ENGRAM_API_KEY")
 
     palace_path = str(Path(args.palace).expanduser())
     if not Path(palace_path).exists():
@@ -427,7 +437,12 @@ def main() -> int:
     report.total = len(unique_records)
     report.duplicates = duplicates
 
-    with httpx.Client() as client:
+    # Build client with optional auth headers
+    headers: dict[str, str] = {}
+    if args.api_key:
+        headers["Authorization"] = f"Bearer {args.api_key}"
+
+    with httpx.Client(headers=headers) as client:
         for rec in unique_records:
             report.by_wing[rec.wing] += 1
             report.by_kind[rec.kind] += 1
