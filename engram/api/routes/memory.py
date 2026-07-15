@@ -50,7 +50,9 @@ from engram.safety import has_secrets
 from engram.source_types import SourceType
 from engram.trust_policy import resolve_trust_defaults
 from engram.usage import (
+    EmbeddingOutcome,
     Timer,
+    embedding_call_occurred_for,
     record_candidate_once,
     record_candidate_outcome,
     record_retrieval_request,
@@ -1108,7 +1110,7 @@ async def recall(
     # On success, the resolved embedding_outcome comes from the recall engine
     # (it owns the embedding call and knows whether it happened). The Boolean
     # embedding_call_occurred is derived from that actual outcome, not the mode.
-    resolved_embedding_outcome = result.get(
+    resolved_embedding_outcome: EmbeddingOutcome = result.get(
         "embedding_outcome", "not_required" if mode != "semantic" else "unknown"
     )
     await record_retrieval_request(
@@ -1123,8 +1125,7 @@ async def recall(
         latency_ms=timer.elapsed_ms(),
         scoring_version=result.get("scoring_version"),
         config_version=result.get("config_version"),
-        embedding_call_occurred=resolved_embedding_outcome
-        in ("succeeded", "failed", "disabled"),
+        embedding_call_occurred=embedding_call_occurred_for(resolved_embedding_outcome),
         embedding_outcome=resolved_embedding_outcome,
     )
 
@@ -1162,14 +1163,14 @@ async def search(
     # Tracks the actual embedding stage as _search_impl progresses, so the
     # except handler records the truth rather than guessing from the mode.
     # Values: not_attempted | disabled | succeeded | failed.
-    embedding_stage: dict[str, str] = {"value": "not_attempted"}
+    embedding_stage: dict[str, EmbeddingOutcome] = {"value": "not_attempted"}
 
     async def _record_search(
         operation: str,
         results: list[dict[str, Any]],
         *,
         status: str = "succeeded",
-        embedding_outcome: str | None = None,
+        embedding_outcome: EmbeddingOutcome | None = None,
     ) -> None:
         # Default embedding_outcome to the tracked stage when not overridden.
         outcome = embedding_outcome if embedding_outcome is not None else embedding_stage["value"]
@@ -1183,7 +1184,7 @@ async def search(
             item_count=len(results),
             byte_count=byte_count,
             latency_ms=timer.elapsed_ms(),
-            embedding_call_occurred=outcome in ("succeeded", "failed", "disabled"),
+            embedding_call_occurred=embedding_call_occurred_for(outcome),
             embedding_outcome=outcome,
         )
 
@@ -1212,7 +1213,7 @@ async def _search_impl(
     principal_id: UUID,
     timer: Any,
     _record_search: Any,
-    embedding_stage: dict[str, str],
+    embedding_stage: dict[str, EmbeddingOutcome],
 ) -> SearchResponse:
     """Keyword/semantic/hybrid search body, split out so the route can wrap it
     in failure-recording telemetry (ENG-METER-001).
@@ -1230,6 +1231,7 @@ async def _search_impl(
 
     if mode == "keyword":
         # Keyword search never calls an embedding provider.
+        embedding_stage["value"] = "not_required"
         results = await _keyword_search(
             session,
             req.query,

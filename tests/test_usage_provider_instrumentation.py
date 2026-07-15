@@ -99,6 +99,7 @@ class _FakeUsage:
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     total_tokens: int | None = None
+    cost: float | None = None
 
 
 class _FakeMessage:
@@ -228,6 +229,9 @@ async def test_classification_failure_records_failed_with_fallback_metadata(monk
 
         metadata = json.loads(metadata)
     assert metadata["application_fallback"] is True
+    assert metadata["failure_stage"] == "provider_error"
+    assert metadata["error_type"] == "RuntimeError"
+    assert "provider down" not in str(metadata)
 
 
 async def test_classification_disabled_records_disabled_status(monkeypatch):
@@ -301,6 +305,9 @@ async def test_conflict_classification_failure_records_failed(monkeypatch):
 
         metadata = json.loads(metadata)
     assert metadata["application_fallback"] is True
+    assert metadata["failure_stage"] == "provider_error"
+    assert metadata["error_type"] == "RuntimeError"
+    assert "provider down" not in str(metadata)
 
 
 async def test_classification_malformed_json_records_response_parse(monkeypatch):
@@ -317,7 +324,7 @@ async def test_classification_malformed_json_records_response_parse(monkeypatch)
     # but the content is not valid JSON.
     response = _FakeChatResponse(
         content="<<not json at all",
-        usage=_FakeUsage(prompt_tokens=40, completion_tokens=8, total_tokens=48),
+        usage=_FakeUsage(prompt_tokens=40, completion_tokens=8, total_tokens=48, cost=0.006),
     )
     monkeypatch.setattr(
         classification_mod, "AsyncOpenAI", lambda **kw: FakeAsyncOpenAI(chat_response=response)
@@ -331,12 +338,14 @@ async def test_classification_malformed_json_records_response_parse(monkeypatch)
     assert calls[0]["status"] == "failed"
     # Usage from the delivered-but-unusable response is preserved.
     assert calls[0]["total_tokens"] == 48
+    assert float(calls[0]["reported_cost_usd"]) == pytest.approx(0.006)
     metadata = calls[0]["metadata"]
     if isinstance(metadata, str):
         import json
 
         metadata = json.loads(metadata)
     assert metadata["failure_stage"] == "response_parse"
+    assert metadata["error_type"] == "JSONDecodeError"
     assert metadata["application_fallback"] is True
 
 
@@ -348,7 +357,7 @@ async def test_conflict_classification_malformed_json_records_response_parse(mon
     monkeypatch.setattr(settings, "classification_provider", "openai")
     response = _FakeChatResponse(
         content="{broken json",
-        usage=_FakeUsage(prompt_tokens=20, total_tokens=20),
+        usage=_FakeUsage(prompt_tokens=20, total_tokens=20, cost=0.003),
     )
     monkeypatch.setattr(
         conflicts_mod, "AsyncOpenAI", lambda **kw: FakeAsyncOpenAI(chat_response=response)
@@ -363,12 +372,74 @@ async def test_conflict_classification_malformed_json_records_response_parse(mon
     assert len(calls) == 1
     assert calls[0]["status"] == "failed"
     assert calls[0]["total_tokens"] == 20
+    assert float(calls[0]["reported_cost_usd"]) == pytest.approx(0.003)
     metadata = calls[0]["metadata"]
     if isinstance(metadata, str):
         import json
 
         metadata = json.loads(metadata)
     assert metadata["failure_stage"] == "response_parse"
+    assert metadata["error_type"] == "JSONDecodeError"
+
+
+async def test_embedding_transport_failure_has_safe_metadata(monkeypatch):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    tenant_id = await _default_tenant_id()
+    monkeypatch.setattr(settings, "embedding_provider", "openai")
+    monkeypatch.setattr(
+        "openai.AsyncOpenAI",
+        lambda **kw: FakeAsyncOpenAI(embeddings_exc=RuntimeError("secret query provider body")),
+    )
+
+    with pytest.raises(RuntimeError):
+        await embeddings_mod.generate_embedding("private query", tenant_id=tenant_id)
+
+    calls = await _provider_calls("embedding_document")
+    assert len(calls) == 1
+    metadata = calls[0]["metadata"]
+    assert metadata["failure_stage"] == "provider_error"
+    assert metadata["error_type"] == "RuntimeError"
+    assert "secret" not in str(metadata)
+    assert "private query" not in str(metadata)
+
+
+@pytest.mark.parametrize(
+    ("vectors", "expected_error"),
+    [
+        ([[0.1, 0.2, 0.3]], "vector count"),
+        ([[0.1, 0.2], [0.3, 0.4]], "vector dimension"),
+    ],
+)
+async def test_embedding_response_validation_records_one_failed_call_with_usage(
+    monkeypatch, vectors, expected_error
+):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    tenant_id = await _default_tenant_id()
+    monkeypatch.setattr(settings, "embedding_provider", "openai")
+    monkeypatch.setattr(settings, "embedding_dim", 3)
+    response = _FakeEmbeddingsResponse(
+        vectors=vectors,
+        usage=_FakeUsage(prompt_tokens=7, total_tokens=7, cost=0.004),
+    )
+    monkeypatch.setattr(
+        "openai.AsyncOpenAI", lambda **kw: FakeAsyncOpenAI(embeddings_response=response)
+    )
+
+    with pytest.raises(ValueError, match=expected_error):
+        await embeddings_mod.generate_embeddings(["first", "second"], tenant_id=tenant_id)
+
+    calls = await _provider_calls("embedding_document")
+    assert len(calls) == 1
+    assert calls[0]["status"] == "failed"
+    assert calls[0]["total_tokens"] == 7
+    assert float(calls[0]["reported_cost_usd"]) == pytest.approx(0.004)
+    metadata = calls[0]["metadata"]
+    assert metadata == {
+        "failure_stage": "response_validation",
+        "error_type": "ValueError",
+    }
 
 
 # ---- embeddings ----

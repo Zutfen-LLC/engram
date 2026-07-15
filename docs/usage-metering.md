@@ -1,4 +1,4 @@
-# Usage metering (ENG-METER-001)
+# Usage metering (ENG-METER-001 / ENG-METER-002)
 
 > **Status:** this is an OBSERVABILITY slice, not a billing slice. It exists so
 > real dogfood data can inform hosted pricing allowances later. Nothing here
@@ -33,8 +33,8 @@ All events share one table, `usage_events`, distinguished by `event_type` +
 |---|---|---|---|
 | `candidate.observed` | `process_memory_candidate` | `accepted_for_processing` | One candidate memory entered the pipeline (via `/v1/classify` and/or `/v1/remember`). Recorded exactly once per `correlation_id`. |
 | `candidate.outcome` | `process_memory_candidate` | `created` / `deduped` / `superseded` / `failed` | The terminal outcome of ONE `/v1/remember` attempt for a candidate. **Append-only per attempt** — every invocation appends its own row; the report derives a single logical outcome per `correlation_id` (earliest non-`failed` attempt, else `failed`). |
-| `provider.call` | `classification`, `conflict_classification`, `embedding_document`, `embedding_backfill`, `embedding_query_recall`, `embedding_query_search`, `embedding_setup` | `succeeded` / `failed` / `disabled` | One application-level call to an OpenAI-compatible provider. A batched embedding call is one row with `input_count=N`, never N rows. `status` records the **provider outcome only**: `succeeded` (a usable result, including responses that carry no token usage), `failed` (the provider errored or returned an unusable response — the application may still fall back to rules, recorded as `metadata.application_fallback=true`), or `disabled` (the provider is `none`; no external call occurred). |
-| `retrieval.request` | `startup_recall`, `semantic_recall`, `keyword_search`, `semantic_search`, `hybrid_search` | `succeeded` / `failed` | One recall/search request (success or failure), with result counts and whether an external embedding provider call occurred (`metadata.embedding_outcome`: `not_required` / `succeeded` / `failed` / `disabled`). |
+| `provider.call` | `classification`, `conflict_classification`, `embedding_document`, `embedding_backfill`, `embedding_query_recall`, `embedding_query_search`, `embedding_setup` | `succeeded` / `failed` / `disabled` | One instrumented provider operation. A batched embedding operation is one row with `input_count=N`, never N rows. `succeeded` and `failed` represent actual external calls; `disabled` means configuration prevented an external request. |
+| `retrieval.request` | `startup_recall`, `semantic_recall`, `keyword_search`, `semantic_search`, `hybrid_search` | `succeeded` / `failed` | One recall/search request (success or failure), with result counts and the canonical embedding outcome described below. |
 | `client.lifecycle_summary` | `sync_turn`, `pre_compress`, `session_end` | `succeeded` / `partial` | A client-reported aggregate for one hooks-adapter lifecycle invocation. **Diagnostic and non-authoritative** — see below. |
 
 ## Column meanings
@@ -66,6 +66,23 @@ See `migrations/017_usage_events.sql` for the full DDL. Notable columns:
   classification confidence, conflict verdict, embedding vector count/
   dimensions, sanitized exception class for failures). Never raw content.
 
+## Retrieval embedding outcomes
+
+`metadata.embedding_outcome` has one canonical vocabulary. The legacy
+nullable `metadata.embedding_call_occurred` is derived exactly as follows:
+
+| `embedding_outcome` | `embedding_call_occurred` | meaning |
+|---|---:|---|
+| `not_required` | `false` | The retrieval mode does not use embeddings (keyword search and startup recall). |
+| `not_attempted` | `false` | Embeddings were relevant, but execution failed before the provider call. |
+| `disabled` | `false` | The embedding abstraction was reached, but configuration prevented an external call. |
+| `succeeded` | `true` | An external embedding call returned a usable vector. Later database/search failure does not change this outcome. |
+| `failed` | `true` | An external embedding call failed or returned an unusable response. |
+| `unknown` | `null` | The recording layer cannot truthfully determine which embedding stage was reached. |
+
+The requested retrieval mode is never used as a proxy for whether an external
+embedding call occurred.
+
 ## Correlation and deduplication semantics
 
 One `correlation_id` is generated per extracted candidate — by the client
@@ -91,10 +108,57 @@ attempt followed by a successful retry is recorded honestly as two rows.
 candidate). The report derives a single **logical outcome** per
 `correlation_id` — the earliest non-`failed` attempt's status, or `failed`
 when no attempt succeeded — for the failure/create funnel, and reports raw
-attempt-level diagnostics (`total_attempts`, `failed_attempts`,
+attempt-level diagnostics (`remember_attempts`, `failed_attempts`,
 `attempts_per_candidate_avg`) separately. This corrects the earlier
 first-outcome-wins model, which silently suppressed a later successful retry
 once a `failed` row existed.
+
+In the report, `candidate_observations` counts unique observed candidate
+correlation IDs, `logical_candidates` counts retry-resolved outcomes, and
+`remember_attempts` counts literal `candidate.outcome` rows (one per
+`/v1/remember` invocation). Logical `created`/`deduped`/`superseded`/`failed`,
+per-principal `created_count`, and semantic queries per created memory all use
+the retry-safe logical outcome. Compatibility aliases remain:
+`total_attempts == remember_attempts` and
+`distinct_candidates == logical_candidates`.
+
+## Provider operations, calls, and failures
+
+A `provider.call` row is an instrumented **provider operation**. It is an
+**actual external provider call** only when `status != 'disabled'`. Every
+report section therefore distinguishes:
+
+- `provider_operations`: all `provider.call` rows;
+- `actual_provider_calls`: non-disabled rows;
+- `disabled_provider_operations`: disabled rows where no external request
+  occurred.
+
+For provider-economics groups, retained `calls` is a compatibility field that
+counts all operations; `actual_calls` excludes disabled rows and `disabled_n`
+counts them. Conflict economics similarly exposes
+`conflict_classifications` (all operations) and `conflict_actual_calls`;
+query embeddings expose compatibility `query_embedding_calls` (all
+operations) and `query_embedding_actual_calls`. Hourly `provider_calls` is the
+compatibility all-operation field, while `actual_provider_calls` excludes
+disabled rows. Token and cost coverage denominators exclude disabled rows.
+
+Every production `provider.call` with `status='failed'` carries only safe,
+categorical failure metadata:
+
+- `failure_stage='provider_error'` for transport, timeout, authentication,
+  HTTP/API, or SDK failure before a usable response;
+- `failure_stage='response_parse'` when a required JSON response cannot be
+  parsed or is not the required structural type;
+- `failure_stage='response_validation'` when a parsed provider response
+  violates a contract such as embedding vector count or dimensions;
+- `error_type=type(exc).__name__`, never the exception message;
+- `application_fallback=true` only for classification and conflict
+  classification failures that use the existing rule/heuristic fallback.
+
+Failed response parsing or validation may still carry token counts and
+provider-reported cost because provider inference was incurred even though the
+response was unusable. Embedding failures do not claim an application
+fallback because Engram substitutes no embedding vector.
 
 ## Privacy rules (data minimization)
 

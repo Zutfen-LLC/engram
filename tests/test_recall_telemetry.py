@@ -191,6 +191,7 @@ async def test_recall_response_does_not_write_counters_inline():
     result = await _run_startup_recall(tenant_id, principal_id)
     assert result["item_count"] == 1
     assert result["telemetry_enqueued"] is True
+    assert result["embedding_outcome"] == "not_required"
 
     counters = await _item_counters(item_id)
     assert counters["recall_count"] == 0

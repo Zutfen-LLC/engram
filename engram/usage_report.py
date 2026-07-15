@@ -1,4 +1,4 @@
-"""Dogfood usage/metering report (ENG-METER-001) — ``engram usage-report``.
+"""Dogfood usage report (ENG-METER-001 / ENG-METER-002) — ``engram usage-report``.
 
 Derives diagnostic candidate-funnel, provider-economics, retrieval, worker,
 and storage statistics from the append-only ``usage_events`` ledger plus
@@ -60,6 +60,30 @@ async def _scalar(session: AsyncSession, sql: str, params: dict[str, Any]) -> An
 
 async def _rows(session: AsyncSession, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
     return [dict(r) for r in (await session.execute(text(sql), params)).mappings().all()]
+
+
+def _logical_candidate_outcomes_cte(clause: str) -> str:
+    """Reusable retry-safe logical outcome selection for report SQL.
+
+    Each correlation ID resolves to its earliest non-failed attempt, or its
+    earliest failed attempt when it never succeeds. ``id`` is the deterministic
+    tie-breaker for events with the same timestamp.
+    """
+    return f"""
+        logical_candidate_outcomes AS (
+            SELECT * FROM (
+                SELECT ue.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY correlation_id
+                           ORDER BY CASE WHEN status != 'failed' THEN 0 ELSE 1 END,
+                                    created_at, id
+                       ) AS logical_rank
+                FROM usage_events ue
+                WHERE {clause} AND event_type = 'candidate.outcome'
+            ) ranked
+            WHERE logical_rank = 1
+        )
+    """
 
 
 async def _coverage_section(session: AsyncSession, window: ReportWindow) -> dict[str, Any]:
@@ -218,7 +242,6 @@ async def _candidate_funnel_section(session: AsyncSession, window: ReportWindow)
         )
     ).mappings().one()
 
-    outcome_clause = clause + " AND event_type = 'candidate.outcome'"
     # candidate.outcome is now append-only PER ATTEMPT (one row per
     # /v1/remember invocation, no dedupe_key — see ENG-METER-001). So the
     # outcome counts below are two views:
@@ -229,14 +252,8 @@ async def _candidate_funnel_section(session: AsyncSession, window: ReportWindow)
     #   * attempt_*: raw attempt-level counters, including every failed retry.
     logical_outcomes = await _rows(
         session,
-        "WITH ranked AS ( "
-        "SELECT correlation_id, status, created_at, "
-        "ROW_NUMBER() OVER ( "
-        "PARTITION BY correlation_id "
-        "ORDER BY CASE WHEN status != 'failed' THEN 0 ELSE 1 END, created_at "
-        ") AS rn "
-        f"FROM usage_events WHERE {outcome_clause} "
-        ") SELECT status, count(*) AS n FROM ranked WHERE rn = 1 GROUP BY status",
+        f"WITH {_logical_candidate_outcomes_cte(clause)} "
+        "SELECT status, count(*) AS n FROM logical_candidate_outcomes GROUP BY status",
         params,
     )
     logical = {r["status"]: r["n"] for r in logical_outcomes}
@@ -245,7 +262,7 @@ async def _candidate_funnel_section(session: AsyncSession, window: ReportWindow)
     attempt_rows = await _rows(
         session,
         "SELECT status, count(*) AS n FROM usage_events "
-        f"WHERE {outcome_clause} GROUP BY status",
+        f"WHERE {clause} AND event_type = 'candidate.outcome' GROUP BY status",
         params,
     )
     attempts = {r["status"]: r["n"] for r in attempt_rows}
@@ -260,7 +277,8 @@ async def _candidate_funnel_section(session: AsyncSession, window: ReportWindow)
         "lifecycle_parked": int(lifecycle_row["parked"]),
         "candidate_observations": int(candidate_observations),
         # Logical-outcome funnel (one outcome per correlation_id).
-        "remember_attempts": int(distinct_candidates),
+        "logical_candidates": int(distinct_candidates),
+        "remember_attempts": int(total_attempts),
         "created": int(logical.get("created", 0)),
         "deduped": int(logical.get("deduped", 0)),
         "superseded": int(logical.get("superseded", 0)),
@@ -299,7 +317,8 @@ async def _source_type_section(session: AsyncSession, window: ReportWindow) -> l
 async def _principal_section(session: AsyncSession, window: ReportWindow) -> list[dict[str, Any]]:
     clause, params = _tenant_clause(window, alias="ue")
     sql = f"""
-        WITH cand AS (
+        WITH {_logical_candidate_outcomes_cte(clause)},
+        cand AS (
             SELECT principal_id, count(*) AS candidate_count,
                    COALESCE(sum(ceil(input_bytes / 1024.0)), 0) AS kib_units
             FROM usage_events ue
@@ -308,8 +327,8 @@ async def _principal_section(session: AsyncSession, window: ReportWindow) -> lis
         ),
         created AS (
             SELECT principal_id, count(*) AS created_count
-            FROM usage_events ue
-            WHERE {clause} AND event_type = 'candidate.outcome' AND status = 'created'
+            FROM logical_candidate_outcomes ue
+            WHERE status = 'created'
             GROUP BY principal_id
         ),
         retrieval AS (
@@ -359,6 +378,7 @@ async def _provider_economics_section(
             provider_host,
             model,
             count(*) AS calls,
+            count(*) FILTER (WHERE status != 'disabled') AS actual_calls,
             count(*) FILTER (WHERE status = 'succeeded') AS successes,
             count(*) FILTER (WHERE status = 'failed') AS failures,
             count(*) FILTER (WHERE status = 'disabled') AS disabled_n,
@@ -369,7 +389,9 @@ async def _provider_economics_section(
             COALESCE(sum(completion_tokens), 0) AS completion_tokens,
             COALESCE(sum(total_tokens), 0) AS total_tokens,
             sum(reported_cost_usd) AS reported_cost_usd,
-            count(*) FILTER (WHERE reported_cost_usd IS NOT NULL) AS with_reported_cost,
+            count(*) FILTER (
+                WHERE status != 'disabled' AND reported_cost_usd IS NOT NULL
+            ) AS with_reported_cost,
             percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms) AS latency_p50,
             percentile_cont(0.9) WITHIN GROUP (ORDER BY latency_ms) AS latency_p90,
             percentile_cont(0.99) WITHIN GROUP (ORDER BY latency_ms) AS latency_p99
@@ -380,10 +402,11 @@ async def _provider_economics_section(
     """
     rows = await _rows(session, sql, params)
     for row in rows:
-        calls = row["calls"] or 0
+        # ``calls`` is retained as the compatibility all-operation count;
+        # ``actual_calls`` is the external-call count used for coverage.
         # reported-cost coverage excludes disabled rows (no external call, so
         # no provider cost to report).
-        actual = calls - (row["disabled_n"] or 0)
+        actual = row["actual_calls"] or 0
         row["reported_cost_coverage_pct"] = (
             round(100.0 * row["with_reported_cost"] / actual, 1) if actual else 0.0
         )
@@ -522,8 +545,8 @@ async def _retrieval_section(session: AsyncSession, window: ReportWindow) -> dic
     created_count = (
         await _scalar(
             session,
-            f"SELECT count(*) FROM usage_events WHERE {clause} "
-            "AND event_type = 'candidate.outcome' AND status = 'created'",
+            f"WITH {_logical_candidate_outcomes_cte(clause)} "
+            "SELECT count(*) FROM logical_candidate_outcomes WHERE status = 'created'",
             params,
         )
         or 0
