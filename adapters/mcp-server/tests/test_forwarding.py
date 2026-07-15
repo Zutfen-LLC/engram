@@ -60,6 +60,8 @@ async def test_remember_forwards_full_shape(mcp_server, mock_client) -> None:
     }
     assert result.structuredContent["status"] == "created"
     assert result.structuredContent["memory_confidence"] == 0.9
+    assert result.structuredContent["ingest_id"] == "33333333-3333-3333-3333-333333333333"
+    assert result.structuredContent["attempt_id"] == "44444444-4444-4444-4444-444444444444"
 
 
 async def test_remember_applies_trust_defaults(mcp_server, mock_client) -> None:

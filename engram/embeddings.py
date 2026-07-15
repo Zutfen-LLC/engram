@@ -59,6 +59,7 @@ async def generate_embeddings(
         "request", "async_enrichment", "maintenance", "diagnostic", "unknown"
     ] = "unknown",
     correlation_id: uuid.UUID | None = None,
+    ingest_id: uuid.UUID | None = None,
     job_id: uuid.UUID | None = None,
 ) -> list[list[float] | None]:
     """Generate embedding vectors for a batch of ``texts`` in one provider call.
@@ -98,6 +99,7 @@ async def generate_embeddings(
                 input_count=len(texts),
                 input_bytes=input_bytes,
                 correlation_id=correlation_id,
+                ingest_id=ingest_id,
                 job_id=job_id,
             )
         return [None] * len(texts)
@@ -130,6 +132,7 @@ async def generate_embeddings(
                 input_bytes=input_bytes,
                 latency_ms=timer.elapsed_ms(),
                 correlation_id=correlation_id,
+                ingest_id=ingest_id,
                 job_id=job_id,
                 event_id=event_id,
                 metadata={"failure_stage": "client_setup", "error_type": type(exc).__name__},
@@ -164,6 +167,7 @@ async def generate_embeddings(
                 input_bytes=input_bytes,
                 latency_ms=timer.elapsed_ms(),
                 correlation_id=correlation_id,
+                ingest_id=ingest_id,
                 job_id=job_id,
                 event_id=event_id,
                 metadata={
@@ -227,6 +231,7 @@ async def generate_embeddings(
                 reported_cost_usd=usage.reported_cost_usd,
                 latency_ms=timer.elapsed_ms(),
                 correlation_id=correlation_id,
+                ingest_id=ingest_id,
                 job_id=job_id,
                 event_id=event_id,
                 metadata={
@@ -265,6 +270,7 @@ async def generate_embeddings(
             reported_cost_usd=usage.reported_cost_usd,
             latency_ms=timer.elapsed_ms(),
             correlation_id=correlation_id,
+            ingest_id=ingest_id,
             job_id=job_id,
             event_id=event_id,
             metadata={"vector_count": len(vectors), "dimensions": dimensions},
@@ -284,6 +290,7 @@ async def generate_embedding(
         "request", "async_enrichment", "maintenance", "diagnostic", "unknown"
     ] = "unknown",
     correlation_id: uuid.UUID | None = None,
+    ingest_id: uuid.UUID | None = None,
     job_id: uuid.UUID | None = None,
 ) -> list[float] | None:
     """Generate an embedding vector for ``text`` or return ``None`` when disabled."""
@@ -297,6 +304,7 @@ async def generate_embedding(
             operation=operation,
             usage_class=usage_class,
             correlation_id=correlation_id,
+            ingest_id=ingest_id,
             job_id=job_id,
         )
     )[0]

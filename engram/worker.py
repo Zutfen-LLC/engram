@@ -215,6 +215,7 @@ async def handle_embedding_generate(session: AsyncSession, job: Job) -> None:
     # the worker-originated provider call is attributed to the original
     # candidate. Absent on older/backfill payloads — None is valid.
     raw_correlation_id = job.payload.get("correlation_id")
+    raw_ingest_id = job.payload.get("ingest_id")
     item = await _reload_item(session, item_id)
     if item is None or _is_expired_or_inactive(item):
         logger.info("embedding.generate id=%s skipped: item gone/inactive", item_id)
@@ -248,6 +249,7 @@ async def handle_embedding_generate(session: AsyncSession, job: Job) -> None:
                 operation="embedding_document",
                 usage_class="async_enrichment",
                 correlation_id=_parse_uuid(raw_correlation_id) if raw_correlation_id else None,
+                ingest_id=_parse_uuid(raw_ingest_id) if raw_ingest_id else None,
                 job_id=job.id,
             )
         else:
@@ -297,6 +299,8 @@ async def handle_embedding_generate(session: AsyncSession, job: Job) -> None:
         }
         if raw_correlation_id is not None:
             conflict_payload["correlation_id"] = str(raw_correlation_id)
+        if raw_ingest_id is not None:
+            conflict_payload["ingest_id"] = str(raw_ingest_id)
         await enqueue_job(
             session,
             tenant_id=job.tenant_id,
@@ -343,11 +347,13 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
         raise RuntimeError(f"job tenant {job.tenant_id} != item tenant {item.tenant_id}")
 
     raw_correlation_id = job.payload.get("correlation_id")
+    raw_ingest_id = job.payload.get("ingest_id")
     result = await detect_conflicts(
         item,
         session,
         profile=profile,
         correlation_id=_parse_uuid(raw_correlation_id) if raw_correlation_id else None,
+        ingest_id=_parse_uuid(raw_ingest_id) if raw_ingest_id else None,
         job_id=job.id,
         usage_class="async_enrichment",
     )
@@ -1405,6 +1411,14 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
         principal_id=item.principal_id,
         workspace_id=item.workspace_id,
         source_type=item.source_type,
+        correlation_id=(
+            _parse_uuid(job.payload["correlation_id"])
+            if job.payload.get("correlation_id")
+            else None
+        ),
+        ingest_id=(
+            _parse_uuid(job.payload["ingest_id"]) if job.payload.get("ingest_id") else None
+        ),
         job_id=job.id,
     )
     actor = await resolve_internal_system_actor(
@@ -1443,6 +1457,9 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
         workspace_id=locked_item.workspace_id,
         context=None,
         result=result,
+        ingest_id=(
+            _parse_uuid(job.payload["ingest_id"]) if job.payload.get("ingest_id") else None
+        ),
     )
     session.add(run)
     bind_run(run, locked_item)

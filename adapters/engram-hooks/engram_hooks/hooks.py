@@ -316,6 +316,7 @@ class LifecycleHooks:
         retention_confidence = 0.0
         retention_disposition = "uncertain"
         classification_run_id: Any = None
+        ingest_id: Any = None
         classified = False
 
         if client is not None:
@@ -334,6 +335,7 @@ class LifecycleHooks:
                 retention_confidence = resp.retention_confidence
                 retention_disposition = resp.retention_disposition
                 classification_run_id = resp.classification_run_id
+                ingest_id = resp.ingest_id
                 classified = True
                 # A receipt makes the server taxonomy authoritative.
                 kind = resp.suggested_kind
@@ -373,6 +375,7 @@ class LifecycleHooks:
                     source_type=source_type,
                     classification_run_id=classification_run_id,
                     correlation_id=correlation_id,
+                    ingest_id=ingest_id,
                 )
                 return {
                     "content": content,

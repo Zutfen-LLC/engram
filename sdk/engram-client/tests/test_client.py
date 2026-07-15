@@ -37,6 +37,8 @@ from engram_client import (
 
 ITEM_ID = "11111111-1111-1111-1111-111111111111"
 OTHER_ID = "22222222-2222-2222-2222-222222222222"
+INGEST_ID = "33333333-3333-3333-3333-333333333333"
+ATTEMPT_ID = "44444444-4444-4444-4444-444444444444"
 
 _REMEMBER_CREATED: dict[str, Any] = {
     "id": ITEM_ID,
@@ -44,6 +46,8 @@ _REMEMBER_CREATED: dict[str, Any] = {
     "review_status": "active",
     "memory_confidence": 0.9,
     "correlation_id": ITEM_ID,
+    "ingest_id": INGEST_ID,
+    "attempt_id": ATTEMPT_ID,
 }
 
 
@@ -97,6 +101,8 @@ async def test_remember_success() -> None:
             "review_status": "active",
             "memory_confidence": 0.9,
             "correlation_id": ITEM_ID,
+            "ingest_id": INGEST_ID,
+            "attempt_id": ATTEMPT_ID,
         },
     )
     client = _client(rec)
@@ -136,6 +142,8 @@ async def test_remember_forwards_session_end_source_type() -> None:
             "review_status": "proposed",
             "memory_confidence": 0.35,
             "correlation_id": ITEM_ID,
+            "ingest_id": INGEST_ID,
+            "attempt_id": ATTEMPT_ID,
         },
     )
     client = _client(rec)
@@ -157,6 +165,8 @@ async def test_remember_deduped_response() -> None:
             "memory_confidence": 0.9,
             "deduped_existing_id": OTHER_ID,
             "correlation_id": ITEM_ID,
+            "ingest_id": INGEST_ID,
+            "attempt_id": ATTEMPT_ID,
         },
     )
     async with _client(rec) as client:
@@ -291,6 +301,7 @@ async def test_classify_success() -> None:
             "classification_run_id": ITEM_ID,
             "expires_at": "2026-07-14T13:00:00Z",
             "correlation_id": ITEM_ID,
+            "ingest_id": INGEST_ID,
             "suggested_kind": "invariant",
             "suggested_wing": "engineering",
             "suggested_room": "conventions",
@@ -587,6 +598,17 @@ async def test_remember_omits_correlation_id_when_not_given() -> None:
     assert "correlation_id" not in _body(rec.request)
 
 
+async def test_remember_forwards_server_ingest_id() -> None:
+    rec = _Recorder(status_code=201, payload=_REMEMBER_CREATED)
+    ingest_id = UUID(INGEST_ID)
+    async with _client(rec) as client:
+        response = await client.remember("x", ingest_id=ingest_id)
+    assert rec.request is not None
+    assert _body(rec.request)["ingest_id"] == str(ingest_id)
+    assert response.ingest_id == ingest_id
+    assert response.attempt_id == UUID(ATTEMPT_ID)
+
+
 async def test_classify_forwards_correlation_id() -> None:
     correlation_id = UUID("44444444-4444-4444-4444-444444444444")
     rec = _Recorder(
@@ -594,6 +616,7 @@ async def test_classify_forwards_correlation_id() -> None:
             "classification_run_id": ITEM_ID,
             "expires_at": "2026-07-14T13:00:00Z",
             "correlation_id": str(correlation_id),
+            "ingest_id": INGEST_ID,
             "suggested_kind": "fact",
             "taxonomy_confidence": 0.5,
             "confidence": 0.5,

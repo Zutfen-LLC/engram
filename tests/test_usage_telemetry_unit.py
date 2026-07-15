@@ -19,6 +19,7 @@ from engram.usage import (
     embedding_call_occurred_for,
     extract_openai_compatible_usage,
     record_candidate_once,
+    record_candidate_outcome,
     record_provider_call,
     record_retrieval_request,
     record_usage_event_best_effort,
@@ -225,6 +226,7 @@ async def test_disabled_telemetry_is_noop_and_opens_no_db_session(monkeypatch):
         principal_id=None,
         workspace_id=None,
         correlation_id=__import__("uuid").uuid4(),
+        ingest_id=__import__("uuid").uuid4(),
         candidate_utf8_bytes=10,
         source_type="manual",
     )
@@ -249,6 +251,33 @@ async def test_unresolvable_tenant_id_is_swallowed_not_raised(monkeypatch):
         status="accepted_for_processing",
     )
     assert result is None
+
+
+async def test_candidate_outcome_reuses_attempt_id_for_telemetry_retry(monkeypatch):
+    from uuid import uuid4
+
+    captured: list[dict[str, object]] = []
+
+    async def capture(**kwargs: object):
+        captured.append(kwargs)
+        return kwargs["event_id"]
+
+    monkeypatch.setattr("engram.usage.record_usage_event_best_effort", capture)
+    attempt_id = uuid4()
+    ingest_id = uuid4()
+    correlation_id = uuid4()
+    for _ in range(2):
+        await record_candidate_outcome(
+            tenant_id=uuid4(),
+            principal_id=None,
+            workspace_id=None,
+            correlation_id=correlation_id,
+            ingest_id=ingest_id,
+            attempt_id=attempt_id,
+            status="created",
+        )
+    assert [call["event_id"] for call in captured] == [attempt_id, attempt_id]
+    assert all(call["ingest_id"] == ingest_id for call in captured)
 
 
 # ---- IntegrityError discrimination (ENG-METER-001 correction) ----

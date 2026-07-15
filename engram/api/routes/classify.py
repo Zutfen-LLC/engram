@@ -11,6 +11,8 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.auth import ADMIN_SCOPE, READ_SCOPE
+from engram.candidate_ingests import CandidateIdentity, create_ingest
+from engram.canonicalize import canonicalize, content_hash
 from engram.classification import ClassificationResult, RetentionDisposition
 from engram.classification import classify as classify_content
 from engram.classification_evidence import new_run
@@ -27,10 +29,8 @@ class ClassifyRequest(BaseModel):
     context: str | None = None  # optional conversation excerpt or source_type hint
     workspace: str | None = None
     source_type: SourceType = "manual"
-    # Optional client-supplied correlation id shared with the /v1/remember call
-    # for the same candidate. When absent the server generates one. Lifecycle
-    # hooks always supply this — one UUID per extracted candidate — so the two
-    # legs (classify, remember) count as a single candidate.observed event.
+    # Optional client trace shared with /v1/remember. It does not control
+    # candidate uniqueness; the server-issued ingest_id is authoritative.
     correlation_id: UUID | None = None
 
 
@@ -40,6 +40,7 @@ class ClassifyResponse(BaseModel):
     # Additive, backward-compatible: the effective correlation id (echoed back
     # if the caller supplied one, otherwise server-generated).
     correlation_id: UUID
+    ingest_id: UUID
     suggested_kind: str
     suggested_wing: str | None = None
     suggested_room: str | None = None
@@ -119,15 +120,28 @@ async def classify(
     workspace_id = await _resolve_workspace_id(session, tenant_id, req.workspace)
     correlation_id = req.correlation_id or uuid4()
 
-    # candidate.observed is recorded once per correlation_id (idempotent via
-    # usage_events' dedupe_key unique index) so a direct /v1/remember call and
-    # a preceding /v1/classify call for the same candidate never double-count.
-    # Best-effort: a telemetry failure here must never affect classification.
+    identity = CandidateIdentity(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        workspace_id=workspace_id,
+        source_type=req.source_type,
+        content_hash=content_hash(canonicalize(req.content)),
+    )
+    ingest = create_ingest(identity=identity, client_correlation_id=req.correlation_id)
+    session.add(ingest)
+    # The ingest is authoritative business state, not best-effort telemetry.
+    # Commit it before provider execution so fallback/failure still has the
+    # same durable server-issued identity.
+    await session.commit()
+
+    # candidate.observed is idempotent per server-issued ingest. Best-effort: a
+    # telemetry failure here must never affect classification.
     await record_candidate_once(
         tenant_id=tenant_id,
         principal_id=principal_id,
         workspace_id=workspace_id,
         correlation_id=correlation_id,
+        ingest_id=ingest.id,
         candidate_utf8_bytes=len(req.content.encode("utf-8")),
         source_type=req.source_type,
     )
@@ -140,6 +154,7 @@ async def classify(
         principal_id=principal_id,
         workspace_id=workspace_id,
         correlation_id=correlation_id,
+        ingest_id=ingest.id,
         source_type=req.source_type,
         usage_class="request",
     )
@@ -151,6 +166,7 @@ async def classify(
         workspace_id=workspace_id,
         context=req.context,
         result=result,
+        ingest_id=ingest.id,
     )
     session.add(run)
     await session.commit()
@@ -158,6 +174,7 @@ async def classify(
         classification_run_id=run.id,
         expires_at=run.expires_at,
         correlation_id=correlation_id,
+        ingest_id=ingest.id,
         **result.model_dump(exclude={"provenance"}),
     )
 

@@ -20,6 +20,7 @@ class Client:
         self.classify_calls.append({"content": content, **kwargs})
         return SimpleNamespace(
             classification_run_id="receipt",
+            ingest_id="ingest",
             suggested_kind="decision",
             suggested_wing="engineering",
             suggested_room="architecture",
@@ -53,6 +54,7 @@ async def test_retain_above_threshold_remembers_receipt_and_server_taxonomy(tmp_
     assert detail["route"] == "remembered"
     assert client.classify_calls[0]["source_type"] == "sync_turn"
     assert client.remember_calls[0]["classification_run_id"] == "receipt"
+    assert client.remember_calls[0]["ingest_id"] == "ingest"
     assert client.remember_calls[0]["kind"] == "decision"
 
 

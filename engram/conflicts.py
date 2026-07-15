@@ -107,6 +107,7 @@ async def detect_conflicts(
     *,
     profile: EmbeddingProfile | None = None,
     correlation_id: UUID | None = None,
+    ingest_id: UUID | None = None,
     job_id: UUID | None = None,
     usage_class: UsageClass = "async_enrichment",
 ) -> ConflictResult | None:
@@ -196,6 +197,7 @@ async def detect_conflicts(
         principal_id=new_item.principal_id,
         workspace_id=new_item.workspace_id,
         correlation_id=correlation_id,
+        ingest_id=ingest_id,
         job_id=job_id,
         usage_class=usage_class,
     )
@@ -269,6 +271,7 @@ async def _classify_relationship(
     principal_id: UUID | None = None,
     workspace_id: UUID | None = None,
     correlation_id: UUID | None = None,
+    ingest_id: UUID | None = None,
     job_id: UUID | None = None,
     usage_class: UsageClass = "async_enrichment",
 ) -> tuple[ConflictVerdict, float, str, dict[str, Any]]:
@@ -293,6 +296,7 @@ async def _classify_relationship(
                 input_count=1,
                 input_bytes=utf8_byte_len(old_content) + utf8_byte_len(new_content),
                 correlation_id=correlation_id,
+                ingest_id=ingest_id,
                 job_id=job_id,
             )
         return _classify_relationship_fallback(similarity)
@@ -305,6 +309,7 @@ async def _classify_relationship(
             principal_id=principal_id,
             workspace_id=workspace_id,
             correlation_id=correlation_id,
+            ingest_id=ingest_id,
             job_id=job_id,
             usage_class=usage_class,
         )
@@ -357,6 +362,7 @@ async def _classify_relationship_llm(
     principal_id: UUID | None = None,
     workspace_id: UUID | None = None,
     correlation_id: UUID | None = None,
+    ingest_id: UUID | None = None,
     job_id: UUID | None = None,
     usage_class: UsageClass = "async_enrichment",
 ) -> tuple[ConflictVerdict, float, str, dict[str, Any]]:
@@ -414,6 +420,7 @@ async def _classify_relationship_llm(
                 input_bytes=input_bytes,
                 latency_ms=timer.elapsed_ms(),
                 correlation_id=correlation_id,
+                ingest_id=ingest_id,
                 job_id=job_id,
                 event_id=event_id,
                 metadata={
@@ -449,6 +456,7 @@ async def _classify_relationship_llm(
                 input_bytes=input_bytes,
                 latency_ms=timer.elapsed_ms(),
                 correlation_id=correlation_id,
+                ingest_id=ingest_id,
                 job_id=job_id,
                 event_id=event_id,
                 metadata={
@@ -487,6 +495,7 @@ async def _classify_relationship_llm(
                 reported_cost_usd=usage.reported_cost_usd,
                 latency_ms=timer.elapsed_ms(),
                 correlation_id=correlation_id,
+                ingest_id=ingest_id,
                 job_id=job_id,
                 event_id=event_id,
                 metadata={
@@ -527,6 +536,7 @@ async def _classify_relationship_llm(
                 reported_cost_usd=usage.reported_cost_usd,
                 latency_ms=timer.elapsed_ms(),
                 correlation_id=correlation_id,
+                ingest_id=ingest_id,
                 job_id=job_id,
                 event_id=event_id,
                 metadata={
@@ -564,6 +574,7 @@ async def _classify_relationship_llm(
                 reported_cost_usd=usage.reported_cost_usd,
                 latency_ms=timer.elapsed_ms(),
                 correlation_id=correlation_id,
+                ingest_id=ingest_id,
                 job_id=job_id,
                 event_id=event_id,
                 metadata={
@@ -607,6 +618,7 @@ async def _classify_relationship_llm(
             reported_cost_usd=usage.reported_cost_usd,
             latency_ms=timer.elapsed_ms(),
             correlation_id=correlation_id,
+            ingest_id=ingest_id,
             job_id=job_id,
             event_id=event_id,
             metadata={"verdict": verdict.value, "confidence": confidence},

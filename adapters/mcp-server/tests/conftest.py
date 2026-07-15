@@ -36,6 +36,8 @@ DB_SKIP_MARKER = "requires a live PostgreSQL"
 
 ITEM_ID = UUID("11111111-1111-1111-1111-111111111111")
 OTHER_ID = UUID("22222222-2222-2222-2222-222222222222")
+INGEST_ID = UUID("33333333-3333-3333-3333-333333333333")
+ATTEMPT_ID = UUID("44444444-4444-4444-4444-444444444444")
 
 
 def build_mock_client() -> AsyncMock:
@@ -53,6 +55,8 @@ def build_mock_client() -> AsyncMock:
         review_status="active",
         memory_confidence=0.9,
         correlation_id=OTHER_ID,
+        ingest_id=INGEST_ID,
+        attempt_id=ATTEMPT_ID,
     )
     client.recall.return_value = engram_client.RecallResponse(
         working_set="- [invariant] always use lowercase table names",
@@ -68,6 +72,7 @@ def build_mock_client() -> AsyncMock:
     )
     client.classify.return_value = engram_client.ClassifyResponse(
         classification_run_id=OTHER_ID,
+        ingest_id=INGEST_ID,
         expires_at=datetime.now(UTC) + timedelta(hours=1),
         correlation_id=OTHER_ID,
         suggested_kind="invariant",

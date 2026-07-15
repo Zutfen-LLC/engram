@@ -107,6 +107,7 @@ async def _insert_event(
     model: str | None = None,
     dedupe_key: str | None = None,
     correlation_id: str | None = None,
+    ingest_id: str | None = None,
     created_at: datetime | None = None,
     usage_class: str = "request",
     external_call_attempted: bool | None = None,
@@ -117,11 +118,12 @@ async def _insert_event(
         text(
             "INSERT INTO usage_events (tenant_id, principal_id, event_type, operation, status, "
             "input_count, input_bytes, prompt_tokens, total_tokens, reported_cost_usd, "
-            "latency_ms, source_type, provider_host, model, dedupe_key, correlation_id, "
+            "latency_ms, source_type, provider_host, model, dedupe_key, correlation_id, ingest_id, "
             "created_at, usage_class, external_call_attempted) "
             "VALUES (:tenant_id, :principal_id, :event_type, :operation, :status, "
             ":input_count, :input_bytes, :prompt_tokens, :total_tokens, :reported_cost_usd, "
-            ":latency_ms, :source_type, :provider_host, :model, :dedupe_key, :correlation_id, "
+            ":latency_ms, :source_type, :provider_host, :model, :dedupe_key, "
+            ":correlation_id, :ingest_id, "
             "COALESCE(:created_at, now()), :usage_class, :external_call_attempted)"
         ),
         {
@@ -141,6 +143,7 @@ async def _insert_event(
             "model": model,
             "dedupe_key": dedupe_key,
             "correlation_id": correlation_id,
+            "ingest_id": ingest_id,
             "created_at": created_at,
             "usage_class": usage_class if event_type == "provider.call" else None,
             "external_call_attempted": external_call_attempted,
@@ -578,6 +581,11 @@ async def test_usage_report_golden_contract(tenant, principal):
     }
 
     funnel_keys = (
+        "candidate_ingests",
+        "candidate_ingests_with_outcomes",
+        "candidate_ingests_unresolved",
+        "legacy_correlation_candidates",
+        "ingest_identity_coverage_pct",
         "candidate_cohort_size",
         "candidate_observations",
         "created",
@@ -621,6 +629,68 @@ async def test_usage_report_golden_contract(tenant, principal):
     }
     expected = json.loads(Path("tests/fixtures/usage_report_golden.json").read_text())
     assert actual == expected
+
+
+async def test_ingest_identity_prevents_correlation_merging(tenant, principal):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    now = datetime.now(UTC) - timedelta(minutes=1)
+    correlation_id = str(uuid.uuid4())
+    ingest_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+    async with _test_session_factory() as session:
+        for ingest_id, content_hash in zip(ingest_ids, ("hash-a", "hash-b"), strict=True):
+            await session.execute(
+                text(
+                    "INSERT INTO candidate_ingests "
+                    "(id, tenant_id, principal_id, source_type, content_hash, "
+                    "client_correlation_id, created_at) "
+                    "VALUES (:id, :tenant, :principal, 'manual', :hash, :correlation, :created)"
+                ),
+                {
+                    "id": ingest_id,
+                    "tenant": tenant,
+                    "principal": principal,
+                    "hash": content_hash,
+                    "correlation": correlation_id,
+                    "created": now,
+                },
+            )
+            await _insert_event(
+                session,
+                tenant_id=tenant,
+                principal_id=principal,
+                event_type="candidate.observed",
+                operation="process_memory_candidate",
+                status="accepted_for_processing",
+                correlation_id=correlation_id,
+                ingest_id=ingest_id,
+                created_at=now,
+            )
+            await _insert_event(
+                session,
+                tenant_id=tenant,
+                principal_id=principal,
+                event_type="candidate.outcome",
+                operation="process_memory_candidate",
+                status="created",
+                correlation_id=correlation_id,
+                ingest_id=ingest_id,
+                created_at=now + timedelta(seconds=1),
+            )
+        await session.commit()
+        report = await build_report(
+            session,
+            tenant_id=tenant,
+            since=now - timedelta(seconds=1),
+            until=now + timedelta(minutes=1),
+        )
+    funnel = report["candidate_funnel"]
+    assert funnel["candidate_ingests"] == 2
+    assert funnel["candidate_ingests_with_outcomes"] == 2
+    assert funnel["logical_candidates"] == 2
+    assert funnel["created"] == 2
+    assert funnel["legacy_correlation_candidates"] == 0
+    assert funnel["ingest_identity_coverage_pct"] == 100.0
 
 
 async def test_disabled_provider_calls_excluded_from_coverage(tenant, principal):

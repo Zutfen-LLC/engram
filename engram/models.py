@@ -386,6 +386,9 @@ class ClassificationRun(Base):
     principal_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("principals.id", ondelete="CASCADE"), nullable=False
     )
+    ingest_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("candidate_ingests.id", ondelete="RESTRICT"), nullable=True
+    )
     memory_item_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("memory_items.id", ondelete="SET NULL"),
@@ -679,6 +682,31 @@ class Job(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class CandidateIngest(Base):
+    """Immutable server-issued identity for one candidate entering the pipeline."""
+
+    __tablename__ = "candidate_ingests"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    principal_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("principals.id", ondelete="CASCADE"), nullable=False
+    )
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=True
+    )
+    source_type: Mapped[str] = mapped_column(Text, nullable=False)
+    content_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    client_correlation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
 class UsageEvent(Base):
     """Append-only metering/usage telemetry ledger (ENG-METER-001).
 
@@ -710,6 +738,9 @@ class UsageEvent(Base):
     status: Mapped[str] = mapped_column(Text, nullable=False)
 
     correlation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    ingest_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("candidate_ingests.id", ondelete="RESTRICT"), nullable=True
+    )
     dedupe_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     job_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
 

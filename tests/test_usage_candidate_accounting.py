@@ -4,11 +4,11 @@ Requires a live PostgreSQL with the v2 schema. Skips automatically when no DB
 is reachable, matching test_remember.py / test_worker_classification.py.
 
 Covers:
-* classify() then remember() with the same correlation_id -> one
+* classify() then remember() with the same ingest_id -> one
   candidate.observed event (not two).
 * a direct remember() with no preceding classify() -> exactly one
   candidate.observed event.
-* a retried candidate.observed insert (same correlation_id) is deduplicated.
+* a retried candidate.observed insert (same ingest_id) is deduplicated.
 * created / deduped / superseded / failed outcomes are represented exactly
   once each, without changing the API response.
 * UTF-8 byte accounting is correct for non-ASCII content.
@@ -16,6 +16,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 import pytest
@@ -103,6 +104,7 @@ async def _clean_db():
         await conn.execute(text("DELETE FROM classification_runs"))
         await conn.execute(text("DELETE FROM memory_embeddings"))
         await conn.execute(text("DELETE FROM memory_items"))
+        await conn.execute(text("DELETE FROM candidate_ingests"))
 
 
 @pytest.fixture(autouse=True)
@@ -136,6 +138,7 @@ async def test_classify_then_remember_same_correlation_counts_once(client):
     )
     assert classify_resp.status_code == 200
     assert classify_resp.json()["correlation_id"] == correlation_id
+    ingest_id = classify_resp.json()["ingest_id"]
 
     remember_resp = await client.post(
         "/v1/remember",
@@ -143,10 +146,13 @@ async def test_classify_then_remember_same_correlation_counts_once(client):
             "content": "we decided to use pgvector",
             "correlation_id": correlation_id,
             "classification_run_id": classify_resp.json()["classification_run_id"],
+            "ingest_id": ingest_id,
         },
     )
     assert remember_resp.status_code == 201
     assert remember_resp.json()["correlation_id"] == correlation_id
+    assert remember_resp.json()["ingest_id"] == ingest_id
+    assert remember_resp.json()["attempt_id"]
 
     observed = await _usage_events("candidate.observed", correlation_id)
     assert len(observed) == 1
@@ -171,8 +177,7 @@ async def test_retried_candidate_observation_is_deduplicated(client):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     correlation_id = str(uuid.uuid4())
-    # Two classify() calls with the same correlation id (simulating a client
-    # retry) must still produce exactly one candidate.observed row.
+    # Correlation is trace-only: two classify calls receive distinct ingests.
     for _ in range(2):
         resp = await client.post(
             "/v1/classify",
@@ -181,7 +186,97 @@ async def test_retried_candidate_observation_is_deduplicated(client):
         assert resp.status_code == 200
 
     observed = await _usage_events("candidate.observed", correlation_id)
+    assert len(observed) == 2
+    assert len({row["ingest_id"] for row in observed}) == 2
+
+
+async def test_same_correlation_different_content_creates_distinct_ingests(client):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    correlation_id = str(uuid.uuid4())
+    responses = [
+        await client.post(
+            "/v1/classify", json={"content": content, "correlation_id": correlation_id}
+        )
+        for content in ("candidate alpha", "candidate beta")
+    ]
+    assert all(response.status_code == 200 for response in responses)
+    assert len({response.json()["ingest_id"] for response in responses}) == 2
+    observed = await _usage_events("candidate.observed", correlation_id)
+    assert len(observed) == 2
+
+
+async def test_concurrent_remember_replay_records_one_observation(client):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    classified = await client.post(
+        "/v1/classify", json={"content": "concurrent ingest candidate"}
+    )
+    assert classified.status_code == 200
+    body = classified.json()
+    request = {
+        "content": "concurrent ingest candidate",
+        "classification_run_id": body["classification_run_id"],
+        "ingest_id": body["ingest_id"],
+    }
+
+    first, second = await asyncio.gather(
+        client.post("/v1/remember", json=request),
+        client.post("/v1/remember", json=request),
+    )
+
+    assert first.status_code == second.status_code == 201
+    assert {first.json()["status"], second.json()["status"]} == {"created", "deduped"}
+    assert first.json()["ingest_id"] == second.json()["ingest_id"] == body["ingest_id"]
+    observed = await _usage_events("candidate.observed")
     assert len(observed) == 1
+    assert str(observed[0]["ingest_id"]) == body["ingest_id"]
+
+
+async def test_ingest_reuse_validates_identity_without_mutation(client):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    first = await client.post("/v1/remember", json={"content": "immutable candidate"})
+    assert first.status_code == 201
+    ingest_id = first.json()["ingest_id"]
+    replay = await client.post(
+        "/v1/remember", json={"content": "immutable candidate", "ingest_id": ingest_id}
+    )
+    assert replay.status_code == 201
+    assert replay.json()["status"] == "deduped"
+    assert replay.json()["ingest_id"] == ingest_id
+
+    rejected = await client.post(
+        "/v1/remember", json={"content": "different candidate", "ingest_id": ingest_id}
+    )
+    assert rejected.status_code == 409
+    async with _test_session_factory() as session:
+        count = await session.scalar(text("SELECT count(*) FROM memory_items"))
+        diagnostic = await session.scalar(
+            text(
+                "SELECT metadata->'mismatch_categories' FROM usage_events "
+                "WHERE event_type = 'candidate.ingest_reuse_rejected'"
+            )
+        )
+    assert count == 1
+    assert diagnostic == ["content_hash_mismatch"]
+
+
+async def test_remember_attempt_ids_are_distinct_for_replay(client):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    first = await client.post("/v1/remember", json={"content": "attempt identity"})
+    second = await client.post(
+        "/v1/remember",
+        json={"content": "attempt identity", "ingest_id": first.json()["ingest_id"]},
+    )
+    assert first.status_code == second.status_code == 201
+    assert first.json()["attempt_id"] != second.json()["attempt_id"]
+    outcomes = await _usage_events("candidate.outcome")
+    assert {str(row["id"]) for row in outcomes} == {
+        first.json()["attempt_id"],
+        second.json()["attempt_id"],
+    }
 
 
 async def test_deduped_outcome_via_unique_index_is_recorded(client):

@@ -39,6 +39,7 @@ class ContextRecordingClient:
             retention_confidence=self._confidence,
             retention_disposition="retain",
             classification_run_id="run-id",
+            ingest_id="ingest-id",
             suggested_kind="fact",
             suggested_wing=None,
             suggested_room=None,

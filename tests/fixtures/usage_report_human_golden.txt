@@ -1,7 +1,7 @@
 Engram dogfood usage report
 ============================================================
 tenant:  (all tenants)
-schema:  3
+schema:  4
 window:  2026-07-01T00:00:00+00:00  to  2026-07-02T00:00:00+00:00
 
 -- Coverage & data quality --
@@ -10,6 +10,7 @@ window:  2026-07-01T00:00:00+00:00  to  2026-07-02T00:00:00+00:00
   last_event_at:                None
   actual calls w/ tokens:        0.0%
   actual calls w/ cost:          0.0%
+  candidate events w/ ingest:   100.0% (0 legacy)
   active principals:            0 (0 with lifecycle summaries)
 
 -- Candidate funnel --
@@ -19,6 +20,11 @@ window:  2026-07-01T00:00:00+00:00  to  2026-07-02T00:00:00+00:00
   lifecycle_parked                 0
   candidate_observations           8
   candidate_cohort_size            8
+  candidate_ingests                8
+  candidate_ingests_with_outcomes  7
+  candidate_ingests_unresolved     1
+  legacy_correlation_candidates    0
+  ingest_identity_coverage_pct     100.0
   logical_candidates               7
   unresolved_candidates            1
   remember_attempts                9

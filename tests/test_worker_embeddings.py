@@ -186,6 +186,17 @@ async def test_remember_enqueues_embedding_job_without_provider_call(client, mon
     # A pending embedding.generate job exists; the placeholder row is pending.
     counts = await _job_counts()
     assert counts.get("embedding.generate:pending", 0) >= 1
+    async with _test_session_factory() as session:
+        payload = (
+            await session.execute(
+                text(
+                    "SELECT payload FROM jobs WHERE job_type = 'embedding.generate' "
+                    "AND payload->>'memory_item_id' = :item_id"
+                ),
+                {"item_id": response.json()["id"]},
+            )
+        ).scalar_one()
+    assert payload["ingest_id"] == response.json()["ingest_id"]
     state = await _embedding_state(response.json()["id"])
     assert state["embedding_status"] == "pending"
     assert state["has_vector"] is False

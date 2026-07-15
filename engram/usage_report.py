@@ -25,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.config import settings
 
-REPORT_SCHEMA_VERSION = 3
+REPORT_SCHEMA_VERSION = 4
 
 
 @dataclass
@@ -68,36 +68,40 @@ def _candidate_cohort_cte() -> str:
     """Reusable cohort-first, as-of-until logical candidate SQL."""
     return """
         candidate_first_seen AS (
-            SELECT tenant_id, correlation_id, min(created_at) AS first_seen_at
+            SELECT tenant_id,
+                   COALESCE('ingest:' || ingest_id::text,
+                            'legacy:' || correlation_id::text) AS candidate_key,
+                   min(created_at) AS first_seen_at
             FROM usage_events
             WHERE event_type IN ('candidate.observed', 'candidate.outcome')
-              AND correlation_id IS NOT NULL
+              AND (ingest_id IS NOT NULL OR correlation_id IS NOT NULL)
               AND (CAST(:tenant_id AS uuid) IS NULL
                    OR tenant_id = CAST(:tenant_id AS uuid))
-            GROUP BY tenant_id, correlation_id
+            GROUP BY tenant_id, candidate_key
         ),
         candidate_cohort AS (
-            SELECT tenant_id, correlation_id, first_seen_at
+            SELECT tenant_id, candidate_key, first_seen_at
             FROM candidate_first_seen
             WHERE first_seen_at >= :since AND first_seen_at < :until
         ),
         ranked_candidate_outcomes AS (
-            SELECT ue.tenant_id, ue.correlation_id, ue.principal_id, ue.status,
+            SELECT ue.tenant_id, cc.candidate_key, ue.principal_id, ue.status,
                    ue.created_at, ue.id, cc.first_seen_at,
                    ROW_NUMBER() OVER (
-                       PARTITION BY ue.tenant_id, ue.correlation_id
+                       PARTITION BY ue.tenant_id, cc.candidate_key
                        ORDER BY CASE WHEN ue.status != 'failed' THEN 0 ELSE 1 END,
                                 ue.created_at, ue.id
                    ) AS logical_rank
             FROM candidate_cohort cc
             JOIN usage_events ue
               ON ue.tenant_id = cc.tenant_id
-             AND ue.correlation_id = cc.correlation_id
+             AND COALESCE('ingest:' || ue.ingest_id::text,
+                          'legacy:' || ue.correlation_id::text) = cc.candidate_key
              AND ue.event_type = 'candidate.outcome'
              AND ue.created_at < :until
         ),
         logical_candidate_outcomes AS (
-            SELECT tenant_id, correlation_id, principal_id, status, created_at, first_seen_at
+            SELECT tenant_id, candidate_key, principal_id, status, created_at, first_seen_at
             FROM ranked_candidate_outcomes
             WHERE logical_rank = 1
         )
@@ -135,6 +139,19 @@ async def _coverage_section(session: AsyncSession, window: ReportWindow) -> dict
                 f"AND reported_cost_usd IS NOT NULL) "
                 f"AS with_cost "
                 f"FROM usage_events WHERE {provider_clause}"
+            ),
+            params,
+        )
+    ).mappings().one()
+    candidate_coverage = (
+        await session.execute(
+            text(
+                "SELECT count(*) AS total, "
+                "count(*) FILTER (WHERE ingest_id IS NOT NULL) AS with_ingest, "
+                "count(*) FILTER (WHERE ingest_id IS NULL AND correlation_id IS NOT NULL) "
+                "AS legacy FROM usage_events WHERE "
+                + clause
+                + " AND event_type IN ('candidate.observed', 'candidate.outcome')"
             ),
             params,
         )
@@ -201,6 +218,17 @@ async def _coverage_section(session: AsyncSession, window: ReportWindow) -> dict
             "lifecycle summaries — locally guard-rejected/parked candidates for "
             "those principals are invisible to this report"
         )
+    candidate_total = int(candidate_coverage["total"] or 0)
+    candidate_with_ingest = int(candidate_coverage["with_ingest"] or 0)
+    legacy_candidate_events = int(candidate_coverage["legacy"] or 0)
+    ingest_pct = (
+        round(100.0 * candidate_with_ingest / candidate_total, 1) if candidate_total else 0.0
+    )
+    if candidate_total and ingest_pct < 95.0:
+        warnings.append(
+            f"server ingest identity covers only {ingest_pct}% of candidate events; "
+            f"{legacy_candidate_events} legacy correlation-only event(s) remain"
+        )
 
     return {
         "telemetry_enabled": settings.usage_telemetry_enabled,
@@ -212,6 +240,8 @@ async def _coverage_section(session: AsyncSession, window: ReportWindow) -> dict
         "provider_non_attempted_failures": provider_coverage["non_attempted_failures"] or 0,
         "pct_provider_calls_with_tokens": pct_tokens,
         "pct_provider_calls_with_cost": pct_cost,
+        "pct_candidate_events_with_ingest_id": ingest_pct,
+        "legacy_candidate_event_count": legacy_candidate_events,
         "active_principals": active_principals,
         "active_principals_with_lifecycle_summary": principals_with_summary,
         "active_principals_without_lifecycle_summary": principals_without_summary,
@@ -307,12 +337,43 @@ async def _candidate_funnel_section(session: AsyncSession, window: ReportWindow)
         or 0
     )
     unresolved = max(0, cohort_size - distinct_candidates)
+    ingest_clause, ingest_params = _tenant_clause(window, alias="ci")
+    ingest_counts = (
+        await session.execute(
+            text(
+                "SELECT count(*) AS total, count(*) FILTER (WHERE EXISTS ("
+                "SELECT 1 FROM usage_events ue WHERE ue.tenant_id = ci.tenant_id "
+                "AND ue.ingest_id = ci.id AND ue.event_type = 'candidate.outcome' "
+                "AND ue.created_at < :until)) AS with_outcomes "
+                "FROM candidate_ingests ci WHERE " + ingest_clause
+            ),
+            ingest_params,
+        )
+    ).mappings().one()
+    candidate_ingests = int(ingest_counts["total"] or 0)
+    candidate_ingests_with_outcomes = int(ingest_counts["with_outcomes"] or 0)
+    legacy_correlation_candidates = int(
+        await _scalar(
+            session,
+            f"WITH {_candidate_cohort_cte()} SELECT count(*) FROM candidate_cohort "
+            "WHERE candidate_key LIKE 'legacy:%'",
+            cohort_params,
+        )
+        or 0
+    )
+    total_identity_candidates = candidate_ingests + legacy_correlation_candidates
+    ingest_identity_coverage_pct = (
+        round(100.0 * candidate_ingests / total_identity_candidates, 1)
+        if total_identity_candidates
+        else 0.0
+    )
     cohort_attempts = int(
         await _scalar(
             session,
             f"WITH {_candidate_cohort_cte()} SELECT count(*) FROM usage_events ue "
             "JOIN candidate_cohort cc ON cc.tenant_id = ue.tenant_id "
-            "AND cc.correlation_id = ue.correlation_id "
+            "AND COALESCE('ingest:' || ue.ingest_id::text, "
+            "'legacy:' || ue.correlation_id::text) = cc.candidate_key "
             "WHERE ue.event_type = 'candidate.outcome' AND ue.created_at < :until",
             cohort_params,
         )
@@ -327,14 +388,20 @@ async def _candidate_funnel_section(session: AsyncSession, window: ReportWindow)
             + " AND success.event_type = 'candidate.outcome' AND success.status != 'failed' "
             "AND NOT EXISTS (SELECT 1 FROM usage_events earlier_success WHERE "
             "earlier_success.tenant_id = success.tenant_id "
-            "AND earlier_success.correlation_id = success.correlation_id "
+            "AND COALESCE('ingest:' || earlier_success.ingest_id::text, "
+            "'legacy:' || earlier_success.correlation_id::text) = "
+            "COALESCE('ingest:' || success.ingest_id::text, "
+            "'legacy:' || success.correlation_id::text) "
             "AND earlier_success.event_type = 'candidate.outcome' "
             "AND earlier_success.status != 'failed' "
             "AND (earlier_success.created_at, earlier_success.id) < "
             "(success.created_at, success.id)) "
             "AND EXISTS (SELECT 1 FROM usage_events failure WHERE "
             "failure.tenant_id = success.tenant_id "
-            "AND failure.correlation_id = success.correlation_id "
+            "AND COALESCE('ingest:' || failure.ingest_id::text, "
+            "'legacy:' || failure.correlation_id::text) = "
+            "COALESCE('ingest:' || success.ingest_id::text, "
+            "'legacy:' || success.correlation_id::text) "
             "AND failure.event_type = 'candidate.outcome' AND failure.status = 'failed' "
             "AND (failure.created_at, failure.id) < (success.created_at, success.id))",
             success_params,
@@ -365,6 +432,13 @@ async def _candidate_funnel_section(session: AsyncSession, window: ReportWindow)
         "lifecycle_parked": int(lifecycle_row["parked"]),
         "candidate_observations": int(candidate_observations),
         "candidate_cohort_size": cohort_size,
+        "candidate_ingests": candidate_ingests,
+        "candidate_ingests_with_outcomes": candidate_ingests_with_outcomes,
+        "candidate_ingests_unresolved": max(
+            0, candidate_ingests - candidate_ingests_with_outcomes
+        ),
+        "legacy_correlation_candidates": legacy_correlation_candidates,
+        "ingest_identity_coverage_pct": ingest_identity_coverage_pct,
         # Logical-outcome funnel (one outcome per correlation_id).
         "logical_candidates": int(distinct_candidates),
         "unresolved_candidates": unresolved,
@@ -848,7 +922,7 @@ async def _storage_section(session: AsyncSession, window: ReportWindow) -> dict[
 
     tables = (
         "memory_items", "memory_embeddings", "memory_edges", "kg_triples",
-        "item_events", "recall_logs", "jobs", "usage_events",
+        "item_events", "recall_logs", "jobs", "usage_events", "candidate_ingests",
     )
     table_sizes: dict[str, int | None] = {}
     index_sizes: dict[str, int | None] = {}

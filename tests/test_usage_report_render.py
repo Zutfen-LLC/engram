@@ -22,7 +22,7 @@ from engram.cli import _print_human_usage_report
 def _sample_report(*, with_provider_row: bool = True) -> dict[str, Any]:
     """A minimal report dict with every key the renderer reads."""
     report: dict[str, Any] = {
-        "report_schema_version": 3,
+        "report_schema_version": 4,
         "tenant_id": None,
         "since": datetime(2026, 7, 1, tzinfo=UTC).isoformat(),
         "until": datetime(2026, 7, 2, tzinfo=UTC).isoformat(),
@@ -32,6 +32,8 @@ def _sample_report(*, with_provider_row: bool = True) -> dict[str, Any]:
             "last_event_at": None,
             "pct_provider_calls_with_tokens": 0.0,
             "pct_provider_calls_with_cost": 0.0,
+            "pct_candidate_events_with_ingest_id": 100.0,
+            "legacy_candidate_event_count": 0,
             "active_principals": 0,
             "active_principals_with_lifecycle_summary": 0,
             "warnings": [],
@@ -43,6 +45,11 @@ def _sample_report(*, with_provider_row: bool = True) -> dict[str, Any]:
             "lifecycle_parked": 0,
             "candidate_observations": 8,
             "candidate_cohort_size": 8,
+            "candidate_ingests": 8,
+            "candidate_ingests_with_outcomes": 7,
+            "candidate_ingests_unresolved": 1,
+            "legacy_correlation_candidates": 0,
+            "ingest_identity_coverage_pct": 100.0,
             "logical_candidates": 7,
             "unresolved_candidates": 1,
             "remember_attempts": 9,
