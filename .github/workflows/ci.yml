@@ -18,7 +18,10 @@ jobs:
         run: docker compose -f docker-compose.ci.yml config -q
 
       - name: Run Canonical Trust Proof
-        run: make compose-trust-proof
+        run: |
+          docker compose -f docker-compose.ci.yml run --build --rm \
+            -e ENGRAM_FAIL_ON_DB_SKIP=1 \
+            engram-test python scripts/run_trust_proof.py
 
       - name: Reset Trust-Proof Stack
         run: docker compose -f docker-compose.ci.yml down -v --remove-orphans
@@ -63,6 +66,7 @@ jobs:
           export ENGRAM_VOCAB_CACHE_TTL_SECONDS=999
           export ENGRAM_VOCAB_CACHE_MAX_TENANTS=888
           export ENGRAM_PROMOTION_CONFLICT_CANDIDATE_K=777
+          export ENGRAM_USAGE_TELEMETRY_ENABLED=true
           export ENGRAM_API_KEY_CACHE_TTL_SECONDS=666
           export ENGRAM_READ_DATABASE_URL='postgresql+asyncpg://sentinel-read'
           export ENGRAM_RECALL_BYTE_BUDGET=555
