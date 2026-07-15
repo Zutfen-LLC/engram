@@ -207,7 +207,8 @@ def main() -> None:
         "--poll-interval",
         type=float,
         default=None,
-        help="Seconds between claim attempts (default: ENGRAM_JOB_POLL_INTERVAL_SECONDS).",
+        help="Seconds to wait before another claim when the queue is idle or the worker loop "
+        "errors (default: ENGRAM_JOB_POLL_INTERVAL_SECONDS).",
     )
     worker_parser.add_argument(
         "--job-type",

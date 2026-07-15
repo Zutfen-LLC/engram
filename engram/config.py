@@ -118,7 +118,8 @@ class Settings(BaseSettings):
     # Background worker / job queue (ENG-AUD-008). The service still works
     # without a worker running; pending jobs simply queue and semantic recall /
     # LLM refinement lag until processed.
-    # How often (seconds) a polling worker claims jobs. ``--once`` ignores this.
+    # Idle/error backoff (seconds) before the worker tries another claim.
+    # Available jobs are processed serially without this delay; ``--once`` ignores it.
     job_poll_interval_seconds: float = 2.0
     # Default per-job retry ceiling before a job is marked dead (overridable per
     # enqueue). Matches the jobs.max_attempts column default.
