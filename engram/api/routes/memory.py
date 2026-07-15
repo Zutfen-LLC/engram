@@ -1258,6 +1258,7 @@ async def _search_impl(
                 tenant_id=tenant_id,
                 principal_id=principal_id,
                 operation="embedding_query_search",
+                usage_class="request",
             )
         else:
             query_embedding = await generate_embedding(req.query)

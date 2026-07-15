@@ -719,6 +719,8 @@ class UsageEvent(Base):
     provider_host: Mapped[str | None] = mapped_column(Text, nullable=True)
     model: Mapped[str | None] = mapped_column(Text, nullable=True)
     embedding_profile: Mapped[str | None] = mapped_column(Text, nullable=True)
+    usage_class: Mapped[str | None] = mapped_column(Text, nullable=True)
+    external_call_attempted: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
     input_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     input_bytes: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)

@@ -1167,7 +1167,10 @@ async def _run_setup_embeddings(test_text: str) -> int:
         from engram.embeddings import generate_embedding
 
         vec = await generate_embedding(
-            test_text, tenant_id=setup_tenant_id, operation="embedding_setup"
+            test_text,
+            tenant_id=setup_tenant_id,
+            operation="embedding_setup",
+            usage_class="diagnostic",
         )
     except Exception as exc:
         print("\n  FAIL: Embedding generation raised an error:")
@@ -1225,6 +1228,7 @@ def _print_human_usage_report(report: dict[str, Any]) -> None:
     print("Engram dogfood usage report")
     print("=" * 60)
     print(f"tenant:  {report['tenant_id'] or '(all tenants)'}")
+    print(f"schema:  {report['report_schema_version']}")
     print(f"window:  {report['since']}  to  {report['until']}")
     print()
     print("-- Coverage & data quality --")
@@ -1243,9 +1247,11 @@ def _print_human_usage_report(report: dict[str, Any]) -> None:
     print("-- Candidate funnel --")
     for key in (
         "lifecycle_extracted", "lifecycle_guard_rejected", "lifecycle_classified",
-        "lifecycle_parked", "candidate_observations", "logical_candidates",
-        "remember_attempts", "created", "deduped", "superseded", "failed",
-        "failed_attempts", "successful_attempts", "attempts_per_candidate_avg",
+        "lifecycle_parked", "candidate_observations", "candidate_cohort_size",
+        "logical_candidates", "unresolved_candidates", "remember_attempts",
+        "created", "deduped", "superseded", "failed", "new_memory_writes",
+        "failed_attempts", "successful_attempts", "retry_successes_in_window",
+        "attempts_per_cohort_candidate_avg",
         "flat_candidate_units", "kib_candidate_units",
     ):
         print(f"  {key:32s} {funnel[key]}")
@@ -1260,11 +1266,33 @@ def _print_human_usage_report(report: dict[str, Any]) -> None:
         print(f"  {row['source_type']:16s} observed={row['candidate_observations']:<8} "
               f"bytes={row['candidate_bytes']:<10} kib_units={row['kib_candidate_units']}")
     print()
-    print("-- Provider economics (operation/host/model) --")
+    print("-- Provider economics (usage class/operation/host/model) --")
+    print(
+        "  all operations/calls:          "
+        f"{report['all_provider_operations']}/{report['all_actual_provider_calls']}"
+    )
+    print(f"  non-attempted failures:        {report['all_non_attempted_failures']}")
+    print(f"  disabled operations:           {report['all_disabled_operations']}")
+    print(
+        "  product operations/calls:      "
+        f"{report['product_provider_operations']}/"
+        f"{report['product_actual_provider_calls']}"
+    )
+    print(
+        "  maintenance operations/calls:  "
+        f"{report['maintenance_provider_operations']}/"
+        f"{report['maintenance_actual_provider_calls']}"
+    )
+    print(
+        "  diagnostic operations/calls:   "
+        f"{report['diagnostic_provider_operations']}/"
+        f"{report['diagnostic_actual_provider_calls']}"
+    )
     for row in report["provider_economics"]:
         disabled = row.get("disabled_n") or 0
         print(
-            f"  {row['operation']:24s} {row['provider_host'] or '-':22s} {row['model'] or '-':20s} "
+            f"  {row['usage_class']:18s} {row['operation']:24s} "
+            f"{row['provider_host'] or '-':22s} {row['model'] or '-':20s} "
             f"operations={row['calls']:<6} calls={row.get('actual_calls', 0):<6} "
             f"disabled={disabled:<4} ok={row['successes']:<6} fail={row['failures']:<4} "
             f"fallback={row.get('application_fallbacks', 0):<4} "
@@ -1291,7 +1319,10 @@ def _print_human_usage_report(report: dict[str, Any]) -> None:
     print(f"  query-embedding operations:    {retrieval['query_embedding_calls']}")
     print(f"  actual query-embedding calls:  {retrieval['query_embedding_actual_calls']}")
     print(f"  query-embedding tokens:        {retrieval['query_embedding_tokens']}")
-    print(f"  semantic_queries/created_mem:  {retrieval['semantic_queries_per_created_memory']}")
+    print(
+        "  semantic_queries/new_write:    "
+        f"{retrieval['semantic_queries_per_new_memory_write']}"
+    )
     print(f"  retrievals/active_principal:   {retrieval['retrievals_per_active_principal']}")
     print()
     print("-- Worker/queue --")

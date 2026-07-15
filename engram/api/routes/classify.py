@@ -141,6 +141,7 @@ async def classify(
         workspace_id=workspace_id,
         correlation_id=correlation_id,
         source_type=req.source_type,
+        usage_class="request",
     )
     run = new_run(
         tenant_id=tenant_id,

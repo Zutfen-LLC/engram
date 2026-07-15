@@ -53,6 +53,7 @@ EmbeddingOutcome = Literal[
     "failed",
     "unknown",
 ]
+UsageClass = Literal["request", "async_enrichment", "maintenance", "diagnostic", "unknown"]
 
 
 def embedding_call_occurred_for(outcome: EmbeddingOutcome) -> bool | None:
@@ -170,6 +171,8 @@ async def record_usage_event_best_effort(
     provider_host: str | None = None,
     model: str | None = None,
     embedding_profile: str | None = None,
+    usage_class: UsageClass | None = None,
+    external_call_attempted: bool | None = None,
     input_count: int = 0,
     input_bytes: int = 0,
     prompt_tokens: int | None = None,
@@ -230,6 +233,8 @@ async def record_usage_event_best_effort(
                 provider_host=provider_host,
                 model=model,
                 embedding_profile=embedding_profile,
+                usage_class=usage_class,
+                external_call_attempted=external_call_attempted,
                 input_count=max(0, input_count),
                 input_bytes=max(0, input_bytes),
                 prompt_tokens=prompt_tokens,
@@ -370,6 +375,8 @@ async def record_provider_call(
     tenant_id: UUID | str,
     operation: str,
     status: str,
+    usage_class: UsageClass,
+    external_call_attempted: bool,
     principal_id: UUID | str | None = None,
     workspace_id: UUID | str | None = None,
     provider_adapter: str | None = None,
@@ -388,9 +395,9 @@ async def record_provider_call(
     event_id: UUID | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> UUID | None:
-    """Record one ``provider.call`` event.
+    """Record one application-level ``provider.call`` operation.
 
-    One event = one application-level provider call (a batched embedding
+    One event = one application-level provider operation (a batched embedding
     request is one event with ``input_count=N``, never N events). ``status``
     records the provider outcome only: ``succeeded`` (a usable result was
     obtained, including responses that carry no token usage), ``failed`` (the
@@ -413,6 +420,8 @@ async def record_provider_call(
         provider_host=provider_host,
         model=model,
         embedding_profile=embedding_profile,
+        usage_class=usage_class,
+        external_call_attempted=external_call_attempted,
         input_count=input_count,
         input_bytes=input_bytes,
         prompt_tokens=prompt_tokens,
@@ -462,12 +471,11 @@ async def record_retrieval_request(
     """
     if embedding_outcome is not None:
         embedding_call_occurred = embedding_call_occurred_for(embedding_outcome)
-    meta: dict[str, Any] = {
-        # Preserve an explicit JSON null for ``unknown`` so consumers can
-        # distinguish the canonical indeterminate state from legacy events
-        # that predate this field.
-        "embedding_call_occurred": embedding_call_occurred,
-    }
+    meta: dict[str, Any] = {}
+    if embedding_outcome is not None or embedding_call_occurred is not None:
+        # Preserve explicit JSON null only for canonical ``unknown``. Legacy
+        # callers that supplied neither field retain true field absence.
+        meta["embedding_call_occurred"] = embedding_call_occurred
     meta.update({
         k: v
         for k, v in {

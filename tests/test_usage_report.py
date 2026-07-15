@@ -15,6 +15,7 @@ import hashlib
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from sqlalchemy import text
@@ -107,17 +108,21 @@ async def _insert_event(
     dedupe_key: str | None = None,
     correlation_id: str | None = None,
     created_at: datetime | None = None,
+    usage_class: str = "request",
+    external_call_attempted: bool | None = None,
 ) -> None:
+    if event_type == "provider.call" and external_call_attempted is None:
+        external_call_attempted = status != "disabled"
     await session.execute(
         text(
             "INSERT INTO usage_events (tenant_id, principal_id, event_type, operation, status, "
             "input_count, input_bytes, prompt_tokens, total_tokens, reported_cost_usd, "
             "latency_ms, source_type, provider_host, model, dedupe_key, correlation_id, "
-            "created_at) "
+            "created_at, usage_class, external_call_attempted) "
             "VALUES (:tenant_id, :principal_id, :event_type, :operation, :status, "
             ":input_count, :input_bytes, :prompt_tokens, :total_tokens, :reported_cost_usd, "
             ":latency_ms, :source_type, :provider_host, :model, :dedupe_key, :correlation_id, "
-            "COALESCE(:created_at, now()))"
+            "COALESCE(:created_at, now()), :usage_class, :external_call_attempted)"
         ),
         {
             "tenant_id": tenant_id,
@@ -137,6 +142,8 @@ async def _insert_event(
             "dedupe_key": dedupe_key,
             "correlation_id": correlation_id,
             "created_at": created_at,
+            "usage_class": usage_class if event_type == "provider.call" else None,
+            "external_call_attempted": external_call_attempted,
         },
     )
 
@@ -307,6 +314,7 @@ async def test_candidate_funnel_outcomes(tenant, principal):
     assert funnel["created"] == 2
     assert funnel["deduped"] == 1
     assert funnel["superseded"] == 1
+    assert funnel["new_memory_writes"] == 3
     assert funnel["failed"] == 1
     assert funnel["remember_attempts"] == 5
     # Attempt-level diagnostics mirror the logical counts (no retries here).
@@ -315,6 +323,11 @@ async def test_candidate_funnel_outcomes(tenant, principal):
     assert funnel["failed_attempts"] == 1
     assert funnel["successful_attempts"] == 4
     assert funnel["attempts_per_candidate_avg"] == 1.0
+    principal_row = next(
+        row for row in report["by_principal"] if str(row["principal_id"]) == principal
+    )
+    assert principal_row["created_count"] == 2
+    assert principal_row["new_memory_write_count"] == 3
 
 
 async def test_candidate_funnel_logical_outcome_resolves_retry(tenant, principal):
@@ -417,6 +430,199 @@ async def test_provider_call_token_and_cost_coverage(tenant, principal):
     assert econ[0]["reported_cost_coverage_pct"] == 50.0
 
 
+async def test_cross_day_candidate_cohort_is_stable(tenant, principal):
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    candidate_id = str(uuid.uuid4())
+    day1 = datetime(2026, 7, 1, tzinfo=UTC)
+    boundary = day1 + timedelta(days=1)
+    day2_end = boundary + timedelta(days=1)
+    async with _test_session_factory() as session:
+        await _insert_event(
+            session,
+            tenant_id=tenant,
+            principal_id=principal,
+            event_type="candidate.observed",
+            operation="process_memory_candidate",
+            status="accepted_for_processing",
+            correlation_id=candidate_id,
+            created_at=day1 + timedelta(hours=1),
+        )
+        await _insert_event(
+            session,
+            tenant_id=tenant,
+            principal_id=principal,
+            event_type="candidate.outcome",
+            operation="process_memory_candidate",
+            status="failed",
+            correlation_id=candidate_id,
+            created_at=day1 + timedelta(hours=2),
+        )
+        await _insert_event(
+            session,
+            tenant_id=tenant,
+            principal_id=principal,
+            event_type="candidate.outcome",
+            operation="process_memory_candidate",
+            status="created",
+            correlation_id=candidate_id,
+            created_at=boundary + timedelta(hours=2),
+        )
+        await session.commit()
+
+        first = await build_report(session, tenant_id=tenant, since=day1, until=boundary)
+        second = await build_report(
+            session, tenant_id=tenant, since=boundary, until=day2_end
+        )
+        combined = await build_report(session, tenant_id=tenant, since=day1, until=day2_end)
+
+    first_funnel = first["candidate_funnel"]
+    assert first_funnel["candidate_cohort_size"] == 1
+    assert first_funnel["failed"] == 1
+    assert first_funnel["remember_attempts"] == 1
+
+    second_funnel = second["candidate_funnel"]
+    assert second_funnel["candidate_cohort_size"] == 0
+    assert second_funnel["logical_candidates"] == 0
+    assert second_funnel["remember_attempts"] == 1
+    assert second_funnel["successful_attempts"] == 1
+    assert second_funnel["retry_successes_in_window"] == 1
+
+    combined_funnel = combined["candidate_funnel"]
+    assert combined_funnel["candidate_cohort_size"] == 1
+    assert combined_funnel["created"] == 1
+    assert combined_funnel["remember_attempts"] == 2
+    assert combined_funnel["new_memory_writes"] == 1
+
+
+async def test_usage_report_golden_contract(tenant, principal):
+    """Sanitized deterministic contract covering the pricing-analysis semantics."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    day1 = datetime(2026, 7, 1, tzinfo=UTC)
+    day2 = day1 + timedelta(days=1)
+    until = day1 + timedelta(days=2)
+    retry, created, superseded, unresolved = [str(uuid.uuid4()) for _ in range(4)]
+    async with _test_session_factory() as session:
+        for correlation_id, timestamp in (
+            (retry, day1 + timedelta(hours=1)),
+            (superseded, day1 + timedelta(hours=2)),
+            (unresolved, day1 + timedelta(hours=3)),
+        ):
+            await _insert_event(
+                session,
+                tenant_id=tenant,
+                principal_id=principal,
+                event_type="candidate.observed",
+                operation="process_memory_candidate",
+                status="accepted_for_processing",
+                correlation_id=correlation_id,
+                created_at=timestamp,
+            )
+        for correlation_id, status, timestamp in (
+            (retry, "failed", day1 + timedelta(hours=4)),
+            (retry, "created", day2 + timedelta(hours=1)),
+            (created, "created", day1 + timedelta(hours=5)),
+            (superseded, "superseded", day1 + timedelta(hours=6)),
+        ):
+            await _insert_event(
+                session,
+                tenant_id=tenant,
+                principal_id=principal,
+                event_type="candidate.outcome",
+                operation="process_memory_candidate",
+                status=status,
+                correlation_id=correlation_id,
+                created_at=timestamp,
+            )
+        provider_rows = (
+            ("classification", "succeeded", "request", True, 10),
+            ("classification", "succeeded", "async_enrichment", True, 20),
+            ("classification", "disabled", "async_enrichment", False, 0),
+            ("classification", "failed", "request", False, 0),
+            ("embedding_query_search", "succeeded", "request", True, 5),
+            ("embedding_backfill", "succeeded", "maintenance", True, 30),
+            ("embedding_setup", "succeeded", "diagnostic", True, 2),
+        )
+        for operation, status, usage_class, attempted, tokens in provider_rows:
+            await _insert_event(
+                session,
+                tenant_id=tenant,
+                principal_id=principal,
+                event_type="provider.call",
+                operation=operation,
+                status=status,
+                usage_class=usage_class,
+                external_call_attempted=attempted,
+                total_tokens=tokens,
+                provider_host="provider.example.test",
+                model="fixture-model",
+                created_at=day1 + timedelta(hours=8),
+            )
+        await session.commit()
+        report = await build_report(session, tenant_id=tenant, since=day1, until=until)
+
+    assert set(report) == {
+        "report_schema_version", "tenant_id", "since", "until", "coverage",
+        "candidate_funnel", "by_source_type", "by_principal", "provider_economics",
+        "all_provider_operations", "all_actual_provider_calls",
+        "all_non_attempted_failures", "all_disabled_operations", "all_provider_tokens",
+        "all_reported_cost_usd", "product_provider_operations",
+        "product_actual_provider_calls", "product_provider_tokens",
+        "product_reported_cost_usd", "maintenance_provider_operations",
+        "maintenance_actual_provider_calls", "maintenance_provider_tokens",
+        "maintenance_reported_cost_usd", "diagnostic_provider_operations",
+        "diagnostic_actual_provider_calls", "diagnostic_provider_tokens",
+        "diagnostic_reported_cost_usd", "conflict_economics", "retrieval", "worker",
+        "storage", "hourly_series",
+    }
+
+    funnel_keys = (
+        "candidate_cohort_size",
+        "candidate_observations",
+        "created",
+        "deduped",
+        "failed",
+        "failed_attempts",
+        "logical_candidates",
+        "new_memory_writes",
+        "remember_attempts",
+        "retry_successes_in_window",
+        "successful_attempts",
+        "superseded",
+        "unresolved_candidates",
+    )
+    total_keys = (
+        "all_actual_provider_calls",
+        "all_provider_operations",
+        "all_non_attempted_failures",
+        "all_disabled_operations",
+        "all_provider_tokens",
+        "diagnostic_actual_provider_calls",
+        "diagnostic_provider_operations",
+        "diagnostic_provider_tokens",
+        "maintenance_actual_provider_calls",
+        "maintenance_provider_operations",
+        "maintenance_provider_tokens",
+        "product_actual_provider_calls",
+        "product_provider_operations",
+        "product_provider_tokens",
+    )
+    actual = {
+        "report_schema_version": report["report_schema_version"],
+        "candidate_funnel": {key: report["candidate_funnel"][key] for key in funnel_keys},
+        "provider_totals": {key: report[key] for key in total_keys},
+        "retrieval": {
+            "semantic_queries_per_new_memory_write": report["retrieval"][
+                "semantic_queries_per_new_memory_write"
+            ]
+        },
+        "tenant_storage_warning": bool(report["storage"]["warnings"]),
+    }
+    expected = json.loads(Path("tests/fixtures/usage_report_golden.json").read_text())
+    assert actual == expected
+
+
 async def test_disabled_provider_calls_excluded_from_coverage(tenant, principal):
     """``disabled`` provider.call events are not external calls and must be
     excluded from the actual-call and usage-coverage denominators
@@ -452,6 +658,7 @@ async def test_disabled_provider_calls_excluded_from_coverage(tenant, principal)
     assert coverage["provider_calls_total"] == 3
     assert coverage["provider_actual_calls"] == 1
     assert coverage["provider_disabled_calls"] == 2
+    assert not any("only 0.0%" in warning for warning in coverage["warnings"])
     # The single actual call carried tokens → 100%, not dragged down by disabled.
     assert coverage["pct_provider_calls_with_tokens"] == 100.0
     econ = report["provider_economics"]
@@ -720,9 +927,18 @@ async def test_report_shape_is_stable_and_json_serializable(tenant, principal):
         report = await build_report(session, tenant_id=tenant)
 
     expected_top_level = {
-        "tenant_id", "since", "until", "coverage", "candidate_funnel",
-        "by_source_type", "by_principal", "provider_economics",
-        "conflict_economics", "retrieval", "worker", "storage", "hourly_series",
+        "report_schema_version", "tenant_id", "since", "until", "coverage",
+        "candidate_funnel", "by_source_type", "by_principal", "provider_economics",
+        "all_provider_operations", "all_actual_provider_calls",
+        "all_non_attempted_failures", "all_disabled_operations", "all_provider_tokens",
+        "all_reported_cost_usd", "product_provider_operations",
+        "product_actual_provider_calls", "product_provider_tokens",
+        "product_reported_cost_usd", "maintenance_provider_operations",
+        "maintenance_actual_provider_calls", "maintenance_provider_tokens",
+        "maintenance_reported_cost_usd", "diagnostic_provider_operations",
+        "diagnostic_actual_provider_calls", "diagnostic_provider_tokens",
+        "diagnostic_reported_cost_usd", "conflict_economics", "retrieval", "worker",
+        "storage", "hourly_series",
     }
     assert set(report.keys()) == expected_top_level
     # Must round-trip through JSON with a Decimal/datetime-safe default.

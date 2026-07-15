@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 from contextlib import redirect_stdout
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from engram.cli import _print_human_usage_report
@@ -21,9 +22,10 @@ from engram.cli import _print_human_usage_report
 def _sample_report(*, with_provider_row: bool = True) -> dict[str, Any]:
     """A minimal report dict with every key the renderer reads."""
     report: dict[str, Any] = {
+        "report_schema_version": 3,
         "tenant_id": None,
-        "since": datetime.now(UTC).isoformat(),
-        "until": datetime.now(UTC).isoformat(),
+        "since": datetime(2026, 7, 1, tzinfo=UTC).isoformat(),
+        "until": datetime(2026, 7, 2, tzinfo=UTC).isoformat(),
         "coverage": {
             "telemetry_enabled": True,
             "first_event_at": None,
@@ -40,15 +42,19 @@ def _sample_report(*, with_provider_row: bool = True) -> dict[str, Any]:
             "lifecycle_classified": 0,
             "lifecycle_parked": 0,
             "candidate_observations": 8,
+            "candidate_cohort_size": 8,
             "logical_candidates": 7,
+            "unresolved_candidates": 1,
             "remember_attempts": 9,
             "created": 4,
             "deduped": 2,
             "superseded": 0,
             "failed": 0,
+            "new_memory_writes": 4,
             "failed_attempts": 2,
             "successful_attempts": 7,
-            "attempts_per_candidate_avg": 1.29,
+            "retry_successes_in_window": 1,
+            "attempts_per_cohort_candidate_avg": 1.12,
             "flat_candidate_units": 0,
             "kib_candidate_units": 0,
             "candidate_bytes_p50": 0,
@@ -57,6 +63,16 @@ def _sample_report(*, with_provider_row: bool = True) -> dict[str, Any]:
         },
         "by_source_type": [],
         "provider_economics": [],
+        "all_provider_operations": 10,
+        "all_actual_provider_calls": 9,
+        "all_non_attempted_failures": 1,
+        "all_disabled_operations": 1,
+        "product_provider_operations": 10,
+        "product_actual_provider_calls": 9,
+        "maintenance_provider_operations": 0,
+        "maintenance_actual_provider_calls": 0,
+        "diagnostic_provider_operations": 0,
+        "diagnostic_actual_provider_calls": 0,
         "conflict_economics": {
             "conflict_classifications": 3,
             "conflict_actual_calls": 2,
@@ -73,6 +89,7 @@ def _sample_report(*, with_provider_row: bool = True) -> dict[str, Any]:
             "query_embedding_actual_calls": 4,
             "query_embedding_tokens": 123,
             "semantic_queries_per_created_memory": 0.0,
+            "semantic_queries_per_new_memory_write": 0.0,
             "retrievals_per_active_principal": 0.0,
         },
         "worker": {"by_job_type_status": [], "oldest_pending_age_seconds": None},
@@ -99,6 +116,7 @@ def _sample_report(*, with_provider_row: bool = True) -> dict[str, Any]:
         report["provider_economics"] = [
             {
                 "operation": "classification",
+                "usage_class": "request",
                 "provider_host": "api.openai.com",
                 "model": "gpt-4o-mini",
                 "calls": 10,
@@ -134,6 +152,8 @@ def test_human_report_renders_without_error_with_provider_row():
     with redirect_stdout(buf):
         _print_human_usage_report(report)
     output = buf.getvalue()
+    golden = Path("tests/fixtures/usage_report_human_golden.txt").read_text()
+    assert output == golden
     assert "classification" in output
     # The renamed column is rendered (as the fallback count).
     assert "fallback=2" in output
