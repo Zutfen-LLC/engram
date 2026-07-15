@@ -84,7 +84,7 @@ def _as_uuid(value: UUID | str | None) -> UUID | None:
 # Constraints whose IntegrityError is the intended idempotent no-op: a
 # duplicate primary key (``usage_events_pkey``, from a retried insert reusing
 # the same ``event_id``) or a duplicate dedupe_key (``idx_usage_events_dedupe``,
-# from a retried candidate.observed / client.lifecycle_summary event). Any
+# from a retried ingest-keyed candidate.observed / client.lifecycle_summary event). Any
 # OTHER integrity failure (foreign-key, CHECK, privilege error surfaced as an
 # integrity error) is a real problem that must be logged, not silently
 # suppressed as a "duplicate" (ENG-METER-001 blocking correction).
@@ -164,6 +164,7 @@ async def record_usage_event_best_effort(
     principal_id: UUID | str | None = None,
     workspace_id: UUID | str | None = None,
     correlation_id: UUID | None = None,
+    ingest_id: UUID | None = None,
     dedupe_key: str | None = None,
     job_id: UUID | str | None = None,
     source_type: str | None = None,
@@ -226,6 +227,7 @@ async def record_usage_event_best_effort(
                 operation=operation,
                 status=status,
                 correlation_id=correlation_id,
+                ingest_id=ingest_id,
                 dedupe_key=dedupe_key,
                 job_id=job_uuid,
                 source_type=source_type,
@@ -294,16 +296,16 @@ async def record_candidate_once(
     principal_id: UUID | str | None,
     workspace_id: UUID | str | None,
     correlation_id: UUID,
+    ingest_id: UUID,
     candidate_utf8_bytes: int,
     source_type: str | None,
 ) -> UUID | None:
-    """Record ``candidate.observed`` exactly once per ``correlation_id``.
+    """Record ``candidate.observed`` exactly once per server-owned ingest.
 
     Idempotent via ``usage_events``' partial unique index on
     ``(tenant_id, event_type, dedupe_key)``: whichever of classify/remember
     (or a retry of either) reaches this first wins; later calls for the same
-    correlation_id are no-ops. A direct ``/v1/remember`` call not preceded by
-    ``/v1/classify`` still produces exactly one observation.
+    ingest id are no-ops. The client correlation id is trace-only.
     """
     return await record_usage_event_best_effort(
         tenant_id=tenant_id,
@@ -313,7 +315,8 @@ async def record_candidate_once(
         operation="process_memory_candidate",
         status="accepted_for_processing",
         correlation_id=correlation_id,
-        dedupe_key=str(correlation_id),
+        ingest_id=ingest_id,
+        dedupe_key=f"ingest:{ingest_id}",
         source_type=source_type,
         input_count=1,
         input_bytes=max(0, candidate_utf8_bytes),
@@ -326,6 +329,8 @@ async def record_candidate_outcome(
     principal_id: UUID | str | None,
     workspace_id: UUID | str | None,
     correlation_id: UUID,
+    ingest_id: UUID | None,
+    attempt_id: UUID,
     status: str,
     source_type: str | None = None,
     final_kind: str | None = None,
@@ -333,18 +338,19 @@ async def record_candidate_outcome(
     final_visibility: str | None = None,
     classification_mode: str | None = None,
 ) -> UUID | None:
-    """Record one ``candidate.outcome`` attempt for ``correlation_id``.
+    """Record one ``candidate.outcome`` attempt for ``ingest_id``.
 
-    Append-only per attempt (ENG-METER-001): every ``/v1/remember`` invocation
-    appends its own row with its own auto-generated ``event_id`` — there is no
-    ``dedupe_key``. ``candidate.observed`` stays unique per ``correlation_id``
+    Append-only per attempt: every ``/v1/remember`` invocation receives a
+    server-generated ``attempt_id`` used as this event's ID. Retrying only the
+    telemetry insert reuses that ID; there is no ``dedupe_key``.
+    ``candidate.observed`` stays unique per ingest
     (see :func:`record_candidate_once`), but a candidate may be attempted more
     than once (e.g. a transient ``failed`` attempt followed by a successful
     retry), and both attempts are recorded honestly.
 
     ``status`` is the terminal outcome of THIS attempt: ``created``,
     ``deduped``, ``superseded``, or ``failed``. The report derives a single
-    *logical* outcome per ``correlation_id`` (earliest non-``failed`` attempt,
+    *logical* outcome per ingest (earliest non-``failed`` attempt,
     else ``failed``) so retries do not distort the failure/create funnel.
     """
     meta = {
@@ -365,8 +371,33 @@ async def record_candidate_outcome(
         operation="process_memory_candidate",
         status=status,
         correlation_id=correlation_id,
+        ingest_id=ingest_id,
         source_type=source_type,
         metadata=meta,
+        event_id=attempt_id,
+    )
+
+
+async def record_ingest_reuse_rejected(
+    *,
+    tenant_id: UUID | str,
+    principal_id: UUID | str | None,
+    workspace_id: UUID | str | None,
+    correlation_id: UUID | None,
+    ingest_id: UUID | None,
+    mismatches: tuple[str, ...],
+) -> UUID | None:
+    """Record privacy-safe diagnostics for incompatible ingest reuse."""
+    return await record_usage_event_best_effort(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        workspace_id=workspace_id,
+        event_type="candidate.ingest_reuse_rejected",
+        operation="process_memory_candidate",
+        status="rejected",
+        correlation_id=correlation_id,
+        ingest_id=ingest_id,
+        metadata={"mismatch_categories": list(mismatches)},
     )
 
 
@@ -391,6 +422,7 @@ async def record_provider_call(
     latency_ms: int | None = None,
     reported_cost_usd: float | None = None,
     correlation_id: UUID | None = None,
+    ingest_id: UUID | None = None,
     job_id: UUID | str | None = None,
     event_id: UUID | None = None,
     metadata: dict[str, Any] | None = None,
@@ -415,6 +447,7 @@ async def record_provider_call(
         operation=operation,
         status=status,
         correlation_id=correlation_id,
+        ingest_id=ingest_id,
         job_id=job_id,
         provider_adapter=provider_adapter,
         provider_host=provider_host,

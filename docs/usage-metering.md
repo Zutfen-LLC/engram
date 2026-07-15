@@ -1,4 +1,4 @@
-# Usage metering (ENG-METER-001 through ENG-METER-003)
+# Usage metering (ENG-METER-001 through ENG-METER-004)
 
 > **Status:** this is an OBSERVABILITY slice, not a billing slice. It exists so
 > real dogfood data can inform hosted pricing allowances later. Nothing here
@@ -25,6 +25,10 @@ append-only ledger that answers these questions from real usage instead of
 guesswork. `engram usage-report` turns it into a report (see
 `docs/ops/dogfood-usage-metering.md` for the runbook).
 
+Migration `020_candidate_ingests.sql` adds the authoritative identity
+substrate. It does not calculate a charge: an ingest ID is a prerequisite for
+future authoritative billing, not a billable unit by itself.
+
 ## Event taxonomy
 
 All events share one table, `usage_events`, distinguished by `event_type` +
@@ -32,8 +36,9 @@ All events share one table, `usage_events`, distinguished by `event_type` +
 
 | event_type | operation (examples) | status (examples) | meaning |
 |---|---|---|---|
-| `candidate.observed` | `process_memory_candidate` | `accepted_for_processing` | One candidate memory entered the pipeline (via `/v1/classify` and/or `/v1/remember`). Recorded exactly once per `correlation_id`. |
-| `candidate.outcome` | `process_memory_candidate` | `created` / `deduped` / `superseded` / `failed` | The terminal outcome of ONE `/v1/remember` attempt for a candidate. **Append-only per attempt** — every invocation appends its own row; the report derives a single logical outcome per `correlation_id` (earliest non-`failed` attempt, else `failed`). |
+| `candidate.observed` | `process_memory_candidate` | `accepted_for_processing` | One candidate memory entered the pipeline. New rows are recorded once per server-issued `ingest_id`. |
+| `candidate.outcome` | `process_memory_candidate` | `created` / `deduped` / `superseded` / `failed` | The terminal outcome of one `/v1/remember` attempt. Every invocation has a distinct server-issued attempt UUID used as the event ID. |
+| `candidate.ingest_reuse_rejected` | `process_memory_candidate` | `rejected` | Safe diagnostic for incompatible ingest reuse; it is not a processed candidate or successful attempt. |
 | `provider.call` | `classification`, `conflict_classification`, `embedding_document`, `embedding_backfill`, `embedding_query_recall`, `embedding_query_search`, `embedding_setup` | `succeeded` / `failed` / `disabled` | One instrumented provider operation. `external_call_attempted` distinguishes setup/preflight work from an external request. |
 | `retrieval.request` | `startup_recall`, `semantic_recall`, `keyword_search`, `semantic_search`, `hybrid_search` | `succeeded` / `failed` | One recall/search request (success or failure), with result counts and the canonical embedding outcome described below. |
 | `client.lifecycle_summary` | `sync_turn`, `pre_compress`, `session_end` | `succeeded` / `partial` | A client-reported aggregate for one hooks-adapter lifecycle invocation. **Diagnostic and non-authoritative** — see below. |
@@ -42,17 +47,21 @@ All events share one table, `usage_events`, distinguished by `event_type` +
 
 See `migrations/017_usage_events.sql` for the full DDL. Notable columns:
 
-- `correlation_id` — one UUID per extracted candidate. Shared by the
+- `ingest_id` — immutable server-owned candidate identity shared by classify,
+  remember, its receipt, async jobs, and provider events. New accounting and
+  logical-outcome grouping use this field. Historical null rows fall back to
+  correlation identity only for reporting.
+- `correlation_id` — an optional client trace UUID. Shared by the
   `candidate.observed` event, the `candidate.outcome` event, and (when the
   candidate originated from `/v1/remember`) the worker-driven
   `provider.call` events for that candidate's embedding generation and
-  conflict classification — the correlation id is threaded through the job
-  payload so async worker calls are attributable to the original candidate.
+  conflict classification. It is never a uniqueness, deduplication, or future
+  billing identity, and reuse cannot suppress a distinct candidate.
   `provider.call` events also carry `job_id` for worker-driven calls.
   `retrieval.request` events do not set `correlation_id`.
 - `dedupe_key` — the idempotency key backing the partial unique index on
   `(tenant_id, event_type, dedupe_key)`. Used by `candidate.observed`
-  (`str(correlation_id)`) and `client.lifecycle_summary`
+  (`ingest:<ingest_id>`) and `client.lifecycle_summary`
   (`str(invocation_id)`). `candidate.outcome` is append-only per attempt and
   carries **no** `dedupe_key` (see "Correlation and deduplication semantics").
 - `provider_host` — a bare hostname (e.g. `api.deepinfra.com`), never a path,
@@ -90,52 +99,58 @@ nullable `metadata.embedding_call_occurred` is derived exactly as follows:
 The requested retrieval mode is never used as a proxy for whether an external
 embedding call occurred.
 
-## Correlation and deduplication semantics
+## Server-owned ingest identity and deduplication
 
-One `correlation_id` is generated per extracted candidate — by the client
-(hooks adapter) when one exists, or by the server when a caller doesn't
-supply one. It is threaded through:
+`candidate_ingests.id` is generated by Engram and immutable from the
+application role. Each row binds the tenant, authenticated principal, resolved
+workspace (including null), canonical source type, and the same canonical
+content hash used by `memory_items`. Raw candidate content is never stored.
+The optional `client_correlation_id` is trace-only.
 
-1. `POST /v1/classify` (optional request field, echoed in the response).
-2. `POST /v1/remember` (optional request field, echoed in the response).
+`POST /v1/classify` commits the ingest before provider execution, records the
+observation against it, binds the classification receipt to it, and returns
+both IDs. The ingest therefore survives provider fallback. Failure to create
+it is a normal persistence error; later telemetry failure remains best-effort.
 
-Both endpoints call `record_candidate_once`, which inserts a
-`candidate.observed` row keyed by `dedupe_key = str(correlation_id)`. The
-partial unique index on `(tenant_id, event_type, dedupe_key)` makes this
-idempotent: whichever of classify/remember (or a retry of either) reaches the
-database first wins; the other is a silent no-op. This is why a direct
-`/v1/remember` call with no preceding `/v1/classify` still produces exactly
-one `candidate.observed` event, and why a classify-then-remember pair never
-double-counts.
+`POST /v1/remember` resolves identity in this order:
 
-`candidate.outcome` is now **append-only per attempt**: every `/v1/remember`
-invocation appends its own row (no `dedupe_key`), so a transiently `failed`
-attempt followed by a successful retry is recorded honestly as two rows.
-`candidate.observed` stays unique per `correlation_id` (one observation per
-candidate). The report derives a single **logical outcome** per
-`correlation_id` — the earliest non-`failed` attempt's status, or `failed`
-when no attempt succeeded — for the failure/create funnel, and reports raw
-attempt-level diagnostics (`remember_attempts`, `failed_attempts`,
-`attempts_per_candidate_avg`) separately. This corrects the earlier
-first-outcome-wins model, which silently suppressed a later successful retry
-once a `failed` row existed.
+1. With a receipt, the locked receipt's ingest is authoritative; a body value
+   must match it exactly.
+2. Without a receipt, a supplied ingest is key-share locked and every binding
+   field is verified before any mutation.
+3. With neither, Engram creates and commits a new ingest.
 
-The report first derives each candidate's `first_seen_at` from the earliest
-`candidate.observed` or `candidate.outcome` row. A candidate is in the cohort
-only when that timestamp is in `[since, until)`. For cohort candidates, all
-outcomes before `until` are inspected: the earliest non-failed outcome wins,
-otherwise the earliest failure wins, otherwise the candidate is unresolved.
-Logical outcomes are therefore an as-of-`until` cohort snapshot and are not
-additive across independently generated daily reports. Candidate observations,
-remember attempts, and retry successes remain event-window metrics.
-Compatibility aliases remain:
-`total_attempts == remember_attempts` and
-`distinct_candidates == logical_candidates`.
+Receipt replay returns the same ingest. Incompatible reuse returns a
+non-mutating conflict and records only safe mismatch category names. Every
+remember invocation also creates a distinct `attempt_id`; that UUID is the
+`candidate.outcome` event ID and is returned on successful responses. Retrying
+only a telemetry insert reuses the same attempt ID.
 
-`new_memory_writes = created + superseded`, because supersession writes a new
-memory row while invalidating the old one. Per-principal write counts and
-semantic-query ratios use this retry-safe denominator; `created_count` remains
-the exact created-only field.
+The hooks adapter still generates a correlation UUID, then passes classify's
+server-issued ingest and receipt into remember. It never manufactures an
+ingest, and classify failure retains the existing volatile fallback. Async
+`embedding.generate`, `conflict.check`, classification-refinement, and
+promotion payloads carry the ingest when known; document embedding and
+conflict-classification provider events carry it too. Older job payloads with
+no ingest remain valid.
+
+`candidate.observed` uses `dedupe_key = ingest:<ingest_id>`. The partial unique
+index makes classify/remember concurrency and telemetry retries idempotent for
+one ingest. Reusing a correlation UUID across two server ingests produces two
+observations.
+
+`candidate.outcome` is append-only per attempt. The report derives one logical
+outcome per ingest (earliest non-failed attempt, otherwise earliest failure)
+and keeps raw attempt metrics separately. During the mixed historical/new
+period, only rows with null ingest fall back to correlation grouping. Two
+server ingests never merge because they share a client trace UUID. Coverage
+fields and warnings expose the remaining legacy population.
+
+The report's cohort is based on first observation/outcome in `[since, until)`
+and resolves outcomes as of `until`. It exposes `candidate_ingests`,
+`candidate_ingests_with_outcomes`, `candidate_ingests_unresolved`,
+`legacy_correlation_candidates`, and `ingest_identity_coverage_pct`.
+`new_memory_writes = created + superseded`; attempt metrics remain append-only.
 
 ## Provider operations, calls, and failures
 
@@ -216,6 +231,29 @@ tenant-scoped table (see `migrations/003_app_role_and_force_rls.sql`):
 - Owner/migration operations bypass RLS entirely (as with every other admin/
   reporting path in this codebase), which is how `engram usage-report`
   produces cross-tenant platform reporting.
+
+`candidate_ingests` has the same `ENABLE` + `FORCE` RLS posture and canonical
+tenant policy. The app role has only `SELECT` and `INSERT`; it cannot update or
+delete an identity. Composite tenant/ingest foreign keys prevent a usage event
+or receipt from referencing another tenant's ingest. The owner retains the
+migration and reporting access used elsewhere in Engram.
+
+## Operator rollout and rollback
+
+1. Apply migration 020 before deploying server code. It creates
+   `candidate_ingests`, adds nullable ingest references to usage events and
+   classification receipts, and adds report indexes. Reapplication is safe.
+2. Deploy the server, then the SDK, then `engram-hooks`. This ordering ensures
+   classify can return an ingest before hooks attempts to forward it.
+3. Expect a mixed period: historical rows remain null and reports fall back to
+   correlation only for those rows. Monitor
+   `pct_candidate_events_with_ingest_id`, `legacy_candidate_event_count`, and
+   the coverage warning until upgraded clients dominate.
+4. To roll application code back, leave migration 020 in place. Its new
+   columns are nullable, old clients and queued jobs omit them safely, and old
+   reports can ignore them. Do not fabricate IDs for historical events. A
+   schema rollback would require first removing all new references and is not
+   part of normal rollback procedure.
 
 ## Telemetry configuration
 

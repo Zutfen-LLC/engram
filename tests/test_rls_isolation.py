@@ -58,6 +58,7 @@ RLS_TABLES: tuple[str, ...] = (
     "memory_kinds",
     "memory_edges",
     "usage_events",
+    "candidate_ingests",
 )
 
 # Representative high-risk tables exercised with real rows below. The full set

@@ -203,6 +203,7 @@ class EngramClient:
         external_source: str | None = None,
         classification_run_id: UUID | None = None,
         correlation_id: UUID | None = None,
+        ingest_id: UUID | None = None,
     ) -> RememberResponse:
         """Write a memory item with dedup, trust defaults, and supersession.
 
@@ -231,6 +232,7 @@ class EngramClient:
             external_source=external_source,
             classification_run_id=classification_run_id,
             correlation_id=correlation_id,
+            ingest_id=ingest_id,
         )
         return await self._send(
             "POST",

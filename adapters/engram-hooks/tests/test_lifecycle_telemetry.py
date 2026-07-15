@@ -27,6 +27,7 @@ class _Client:
         self.classify_calls.append({"content": content, **kwargs})
         return SimpleNamespace(
             classification_run_id="run-id",
+            ingest_id="ingest-id",
             suggested_kind="fact",
             suggested_wing=None,
             suggested_room=None,

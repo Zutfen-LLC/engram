@@ -1,5 +1,10 @@
 {
   "candidate_funnel": {
+    "candidate_ingests": 0,
+    "candidate_ingests_with_outcomes": 0,
+    "candidate_ingests_unresolved": 0,
+    "legacy_correlation_candidates": 4,
+    "ingest_identity_coverage_pct": 0.0,
     "candidate_cohort_size": 4,
     "candidate_observations": 3,
     "created": 2,
@@ -30,7 +35,7 @@
     "product_provider_operations": 5,
     "product_provider_tokens": 35
   },
-  "report_schema_version": 3,
+  "report_schema_version": 4,
   "retrieval": {
     "semantic_queries_per_new_memory_write": 0.0
   },

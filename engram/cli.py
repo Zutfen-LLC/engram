@@ -1238,6 +1238,11 @@ def _print_human_usage_report(report: dict[str, Any]) -> None:
     print(f"  actual calls w/ tokens:        {cov['pct_provider_calls_with_tokens']}%")
     print(f"  actual calls w/ cost:          {cov['pct_provider_calls_with_cost']}%")
     print(
+        "  candidate events w/ ingest:   "
+        f"{cov['pct_candidate_events_with_ingest_id']}% "
+        f"({cov['legacy_candidate_event_count']} legacy)"
+    )
+    print(
         f"  active principals:            {cov['active_principals']} "
         f"({cov['active_principals_with_lifecycle_summary']} with lifecycle summaries)"
     )
@@ -1248,6 +1253,9 @@ def _print_human_usage_report(report: dict[str, Any]) -> None:
     for key in (
         "lifecycle_extracted", "lifecycle_guard_rejected", "lifecycle_classified",
         "lifecycle_parked", "candidate_observations", "candidate_cohort_size",
+        "candidate_ingests", "candidate_ingests_with_outcomes",
+        "candidate_ingests_unresolved", "legacy_correlation_candidates",
+        "ingest_identity_coverage_pct",
         "logical_candidates", "unresolved_candidates", "remember_attempts",
         "created", "deduped", "superseded", "failed", "new_memory_writes",
         "failed_attempts", "successful_attempts", "retry_successes_in_window",

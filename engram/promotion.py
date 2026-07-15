@@ -801,7 +801,11 @@ async def schedule_evidence_promotion_if_qualified(
         session,
         tenant_id=item.tenant_id,
         job_type="promotion.path_a",
-        payload={"memory_item_id": str(item.id), "classification_run_id": str(run.id)},
+        payload={
+            "memory_item_id": str(item.id),
+            "classification_run_id": str(run.id),
+            **({"ingest_id": str(run.ingest_id)} if run.ingest_id is not None else {}),
+        },
         run_after=run_after,
         dedupe_key=f"promotion.path_a:{item.id}:{run.id}",
     )

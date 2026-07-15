@@ -22,6 +22,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from engram import semantic, trust_policy
 from engram.auth import READ_SCOPE, WRITE_SCOPE
 from engram.authority import authority_allows_supersession, authority_label, derive_memory_authority
+from engram.candidate_ingests import (
+    CandidateIdentity,
+    create_ingest,
+    identity_mismatches,
+    lock_ingest,
+)
 from engram.canonicalize import canonicalize, content_hash
 from engram.classification import ClassificationResult, classify_rules_only
 from engram.classification_evidence import bind_run, lock_run
@@ -40,6 +46,7 @@ from engram.jobs import enqueue_job
 from engram.memory_access import eligibility_sql, resolve_workspace_scope, tenant_sql
 from engram.memory_kinds import UnknownMemoryKindError, require_enabled_memory_kind
 from engram.models import (
+    CandidateIngest,
     ClassificationRun,
     ItemEvent,
     MemoryItem,
@@ -55,6 +62,7 @@ from engram.usage import (
     embedding_call_occurred_for,
     record_candidate_once,
     record_candidate_outcome,
+    record_ingest_reuse_rejected,
     record_retrieval_request,
 )
 
@@ -102,12 +110,10 @@ class RememberRequest(BaseModel):
     external_id: str | None = None
     external_source: str | None = None
     classification_run_id: UUID | None = None
-    # Optional client-supplied correlation id shared with the preceding
-    # /v1/classify call for the same candidate (ENG-METER-001). When absent
-    # the server generates one. Lifecycle hooks always supply this — one UUID
-    # per extracted candidate — so classify+remember count as a single
-    # candidate.observed usage event rather than two.
+    # Optional client trace shared with a preceding /v1/classify call. It is
+    # never an identity or deduplication key; ingest_id owns those semantics.
     correlation_id: UUID | None = None
+    ingest_id: UUID | None = None
 
 
 class RememberResponse(BaseModel):
@@ -120,6 +126,8 @@ class RememberResponse(BaseModel):
     # Additive, backward-compatible: the effective correlation id (echoed back
     # if the caller supplied one, otherwise server-generated).
     correlation_id: UUID
+    ingest_id: UUID
+    attempt_id: UUID
 
 
 class RecallRequest(BaseModel):
@@ -478,7 +486,7 @@ async def remember(
     """Write a memory item with dedup, trust defaults, and supersession.
 
     Thin wrapper around :func:`_remember_impl` that owns usage-telemetry
-    correlation (ENG-METER-001): it resolves the effective correlation id and
+    attribution: it resolves the effective correlation id and
     guarantees exactly one ``candidate.outcome`` event is recorded — status
     ``created``/``deduped``/``superseded`` on success, ``failed`` for every
     other early-return/raised path (inventoried in ``_remember_impl``) —
@@ -492,6 +500,7 @@ async def remember(
     RLS session context (never request content), so no secret/content can leak
     into telemetry via this path.
     """
+    attempt_id = uuid.uuid4()
     correlation_id = req.correlation_id or uuid.uuid4()
     outcome_ctx: dict[str, Any] = {"classification_mode": "explicit" if req.kind else "automatic"}
     # Resolve authenticated identity up front so every failure path (including
@@ -509,6 +518,7 @@ async def remember(
             req, session, correlation_id=correlation_id, outcome_ctx=outcome_ctx,
             tenant_id=tenant_id, principal_id=principal_id,
             principal_type=_principal_type,
+            attempt_id=attempt_id,
         )
         outcome_status = result.status
         return result
@@ -518,6 +528,8 @@ async def remember(
             principal_id=outcome_ctx.get("principal_id"),
             workspace_id=outcome_ctx.get("workspace_id"),
             correlation_id=correlation_id,
+            ingest_id=outcome_ctx.get("ingest_id"),
+            attempt_id=attempt_id,
             status=outcome_status,
             source_type=req.source_type,
             final_kind=outcome_ctx.get("final_kind"),
@@ -536,6 +548,7 @@ async def _remember_impl(
     tenant_id: UUID,
     principal_id: UUID,
     principal_type: str,
+    attempt_id: UUID,
 ) -> RememberResponse:
     """The actual write logic. See :func:`remember` for the telemetry wrapper.
 
@@ -563,19 +576,15 @@ async def _remember_impl(
     workspace_id = await _resolve_workspace_id(session, tenant_id, req.workspace)
     outcome_ctx["workspace_id"] = workspace_id
 
-    # candidate.observed is recorded once per correlation_id (idempotent via
-    # usage_events' dedupe_key unique index) so a direct /v1/remember call and
-    # a preceding /v1/classify call for the same candidate never double-count.
-    await record_candidate_once(
+    identity = CandidateIdentity(
         tenant_id=tenant_id,
         principal_id=principal_id,
         workspace_id=workspace_id,
-        correlation_id=correlation_id,
-        candidate_utf8_bytes=len(req.content.encode("utf-8")),
         source_type=req.source_type,
+        content_hash=chash,
     )
-
     receipt: ClassificationRun | None = None
+    ingest: CandidateIngest | None
     if req.classification_run_id is not None:
         receipt = await lock_run(session, req.classification_run_id)
         if (
@@ -584,6 +593,85 @@ async def _remember_impl(
             or receipt.principal_id != principal_id
         ):
             raise HTTPException(status_code=404, detail="classification run not found")
+        if (
+            receipt.expires_at <= datetime.now(UTC)
+            or receipt.content_hash != chash
+            or receipt.source_type != req.source_type
+            or receipt.workspace_id != workspace_id
+        ) and receipt.bound_at is None:
+            raise HTTPException(status_code=422, detail="classification run does not match request")
+
+    # The locked receipt is authoritative. Historical pre-migration receipts
+    # acquire a newly issued ingest here; a body-supplied id never chooses it.
+    if receipt is not None and receipt.ingest_id is None:
+        ingest = create_ingest(identity=identity, client_correlation_id=req.correlation_id)
+        session.add(ingest)
+        receipt.ingest_id = ingest.id
+        await session.commit()
+        receipt = await lock_run(session, receipt.id)
+        if receipt is None:
+            raise HTTPException(status_code=404, detail="classification run not found")
+
+    if receipt is not None:
+        if req.ingest_id is not None and req.ingest_id != receipt.ingest_id:
+            await record_ingest_reuse_rejected(
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                workspace_id=workspace_id,
+                correlation_id=req.correlation_id,
+                ingest_id=None,
+                mismatches=(),
+            )
+            raise HTTPException(
+                status_code=409, detail="ingest_id does not match classification run"
+            )
+        if receipt.ingest_id is None:  # pragma: no cover - guarded above
+            raise RuntimeError("classification run has no ingest identity")
+        ingest = await lock_ingest(session, receipt.ingest_id)
+    elif req.ingest_id is not None:
+        ingest = await lock_ingest(session, req.ingest_id)
+        if ingest is None:
+            await record_ingest_reuse_rejected(
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                workspace_id=workspace_id,
+                correlation_id=req.correlation_id,
+                ingest_id=None,
+                mismatches=("tenant_mismatch",),
+            )
+            raise HTTPException(status_code=404, detail="candidate ingest not found")
+    else:
+        ingest = create_ingest(identity=identity, client_correlation_id=req.correlation_id)
+        session.add(ingest)
+        # Authoritative identity must be durable before the rest of remember.
+        await session.commit()
+
+    if ingest is None:
+        raise HTTPException(status_code=404, detail="candidate ingest not found")
+    mismatches = identity_mismatches(ingest, identity)
+    if mismatches:
+        await record_ingest_reuse_rejected(
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            workspace_id=workspace_id,
+            correlation_id=req.correlation_id,
+            ingest_id=ingest.id,
+            mismatches=mismatches,
+        )
+        raise HTTPException(status_code=409, detail="candidate ingest does not match request")
+    outcome_ctx["ingest_id"] = ingest.id
+
+    await record_candidate_once(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        workspace_id=workspace_id,
+        correlation_id=correlation_id,
+        ingest_id=ingest.id,
+        candidate_utf8_bytes=len(req.content.encode("utf-8")),
+        source_type=req.source_type,
+    )
+
+    if receipt is not None:
         if receipt.bound_at is None and receipt.memory_item_id is not None:
             raise HTTPException(status_code=409, detail="classification run has invalid state")
         if receipt.bound_at is not None:
@@ -619,15 +707,9 @@ async def _remember_impl(
                 memory_confidence=bound_item.memory_confidence,
                 deduped_existing_id=bound_item.id,
                 correlation_id=correlation_id,
+                ingest_id=ingest.id,
+                attempt_id=attempt_id,
             )
-        if (
-            receipt.expires_at <= datetime.now(UTC)
-            or receipt.tenant_id != tenant_id
-            or receipt.content_hash != chash
-            or receipt.source_type != req.source_type
-            or receipt.workspace_id != workspace_id
-        ):
-            raise HTTPException(status_code=422, detail="classification run does not match request")
 
     kind = req.kind
     wing = req.wing
@@ -882,6 +964,8 @@ async def _remember_impl(
             memory_confidence=existing.memory_confidence,
             deduped_existing_id=existing.id,
             correlation_id=correlation_id,
+            ingest_id=ingest.id,
+            attempt_id=attempt_id,
         )
 
     provider = "caller"
@@ -1020,6 +1104,7 @@ async def _remember_impl(
                     # worker-originated embedding provider call is attributed to
                     # the original candidate, and propagated into conflict.check.
                     "correlation_id": str(correlation_id),
+                    "ingest_id": str(ingest.id),
                 },
                 dedupe_key=f"embedding.generate:{item.id}:{profile.id}",
             )
@@ -1036,6 +1121,8 @@ async def _remember_impl(
         memory_confidence=memory_confidence,
         superseded_id=superseded_id,
         correlation_id=correlation_id,
+        ingest_id=ingest.id,
+        attempt_id=attempt_id,
     )
 
 

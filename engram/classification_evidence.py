@@ -91,6 +91,7 @@ def new_run(
     workspace_id: UUID | None,
     context: str | None,
     result: ClassificationResult,
+    ingest_id: UUID | None = None,
     now: datetime | None = None,
 ) -> ClassificationRun:
     created_at = now or datetime.now(UTC)
@@ -100,6 +101,7 @@ def new_run(
     return ClassificationRun(
         tenant_id=tenant_id,
         principal_id=principal_id,
+        ingest_id=ingest_id,
         content_hash=hash_content(content),
         canonicalization_version=CANONICALIZATION_VERSION,
         source_type=source_type,

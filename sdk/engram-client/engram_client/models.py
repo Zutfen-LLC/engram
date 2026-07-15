@@ -46,6 +46,7 @@ class RememberRequest(BaseModel):
     # same candidate. When omitted the server generates one (see
     # RememberResponse.correlation_id).
     correlation_id: UUID | None = None
+    ingest_id: UUID | None = None
 
 
 class RememberResponse(BaseModel):
@@ -56,6 +57,8 @@ class RememberResponse(BaseModel):
     deduped_existing_id: UUID | None = None
     superseded_id: UUID | None = None
     correlation_id: UUID
+    ingest_id: UUID
+    attempt_id: UUID
 
 
 # ---- /v1/recall ----
@@ -119,6 +122,7 @@ class ClassifyResponse(BaseModel):
     classification_run_id: UUID
     expires_at: datetime
     correlation_id: UUID
+    ingest_id: UUID
     suggested_kind: str
     suggested_wing: str | None = None
     suggested_room: str | None = None

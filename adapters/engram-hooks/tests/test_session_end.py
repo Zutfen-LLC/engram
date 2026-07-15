@@ -17,6 +17,7 @@ class RecordingClient:
             retention_confidence=0.9,
             retention_disposition="retain",
             classification_run_id="run-id",
+            ingest_id="ingest-id",
             suggested_kind="fact",
             suggested_wing=None,
             suggested_room=None,
@@ -52,4 +53,5 @@ async def test_session_end_routes_dedicated_source_type(tmp_path) -> None:
         "workspace": None,
         "source_type": "session_end",
         "classification_run_id": "run-id",
+        "ingest_id": "ingest-id",
     }
