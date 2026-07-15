@@ -391,8 +391,16 @@ async def _classify_relationship_llm(
             )
         raise
     message = response.choices[0].message.content or "{}"
-    payload = json.loads(message)
-    if not isinstance(payload, dict):
+    usage = extract_openai_compatible_usage(response)
+    try:
+        payload = json.loads(message)
+        if not isinstance(payload, dict):
+            raise ValueError("conflict classification response was not a JSON object")
+    except (json.JSONDecodeError, ValueError) as parse_exc:
+        # The provider delivered a response, but it was not usable JSON (or not
+        # a JSON object). Record this real failure now (previously json.loads
+        # raised before the isinstance branch could record it), carrying any
+        # usage/cost the response DID carry.
         if tenant_id is not None:
             await record_provider_call(
                 tenant_id=tenant_id,
@@ -405,12 +413,18 @@ async def _classify_relationship_llm(
                 model=settings.classification_model,
                 input_count=1,
                 input_bytes=input_bytes,
+                prompt_tokens=usage.prompt_tokens,
+                completion_tokens=usage.completion_tokens,
+                total_tokens=usage.total_tokens,
+                reported_cost_usd=usage.reported_cost_usd,
                 latency_ms=timer.elapsed_ms(),
                 correlation_id=correlation_id,
                 job_id=job_id,
-                metadata={"application_fallback": True, "failure_stage": "non_json_response"},
+                metadata={"application_fallback": True, "failure_stage": "response_parse"},
             )
-        raise ValueError("conflict classification response was not a JSON object")
+        raise ValueError(
+            "conflict classification response was not valid JSON or not a JSON object"
+        ) from parse_exc
 
     verdict = _parse_verdict(payload.get("verdict"))
     try:
@@ -428,7 +442,6 @@ async def _classify_relationship_llm(
     }
 
     if tenant_id is not None:
-        usage = extract_openai_compatible_usage(response)
         await record_provider_call(
             tenant_id=tenant_id,
             principal_id=principal_id,

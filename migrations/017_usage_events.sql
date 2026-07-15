@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS usage_events (
 
     event_type          TEXT NOT NULL,   -- candidate.observed | candidate.outcome | provider.call | retrieval.request | client.lifecycle_summary
     operation           TEXT NOT NULL,   -- e.g. process_memory_candidate, classification, embedding_document, semantic_recall, sync_turn, ...
-    status               TEXT NOT NULL,   -- e.g. accepted_for_processing, created, deduped, superseded, failed, succeeded, fallback, disabled, no_usage, partial
+    status               TEXT NOT NULL,   -- accepted_for_processing, created, deduped, superseded, failed, succeeded, disabled (provider.call status records the provider outcome only: succeeded/failed/disabled; application fallback is metadata, not a status)
 
     correlation_id      UUID NULL,       -- one per extracted candidate; ties candidate.observed <-> candidate.outcome <-> classify/remember
     dedupe_key          TEXT NULL,       -- idempotency key for retried inserts (partial unique index below)

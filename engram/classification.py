@@ -742,8 +742,16 @@ async def _call_openai_classification(
         raise
 
     message = response.choices[0].message.content or "{}"
-    payload = json.loads(message)
-    if not isinstance(payload, dict):
+    usage = extract_openai_compatible_usage(response)
+    try:
+        payload = json.loads(message)
+        if not isinstance(payload, dict):
+            raise ValueError("classification response was not a JSON object")
+    except (json.JSONDecodeError, ValueError) as parse_exc:
+        # The provider delivered a response, but it was not usable JSON (or not
+        # a JSON object). This is a real provider failure that previously
+        # vanished: json.loads raised before the isinstance branch could record
+        # it. Record it now, carrying any usage/cost the response DID carry.
         if tenant_id is not None:
             await record_provider_call(
                 tenant_id=tenant_id,
@@ -756,15 +764,20 @@ async def _call_openai_classification(
                 model=settings.classification_model,
                 input_count=1,
                 input_bytes=utf8_byte_len(prompt),
+                prompt_tokens=usage.prompt_tokens,
+                completion_tokens=usage.completion_tokens,
+                total_tokens=usage.total_tokens,
+                reported_cost_usd=usage.reported_cost_usd,
                 latency_ms=timer.elapsed_ms(),
                 correlation_id=correlation_id,
                 job_id=job_id,
-                metadata=_classification_failure_meta(source_type, "non_json_response"),
+                metadata=_classification_failure_meta(source_type, "response_parse"),
             )
-        raise ValueError("classification response was not a JSON object")
+        raise ValueError(
+            "classification response was not valid JSON or not a JSON object"
+        ) from parse_exc
 
     if tenant_id is not None:
-        usage = extract_openai_compatible_usage(response)
         confidence = payload.get("taxonomy_confidence", payload.get("confidence"))
         meta = {
             k: v

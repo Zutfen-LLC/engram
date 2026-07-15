@@ -303,6 +303,74 @@ async def test_conflict_classification_failure_records_failed(monkeypatch):
     assert metadata["application_fallback"] is True
 
 
+async def test_classification_malformed_json_records_response_parse(monkeypatch):
+    """A provider response that is not valid JSON (a common OpenAI-compatible
+    failure mode) must be recorded as a failed provider call with
+    ``failure_stage=response_parse`` — previously ``json.loads`` raised before
+    the isinstance branch could record it, so the failure vanished from the
+    ledger (ENG-METER-001 correction)."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    tenant_id = await _default_tenant_id()
+    monkeypatch.setattr(settings, "classification_provider", "openai")
+    # The response carries usage (the provider DID deliver a billed response)
+    # but the content is not valid JSON.
+    response = _FakeChatResponse(
+        content="<<not json at all",
+        usage=_FakeUsage(prompt_tokens=40, completion_tokens=8, total_tokens=48),
+    )
+    monkeypatch.setattr(
+        classification_mod, "AsyncOpenAI", lambda **kw: FakeAsyncOpenAI(chat_response=response)
+    )
+
+    with pytest.raises(ValueError):
+        await classification_mod._call_openai_classification("classify this", tenant_id=tenant_id)
+
+    calls = await _provider_calls("classification")
+    assert len(calls) == 1
+    assert calls[0]["status"] == "failed"
+    # Usage from the delivered-but-unusable response is preserved.
+    assert calls[0]["total_tokens"] == 48
+    metadata = calls[0]["metadata"]
+    if isinstance(metadata, str):
+        import json
+
+        metadata = json.loads(metadata)
+    assert metadata["failure_stage"] == "response_parse"
+    assert metadata["application_fallback"] is True
+
+
+async def test_conflict_classification_malformed_json_records_response_parse(monkeypatch):
+    """Same malformed-JSON coverage for the conflict-classification LLM path."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    tenant_id = await _default_tenant_id()
+    monkeypatch.setattr(settings, "classification_provider", "openai")
+    response = _FakeChatResponse(
+        content="{broken json",
+        usage=_FakeUsage(prompt_tokens=20, total_tokens=20),
+    )
+    monkeypatch.setattr(
+        conflicts_mod, "AsyncOpenAI", lambda **kw: FakeAsyncOpenAI(chat_response=response)
+    )
+
+    with pytest.raises(ValueError):
+        await conflicts_mod._classify_relationship_llm(
+            "old content", "new content", 0.9, tenant_id=tenant_id
+        )
+
+    calls = await _provider_calls("conflict_classification")
+    assert len(calls) == 1
+    assert calls[0]["status"] == "failed"
+    assert calls[0]["total_tokens"] == 20
+    metadata = calls[0]["metadata"]
+    if isinstance(metadata, str):
+        import json
+
+        metadata = json.loads(metadata)
+    assert metadata["failure_stage"] == "response_parse"
+
+
 # ---- embeddings ----
 
 

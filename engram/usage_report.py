@@ -404,6 +404,19 @@ async def _conflict_economics_section(
         )
         or 0
     )
+    # ``disabled`` conflict operations are not external LLM calls (the provider
+    # is ``none``); exclude them from the actual-call count so inference volume
+    # is not overstated when a provider is disabled.
+    conflict_actual_calls = (
+        await _scalar(
+            session,
+            "SELECT count(*) FROM usage_events "
+            f"WHERE {clause} AND event_type = 'provider.call' "
+            "AND operation = 'conflict_classification' AND status != 'disabled'",
+            params,
+        )
+        or 0
+    )
     candidate_observations = (
         await _scalar(
             session,
@@ -414,7 +427,7 @@ async def _conflict_economics_section(
         or 0
     )
     per_1000 = (
-        round(1000.0 * conflict_calls / candidate_observations, 2)
+        round(1000.0 * conflict_actual_calls / candidate_observations, 2)
         if candidate_observations
         else 0.0
     )
@@ -448,7 +461,12 @@ async def _conflict_economics_section(
         or 0
     )
     return {
+        # Total conflict_classification provider rows (includes disabled).
         "conflict_classifications": int(conflict_calls),
+        # Actual external LLM calls (excludes disabled, which never called a
+        # provider). The per-1000 ratio uses this so it is not inflated when a
+        # provider is disabled.
+        "conflict_actual_calls": int(conflict_actual_calls),
         "conflict_calls_per_1000_candidate_observations": per_1000,
         "verdict_distribution": {r["verdict"]: r["n"] for r in verdicts},
         # A failed provider call and an application fallback are the same event
@@ -477,7 +495,10 @@ async def _retrieval_section(session: AsyncSession, window: ReportWindow) -> dic
     query_embeddings = (
         await session.execute(
             text(
-                "SELECT count(*) AS calls, COALESCE(sum(total_tokens), 0) AS tokens "
+                "SELECT "
+                "count(*) AS calls, "
+                "count(*) FILTER (WHERE status != 'disabled') AS actual_calls, "
+                "COALESCE(sum(total_tokens), 0) AS tokens "
                 "FROM usage_events WHERE "
                 + clause
                 + " AND event_type = 'provider.call' "
@@ -520,7 +541,10 @@ async def _retrieval_section(session: AsyncSession, window: ReportWindow) -> dic
     return {
         "by_mode": by_mode,
         "total_requests": total_retrieval,
+        # Total query-embedding provider rows (includes disabled).
         "query_embedding_calls": int(query_embeddings["calls"]),
+        # Actual external embedding calls (excludes disabled).
+        "query_embedding_actual_calls": int(query_embeddings["actual_calls"]),
         "query_embedding_tokens": int(query_embeddings["tokens"]),
         "semantic_queries_per_created_memory": (
             round(semantic_queries / created_count, 2) if created_count else 0.0
@@ -605,9 +629,11 @@ async def _storage_section(session: AsyncSession, window: ReportWindow) -> dict[
                 "count(*) FILTER (WHERE review_status = 'archived') AS archived_n, "
                 "count(*) FILTER (WHERE review_status = 'rejected') AS rejected_n, "
                 # Non-current rows that still occupy durable storage but are NOT
-                # archived: superseded and manually invalidated memories.
+                # archived and NOT superseded — manually invalidated memories
+                # only (superseded rows are counted separately below).
                 "count(*) FILTER (WHERE valid_to IS NOT NULL "
-                "AND review_status NOT IN ('archived', 'rejected')) AS invalidated_n, "
+                "AND review_status NOT IN ('archived', 'rejected') "
+                "AND superseded_by IS NULL) AS invalidated_n, "
                 "count(*) FILTER (WHERE superseded_by IS NOT NULL) AS superseded_n "
                 f"FROM memory_items WHERE 1=1{tenant_filter_mi}"
             ),
@@ -747,6 +773,8 @@ async def _hourly_series(session: AsyncSession, window: ReportWindow) -> list[di
             COALESCE(sum(ceil(input_bytes / 1024.0)) FILTER (
                 WHERE event_type = 'candidate.observed'), 0) AS kib_candidate_units,
             count(*) FILTER (WHERE event_type = 'provider.call') AS provider_calls,
+            count(*) FILTER (WHERE event_type = 'provider.call' AND status != 'disabled')
+                AS actual_provider_calls,
             COALESCE(sum(total_tokens)
                 FILTER (WHERE event_type = 'provider.call'), 0) AS total_tokens,
             sum(reported_cost_usd) FILTER (WHERE event_type = 'provider.call') AS reported_cost_usd,

@@ -11,6 +11,7 @@ snapshot, and a stable/JSON-serializable report shape.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -138,6 +139,43 @@ async def _insert_event(
             "created_at": created_at,
         },
     )
+
+
+async def _insert_memory_item(
+    session: AsyncSession,
+    *,
+    tenant: str,
+    principal: str,
+    content: str | None = None,
+    review_status: str = "active",
+    valid_to: str | None = None,
+    superseded_by: str | None = None,
+) -> str:
+    """Insert a minimal memory_items row for storage-section tests."""
+    item_id = str(uuid.uuid4())
+    raw_content = content or f"content-{item_id[:8]}"
+    valid_to_dt = datetime.fromisoformat(valid_to) if valid_to else None
+    await session.execute(
+        text(
+            "INSERT INTO memory_items "
+            "(id, tenant_id, principal_id, content, content_hash, kind, "
+            "review_status, source_type, authority, memory_confidence, visibility, "
+            "valid_to, superseded_by) "
+            "VALUES (:id, :tid, :pid, :content, :chash, 'fact', "
+            ":review_status, 'manual', 10, 0.5, 'private', :valid_to, :superseded_by)"
+        ),
+        {
+            "id": item_id,
+            "tid": tenant,
+            "pid": principal,
+            "content": raw_content,
+            "chash": hashlib.sha256(raw_content.encode("utf-8")).hexdigest(),
+            "review_status": review_status,
+            "valid_to": valid_to_dt,
+            "superseded_by": superseded_by,
+        },
+    )
+    return item_id
 
 
 async def test_empty_ledger_report_handles_cleanly(tenant):
@@ -401,6 +439,56 @@ async def test_disabled_provider_calls_excluded_from_coverage(tenant, principal)
     assert coverage["pct_provider_calls_with_tokens"] == 100.0
 
 
+async def test_disabled_excluded_from_conflict_and_query_embedding_counts(tenant, principal):
+    """Disabled provider rows must not inflate the conflict_classifications
+    or query_embedding actual-call counts (ENG-METER-001 correction). Both
+    sections expose the total (with disabled) AND the actual-call count
+    (without) so a disabled-provider deployment does not overstate inference
+    volume."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    async with _test_session_factory() as session:
+        # One real conflict_classification call + one disabled.
+        await _insert_event(
+            session, tenant_id=tenant, principal_id=principal,
+            event_type="provider.call", operation="conflict_classification",
+            status="succeeded", total_tokens=50,
+        )
+        await _insert_event(
+            session, tenant_id=tenant, principal_id=principal,
+            event_type="provider.call", operation="conflict_classification",
+            status="disabled",
+        )
+        # One real query embedding call + one disabled.
+        await _insert_event(
+            session, tenant_id=tenant, principal_id=principal,
+            event_type="provider.call", operation="embedding_query_search",
+            status="succeeded", total_tokens=10,
+        )
+        await _insert_event(
+            session, tenant_id=tenant, principal_id=principal,
+            event_type="provider.call", operation="embedding_query_search",
+            status="disabled",
+        )
+        # Need a candidate.observed so the per-1000 ratio has a denominator.
+        await _insert_event(
+            session, tenant_id=tenant, principal_id=principal,
+            event_type="candidate.observed", operation="process_memory_candidate",
+            status="accepted_for_processing", input_bytes=10,
+        )
+        await session.commit()
+        report = await build_report(session, tenant_id=tenant)
+    conflict = report["conflict_economics"]
+    # Total includes disabled; actual excludes it.
+    assert conflict["conflict_classifications"] == 2
+    assert conflict["conflict_actual_calls"] == 1
+    # The per-1000 ratio uses actual calls (1 per 1 observation = 1000).
+    assert conflict["conflict_calls_per_1000_candidate_observations"] == 1000.0
+    retrieval = report["retrieval"]
+    assert retrieval["query_embedding_calls"] == 2
+    assert retrieval["query_embedding_actual_calls"] == 1
+
+
 async def test_latency_percentiles(tenant, principal):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
@@ -517,6 +605,45 @@ async def test_storage_snapshot_has_expected_keys(tenant):
         "bytes_per_retained_memory_note", "warnings",
     ):
         assert key in storage
+
+
+async def test_storage_invalidated_excludes_superseded(tenant, principal):
+    """``invalidated_n`` counts manually-invalidated rows only — superseded
+    rows are counted in ``superseded_n``, NOT double-counted in invalidated
+    (ENG-METER-001 correction: the original condition lacked
+    ``superseded_by IS NULL``)."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    async with _test_session_factory() as session:
+        # The superseding item must exist first (FK on superseded_by).
+        other_item = await _insert_memory_item(
+            session, tenant=tenant, principal=principal, content="superseder"
+        )
+        # A live item.
+        await _insert_memory_item(session, tenant=tenant, principal=principal)
+        # An archived item (review_status='archived').
+        await _insert_memory_item(
+            session, tenant=tenant, principal=principal, review_status="archived",
+            valid_to="2026-01-01T00:00:00Z",
+        )
+        # A superseded item: valid_to set AND superseded_by set.
+        await _insert_memory_item(
+            session, tenant=tenant, principal=principal, review_status="active",
+            valid_to="2026-01-01T00:00:00Z", superseded_by=other_item,
+        )
+        # A manually invalidated item: valid_to set, not archived/rejected,
+        # NOT superseded.
+        await _insert_memory_item(
+            session, tenant=tenant, principal=principal, review_status="active",
+            valid_to="2026-01-02T00:00:00Z",
+        )
+        await session.commit()
+        report = await build_report(session, tenant_id=tenant)
+    storage = report["storage"]
+    assert storage["memory_items_archived"] == 1
+    assert storage["memory_items_superseded"] == 1
+    # The superseded row must NOT appear in invalidated (only the manual one).
+    assert storage["memory_items_invalidated"] == 1
 
 
 async def test_storage_tenant_scoped_suppresses_bytes_per_memory(tenant):

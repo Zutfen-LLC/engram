@@ -1261,10 +1261,12 @@ def _print_human_usage_report(report: dict[str, Any]) -> None:
     print()
     print("-- Provider economics (operation/host/model) --")
     for row in report["provider_economics"]:
+        disabled = row.get("disabled_n") or 0
         print(
             f"  {row['operation']:24s} {row['provider_host'] or '-':22s} {row['model'] or '-':20s} "
             f"calls={row['calls']:<6} ok={row['successes']:<6} fail={row['failures']:<4} "
-            f"fallback={row['fallbacks']:<4} tokens={row['total_tokens']:<8} "
+            f"fallback={row.get('application_fallbacks', 0):<4} disabled={disabled:<4} "
+            f"tokens={row['total_tokens']:<8} "
             f"cost=${row['reported_cost_usd'] or 0:.4f} "
             f"cost_cov={row['reported_cost_coverage_pct']}%"
         )

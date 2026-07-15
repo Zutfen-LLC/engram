@@ -237,6 +237,40 @@ async def test_failed_remember_recorded_without_changing_api_response(client):
     assert len(matching) == 1
 
 
+async def test_secret_rejection_still_records_failed_outcome(client):
+    """A secret-denylist rejection happens inside _remember_impl BEFORE the
+    old telemetry context was populated, so it previously produced no
+    candidate.outcome row. The wrapper now resolves tenant/principal identity
+    up front so every authenticated failure is recorded (ENG-METER-001)."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    # Content matching the safety.py password pattern.
+    resp = await client.post(
+        "/v1/remember", json={"content": "password = supersecretvalue123"}
+    )
+    assert resp.status_code == 422
+
+    failed = await _usage_events("candidate.outcome")
+    matching = [e for e in failed if e["status"] == "failed"]
+    assert len(matching) == 1
+
+
+async def test_invalid_workspace_still_records_failed_outcome(client):
+    """An invalid workspace slug is rejected after identity resolution but
+    before the write; it must still produce a failed outcome."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    resp = await client.post(
+        "/v1/remember",
+        json={"content": "valid content for a bad workspace", "workspace": "no-such-slug-xyz"},
+    )
+    assert resp.status_code == 422
+
+    failed = await _usage_events("candidate.outcome")
+    matching = [e for e in failed if e["status"] == "failed"]
+    assert len(matching) == 1
+
+
 async def test_candidate_outcome_is_append_only_per_attempt(client):
     """candidate.outcome is append-only per attempt (ENG-METER-001 correction):
     every /v1/remember invocation appends its own outcome row, so a failed

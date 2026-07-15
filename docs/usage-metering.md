@@ -42,14 +42,18 @@ All events share one table, `usage_events`, distinguished by `event_type` +
 See `migrations/017_usage_events.sql` for the full DDL. Notable columns:
 
 - `correlation_id` — one UUID per extracted candidate. Shared by the
-  `candidate.observed` event, the `candidate.outcome` event, and (when a
-  hooks adapter is involved) the underlying classify/remember HTTP calls.
-  Not set on `provider.call`/`retrieval.request` events, which correlate via
-  `job_id` (worker-driven calls) or simply their own timestamp/tenant scope.
+  `candidate.observed` event, the `candidate.outcome` event, and (when the
+  candidate originated from `/v1/remember`) the worker-driven
+  `provider.call` events for that candidate's embedding generation and
+  conflict classification — the correlation id is threaded through the job
+  payload so async worker calls are attributable to the original candidate.
+  `provider.call` events also carry `job_id` for worker-driven calls.
+  `retrieval.request` events do not set `correlation_id`.
 - `dedupe_key` — the idempotency key backing the partial unique index on
-  `(tenant_id, event_type, dedupe_key)`. For `candidate.observed` and
-  `candidate.outcome` this is `str(correlation_id)`; for
-  `client.lifecycle_summary` it is `str(invocation_id)`.
+  `(tenant_id, event_type, dedupe_key)`. Used by `candidate.observed`
+  (`str(correlation_id)`) and `client.lifecycle_summary`
+  (`str(invocation_id)`). `candidate.outcome` is append-only per attempt and
+  carries **no** `dedupe_key` (see "Correlation and deduplication semantics").
 - `provider_host` — a bare hostname (e.g. `api.deepinfra.com`), never a path,
   query string, or credential. See "Privacy rules" below.
 - `input_count` / `input_bytes` — UTF-8 byte counts, never Python character
