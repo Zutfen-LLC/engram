@@ -1823,8 +1823,10 @@ async def run_worker(
     """Run the worker loop.
 
     With ``once=True`` claims and processes at most one job then exits.
-    Otherwise polls indefinitely. Exits 0 on normal completion; nonzero only on
-    fatal setup errors (ordinary job failures do NOT stop the loop).
+    Otherwise processes available jobs serially without delay and sleeps for
+    the poll interval only while idle or after an unexpected loop error. Exits
+    0 on normal completion; nonzero only on fatal setup errors (ordinary job
+    failures do NOT stop the loop).
     """
     interval = poll_interval if poll_interval is not None else settings.job_poll_interval_seconds
     stale = (
@@ -1863,6 +1865,9 @@ async def run_worker(
         if max_jobs is not None and processed >= max_jobs:
             logger.info("worker=%s reached max_jobs=%s, exiting", worker_id, max_jobs)
             return 0
+
+        if did:
+            continue
 
         await asyncio.sleep(interval)
 
