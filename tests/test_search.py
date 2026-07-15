@@ -77,6 +77,7 @@ async def _clean_db():
     if not await _db_ok():
         return
     async with _test_engine.begin() as conn:
+        await conn.execute(text("DELETE FROM usage_events"))
         await conn.execute(text("DELETE FROM memory_embeddings"))
         await conn.execute(text("DELETE FROM memory_items"))
 
@@ -135,10 +136,26 @@ async def _memory_embeddings_rows() -> list[dict[str, object]]:
         return [dict(row) for row in result.mappings().all()]
 
 
+async def _latest_retrieval(operation: str) -> dict[str, object]:
+    async with _test_session_factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT metadata FROM usage_events "
+                    "WHERE event_type = 'retrieval.request' AND operation = :operation "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ),
+                {"operation": operation},
+            )
+        ).mappings().one()
+    return dict(row["metadata"])
+
+
 async def test_keyword_search_returns_active_match(client):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     settings.embedding_provider = "none"
+    settings.usage_telemetry_enabled = True
     remember = await _remember(client, "keyword search target alpha")
     assert remember.status_code == 201
 
@@ -148,6 +165,9 @@ async def test_keyword_search_returns_active_match(client):
     assert body["total"] == 1
     assert [item["content"] for item in body["results"]] == ["keyword search target alpha"]
     assert body["message"] is None
+    metadata = await _latest_retrieval("keyword_search")
+    assert metadata["embedding_outcome"] == "not_required"
+    assert metadata["embedding_call_occurred"] is False
 
 
 async def test_search_returns_only_active_items_by_default(client):
@@ -176,6 +196,7 @@ async def test_semantic_search_returns_best_match_and_ready_embedding_row(client
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     settings.embedding_provider = "openai"
+    settings.usage_telemetry_enabled = True
     target = [1.0] + [0.0] * 1535
     distractor = [0.0, 1.0] + [0.0] * 1534
 
@@ -218,6 +239,9 @@ async def test_semantic_search_returns_best_match_and_ready_embedding_row(client
             "has_embedding": True,
         },
     ]
+    metadata = await _latest_retrieval("semantic_search")
+    assert metadata["embedding_outcome"] == "succeeded"
+    assert metadata["embedding_call_occurred"] is True
 
 
 async def test_hybrid_search_fuses_keyword_and_semantic_rankings(client, monkeypatch):

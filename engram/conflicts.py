@@ -371,7 +371,7 @@ async def _classify_relationship_llm(
             ],
             response_format={"type": "json_object"},
         )
-    except Exception:
+    except Exception as exc:
         if tenant_id is not None:
             await record_provider_call(
                 tenant_id=tenant_id,
@@ -387,7 +387,11 @@ async def _classify_relationship_llm(
                 latency_ms=timer.elapsed_ms(),
                 correlation_id=correlation_id,
                 job_id=job_id,
-                metadata={"application_fallback": True, "failure_stage": "provider_error"},
+                metadata={
+                    "application_fallback": True,
+                    "failure_stage": "provider_error",
+                    "error_type": type(exc).__name__,
+                },
             )
         raise
     message = response.choices[0].message.content or "{}"
@@ -420,7 +424,11 @@ async def _classify_relationship_llm(
                 latency_ms=timer.elapsed_ms(),
                 correlation_id=correlation_id,
                 job_id=job_id,
-                metadata={"application_fallback": True, "failure_stage": "response_parse"},
+                metadata={
+                    "application_fallback": True,
+                    "failure_stage": "response_parse",
+                    "error_type": type(parse_exc).__name__,
+                },
             )
         raise ValueError(
             "conflict classification response was not valid JSON or not a JSON object"

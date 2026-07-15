@@ -16,13 +16,52 @@ from engram.config import settings
 from engram.usage import (
     ProviderUsage,
     _is_expected_unique_violation,
+    embedding_call_occurred_for,
     extract_openai_compatible_usage,
     record_candidate_once,
     record_provider_call,
+    record_retrieval_request,
     record_usage_event_best_effort,
     safe_provider_identity,
     utf8_byte_len,
 )
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        ("not_required", False),
+        ("not_attempted", False),
+        ("disabled", False),
+        ("succeeded", True),
+        ("failed", True),
+        ("unknown", None),
+    ],
+)
+def test_embedding_call_occurred_mapping(outcome, expected):
+    assert embedding_call_occurred_for(outcome) is expected
+
+
+async def test_unknown_retrieval_outcome_records_explicit_null_boolean(monkeypatch):
+    captured: dict[str, object] = {}
+
+    async def capture(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("engram.usage.record_usage_event_best_effort", capture)
+    await record_retrieval_request(
+        tenant_id="00000000-0000-0000-0000-000000000001",
+        principal_id=None,
+        workspace_id=None,
+        operation="semantic_recall",
+        status="failed",
+        embedding_outcome="unknown",
+    )
+    metadata = captured["metadata"]
+    assert isinstance(metadata, dict)
+    assert metadata["embedding_outcome"] == "unknown"
+    assert "embedding_call_occurred" in metadata
+    assert metadata["embedding_call_occurred"] is None
 
 
 def test_utf8_byte_len_counts_bytes_not_characters():

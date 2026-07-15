@@ -675,7 +675,7 @@ def _build_prompt(
 
 
 def _classification_failure_meta(
-    source_type: str | None, failure_stage: str
+    source_type: str | None, failure_stage: str, exc: Exception
 ) -> dict[str, Any]:
     """Metadata for a failed classification/conflict provider call.
 
@@ -684,7 +684,11 @@ def _classification_failure_meta(
     truthfully alongside a sanitized failure stage. ``source_type`` is a safe
     categorical dimension. Never carries content or raw error messages.
     """
-    meta: dict[str, Any] = {"application_fallback": True, "failure_stage": failure_stage}
+    meta: dict[str, Any] = {
+        "application_fallback": True,
+        "failure_stage": failure_stage,
+        "error_type": type(exc).__name__,
+    }
     if source_type is not None:
         meta["source_type"] = source_type
     return meta
@@ -721,7 +725,7 @@ async def _call_openai_classification(
             ],
             response_format={"type": "json_object"},
         )
-    except Exception:
+    except Exception as exc:
         if tenant_id is not None:
             await record_provider_call(
                 tenant_id=tenant_id,
@@ -737,7 +741,7 @@ async def _call_openai_classification(
                 latency_ms=timer.elapsed_ms(),
                 correlation_id=correlation_id,
                 job_id=job_id,
-                metadata=_classification_failure_meta(source_type, "provider_error"),
+                metadata=_classification_failure_meta(source_type, "provider_error", exc),
             )
         raise
 
@@ -771,7 +775,7 @@ async def _call_openai_classification(
                 latency_ms=timer.elapsed_ms(),
                 correlation_id=correlation_id,
                 job_id=job_id,
-                metadata=_classification_failure_meta(source_type, "response_parse"),
+                metadata=_classification_failure_meta(source_type, "response_parse", parse_exc),
             )
         raise ValueError(
             "classification response was not valid JSON or not a JSON object"

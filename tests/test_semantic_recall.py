@@ -87,6 +87,7 @@ async def _clean_db():
     if not await _db_ok():
         return
     async with _test_engine.begin() as conn:
+        await conn.execute(text("DELETE FROM usage_events"))
         await conn.execute(text("DELETE FROM feedback_events"))
         await conn.execute(text("DELETE FROM recall_logs"))
         await conn.execute(text("DELETE FROM memory_embeddings"))
@@ -173,6 +174,21 @@ async def _drain_jobs(max_iterations: int = 10) -> None:
             return
 
 
+async def _latest_retrieval(operation: str) -> dict[str, object]:
+    async with _test_session_factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT metadata FROM usage_events "
+                    "WHERE event_type = 'retrieval.request' AND operation = :operation "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ),
+                {"operation": operation},
+            )
+        ).mappings().one()
+    return dict(row["metadata"])
+
+
 # ---- happy path ----
 
 
@@ -180,6 +196,7 @@ async def test_semantic_recall_returns_best_match(client, monkeypatch):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     settings.embedding_provider = "openai"
+    settings.usage_telemetry_enabled = True
     _patch_embeddings(monkeypatch)
 
     await _remember(client, "semantic target")
@@ -203,6 +220,9 @@ async def test_semantic_recall_returns_best_match(client, monkeypatch):
     assert body["config_version"]
     # working_set rendered one line per item
     assert "semantic target" in body["working_set"]
+    metadata = await _latest_retrieval("semantic_recall")
+    assert metadata["embedding_outcome"] == "succeeded"
+    assert metadata["embedding_call_occurred"] is True
 
 
 async def test_semantic_recall_includes_proposed_with_unreviewed_warning(client, monkeypatch):
@@ -317,6 +337,7 @@ async def test_semantic_recall_no_embeddings_returns_empty_non_500(client):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     settings.embedding_provider = "none"
+    settings.usage_telemetry_enabled = True
     await _remember(client, "semantic target")
 
     resp = await client.post(
@@ -332,6 +353,9 @@ async def test_semantic_recall_no_embeddings_returns_empty_non_500(client):
     assert "embeddings" in body["message"].lower()
     # audit row still written
     assert body["recall_log_id"]
+    metadata = await _latest_retrieval("semantic_recall")
+    assert metadata["embedding_outcome"] == "disabled"
+    assert metadata["embedding_call_occurred"] is False
 
 
 async def test_semantic_recall_no_candidates_returns_empty(client, monkeypatch):

@@ -348,6 +348,15 @@ async def test_candidate_funnel_logical_outcome_resolves_retry(tenant, principal
             correlation_id=retried_cid,
             created_at=now,
         )
+        for operation in ("semantic_recall", "semantic_search"):
+            await _insert_event(
+                session,
+                tenant_id=tenant,
+                principal_id=principal,
+                event_type="retrieval.request",
+                operation=operation,
+                status="succeeded",
+            )
         await session.commit()
         report = await build_report(session, tenant_id=tenant)
     funnel = report["candidate_funnel"]
@@ -355,11 +364,18 @@ async def test_candidate_funnel_logical_outcome_resolves_retry(tenant, principal
     assert funnel["created"] == 1
     assert funnel["failed"] == 0
     assert funnel["distinct_candidates"] == 1
+    assert funnel["logical_candidates"] == 1
+    assert funnel["remember_attempts"] == 2
     # Attempt-level: both attempts are visible (one failed, one succeeded).
     assert funnel["total_attempts"] == 2
     assert funnel["failed_attempts"] == 1
     assert funnel["successful_attempts"] == 1
     assert funnel["attempts_per_candidate_avg"] == 2.0
+    principal_row = next(
+        row for row in report["by_principal"] if str(row["principal_id"]) == principal
+    )
+    assert principal_row["created_count"] == 1
+    assert report["retrieval"]["semantic_queries_per_created_memory"] == 2.0
 
 
 async def test_provider_call_token_and_cost_coverage(tenant, principal):
@@ -397,6 +413,7 @@ async def test_provider_call_token_and_cost_coverage(tenant, principal):
     econ = report["provider_economics"]
     assert len(econ) == 1
     assert econ[0]["calls"] == 2
+    assert econ[0]["actual_calls"] == 2
     assert econ[0]["reported_cost_coverage_pct"] == 50.0
 
 
@@ -437,6 +454,13 @@ async def test_disabled_provider_calls_excluded_from_coverage(tenant, principal)
     assert coverage["provider_disabled_calls"] == 2
     # The single actual call carried tokens → 100%, not dragged down by disabled.
     assert coverage["pct_provider_calls_with_tokens"] == 100.0
+    econ = report["provider_economics"]
+    assert sum(row["calls"] for row in econ) == 3
+    assert sum(row["actual_calls"] for row in econ) == 1
+    assert sum(row["disabled_n"] for row in econ) == 2
+    hourly = report["hourly_series"]
+    assert sum(row["provider_calls"] for row in hourly) == 3
+    assert sum(row["actual_provider_calls"] for row in hourly) == 1
 
 
 async def test_disabled_excluded_from_conflict_and_query_embedding_counts(tenant, principal):

@@ -121,7 +121,7 @@ async def generate_embeddings(
             # causing a silent "No embedding data received" error.
             encoding_format="float",
         )
-    except Exception:
+    except Exception as exc:
         if tenant_id is not None:
             await record_provider_call(
                 tenant_id=tenant_id,
@@ -138,41 +138,54 @@ async def generate_embeddings(
                 latency_ms=timer.elapsed_ms(),
                 correlation_id=correlation_id,
                 job_id=job_id,
+                metadata={
+                    "failure_stage": "provider_error",
+                    "error_type": type(exc).__name__,
+                },
             )
         raise
-    # The API returns exactly one embedding per input, in input order.
-    vectors: list[list[float] | None] = [
-        [float(value) for value in item.embedding] for item in response.data
-    ]
-    for vector in vectors:
-        if vector is None:
-            continue
-        if len(vector) != dimensions:
-            if tenant_id is not None:
-                await record_provider_call(
-                    tenant_id=tenant_id,
-                    principal_id=principal_id,
-                    workspace_id=workspace_id,
-                    operation=operation,
-                    status="failed",
-                    provider_adapter=adapter,
-                    provider_host=host,
-                    model=model,
-                    embedding_profile=profile_key,
-                    input_count=len(texts),
-                    input_bytes=input_bytes,
-                    latency_ms=timer.elapsed_ms(),
-                    correlation_id=correlation_id,
-                    job_id=job_id,
-                    metadata={"exception_type": "ValueError"},
-                )
-            raise ValueError(
-                f"embedding provider returned dimension {len(vector)}; expected {dimensions} "
-                f"for profile {profile.profile_key if profile else model}"
+    usage = extract_openai_compatible_usage(response)
+    try:
+        # The API must return exactly one usable float vector per input, in
+        # input order. Missing/malformed data, coercion failures, count drift,
+        # and dimension drift are all response-validation failures from this
+        # single provider call.
+        vectors: list[list[float] | None] = [
+            [float(value) for value in item.embedding] for item in response.data
+        ]
+        if len(vectors) != len(texts):
+            raise ValueError("embedding provider returned an unexpected vector count")
+        if any(len(vector) != dimensions for vector in vectors if vector is not None):
+            raise ValueError("embedding provider returned an unexpected vector dimension")
+    except Exception as exc:
+        if tenant_id is not None:
+            await record_provider_call(
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                workspace_id=workspace_id,
+                operation=operation,
+                status="failed",
+                provider_adapter=adapter,
+                provider_host=host,
+                model=model,
+                embedding_profile=profile_key,
+                input_count=len(texts),
+                input_bytes=input_bytes,
+                prompt_tokens=usage.prompt_tokens,
+                completion_tokens=usage.completion_tokens,
+                total_tokens=usage.total_tokens,
+                reported_cost_usd=usage.reported_cost_usd,
+                latency_ms=timer.elapsed_ms(),
+                correlation_id=correlation_id,
+                job_id=job_id,
+                metadata={
+                    "failure_stage": "response_validation",
+                    "error_type": type(exc).__name__,
+                },
             )
+        raise
 
     if tenant_id is not None:
-        usage = extract_openai_compatible_usage(response)
         await record_provider_call(
             tenant_id=tenant_id,
             principal_id=principal_id,

@@ -1231,8 +1231,8 @@ def _print_human_usage_report(report: dict[str, Any]) -> None:
     print(f"  telemetry_enabled:            {cov['telemetry_enabled']}")
     print(f"  first_event_at:               {cov['first_event_at']}")
     print(f"  last_event_at:                {cov['last_event_at']}")
-    print(f"  provider calls w/ tokens:      {cov['pct_provider_calls_with_tokens']}%")
-    print(f"  provider calls w/ cost:        {cov['pct_provider_calls_with_cost']}%")
+    print(f"  actual calls w/ tokens:        {cov['pct_provider_calls_with_tokens']}%")
+    print(f"  actual calls w/ cost:          {cov['pct_provider_calls_with_cost']}%")
     print(
         f"  active principals:            {cov['active_principals']} "
         f"({cov['active_principals_with_lifecycle_summary']} with lifecycle summaries)"
@@ -1243,8 +1243,9 @@ def _print_human_usage_report(report: dict[str, Any]) -> None:
     print("-- Candidate funnel --")
     for key in (
         "lifecycle_extracted", "lifecycle_guard_rejected", "lifecycle_classified",
-        "lifecycle_parked", "candidate_observations", "remember_attempts",
-        "created", "deduped", "superseded", "failed",
+        "lifecycle_parked", "candidate_observations", "logical_candidates",
+        "remember_attempts", "created", "deduped", "superseded", "failed",
+        "failed_attempts", "successful_attempts", "attempts_per_candidate_avg",
         "flat_candidate_units", "kib_candidate_units",
     ):
         print(f"  {key:32s} {funnel[key]}")
@@ -1264,27 +1265,32 @@ def _print_human_usage_report(report: dict[str, Any]) -> None:
         disabled = row.get("disabled_n") or 0
         print(
             f"  {row['operation']:24s} {row['provider_host'] or '-':22s} {row['model'] or '-':20s} "
-            f"calls={row['calls']:<6} ok={row['successes']:<6} fail={row['failures']:<4} "
-            f"fallback={row.get('application_fallbacks', 0):<4} disabled={disabled:<4} "
+            f"operations={row['calls']:<6} calls={row.get('actual_calls', 0):<6} "
+            f"disabled={disabled:<4} ok={row['successes']:<6} fail={row['failures']:<4} "
+            f"fallback={row.get('application_fallbacks', 0):<4} "
             f"tokens={row['total_tokens']:<8} "
             f"cost=${row['reported_cost_usd'] or 0:.4f} "
             f"cost_cov={row['reported_cost_coverage_pct']}%"
         )
     print()
     print("-- Conflict economics --")
-    print(f"  conflict_classifications:     {conflict['conflict_classifications']}")
+    print(f"  conflict operations:           {conflict['conflict_classifications']}")
+    print(f"  actual conflict LLM calls:     {conflict['conflict_actual_calls']}")
     print(
         "  per 1000 candidate obs:        "
         f"{conflict['conflict_calls_per_1000_candidate_observations']}"
     )
     print(f"  verdict distribution:         {conflict['verdict_distribution']}")
-    print(f"  failed_or_fallback:            {conflict['failed_or_fallback_count']}")
+    print(f"  failures:                      {conflict['failed_calls']}")
+    print(f"  application fallbacks:         {conflict['application_fallback_count']}")
     print()
     print("-- Retrieval --")
     for row in retrieval["by_mode"]:
         print(f"  {row['operation']:18s} requests={row['requests']:<6} "
               f"items={row['item_total']:<8} bytes={row['byte_total']}")
-    print(f"  query_embedding_calls:         {retrieval['query_embedding_calls']}")
+    print(f"  query-embedding operations:    {retrieval['query_embedding_calls']}")
+    print(f"  actual query-embedding calls:  {retrieval['query_embedding_actual_calls']}")
+    print(f"  query-embedding tokens:        {retrieval['query_embedding_tokens']}")
     print(f"  semantic_queries/created_mem:  {retrieval['semantic_queries_per_created_memory']}")
     print(f"  retrievals/active_principal:   {retrieval['retrievals_per_active_principal']}")
     print()
@@ -1311,7 +1317,7 @@ async def _run_usage_report(
     until: str | None,
     as_json: bool,
 ) -> int:
-    """Build and print the dogfood usage report (ENG-METER-001).
+    """Build and print the dogfood usage report (ENG-METER-001 / ENG-METER-002).
 
     Uses the owner database URL for cross-tenant reporting (bypasses RLS,
     matching ``_run_promotion``/``_run_backfill``); every query still filters

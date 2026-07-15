@@ -1,4 +1,4 @@
-"""Usage/metering telemetry (ENG-METER-001).
+"""Usage/metering telemetry (ENG-METER-001 / ENG-METER-002).
 
 Append-only, best-effort, privacy-preserving observability for dogfood
 economics. This module is deliberately narrow: it never changes the result of
@@ -32,7 +32,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
@@ -44,6 +44,24 @@ from engram.models import UsageEvent
 logger = logging.getLogger("engram.usage")
 
 _NIL_UUID = UUID("00000000-0000-0000-0000-000000000000")
+
+EmbeddingOutcome = Literal[
+    "not_required",
+    "not_attempted",
+    "disabled",
+    "succeeded",
+    "failed",
+    "unknown",
+]
+
+
+def embedding_call_occurred_for(outcome: EmbeddingOutcome) -> bool | None:
+    """Derive the legacy nullable call Boolean from an embedding outcome."""
+    if outcome in ("not_required", "not_attempted", "disabled"):
+        return False
+    if outcome in ("succeeded", "failed"):
+        return True
+    return None
 
 
 def utf8_byte_len(text: str) -> int:
@@ -421,7 +439,7 @@ async def record_retrieval_request(
     scoring_version: str | None = None,
     config_version: str | None = None,
     embedding_call_occurred: bool | None = None,
-    embedding_outcome: str | None = None,
+    embedding_outcome: EmbeddingOutcome | None = None,
 ) -> UUID | None:
     """Record one ``retrieval.request`` event (success OR failure).
 
@@ -433,22 +451,33 @@ async def record_retrieval_request(
     ``status`` is ``succeeded`` or ``failed``; failures are recorded too (a
     raised recall/search request previously produced no telemetry row, hiding
     retrieval errors). ``embedding_outcome`` distinguishes whether an external
-    embedding provider call occurred, independently of the requested mode: one
-    of ``not_required`` (startup/keyword), ``succeeded``, ``failed``, or
-    ``disabled`` (provider is ``none``). ``embedding_call_occurred`` is retained
-    for backward compatibility; ``embedding_outcome`` is the richer signal.
+    embedding provider call occurred, independently of the requested mode:
+    ``not_required`` (the mode does not use embeddings), ``not_attempted``
+    (execution failed before the provider call), ``disabled`` (the embedding
+    abstraction was reached but configuration prevented an external call),
+    ``succeeded`` (a usable vector was returned), ``failed`` (an external call
+    failed or returned an unusable response), or ``unknown`` (the outer layer
+    cannot determine the stage). ``embedding_call_occurred`` is retained for
+    backward compatibility and is canonically derived from that outcome.
     """
-    meta = {
+    if embedding_outcome is not None:
+        embedding_call_occurred = embedding_call_occurred_for(embedding_outcome)
+    meta: dict[str, Any] = {
+        # Preserve an explicit JSON null for ``unknown`` so consumers can
+        # distinguish the canonical indeterminate state from legacy events
+        # that predate this field.
+        "embedding_call_occurred": embedding_call_occurred,
+    }
+    meta.update({
         k: v
         for k, v in {
             "candidate_count": candidate_count,
             "scoring_version": scoring_version,
             "config_version": config_version,
-            "embedding_call_occurred": embedding_call_occurred,
             "embedding_outcome": embedding_outcome,
         }.items()
         if v is not None
-    }
+    })
     return await record_usage_event_best_effort(
         tenant_id=tenant_id,
         principal_id=principal_id,
@@ -617,8 +646,10 @@ class Timer:
 
 
 __all__ = [
+    "EmbeddingOutcome",
     "ProviderUsage",
     "Timer",
+    "embedding_call_occurred_for",
     "extract_openai_compatible_usage",
     "record_candidate_once",
     "record_candidate_outcome",

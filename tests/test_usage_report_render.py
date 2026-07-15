@@ -39,12 +39,16 @@ def _sample_report(*, with_provider_row: bool = True) -> dict[str, Any]:
             "lifecycle_guard_rejected": 0,
             "lifecycle_classified": 0,
             "lifecycle_parked": 0,
-            "candidate_observations": 0,
-            "remember_attempts": 0,
-            "created": 0,
-            "deduped": 0,
+            "candidate_observations": 8,
+            "logical_candidates": 7,
+            "remember_attempts": 9,
+            "created": 4,
+            "deduped": 2,
             "superseded": 0,
             "failed": 0,
+            "failed_attempts": 2,
+            "successful_attempts": 7,
+            "attempts_per_candidate_avg": 1.29,
             "flat_candidate_units": 0,
             "kib_candidate_units": 0,
             "candidate_bytes_p50": 0,
@@ -54,15 +58,20 @@ def _sample_report(*, with_provider_row: bool = True) -> dict[str, Any]:
         "by_source_type": [],
         "provider_economics": [],
         "conflict_economics": {
-            "conflict_classifications": 0,
-            "conflict_calls_per_1000_candidate_observations": 0.0,
+            "conflict_classifications": 3,
+            "conflict_actual_calls": 2,
+            "conflict_calls_per_1000_candidate_observations": 250.0,
             "verdict_distribution": {},
             "failed_or_fallback_count": 0,
+            "failed_calls": 0,
+            "application_fallback_count": 0,
         },
         "retrieval": {
             "by_mode": [],
             "total_requests": 0,
-            "query_embedding_calls": 0,
+            "query_embedding_calls": 5,
+            "query_embedding_actual_calls": 4,
+            "query_embedding_tokens": 123,
             "semantic_queries_per_created_memory": 0.0,
             "retrievals_per_active_principal": 0.0,
         },
@@ -93,6 +102,7 @@ def _sample_report(*, with_provider_row: bool = True) -> dict[str, Any]:
                 "provider_host": "api.openai.com",
                 "model": "gpt-4o-mini",
                 "calls": 10,
+                "actual_calls": 9,
                 "successes": 8,
                 "failures": 2,
                 "disabled_n": 1,
@@ -128,7 +138,13 @@ def test_human_report_renders_without_error_with_provider_row():
     # The renamed column is rendered (as the fallback count).
     assert "fallback=2" in output
     # The new disabled count is rendered.
+    assert "operations=10" in output
+    assert "calls=9" in output
     assert "disabled=1" in output
+    assert "actual conflict LLM calls" in output
+    assert "actual query-embedding calls" in output
+    assert "logical_candidates" in output
+    assert "remember_attempts" in output
 
 
 def test_human_report_renders_without_provider_rows():
