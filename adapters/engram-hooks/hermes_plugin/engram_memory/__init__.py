@@ -205,7 +205,6 @@ class EngramMemoryProvider(MemoryProvider):
             lines = ["## Engram Relevant Memories"]
             for r in resp.results:
                 content = r.get("content", "")
-                score = r.get("score", 0)
                 wing = r.get("wing", "")
                 room = r.get("room", "")
                 tag = f"[{wing}/{room}]" if wing or room else ""
