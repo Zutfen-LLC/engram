@@ -93,6 +93,11 @@ x-env: &engram-env
   ENGRAM_JOB_MAX_ATTEMPTS: ${ENGRAM_JOB_MAX_ATTEMPTS:-5}
   ENGRAM_JOB_LEASE_STALE_AFTER_SECONDS: ${ENGRAM_JOB_LEASE_STALE_AFTER_SECONDS:-300}
 
+  # Usage/metering telemetry (ENG-METER-001) — off by default. Both the API
+  # (classify/remember/recall/search) and worker (embedding/classification/
+  # conflict provider calls) record usage_events, so this must be shared.
+  ENGRAM_USAGE_TELEMETRY_ENABLED: ${ENGRAM_USAGE_TELEMETRY_ENABLED:-false}
+
 services:
   postgres:
     image: pgvector/pgvector:pg16

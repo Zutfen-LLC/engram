@@ -938,7 +938,9 @@ async def test_semantic_recall_warning_changes_after_promotion(client, monkeypat
 
     target_vec = [1.0] + [0.0] * 1535
 
-    async def fake_embedding(text_value: str) -> list[float] | None:
+    async def fake_embedding(
+        text_value: str, *_args: object, **_kwargs: object
+    ) -> list[float] | None:
         if text_value.startswith("semantic target"):
             return target_vec
         return [0.0, 1.0] + [0.0] * 1534
@@ -1748,7 +1750,7 @@ async def test_conflict_recheck_blocks_when_active_item_conflicts_later(monkeypa
 
     import engram.conflicts as conflicts_mod
 
-    async def fake_classify(old_content, new_content, similarity):
+    async def fake_classify(old_content, new_content, similarity, **_kwargs):
         return ConflictVerdict.CONTRADICT, 0.9, "forced contradiction", {}
 
     monkeypatch.setattr(conflicts_mod, "_classify_relationship", fake_classify)
@@ -1831,7 +1833,7 @@ async def test_topk_conflict_candidate_third_nearest_detected(monkeypatch):
 
     import engram.conflicts as conflicts_mod
 
-    async def fake_classify(old_content, new_content, similarity):
+    async def fake_classify(old_content, new_content, similarity, **_kwargs):
         if "cand1" in old_content:
             return ConflictVerdict.DUPLICATE, 0.9, "cand1 dup", {}
         if "cand2" in old_content:

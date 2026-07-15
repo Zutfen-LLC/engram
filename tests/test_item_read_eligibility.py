@@ -238,7 +238,7 @@ def _patch_embeddings(monkeypatch: pytest.MonkeyPatch, target_prefix: str) -> No
     target_vec = [1.0] + [0.0] * 1535
     distractor_vec = [0.0, 1.0] + [0.0] * 1534
 
-    async def fake_embedding(text_value: str) -> list[float] | None:
+    async def fake_embedding(text_value: str, *_args: object, **_kwargs: object) -> list[float] | None:
         return target_vec if text_value.startswith(target_prefix) else distractor_vec
 
     import engram.embeddings as embeddings_mod

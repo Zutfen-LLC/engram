@@ -65,14 +65,14 @@ _VECTOR_A = [1.0] + [0.0] * 1535
 def _enable_embeddings(monkeypatch):
     settings.embedding_provider = "openai"
 
-    async def fake_embedding(_text_value: str):
+    async def fake_embedding(_text_value: str, *_args: object, **_kwargs: object):
         return _VECTOR_A
 
     monkeypatch.setattr(embeddings_mod, "generate_embedding", fake_embedding)
 
 
 def _stub_verdict(monkeypatch, verdict: ConflictVerdict, confidence: float = 0.9):
-    async def fake_classify(old_content: str, new_content: str, similarity: float):
+    async def fake_classify(old_content, new_content, similarity, **_kwargs):
         return verdict, confidence, f"forced {verdict.value}", {"provider": "test"}
 
     monkeypatch.setattr("engram.conflicts._classify_relationship", fake_classify)

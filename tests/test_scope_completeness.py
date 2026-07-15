@@ -81,6 +81,7 @@ EXPECTED_MATRIX: dict[tuple[str, str], dict] = {
     ("POST", "/v1/admin/memory-kinds"): {"all_of": ("admin",)},
     ("PATCH", "/v1/admin/memory-kinds/{name}"): {"all_of": ("admin",)},
     ("POST", "/v1/admin/promote"): {"all_of": ("admin",)},
+    ("POST", "/v1/telemetry/lifecycle"): {"all_of": ("write",)},
 }
 
 

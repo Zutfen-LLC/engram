@@ -185,7 +185,7 @@ async def test_hostile_provider_context_echo_is_absent_from_receipt_and_event(cl
     context = "PRIVATE-CONTEXT-echo-sentinel-948271"
     content = "Durable candidate for hostile provider test"
 
-    async def hostile_provider(_prompt: str) -> dict[str, object]:
+    async def hostile_provider(_prompt: str, **_kwargs: object) -> dict[str, object]:
         return {
             "suggested_kind": "fact",
             "suggested_visibility": "private",
@@ -914,7 +914,7 @@ async def test_llm_enriched_classification_uses_taxonomy_and_vocab(client, monke
 
     captured: list[str] = []
 
-    async def fake_openai(prompt: str) -> dict[str, object]:
+    async def fake_openai(prompt: str, **_kwargs: object) -> dict[str, object]:
         captured.append(prompt)
         return {
             "suggested_kind": "decision",
@@ -1032,7 +1032,7 @@ async def test_llm_low_confidence_is_preserved(client, monkeypatch):
     settings.classification_provider = "none"
     await _seed_vocab_for_llm(client)
 
-    async def fake_openai(prompt: str) -> dict[str, object]:
+    async def fake_openai(prompt: str, **_kwargs: object) -> dict[str, object]:
         return {
             "suggested_kind": "fact",
             "confidence": 0.35,
@@ -1056,7 +1056,7 @@ async def test_llm_high_confidence_clamped_to_ceiling(client, monkeypatch):
     settings.classification_provider = "none"
     await _seed_vocab_for_llm(client)
 
-    async def fake_openai(prompt: str) -> dict[str, object]:
+    async def fake_openai(prompt: str, **_kwargs: object) -> dict[str, object]:
         return {
             "suggested_kind": "fact",
             "confidence": 1.0,
@@ -1082,7 +1082,7 @@ async def test_llm_below_threshold_falls_back_without_re_raising(client, monkeyp
     settings.classification_confidence_threshold = 0.5
     await _seed_vocab_for_llm(client)
 
-    async def fake_openai(prompt: str) -> dict[str, object]:
+    async def fake_openai(prompt: str, **_kwargs: object) -> dict[str, object]:
         return {
             "suggested_kind": "decision",
             "confidence": 0.2,
@@ -1110,7 +1110,7 @@ async def test_llm_suggested_visibility_passes_through(client, monkeypatch):
     settings.classification_provider = "none"
     await _seed_vocab_for_llm(client)
 
-    async def fake_openai(prompt: str) -> dict[str, object]:
+    async def fake_openai(prompt: str, **_kwargs: object) -> dict[str, object]:
         return {
             "suggested_kind": "fact",
             "suggested_visibility": "private",
@@ -1135,7 +1135,7 @@ async def test_llm_invalid_suggested_visibility_becomes_none(client, monkeypatch
     settings.classification_provider = "none"
     await _seed_vocab_for_llm(client)
 
-    async def fake_openai(prompt: str) -> dict[str, object]:
+    async def fake_openai(prompt: str, **_kwargs: object) -> dict[str, object]:
         return {
             "suggested_kind": "fact",
             "suggested_visibility": "global",

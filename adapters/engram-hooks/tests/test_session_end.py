@@ -40,14 +40,16 @@ async def test_session_end_routes_dedicated_source_type(tmp_path) -> None:
     result = await hooks.session_end({"content": "Durable session summary"})
 
     assert result.promoted == 1
-    assert recorder.remember_calls == [
-        {
-            "content": "Durable session summary",
-            "kind": "fact",
-            "wing": None,
-            "room": None,
-            "workspace": None,
-            "source_type": "session_end",
-            "classification_run_id": "run-id",
-        }
-    ]
+    assert len(recorder.remember_calls) == 1
+    call = recorder.remember_calls[0]
+    correlation_id = call.pop("correlation_id")
+    assert correlation_id is not None
+    assert call == {
+        "content": "Durable session summary",
+        "kind": "fact",
+        "wing": None,
+        "room": None,
+        "workspace": None,
+        "source_type": "session_end",
+        "classification_run_id": "run-id",
+    }

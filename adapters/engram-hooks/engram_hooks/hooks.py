@@ -36,6 +36,8 @@ runs before any native write. In both cases the plugin works with stock Hermes
 from __future__ import annotations
 
 import logging
+import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -289,10 +291,20 @@ class LifecycleHooks:
         Returns a detail dict for the :class:`HookResult`. Every branch is
         terminal — there is no fall-through to an unintended action.
         """
+        # One correlation id per candidate (ENG-METER-001), shared by the
+        # classify and remember calls below so the server counts this
+        # candidate as a single usage-telemetry observation.
+        correlation_id = uuid.uuid4()
+
         # 1. Write-boundary guard. Always returns a verdict (never None).
         verdict: GuardVerdict = prepare_memory_write_guard(content)
         if not is_allowed(verdict):
-            return {"content": content, "route": "rejected", "verdict": verdict}
+            return {
+                "content": content,
+                "route": "rejected",
+                "guard_rejected": True,
+                "verdict": verdict,
+            }
 
         # 2. Engram classify, if a client is available. Without a client we
         #    park everything in volatile — the plugin degrades gracefully.
@@ -304,6 +316,7 @@ class LifecycleHooks:
         retention_confidence = 0.0
         retention_disposition = "uncertain"
         classification_run_id: Any = None
+        classified = False
 
         if client is not None:
             try:
@@ -315,11 +328,13 @@ class LifecycleHooks:
                     context=ctx,
                     workspace=self.config.default_workspace,
                     source_type=source_type,
+                    correlation_id=correlation_id,
                 )
                 taxonomy_confidence = resp.taxonomy_confidence
                 retention_confidence = resp.retention_confidence
                 retention_disposition = resp.retention_disposition
                 classification_run_id = resp.classification_run_id
+                classified = True
                 # A receipt makes the server taxonomy authoritative.
                 kind = resp.suggested_kind
                 wing = resp.suggested_wing
@@ -333,6 +348,7 @@ class LifecycleHooks:
             "retention_confidence": retention_confidence,
             "retention_disposition": retention_disposition,
             "classification_run_id": classification_run_id,
+            "classified": classified,
         }
 
         if client is not None and retention_disposition == "noise":
@@ -356,6 +372,7 @@ class LifecycleHooks:
                     workspace=self.config.default_workspace,
                     source_type=source_type,
                     classification_run_id=classification_run_id,
+                    correlation_id=correlation_id,
                 )
                 return {
                     "content": content,
@@ -395,10 +412,15 @@ class LifecycleHooks:
         :data:`~engram_hooks.config.EVENT_HOOK_MAP`). ``payload`` is whatever
         Hermes passed. Returns a :class:`HookResult` summarizing the routing.
         """
+        start = time.monotonic()
         source_type = self.config.source_type_for(event)
         candidates = self._extract_candidates(payload)
         result = HookResult(event=event, extracted=len(candidates))
+        guard_rejected = 0
+        classified = 0
+        candidate_bytes = 0
         for content in candidates:
+            candidate_bytes += len(content.encode("utf-8"))
             try:
                 detail = await self._route_candidate(content, source_type=source_type)
             except Exception as exc:  # noqa: BLE001 — never let one candidate kill the hook
@@ -409,10 +431,14 @@ class LifecycleHooks:
             route = detail.get("route")
             if route == "rejected":
                 result.rejected += 1
+                if detail.get("guard_rejected"):
+                    guard_rejected += 1
             elif route == "remembered":
                 result.promoted += 1
             elif route == "parked":
                 result.parked += 1
+            if detail.get("classified"):
+                classified += 1
 
             # Accumulate non-rejected candidates into session context so the
             # next classify call sees conversation history. Rejected candidates
@@ -430,7 +456,52 @@ class LifecycleHooks:
             result.parked,
             result.errors,
         )
+
+        if self.config.report_lifecycle_telemetry:
+            await self._report_lifecycle_summary(
+                event=event,
+                result=result,
+                guard_rejected=guard_rejected,
+                classified=classified,
+                candidate_bytes=candidate_bytes,
+                latency_ms=round((time.monotonic() - start) * 1000),
+            )
         return result
+
+    async def _report_lifecycle_summary(
+        self,
+        *,
+        event: str,
+        result: HookResult,
+        guard_rejected: int,
+        classified: int,
+        candidate_bytes: int,
+        latency_ms: int,
+    ) -> None:
+        """Best-effort diagnostic summary report (ENG-METER-001).
+
+        Never raises and never mutates ``result`` — a reporting failure (no
+        client configured, network error, server error) is logged and
+        swallowed so it can never change the caller-visible ``HookResult``.
+        """
+        client = self._get_client()
+        if client is None:
+            return
+        try:
+            await client.report_lifecycle_summary(
+                invocation_id=uuid.uuid4(),
+                event=event,
+                extracted=result.extracted,
+                guard_rejected=guard_rejected,
+                classified=classified,
+                promoted=result.promoted,
+                parked=result.parked,
+                errors=result.errors,
+                candidate_bytes=candidate_bytes,
+                latency_ms=latency_ms,
+            )
+        except Exception as exc:  # noqa: BLE001 — telemetry reporting is best-effort
+            logger.warning("lifecycle telemetry summary report failed: %s", exc)
 
     async def pre_compress(self, payload: Any) -> HookResult:
         """Hook: facts are about to be lost to compression — extract & route."""

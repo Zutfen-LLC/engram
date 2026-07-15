@@ -47,7 +47,14 @@ from engram.models import (
     Workspace,
 )
 from engram.safety import has_secrets
+from engram.source_types import SourceType
 from engram.trust_policy import resolve_trust_defaults
+from engram.usage import (
+    Timer,
+    record_candidate_once,
+    record_candidate_outcome,
+    record_retrieval_request,
+)
 
 # Backward-compatible test/import alias; canonical implementation lives in trust_policy.
 _resolve_trust_defaults = resolve_trust_defaults
@@ -62,9 +69,9 @@ _ACTIVE_SOURCES = {"manual", "import", "migration"}
 
 # ---- Request/response models ----
 
-SourceKind = Literal[
-    "manual", "import", "migration", "extraction", "sync_turn", "pre_compress", "session_end"
-]
+# Backward-compatible alias — canonical vocabulary now lives in
+# engram.source_types (shared with /v1/classify so the two never drift).
+SourceKind = SourceType
 PrincipalKind = Literal["user", "agent", "system", "admin"]
 SensitivityKind = Literal["normal", "sensitive", "restricted"]
 
@@ -93,6 +100,12 @@ class RememberRequest(BaseModel):
     external_id: str | None = None
     external_source: str | None = None
     classification_run_id: UUID | None = None
+    # Optional client-supplied correlation id shared with the preceding
+    # /v1/classify call for the same candidate (ENG-METER-001). When absent
+    # the server generates one. Lifecycle hooks always supply this — one UUID
+    # per extracted candidate — so classify+remember count as a single
+    # candidate.observed usage event rather than two.
+    correlation_id: UUID | None = None
 
 
 class RememberResponse(BaseModel):
@@ -102,6 +115,9 @@ class RememberResponse(BaseModel):
     memory_confidence: float
     deduped_existing_id: UUID | None = None
     superseded_id: UUID | None = None
+    # Additive, backward-compatible: the effective correlation id (echoed back
+    # if the caller supplied one, otherwise server-generated).
+    correlation_id: UUID
 
 
 class RecallRequest(BaseModel):
@@ -457,7 +473,79 @@ async def remember(
     req: RememberRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> RememberResponse:
-    """Write a memory item with dedup, trust defaults, and supersession."""
+    """Write a memory item with dedup, trust defaults, and supersession.
+
+    Thin wrapper around :func:`_remember_impl` that owns usage-telemetry
+    correlation (ENG-METER-001): it resolves the effective correlation id and
+    guarantees exactly one ``candidate.outcome`` event is recorded — status
+    ``created``/``deduped``/``superseded`` on success, ``failed`` for every
+    other early-return/raised path (inventoried in ``_remember_impl``) —
+    without altering the response or re-raising differently. Telemetry
+    failures are swallowed inside :mod:`engram.usage` and never reach here.
+
+    Tenant/principal identity is resolved HERE (before ``_remember_impl``) so
+    that an outcome is recorded even for early failures the impl raises before
+    it would have populated ``outcome_ctx`` — notably the secret-denylist
+    rejection and an invalid workspace slug. Identity resolution reads only the
+    RLS session context (never request content), so no secret/content can leak
+    into telemetry via this path.
+    """
+    correlation_id = req.correlation_id or uuid.uuid4()
+    outcome_ctx: dict[str, Any] = {"classification_mode": "explicit" if req.kind else "automatic"}
+    # Resolve authenticated identity up front so every failure path (including
+    # the secret-denylist rejection inside _remember_impl) is attributable.
+    # A 403 here (no tenant/principal context) is an auth failure, not a
+    # candidate outcome — it propagates without recording, matching the
+    # pre-existing behavior for unauthenticated requests.
+    tenant_id = await _resolve_tenant_id(session)
+    principal_id, _principal_type = await _resolve_principal(session, tenant_id)
+    outcome_ctx["tenant_id"] = tenant_id
+    outcome_ctx["principal_id"] = principal_id
+    outcome_status = "failed"
+    try:
+        result = await _remember_impl(
+            req, session, correlation_id=correlation_id, outcome_ctx=outcome_ctx,
+            tenant_id=tenant_id, principal_id=principal_id,
+            principal_type=_principal_type,
+        )
+        outcome_status = result.status
+        return result
+    finally:
+        await record_candidate_outcome(
+            tenant_id=outcome_ctx["tenant_id"],
+            principal_id=outcome_ctx.get("principal_id"),
+            workspace_id=outcome_ctx.get("workspace_id"),
+            correlation_id=correlation_id,
+            status=outcome_status,
+            source_type=req.source_type,
+            final_kind=outcome_ctx.get("final_kind"),
+            final_review_status=outcome_ctx.get("final_review_status"),
+            final_visibility=outcome_ctx.get("final_visibility"),
+            classification_mode=outcome_ctx.get("classification_mode"),
+        )
+
+
+async def _remember_impl(
+    req: RememberRequest,
+    session: AsyncSession,
+    *,
+    correlation_id: UUID,
+    outcome_ctx: dict[str, Any],
+    tenant_id: UUID,
+    principal_id: UUID,
+    principal_type: str,
+) -> RememberResponse:
+    """The actual write logic. See :func:`remember` for the telemetry wrapper.
+
+    ``outcome_ctx`` is mutated in place with tenant/principal/workspace (as
+    soon as they are resolved) and final outcome dimensions (right before each
+    return), so the wrapper can record a ``candidate.outcome`` event even when
+    this function raises partway through.
+
+    ``tenant_id``/``principal_id``/``principal_type`` are resolved by the
+    wrapper before this function runs (so an outcome is recorded even for the
+    secret-denylist rejection), and are NOT re-resolved here.
+    """
     # 1. Secret check — wire existing safety.py denylist.
     if has_secrets(req.content):
         raise HTTPException(
@@ -469,10 +557,21 @@ async def remember(
     canonical = canonicalize(req.content)
     chash = content_hash(canonical)
 
-    # 3. Resolve RLS context.
-    tenant_id = await _resolve_tenant_id(session)
-    principal_id, principal_type = await _resolve_principal(session, tenant_id)
+    # 3. Resolve workspace (tenant/principal already resolved by the wrapper).
     workspace_id = await _resolve_workspace_id(session, tenant_id, req.workspace)
+    outcome_ctx["workspace_id"] = workspace_id
+
+    # candidate.observed is recorded once per correlation_id (idempotent via
+    # usage_events' dedupe_key unique index) so a direct /v1/remember call and
+    # a preceding /v1/classify call for the same candidate never double-count.
+    await record_candidate_once(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        workspace_id=workspace_id,
+        correlation_id=correlation_id,
+        candidate_utf8_bytes=len(req.content.encode("utf-8")),
+        source_type=req.source_type,
+    )
 
     receipt: ClassificationRun | None = None
     if req.classification_run_id is not None:
@@ -508,12 +607,16 @@ async def remember(
                 or (req.kind is not None and req.kind != receipt.suggested_kind)
             ):
                 raise HTTPException(status_code=409, detail="classification run is already bound")
+            outcome_ctx["final_kind"] = bound_item.kind
+            outcome_ctx["final_review_status"] = bound_item.review_status
+            outcome_ctx["final_visibility"] = bound_item.visibility
             return RememberResponse(
                 id=bound_item.id,
                 status="deduped",
                 review_status=bound_item.review_status,
                 memory_confidence=bound_item.memory_confidence,
                 deduped_existing_id=bound_item.id,
+                correlation_id=correlation_id,
             )
         if (
             receipt.expires_at <= datetime.now(UTC)
@@ -767,12 +870,16 @@ async def remember(
                 )
             )
             await session.commit()
+        outcome_ctx["final_kind"] = existing.kind
+        outcome_ctx["final_review_status"] = existing.review_status
+        outcome_ctx["final_visibility"] = existing.visibility
         return RememberResponse(
             id=existing.id,
             status="deduped",
             review_status=existing.review_status,
             memory_confidence=existing.memory_confidence,
             deduped_existing_id=existing.id,
+            correlation_id=correlation_id,
         )
 
     provider = "caller"
@@ -907,18 +1014,26 @@ async def remember(
                     "memory_item_id": str(item.id),
                     "profile_id": str(profile.id),
                     "profile_key": profile.profile_key,
+                    # ENG-METER-001: thread the candidate correlation id so the
+                    # worker-originated embedding provider call is attributed to
+                    # the original candidate, and propagated into conflict.check.
+                    "correlation_id": str(correlation_id),
                 },
                 dedupe_key=f"embedding.generate:{item.id}:{profile.id}",
             )
 
     await session.commit()
 
+    outcome_ctx["final_kind"] = kind
+    outcome_ctx["final_review_status"] = review_status
+    outcome_ctx["final_visibility"] = final_visibility
     return RememberResponse(
         id=item.id,
         status="superseded" if superseded_id is not None else "created",
         review_status=review_status,
         memory_confidence=memory_confidence,
         superseded_id=superseded_id,
+        correlation_id=correlation_id,
     )
 
 
@@ -947,27 +1062,71 @@ async def recall(
     tenant_id = await _resolve_tenant_id(session)
     principal_id, _ = await _resolve_principal(session, tenant_id)
 
-    if mode == "semantic":
-        # execute_semantic_recall owns the query-embedding generation flow.
-        result = await execute_semantic_recall(
-            session=session,
-            tenant_id=str(tenant_id),
-            principal_id=str(principal_id),
-            workspace=req.workspace,
-            query=req.query or "",
-            byte_budget=req.byte_budget,
-            token_budget=req.token_budget,
-            item_budget=req.item_budget,
+    timer = Timer()
+    operation = "semantic_recall" if mode == "semantic" else "startup_recall"
+    try:
+        if mode == "semantic":
+            # execute_semantic_recall owns the query-embedding generation flow.
+            result = await execute_semantic_recall(
+                session=session,
+                tenant_id=str(tenant_id),
+                principal_id=str(principal_id),
+                workspace=req.workspace,
+                query=req.query or "",
+                byte_budget=req.byte_budget,
+                token_budget=req.token_budget,
+                item_budget=req.item_budget,
+            )
+        else:
+            result = await execute_startup_recall(
+                session=session,
+                tenant_id=str(tenant_id),
+                principal_id=str(principal_id),
+                workspace=req.workspace,
+                byte_budget=req.byte_budget,
+                token_budget=req.token_budget,
+            )
+    except Exception:
+        # Record the failed retrieval request (previously no row was written on
+        # exception, hiding retrieval errors — ENG-METER-001 correction). The
+        # embedding stage is NOT known on an opaque failure: the exception may
+        # have occurred before, during, or after the embedding call. Record
+        # "unknown" rather than asserting an outcome that may be false, and do
+        # NOT set embedding_call_occurred=True based solely on the mode.
+        await record_retrieval_request(
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            workspace_id=None,
+            operation=operation,
+            status="failed",
+            latency_ms=timer.elapsed_ms(),
+            embedding_call_occurred=None,
+            embedding_outcome="unknown" if mode == "semantic" else "not_required",
         )
-    else:
-        result = await execute_startup_recall(
-            session=session,
-            tenant_id=str(tenant_id),
-            principal_id=str(principal_id),
-            workspace=req.workspace,
-            byte_budget=req.byte_budget,
-            token_budget=req.token_budget,
-        )
+        raise
+
+    # On success, the resolved embedding_outcome comes from the recall engine
+    # (it owns the embedding call and knows whether it happened). The Boolean
+    # embedding_call_occurred is derived from that actual outcome, not the mode.
+    resolved_embedding_outcome = result.get(
+        "embedding_outcome", "not_required" if mode != "semantic" else "unknown"
+    )
+    await record_retrieval_request(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        workspace_id=result.get("workspace_id"),
+        operation=operation,
+        status="succeeded",
+        item_count=result.get("item_count", 0),
+        byte_count=result.get("byte_count", 0),
+        candidate_count=result.get("candidate_count"),
+        latency_ms=timer.elapsed_ms(),
+        scoring_version=result.get("scoring_version"),
+        config_version=result.get("config_version"),
+        embedding_call_occurred=resolved_embedding_outcome
+        in ("succeeded", "failed", "disabled"),
+        embedding_outcome=resolved_embedding_outcome,
+    )
 
     return RecallResponse(
         working_set=result["working_set"],
@@ -995,17 +1154,82 @@ async def search(
     never sees another tenant's memory, another principal's private memory,
     or workspace memory from a workspace they aren't a member of.
     """
+    mode = req.mode
+    tenant_id = await _resolve_tenant_id(session)
+    principal_id, _ = await _resolve_principal(session, tenant_id)
+    timer = Timer()
+
+    # Tracks the actual embedding stage as _search_impl progresses, so the
+    # except handler records the truth rather than guessing from the mode.
+    # Values: not_attempted | disabled | succeeded | failed.
+    embedding_stage: dict[str, str] = {"value": "not_attempted"}
+
+    async def _record_search(
+        operation: str,
+        results: list[dict[str, Any]],
+        *,
+        status: str = "succeeded",
+        embedding_outcome: str | None = None,
+    ) -> None:
+        # Default embedding_outcome to the tracked stage when not overridden.
+        outcome = embedding_outcome if embedding_outcome is not None else embedding_stage["value"]
+        byte_count = sum(len(str(r.get("content", "")).encode("utf-8")) for r in results)
+        await record_retrieval_request(
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            workspace_id=None,
+            operation=operation,
+            status=status,
+            item_count=len(results),
+            byte_count=byte_count,
+            latency_ms=timer.elapsed_ms(),
+            embedding_call_occurred=outcome in ("succeeded", "failed", "disabled"),
+            embedding_outcome=outcome,
+        )
+
+    try:
+        return await _search_impl(
+            req, session, tenant_id, principal_id, timer, _record_search, embedding_stage
+        )
+    except Exception:
+        # Record the failed search request before re-raising — previously no
+        # row was written on exception, hiding search errors (ENG-METER-001).
+        # The embedding stage is whatever _search_impl actually reached (tracked
+        # in embedding_stage), NOT a guess from the requested mode.
+        failed_op = {
+            "keyword": "keyword_search",
+            "semantic": "semantic_search",
+            "hybrid": "hybrid_search",
+        }.get(mode, "hybrid_search")
+        await _record_search(failed_op, [], status="failed")
+        raise
+
+
+async def _search_impl(
+    req: SearchRequest,
+    session: AsyncSession,
+    tenant_id: UUID,
+    principal_id: UUID,
+    timer: Any,
+    _record_search: Any,
+    embedding_stage: dict[str, str],
+) -> SearchResponse:
+    """Keyword/semantic/hybrid search body, split out so the route can wrap it
+    in failure-recording telemetry (ENG-METER-001).
+
+    ``embedding_stage`` is mutated in place to reflect the actual embedding
+    provider-call state (``not_attempted`` → ``succeeded``/``disabled``/
+    ``failed``) so the outer wrapper records the truth on exception, not a
+    guess from the requested mode.
+    """
     limit = req.limit
     mode = req.mode
-    # kind/wing/room filters apply (AND semantics) to all three search modes.
     kind = req.kind
     wing = req.wing
     room = req.room
 
-    tenant_id = await _resolve_tenant_id(session)
-    principal_id, _ = await _resolve_principal(session, tenant_id)
-
     if mode == "keyword":
+        # Keyword search never calls an embedding provider.
         results = await _keyword_search(
             session,
             req.query,
@@ -1016,6 +1240,7 @@ async def search(
             wing=wing,
             room=room,
         )
+        await _record_search("keyword_search", results)
         return SearchResponse(results=results, total=len(results))
 
     import inspect
@@ -1023,10 +1248,24 @@ async def search(
     from engram.embedding_profiles import get_active_profile
 
     active_profile = await get_active_profile(session)
-    if len(inspect.signature(generate_embedding).parameters) >= 2:
-        query_embedding = await generate_embedding(req.query, active_profile)
-    else:
-        query_embedding = await generate_embedding(req.query)
+    try:
+        if len(inspect.signature(generate_embedding).parameters) >= 2:
+            query_embedding = await generate_embedding(
+                req.query,
+                active_profile,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                operation="embedding_query_search",
+            )
+        else:
+            query_embedding = await generate_embedding(req.query)
+    except Exception:
+        # The embedding provider call itself failed.
+        embedding_stage["value"] = "failed"
+        raise
+    # An embedding provider WAS attempted; whether it produced a vector
+    # (succeeded) or came back disabled/empty (disabled) is the signal.
+    embedding_stage["value"] = "succeeded" if query_embedding is not None else "disabled"
     semantic_count = await semantic.candidate_count(
         session,
         tenant_id=tenant_id,
@@ -1039,6 +1278,7 @@ async def search(
 
     if mode == "semantic":
         if query_embedding is None or semantic_count == 0:
+            await _record_search("semantic_search", [])
             return SearchResponse(results=[], total=0, message=_SEARCH_HELPFUL_MESSAGE)
         # Over-fetch so trust-weighted re-ranking can reorder within the window
         # before trimming to the caller's requested limit.
@@ -1055,8 +1295,10 @@ async def search(
             profile=active_profile,
         )
         if not raw:
+            await _record_search("semantic_search", [])
             return SearchResponse(results=[], total=0, message=_SEARCH_HELPFUL_MESSAGE)
         results = [_format_semantic_result(row) for row in raw[:limit]]
+        await _record_search("semantic_search", results)
         return SearchResponse(results=results, total=len(results))
 
     keyword_results = await _keyword_search(
@@ -1070,8 +1312,10 @@ async def search(
         room=room,
     )
     if query_embedding is None or semantic_count == 0:
+        limited = keyword_results[:limit]
+        await _record_search("hybrid_search", limited)
         return SearchResponse(
-            results=keyword_results[:limit],
+            results=limited,
             total=min(len(keyword_results), limit),
             message=_SEARCH_HELPFUL_MESSAGE,
         )
@@ -1089,6 +1333,7 @@ async def search(
     )
     semantic_results = [_format_semantic_result(row) for row in raw_semantic]
     results = _rrf_fuse(keyword_results, semantic_results, limit=limit)
+    await _record_search("hybrid_search", results)
     return SearchResponse(results=results, total=len(results))
 
 

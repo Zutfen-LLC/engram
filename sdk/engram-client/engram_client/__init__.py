@@ -25,6 +25,8 @@ from .models import (
     KgAddRequest,
     KgAddResponse,
     KgTripleOut,
+    LifecycleSummaryRequest,
+    LifecycleSummaryResponse,
     RecallRequest,
     RecallResponse,
     RememberRequest,
@@ -59,4 +61,6 @@ __all__ = [
     "KgTripleOut",
     "DiaryWrite",
     "DiaryWriteResponse",
+    "LifecycleSummaryRequest",
+    "LifecycleSummaryResponse",
 ]

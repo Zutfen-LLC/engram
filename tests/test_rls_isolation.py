@@ -57,6 +57,7 @@ RLS_TABLES: tuple[str, ...] = (
     "jobs",
     "memory_kinds",
     "memory_edges",
+    "usage_events",
 )
 
 # Representative high-risk tables exercised with real rows below. The full set
@@ -68,6 +69,7 @@ REPRESENTATIVE_RLS_TABLES: tuple[str, ...] = (
     "recall_logs",
     "api_keys",
     "workspace_members",
+    "usage_events",
 )
 
 
@@ -275,6 +277,24 @@ async def two_tenant_data():
                 p_b,
             )
 
+            # usage_events in each tenant.
+            await owner.execute(
+                "INSERT INTO usage_events (id, tenant_id, principal_id, event_type, "
+                "operation, status) VALUES ($1, $2, $3, 'candidate.observed', "
+                "'process_memory_candidate', 'accepted_for_processing')",
+                str(uuid4()),
+                a_id,
+                p_a,
+            )
+            await owner.execute(
+                "INSERT INTO usage_events (id, tenant_id, principal_id, event_type, "
+                "operation, status) VALUES ($1, $2, $3, 'candidate.observed', "
+                "'process_memory_candidate', 'accepted_for_processing')",
+                str(uuid4()),
+                b_id,
+                p_b,
+            )
+
         yield {
             "owner": owner,
             "tenant_a": a_id,
@@ -349,6 +369,11 @@ async def test_cross_tenant_select_blocked_as_app_role(two_tenant_data, table: s
                 "SELECT count(*) FROM workspace_members WHERE id = $1", data["member_b"]
             ) == 0
             assert await app.fetchval("SELECT count(*) FROM workspace_members") >= 1
+        elif table == "usage_events":
+            assert await app.fetchval(
+                "SELECT count(*) FROM usage_events WHERE tenant_id::text = $1", data["tenant_b"]
+            ) == 0
+            assert await app.fetchval("SELECT count(*) FROM usage_events") >= 1
     finally:
         await app.close()
 

@@ -108,7 +108,7 @@ def _provider(enabled: bool, monkeypatch) -> None:
     else:
         settings.embedding_provider = "none"
 
-    async def fake_embedding(text_value: str):
+    async def fake_embedding(text_value: str, *_args: object, **_kwargs: object):
         return [0.01] * settings.embedding_dim
 
     if enabled:
@@ -169,10 +169,10 @@ async def test_remember_enqueues_embedding_job_without_provider_call(client, mon
     provider_called = False
     original = embeddings_mod.generate_embedding
 
-    async def spy(text_value: str):
+    async def spy(text_value: str, *args: object, **kwargs: object):
         nonlocal provider_called
         provider_called = True
-        return await original(text_value)  # type: ignore[misc]
+        return await original(text_value, *args, **kwargs)  # type: ignore[misc]
 
     monkeypatch.setattr(memory_routes, "generate_embedding", spy)
 
@@ -217,7 +217,7 @@ async def test_failed_provider_retries_then_dead(client, monkeypatch):
 
     call_count = 0
 
-    async def always_fail(text_value: str):
+    async def always_fail(text_value: str, *args: object, **kwargs: object):
         nonlocal call_count
         call_count += 1
         raise RuntimeError("provider down")

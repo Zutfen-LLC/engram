@@ -249,6 +249,35 @@ def main() -> None:
         help="Text to embed for the validation test (default: a pangram).",
     )
 
+    # --- usage-report ---------------------------------------------------------
+    usage_report_parser = sub.add_parser(
+        "usage-report",
+        help="Dogfood usage/metering report (ENG-METER-001): candidate funnel, "
+        "provider economics, retrieval, worker, and storage stats derived from "
+        "the append-only usage_events ledger. Observability only — never an "
+        "invoice or authoritative billable usage.",
+    )
+    usage_report_parser.add_argument(
+        "--tenant",
+        default=None,
+        help="Restrict the report to a single tenant id. Default: all tenants.",
+    )
+    usage_report_parser.add_argument(
+        "--since",
+        default=None,
+        help="ISO-8601 window start. Default: 7 days ago.",
+    )
+    usage_report_parser.add_argument(
+        "--until",
+        default=None,
+        help="ISO-8601 window end. Default: now.",
+    )
+    usage_report_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit stable machine-readable JSON instead of a human-readable report.",
+    )
+
     args = parser.parse_args()
     if args.command == "serve":
         import uvicorn
@@ -354,6 +383,17 @@ def main() -> None:
         )
     elif args.command == "setup-embeddings":
         raise SystemExit(asyncio.run(_run_setup_embeddings(args.text)))
+    elif args.command == "usage-report":
+        raise SystemExit(
+            asyncio.run(
+                _run_usage_report(
+                    tenant=args.tenant,
+                    since=args.since,
+                    until=args.until,
+                    as_json=args.json,
+                )
+            )
+        )
     else:
         parser.print_help()
 
@@ -1108,10 +1148,27 @@ async def _run_setup_embeddings(test_text: str) -> int:
 
     # 5. Test embedding generation
     print(f'\n  Generating test embedding for: "{test_text[:60]}..."')
+    # Best-effort tenant resolution for the embedding_setup usage-telemetry
+    # event only — this diagnostic ping is deliberately excluded from normal
+    # product-usage totals in the dogfood report (operation=embedding_setup).
+    # Never blocks the diagnostic: a lookup failure just means no telemetry.
+    setup_tenant_id = None
+    try:
+        from sqlalchemy import select as _select
+
+        from engram.db import owner_session_factory
+        from engram.models import Tenant
+
+        async with owner_session_factory() as _session:
+            setup_tenant_id = await _session.scalar(_select(Tenant.id).limit(1))
+    except Exception:  # noqa: BLE001 - diagnostic tenant lookup is best-effort
+        setup_tenant_id = None
     try:
         from engram.embeddings import generate_embedding
 
-        vec = await generate_embedding(test_text)
+        vec = await generate_embedding(
+            test_text, tenant_id=setup_tenant_id, operation="embedding_setup"
+        )
     except Exception as exc:
         print("\n  FAIL: Embedding generation raised an error:")
         print(f"    {type(exc).__name__}: {exc}")
@@ -1140,6 +1197,142 @@ async def _run_setup_embeddings(test_text: str) -> int:
     print(f"\n  SUCCESS: Generated {len(vec)}-dimensional embedding.")
     print(f"  First 5 values: {vec[:5]}")
     print("\n  Embedding configuration is valid.")
+    return 0
+
+
+# --- usage-report ------------------------------------------------------------
+
+
+def _json_default(value: Any) -> Any:
+    """json.dumps ``default=`` for datetime/Decimal values from raw SQL rows."""
+    import datetime as _dt
+    import decimal
+
+    if isinstance(value, _dt.datetime):
+        return value.isoformat()
+    if isinstance(value, decimal.Decimal):
+        return float(value)
+    return str(value)
+
+
+def _print_human_usage_report(report: dict[str, Any]) -> None:
+    cov = report["coverage"]
+    funnel = report["candidate_funnel"]
+    retrieval = report["retrieval"]
+    conflict = report["conflict_economics"]
+    storage = report["storage"]
+
+    print("Engram dogfood usage report")
+    print("=" * 60)
+    print(f"tenant:  {report['tenant_id'] or '(all tenants)'}")
+    print(f"window:  {report['since']}  to  {report['until']}")
+    print()
+    print("-- Coverage & data quality --")
+    print(f"  telemetry_enabled:            {cov['telemetry_enabled']}")
+    print(f"  first_event_at:               {cov['first_event_at']}")
+    print(f"  last_event_at:                {cov['last_event_at']}")
+    print(f"  provider calls w/ tokens:      {cov['pct_provider_calls_with_tokens']}%")
+    print(f"  provider calls w/ cost:        {cov['pct_provider_calls_with_cost']}%")
+    print(
+        f"  active principals:            {cov['active_principals']} "
+        f"({cov['active_principals_with_lifecycle_summary']} with lifecycle summaries)"
+    )
+    for w in cov["warnings"]:
+        print(f"  WARNING: {w}")
+    print()
+    print("-- Candidate funnel --")
+    for key in (
+        "lifecycle_extracted", "lifecycle_guard_rejected", "lifecycle_classified",
+        "lifecycle_parked", "candidate_observations", "remember_attempts",
+        "created", "deduped", "superseded", "failed",
+        "flat_candidate_units", "kib_candidate_units",
+    ):
+        print(f"  {key:32s} {funnel[key]}")
+    print(
+        f"  candidate_bytes p50/p90/p99:   "
+        f"{funnel['candidate_bytes_p50']}/{funnel['candidate_bytes_p90']}/"
+        f"{funnel['candidate_bytes_p99']}"
+    )
+    print()
+    print("-- Breakdown by source type --")
+    for row in report["by_source_type"]:
+        print(f"  {row['source_type']:16s} observed={row['candidate_observations']:<8} "
+              f"bytes={row['candidate_bytes']:<10} kib_units={row['kib_candidate_units']}")
+    print()
+    print("-- Provider economics (operation/host/model) --")
+    for row in report["provider_economics"]:
+        disabled = row.get("disabled_n") or 0
+        print(
+            f"  {row['operation']:24s} {row['provider_host'] or '-':22s} {row['model'] or '-':20s} "
+            f"calls={row['calls']:<6} ok={row['successes']:<6} fail={row['failures']:<4} "
+            f"fallback={row.get('application_fallbacks', 0):<4} disabled={disabled:<4} "
+            f"tokens={row['total_tokens']:<8} "
+            f"cost=${row['reported_cost_usd'] or 0:.4f} "
+            f"cost_cov={row['reported_cost_coverage_pct']}%"
+        )
+    print()
+    print("-- Conflict economics --")
+    print(f"  conflict_classifications:     {conflict['conflict_classifications']}")
+    print(
+        "  per 1000 candidate obs:        "
+        f"{conflict['conflict_calls_per_1000_candidate_observations']}"
+    )
+    print(f"  verdict distribution:         {conflict['verdict_distribution']}")
+    print(f"  failed_or_fallback:            {conflict['failed_or_fallback_count']}")
+    print()
+    print("-- Retrieval --")
+    for row in retrieval["by_mode"]:
+        print(f"  {row['operation']:18s} requests={row['requests']:<6} "
+              f"items={row['item_total']:<8} bytes={row['byte_total']}")
+    print(f"  query_embedding_calls:         {retrieval['query_embedding_calls']}")
+    print(f"  semantic_queries/created_mem:  {retrieval['semantic_queries_per_created_memory']}")
+    print(f"  retrievals/active_principal:   {retrieval['retrievals_per_active_principal']}")
+    print()
+    print("-- Worker/queue --")
+    for row in report["worker"]["by_job_type_status"]:
+        print(f"  {row['job_type']:24s} {row['status']:12s} {row['n']}")
+    print(f"  oldest_pending_age_seconds:    {report['worker']['oldest_pending_age_seconds']}")
+    print()
+    print("-- Storage --")
+    for key in (
+        "memory_items_total", "memory_items_live", "memory_items_active",
+        "memory_items_proposed", "memory_items_disputed", "memory_items_rejected",
+        "memory_items_archived", "embeddings_ready", "embeddings_pending",
+        "embeddings_failed", "embedding_profiles_total", "embedding_profiles_writable",
+        "database_bytes", "bytes_per_retained_memory", "bytes_per_ready_embedding",
+    ):
+        print(f"  {key:28s} {storage[key]}")
+
+
+async def _run_usage_report(
+    *,
+    tenant: str | None,
+    since: str | None,
+    until: str | None,
+    as_json: bool,
+) -> int:
+    """Build and print the dogfood usage report (ENG-METER-001).
+
+    Uses the owner database URL for cross-tenant reporting (bypasses RLS,
+    matching ``_run_promotion``/``_run_backfill``); every query still filters
+    explicitly by ``--tenant`` when given, so results are correct under RLS too.
+    """
+    import json as _json_module
+    from datetime import UTC, datetime
+
+    from engram.db import owner_session_factory
+    from engram.usage_report import build_report
+
+    since_dt = datetime.fromisoformat(since).astimezone(UTC) if since else None
+    until_dt = datetime.fromisoformat(until).astimezone(UTC) if until else None
+
+    async with owner_session_factory() as session:
+        report = await build_report(session, tenant_id=tenant, since=since_dt, until=until_dt)
+
+    if as_json:
+        print(_json_module.dumps(report, default=_json_default, indent=2, sort_keys=True))
+    else:
+        _print_human_usage_report(report)
     return 0
 
 

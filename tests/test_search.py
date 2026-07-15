@@ -179,7 +179,7 @@ async def test_semantic_search_returns_best_match_and_ready_embedding_row(client
     target = [1.0] + [0.0] * 1535
     distractor = [0.0, 1.0] + [0.0] * 1534
 
-    async def fake_embedding(text_value: str):
+    async def fake_embedding(text_value: str, *_args: object, **_kwargs: object):
         if text_value in {"semantic target", "semantic query"}:
             return target
         if text_value == "semantic distractor":
@@ -227,7 +227,7 @@ async def test_hybrid_search_fuses_keyword_and_semantic_rankings(client, monkeyp
     target = [1.0] + [0.0] * 1535
     distractor = [0.0, 1.0] + [0.0] * 1534
 
-    async def fake_embedding(text_value: str):
+    async def fake_embedding(text_value: str, *_args: object, **_kwargs: object):
         if text_value == "blue":
             return target
         if text_value == "blue keyword match":
@@ -326,7 +326,7 @@ async def test_semantic_search_kind_filter_honored(client, monkeypatch):
     # filter is the only differentiator.
     same_vec = [1.0] + [0.0] * 1535
 
-    async def fake_embedding(text_value: str):
+    async def fake_embedding(text_value: str, *_args: object, **_kwargs: object):
         return same_vec
 
     monkeypatch.setattr(memory_routes, "generate_embedding", fake_embedding)
@@ -350,7 +350,7 @@ async def test_semantic_search_room_filter_honored(client, monkeypatch):
     settings.embedding_provider = "openai"
     same_vec = [1.0] + [0.0] * 1535
 
-    async def fake_embedding(text_value: str):
+    async def fake_embedding(text_value: str, *_args: object, **_kwargs: object):
         return same_vec
 
     monkeypatch.setattr(memory_routes, "generate_embedding", fake_embedding)
@@ -374,7 +374,7 @@ async def test_hybrid_search_wing_filter_honored(client, monkeypatch):
     settings.embedding_provider = "openai"
     same_vec = [1.0] + [0.0] * 1535
 
-    async def fake_embedding(text_value: str):
+    async def fake_embedding(text_value: str, *_args: object, **_kwargs: object):
         return same_vec
 
     monkeypatch.setattr(memory_routes, "generate_embedding", fake_embedding)
@@ -431,7 +431,7 @@ async def test_semantic_search_ranks_high_trust_above_slightly_closer_low_trust(
     low_trust_vec = [1.0, 0.0] + [0.0] * 1534  # exactly the query vector
     query_vec = [1.0, 0.0] + [0.0] * 1534
 
-    async def fake_embedding(text_value: str):
+    async def fake_embedding(text_value: str, *_args: object, **_kwargs: object):
         if text_value == "high trust memory":
             return high_trust_vec
         if text_value == "low trust memory":

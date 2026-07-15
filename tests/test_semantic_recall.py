@@ -136,7 +136,9 @@ async def _remember(client: AsyncClient, content: str, **payload: Any) -> dict[s
 
 
 def _patch_embeddings(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_embedding(text_value: str) -> list[float] | None:
+    async def fake_embedding(
+        text_value: str, *_args: object, **_kwargs: object
+    ) -> list[float] | None:
         return _fake_embedding_for(text_value)
 
     # recall.execute_semantic_recall imports generate_embedding at module load.

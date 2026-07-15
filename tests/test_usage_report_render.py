@@ -1,0 +1,141 @@
+"""Unit tests for the human-readable usage-report renderer (ENG-METER-001).
+
+These tests do NOT require a live database — they invoke
+``_print_human_usage_report`` directly with a synthetic report dict, so the
+renderer is covered even in environments without PostgreSQL. The renderer
+previously crashed with ``KeyError: 'fallbacks'`` because the builder renamed
+the column to ``application_fallbacks``; this guards against that class of
+drift.
+"""
+
+from __future__ import annotations
+
+import io
+from contextlib import redirect_stdout
+from datetime import UTC, datetime
+from typing import Any
+
+from engram.cli import _print_human_usage_report
+
+
+def _sample_report(*, with_provider_row: bool = True) -> dict[str, Any]:
+    """A minimal report dict with every key the renderer reads."""
+    report: dict[str, Any] = {
+        "tenant_id": None,
+        "since": datetime.now(UTC).isoformat(),
+        "until": datetime.now(UTC).isoformat(),
+        "coverage": {
+            "telemetry_enabled": True,
+            "first_event_at": None,
+            "last_event_at": None,
+            "pct_provider_calls_with_tokens": 0.0,
+            "pct_provider_calls_with_cost": 0.0,
+            "active_principals": 0,
+            "active_principals_with_lifecycle_summary": 0,
+            "warnings": [],
+        },
+        "candidate_funnel": {
+            "lifecycle_extracted": 0,
+            "lifecycle_guard_rejected": 0,
+            "lifecycle_classified": 0,
+            "lifecycle_parked": 0,
+            "candidate_observations": 0,
+            "remember_attempts": 0,
+            "created": 0,
+            "deduped": 0,
+            "superseded": 0,
+            "failed": 0,
+            "flat_candidate_units": 0,
+            "kib_candidate_units": 0,
+            "candidate_bytes_p50": 0,
+            "candidate_bytes_p90": 0,
+            "candidate_bytes_p99": 0,
+        },
+        "by_source_type": [],
+        "provider_economics": [],
+        "conflict_economics": {
+            "conflict_classifications": 0,
+            "conflict_calls_per_1000_candidate_observations": 0.0,
+            "verdict_distribution": {},
+            "failed_or_fallback_count": 0,
+        },
+        "retrieval": {
+            "by_mode": [],
+            "total_requests": 0,
+            "query_embedding_calls": 0,
+            "semantic_queries_per_created_memory": 0.0,
+            "retrievals_per_active_principal": 0.0,
+        },
+        "worker": {"by_job_type_status": [], "oldest_pending_age_seconds": None},
+        "storage": {
+            "memory_items_total": 0,
+            "memory_items_live": 0,
+            "memory_items_active": 0,
+            "memory_items_proposed": 0,
+            "memory_items_disputed": 0,
+            "memory_items_rejected": 0,
+            "memory_items_archived": 0,
+            "embeddings_ready": 0,
+            "embeddings_pending": 0,
+            "embeddings_failed": 0,
+            "embedding_profiles_total": 0,
+            "embedding_profiles_writable": 0,
+            "database_bytes": 0,
+            "bytes_per_retained_memory": None,
+            "bytes_per_ready_embedding": None,
+        },
+        "hourly_series": [],
+    }
+    if with_provider_row:
+        report["provider_economics"] = [
+            {
+                "operation": "classification",
+                "provider_host": "api.openai.com",
+                "model": "gpt-4o-mini",
+                "calls": 10,
+                "successes": 8,
+                "failures": 2,
+                "disabled_n": 1,
+                "application_fallbacks": 2,
+                "input_count": 10,
+                "prompt_tokens": 500,
+                "completion_tokens": 100,
+                "total_tokens": 600,
+                "reported_cost_usd": 0.0123,
+                "with_reported_cost": 10,
+                "reported_cost_coverage_pct": 100.0,
+                "latency_p50": 200,
+                "latency_p90": 400,
+                "latency_p99": 900,
+            }
+        ]
+    return report
+
+
+def test_human_report_renders_without_error_with_provider_row():
+    """The renderer must not raise when provider_economics has a row.
+
+    Regression guard: the builder renamed ``fallbacks`` to
+    ``application_fallbacks`` and added ``disabled_n``, but the renderer
+    previously read ``row['fallbacks']`` — a KeyError.
+    """
+    report = _sample_report(with_provider_row=True)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        _print_human_usage_report(report)
+    output = buf.getvalue()
+    assert "classification" in output
+    # The renamed column is rendered (as the fallback count).
+    assert "fallback=2" in output
+    # The new disabled count is rendered.
+    assert "disabled=1" in output
+
+
+def test_human_report_renders_without_provider_rows():
+    """The renderer must not raise when provider_economics is empty."""
+    report = _sample_report(with_provider_row=False)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        _print_human_usage_report(report)
+    output = buf.getvalue()
+    assert "Engram dogfood usage report" in output

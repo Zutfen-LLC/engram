@@ -14,6 +14,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from engram.config import settings
 from engram.embedding_profiles import LEGACY_MODEL
 from engram.models import EmbeddingProfile, MemoryEmbedding, MemoryItem
+from engram.usage import (
+    Timer,
+    extract_openai_compatible_usage,
+    record_provider_call,
+    safe_provider_identity,
+    utf8_byte_len,
+)
 
 log = logging.getLogger(__name__)
 
@@ -40,18 +47,53 @@ STATUS_FAILED = "failed"
 
 
 async def generate_embeddings(
-    texts: list[str], profile: EmbeddingProfile | None = None
+    texts: list[str],
+    profile: EmbeddingProfile | None = None,
+    *,
+    tenant_id: uuid.UUID | str | None = None,
+    principal_id: uuid.UUID | str | None = None,
+    workspace_id: uuid.UUID | str | None = None,
+    operation: str = "embedding_document",
+    correlation_id: uuid.UUID | None = None,
+    job_id: uuid.UUID | None = None,
 ) -> list[list[float] | None]:
     """Generate embedding vectors for a batch of ``texts`` in one provider call.
 
     Returns one vector per input text, in input order. When the provider is
     ``none`` every entry is ``None``. Provider call errors propagate to the
     caller; the backfill batches so a single failed call only fails its batch.
+
+    ``tenant_id`` (and the optional ``principal_id``/``workspace_id``/
+    ``correlation_id``/``job_id``) are usage-telemetry context
+    (ENG-METER-001): when given, this single call site records one
+    ``provider.call`` event — ``input_count=len(texts)`` — tagged with
+    ``operation`` (one of ``embedding_document``, ``embedding_backfill``,
+    ``embedding_query_recall``, ``embedding_query_search``,
+    ``embedding_setup``). Omitting ``tenant_id`` (the default) records
+    nothing, so callers without tenant context are unaffected.
     """
     provider = profile.provider if profile is not None else settings.embedding_provider
     model = profile.model if profile is not None else settings.embedding_model
     dimensions = profile.dimensions if profile is not None else settings.embedding_dim
+    input_bytes = sum(utf8_byte_len(t) for t in texts)
+    profile_key = profile.profile_key if profile is not None else None
+
     if provider == "none" or settings.embedding_provider == "none":
+        if tenant_id is not None:
+            await record_provider_call(
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                workspace_id=workspace_id,
+                operation=operation,
+                status="disabled",
+                provider_adapter=provider or "none",
+                model=model,
+                embedding_profile=profile_key,
+                input_count=len(texts),
+                input_bytes=input_bytes,
+                correlation_id=correlation_id,
+                job_id=job_id,
+            )
         return [None] * len(texts)
     if provider != "openai":
         raise ValueError(f"unsupported embedding provider: {provider!r}")
@@ -67,15 +109,37 @@ async def generate_embeddings(
     if settings.openai_base_url:
         client_kwargs["base_url"] = settings.openai_base_url
     client = AsyncOpenAI(**client_kwargs)
-    response = await client.embeddings.create(
-        model=model,
-        input=texts,
-        dimensions=dimensions,
-        # Explicitly request float format: the SDK defaults to "base64" which
-        # some OpenAI-compatible providers (e.g. OpenRouter) do not support,
-        # causing a silent "No embedding data received" error.
-        encoding_format="float",
-    )
+    adapter, host = safe_provider_identity("openai", settings.openai_base_url)
+    timer = Timer()
+    try:
+        response = await client.embeddings.create(
+            model=model,
+            input=texts,
+            dimensions=dimensions,
+            # Explicitly request float format: the SDK defaults to "base64" which
+            # some OpenAI-compatible providers (e.g. OpenRouter) do not support,
+            # causing a silent "No embedding data received" error.
+            encoding_format="float",
+        )
+    except Exception:
+        if tenant_id is not None:
+            await record_provider_call(
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                workspace_id=workspace_id,
+                operation=operation,
+                status="failed",
+                provider_adapter=adapter,
+                provider_host=host,
+                model=model,
+                embedding_profile=profile_key,
+                input_count=len(texts),
+                input_bytes=input_bytes,
+                latency_ms=timer.elapsed_ms(),
+                correlation_id=correlation_id,
+                job_id=job_id,
+            )
+        raise
     # The API returns exactly one embedding per input, in input order.
     vectors: list[list[float] | None] = [
         [float(value) for value in item.embedding] for item in response.data
@@ -84,18 +148,79 @@ async def generate_embeddings(
         if vector is None:
             continue
         if len(vector) != dimensions:
+            if tenant_id is not None:
+                await record_provider_call(
+                    tenant_id=tenant_id,
+                    principal_id=principal_id,
+                    workspace_id=workspace_id,
+                    operation=operation,
+                    status="failed",
+                    provider_adapter=adapter,
+                    provider_host=host,
+                    model=model,
+                    embedding_profile=profile_key,
+                    input_count=len(texts),
+                    input_bytes=input_bytes,
+                    latency_ms=timer.elapsed_ms(),
+                    correlation_id=correlation_id,
+                    job_id=job_id,
+                    metadata={"exception_type": "ValueError"},
+                )
             raise ValueError(
                 f"embedding provider returned dimension {len(vector)}; expected {dimensions} "
                 f"for profile {profile.profile_key if profile else model}"
             )
+
+    if tenant_id is not None:
+        usage = extract_openai_compatible_usage(response)
+        await record_provider_call(
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            workspace_id=workspace_id,
+            operation=operation,
+            status="succeeded",
+            provider_adapter=adapter,
+            provider_host=host,
+            model=model,
+            embedding_profile=profile_key,
+            input_count=len(texts),
+            input_bytes=input_bytes,
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+            total_tokens=usage.total_tokens,
+            reported_cost_usd=usage.reported_cost_usd,
+            latency_ms=timer.elapsed_ms(),
+            correlation_id=correlation_id,
+            job_id=job_id,
+            metadata={"vector_count": len(vectors), "dimensions": dimensions},
+        )
     return vectors
 
 
 async def generate_embedding(
-    text: str, profile: EmbeddingProfile | None = None
+    text: str,
+    profile: EmbeddingProfile | None = None,
+    *,
+    tenant_id: uuid.UUID | str | None = None,
+    principal_id: uuid.UUID | str | None = None,
+    workspace_id: uuid.UUID | str | None = None,
+    operation: str = "embedding_document",
+    correlation_id: uuid.UUID | None = None,
+    job_id: uuid.UUID | None = None,
 ) -> list[float] | None:
     """Generate an embedding vector for ``text`` or return ``None`` when disabled."""
-    return (await generate_embeddings([text], profile))[0]
+    return (
+        await generate_embeddings(
+            [text],
+            profile,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            workspace_id=workspace_id,
+            operation=operation,
+            correlation_id=correlation_id,
+            job_id=job_id,
+        )
+    )[0]
 
 
 async def create_embedding_placeholder(
@@ -658,8 +783,11 @@ async def _embed_batch(
         return
 
     texts = [content for _, content in to_embed]
+    tenant_id = to_embed[0][0].tenant_id
     try:
-        vectors = await generate_embeddings(texts)
+        vectors = await generate_embeddings(
+            texts, tenant_id=tenant_id, operation="embedding_backfill"
+        )
     except Exception as exc:  # noqa: BLE001 - provider errors are varied
         if fail_fast:
             raise

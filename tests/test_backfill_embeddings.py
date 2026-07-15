@@ -195,7 +195,9 @@ def _patch_backfill_embedding(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     from engram import embeddings as embeddings_mod
 
-    async def fake_embeddings(texts: list[str]) -> list[list[float] | None]:
+    async def fake_embeddings(
+        texts: list[str], *_args: object, **_kwargs: object
+    ) -> list[list[float] | None]:
         # A whole batch fails if any input is the trigger (batched providers
         # are all-or-nothing per request); use --batch-size 1 to isolate a
         # single bad item into its own batch.
@@ -484,7 +486,9 @@ async def test_batch_size_groups_provider_calls(monkeypatch):
 
     call_sizes: list[int] = []
 
-    async def fake_embeddings(texts: list[str]) -> list[list[float] | None]:
+    async def fake_embeddings(
+        texts: list[str], *_args: object, **_kwargs: object
+    ) -> list[list[float] | None]:
         call_sizes.append(len(texts))
         return [list(_VEC_OK) for _ in texts]
 

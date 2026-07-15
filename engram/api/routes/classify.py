@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, model_validator
@@ -17,6 +16,8 @@ from engram.classification import classify as classify_content
 from engram.classification_evidence import new_run
 from engram.db import get_session
 from engram.models import Principal, Workspace
+from engram.source_types import SourceType
+from engram.usage import record_candidate_once
 
 router = APIRouter()
 
@@ -25,14 +26,20 @@ class ClassifyRequest(BaseModel):
     content: str
     context: str | None = None  # optional conversation excerpt or source_type hint
     workspace: str | None = None
-    source_type: Literal[
-        "manual", "import", "migration", "extraction", "sync_turn", "pre_compress", "session_end"
-    ] = "manual"
+    source_type: SourceType = "manual"
+    # Optional client-supplied correlation id shared with the /v1/remember call
+    # for the same candidate. When absent the server generates one. Lifecycle
+    # hooks always supply this — one UUID per extracted candidate — so the two
+    # legs (classify, remember) count as a single candidate.observed event.
+    correlation_id: UUID | None = None
 
 
 class ClassifyResponse(BaseModel):
     classification_run_id: UUID
     expires_at: datetime
+    # Additive, backward-compatible: the effective correlation id (echoed back
+    # if the caller supplied one, otherwise server-generated).
+    correlation_id: UUID
     suggested_kind: str
     suggested_wing: str | None = None
     suggested_room: str | None = None
@@ -110,8 +117,30 @@ async def classify(
     tenant_id = await _resolve_tenant_id(session)
     principal_id = await _resolve_principal_id(session, tenant_id)
     workspace_id = await _resolve_workspace_id(session, tenant_id, req.workspace)
+    correlation_id = req.correlation_id or uuid4()
+
+    # candidate.observed is recorded once per correlation_id (idempotent via
+    # usage_events' dedupe_key unique index) so a direct /v1/remember call and
+    # a preceding /v1/classify call for the same candidate never double-count.
+    # Best-effort: a telemetry failure here must never affect classification.
+    await record_candidate_once(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        workspace_id=workspace_id,
+        correlation_id=correlation_id,
+        candidate_utf8_bytes=len(req.content.encode("utf-8")),
+        source_type=req.source_type,
+    )
+
     result: ClassificationResult = await classify_content(
-        req.content, tenant_id, session, context=req.context
+        req.content,
+        tenant_id,
+        session,
+        context=req.context,
+        principal_id=principal_id,
+        workspace_id=workspace_id,
+        correlation_id=correlation_id,
+        source_type=req.source_type,
     )
     run = new_run(
         tenant_id=tenant_id,
@@ -127,6 +156,7 @@ async def classify(
     return ClassifyResponse(
         classification_run_id=run.id,
         expires_at=run.expires_at,
+        correlation_id=correlation_id,
         **result.model_dump(exclude={"provenance"}),
     )
 

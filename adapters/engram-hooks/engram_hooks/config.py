@@ -146,6 +146,15 @@ class HooksConfig:
         default_factory=lambda: _env_bool("ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE", False)
     )
 
+    # When True, report one aggregate, diagnostic lifecycle-summary telemetry
+    # event (ENG-METER-001) to the server after each hook invocation via
+    # POST /v1/telemetry/lifecycle — counts and byte totals only, never
+    # candidate text. Best-effort: reporting failure never changes HookResult.
+    # Off by default; dogfood deployments enable it explicitly.
+    report_lifecycle_telemetry: bool = field(
+        default_factory=lambda: _env_bool("ENGRAM_HOOKS_REPORT_LIFECYCLE_TELEMETRY", False)
+    )
+
     def __post_init__(self) -> None:
         import os
 

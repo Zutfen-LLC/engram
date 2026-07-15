@@ -33,6 +33,21 @@ def _restore_auth_enabled_default():
 
 
 @pytest.fixture(autouse=True)
+def _restore_usage_telemetry_enabled_default():
+    """Guard against global `settings.usage_telemetry_enabled` leakage.
+
+    Same rationale as `_restore_auth_enabled_default`: several usage-telemetry
+    tests flip this singleton to True to exercise the enabled path, without
+    their own teardown. Restore the pre-test value after every test.
+    """
+    from engram.config import settings
+
+    original = settings.usage_telemetry_enabled
+    yield
+    settings.usage_telemetry_enabled = original
+
+
+@pytest.fixture(autouse=True)
 async def _dispose_db_engines_after_test():
     """Dispose the real module-level SQLAlchemy engines after every test.
 

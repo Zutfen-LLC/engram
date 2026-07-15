@@ -34,6 +34,7 @@ def test_classify_legacy_confidence_is_canonical_alias() -> None:
         {
             "classification_run_id": "11111111-1111-1111-1111-111111111111",
             "expires_at": "2026-07-14T13:00:00Z",
+            "correlation_id": "11111111-1111-1111-1111-111111111111",
             "suggested_kind": "fact",
             "taxonomy_confidence": 0.8,
             "confidence": 0.1,

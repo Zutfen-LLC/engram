@@ -29,6 +29,9 @@ from .models import (
     KgAddRequest,
     KgAddResponse,
     KgTripleOut,
+    LifecycleEvent,
+    LifecycleSummaryRequest,
+    LifecycleSummaryResponse,
     RecallRequest,
     RecallResponse,
     RememberRequest,
@@ -199,8 +202,16 @@ class EngramClient:
         external_id: str | None = None,
         external_source: str | None = None,
         classification_run_id: UUID | None = None,
+        correlation_id: UUID | None = None,
     ) -> RememberResponse:
-        """Write a memory item with dedup, trust defaults, and supersession."""
+        """Write a memory item with dedup, trust defaults, and supersession.
+
+        ``correlation_id``, when shared with a preceding :meth:`classify`
+        call for the same candidate, lets the server count the two calls as a
+        single usage-telemetry candidate observation rather than two. Omit it
+        for a direct remember with no preceding classify — the server
+        generates one.
+        """
         req = RememberRequest(
             content=content,
             kind=kind,
@@ -219,6 +230,7 @@ class EngramClient:
             external_id=external_id,
             external_source=external_source,
             classification_run_id=classification_run_id,
+            correlation_id=correlation_id,
         )
         return await self._send(
             "POST",
@@ -292,15 +304,68 @@ class EngramClient:
         context: str | None = None,
         workspace: str | None = None,
         source_type: SourceKind = "manual",
+        correlation_id: UUID | None = None,
     ) -> ClassifyResponse:
-        """Classify raw text: suggest kind, wing, room, visibility."""
+        """Classify raw text: suggest kind, wing, room, visibility.
+
+        ``correlation_id``, when shared with a subsequent :meth:`remember`
+        call for the same candidate, lets the server count the two calls as a
+        single usage-telemetry candidate observation rather than two.
+        """
         req = ClassifyRequest(
-            content=content, context=context, workspace=workspace, source_type=source_type
+            content=content,
+            context=context,
+            workspace=workspace,
+            source_type=source_type,
+            correlation_id=correlation_id,
         )
         return await self._send(
             "POST",
             "/v1/classify",
             ClassifyResponse,
+            json_body=req.model_dump(mode="json", exclude_none=True),
+        )
+
+    # ---- /v1/telemetry/lifecycle ----
+
+    async def report_lifecycle_summary(
+        self,
+        *,
+        invocation_id: UUID,
+        event: LifecycleEvent,
+        extracted: int = 0,
+        guard_rejected: int = 0,
+        classified: int = 0,
+        promoted: int = 0,
+        parked: int = 0,
+        errors: int = 0,
+        candidate_bytes: int = 0,
+        latency_ms: int | None = None,
+        adapter_version: str | None = None,
+    ) -> LifecycleSummaryResponse:
+        """Report one diagnostic, client-reported lifecycle summary.
+
+        Never send candidate text here — only aggregate counts/byte totals
+        for one hook invocation. Tenant/principal are derived from
+        authentication server-side; this is diagnostic and non-authoritative.
+        """
+        req = LifecycleSummaryRequest(
+            invocation_id=invocation_id,
+            event=event,
+            extracted=extracted,
+            guard_rejected=guard_rejected,
+            classified=classified,
+            promoted=promoted,
+            parked=parked,
+            errors=errors,
+            candidate_bytes=candidate_bytes,
+            latency_ms=latency_ms,
+            adapter_version=adapter_version,
+        )
+        return await self._send(
+            "POST",
+            "/v1/telemetry/lifecycle",
+            LifecycleSummaryResponse,
             json_body=req.model_dump(mode="json", exclude_none=True),
         )
 
