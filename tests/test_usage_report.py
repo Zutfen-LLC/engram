@@ -927,9 +927,18 @@ async def test_report_shape_is_stable_and_json_serializable(tenant, principal):
         report = await build_report(session, tenant_id=tenant)
 
     expected_top_level = {
-        "tenant_id", "since", "until", "coverage", "candidate_funnel",
-        "by_source_type", "by_principal", "provider_economics",
-        "conflict_economics", "retrieval", "worker", "storage", "hourly_series",
+        "report_schema_version", "tenant_id", "since", "until", "coverage",
+        "candidate_funnel", "by_source_type", "by_principal", "provider_economics",
+        "all_provider_operations", "all_actual_provider_calls",
+        "all_non_attempted_failures", "all_disabled_operations", "all_provider_tokens",
+        "all_reported_cost_usd", "product_provider_operations",
+        "product_actual_provider_calls", "product_provider_tokens",
+        "product_reported_cost_usd", "maintenance_provider_operations",
+        "maintenance_actual_provider_calls", "maintenance_provider_tokens",
+        "maintenance_reported_cost_usd", "diagnostic_provider_operations",
+        "diagnostic_actual_provider_calls", "diagnostic_provider_tokens",
+        "diagnostic_reported_cost_usd", "conflict_economics", "retrieval", "worker",
+        "storage", "hourly_series",
     }
     assert set(report.keys()) == expected_top_level
     # Must round-trip through JSON with a Decimal/datetime-safe default.
