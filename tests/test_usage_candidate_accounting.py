@@ -237,6 +237,40 @@ async def test_failed_remember_recorded_without_changing_api_response(client):
     assert len(matching) == 1
 
 
+async def test_candidate_outcome_is_append_only_per_attempt(client):
+    """candidate.outcome is append-only per attempt (ENG-METER-001 correction):
+    every /v1/remember invocation appends its own outcome row, so a failed
+    attempt followed by a successful retry with the SAME correlation_id
+    records TWO outcome rows (one failed, one created) rather than suppressing
+    the second. The report resolves a logical outcome from these."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    import uuid as _uuid
+
+    correlation_id = str(_uuid.uuid4())
+    # First attempt: failed (bad kind).
+    first = await client.post(
+        "/v1/remember",
+        json={
+            "content": "retryable content",
+            "kind": "not-a-real-kind",
+            "correlation_id": correlation_id,
+        },
+    )
+    assert first.status_code == 422
+    # Second attempt for the SAME candidate: succeeded.
+    second = await client.post(
+        "/v1/remember",
+        json={"content": "retryable content", "correlation_id": correlation_id},
+    )
+    assert second.status_code == 201
+
+    outcomes = await _usage_events("candidate.outcome", correlation_id)
+    statuses = sorted(o["status"] for o in outcomes)
+    # Both attempts are recorded (append-only), not suppressed.
+    assert statuses == ["created", "failed"]
+
+
 async def test_utf8_byte_accounting_for_non_ascii_content(client):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")

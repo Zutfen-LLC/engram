@@ -995,6 +995,10 @@ async def _remember_impl(
                     "memory_item_id": str(item.id),
                     "profile_id": str(profile.id),
                     "profile_key": profile.profile_key,
+                    # ENG-METER-001: thread the candidate correlation id so the
+                    # worker-originated embedding provider call is attributed to
+                    # the original candidate, and propagated into conflict.check.
+                    "correlation_id": str(correlation_id),
                 },
                 dedupe_key=f"embedding.generate:{item.id}:{profile.id}",
             )
@@ -1040,40 +1044,61 @@ async def recall(
     principal_id, _ = await _resolve_principal(session, tenant_id)
 
     timer = Timer()
-    if mode == "semantic":
-        # execute_semantic_recall owns the query-embedding generation flow.
-        result = await execute_semantic_recall(
-            session=session,
-            tenant_id=str(tenant_id),
-            principal_id=str(principal_id),
-            workspace=req.workspace,
-            query=req.query or "",
-            byte_budget=req.byte_budget,
-            token_budget=req.token_budget,
-            item_budget=req.item_budget,
+    operation = "semantic_recall" if mode == "semantic" else "startup_recall"
+    try:
+        if mode == "semantic":
+            # execute_semantic_recall owns the query-embedding generation flow.
+            result = await execute_semantic_recall(
+                session=session,
+                tenant_id=str(tenant_id),
+                principal_id=str(principal_id),
+                workspace=req.workspace,
+                query=req.query or "",
+                byte_budget=req.byte_budget,
+                token_budget=req.token_budget,
+                item_budget=req.item_budget,
+            )
+        else:
+            result = await execute_startup_recall(
+                session=session,
+                tenant_id=str(tenant_id),
+                principal_id=str(principal_id),
+                workspace=req.workspace,
+                byte_budget=req.byte_budget,
+                token_budget=req.token_budget,
+            )
+    except Exception:
+        # Record the failed retrieval request (previously no row was written on
+        # exception, hiding retrieval errors — ENG-METER-001 correction). The
+        # embedding_outcome is unknown on an opaque failure; recorded as such.
+        await record_retrieval_request(
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            workspace_id=None,
+            operation=operation,
+            status="failed",
+            latency_ms=timer.elapsed_ms(),
+            embedding_call_occurred=(mode == "semantic"),
+            embedding_outcome=("succeeded" if mode == "semantic" else "not_required"),
         )
-    else:
-        result = await execute_startup_recall(
-            session=session,
-            tenant_id=str(tenant_id),
-            principal_id=str(principal_id),
-            workspace=req.workspace,
-            byte_budget=req.byte_budget,
-            token_budget=req.token_budget,
-        )
+        raise
 
     await record_retrieval_request(
         tenant_id=tenant_id,
         principal_id=principal_id,
-        workspace_id=None,
-        operation="semantic_recall" if mode == "semantic" else "startup_recall",
+        workspace_id=result.get("workspace_id"),
+        operation=operation,
         status="succeeded",
         item_count=result.get("item_count", 0),
         byte_count=result.get("byte_count", 0),
+        candidate_count=result.get("candidate_count"),
         latency_ms=timer.elapsed_ms(),
         scoring_version=result.get("scoring_version"),
         config_version=result.get("config_version"),
         embedding_call_occurred=(mode == "semantic"),
+        embedding_outcome=result.get(
+            "embedding_outcome", "succeeded" if mode == "semantic" else "not_required"
+        ),
     )
 
     return RecallResponse(
@@ -1102,30 +1127,69 @@ async def search(
     never sees another tenant's memory, another principal's private memory,
     or workspace memory from a workspace they aren't a member of.
     """
-    limit = req.limit
     mode = req.mode
-    # kind/wing/room filters apply (AND semantics) to all three search modes.
-    kind = req.kind
-    wing = req.wing
-    room = req.room
-
     tenant_id = await _resolve_tenant_id(session)
     principal_id, _ = await _resolve_principal(session, tenant_id)
     timer = Timer()
 
-    async def _record_search(operation: str, results: list[dict[str, Any]]) -> None:
+    async def _record_search(
+        operation: str,
+        results: list[dict[str, Any]],
+        *,
+        status: str = "succeeded",
+        embedding_outcome: str = "not_required",
+    ) -> None:
         byte_count = sum(len(str(r.get("content", "")).encode("utf-8")) for r in results)
         await record_retrieval_request(
             tenant_id=tenant_id,
             principal_id=principal_id,
             workspace_id=None,
             operation=operation,
-            status="succeeded",
+            status=status,
             item_count=len(results),
             byte_count=byte_count,
             latency_ms=timer.elapsed_ms(),
             embedding_call_occurred=(operation != "keyword_search"),
+            embedding_outcome=embedding_outcome,
         )
+
+    try:
+        return await _search_impl(
+            req, session, tenant_id, principal_id, timer, _record_search
+        )
+    except Exception:
+        # Record the failed search request before re-raising — previously no
+        # row was written on exception, hiding search errors (ENG-METER-001).
+        # The embedding outcome is inferred from the requested mode.
+        failed_op = {
+            "keyword": "keyword_search",
+            "semantic": "semantic_search",
+            "hybrid": "hybrid_search",
+        }.get(mode, "hybrid_search")
+        await _record_search(
+            failed_op,
+            [],
+            status="failed",
+            embedding_outcome="not_required" if mode == "keyword" else "failed",
+        )
+        raise
+
+
+async def _search_impl(
+    req: SearchRequest,
+    session: AsyncSession,
+    tenant_id: UUID,
+    principal_id: UUID,
+    timer: Any,
+    _record_search: Any,
+) -> SearchResponse:
+    """Keyword/semantic/hybrid search body, split out so the route can wrap it
+    in failure-recording telemetry (ENG-METER-001)."""
+    limit = req.limit
+    mode = req.mode
+    kind = req.kind
+    wing = req.wing
+    room = req.room
 
     if mode == "keyword":
         results = await _keyword_search(
@@ -1146,6 +1210,7 @@ async def search(
     from engram.embedding_profiles import get_active_profile
 
     active_profile = await get_active_profile(session)
+    embedding_outcome = "not_required"
     if len(inspect.signature(generate_embedding).parameters) >= 2:
         query_embedding = await generate_embedding(
             req.query,
@@ -1156,6 +1221,10 @@ async def search(
         )
     else:
         query_embedding = await generate_embedding(req.query)
+    # An embedding provider WAS attempted for semantic/hybrid; whether it
+    # produced a vector (succeeded) or came back disabled/empty (disabled)
+    # is the telemetry signal — independent of the requested mode.
+    embedding_outcome = "succeeded" if query_embedding is not None else "disabled"
     semantic_count = await semantic.candidate_count(
         session,
         tenant_id=tenant_id,
@@ -1168,7 +1237,7 @@ async def search(
 
     if mode == "semantic":
         if query_embedding is None or semantic_count == 0:
-            await _record_search("semantic_search", [])
+            await _record_search("semantic_search", [], embedding_outcome=embedding_outcome)
             return SearchResponse(results=[], total=0, message=_SEARCH_HELPFUL_MESSAGE)
         # Over-fetch so trust-weighted re-ranking can reorder within the window
         # before trimming to the caller's requested limit.
@@ -1185,10 +1254,10 @@ async def search(
             profile=active_profile,
         )
         if not raw:
-            await _record_search("semantic_search", [])
+            await _record_search("semantic_search", [], embedding_outcome=embedding_outcome)
             return SearchResponse(results=[], total=0, message=_SEARCH_HELPFUL_MESSAGE)
         results = [_format_semantic_result(row) for row in raw[:limit]]
-        await _record_search("semantic_search", results)
+        await _record_search("semantic_search", results, embedding_outcome=embedding_outcome)
         return SearchResponse(results=results, total=len(results))
 
     keyword_results = await _keyword_search(
@@ -1203,7 +1272,7 @@ async def search(
     )
     if query_embedding is None or semantic_count == 0:
         limited = keyword_results[:limit]
-        await _record_search("hybrid_search", limited)
+        await _record_search("hybrid_search", limited, embedding_outcome=embedding_outcome)
         return SearchResponse(
             results=limited,
             total=min(len(keyword_results), limit),
@@ -1223,7 +1292,7 @@ async def search(
     )
     semantic_results = [_format_semantic_result(row) for row in raw_semantic]
     results = _rrf_fuse(keyword_results, semantic_results, limit=limit)
-    await _record_search("hybrid_search", results)
+    await _record_search("hybrid_search", results, embedding_outcome=embedding_outcome)
     return SearchResponse(results=results, total=len(results))
 
 

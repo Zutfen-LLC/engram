@@ -104,16 +104,18 @@ async def _insert_event(
     provider_host: str | None = None,
     model: str | None = None,
     dedupe_key: str | None = None,
+    correlation_id: str | None = None,
     created_at: datetime | None = None,
 ) -> None:
     await session.execute(
         text(
             "INSERT INTO usage_events (tenant_id, principal_id, event_type, operation, status, "
             "input_count, input_bytes, prompt_tokens, total_tokens, reported_cost_usd, "
-            "latency_ms, source_type, provider_host, model, dedupe_key, created_at) "
+            "latency_ms, source_type, provider_host, model, dedupe_key, correlation_id, "
+            "created_at) "
             "VALUES (:tenant_id, :principal_id, :event_type, :operation, :status, "
             ":input_count, :input_bytes, :prompt_tokens, :total_tokens, :reported_cost_usd, "
-            ":latency_ms, :source_type, :provider_host, :model, :dedupe_key, "
+            ":latency_ms, :source_type, :provider_host, :model, :dedupe_key, :correlation_id, "
             "COALESCE(:created_at, now()))"
         ),
         {
@@ -132,6 +134,7 @@ async def _insert_event(
             "provider_host": provider_host,
             "model": model,
             "dedupe_key": dedupe_key,
+            "correlation_id": correlation_id,
             "created_at": created_at,
         },
     )
@@ -256,15 +259,69 @@ async def test_candidate_funnel_outcomes(tenant, principal):
                 event_type="candidate.outcome",
                 operation="process_memory_candidate",
                 status=status,
+                correlation_id=str(uuid.uuid4()),
             )
         await session.commit()
         report = await build_report(session, tenant_id=tenant)
     funnel = report["candidate_funnel"]
+    # Logical outcomes: one per correlation_id (each test event is a distinct
+    # candidate). created/deduped/superseded/failed are the logical counts.
     assert funnel["created"] == 2
     assert funnel["deduped"] == 1
     assert funnel["superseded"] == 1
     assert funnel["failed"] == 1
     assert funnel["remember_attempts"] == 5
+    # Attempt-level diagnostics mirror the logical counts (no retries here).
+    assert funnel["total_attempts"] == 5
+    assert funnel["distinct_candidates"] == 5
+    assert funnel["failed_attempts"] == 1
+    assert funnel["successful_attempts"] == 4
+    assert funnel["attempts_per_candidate_avg"] == 1.0
+
+
+async def test_candidate_funnel_logical_outcome_resolves_retry(tenant, principal):
+    """A failed attempt followed by a successful retry resolves to 'created'
+    at the logical-outcome level, while both attempts remain in the attempt
+    diagnostics (ENG-METER-001 append-only-attempt correction)."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    retried_cid = str(uuid.uuid4())
+    async with _test_session_factory() as session:
+        now = datetime.now(UTC)
+        # First attempt: failed.
+        await _insert_event(
+            session,
+            tenant_id=tenant,
+            principal_id=principal,
+            event_type="candidate.outcome",
+            operation="process_memory_candidate",
+            status="failed",
+            correlation_id=retried_cid,
+            created_at=now - timedelta(minutes=1),
+        )
+        # Second attempt for the SAME candidate: succeeded.
+        await _insert_event(
+            session,
+            tenant_id=tenant,
+            principal_id=principal,
+            event_type="candidate.outcome",
+            operation="process_memory_candidate",
+            status="created",
+            correlation_id=retried_cid,
+            created_at=now,
+        )
+        await session.commit()
+        report = await build_report(session, tenant_id=tenant)
+    funnel = report["candidate_funnel"]
+    # Logical: the retry succeeded, so this candidate counts as 'created', NOT 'failed'.
+    assert funnel["created"] == 1
+    assert funnel["failed"] == 0
+    assert funnel["distinct_candidates"] == 1
+    # Attempt-level: both attempts are visible (one failed, one succeeded).
+    assert funnel["total_attempts"] == 2
+    assert funnel["failed_attempts"] == 1
+    assert funnel["successful_attempts"] == 1
+    assert funnel["attempts_per_candidate_avg"] == 2.0
 
 
 async def test_provider_call_token_and_cost_coverage(tenant, principal):
@@ -303,6 +360,45 @@ async def test_provider_call_token_and_cost_coverage(tenant, principal):
     assert len(econ) == 1
     assert econ[0]["calls"] == 2
     assert econ[0]["reported_cost_coverage_pct"] == 50.0
+
+
+async def test_disabled_provider_calls_excluded_from_coverage(tenant, principal):
+    """``disabled`` provider.call events are not external calls and must be
+    excluded from the actual-call and usage-coverage denominators
+    (ENG-METER-001 correction)."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    async with _test_session_factory() as session:
+        # One real call with tokens.
+        await _insert_event(
+            session,
+            tenant_id=tenant,
+            principal_id=principal,
+            event_type="provider.call",
+            operation="classification",
+            status="succeeded",
+            total_tokens=100,
+            provider_host="api.openai.com",
+            model="gpt-x",
+        )
+        # Two disabled rows (provider='none') — not external calls.
+        for _ in range(2):
+            await _insert_event(
+                session,
+                tenant_id=tenant,
+                principal_id=principal,
+                event_type="provider.call",
+                operation="classification",
+                status="disabled",
+            )
+        await session.commit()
+        report = await build_report(session, tenant_id=tenant)
+    coverage = report["coverage"]
+    assert coverage["provider_calls_total"] == 3
+    assert coverage["provider_actual_calls"] == 1
+    assert coverage["provider_disabled_calls"] == 2
+    # The single actual call carried tokens → 100%, not dragged down by disabled.
+    assert coverage["pct_provider_calls_with_tokens"] == 100.0
 
 
 async def test_latency_percentiles(tenant, principal):
@@ -413,6 +509,47 @@ async def test_storage_snapshot_has_expected_keys(tenant):
         "database_bytes",
     ):
         assert key in storage
+    # New keys from the storage-economics correction (ENG-METER-001).
+    for key in (
+        "memory_items_archived", "memory_items_invalidated",
+        "memory_items_superseded", "global_physical_bytes",
+        "logical_tenant_bytes", "bytes_per_retained_memory",
+        "bytes_per_retained_memory_note", "warnings",
+    ):
+        assert key in storage
+
+
+async def test_storage_tenant_scoped_suppresses_bytes_per_memory(tenant):
+    """Under --tenant the global physical relation size cannot be attributed
+    to one tenant, so bytes_per_retained_memory is suppressed (None) and a
+    warning explains why (ENG-METER-001 correction)."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    async with _test_session_factory() as session:
+        report = await build_report(session, tenant_id=tenant)
+    storage = report["storage"]
+    assert storage["bytes_per_retained_memory"] is None
+    assert storage["bytes_per_retained_memory_note"] is not None
+    assert any("suppressed" in w or "global" in w for w in storage["warnings"])
+
+
+async def test_storage_deployment_wide_reports_bytes_per_memory():
+    """A deployment-wide (no --tenant) report computes bytes_per_retained_memory
+    against the total row count (all retained rows occupy storage, not just
+    live ones) — ENG-METER-001 correction."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    async with _test_session_factory() as session:
+        report = await build_report(session, tenant_id=None)
+    storage = report["storage"]
+    # When there is at least one memory_items row, the deployment-wide ratio is
+    # a real number; when there are zero rows it is None (avoid divide-by-zero).
+    total = storage["memory_items_total"] or 0
+    if total:
+        assert storage["bytes_per_retained_memory"] is not None
+        assert storage["bytes_per_retained_memory"] > 0
+    else:
+        assert storage["bytes_per_retained_memory"] is None
 
 
 async def test_report_shape_is_stable_and_json_serializable(tenant, principal):

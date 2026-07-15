@@ -213,7 +213,7 @@ async def test_refinement_updates_kind_above_threshold(client, monkeypatch):
 
     item_id = await _remember(client, content="some decision memory")
 
-    async def fake_classify(content, tenant_id, session, context=None):
+    async def fake_classify(content, tenant_id, session, context=None, **_kwargs):
         return ClassificationResult(
             suggested_kind="decision",
             suggested_wing="project",
@@ -241,7 +241,7 @@ async def test_refinement_narrows_visibility_never_widens(client, monkeypatch):
     item_id = await _remember(client, content="visibility narrow test", visibility="tenant")
 
     # First refinement: LLM suggests workspace (narrower) → applied.
-    async def suggest_workspace(content, tenant_id, session, context=None):
+    async def suggest_workspace(content, tenant_id, session, context=None, **_kwargs):
         return ClassificationResult(
             suggested_kind="fact",
             suggested_visibility="workspace",
@@ -256,7 +256,7 @@ async def test_refinement_narrows_visibility_never_widens(client, monkeypatch):
     assert (await _fetch_item(item_id))["visibility"] == "workspace"
 
     # Second refinement: LLM suggests tenant (WIDER) → must NOT widen.
-    async def suggest_tenant(content, tenant_id, session, context=None):
+    async def suggest_tenant(content, tenant_id, session, context=None, **_kwargs):
         return ClassificationResult(
             suggested_kind="fact",
             suggested_visibility="tenant",
@@ -276,7 +276,7 @@ async def test_refinement_writes_item_events(client, monkeypatch):
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     item_id = await _remember(client, content="event provenance test")
 
-    async def fake_classify(content, tenant_id, session, context=None):
+    async def fake_classify(content, tenant_id, session, context=None, **_kwargs):
         return ClassificationResult(
             suggested_kind="decision",
             suggested_visibility="private",  # narrower than default workspace
@@ -304,7 +304,7 @@ async def test_refinement_rerun_is_idempotent(client, monkeypatch):
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     item_id = await _remember(client, content="idempotent refinement")
 
-    async def fake_classify(content, tenant_id, session, context=None):
+    async def fake_classify(content, tenant_id, session, context=None, **_kwargs):
         return ClassificationResult(
             suggested_kind="decision",
             suggested_visibility="private",
@@ -335,7 +335,7 @@ async def test_refinement_skips_below_threshold(client, monkeypatch):
     item_id = await _remember(client, content="low confidence refine")
     before = await _fetch_item(item_id)
 
-    async def fake_classify(content, tenant_id, session, context=None):
+    async def fake_classify(content, tenant_id, session, context=None, **_kwargs):
         return ClassificationResult(
             suggested_kind="doctrine",  # would change kind if applied
             confidence=0.1,  # well below the default 0.5 threshold
@@ -411,7 +411,7 @@ async def test_refinement_schedules_from_reloaded_final_kind_and_reports_final_s
         )
         await session.commit()
 
-    async def qualifying_decision(content, tenant_id, session, context=None):
+    async def qualifying_decision(content, tenant_id, session, context=None, **_kwargs):
         return ClassificationResult(
             suggested_kind="decision",
             suggested_visibility="workspace",

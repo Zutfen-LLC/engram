@@ -133,7 +133,14 @@ async def classify(
     )
 
     result: ClassificationResult = await classify_content(
-        req.content, tenant_id, session, context=req.context
+        req.content,
+        tenant_id,
+        session,
+        context=req.context,
+        principal_id=principal_id,
+        workspace_id=workspace_id,
+        correlation_id=correlation_id,
+        source_type=req.source_type,
     )
     run = new_run(
         tenant_id=tenant_id,

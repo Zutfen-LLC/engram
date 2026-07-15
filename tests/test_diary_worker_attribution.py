@@ -869,7 +869,7 @@ async def test_every_conflict_branch_uses_conflict_actor(
     async def active_profile(_session):
         return profile
 
-    async def verdict(_item, _session, *, profile):
+    async def verdict(_item, _session, *, profile, **_kwargs):
         del profile
         return ConflictResult(
             verdict=(ConflictVerdict.DUPLICATE if action == ConflictAction.DEDUP else ConflictVerdict.REFINE),

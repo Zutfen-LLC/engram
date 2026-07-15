@@ -202,7 +202,7 @@ async def test_classification_success_records_tokens(monkeypatch):
     assert calls[0]["input_count"] == 1
 
 
-async def test_classification_failure_records_fallback_not_success(monkeypatch):
+async def test_classification_failure_records_failed_with_fallback_metadata(monkeypatch):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     tenant_id = await _default_tenant_id()
@@ -218,9 +218,16 @@ async def test_classification_failure_records_fallback_not_success(monkeypatch):
 
     calls = await _provider_calls("classification")
     assert len(calls) == 1
-    assert calls[0]["status"] == "fallback"
-    assert calls[0]["status"] != "succeeded"
+    # status is the provider outcome only (failed), not a 'fallback' status;
+    # the application fallback is recorded as metadata.
+    assert calls[0]["status"] == "failed"
     assert calls[0]["prompt_tokens"] is None
+    metadata = calls[0]["metadata"]
+    if isinstance(metadata, str):
+        import json
+
+        metadata = json.loads(metadata)
+    assert metadata["application_fallback"] is True
 
 
 async def test_classification_disabled_records_disabled_status(monkeypatch):
@@ -269,7 +276,7 @@ async def test_conflict_classification_success(monkeypatch):
     assert metadata["verdict"] == "duplicate"
 
 
-async def test_conflict_classification_failure_records_fallback(monkeypatch):
+async def test_conflict_classification_failure_records_failed(monkeypatch):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     tenant_id = await _default_tenant_id()
@@ -287,7 +294,13 @@ async def test_conflict_classification_failure_records_fallback(monkeypatch):
 
     calls = await _provider_calls("conflict_classification")
     assert len(calls) == 1
-    assert calls[0]["status"] == "fallback"
+    assert calls[0]["status"] == "failed"
+    metadata = calls[0]["metadata"]
+    if isinstance(metadata, str):
+        import json
+
+        metadata = json.loads(metadata)
+    assert metadata["application_fallback"] is True
 
 
 # ---- embeddings ----

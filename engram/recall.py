@@ -847,6 +847,10 @@ async def execute_startup_recall(
         "candidate_strategy_version": STARTUP_CANDIDATES_VERSION,
         "read_source": read_source,
         "telemetry_enqueued": telemetry_enqueued,
+        # Telemetry context (ENG-METER-001). Startup recall is deterministic and
+        # never calls an embedding provider, so embedding_outcome is not_required.
+        "workspace_id": str(workspace_id) if workspace_id else None,
+        "embedding_outcome": "not_required",
     }
 
 
@@ -1007,6 +1011,10 @@ async def execute_semantic_recall(
             "config_version": config_version,
             "recall_log_id": str(recall_log.id),
             "message": _NO_EMBEDDINGS_MESSAGE,
+            # Telemetry context (ENG-METER-001).
+            "workspace_id": str(workspace_id) if workspace_id else None,
+            "candidate_count": 0,
+            "embedding_outcome": "disabled" if query_embedding is None else "succeeded",
         }
 
     # 2. Retrieve nearest candidates by cosine similarity, scoped to the
@@ -1153,4 +1161,8 @@ async def execute_semantic_recall(
         "config_version": config_version,
         "recall_log_id": str(recall_log.id),
         "message": None,
+        # Telemetry context (ENG-METER-001).
+        "workspace_id": str(workspace_id) if workspace_id else None,
+        "candidate_count": candidate_total,
+        "embedding_outcome": "succeeded",
     }

@@ -62,6 +62,61 @@ def _as_uuid(value: UUID | str | None) -> UUID | None:
         return None
 
 
+# Constraints whose IntegrityError is the intended idempotent no-op: a
+# duplicate primary key (``usage_events_pkey``, from a retried insert reusing
+# the same ``event_id``) or a duplicate dedupe_key (``idx_usage_events_dedupe``,
+# from a retried candidate.observed / client.lifecycle_summary event). Any
+# OTHER integrity failure (foreign-key, CHECK, privilege error surfaced as an
+# integrity error) is a real problem that must be logged, not silently
+# suppressed as a "duplicate" (ENG-METER-001 blocking correction).
+_EXPECTED_UNIQUE_CONSTRAINTS = frozenset({"usage_events_pkey", "idx_usage_events_dedupe"})
+
+# SQLSTATE for a unique-violation (the only one we suppress as idempotent).
+_UNIQUE_VIOLATION_SQLSTATE = "23505"
+
+
+def _dbapi_exc(exc: Exception) -> Any:
+    """Return the deepest driver-native exception SQLAlchemy wrapped.
+
+    SQLAlchemy's asyncpg dialect re-wraps the raw ``asyncpg`` exception into
+    its own ``AsyncAdapt_asyncpg_dbapi`` error class on ``.orig`` — that
+    wrapper forwards ``sqlstate`` but drops ``constraint_name``/
+    ``table_name``. The original asyncpg exception (which has both) is
+    preserved as ``orig.__cause__`` (SQLAlchemy raises the wrapper ``from``
+    it). Mirrors the unwrapping in ``engram.api.errors``.
+    """
+    orig = getattr(exc, "orig", None)
+    if orig is None:
+        return exc
+    cause = getattr(orig, "__cause__", None)
+    return cause if cause is not None else orig
+
+
+def _sqlstate(exc: Exception) -> str | None:
+    native = _dbapi_exc(exc)
+    sqlstate = getattr(native, "sqlstate", None)
+    return str(sqlstate) if sqlstate is not None else None
+
+
+def _constraint_name(exc: Exception) -> str | None:
+    name = getattr(_dbapi_exc(exc), "constraint_name", None)
+    return str(name) if name is not None else None
+
+
+def _is_expected_unique_violation(exc: Exception) -> bool:
+    """True only for the intended idempotent-duplicate IntegrityError.
+
+    Suppresses exactly a unique-violation (SQLSTATE 23505) on the primary key
+    or the dedupe_key partial index. Everything else — foreign-key violations,
+    CHECK constraints, privilege errors surfaced as integrity errors — is a
+    genuine telemetry failure that must be logged, not hidden.
+    """
+    if _sqlstate(exc) != _UNIQUE_VIOLATION_SQLSTATE:
+        return False
+    name = _constraint_name(exc)
+    return name in _EXPECTED_UNIQUE_CONSTRAINTS
+
+
 def _json_safe(value: dict[str, Any] | None) -> dict[str, Any]:
     """Best-effort coercion to a JSON-serializable dict for the metadata column.
 
@@ -169,17 +224,34 @@ async def record_usage_event_best_effort(
             session.add(event)
             await session.commit()
         return resolved_event_id
-    except IntegrityError:
-        # Duplicate primary key (retried telemetry insert reusing event_id) or
-        # duplicate dedupe_key (retried candidate/outcome event) — both are the
-        # intended idempotent no-op, not a failure.
-        logger.debug(
-            "usage telemetry duplicate suppressed op=%s event_id=%s tenant_id=%s",
+    except IntegrityError as exc:
+        if _is_expected_unique_violation(exc):
+            # Duplicate primary key (retried telemetry insert reusing event_id)
+            # or duplicate dedupe_key (retried candidate.observed /
+            # client.lifecycle_summary event) — the intended idempotent no-op.
+            logger.debug(
+                "usage telemetry duplicate suppressed op=%s event_id=%s tenant_id=%s",
+                operation,
+                resolved_event_id,
+                tenant_uuid,
+            )
+            return resolved_event_id
+        # Any OTHER integrity failure (foreign-key, CHECK, privilege error
+        # surfaced as an integrity error) is a genuine telemetry failure. It is
+        # logged — never re-raised, telemetry must not poison the caller — but
+        # distinctly, not hidden as a "duplicate". Constraint name is a schema
+        # identifier (safe to log); str(exc) is excluded (may echo request data).
+        logger.warning(
+            "usage telemetry insert failed op=%s event_id=%s tenant_id=%s "
+            "exc_type=%s sqlstate=%s constraint=%s",
             operation,
             resolved_event_id,
             tenant_uuid,
+            type(exc).__name__,
+            _sqlstate(exc),
+            _constraint_name(exc),
         )
-        return resolved_event_id
+        return None
     except Exception as exc:  # noqa: BLE001 - telemetry must never raise
         # Deliberately exclude str(exc): it may echo request data (content,
         # prompts, queries). Only the exception *type* is safe to log.
@@ -238,14 +310,19 @@ async def record_candidate_outcome(
     final_visibility: str | None = None,
     classification_mode: str | None = None,
 ) -> UUID | None:
-    """Record ``candidate.outcome`` exactly once per ``correlation_id``.
+    """Record one ``candidate.outcome`` attempt for ``correlation_id``.
 
-    ``status`` should be one of ``created``, ``deduped``, ``superseded``,
-    ``failed``. Idempotent the same way as :func:`record_candidate_once` — a
-    retry with the same correlation id does not double-count. Known
-    limitation: because the ledger is append-only, if a first attempt records
-    ``failed`` and a later retry of the same correlation id actually succeeds,
-    the earlier ``failed`` row is not corrected (see docs/usage-metering.md).
+    Append-only per attempt (ENG-METER-001): every ``/v1/remember`` invocation
+    appends its own row with its own auto-generated ``event_id`` — there is no
+    ``dedupe_key``. ``candidate.observed`` stays unique per ``correlation_id``
+    (see :func:`record_candidate_once`), but a candidate may be attempted more
+    than once (e.g. a transient ``failed`` attempt followed by a successful
+    retry), and both attempts are recorded honestly.
+
+    ``status`` is the terminal outcome of THIS attempt: ``created``,
+    ``deduped``, ``superseded``, or ``failed``. The report derives a single
+    *logical* outcome per ``correlation_id`` (earliest non-``failed`` attempt,
+    else ``failed``) so retries do not distort the failure/create funnel.
     """
     meta = {
         k: v
@@ -265,7 +342,6 @@ async def record_candidate_outcome(
         operation="process_memory_candidate",
         status=status,
         correlation_id=correlation_id,
-        dedupe_key=str(correlation_id),
         source_type=source_type,
         metadata=meta,
     )
@@ -298,9 +374,13 @@ async def record_provider_call(
 
     One event = one application-level provider call (a batched embedding
     request is one event with ``input_count=N``, never N events). ``status``
-    is one of ``succeeded``, ``failed``, ``fallback``, ``disabled``,
-    ``no_usage``. For failed calls, ``metadata`` should carry only a sanitized
-    exception class/category — never a raw error message.
+    records the provider outcome only: ``succeeded`` (a usable result was
+    obtained, including responses that carry no token usage), ``failed`` (the
+    provider errored or returned an unusable response), or ``disabled`` (no
+    external provider call occurred — the provider is ``none``). Whether the
+    APPLICATION fell back to a rule/heuristic after a provider failure is a
+    separate concern recorded as ``metadata["application_fallback"] = True``
+    (plus a sanitized ``error_type``); it is never conflated with ``status``.
     """
     return await record_usage_event_best_effort(
         tenant_id=tenant_id,
@@ -341,13 +421,22 @@ async def record_retrieval_request(
     scoring_version: str | None = None,
     config_version: str | None = None,
     embedding_call_occurred: bool | None = None,
+    embedding_outcome: str | None = None,
 ) -> UUID | None:
-    """Record one ``retrieval.request`` event.
+    """Record one ``retrieval.request`` event (success OR failure).
 
     ``operation`` is one of ``startup_recall``, ``semantic_recall``,
     ``keyword_search``, ``semantic_search``, ``hybrid_search``. Never stores
     query text. ``recall_logs`` remains the audit source of what was
     recalled; this is a metering summary only.
+
+    ``status`` is ``succeeded`` or ``failed``; failures are recorded too (a
+    raised recall/search request previously produced no telemetry row, hiding
+    retrieval errors). ``embedding_outcome`` distinguishes whether an external
+    embedding provider call occurred, independently of the requested mode: one
+    of ``not_required`` (startup/keyword), ``succeeded``, ``failed``, or
+    ``disabled`` (provider is ``none``). ``embedding_call_occurred`` is retained
+    for backward compatibility; ``embedding_outcome`` is the richer signal.
     """
     meta = {
         k: v
@@ -356,6 +445,7 @@ async def record_retrieval_request(
             "scoring_version": scoring_version,
             "config_version": config_version,
             "embedding_call_occurred": embedding_call_occurred,
+            "embedding_outcome": embedding_outcome,
         }.items()
         if v is not None
     }
@@ -471,7 +561,11 @@ def extract_openai_compatible_usage(response: Any) -> ProviderUsage:
     try:
         usage = getattr(response, "usage", None)
         if usage is None:
-            return ProviderUsage()
+            # Some OpenAI-compatible providers attach cost only to the
+            # top-level response (never on a ``usage`` object). Missing usage
+            # is valid, but it must not prevent us from capturing a cost that
+            # IS present at the top level.
+            return ProviderUsage(reported_cost_usd=_get_numeric(response, _COST_FIELD_NAMES))
         prompt = _get_numeric(usage, ("prompt_tokens", "input_tokens"))
         completion = _get_numeric(usage, ("completion_tokens", "output_tokens"))
         total = _get_numeric(usage, ("total_tokens",))

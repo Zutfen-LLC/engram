@@ -89,6 +89,8 @@ async def detect_conflicts(
     session: AsyncSession,
     *,
     profile: EmbeddingProfile | None = None,
+    correlation_id: UUID | None = None,
+    job_id: UUID | None = None,
 ) -> ConflictResult | None:
     """Check ``new_item`` against active items in scope for semantic conflicts.
 
@@ -96,6 +98,9 @@ async def detect_conflicts(
     workspace and kind are filtered explicitly. Returns ``None`` when no similar
     active item is found above the similarity threshold, or when the new item
     has no usable embedding.
+
+    ``correlation_id``/``job_id`` are optional usage-telemetry context
+    (ENG-METER-001) for the conflict-classification ``provider.call`` event.
     """
     if profile is None:
         from engram.embedding_profiles import get_active_profile
@@ -172,6 +177,8 @@ async def detect_conflicts(
         tenant_id=new_item.tenant_id,
         principal_id=new_item.principal_id,
         workspace_id=new_item.workspace_id,
+        correlation_id=correlation_id,
+        job_id=job_id,
     )
 
     # 4. Resolve the action based on verdict + authority hierarchy.
@@ -238,12 +245,14 @@ async def _classify_relationship(
     tenant_id: UUID | None = None,
     principal_id: UUID | None = None,
     workspace_id: UUID | None = None,
+    correlation_id: UUID | None = None,
+    job_id: UUID | None = None,
 ) -> tuple[ConflictVerdict, float, str, dict[str, Any]]:
     """Classify how new content relates to existing content.
 
-    ``tenant_id``/``principal_id``/``workspace_id`` are optional
-    usage-telemetry context (ENG-METER-001) for the resulting
-    ``conflict_classification`` provider.call event.
+    ``tenant_id``/``principal_id``/``workspace_id``/``correlation_id``/
+    ``job_id`` are optional usage-telemetry context (ENG-METER-001) for the
+    resulting ``conflict_classification`` provider.call event.
     """
     if settings.classification_provider != "openai":
         if tenant_id is not None:
@@ -257,6 +266,8 @@ async def _classify_relationship(
                 model=settings.classification_model,
                 input_count=1,
                 input_bytes=utf8_byte_len(old_content) + utf8_byte_len(new_content),
+                correlation_id=correlation_id,
+                job_id=job_id,
             )
         return _classify_relationship_fallback(similarity)
     try:
@@ -267,10 +278,12 @@ async def _classify_relationship(
             tenant_id=tenant_id,
             principal_id=principal_id,
             workspace_id=workspace_id,
+            correlation_id=correlation_id,
+            job_id=job_id,
         )
     except Exception as exc:  # pragma: no cover - defensive fallback
         verdict, confidence, reason, _ = _classify_relationship_fallback(similarity)
-        provenance = {"provider": "openai", "mode": "fallback", "error": str(exc)}
+        provenance = {"provider": "openai", "mode": "fallback", "error_type": type(exc).__name__}
         return verdict, confidence, reason, provenance
 
 
@@ -310,6 +323,8 @@ async def _classify_relationship_llm(
     tenant_id: UUID | None = None,
     principal_id: UUID | None = None,
     workspace_id: UUID | None = None,
+    correlation_id: UUID | None = None,
+    job_id: UUID | None = None,
 ) -> tuple[ConflictVerdict, float, str, dict[str, Any]]:
     """LLM-backed classification of the relationship between two items."""
     prompt = json.dumps(
@@ -343,7 +358,9 @@ async def _classify_relationship_llm(
         else AsyncOpenAI(api_key=settings.openai_api_key)
     )
     adapter, host = safe_provider_identity("openai", None)
-    input_bytes = utf8_byte_len(old_content) + utf8_byte_len(new_content)
+    # input_bytes is the UTF-8 size of the actual serialized prompt sent to the
+    # provider — not just the two content strings (ENG-METER-001 correction).
+    input_bytes = utf8_byte_len(prompt)
     timer = Timer()
     try:
         response = await client.chat.completions.create(
@@ -361,13 +378,16 @@ async def _classify_relationship_llm(
                 principal_id=principal_id,
                 workspace_id=workspace_id,
                 operation="conflict_classification",
-                status="fallback",
+                status="failed",
                 provider_adapter=adapter,
                 provider_host=host,
                 model=settings.classification_model,
                 input_count=1,
                 input_bytes=input_bytes,
                 latency_ms=timer.elapsed_ms(),
+                correlation_id=correlation_id,
+                job_id=job_id,
+                metadata={"application_fallback": True, "failure_stage": "provider_error"},
             )
         raise
     message = response.choices[0].message.content or "{}"
@@ -379,13 +399,16 @@ async def _classify_relationship_llm(
                 principal_id=principal_id,
                 workspace_id=workspace_id,
                 operation="conflict_classification",
-                status="fallback",
+                status="failed",
                 provider_adapter=adapter,
                 provider_host=host,
                 model=settings.classification_model,
                 input_count=1,
                 input_bytes=input_bytes,
                 latency_ms=timer.elapsed_ms(),
+                correlation_id=correlation_id,
+                job_id=job_id,
+                metadata={"application_fallback": True, "failure_stage": "non_json_response"},
             )
         raise ValueError("conflict classification response was not a JSON object")
 
@@ -411,7 +434,7 @@ async def _classify_relationship_llm(
             principal_id=principal_id,
             workspace_id=workspace_id,
             operation="conflict_classification",
-            status="succeeded" if usage.total_tokens is not None else "no_usage",
+            status="succeeded",
             provider_adapter=adapter,
             provider_host=host,
             model=settings.classification_model,
@@ -422,6 +445,8 @@ async def _classify_relationship_llm(
             total_tokens=usage.total_tokens,
             reported_cost_usd=usage.reported_cost_usd,
             latency_ms=timer.elapsed_ms(),
+            correlation_id=correlation_id,
+            job_id=job_id,
             metadata={"verdict": verdict.value, "confidence": confidence},
         )
 

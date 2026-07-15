@@ -76,21 +76,37 @@ async def _coverage_section(session: AsyncSession, window: ReportWindow) -> dict
     provider_coverage = (
         await session.execute(
             text(
-                f"SELECT count(*) AS total, "
-                f"count(*) FILTER (WHERE total_tokens IS NOT NULL) AS with_tokens, "
-                f"count(*) FILTER (WHERE reported_cost_usd IS NOT NULL) AS with_cost "
+                f"SELECT "
+                f"count(*) AS total, "
+                f"count(*) FILTER (WHERE status != 'disabled') AS actual_calls, "
+                f"count(*) FILTER (WHERE status = 'disabled') AS disabled_calls, "
+                f"count(*) FILTER (WHERE status != 'disabled' AND total_tokens IS NOT NULL) "
+                f"AS with_tokens, "
+                f"count(*) FILTER (WHERE status != 'disabled' AND reported_cost_usd IS NOT NULL) "
+                f"AS with_cost "
                 f"FROM usage_events WHERE {provider_clause}"
             ),
             params,
         )
     ).mappings().one()
 
+    # ``disabled`` is NOT an external provider call (the provider is ``none``),
+    # so it is excluded from the actual-call and usage-coverage denominators —
+    # otherwise a deployment with the embedding provider off would see its token
+    # coverage ratio dragged toward zero by rows that never called a provider
+    # (ENG-METER-001 blocking correction).
     total_calls = provider_coverage["total"] or 0
+    actual_calls = provider_coverage["actual_calls"] or 0
+    disabled_calls = provider_coverage["disabled_calls"] or 0
     pct_tokens = (
-        round(100.0 * provider_coverage["with_tokens"] / total_calls, 1) if total_calls else 0.0
+        round(100.0 * provider_coverage["with_tokens"] / actual_calls, 1)
+        if actual_calls
+        else 0.0
     )
     pct_cost = (
-        round(100.0 * provider_coverage["with_cost"] / total_calls, 1) if total_calls else 0.0
+        round(100.0 * provider_coverage["with_cost"] / actual_calls, 1)
+        if actual_calls
+        else 0.0
     )
 
     active_principals = await _scalar(
@@ -120,8 +136,14 @@ async def _coverage_section(session: AsyncSession, window: ReportWindow) -> dict
         warnings.append("no usage_events rows found in the requested window")
     if total_calls and pct_tokens < 50.0:
         warnings.append(
-            f"only {pct_tokens}% of provider.call events carry token usage — "
-            "provider/proxy may not be returning usage data"
+            f"only {pct_tokens}% of actual (non-disabled) provider.call events "
+            "carry token usage — provider/proxy may not be returning usage data"
+        )
+    if disabled_calls:
+        warnings.append(
+            f"{disabled_calls} provider.call event(s) are 'disabled' (no external "
+            "call occurred) and excluded from the actual-call and usage-coverage "
+            "denominators"
         )
     if principals_without_summary > 0:
         warnings.append(
@@ -135,6 +157,8 @@ async def _coverage_section(session: AsyncSession, window: ReportWindow) -> dict
         "first_event_at": first_last["first_ts"],
         "last_event_at": first_last["last_ts"],
         "provider_calls_total": total_calls,
+        "provider_actual_calls": actual_calls,
+        "provider_disabled_calls": disabled_calls,
         "pct_provider_calls_with_tokens": pct_tokens,
         "pct_provider_calls_with_cost": pct_cost,
         "active_principals": active_principals,
@@ -194,14 +218,40 @@ async def _candidate_funnel_section(session: AsyncSession, window: ReportWindow)
         )
     ).mappings().one()
 
-    outcome_rows = await _rows(
+    outcome_clause = clause + " AND event_type = 'candidate.outcome'"
+    # candidate.outcome is now append-only PER ATTEMPT (one row per
+    # /v1/remember invocation, no dedupe_key — see ENG-METER-001). So the
+    # outcome counts below are two views:
+    #   * logical_outcomes: one status per correlation_id, resolved as the
+    #     earliest non-'failed' attempt (a failed attempt followed by a
+    #     successful retry resolves to that success), or 'failed' when no
+    #     attempt succeeded. This is what drives the failure/create funnel.
+    #   * attempt_*: raw attempt-level counters, including every failed retry.
+    logical_outcomes = await _rows(
         session,
-        "SELECT status, count(*) AS n FROM usage_events "
-        f"WHERE {clause} AND event_type = 'candidate.outcome' GROUP BY status",
+        "WITH ranked AS ( "
+        "SELECT correlation_id, status, created_at, "
+        "ROW_NUMBER() OVER ( "
+        "PARTITION BY correlation_id "
+        "ORDER BY CASE WHEN status != 'failed' THEN 0 ELSE 1 END, created_at "
+        ") AS rn "
+        f"FROM usage_events WHERE {outcome_clause} "
+        ") SELECT status, count(*) AS n FROM ranked WHERE rn = 1 GROUP BY status",
         params,
     )
-    outcomes = {r["status"]: r["n"] for r in outcome_rows}
-    remember_attempts = sum(outcomes.values())
+    logical = {r["status"]: r["n"] for r in logical_outcomes}
+    distinct_candidates = sum(logical.values())
+
+    attempt_rows = await _rows(
+        session,
+        "SELECT status, count(*) AS n FROM usage_events "
+        f"WHERE {outcome_clause} GROUP BY status",
+        params,
+    )
+    attempts = {r["status"]: r["n"] for r in attempt_rows}
+    total_attempts = sum(attempts.values())
+    failed_attempts = int(attempts.get("failed", 0))
+    successful_attempts = total_attempts - failed_attempts
 
     return {
         "lifecycle_extracted": int(lifecycle_row["extracted"]),
@@ -209,11 +259,20 @@ async def _candidate_funnel_section(session: AsyncSession, window: ReportWindow)
         "lifecycle_classified": int(lifecycle_row["classified"]),
         "lifecycle_parked": int(lifecycle_row["parked"]),
         "candidate_observations": int(candidate_observations),
-        "remember_attempts": int(remember_attempts),
-        "created": int(outcomes.get("created", 0)),
-        "deduped": int(outcomes.get("deduped", 0)),
-        "superseded": int(outcomes.get("superseded", 0)),
-        "failed": int(outcomes.get("failed", 0)),
+        # Logical-outcome funnel (one outcome per correlation_id).
+        "remember_attempts": int(distinct_candidates),
+        "created": int(logical.get("created", 0)),
+        "deduped": int(logical.get("deduped", 0)),
+        "superseded": int(logical.get("superseded", 0)),
+        "failed": int(logical.get("failed", 0)),
+        # Attempt-level diagnostics (every /v1/remember invocation).
+        "total_attempts": int(total_attempts),
+        "distinct_candidates": int(distinct_candidates),
+        "failed_attempts": failed_attempts,
+        "successful_attempts": successful_attempts,
+        "attempts_per_candidate_avg": (
+            round(total_attempts / distinct_candidates, 2) if distinct_candidates else 0.0
+        ),
         "flat_candidate_units": int(candidate_observations),
         "kib_candidate_units": int(kib_units),
         "candidate_bytes_p50": byte_pcts["p50"],
@@ -302,7 +361,9 @@ async def _provider_economics_section(
             count(*) AS calls,
             count(*) FILTER (WHERE status = 'succeeded') AS successes,
             count(*) FILTER (WHERE status = 'failed') AS failures,
-            count(*) FILTER (WHERE status = 'fallback') AS fallbacks,
+            count(*) FILTER (WHERE status = 'disabled') AS disabled_n,
+            count(*) FILTER (WHERE metadata->>'application_fallback' = 'true')
+                AS application_fallbacks,
             COALESCE(sum(input_count), 0) AS input_count,
             COALESCE(sum(prompt_tokens), 0) AS prompt_tokens,
             COALESCE(sum(completion_tokens), 0) AS completion_tokens,
@@ -320,8 +381,11 @@ async def _provider_economics_section(
     rows = await _rows(session, sql, params)
     for row in rows:
         calls = row["calls"] or 0
+        # reported-cost coverage excludes disabled rows (no external call, so
+        # no provider cost to report).
+        actual = calls - (row["disabled_n"] or 0)
         row["reported_cost_coverage_pct"] = (
-            round(100.0 * row["with_reported_cost"] / calls, 1) if calls else 0.0
+            round(100.0 * row["with_reported_cost"] / actual, 1) if actual else 0.0
         )
     return rows
 
@@ -362,12 +426,23 @@ async def _conflict_economics_section(
         "GROUP BY metadata->>'verdict'",
         params,
     )
-    failed_or_fallback = (
+    failed_calls = (
         await _scalar(
             session,
             "SELECT count(*) FROM usage_events "
             f"WHERE {clause} AND event_type = 'provider.call' "
-            "AND operation = 'conflict_classification' AND status IN ('failed', 'fallback')",
+            "AND operation = 'conflict_classification' AND status = 'failed'",
+            params,
+        )
+        or 0
+    )
+    application_fallbacks = (
+        await _scalar(
+            session,
+            "SELECT count(*) FROM usage_events "
+            f"WHERE {clause} AND event_type = 'provider.call' "
+            "AND operation = 'conflict_classification' "
+            "AND metadata->>'application_fallback' = 'true'",
             params,
         )
         or 0
@@ -376,7 +451,14 @@ async def _conflict_economics_section(
         "conflict_classifications": int(conflict_calls),
         "conflict_calls_per_1000_candidate_observations": per_1000,
         "verdict_distribution": {r["verdict"]: r["n"] for r in verdicts},
-        "failed_or_fallback_count": int(failed_or_fallback),
+        # A failed provider call and an application fallback are the same event
+        # now (fallback is metadata on a 'failed' row), so the legacy
+        # "failed_or_fallback_count" is the failed count. Kept under the old
+        # key for backward compat; failed_calls / application_fallbacks are the
+        # precise new keys.
+        "failed_or_fallback_count": int(failed_calls),
+        "failed_calls": int(failed_calls),
+        "application_fallback_count": int(application_fallbacks),
     }
 
 
@@ -499,9 +581,10 @@ async def _worker_section(session: AsyncSession, window: ReportWindow) -> dict[s
 
 
 async def _storage_section(session: AsyncSession, window: ReportWindow) -> dict[str, Any]:
+    tenant_scoped = window.tenant_id is not None
     tenant_filter_mi = ""
     params: dict[str, Any] = {}
-    if window.tenant_id is not None:
+    if tenant_scoped:
         tenant_filter_mi = " AND tenant_id = :tenant_id"
         params["tenant_id"] = window.tenant_id
 
@@ -516,8 +599,16 @@ async def _storage_section(session: AsyncSession, window: ReportWindow) -> dict[
                 "AND valid_to IS NULL) AS proposed_n, "
                 "count(*) FILTER (WHERE review_status = 'disputed' "
                 "AND valid_to IS NULL) AS disputed_n, "
+                # review_status='archived' is the archived population (NOT
+                # valid_to IS NOT NULL, which also covers superseded + manually
+                # invalidated memories — see ENG-METER-001 blocking correction).
+                "count(*) FILTER (WHERE review_status = 'archived') AS archived_n, "
                 "count(*) FILTER (WHERE review_status = 'rejected') AS rejected_n, "
-                "count(*) FILTER (WHERE valid_to IS NOT NULL) AS archived_n "
+                # Non-current rows that still occupy durable storage but are NOT
+                # archived: superseded and manually invalidated memories.
+                "count(*) FILTER (WHERE valid_to IS NOT NULL "
+                "AND review_status NOT IN ('archived', 'rejected')) AS invalidated_n, "
+                "count(*) FILTER (WHERE superseded_by IS NOT NULL) AS superseded_n "
                 f"FROM memory_items WHERE 1=1{tenant_filter_mi}"
             ),
             params,
@@ -563,18 +654,56 @@ async def _storage_section(session: AsyncSession, window: ReportWindow) -> dict[
 
     db_size = await _scalar(session, "SELECT pg_database_size(current_database())", {})
 
+    # bytes_per_retained_memory divides the GLOBAL physical relation size by the
+    # retained row count. Superseded/rejected/invalidated/archived rows still
+    # occupy storage, so the denominator is ALL rows (``total``), not just live
+    # — using live alone overstated per-memory cost (ENG-METER-001 correction).
+    total_rows = totals["total"] or 0
     live = totals["live"] or 0
     ready = embeddings["ready"] or 0
-    bytes_per_memory = (
-        round(table_sizes["memory_items"] / live, 1)
-        if live and table_sizes["memory_items"] is not None
+
+    # Under --tenant the counts are tenant-filtered but pg_total_relation_size
+    # is GLOBAL, so a per-memory physical ratio would be meaningless (a small
+    # tenant would appear to consume the whole deployment's table). Suppress it
+    # and provide a clearly-labeled LOGICAL estimate instead.
+    bytes_per_memory: float | None = None
+    bytes_per_memory_note = (
+        "suppressed: pg_total_relation_size is global and cannot be attributed "
+        "to one tenant; see logical_tenant_bytes for a logical estimate"
+        if tenant_scoped
         else None
     )
-    bytes_per_embedding = (
-        round(table_sizes["memory_embeddings"] / ready, 1)
-        if ready and table_sizes["memory_embeddings"] is not None
-        else None
-    )
+    if not tenant_scoped and total_rows and table_sizes["memory_items"] is not None:
+        bytes_per_memory = round(table_sizes["memory_items"] / total_rows, 1)
+
+    bytes_per_embedding: float | None = None
+    if not tenant_scoped and ready and table_sizes["memory_embeddings"] is not None:
+        bytes_per_embedding = round(table_sizes["memory_embeddings"] / ready, 1)
+
+    # Logical tenant-bytes estimate: the tenant's share of the global table
+    # physical size, proportional to its row count. Clearly an estimate, never
+    # a physical measurement — and only meaningful when tenant-scoped (a
+    # deployment-wide report would just echo the global sizes above).
+    logical_tenant_bytes: dict[str, int | None] | None = None
+    if tenant_scoped:
+        global_items = await _scalar(
+            session, "SELECT count(*) FROM memory_items", {}
+        )
+        logical_tenant_bytes = {}
+        if global_items and table_sizes["memory_items"] is not None:
+            logical_tenant_bytes["memory_items"] = round(
+                table_sizes["memory_items"] * total_rows / global_items
+            )
+        else:
+            logical_tenant_bytes["memory_items"] = None
+
+    warnings: list[str] = []
+    if tenant_scoped:
+        warnings.append(
+            "tenant-scoped report: bytes_per_retained_memory is suppressed and "
+            "global_physical_bytes is deployment-wide (not attributable to this "
+            "tenant); logical_tenant_bytes is a proportional estimate only."
+        )
 
     return {
         "memory_items_total": totals["total"],
@@ -584,16 +713,28 @@ async def _storage_section(session: AsyncSession, window: ReportWindow) -> dict[
         "memory_items_disputed": totals["disputed_n"],
         "memory_items_rejected": totals["rejected_n"],
         "memory_items_archived": totals["archived_n"],
+        "memory_items_invalidated": totals["invalidated_n"],
+        "memory_items_superseded": totals["superseded_n"],
         "embeddings_ready": ready,
         "embeddings_pending": embeddings["pending"],
         "embeddings_failed": embeddings["failed"],
         "embedding_profiles_total": profile_counts["total"],
         "embedding_profiles_writable": profile_counts["writable"],
+        # Global physical sizes — deployment-wide, never tenant-attributeable.
+        "global_physical_bytes": {
+            "table_bytes": table_sizes,
+            "index_bytes": index_sizes,
+            "database_bytes": db_size,
+        },
+        # Backward-compatible aliases (deployment-wide physical sizes).
         "table_bytes": table_sizes,
         "index_bytes": index_sizes,
         "database_bytes": db_size,
+        "logical_tenant_bytes": logical_tenant_bytes,
         "bytes_per_retained_memory": bytes_per_memory,
+        "bytes_per_retained_memory_note": bytes_per_memory_note,
         "bytes_per_ready_embedding": bytes_per_embedding,
+        "warnings": warnings,
     }
 
 
@@ -610,7 +751,7 @@ async def _hourly_series(session: AsyncSession, window: ReportWindow) -> list[di
                 FILTER (WHERE event_type = 'provider.call'), 0) AS total_tokens,
             sum(reported_cost_usd) FILTER (WHERE event_type = 'provider.call') AS reported_cost_usd,
             count(*) FILTER (WHERE event_type = 'retrieval.request') AS retrieval_requests,
-            count(*) FILTER (WHERE status IN ('failed', 'fallback')) AS failures
+            count(*) FILTER (WHERE status = 'failed') AS failures
         FROM usage_events
         WHERE {clause}
         GROUP BY hour

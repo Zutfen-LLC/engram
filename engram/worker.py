@@ -211,6 +211,10 @@ async def handle_embedding_generate(session: AsyncSession, job: Job) -> None:
     payload_key = job.payload.get("profile_key")
     if payload_key is not None and str(payload_key) != profile.profile_key:
         raise ValueError("embedding job profile_id/profile_key mismatch")
+    # Telemetry correlation (ENG-METER-001): carried through the job payload so
+    # the worker-originated provider call is attributed to the original
+    # candidate. Absent on older/backfill payloads — None is valid.
+    raw_correlation_id = job.payload.get("correlation_id")
     item = await _reload_item(session, item_id)
     if item is None or _is_expired_or_inactive(item):
         logger.info("embedding.generate id=%s skipped: item gone/inactive", item_id)
@@ -242,6 +246,8 @@ async def handle_embedding_generate(session: AsyncSession, job: Job) -> None:
                 principal_id=item.principal_id,
                 workspace_id=item.workspace_id,
                 operation="embedding_document",
+                correlation_id=_parse_uuid(raw_correlation_id) if raw_correlation_id else None,
+                job_id=job.id,
             )
         else:
             vector = await generate_embedding(item.content)
@@ -283,15 +289,18 @@ async def handle_embedding_generate(session: AsyncSession, job: Job) -> None:
     if settings.conflict_check_on_write and profile.state == "active":
         from engram.jobs import enqueue_job
 
+        conflict_payload: dict[str, object] = {
+            "memory_item_id": str(item_id),
+            "profile_id": str(profile.id),
+            "profile_key": profile.profile_key,
+        }
+        if raw_correlation_id is not None:
+            conflict_payload["correlation_id"] = str(raw_correlation_id)
         await enqueue_job(
             session,
             tenant_id=job.tenant_id,
             job_type="conflict.check",
-            payload={
-                "memory_item_id": str(item_id),
-                "profile_id": str(profile.id),
-                "profile_key": profile.profile_key,
-            },
+            payload=conflict_payload,
             dedupe_key=f"conflict:{item_id}:{profile.id}",
         )
 
@@ -332,7 +341,14 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
     if str(item.tenant_id) != str(job.tenant_id):
         raise RuntimeError(f"job tenant {job.tenant_id} != item tenant {item.tenant_id}")
 
-    result = await detect_conflicts(item, session, profile=profile)
+    raw_correlation_id = job.payload.get("correlation_id")
+    result = await detect_conflicts(
+        item,
+        session,
+        profile=profile,
+        correlation_id=_parse_uuid(raw_correlation_id) if raw_correlation_id else None,
+        job_id=job.id,
+    )
     if result is None:
         return
 
@@ -1380,7 +1396,15 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
         logger.info("classification.refine id=%s skipped: evidence already bound", item_id)
         return
 
-    result = await classify(item.content, item.tenant_id, session)
+    result = await classify(
+        item.content,
+        item.tenant_id,
+        session,
+        principal_id=item.principal_id,
+        workspace_id=item.workspace_id,
+        source_type=item.source_type,
+        job_id=job.id,
+    )
     actor = await resolve_internal_system_actor(
         session,
         tenant_id=job.tenant_id,

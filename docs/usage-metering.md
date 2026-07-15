@@ -32,9 +32,9 @@ All events share one table, `usage_events`, distinguished by `event_type` +
 | event_type | operation (examples) | status (examples) | meaning |
 |---|---|---|---|
 | `candidate.observed` | `process_memory_candidate` | `accepted_for_processing` | One candidate memory entered the pipeline (via `/v1/classify` and/or `/v1/remember`). Recorded exactly once per `correlation_id`. |
-| `candidate.outcome` | `process_memory_candidate` | `created` / `deduped` / `superseded` / `failed` | The terminal outcome of a `/v1/remember` call for a candidate. Recorded exactly once per `correlation_id`. |
-| `provider.call` | `classification`, `conflict_classification`, `embedding_document`, `embedding_backfill`, `embedding_query_recall`, `embedding_query_search`, `embedding_setup` | `succeeded` / `failed` / `fallback` / `disabled` / `no_usage` | One application-level call to an OpenAI-compatible provider. A batched embedding call is one row with `input_count=N`, never N rows. |
-| `retrieval.request` | `startup_recall`, `semantic_recall`, `keyword_search`, `semantic_search`, `hybrid_search` | `succeeded` | One recall/search request, with result counts and whether an embedding provider call occurred. |
+| `candidate.outcome` | `process_memory_candidate` | `created` / `deduped` / `superseded` / `failed` | The terminal outcome of ONE `/v1/remember` attempt for a candidate. **Append-only per attempt** — every invocation appends its own row; the report derives a single logical outcome per `correlation_id` (earliest non-`failed` attempt, else `failed`). |
+| `provider.call` | `classification`, `conflict_classification`, `embedding_document`, `embedding_backfill`, `embedding_query_recall`, `embedding_query_search`, `embedding_setup` | `succeeded` / `failed` / `disabled` | One application-level call to an OpenAI-compatible provider. A batched embedding call is one row with `input_count=N`, never N rows. `status` records the **provider outcome only**: `succeeded` (a usable result, including responses that carry no token usage), `failed` (the provider errored or returned an unusable response — the application may still fall back to rules, recorded as `metadata.application_fallback=true`), or `disabled` (the provider is `none`; no external call occurred). |
+| `retrieval.request` | `startup_recall`, `semantic_recall`, `keyword_search`, `semantic_search`, `hybrid_search` | `succeeded` / `failed` | One recall/search request (success or failure), with result counts and whether an external embedding provider call occurred (`metadata.embedding_outcome`: `not_required` / `succeeded` / `failed` / `disabled`). |
 | `client.lifecycle_summary` | `sync_turn`, `pre_compress`, `session_end` | `succeeded` / `partial` | A client-reported aggregate for one hooks-adapter lifecycle invocation. **Diagnostic and non-authoritative** — see below. |
 
 ## Column meanings
@@ -80,14 +80,17 @@ database first wins; the other is a silent no-op. This is why a direct
 one `candidate.observed` event, and why a classify-then-remember pair never
 double-counts.
 
-`candidate.outcome` is recorded the same way (one row per correlation id),
-covering every terminal path through `/v1/remember`: a receipt-bound dedup, a
-unique-index dedup, a successful create, a supersession, or any raised
-exception (`failed`). **Known limitation:** because the ledger is append-only
-(no UPDATE), if a first attempt for a correlation id is recorded `failed` and
-a later retry of the *same* correlation id actually succeeds, the earlier
-`failed` row is not corrected — both facts remain in the ledger. This is a
-diagnostic tradeoff, not a billing correctness issue.
+`candidate.outcome` is now **append-only per attempt**: every `/v1/remember`
+invocation appends its own row (no `dedupe_key`), so a transiently `failed`
+attempt followed by a successful retry is recorded honestly as two rows.
+`candidate.observed` stays unique per `correlation_id` (one observation per
+candidate). The report derives a single **logical outcome** per
+`correlation_id` — the earliest non-`failed` attempt's status, or `failed`
+when no attempt succeeded — for the failure/create funnel, and reports raw
+attempt-level diagnostics (`total_attempts`, `failed_attempts`,
+`attempts_per_candidate_avg`) separately. This corrects the earlier
+first-outcome-wins model, which silently suppressed a later successful retry
+once a `failed` row existed.
 
 ## Privacy rules (data minimization)
 

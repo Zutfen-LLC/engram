@@ -55,6 +55,7 @@ async def generate_embeddings(
     workspace_id: uuid.UUID | str | None = None,
     operation: str = "embedding_document",
     correlation_id: uuid.UUID | None = None,
+    job_id: uuid.UUID | None = None,
 ) -> list[list[float] | None]:
     """Generate embedding vectors for a batch of ``texts`` in one provider call.
 
@@ -63,13 +64,13 @@ async def generate_embeddings(
     caller; the backfill batches so a single failed call only fails its batch.
 
     ``tenant_id`` (and the optional ``principal_id``/``workspace_id``/
-    ``correlation_id``) are usage-telemetry context (ENG-METER-001): when
-    given, this single call site records one ``provider.call`` event —
-    ``input_count=len(texts)`` — tagged with ``operation`` (one of
-    ``embedding_document``, ``embedding_backfill``, ``embedding_query_recall``,
-    ``embedding_query_search``, ``embedding_setup``). Omitting ``tenant_id``
-    (the default) records nothing, so callers without tenant context are
-    unaffected.
+    ``correlation_id``/``job_id``) are usage-telemetry context
+    (ENG-METER-001): when given, this single call site records one
+    ``provider.call`` event — ``input_count=len(texts)`` — tagged with
+    ``operation`` (one of ``embedding_document``, ``embedding_backfill``,
+    ``embedding_query_recall``, ``embedding_query_search``,
+    ``embedding_setup``). Omitting ``tenant_id`` (the default) records
+    nothing, so callers without tenant context are unaffected.
     """
     provider = profile.provider if profile is not None else settings.embedding_provider
     model = profile.model if profile is not None else settings.embedding_model
@@ -91,6 +92,7 @@ async def generate_embeddings(
                 input_count=len(texts),
                 input_bytes=input_bytes,
                 correlation_id=correlation_id,
+                job_id=job_id,
             )
         return [None] * len(texts)
     if provider != "openai":
@@ -135,6 +137,7 @@ async def generate_embeddings(
                 input_bytes=input_bytes,
                 latency_ms=timer.elapsed_ms(),
                 correlation_id=correlation_id,
+                job_id=job_id,
             )
         raise
     # The API returns exactly one embedding per input, in input order.
@@ -160,6 +163,7 @@ async def generate_embeddings(
                     input_bytes=input_bytes,
                     latency_ms=timer.elapsed_ms(),
                     correlation_id=correlation_id,
+                    job_id=job_id,
                     metadata={"exception_type": "ValueError"},
                 )
             raise ValueError(
@@ -174,7 +178,7 @@ async def generate_embeddings(
             principal_id=principal_id,
             workspace_id=workspace_id,
             operation=operation,
-            status="succeeded" if usage.total_tokens is not None else "no_usage",
+            status="succeeded",
             provider_adapter=adapter,
             provider_host=host,
             model=model,
@@ -187,6 +191,7 @@ async def generate_embeddings(
             reported_cost_usd=usage.reported_cost_usd,
             latency_ms=timer.elapsed_ms(),
             correlation_id=correlation_id,
+            job_id=job_id,
             metadata={"vector_count": len(vectors), "dimensions": dimensions},
         )
     return vectors
@@ -201,6 +206,7 @@ async def generate_embedding(
     workspace_id: uuid.UUID | str | None = None,
     operation: str = "embedding_document",
     correlation_id: uuid.UUID | None = None,
+    job_id: uuid.UUID | None = None,
 ) -> list[float] | None:
     """Generate an embedding vector for ``text`` or return ``None`` when disabled."""
     return (
@@ -212,6 +218,7 @@ async def generate_embedding(
             workspace_id=workspace_id,
             operation=operation,
             correlation_id=correlation_id,
+            job_id=job_id,
         )
     )[0]
 

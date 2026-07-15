@@ -70,6 +70,7 @@ async def classify(
     workspace_id: UUID | None = None,
     correlation_id: UUID | None = None,
     source_type: str | None = None,
+    job_id: UUID | None = None,
 ) -> ClassificationResult:
     """Classify raw memory text using tenant rules, with optional LLM enrichment.
 
@@ -77,10 +78,10 @@ async def classify(
     synchronous ``/v1/remember`` write path uses :func:`classify_rules_only` so
     the OpenAI call never blocks the request (ENG-AUD-008 / F20).
 
-    ``principal_id``/``workspace_id``/``correlation_id``/``source_type`` are
-    optional usage-telemetry context (ENG-METER-001) — passing them tags the
-    resulting ``provider.call`` event; omitting them still classifies
-    correctly, just without that context attached.
+    ``principal_id``/``workspace_id``/``correlation_id``/``source_type``/
+    ``job_id`` are optional usage-telemetry context (ENG-METER-001) — passing
+    them tags the resulting ``provider.call`` event; omitting them still
+    classifies correctly, just without that context attached.
     """
 
     rules = await _load_rules_cached(session, tenant_id)
@@ -99,6 +100,7 @@ async def classify(
             input_count=1,
             input_bytes=utf8_byte_len(content),
             correlation_id=correlation_id,
+            job_id=job_id,
             metadata={"source_type": source_type} if source_type else None,
         )
         return rule_result
@@ -121,6 +123,7 @@ async def classify(
             workspace_id=workspace_id,
             correlation_id=correlation_id,
             source_type=source_type,
+            job_id=job_id,
         )
     except Exception as exc:  # pragma: no cover - defensive fallback
         fallback = dict(rule_result.provenance)
@@ -671,6 +674,22 @@ def _build_prompt(
     return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
 
 
+def _classification_failure_meta(
+    source_type: str | None, failure_stage: str
+) -> dict[str, Any]:
+    """Metadata for a failed classification/conflict provider call.
+
+    The application always falls back to the rule baseline when the LLM
+    classification call fails, so ``application_fallback`` is recorded
+    truthfully alongside a sanitized failure stage. ``source_type`` is a safe
+    categorical dimension. Never carries content or raw error messages.
+    """
+    meta: dict[str, Any] = {"application_fallback": True, "failure_stage": failure_stage}
+    if source_type is not None:
+        meta["source_type"] = source_type
+    return meta
+
+
 async def _call_openai_classification(
     prompt: str,
     *,
@@ -679,6 +698,7 @@ async def _call_openai_classification(
     workspace_id: UUID | None = None,
     correlation_id: UUID | None = None,
     source_type: str | None = None,
+    job_id: UUID | None = None,
 ) -> dict[str, Any]:
     # Classification may use a different provider (e.g. DeepInfra) than
     # embeddings. Fall back to the shared openai_* settings for backward
@@ -708,7 +728,7 @@ async def _call_openai_classification(
                 principal_id=principal_id,
                 workspace_id=workspace_id,
                 operation="classification",
-                status="fallback",
+                status="failed",
                 provider_adapter=adapter,
                 provider_host=host,
                 model=settings.classification_model,
@@ -716,7 +736,8 @@ async def _call_openai_classification(
                 input_bytes=utf8_byte_len(prompt),
                 latency_ms=timer.elapsed_ms(),
                 correlation_id=correlation_id,
-                metadata={"source_type": source_type} if source_type else None,
+                job_id=job_id,
+                metadata=_classification_failure_meta(source_type, "provider_error"),
             )
         raise
 
@@ -729,7 +750,7 @@ async def _call_openai_classification(
                 principal_id=principal_id,
                 workspace_id=workspace_id,
                 operation="classification",
-                status="fallback",
+                status="failed",
                 provider_adapter=adapter,
                 provider_host=host,
                 model=settings.classification_model,
@@ -737,7 +758,8 @@ async def _call_openai_classification(
                 input_bytes=utf8_byte_len(prompt),
                 latency_ms=timer.elapsed_ms(),
                 correlation_id=correlation_id,
-                metadata={"source_type": source_type} if source_type else None,
+                job_id=job_id,
+                metadata=_classification_failure_meta(source_type, "non_json_response"),
             )
         raise ValueError("classification response was not a JSON object")
 
@@ -758,7 +780,7 @@ async def _call_openai_classification(
             principal_id=principal_id,
             workspace_id=workspace_id,
             operation="classification",
-            status="succeeded" if usage.total_tokens is not None else "no_usage",
+            status="succeeded",
             provider_adapter=adapter,
             provider_host=host,
             model=settings.classification_model,
@@ -770,6 +792,7 @@ async def _call_openai_classification(
             reported_cost_usd=usage.reported_cost_usd,
             latency_ms=timer.elapsed_ms(),
             correlation_id=correlation_id,
+            job_id=job_id,
             metadata=meta,
         )
 

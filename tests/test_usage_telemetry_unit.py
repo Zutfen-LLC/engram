@@ -15,6 +15,7 @@ import pytest
 from engram.config import settings
 from engram.usage import (
     ProviderUsage,
+    _is_expected_unique_violation,
     extract_openai_compatible_usage,
     record_candidate_once,
     record_provider_call,
@@ -58,6 +59,17 @@ def test_extract_usage_missing_usage_is_valid_not_an_error():
     assert usage.prompt_tokens is None
     assert usage.total_tokens is None
     assert usage.reported_cost_usd is None
+
+
+def test_extract_usage_top_level_cost_captured_even_when_usage_absent():
+    """Some OpenAI-compatible providers attach cost only to the top-level
+    response (never on a ``usage`` object). Missing usage must not prevent
+    capturing a top-level cost (ENG-METER-001 correction)."""
+    response = SimpleNamespace(total_cost=0.015)
+    usage = extract_openai_compatible_usage(response)
+    assert usage.prompt_tokens is None
+    assert usage.total_tokens is None
+    assert usage.reported_cost_usd == pytest.approx(0.015)
 
 
 def test_extract_usage_malformed_extras_never_raises():
@@ -176,3 +188,60 @@ async def test_unresolvable_tenant_id_is_swallowed_not_raised(monkeypatch):
         status="accepted_for_processing",
     )
     assert result is None
+
+
+# ---- IntegrityError discrimination (ENG-METER-001 correction) ----
+#
+# record_usage_event_best_effort must suppress ONLY the intended idempotent
+# unique-violations (duplicate PK or dedupe_key); every other integrity failure
+# (FK, CHECK, privilege error surfaced as integrity) must be logged distinctly,
+# not hidden as a "duplicate".
+
+
+def _fake_integrity_error(*, sqlstate: str | None, constraint: str | None):
+    """Build an IntegrityError-shaped object that mirrors how SQLAlchemy wraps
+    an asyncpg native exception (see engram.api.errors._dbapi_exc)."""
+    native = SimpleNamespace(sqlstate=sqlstate, constraint_name=constraint)
+    wrapped_orig = SimpleNamespace(__cause__=native)
+    # IntegrityError carries the wrapper on .orig
+    return SimpleNamespace(orig=wrapped_orig)
+
+
+def test_expected_unique_violation_on_primary_key_is_suppressed():
+    exc = _fake_integrity_error(sqlstate="23505", constraint="usage_events_pkey")
+    assert _is_expected_unique_violation(exc) is True
+
+
+def test_expected_unique_violation_on_dedupe_index_is_suppressed():
+    exc = _fake_integrity_error(sqlstate="23505", constraint="idx_usage_events_dedupe")
+    assert _is_expected_unique_violation(exc) is True
+
+
+def test_foreign_key_violation_is_not_suppressed():
+    # 23503 = foreign_key_violation — a real telemetry failure (e.g. a stale
+    # tenant/principal reference), never an idempotent duplicate.
+    exc = _fake_integrity_error(sqlstate="23503", constraint="usage_events_tenant_id_fkey")
+    assert _is_expected_unique_violation(exc) is False
+
+
+def test_check_violation_is_not_suppressed():
+    # 23514 = check_violation — e.g. a negative token count or unresolvable
+    # status, never an idempotent duplicate.
+    exc = _fake_integrity_error(
+        sqlstate="23514", constraint="chk_usage_events_input_count_nonneg"
+    )
+    assert _is_expected_unique_violation(exc) is False
+
+
+def test_unique_violation_on_unrelated_constraint_is_not_suppressed():
+    # A unique violation (23505) on a DIFFERENT constraint than the two we
+    # expect is still a real failure — the whitelist must not over-match.
+    exc = _fake_integrity_error(sqlstate="23505", constraint="some_other_unique_index")
+    assert _is_expected_unique_violation(exc) is False
+
+
+def test_integrity_error_without_sqlstate_is_not_suppressed():
+    # When SQLSTATE can't be determined (non-PostgreSQL backend, malformed
+    # exception), do not guess — treat it as a real failure.
+    exc = _fake_integrity_error(sqlstate=None, constraint="usage_events_pkey")
+    assert _is_expected_unique_violation(exc) is False
