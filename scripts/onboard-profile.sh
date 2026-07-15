@@ -181,7 +181,7 @@ else
     CONFIG_FILE="$PROFILE_DIR/config.yaml"
     if [[ -f "$CONFIG_FILE" ]]; then
         if grep -q "^memory:" "$CONFIG_FILE"; then
-            if grep -A 10 "^memory:" | grep -q "provider:"; then
+            if grep -A 10 "^memory:" "$CONFIG_FILE" | grep -q "provider:"; then
                 sed -i "/^memory:/,/^[^ ]/ s/provider:.*/provider: engram_memory/" "$CONFIG_FILE"
             else
                 sed -i "/^memory:/a\\  provider: engram_memory" "$CONFIG_FILE"
