@@ -1,4 +1,4 @@
-# Usage metering (ENG-METER-001 / ENG-METER-002)
+# Usage metering (ENG-METER-001 through ENG-METER-003)
 
 > **Status:** this is an OBSERVABILITY slice, not a billing slice. It exists so
 > real dogfood data can inform hosted pricing allowances later. Nothing here
@@ -19,7 +19,8 @@ questions like:
   embeddings generated, and database/index storage?
 - Is "one processed memory per candidate, rounded to 1 KiB" a plausible meter?
 
-The `usage_events` table (migrations/017_usage_events.sql) is a durable,
+The `usage_events` table (`migrations/017_usage_events.sql`, hardened by
+`migrations/019_provider_usage_semantics.sql`) is a durable,
 append-only ledger that answers these questions from real usage instead of
 guesswork. `engram usage-report` turns it into a report (see
 `docs/ops/dogfood-usage-metering.md` for the runbook).
@@ -33,7 +34,7 @@ All events share one table, `usage_events`, distinguished by `event_type` +
 |---|---|---|---|
 | `candidate.observed` | `process_memory_candidate` | `accepted_for_processing` | One candidate memory entered the pipeline (via `/v1/classify` and/or `/v1/remember`). Recorded exactly once per `correlation_id`. |
 | `candidate.outcome` | `process_memory_candidate` | `created` / `deduped` / `superseded` / `failed` | The terminal outcome of ONE `/v1/remember` attempt for a candidate. **Append-only per attempt** — every invocation appends its own row; the report derives a single logical outcome per `correlation_id` (earliest non-`failed` attempt, else `failed`). |
-| `provider.call` | `classification`, `conflict_classification`, `embedding_document`, `embedding_backfill`, `embedding_query_recall`, `embedding_query_search`, `embedding_setup` | `succeeded` / `failed` / `disabled` | One instrumented provider operation. A batched embedding operation is one row with `input_count=N`, never N rows. `succeeded` and `failed` represent actual external calls; `disabled` means configuration prevented an external request. |
+| `provider.call` | `classification`, `conflict_classification`, `embedding_document`, `embedding_backfill`, `embedding_query_recall`, `embedding_query_search`, `embedding_setup` | `succeeded` / `failed` / `disabled` | One instrumented provider operation. `external_call_attempted` distinguishes setup/preflight work from an external request. |
 | `retrieval.request` | `startup_recall`, `semantic_recall`, `keyword_search`, `semantic_search`, `hybrid_search` | `succeeded` / `failed` | One recall/search request (success or failure), with result counts and the canonical embedding outcome described below. |
 | `client.lifecycle_summary` | `sync_turn`, `pre_compress`, `session_end` | `succeeded` / `partial` | A client-reported aggregate for one hooks-adapter lifecycle invocation. **Diagnostic and non-authoritative** — see below. |
 
@@ -56,6 +57,12 @@ See `migrations/017_usage_events.sql` for the full DDL. Notable columns:
   carries **no** `dedupe_key` (see "Correlation and deduplication semantics").
 - `provider_host` — a bare hostname (e.g. `api.deepinfra.com`), never a path,
   query string, or credential. See "Privacy rules" below.
+- `usage_class` — `request`, `async_enrichment`, `maintenance`, `diagnostic`,
+  or conservative historical `unknown`. Product inference is exactly
+  `request + async_enrichment`.
+- `external_call_attempted` — false for disabled and client-setup failures,
+  true for succeeded calls, and the durable request-boundary fact for failed
+  operations.
 - `input_count` / `input_bytes` — UTF-8 byte counts, never Python character
   counts. For `provider.call`, `input_count` is the number of prompts/texts in
   that one call (so a batched embedding request reports `input_count=N`).
@@ -113,38 +120,52 @@ attempt-level diagnostics (`remember_attempts`, `failed_attempts`,
 first-outcome-wins model, which silently suppressed a later successful retry
 once a `failed` row existed.
 
-In the report, `candidate_observations` counts unique observed candidate
-correlation IDs, `logical_candidates` counts retry-resolved outcomes, and
-`remember_attempts` counts literal `candidate.outcome` rows (one per
-`/v1/remember` invocation). Logical `created`/`deduped`/`superseded`/`failed`,
-per-principal `created_count`, and semantic queries per created memory all use
-the retry-safe logical outcome. Compatibility aliases remain:
+The report first derives each candidate's `first_seen_at` from the earliest
+`candidate.observed` or `candidate.outcome` row. A candidate is in the cohort
+only when that timestamp is in `[since, until)`. For cohort candidates, all
+outcomes before `until` are inspected: the earliest non-failed outcome wins,
+otherwise the earliest failure wins, otherwise the candidate is unresolved.
+Logical outcomes are therefore an as-of-`until` cohort snapshot and are not
+additive across independently generated daily reports. Candidate observations,
+remember attempts, and retry successes remain event-window metrics.
+Compatibility aliases remain:
 `total_attempts == remember_attempts` and
 `distinct_candidates == logical_candidates`.
+
+`new_memory_writes = created + superseded`, because supersession writes a new
+memory row while invalidating the old one. Per-principal write counts and
+semantic-query ratios use this retry-safe denominator; `created_count` remains
+the exact created-only field.
 
 ## Provider operations, calls, and failures
 
 A `provider.call` row is an instrumented **provider operation**. It is an
-**actual external provider call** only when `status != 'disabled'`. Every
+**actual external provider call** only when `external_call_attempted IS TRUE`.
+Status alone is intentionally insufficient: a setup failure is failed without
+an external attempt. Every
 report section therefore distinguishes:
 
 - `provider_operations`: all `provider.call` rows;
-- `actual_provider_calls`: non-disabled rows;
-- `disabled_provider_operations`: disabled rows where no external request
-  occurred.
+- `actual_provider_calls`: rows whose durable attempt Boolean is true;
+- `non_attempted_failures`: failed setup/preflight operations whose Boolean is false;
+- `disabled_operations`: disabled rows whose Boolean is false.
 
-For provider-economics groups, retained `calls` is a compatibility field that
-counts all operations; `actual_calls` excludes disabled rows and `disabled_n`
-counts them. Conflict economics similarly exposes
+Provider economics are grouped by usage class, operation, sanitized host, and
+model. Total infrastructure economics include every class; product totals
+include only request and async enrichment. Maintenance backfills and diagnostic
+setup probes remain separately visible. Retained `calls` is a compatibility
+all-operation field; `actual_calls` uses the durable Boolean. Conflict economics exposes
 `conflict_classifications` (all operations) and `conflict_actual_calls`;
 query embeddings expose compatibility `query_embedding_calls` (all
 operations) and `query_embedding_actual_calls`. Hourly `provider_calls` is the
-compatibility all-operation field, while `actual_provider_calls` excludes
-disabled rows. Token and cost coverage denominators exclude disabled rows.
+compatibility all-operation field, while `actual_provider_calls` uses the
+durable Boolean. Token and cost coverage denominators use actual calls.
 
 Every production `provider.call` with `status='failed'` carries only safe,
 categorical failure metadata:
 
+- `failure_stage='client_setup'` for SDK import, configuration, or client
+  construction failure before an external attempt;
 - `failure_stage='provider_error'` for transport, timeout, authentication,
   HTTP/API, or SDK failure before a usable response;
 - `failure_stage='response_parse'` when a required JSON response cannot be
@@ -223,6 +244,9 @@ tenant-scoped table (see `migrations/003_app_role_and_force_rls.sql`):
   only sees (and can only instrument) the call it made. Provider-level
   retries inside the OpenAI SDK have the same limitation. Documented here
   honestly rather than claiming perfect provider-attempt accounting.
+- **Historical provider classes are conservative.** Migration 019 maps only
+  reliable operation contexts and labels ambiguous classification/conflict
+  history `unknown`; it never infers product intent from a missing job ID.
 - **`reported_cost_usd` is frequently `NULL`.** Not every OpenAI-compatible
   provider/proxy reports cost. `engram.usage.extract_openai_compatible_usage`
   looks in several plausible locations (`usage.cost`, `usage.total_cost`,

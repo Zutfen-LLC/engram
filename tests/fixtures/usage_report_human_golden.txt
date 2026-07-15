@@ -1,0 +1,82 @@
+Engram dogfood usage report
+============================================================
+tenant:  (all tenants)
+schema:  3
+window:  2026-07-01T00:00:00+00:00  to  2026-07-02T00:00:00+00:00
+
+-- Coverage & data quality --
+  telemetry_enabled:            True
+  first_event_at:               None
+  last_event_at:                None
+  actual calls w/ tokens:        0.0%
+  actual calls w/ cost:          0.0%
+  active principals:            0 (0 with lifecycle summaries)
+
+-- Candidate funnel --
+  lifecycle_extracted              0
+  lifecycle_guard_rejected         0
+  lifecycle_classified             0
+  lifecycle_parked                 0
+  candidate_observations           8
+  candidate_cohort_size            8
+  logical_candidates               7
+  unresolved_candidates            1
+  remember_attempts                9
+  created                          4
+  deduped                          2
+  superseded                       0
+  failed                           0
+  new_memory_writes                4
+  failed_attempts                  2
+  successful_attempts              7
+  retry_successes_in_window        1
+  attempts_per_cohort_candidate_avg 1.12
+  flat_candidate_units             0
+  kib_candidate_units              0
+  candidate_bytes p50/p90/p99:   0/0/0
+
+-- Breakdown by source type --
+
+-- Provider economics (usage class/operation/host/model) --
+  all operations/calls:          10/9
+  non-attempted failures:        1
+  disabled operations:           1
+  product operations/calls:      10/9
+  maintenance operations/calls:  0/0
+  diagnostic operations/calls:   0/0
+  request            classification           api.openai.com         gpt-4o-mini          operations=10     calls=9      disabled=1    ok=8      fail=2    fallback=2    tokens=600      cost=$0.0123 cost_cov=100.0%
+
+-- Conflict economics --
+  conflict operations:           3
+  actual conflict LLM calls:     2
+  per 1000 candidate obs:        250.0
+  verdict distribution:         {}
+  failures:                      0
+  application fallbacks:         0
+
+-- Retrieval --
+  query-embedding operations:    5
+  actual query-embedding calls:  4
+  query-embedding tokens:        123
+  semantic_queries/new_write:    0.0
+  retrievals/active_principal:   0.0
+
+-- Worker/queue --
+  oldest_pending_age_seconds:    None
+
+-- Storage --
+  memory_items_total           0
+  memory_items_live            0
+  memory_items_active          0
+  memory_items_proposed        0
+  memory_items_disputed        0
+  memory_items_rejected        0
+  memory_items_archived        0
+  embeddings_ready             0
+  embeddings_pending           0
+  embeddings_failed            0
+  embedding_profiles_total     0
+  embedding_profiles_writable  0
+  database_bytes               0
+  bytes_per_retained_memory    None
+  bytes_per_ready_embedding    None

@@ -136,13 +136,14 @@ class _FakeChat:
 
 
 class _FakeEmbeddingItem:
-    def __init__(self, embedding: list[float]) -> None:
+    def __init__(self, embedding: list[float], index: int) -> None:
         self.embedding = embedding
+        self.index = index
 
 
 class _FakeEmbeddingsResponse:
     def __init__(self, vectors: list[list[float]], usage: _FakeUsage | None) -> None:
-        self.data = [_FakeEmbeddingItem(v) for v in vectors]
+        self.data = [_FakeEmbeddingItem(v, index) for index, v in enumerate(vectors)]
         self.usage = usage
 
 
@@ -197,6 +198,8 @@ async def test_classification_success_records_tokens(monkeypatch):
     calls = await _provider_calls("classification")
     assert len(calls) == 1
     assert calls[0]["status"] == "succeeded"
+    assert calls[0]["external_call_attempted"] is True
+    assert calls[0]["usage_class"] == "request"
     assert calls[0]["prompt_tokens"] == 50
     assert calls[0]["completion_tokens"] == 10
     assert calls[0]["total_tokens"] == 60
@@ -222,6 +225,7 @@ async def test_classification_failure_records_failed_with_fallback_metadata(monk
     # status is the provider outcome only (failed), not a 'fallback' status;
     # the application fallback is recorded as metadata.
     assert calls[0]["status"] == "failed"
+    assert calls[0]["external_call_attempted"] is True
     assert calls[0]["prompt_tokens"] is None
     metadata = calls[0]["metadata"]
     if isinstance(metadata, str):
@@ -246,6 +250,7 @@ async def test_classification_disabled_records_disabled_status(monkeypatch):
     calls = await _provider_calls("classification")
     assert len(calls) == 1
     assert calls[0]["status"] == "disabled"
+    assert calls[0]["external_call_attempted"] is False
 
 
 # ---- conflict_classification ----
@@ -439,6 +444,10 @@ async def test_embedding_response_validation_records_one_failed_call_with_usage(
     assert metadata == {
         "failure_stage": "response_validation",
         "error_type": "ValueError",
+        "expected_vector_count": 2,
+        "returned_vector_count": len(vectors),
+        "expected_dimensions": 3,
+        "offending_index_present": len(vectors) == 2,
     }
 
 

@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 import time
 from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Literal, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from openai import AsyncOpenAI
 from pydantic import AliasChoices, BaseModel, Field, computed_field
@@ -21,11 +22,11 @@ from engram.config import settings
 from engram.memory_kinds import DEFAULT_KIND_TAXONOMY as _DEFAULT_KIND_TAXONOMY
 from engram.memory_kinds import get_enabled_memory_kinds
 from engram.models import ClassificationRule, MemoryItem
+from engram.provider_clients import resolve_classification_provider
 from engram.usage import (
     Timer,
     extract_openai_compatible_usage,
     record_provider_call,
-    safe_provider_identity,
     utf8_byte_len,
 )
 
@@ -71,6 +72,7 @@ async def classify(
     correlation_id: UUID | None = None,
     source_type: str | None = None,
     job_id: UUID | None = None,
+    usage_class: Literal["request", "async_enrichment"] = "request",
 ) -> ClassificationResult:
     """Classify raw memory text using tenant rules, with optional LLM enrichment.
 
@@ -95,6 +97,8 @@ async def classify(
             workspace_id=workspace_id,
             operation="classification",
             status="disabled",
+            usage_class=usage_class,
+            external_call_attempted=False,
             provider_adapter=settings.classification_provider or "none",
             model=settings.classification_model,
             input_count=1,
@@ -124,6 +128,7 @@ async def classify(
             correlation_id=correlation_id,
             source_type=source_type,
             job_id=job_id,
+            usage_class=usage_class,
         )
     except Exception as exc:  # pragma: no cover - defensive fallback
         fallback = dict(rule_result.provenance)
@@ -703,22 +708,41 @@ async def _call_openai_classification(
     correlation_id: UUID | None = None,
     source_type: str | None = None,
     job_id: UUID | None = None,
+    usage_class: Literal["request", "async_enrichment"] = "request",
 ) -> dict[str, Any]:
-    # Classification may use a different provider (e.g. DeepInfra) than
-    # embeddings. Fall back to the shared openai_* settings for backward
-    # compatibility.
-    api_key = settings.classification_api_key or settings.openai_api_key
-    base_url = settings.classification_base_url or settings.openai_base_url
-    client_kwargs: dict[str, Any] = {"api_key": api_key}
-    if base_url:
-        client_kwargs["base_url"] = base_url
-    client = AsyncOpenAI(**client_kwargs)
-
-    adapter, host = safe_provider_identity("openai", base_url)
+    event_id = uuid4()
     timer = Timer()
+    config = resolve_classification_provider()
+    try:
+        client_kwargs: dict[str, Any] = {"api_key": config.api_key}
+        if config.base_url:
+            client_kwargs["base_url"] = config.base_url
+        client = AsyncOpenAI(**client_kwargs)
+    except Exception as exc:
+        if tenant_id is not None:
+            await record_provider_call(
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                workspace_id=workspace_id,
+                operation="classification",
+                status="failed",
+                usage_class=usage_class,
+                external_call_attempted=False,
+                provider_adapter=config.provider_adapter,
+                provider_host=config.sanitized_provider_host,
+                model=config.model,
+                input_count=1,
+                input_bytes=utf8_byte_len(prompt),
+                latency_ms=timer.elapsed_ms(),
+                correlation_id=correlation_id,
+                job_id=job_id,
+                event_id=event_id,
+                metadata=_classification_failure_meta(source_type, "client_setup", exc),
+            )
+        raise
     try:
         response = await client.chat.completions.create(
-            model=settings.classification_model,
+            model=config.model,
             messages=[
                 {"role": "system", "content": "Return only valid JSON."},
                 {"role": "user", "content": prompt},
@@ -733,20 +757,61 @@ async def _call_openai_classification(
                 workspace_id=workspace_id,
                 operation="classification",
                 status="failed",
-                provider_adapter=adapter,
-                provider_host=host,
-                model=settings.classification_model,
+                usage_class=usage_class,
+                external_call_attempted=True,
+                provider_adapter=config.provider_adapter,
+                provider_host=config.sanitized_provider_host,
+                model=config.model,
                 input_count=1,
                 input_bytes=utf8_byte_len(prompt),
                 latency_ms=timer.elapsed_ms(),
                 correlation_id=correlation_id,
                 job_id=job_id,
+                event_id=event_id,
                 metadata=_classification_failure_meta(source_type, "provider_error", exc),
             )
         raise
 
-    message = response.choices[0].message.content or "{}"
     usage = extract_openai_compatible_usage(response)
+    try:
+        if response is None:
+            raise ValueError("classification response is missing")
+        choices = response.choices
+        if not choices:
+            raise ValueError("classification response choices are missing")
+        first = choices[0]
+        message_obj = first.message
+        message = message_obj.content
+        if not isinstance(message, str):
+            raise TypeError("classification response content must be text")
+    except Exception as validation_exc:
+        if tenant_id is not None:
+            await record_provider_call(
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                workspace_id=workspace_id,
+                operation="classification",
+                status="failed",
+                usage_class=usage_class,
+                external_call_attempted=True,
+                provider_adapter=config.provider_adapter,
+                provider_host=config.sanitized_provider_host,
+                model=config.model,
+                input_count=1,
+                input_bytes=utf8_byte_len(prompt),
+                prompt_tokens=usage.prompt_tokens,
+                completion_tokens=usage.completion_tokens,
+                total_tokens=usage.total_tokens,
+                reported_cost_usd=usage.reported_cost_usd,
+                latency_ms=timer.elapsed_ms(),
+                correlation_id=correlation_id,
+                job_id=job_id,
+                event_id=event_id,
+                metadata=_classification_failure_meta(
+                    source_type, "response_validation", validation_exc
+                ),
+            )
+        raise
     try:
         payload = json.loads(message)
         if not isinstance(payload, dict):
@@ -763,9 +828,11 @@ async def _call_openai_classification(
                 workspace_id=workspace_id,
                 operation="classification",
                 status="failed",
-                provider_adapter=adapter,
-                provider_host=host,
-                model=settings.classification_model,
+                usage_class=usage_class,
+                external_call_attempted=True,
+                provider_adapter=config.provider_adapter,
+                provider_host=config.sanitized_provider_host,
+                model=config.model,
                 input_count=1,
                 input_bytes=utf8_byte_len(prompt),
                 prompt_tokens=usage.prompt_tokens,
@@ -775,11 +842,50 @@ async def _call_openai_classification(
                 latency_ms=timer.elapsed_ms(),
                 correlation_id=correlation_id,
                 job_id=job_id,
+                event_id=event_id,
                 metadata=_classification_failure_meta(source_type, "response_parse", parse_exc),
             )
         raise ValueError(
             "classification response was not valid JSON or not a JSON object"
         ) from parse_exc
+
+    try:
+        for field_name in ("confidence", "taxonomy_confidence", "retention_confidence"):
+            if field_name not in payload:
+                continue
+            value = payload[field_name]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError("classification confidence must be numeric")
+            if not math.isfinite(float(value)):
+                raise ValueError("classification confidence must be finite")
+    except Exception as validation_exc:
+        if tenant_id is not None:
+            await record_provider_call(
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                workspace_id=workspace_id,
+                operation="classification",
+                status="failed",
+                usage_class=usage_class,
+                external_call_attempted=True,
+                provider_adapter=config.provider_adapter,
+                provider_host=config.sanitized_provider_host,
+                model=config.model,
+                input_count=1,
+                input_bytes=utf8_byte_len(prompt),
+                prompt_tokens=usage.prompt_tokens,
+                completion_tokens=usage.completion_tokens,
+                total_tokens=usage.total_tokens,
+                reported_cost_usd=usage.reported_cost_usd,
+                latency_ms=timer.elapsed_ms(),
+                correlation_id=correlation_id,
+                job_id=job_id,
+                event_id=event_id,
+                metadata=_classification_failure_meta(
+                    source_type, "response_validation", validation_exc
+                ),
+            )
+        raise
 
     if tenant_id is not None:
         confidence = payload.get("taxonomy_confidence", payload.get("confidence"))
@@ -798,9 +904,11 @@ async def _call_openai_classification(
             workspace_id=workspace_id,
             operation="classification",
             status="succeeded",
-            provider_adapter=adapter,
-            provider_host=host,
-            model=settings.classification_model,
+            usage_class=usage_class,
+            external_call_attempted=True,
+            provider_adapter=config.provider_adapter,
+            provider_host=config.sanitized_provider_host,
+            model=config.model,
             input_count=1,
             input_bytes=utf8_byte_len(prompt),
             prompt_tokens=usage.prompt_tokens,
@@ -810,6 +918,7 @@ async def _call_openai_classification(
             latency_ms=timer.elapsed_ms(),
             correlation_id=correlation_id,
             job_id=job_id,
+            event_id=event_id,
             metadata=meta,
         )
 

@@ -968,6 +968,7 @@ async def execute_semantic_recall(
             tenant_id=tenant_id,
             principal_id=principal_id,
             operation="embedding_query_recall",
+            usage_class="request",
         )
     else:
         query_embedding = await generate_embedding(query)

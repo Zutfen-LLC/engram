@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -54,6 +55,9 @@ async def generate_embeddings(
     principal_id: uuid.UUID | str | None = None,
     workspace_id: uuid.UUID | str | None = None,
     operation: str = "embedding_document",
+    usage_class: Literal[
+        "request", "async_enrichment", "maintenance", "diagnostic", "unknown"
+    ] = "unknown",
     correlation_id: uuid.UUID | None = None,
     job_id: uuid.UUID | None = None,
 ) -> list[list[float] | None]:
@@ -86,6 +90,8 @@ async def generate_embeddings(
                 workspace_id=workspace_id,
                 operation=operation,
                 status="disabled",
+                usage_class=usage_class,
+                external_call_attempted=False,
                 provider_adapter=provider or "none",
                 model=model,
                 embedding_profile=profile_key,
@@ -95,22 +101,41 @@ async def generate_embeddings(
                 job_id=job_id,
             )
         return [None] * len(texts)
-    if provider != "openai":
-        raise ValueError(f"unsupported embedding provider: {provider!r}")
-
-    try:
-        from openai import AsyncOpenAI
-    except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
-        raise RuntimeError(
-            "openai package is required when ENGRAM_EMBEDDING_PROVIDER=openai"
-        ) from exc
-
-    client_kwargs: dict[str, Any] = {"api_key": settings.openai_api_key}
-    if settings.openai_base_url:
-        client_kwargs["base_url"] = settings.openai_base_url
-    client = AsyncOpenAI(**client_kwargs)
-    adapter, host = safe_provider_identity("openai", settings.openai_base_url)
+    event_id = uuid.uuid4()
     timer = Timer()
+    adapter, host = safe_provider_identity(provider, settings.openai_base_url)
+    try:
+        if provider != "openai":
+            raise ValueError("unsupported embedding provider")
+        from openai import AsyncOpenAI
+        client_kwargs: dict[str, Any] = {"api_key": settings.openai_api_key}
+        if settings.openai_base_url:
+            client_kwargs["base_url"] = settings.openai_base_url
+        client = AsyncOpenAI(**client_kwargs)
+    except Exception as exc:
+        if tenant_id is not None:
+            await record_provider_call(
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                workspace_id=workspace_id,
+                operation=operation,
+                status="failed",
+                usage_class=usage_class,
+                external_call_attempted=False,
+                provider_adapter=adapter,
+                provider_host=host,
+                model=model,
+                embedding_profile=profile_key,
+                input_count=len(texts),
+                input_bytes=input_bytes,
+                latency_ms=timer.elapsed_ms(),
+                correlation_id=correlation_id,
+                job_id=job_id,
+                event_id=event_id,
+                metadata={"failure_stage": "client_setup", "error_type": type(exc).__name__},
+            )
+        raise
+
     try:
         response = await client.embeddings.create(
             model=model,
@@ -129,6 +154,8 @@ async def generate_embeddings(
                 workspace_id=workspace_id,
                 operation=operation,
                 status="failed",
+                usage_class=usage_class,
+                external_call_attempted=True,
                 provider_adapter=adapter,
                 provider_host=host,
                 model=model,
@@ -138,6 +165,7 @@ async def generate_embeddings(
                 latency_ms=timer.elapsed_ms(),
                 correlation_id=correlation_id,
                 job_id=job_id,
+                event_id=event_id,
                 metadata={
                     "failure_stage": "provider_error",
                     "error_type": type(exc).__name__,
@@ -145,18 +173,38 @@ async def generate_embeddings(
             )
         raise
     usage = extract_openai_compatible_usage(response)
+    returned_vector_count: int | None = None
+    offending_index_present = False
     try:
         # The API must return exactly one usable float vector per input, in
         # input order. Missing/malformed data, coercion failures, count drift,
         # and dimension drift are all response-validation failures from this
         # single provider call.
-        vectors: list[list[float] | None] = [
-            [float(value) for value in item.embedding] for item in response.data
-        ]
-        if len(vectors) != len(texts):
+        raw_data = response.data
+        items = list(raw_data)
+        returned_vector_count = len(items)
+        if len(items) != len(texts):
             raise ValueError("embedding provider returned an unexpected vector count")
-        if any(len(vector) != dimensions for vector in vectors if vector is not None):
-            raise ValueError("embedding provider returned an unexpected vector dimension")
+        by_index: dict[int, list[float]] = {}
+        for item in items:
+            index = item.index
+            offending_index_present = True
+            if not isinstance(index, int) or isinstance(index, bool):
+                raise TypeError("embedding response index must be an integer")
+            if index < 0 or index >= len(texts) or index in by_index:
+                raise ValueError("embedding response index is invalid")
+            raw_vector = item.embedding
+            if isinstance(raw_vector, (str, bytes)):
+                raise TypeError("embedding vector must be list-like numeric data")
+            vector = [float(value) for value in raw_vector]
+            if len(vector) != dimensions:
+                raise ValueError("embedding provider returned an unexpected vector dimension")
+            if not all(math.isfinite(value) for value in vector):
+                raise ValueError("embedding provider returned a non-finite vector component")
+            by_index[index] = vector
+        if set(by_index) != set(range(len(texts))):
+            raise ValueError("embedding provider response indexes do not cover all inputs")
+        vectors: list[list[float] | None] = [by_index[index] for index in range(len(texts))]
     except Exception as exc:
         if tenant_id is not None:
             await record_provider_call(
@@ -165,6 +213,8 @@ async def generate_embeddings(
                 workspace_id=workspace_id,
                 operation=operation,
                 status="failed",
+                usage_class=usage_class,
+                external_call_attempted=True,
                 provider_adapter=adapter,
                 provider_host=host,
                 model=model,
@@ -178,9 +228,18 @@ async def generate_embeddings(
                 latency_ms=timer.elapsed_ms(),
                 correlation_id=correlation_id,
                 job_id=job_id,
+                event_id=event_id,
                 metadata={
                     "failure_stage": "response_validation",
                     "error_type": type(exc).__name__,
+                    "expected_vector_count": len(texts),
+                    "expected_dimensions": dimensions,
+                    "offending_index_present": offending_index_present,
+                    **(
+                        {"returned_vector_count": returned_vector_count}
+                        if returned_vector_count is not None
+                        else {}
+                    ),
                 },
             )
         raise
@@ -192,6 +251,8 @@ async def generate_embeddings(
             workspace_id=workspace_id,
             operation=operation,
             status="succeeded",
+            usage_class=usage_class,
+            external_call_attempted=True,
             provider_adapter=adapter,
             provider_host=host,
             model=model,
@@ -205,6 +266,7 @@ async def generate_embeddings(
             latency_ms=timer.elapsed_ms(),
             correlation_id=correlation_id,
             job_id=job_id,
+            event_id=event_id,
             metadata={"vector_count": len(vectors), "dimensions": dimensions},
         )
     return vectors
@@ -218,6 +280,9 @@ async def generate_embedding(
     principal_id: uuid.UUID | str | None = None,
     workspace_id: uuid.UUID | str | None = None,
     operation: str = "embedding_document",
+    usage_class: Literal[
+        "request", "async_enrichment", "maintenance", "diagnostic", "unknown"
+    ] = "unknown",
     correlation_id: uuid.UUID | None = None,
     job_id: uuid.UUID | None = None,
 ) -> list[float] | None:
@@ -230,6 +295,7 @@ async def generate_embedding(
             principal_id=principal_id,
             workspace_id=workspace_id,
             operation=operation,
+            usage_class=usage_class,
             correlation_id=correlation_id,
             job_id=job_id,
         )
@@ -799,12 +865,19 @@ async def _embed_batch(
     tenant_id = to_embed[0][0].tenant_id
     try:
         vectors = await generate_embeddings(
-            texts, tenant_id=tenant_id, operation="embedding_backfill"
+            texts,
+            tenant_id=tenant_id,
+            operation="embedding_backfill",
+            usage_class="maintenance",
         )
     except Exception as exc:  # noqa: BLE001 - provider errors are varied
         if fail_fast:
             raise
-        log.warning("backfill: embedding failed for %d item(s): %s", len(to_embed), exc)
+        log.warning(
+            "backfill: embedding failed for %d item(s); exc_type=%s",
+            len(to_embed),
+            type(exc).__name__,
+        )
         for emb, _content in to_embed:
             _mark_failed(emb, result)
         return

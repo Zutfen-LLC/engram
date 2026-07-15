@@ -246,6 +246,7 @@ async def handle_embedding_generate(session: AsyncSession, job: Job) -> None:
                 principal_id=item.principal_id,
                 workspace_id=item.workspace_id,
                 operation="embedding_document",
+                usage_class="async_enrichment",
                 correlation_id=_parse_uuid(raw_correlation_id) if raw_correlation_id else None,
                 job_id=job.id,
             )
@@ -348,6 +349,7 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
         profile=profile,
         correlation_id=_parse_uuid(raw_correlation_id) if raw_correlation_id else None,
         job_id=job.id,
+        usage_class="async_enrichment",
     )
     if result is None:
         return

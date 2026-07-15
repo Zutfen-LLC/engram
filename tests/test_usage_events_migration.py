@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -83,6 +84,8 @@ async def test_table_checks_and_indexes_exist():
         assert "idx_usage_events_tenant_type_op_created" in indexes
         assert "idx_usage_events_tenant_principal_created" in indexes
         assert "idx_usage_events_dedupe" in indexes
+        assert "idx_usage_events_candidate_outcome_resolution" in indexes
+        assert "idx_usage_events_provider_class_created" in indexes
 
         checks = {
             r["conname"]
@@ -97,6 +100,18 @@ async def test_table_checks_and_indexes_exist():
         assert "chk_usage_events_total_tokens_nonneg" in checks
         assert "chk_usage_events_latency_ms_nonneg" in checks
         assert "chk_usage_events_reported_cost_nonneg" in checks
+        assert "chk_usage_events_provider_semantics" in checks
+    finally:
+        await owner.close()
+
+
+async def test_provider_semantics_migration_is_idempotent():
+    _skip_if_no_rls_stack()
+    owner = await _connect(_owner_dsn())  # type: ignore[arg-type]
+    sql = Path("migrations/019_provider_usage_semantics.sql").read_text()
+    try:
+        await owner.execute(sql)
+        await owner.execute(sql)
     finally:
         await owner.close()
 
@@ -117,6 +132,41 @@ async def test_negative_values_rejected_by_check_constraints():
                 "VALUES ($1, 'provider.call', 'classification', 'succeeded', -1)",
                 tenant_id,
             )
+    finally:
+        await owner.execute("DELETE FROM tenants WHERE id = $1", tenant_id)
+        await owner.close()
+
+
+async def test_provider_operation_semantics_constraints():
+    _skip_if_no_rls_stack()
+    owner = await _connect(_owner_dsn())  # type: ignore[arg-type]
+    tenant_id = str(uuid.uuid4())
+    try:
+        await owner.execute(
+            "INSERT INTO tenants (id, name, slug) VALUES ($1, 't', $2)",
+            tenant_id,
+            f"provider-sem-{tenant_id[:8]}",
+        )
+        with pytest.raises(Exception):  # noqa: B017
+            await owner.execute(
+                "INSERT INTO usage_events (tenant_id, event_type, operation, status, "
+                "usage_class, external_call_attempted) VALUES "
+                "($1, 'provider.call', 'classification', 'succeeded', 'request', false)",
+                tenant_id,
+            )
+        with pytest.raises(Exception):  # noqa: B017
+            await owner.execute(
+                "INSERT INTO usage_events (tenant_id, event_type, operation, status, "
+                "usage_class, external_call_attempted) VALUES "
+                "($1, 'provider.call', 'classification', 'disabled', 'request', true)",
+                tenant_id,
+            )
+        await owner.execute(
+            "INSERT INTO usage_events (tenant_id, event_type, operation, status, "
+            "usage_class, external_call_attempted) VALUES "
+            "($1, 'provider.call', 'classification', 'failed', 'request', false)",
+            tenant_id,
+        )
     finally:
         await owner.execute("DELETE FROM tenants WHERE id = $1", tenant_id)
         await owner.close()

@@ -1,0 +1,38 @@
+{
+  "candidate_funnel": {
+    "candidate_cohort_size": 4,
+    "candidate_observations": 3,
+    "created": 2,
+    "deduped": 0,
+    "failed": 0,
+    "failed_attempts": 1,
+    "logical_candidates": 3,
+    "new_memory_writes": 3,
+    "remember_attempts": 4,
+    "retry_successes_in_window": 1,
+    "successful_attempts": 3,
+    "superseded": 1,
+    "unresolved_candidates": 1
+  },
+  "provider_totals": {
+    "all_actual_provider_calls": 5,
+    "all_disabled_operations": 1,
+    "all_non_attempted_failures": 1,
+    "all_provider_operations": 7,
+    "all_provider_tokens": 67,
+    "diagnostic_actual_provider_calls": 1,
+    "diagnostic_provider_operations": 1,
+    "diagnostic_provider_tokens": 2,
+    "maintenance_actual_provider_calls": 1,
+    "maintenance_provider_operations": 1,
+    "maintenance_provider_tokens": 30,
+    "product_actual_provider_calls": 3,
+    "product_provider_operations": 5,
+    "product_provider_tokens": 35
+  },
+  "report_schema_version": 3,
+  "retrieval": {
+    "semantic_queries_per_new_memory_write": 0.0
+  },
+  "tenant_storage_warning": true
+}

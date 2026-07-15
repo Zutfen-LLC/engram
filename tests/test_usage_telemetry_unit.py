@@ -64,6 +64,26 @@ async def test_unknown_retrieval_outcome_records_explicit_null_boolean(monkeypat
     assert metadata["embedding_call_occurred"] is None
 
 
+async def test_legacy_retrieval_without_embedding_fields_preserves_absence(monkeypatch):
+    captured: dict[str, object] = {}
+
+    async def capture(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("engram.usage.record_usage_event_best_effort", capture)
+    await record_retrieval_request(
+        tenant_id="00000000-0000-0000-0000-000000000001",
+        principal_id=None,
+        workspace_id=None,
+        operation="startup_recall",
+        status="succeeded",
+    )
+    metadata = captured["metadata"]
+    assert isinstance(metadata, dict)
+    assert "embedding_outcome" not in metadata
+    assert "embedding_call_occurred" not in metadata
+
+
 def test_utf8_byte_len_counts_bytes_not_characters():
     # "café" is 4 Python characters but 5 UTF-8 bytes (é is 2 bytes).
     assert utf8_byte_len("café") == 5
@@ -214,6 +234,8 @@ async def test_disabled_telemetry_is_noop_and_opens_no_db_session(monkeypatch):
         tenant_id="00000000-0000-0000-0000-000000000001",
         operation="classification",
         status="succeeded",
+        usage_class="request",
+        external_call_attempted=True,
     )
     assert result3 is None
 

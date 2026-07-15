@@ -7,14 +7,15 @@ then determines if the relationship is duplicate, refine, or contradict.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from openai import AsyncOpenAI
 from pgvector.sqlalchemy import Vector
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import and_, cast, literal_column, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,11 +26,12 @@ from engram.authority import (
 )
 from engram.config import settings
 from engram.models import EmbeddingProfile, MemoryEmbedding, MemoryItem
+from engram.provider_clients import resolve_classification_provider
 from engram.usage import (
     Timer,
+    UsageClass,
     extract_openai_compatible_usage,
     record_provider_call,
-    safe_provider_identity,
     utf8_byte_len,
 )
 
@@ -77,11 +79,26 @@ class ConflictResult(BaseModel):
     provenance: dict[str, Any] = Field(default_factory=dict)
 
 
-_VERDICT_MAP: dict[str, ConflictVerdict] = {
-    "duplicate": ConflictVerdict.DUPLICATE,
-    "refine": ConflictVerdict.REFINE,
-    "contradict": ConflictVerdict.CONTRADICT,
-}
+class ConflictProviderResponse(BaseModel):
+    """Strict, untrusted response contract for conflict classification."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    verdict: ConflictVerdict
+    confidence: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+    reason: str = Field(strict=True)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def confidence_must_be_numeric(cls, value: object) -> object:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError("conflict confidence must be numeric")
+        return value
+
+
+class ConflictProviderResponseError(ValueError):
+    """Sanitized signal that a returned provider response was unusable."""
+
 
 
 async def detect_conflicts(
@@ -91,6 +108,7 @@ async def detect_conflicts(
     profile: EmbeddingProfile | None = None,
     correlation_id: UUID | None = None,
     job_id: UUID | None = None,
+    usage_class: UsageClass = "async_enrichment",
 ) -> ConflictResult | None:
     """Check ``new_item`` against active items in scope for semantic conflicts.
 
@@ -179,7 +197,12 @@ async def detect_conflicts(
         workspace_id=new_item.workspace_id,
         correlation_id=correlation_id,
         job_id=job_id,
+        usage_class=usage_class,
     )
+    if provenance.get("invalid_provider_response") is True:
+        # The heuristic was evaluated for conservative fallback/provenance, but
+        # an invalid provider payload must never authorize a memory mutation.
+        return None
 
     # 4. Resolve the action based on verdict + authority hierarchy.
     action, conflict_type = _resolve_action(
@@ -247,6 +270,7 @@ async def _classify_relationship(
     workspace_id: UUID | None = None,
     correlation_id: UUID | None = None,
     job_id: UUID | None = None,
+    usage_class: UsageClass = "async_enrichment",
 ) -> tuple[ConflictVerdict, float, str, dict[str, Any]]:
     """Classify how new content relates to existing content.
 
@@ -262,6 +286,8 @@ async def _classify_relationship(
                 workspace_id=workspace_id,
                 operation="conflict_classification",
                 status="disabled",
+                usage_class=usage_class,
+                external_call_attempted=False,
                 provider_adapter=settings.classification_provider or "none",
                 model=settings.classification_model,
                 input_count=1,
@@ -280,10 +306,17 @@ async def _classify_relationship(
             workspace_id=workspace_id,
             correlation_id=correlation_id,
             job_id=job_id,
+            usage_class=usage_class,
         )
     except Exception as exc:  # pragma: no cover - defensive fallback
         verdict, confidence, reason, _ = _classify_relationship_fallback(similarity)
-        provenance = {"provider": "openai", "mode": "fallback", "error_type": type(exc).__name__}
+        provenance: dict[str, Any] = {
+            "provider": "openai",
+            "mode": "fallback",
+            "error_type": type(exc).__name__,
+        }
+        if isinstance(exc, ConflictProviderResponseError):
+            provenance["invalid_provider_response"] = True
         return verdict, confidence, reason, provenance
 
 
@@ -325,6 +358,7 @@ async def _classify_relationship_llm(
     workspace_id: UUID | None = None,
     correlation_id: UUID | None = None,
     job_id: UUID | None = None,
+    usage_class: UsageClass = "async_enrichment",
 ) -> tuple[ConflictVerdict, float, str, dict[str, Any]]:
     """LLM-backed classification of the relationship between two items."""
     prompt = json.dumps(
@@ -352,19 +386,46 @@ async def _classify_relationship_llm(
         indent=2,
     )
 
-    client = (
-        AsyncOpenAI()
-        if settings.openai_api_key is None
-        else AsyncOpenAI(api_key=settings.openai_api_key)
-    )
-    adapter, host = safe_provider_identity("openai", None)
+    event_id = uuid4()
+    config = resolve_classification_provider()
     # input_bytes is the UTF-8 size of the actual serialized prompt sent to the
     # provider — not just the two content strings (ENG-METER-001 correction).
     input_bytes = utf8_byte_len(prompt)
     timer = Timer()
     try:
+        client_kwargs: dict[str, Any] = {"api_key": config.api_key}
+        if config.base_url:
+            client_kwargs["base_url"] = config.base_url
+        client = AsyncOpenAI(**client_kwargs)
+    except Exception as exc:
+        if tenant_id is not None:
+            await record_provider_call(
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                workspace_id=workspace_id,
+                operation="conflict_classification",
+                status="failed",
+                usage_class=usage_class,
+                external_call_attempted=False,
+                provider_adapter=config.provider_adapter,
+                provider_host=config.sanitized_provider_host,
+                model=config.model,
+                input_count=1,
+                input_bytes=input_bytes,
+                latency_ms=timer.elapsed_ms(),
+                correlation_id=correlation_id,
+                job_id=job_id,
+                event_id=event_id,
+                metadata={
+                    "application_fallback": True,
+                    "failure_stage": "client_setup",
+                    "error_type": type(exc).__name__,
+                },
+            )
+        raise
+    try:
         response = await client.chat.completions.create(
-            model=settings.classification_model,
+            model=config.model,
             messages=[
                 {"role": "system", "content": "Return only valid JSON."},
                 {"role": "user", "content": prompt},
@@ -379,14 +440,17 @@ async def _classify_relationship_llm(
                 workspace_id=workspace_id,
                 operation="conflict_classification",
                 status="failed",
-                provider_adapter=adapter,
-                provider_host=host,
-                model=settings.classification_model,
+                usage_class=usage_class,
+                external_call_attempted=True,
+                provider_adapter=config.provider_adapter,
+                provider_host=config.sanitized_provider_host,
+                model=config.model,
                 input_count=1,
                 input_bytes=input_bytes,
                 latency_ms=timer.elapsed_ms(),
                 correlation_id=correlation_id,
                 job_id=job_id,
+                event_id=event_id,
                 metadata={
                     "application_fallback": True,
                     "failure_stage": "provider_error",
@@ -394,8 +458,46 @@ async def _classify_relationship_llm(
                 },
             )
         raise
-    message = response.choices[0].message.content or "{}"
     usage = extract_openai_compatible_usage(response)
+    try:
+        if response is None or not response.choices:
+            raise ValueError("conflict response choices are missing")
+        message_obj = response.choices[0].message
+        message = message_obj.content
+        if not isinstance(message, str):
+            raise TypeError("conflict response content must be text")
+    except Exception as validation_exc:
+        if tenant_id is not None:
+            await record_provider_call(
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                workspace_id=workspace_id,
+                operation="conflict_classification",
+                status="failed",
+                usage_class=usage_class,
+                external_call_attempted=True,
+                provider_adapter=config.provider_adapter,
+                provider_host=config.sanitized_provider_host,
+                model=config.model,
+                input_count=1,
+                input_bytes=input_bytes,
+                prompt_tokens=usage.prompt_tokens,
+                completion_tokens=usage.completion_tokens,
+                total_tokens=usage.total_tokens,
+                reported_cost_usd=usage.reported_cost_usd,
+                latency_ms=timer.elapsed_ms(),
+                correlation_id=correlation_id,
+                job_id=job_id,
+                event_id=event_id,
+                metadata={
+                    "application_fallback": True,
+                    "failure_stage": "response_validation",
+                    "error_type": type(validation_exc).__name__,
+                },
+            )
+        raise ConflictProviderResponseError(
+            "conflict response envelope was invalid"
+        ) from validation_exc
     try:
         payload = json.loads(message)
         if not isinstance(payload, dict):
@@ -412,9 +514,11 @@ async def _classify_relationship_llm(
                 workspace_id=workspace_id,
                 operation="conflict_classification",
                 status="failed",
-                provider_adapter=adapter,
-                provider_host=host,
-                model=settings.classification_model,
+                usage_class=usage_class,
+                external_call_attempted=True,
+                provider_adapter=config.provider_adapter,
+                provider_host=config.sanitized_provider_host,
+                model=config.model,
                 input_count=1,
                 input_bytes=input_bytes,
                 prompt_tokens=usage.prompt_tokens,
@@ -424,29 +528,63 @@ async def _classify_relationship_llm(
                 latency_ms=timer.elapsed_ms(),
                 correlation_id=correlation_id,
                 job_id=job_id,
+                event_id=event_id,
                 metadata={
                     "application_fallback": True,
                     "failure_stage": "response_parse",
                     "error_type": type(parse_exc).__name__,
                 },
             )
-        raise ValueError(
+        raise ConflictProviderResponseError(
             "conflict classification response was not valid JSON or not a JSON object"
         ) from parse_exc
 
-    verdict = _parse_verdict(payload.get("verdict"))
     try:
-        confidence = float(payload.get("confidence", 0.5))
-    except (TypeError, ValueError):
-        confidence = 0.5
-    confidence = max(0.0, min(1.0, confidence))
-    reason = str(payload.get("reason") or "").strip() or f"LLM verdict: {verdict.value}"
+        validated = ConflictProviderResponse.model_validate(payload)
+        if not math.isfinite(validated.confidence):
+            raise ValueError("conflict confidence must be finite")
+    except Exception as validation_exc:
+        if tenant_id is not None:
+            await record_provider_call(
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                workspace_id=workspace_id,
+                operation="conflict_classification",
+                status="failed",
+                usage_class=usage_class,
+                external_call_attempted=True,
+                provider_adapter=config.provider_adapter,
+                provider_host=config.sanitized_provider_host,
+                model=config.model,
+                input_count=1,
+                input_bytes=input_bytes,
+                prompt_tokens=usage.prompt_tokens,
+                completion_tokens=usage.completion_tokens,
+                total_tokens=usage.total_tokens,
+                reported_cost_usd=usage.reported_cost_usd,
+                latency_ms=timer.elapsed_ms(),
+                correlation_id=correlation_id,
+                job_id=job_id,
+                event_id=event_id,
+                metadata={
+                    "application_fallback": True,
+                    "failure_stage": "response_validation",
+                    "error_type": type(validation_exc).__name__,
+                },
+            )
+        raise ConflictProviderResponseError(
+            "conflict response payload was invalid"
+        ) from validation_exc
+    verdict = validated.verdict
+    confidence = validated.confidence
+    reason = validated.reason.strip() or f"LLM verdict: {verdict.value}"
 
     provenance: dict[str, Any] = {
         "provider": "openai",
         "mode": "llm",
-        "model": settings.classification_model,
-        "llm_payload": payload,
+        "model": config.model,
+        "llm_verdict": verdict.value,
+        "llm_confidence": confidence,
     }
 
     if tenant_id is not None:
@@ -456,9 +594,11 @@ async def _classify_relationship_llm(
             workspace_id=workspace_id,
             operation="conflict_classification",
             status="succeeded",
-            provider_adapter=adapter,
-            provider_host=host,
-            model=settings.classification_model,
+            usage_class=usage_class,
+            external_call_attempted=True,
+            provider_adapter=config.provider_adapter,
+            provider_host=config.sanitized_provider_host,
+            model=config.model,
             input_count=1,
             input_bytes=input_bytes,
             prompt_tokens=usage.prompt_tokens,
@@ -468,16 +608,13 @@ async def _classify_relationship_llm(
             latency_ms=timer.elapsed_ms(),
             correlation_id=correlation_id,
             job_id=job_id,
+            event_id=event_id,
             metadata={"verdict": verdict.value, "confidence": confidence},
         )
 
     return verdict, confidence, reason, provenance
 
 
-def _parse_verdict(value: Any) -> ConflictVerdict:
-    """Parse the LLM's verdict string, defaulting to refine on ambiguity."""
-    normalized = str(value or "").strip().lower()
-    return _VERDICT_MAP.get(normalized, ConflictVerdict.REFINE)
 
 
 # ---- Promotion-time conflict recheck (top-k candidates, ENG-AUD-007) -------
@@ -727,6 +864,7 @@ async def check_promotion_conflict(
                 tenant_id=item.tenant_id,
                 principal_id=item.principal_id,
                 workspace_id=item.workspace_id,
+                usage_class="maintenance",
             )
             if verdict is ConflictVerdict.CONTRADICT:
                 return PromotionConflictCheck(candidate.id, verdict.value, reason, True)
