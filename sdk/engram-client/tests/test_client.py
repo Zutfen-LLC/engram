@@ -131,6 +131,19 @@ async def test_remember_success() -> None:
     # exclude_none drops unset optional fields
     assert "wing" not in body
     assert "external_id" not in body
+    # ENG-SCOPE-001: visibility defaults to None and is omitted, not sent
+    # explicitly as "workspace" — the server derives the safe default.
+    assert "visibility" not in body
+
+
+async def test_remember_forwards_explicit_visibility_with_workspace() -> None:
+    rec = _Recorder(status_code=201, payload=_REMEMBER_CREATED)
+    async with _client(rec) as client:
+        await client.remember("shared fact", workspace="alpha", visibility="workspace")
+    assert rec.request is not None
+    body = _body(rec.request)
+    assert body["visibility"] == "workspace"
+    assert body["workspace"] == "alpha"
 
 
 async def test_remember_forwards_session_end_source_type() -> None:

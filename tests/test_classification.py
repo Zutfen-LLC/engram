@@ -607,7 +607,7 @@ async def test_dedup_receipt_binding_rolls_back_visibility_and_evidence_on_event
                 "/v1/remember",
                 json={
                     "content": content,
-                    "visibility": "workspace",
+                    "visibility": "tenant",
                     "classification_run_id": receipt_id,
                 },
             )
@@ -638,7 +638,7 @@ async def test_dedup_receipt_binding_rolls_back_visibility_and_evidence_on_event
         "/v1/remember",
         json={
             "content": content,
-            "visibility": "workspace",
+            "visibility": "tenant",
             "classification_run_id": receipt_id,
         },
     )

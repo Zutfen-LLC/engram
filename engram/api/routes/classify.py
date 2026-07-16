@@ -11,13 +11,15 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.auth import ADMIN_SCOPE, READ_SCOPE
+from engram.auth import Principal as AuthPrincipal
 from engram.candidate_ingests import CandidateIdentity, create_ingest
 from engram.canonicalize import canonicalize, content_hash
 from engram.classification import ClassificationResult, RetentionDisposition
 from engram.classification import classify as classify_content
 from engram.classification_evidence import new_run
 from engram.db import get_session
-from engram.models import Principal, Workspace
+from engram.memory_scope import authorize_workspace
+from engram.models import Principal
 from engram.source_types import SourceType
 from engram.usage import record_candidate_once
 
@@ -95,29 +97,33 @@ async def _resolve_principal_id(session: AsyncSession, tenant_id: UUID) -> UUID:
     return principal_id
 
 
-async def _resolve_workspace_id(
-    session: AsyncSession, tenant_id: UUID, slug: str | None
-) -> UUID | None:
-    if slug is None:
-        return None
-    workspace_id = await session.scalar(
-        select(Workspace.id).where(Workspace.tenant_id == tenant_id, Workspace.slug == slug)
-    )
-    if workspace_id is None:
-        raise HTTPException(status_code=422, detail=f"workspace '{slug}' not found")
-    return workspace_id
-
-
-@router.post("/classify", response_model=ClassifyResponse, dependencies=[Depends(READ_SCOPE)])
+@router.post("/classify", response_model=ClassifyResponse)
 async def classify(
     req: ClassifyRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
+    caller: AuthPrincipal = Depends(READ_SCOPE),  # noqa: B008
 ) -> ClassifyResponse:
-    """Classify raw text: suggest kind, wing, room, visibility."""
+    """Classify raw text: suggest kind, wing, room, visibility.
+
+    A classification receipt bound to a workspace must already be authorized
+    at creation time (ENG-SCOPE-001) — the workspace is resolved and the
+    caller's membership verified (or admin scope, tenant-bounded) before any
+    candidate_ingest or classification_runs row is created. /v1/remember
+    re-checks authorization when the receipt is consumed, so a membership
+    revoked after classify() still blocks the later workspace write.
+    """
 
     tenant_id = await _resolve_tenant_id(session)
     principal_id = await _resolve_principal_id(session, tenant_id)
-    workspace_id = await _resolve_workspace_id(session, tenant_id, req.workspace)
+    workspace_id: UUID | None = None
+    if req.workspace is not None:
+        workspace_id = await authorize_workspace(
+            session,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            caller_has_admin_scope=caller.has_scope("admin"),
+            workspace_slug=req.workspace,
+        )
     correlation_id = req.correlation_id or uuid4()
 
     identity = CandidateIdentity(

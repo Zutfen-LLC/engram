@@ -50,6 +50,44 @@ def test_narrow_visibility_preserves_unknown_requested():
     assert narrow_visibility("bogus", "private") == "bogus"
 
 
+# ---- ENG-SCOPE-001: workspace_available guard ----
+
+
+def test_narrow_to_workspace_without_available_workspace_collapses_to_private():
+    """A classifier suggesting 'workspace' when the caller has none narrows to
+    'private' instead — the invariant (workspace visibility always carries a
+    workspace) wins over reproducing the classifier's literal suggestion, and
+    private is still strictly narrower than any requested scope above it."""
+    assert (
+        narrow_visibility("tenant", "workspace", workspace_available=False) == "private"
+    )
+    assert (
+        narrow_visibility("public", "workspace", workspace_available=False) == "private"
+    )
+
+
+def test_narrow_to_workspace_with_available_workspace_is_unaffected():
+    assert narrow_visibility("tenant", "workspace", workspace_available=True) == "workspace"
+    assert narrow_visibility("tenant", "workspace") == "workspace"  # default True
+
+
+def test_narrow_workspace_available_false_is_a_no_op_when_result_isnt_workspace():
+    """The guard only fires when the *narrowed result* is 'workspace' — it
+    never changes a narrowing that lands anywhere else."""
+    assert narrow_visibility("tenant", "private", workspace_available=False) == "private"
+    assert narrow_visibility("private", "tenant", workspace_available=False) == "private"
+
+
+def test_narrow_visibility_never_second_guesses_the_requested_value():
+    """The guard only constrains what the *classifier* can produce — it never
+    rewrites ``requested`` itself. ``resolve_write_scope`` is what guarantees
+    ``requested`` is never 'workspace' without a real workspace in the first
+    place, so this combination cannot occur from a caller that went through
+    the resolver, but narrow_visibility stays a pure narrowing function
+    either way (no suggestion means no narrowing, regardless of the flag)."""
+    assert narrow_visibility("workspace", None, workspace_available=False) == "workspace"
+
+
 # ---- blend_memory_confidence ----
 
 

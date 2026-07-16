@@ -237,8 +237,12 @@ async def test_refinement_narrows_visibility_never_widens(client, monkeypatch):
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
 
-    # Start at tenant visibility (fairly broad).
-    item_id = await _remember(client, content="visibility narrow test", visibility="tenant")
+    # Start at tenant visibility (fairly broad), with a real workspace so a
+    # narrow to "workspace" below is a legitimate target (ENG-SCOPE-001:
+    # visibility='workspace' always requires a workspace).
+    item_id = await _remember(
+        client, content="visibility narrow test", visibility="tenant", workspace="general"
+    )
 
     # First refinement: LLM suggests workspace (narrower) → applied.
     async def suggest_workspace(content, tenant_id, session, context=None, **_kwargs):
@@ -363,6 +367,7 @@ async def test_refinement_schedules_from_reloaded_final_kind_and_reports_final_s
         source_type="session_end",
         kind="fact",
         visibility="tenant",
+        workspace="general",
     )
     async with _test_session_factory() as session:
         from engram.db import (

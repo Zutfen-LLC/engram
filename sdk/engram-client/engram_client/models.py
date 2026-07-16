@@ -30,7 +30,9 @@ class RememberRequest(BaseModel):
     wing: str | None = None
     room: str | None = None
     workspace: str | None = None
-    visibility: str = "workspace"
+    # Omitted/None resolves server-side (ENG-SCOPE-001): private with no
+    # workspace, workspace-shared when an authorized workspace is supplied.
+    visibility: str | None = None
     source_type: SourceKind = "manual"
     source_session: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)

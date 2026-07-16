@@ -175,7 +175,12 @@ async def add_triple(
             content=f"KG triple: {req.subject} {req.predicate} {req.object}",
             content_hash=f"kg-auto-{uuid.uuid4().hex}",
             kind="fact",
-            visibility="workspace",
+            # ENG-SCOPE-001: visibility='workspace' requires a real workspace.
+            # This auto-created backing item stays workspace-shared when a
+            # workspace was resolved, private otherwise — no workspace
+            # membership authorization is layered on here (unchanged, existing
+            # behavior for this route; out of scope for this slice).
+            visibility="workspace" if workspace_id is not None else "private",
             review_status="proposed",
             memory_confidence=source_prior,
             source_trust=source_trust,

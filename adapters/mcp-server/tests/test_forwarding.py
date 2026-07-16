@@ -48,7 +48,7 @@ async def test_remember_forwards_full_shape(mcp_server, mock_client) -> None:
         "wing": None,
         "room": None,
         "workspace": None,
-        "visibility": "workspace",
+        "visibility": None,
         "source_type": "manual",
         "importance": 0.9,
         "sensitivity": "restricted",
@@ -65,12 +65,16 @@ async def test_remember_forwards_full_shape(mcp_server, mock_client) -> None:
 
 
 async def test_remember_applies_trust_defaults(mcp_server, mock_client) -> None:
-    """Omitted fields get the documented defaults (manual/workspace/normal)."""
+    """Omitted fields get the documented defaults (manual/None visibility/normal).
+
+    ``visibility=None`` forwards through to the server, which derives the
+    safe default (ENG-SCOPE-001): private with no workspace.
+    """
     await _call(mcp_server, "engram_remember", {"content": "a bare fact"})
 
     kwargs = mock_client.remember.await_args.kwargs
     assert kwargs["source_type"] == "manual"
-    assert kwargs["visibility"] == "workspace"
+    assert kwargs["visibility"] is None
     assert kwargs["sensitivity"] == "normal"
     assert kwargs["importance"] == 0.5
 

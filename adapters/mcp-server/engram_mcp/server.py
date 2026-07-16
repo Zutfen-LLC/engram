@@ -134,7 +134,7 @@ def register_tools(mcp: FastMCP[EngramState]) -> None:
         wing: str | None = None,
         room: str | None = None,
         workspace: str | None = None,
-        visibility: Visibility = "workspace",
+        visibility: Visibility | None = None,
         source_type: SourceType = "manual",
         importance: float = 0.5,
         sensitivity: Sensitivity = "normal",
@@ -145,6 +145,12 @@ def register_tools(mcp: FastMCP[EngramState]) -> None:
         external_source: str | None = None,
     ) -> dict[str, Any]:
         """Persist a memory item with dedup, trust defaults, and supersession.
+
+        ``visibility`` is optional (ENG-SCOPE-001): omitted, it derives a safe
+        default from ``workspace`` — private when no workspace is given,
+        workspace-shared when one is. An explicit ``visibility="workspace"``
+        still requires ``workspace`` to be set (the server rejects it with a
+        422 otherwise).
 
         Returns the new item id, status (created/deduped/superseded),
         review_status, and memory_confidence.
