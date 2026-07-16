@@ -123,7 +123,7 @@ async def _insert_item(
             source_trust=0.9,
             authority=40,
             review_status="active",
-            visibility="workspace",
+            visibility="tenant",
             tenant_id=tenant_id,
             principal_id=principal_id,
             id=_uuid.uuid4(),

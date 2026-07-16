@@ -113,7 +113,7 @@ class MemoryItem(Base):
         UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
     )
     workspace_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True
+        UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="RESTRICT"), nullable=True
     )
     principal_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("principals.id"), nullable=False
@@ -131,8 +131,10 @@ class MemoryItem(Base):
     subject_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     subject_name: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # Scoping
-    visibility: Mapped[str] = mapped_column(String(20), default="workspace")
+    # Scoping. Private-by-default (ENG-SCOPE-001): missing/ambiguous scope must
+    # never widen access. Every production writer that needs a shared default
+    # must set visibility explicitly — see engram/memory_scope.py.
+    visibility: Mapped[str] = mapped_column(String(20), default="private")
 
     # Trust & review
     review_status: Mapped[str] = mapped_column(String(20), default="proposed")

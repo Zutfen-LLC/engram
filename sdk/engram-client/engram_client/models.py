@@ -18,6 +18,7 @@ SourceKind = Literal[
     "manual", "import", "migration", "extraction", "sync_turn", "pre_compress", "session_end"
 ]
 SensitivityKind = Literal["normal", "sensitive", "restricted"]
+VisibilityKind = Literal["private", "workspace", "tenant", "public"]
 SearchMode = Literal["keyword", "semantic", "hybrid"]
 
 
@@ -30,7 +31,9 @@ class RememberRequest(BaseModel):
     wing: str | None = None
     room: str | None = None
     workspace: str | None = None
-    visibility: str = "workspace"
+    # Omitted/None resolves server-side (ENG-SCOPE-001): private with no
+    # workspace, workspace-shared when an authorized workspace is supplied.
+    visibility: str | None = None
     source_type: SourceKind = "manual"
     source_session: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -179,6 +182,7 @@ class KgAddRequest(BaseModel):
     predicate: str
     object: str
     workspace: str | None = None
+    visibility: VisibilityKind | None = None
     valid_from: str | None = None
     source_item_id: UUID | None = None
     confidence: float = 0.5

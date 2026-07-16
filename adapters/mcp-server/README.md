@@ -274,6 +274,7 @@ Persist a memory item. Returns `{id, status, review_status, memory_confidence}`.
 | `predicate` | string | yes | Triple predicate. |
 | `object` | string | yes | Triple object. |
 | `workspace` | string | no | Workspace scope. |
+| `visibility` | `private` \| `workspace` \| `tenant` \| `public` | no | Derived safely when omitted; must match an existing source item. |
 | `source_item_id` | string (UUID) | no | Backing memory item id. |
 | `confidence` | float | no | `0.5` |
 

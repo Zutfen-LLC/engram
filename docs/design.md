@@ -689,7 +689,48 @@ A hosted deployment can run many tenants with strict isolation.
 | `tenant`    | Any principal in the organization       |
 | `public`    | Any authenticated caller, where enabled |
 
-The default visibility is `workspace`.
+The default visibility is derived, never a fixed constant (ENG-SCOPE-001 —
+missing or ambiguous scope must never widen memory access):
+
+* no `visibility` and no `workspace` -> `private`, scoped to the writing
+  principal.
+* no `visibility` but an authorized `workspace` -> `workspace`, shared with
+  that workspace's members.
+* an explicit `visibility="workspace"` always requires a real, authorized
+  workspace; omitting the workspace fails the request (422) rather than
+  silently falling back to `private` or `tenant`.
+
+Ordinary principals may reference only workspaces they are members of; an
+authenticated key with effective `admin` scope may reference any workspace in
+its own tenant (never across tenants) without a membership row. An unknown or
+unauthorized workspace returns the same non-disclosing 404 in both cases. See
+`engram/memory_scope.py` for the canonical resolver used by `/v1/remember`,
+`/v1/classify`, and KG writes that auto-create backing memories.
+
+Historically, `visibility="workspace"` rows with `workspace_id IS NULL`
+behaved tenant-wide by accident (the default before ENG-SCOPE-001, combined
+with a read-eligibility fallback). That combination is no longer
+representable: migration `021_scope_write_defaults.sql` truthfully relabels
+every existing such row to `visibility="tenant"` (preserving its effective
+access, correcting only the label), a database CHECK constraint
+(`visibility <> 'workspace' OR workspace_id IS NOT NULL`) makes the
+combination unrepresentable going forward, and no read-eligibility path
+(SQLAlchemy or raw SQL, in `engram/memory_access.py`) retains the old
+fallback.
+
+Memory associations deliberately prevent workspace deletion. The
+`memory_items.workspace_id` foreign key uses restrictive deletion: an operator
+must inspect and explicitly re-scope, archive, export/delete, or otherwise
+resolve every associated memory before deleting its workspace. Engram does not
+silently widen those memories to tenant visibility, erase their workspace
+association, or cascade-delete them. An empty workspace may be deleted.
+
+For `POST /v1/kg`, an auto-created backing memory uses the same canonical
+authorized scope resolution as `POST /v1/remember`. When a caller supplies an
+existing readable `source_item_id`, that source memory is authoritative for
+both visibility and workspace; omitted KG scope derives from it, and explicit
+scope must match it exactly. The triple always carries the source memory's
+workspace and cannot widen its audience.
 
 ### Principal model
 

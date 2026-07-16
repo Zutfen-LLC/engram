@@ -56,8 +56,20 @@ def test_tools_carry_descriptions(tools) -> None:
 
 
 def _enum_of(tool: Any, field: str) -> list[str]:
+    """Return the ``enum`` values for ``field``, whether required or optional.
+
+    An optional ``Literal[...] | None`` field (e.g. ``visibility``,
+    ENG-SCOPE-001) surfaces as ``anyOf: [{enum: [...]}, {type: "null"}]``
+    rather than a flat top-level ``enum`` key — check both shapes.
+    """
     schema: dict[str, Any] = tool.inputSchema
-    return schema["properties"][field]["enum"]
+    prop = schema["properties"][field]
+    if "enum" in prop:
+        return list(prop["enum"])
+    for option in prop.get("anyOf", []):
+        if "enum" in option:
+            return list(option["enum"])
+    raise AssertionError(f"no enum found for field {field!r} in schema {prop!r}")
 
 
 def _tool(tools: list[Any], name: str) -> Any:
@@ -76,6 +88,16 @@ def test_remember_visibility_enum(tools) -> None:
         "private",
         "workspace",
         "tenant",
+        "public",
+    ]
+
+
+def test_kg_add_visibility_enum_matches_memory_contract(tools) -> None:
+    assert _enum_of(_tool(tools, "engram_kg_add"), "visibility") == [
+        "private",
+        "workspace",
+        "tenant",
+        "public",
     ]
 
 

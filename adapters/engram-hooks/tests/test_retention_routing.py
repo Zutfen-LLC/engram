@@ -58,6 +58,42 @@ async def test_retain_above_threshold_remembers_receipt_and_server_taxonomy(tmp_
     assert client.remember_calls[0]["kind"] == "decision"
 
 
+async def test_no_default_workspace_forwards_none_workspace_and_no_visibility(
+    tmp_path: Any,
+) -> None:
+    """ENG-SCOPE-001: with no configured default_workspace, the hook forwards
+    workspace=None and never sets visibility explicitly — the SDK omits it
+    from the request, and the server derives 'private' (no widening)."""
+    client = Client("retain", 0.9)
+    hooks = _hooks(tmp_path, client)
+    assert hooks.config.default_workspace is None
+    await hooks._route_candidate("We decided to use Postgres", source_type="sync_turn")
+    assert client.remember_calls[0]["workspace"] is None
+    assert "visibility" not in client.remember_calls[0]
+    assert client.classify_calls[0]["workspace"] is None
+
+
+async def test_default_workspace_forwards_workspace_and_no_visibility(tmp_path: Any) -> None:
+    """ENG-SCOPE-001: a configured default_workspace is forwarded as-is (still
+    no explicit visibility) — the server derives 'workspace' from having a
+    workspace, giving workspace-shared storage without the hook (or a model)
+    having to choose the safe default itself."""
+    client = Client("retain", 0.9)
+    hooks = LifecycleHooks(
+        HooksConfig(
+            base_url="http://test",
+            volatile_path=str(tmp_path / "volatile.jsonl"),
+            store_confidence_threshold=0.65,
+            default_workspace="team-alpha",
+        )
+    )
+    hooks._client = client
+    await hooks._route_candidate("We decided to use Postgres", source_type="sync_turn")
+    assert client.remember_calls[0]["workspace"] == "team-alpha"
+    assert "visibility" not in client.remember_calls[0]
+    assert client.classify_calls[0]["workspace"] == "team-alpha"
+
+
 async def test_zero_threshold_remembers_zero_confidence_retain(tmp_path: Any) -> None:
     client = Client("retain", 0.0)
     hooks = _hooks(tmp_path, client, threshold=0.0)

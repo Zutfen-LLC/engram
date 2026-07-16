@@ -1305,7 +1305,15 @@ _VISIBILITY_RANK: dict[str, int] = {
 }
 
 
-def _can_narrow(current: str, proposed: str) -> bool:
+def _can_narrow(current: str, proposed: str, *, workspace_id: UUID | None) -> bool:
+    """Whether ``proposed`` is a strict narrowing of ``current``.
+
+    ENG-SCOPE-001: a refine job may never propose ``workspace`` for an item
+    with no ``workspace_id`` — that combination is the exact invariant this
+    slice eliminates, so it is rejected here regardless of rank.
+    """
+    if proposed == "workspace" and workspace_id is None:
+        return False
     return _VISIBILITY_RANK.get(proposed, 1) < _VISIBILITY_RANK.get(current, 1)
 
 
@@ -1513,7 +1521,9 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
     # Revalidate against the locked row's current visibility — a concurrent
     # PATCH may have already widened or narrowed it.
     if result.suggested_visibility is not None and _can_narrow(  # noqa: SIM102
-        locked_item.visibility, result.suggested_visibility
+        locked_item.visibility,
+        result.suggested_visibility,
+        workspace_id=locked_item.workspace_id,
     ):
         if await _guarded_field_update(
             session,

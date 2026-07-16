@@ -167,7 +167,7 @@ async def _insert_item(
                     "source_type, valid_to, superseded_by"
                     ") VALUES ("
                     ":id, :tenant_id, :workspace_id, :principal_id, :content, :content_hash, "
-                    ":kind, 'workspace', :review_status, 0.8, :source_trust, 0.5, "
+                    ":kind, :visibility, :review_status, 0.8, :source_trust, 0.5, "
                     "'manual', :valid_to, :superseded_by"
                     ")"
                 ),
@@ -179,6 +179,10 @@ async def _insert_item(
                     "content": content,
                     "content_hash": content_hash or f"sha256:{uuid4().hex}",
                     "kind": kind,
+                    # ENG-SCOPE-001: visibility='workspace' requires a real
+                    # workspace_id — fall back to 'tenant' (same broad-visible
+                    # intent) when the caller didn't supply one.
+                    "visibility": "workspace" if workspace_id else "tenant",
                     "review_status": review_status,
                     "source_trust": source_trust,
                     "valid_to": valid_to,

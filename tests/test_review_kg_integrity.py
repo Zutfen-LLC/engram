@@ -193,7 +193,10 @@ async def test_stale_stats_and_workspace_filters_are_caller_relative(corpus: dic
     expected = {
         await c["item"]("own-stale", owner_name="user", visibility="private", confidence=.2),
         await c["item"]("shared-stale", workspace=c["shared"], visibility="workspace", confidence=.5),
-        await c["item"]("workspace-null", workspace=None, visibility="workspace", confidence=.8),
+        # ENG-SCOPE-001: workspace='workspace' with NULL workspace_id is
+        # unrepresentable after migration 021 — 'tenant' is the truthful
+        # post-migration label for what this row used to mean.
+        await c["item"]("workspace-null", workspace=None, visibility="tenant", confidence=.8),
         await c["item"]("tenant-stale", visibility="tenant"),
         await c["item"]("public-stale", visibility="public"),
     }
@@ -220,7 +223,7 @@ async def test_kg_query_timeline_direction_predicate_as_of_and_orphans(corpus: d
     sources = {
         "own": await c["item"]("kg-own", owner_name="user", visibility="private"),
         "shared": await c["item"]("kg-shared", workspace=c["shared"], visibility="workspace"),
-        "null": await c["item"]("kg-null", visibility="workspace"),
+        "null": await c["item"]("kg-null", visibility="tenant"),
         "tenant": await c["item"]("kg-tenant", visibility="tenant"),
         "public": await c["item"]("kg-public", visibility="public"),
         "private": await c["item"]("kg-private", owner_name="agent_b", visibility="private"),
@@ -317,7 +320,12 @@ async def test_eligibility_expression_sql_and_alias_parity(corpus: dict[str, Any
         ("private-other", {"owner_name": "agent_b", "visibility": "private"}),
         ("workspace-member", {"workspace": c["shared"], "visibility": "workspace"}),
         ("workspace-nonmember", {"workspace": c["restricted"], "visibility": "workspace", "owner_name": "agent_b"}),
-        ("workspace-null-parity", {"visibility": "workspace"}),
+        # ENG-SCOPE-001: visibility='workspace' with NULL workspace_id is no
+        # longer a constructible row (DB CHECK constraint) — the equivalent
+        # "workspace-null-parity" case from before this slice is covered
+        # instead by tests/test_memory_access_unit.py, which exercises it as
+        # a manually-constructed non-Postgres row precisely because real
+        # Postgres now rejects it outright.
         ("tenant-parity", {"visibility": "tenant"}),
         ("public-parity", {"visibility": "public"}),
     ):

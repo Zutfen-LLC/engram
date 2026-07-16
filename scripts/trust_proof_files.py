@@ -28,6 +28,11 @@ SCOPE_PROOFS = (
     "tests/test_scope_enforcement.py",
     "tests/test_scope_issuance.py",
     "tests/test_scopes_unit.py",
+    # ENG-SCOPE-001: truthful scope invariants and safe write defaults.
+    "tests/test_memory_scope_unit.py",
+    "tests/test_memory_access_unit.py",
+    "tests/test_scope_write_defaults.py",
+    "tests/test_scope_write_defaults_migration.py",
 )
 
 # ── Row-level security ──────────────────────────────────────────────

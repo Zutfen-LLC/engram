@@ -91,7 +91,10 @@ async def _mk_item(
     wing: str | None = None,
     room: str | None = None,
     importance: float = 0.5,
-    visibility: str = "workspace",
+    # ENG-SCOPE-001: visibility='workspace' requires a real workspace_id.
+    # 'tenant' preserves this helper's original "generally visible within
+    # the tenant, no membership setup needed" default intent.
+    visibility: str = "tenant",
     review_status: str = "active",
     workspace_id: str | None = None,
 ) -> MemoryItem:

@@ -352,14 +352,18 @@ async def test_secret_rejection_still_records_failed_outcome(client):
 
 async def test_invalid_workspace_still_records_failed_outcome(client):
     """An invalid workspace slug is rejected after identity resolution but
-    before the write; it must still produce a failed outcome."""
+    before the write; it must still produce a failed outcome.
+
+    ENG-SCOPE-001: an unknown workspace returns a non-disclosing 404 (the
+    same response an unauthorized-but-real workspace gets), not 422.
+    """
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     resp = await client.post(
         "/v1/remember",
         json={"content": "valid content for a bad workspace", "workspace": "no-such-slug-xyz"},
     )
-    assert resp.status_code == 422
+    assert resp.status_code == 404
 
     failed = await _usage_events("candidate.outcome")
     matching = [e for e in failed if e["status"] == "failed"]

@@ -235,8 +235,17 @@ def _import_drawer(
     base_url: str,
     rec: DrawerRecord,
     timeout: float,
+    *,
+    visibility: str,
+    workspace: str | None,
 ) -> bool:
-    """POST a single drawer to /v1/remember. Returns True on success."""
+    """POST a single drawer to /v1/remember. Returns True on success.
+
+    ``visibility``/``workspace`` are the import's explicitly selected scope
+    (ENG-SCOPE-001) — never left to the server default, so a MemPalace import
+    never silently reproduces the old accidental tenant-wide-workspace
+    behavior.
+    """
     payload: dict[str, Any] = {
         "content": rec.content,
         "kind": rec.kind,
@@ -245,7 +254,10 @@ def _import_drawer(
         "source_type": "migration",
         "external_source": "mempalace",
         "external_id": rec.drawer_id,
+        "visibility": visibility,
     }
+    if workspace is not None:
+        payload["workspace"] = workspace
     resp = client.post(f"{base_url}/v1/remember", json=payload, timeout=timeout)
     # 201 = created, 200 = deduped (already exists, not an error)
     return resp.status_code in (200, 201)
@@ -256,13 +268,19 @@ def _import_kg_triple(
     base_url: str,
     triple: dict[str, Any],
     timeout: float,
+    *,
+    visibility: str,
+    workspace: str | None,
 ) -> bool:
-    """POST a KG triple to /v1/kg. Returns True on success."""
+    """POST a KG triple using the import's selected memory scope."""
     payload = {
         "subject": triple.get("subject", ""),
         "predicate": triple.get("predicate", ""),
         "object": triple.get("object", ""),
+        "visibility": visibility,
     }
+    if workspace is not None:
+        payload["workspace"] = workspace
     if triple.get("valid_from"):
         payload["valid_from"] = triple["valid_from"]
     resp = client.post(f"{base_url}/v1/kg", json=payload, timeout=timeout)
@@ -294,11 +312,18 @@ def _import_tunnel(
 # ---------------------------------------------------------------------------
 
 
+def _format_scope(visibility: str, workspace: str | None) -> str:
+    return f"{visibility} (workspace={workspace})" if workspace else f"{visibility} (no workspace)"
+
+
 def _print_dry_run(
     records: list[DrawerRecord],
     duplicates: int,
     kg_triples: list[dict[str, Any]],
     tunnels: list[dict[str, Any]],
+    *,
+    visibility: str,
+    workspace: str | None,
 ) -> None:
     """Print the dry-run analysis report."""
     report = ImportReport()
@@ -317,6 +342,10 @@ def _print_dry_run(
     print("=" * 60)
     print("MemPalace → Engram Import (DRY RUN)")
     print("=" * 60)
+    print(
+        "Memory write scope "
+        f"(drawers + KG) : {_format_scope(visibility, workspace)}"
+    )
     print(f"Total drawers in palace : {report.total}")
     print(f"Unique (after dedup)    : {len(records)}")
     print(f"Duplicates detected     : {report.duplicates}")
@@ -403,11 +432,34 @@ def main() -> int:
         default=None,
         help="Engram API key (Bearer token). Required for auth-enabled deployments.",
     )
+    parser.add_argument(
+        "--visibility",
+        choices=["private", "workspace", "tenant", "public"],
+        default="private",
+        help=(
+            "Visibility to import with (ENG-SCOPE-001). Default: private — an "
+            "import never silently reproduces the old accidental tenant-wide "
+            "behavior. Use 'workspace' with --workspace for workspace-shared "
+            "imports."
+        ),
+    )
+    parser.add_argument(
+        "--workspace",
+        default=None,
+        help="Workspace slug to import into. Required when --visibility=workspace.",
+    )
     args = parser.parse_args()
 
     # Resolve API key from env if not given on CLI
     if args.api_key is None:
         args.api_key = os.environ.get("ENGRAM_API_KEY")
+
+    if args.visibility == "workspace" and not args.workspace:
+        print(
+            "ERROR: --visibility workspace requires --workspace (no request sent).",
+            file=sys.stderr,
+        )
+        return 1
 
     palace_path = str(Path(args.palace).expanduser())
     if not Path(palace_path).exists():
@@ -428,7 +480,14 @@ def main() -> int:
 
     # --- Dry run ---
     if not args.apply:
-        _print_dry_run(unique_records, duplicates, kg_triples, tunnels)
+        _print_dry_run(
+            unique_records,
+            duplicates,
+            kg_triples,
+            tunnels,
+            visibility=args.visibility,
+            workspace=args.workspace,
+        )
         return 0
 
     # --- Apply ---
@@ -449,7 +508,14 @@ def main() -> int:
             if rec.needs_review:
                 report.needs_review += 1
             try:
-                if _import_drawer(client, base_url, rec, args.timeout):
+                if _import_drawer(
+                    client,
+                    base_url,
+                    rec,
+                    args.timeout,
+                    visibility=args.visibility,
+                    workspace=args.workspace,
+                ):
                     report.imported += 1
                 else:
                     report.errors += 1
@@ -462,7 +528,14 @@ def main() -> int:
             if _check_endpoint(client, base_url, "/v1/kg/query"):
                 for triple in kg_triples:
                     try:
-                        if _import_kg_triple(client, base_url, triple, args.timeout):
+                        if _import_kg_triple(
+                            client,
+                            base_url,
+                            triple,
+                            args.timeout,
+                            visibility=args.visibility,
+                            workspace=args.workspace,
+                        ):
                             report.kg_triples += 1
                     except httpx.HTTPError:
                         pass
@@ -486,6 +559,10 @@ def main() -> int:
     print("=" * 60)
     print("MemPalace → Engram Import (APPLY)")
     print("=" * 60)
+    print(
+        "Memory write scope "
+        f"(drawers + KG): {_format_scope(args.visibility, args.workspace)}"
+    )
     print(f"Drawers imported  : {report.imported}")
     print(f"Drawers errored   : {report.errors}")
     print(f"Duplicates skipped: {report.duplicates}")

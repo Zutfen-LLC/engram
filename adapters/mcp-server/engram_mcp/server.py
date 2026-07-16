@@ -28,7 +28,7 @@ from starlette.requests import Request
 # rather than bare free-form strings.
 SourceType = Literal["manual", "import", "migration", "extraction", "sync_turn", "pre_compress"]
 Sensitivity = Literal["normal", "sensitive", "restricted"]
-Visibility = Literal["private", "workspace", "tenant"]
+Visibility = Literal["private", "workspace", "tenant", "public"]
 SearchMode = Literal["keyword", "semantic", "hybrid"]
 RecallMode = Literal["startup", "semantic"]
 Direction = Literal["outgoing", "incoming", "both"]
@@ -134,7 +134,7 @@ def register_tools(mcp: FastMCP[EngramState]) -> None:
         wing: str | None = None,
         room: str | None = None,
         workspace: str | None = None,
-        visibility: Visibility = "workspace",
+        visibility: Visibility | None = None,
         source_type: SourceType = "manual",
         importance: float = 0.5,
         sensitivity: Sensitivity = "normal",
@@ -145,6 +145,12 @@ def register_tools(mcp: FastMCP[EngramState]) -> None:
         external_source: str | None = None,
     ) -> dict[str, Any]:
         """Persist a memory item with dedup, trust defaults, and supersession.
+
+        ``visibility`` is optional (ENG-SCOPE-001): omitted, it derives a safe
+        default from ``workspace`` — private when no workspace is given,
+        workspace-shared when one is. An explicit ``visibility="workspace"``
+        still requires ``workspace`` to be set (the server rejects it with a
+        422 otherwise).
 
         Returns the new item id, status (created/deduped/superseded),
         review_status, and memory_confidence.
@@ -240,6 +246,7 @@ def register_tools(mcp: FastMCP[EngramState]) -> None:
         predicate: str,
         object: str,
         workspace: str | None = None,
+        visibility: Visibility | None = None,
         source_item_id: str | None = None,
         confidence: float = 0.5,
     ) -> dict[str, Any]:
@@ -249,6 +256,7 @@ def register_tools(mcp: FastMCP[EngramState]) -> None:
             predicate,
             object,
             workspace=workspace,
+            visibility=visibility,
             source_item_id=source_item_id,
             confidence=confidence,
         )

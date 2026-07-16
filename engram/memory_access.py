@@ -25,6 +25,16 @@ Visibility rules (design.md):
             WHERE principal_id = :caller_principal_id
         )
     )
+
+ENG-SCOPE-001: ``visibility='workspace' AND workspace_id IS NULL`` is no
+longer a supported semantic state. Historically this combination was treated
+as tenant-wide (the accidental result of a caller omitting both fields, which
+defaulted to ``workspace``); migration 021 truthfully relabels every such
+legacy row to ``visibility='tenant'`` and a database CHECK constraint
+(``visibility <> 'workspace' OR workspace_id IS NOT NULL``) now makes the
+combination unrepresentable going forward. This predicate is intentionally
+strict: a ``workspace_id IS NULL`` row can only match here via the ``tenant``/
+``public``/owned-``private`` arms, never the ``workspace`` arm.
 """
 
 from __future__ import annotations
@@ -53,12 +63,13 @@ def eligibility_expression(
     isolation at the DB level too, but the app layer keeps the explicit filter
     as the primary rule (and so non-DB tests stay correct).
 
-    A ``visibility='workspace'`` item with ``workspace_id IS NULL`` (the
-    default for memories written without an explicit ``workspace``) isn't
-    scoped to any workspace, so workspace membership doesn't apply to it —
-    it's treated as tenant-wide, matching pre-existing default-write
-    behavior. Only a ``workspace_id`` that names a real workspace restricts
-    the item to that workspace's members.
+    ``visibility='workspace'`` is strict membership-only (ENG-SCOPE-001): a
+    row must name a real ``workspace_id`` that the caller belongs to. A
+    ``workspace_id IS NULL`` row is unrepresentable for ``visibility=
+    'workspace'`` after migration 021 (enforced by a DB CHECK constraint), so
+    no tenant-wide fallback is applied here — a manually-constructed row of
+    that shape (e.g. in a non-DB unit test) is correctly excluded, not
+    admitted.
     """
     member_workspaces = (
         sa_select(WorkspaceMember.workspace_id)
@@ -71,10 +82,7 @@ def eligibility_expression(
         and_(item_entity.visibility == "private", item_entity.principal_id == principal_id),
         and_(
             item_entity.visibility == "workspace",
-            or_(
-                item_entity.workspace_id.is_(None),
-                item_entity.workspace_id.in_(member_workspaces),
-            ),
+            item_entity.workspace_id.in_(member_workspaces),
         ),
     )
 
@@ -95,12 +103,9 @@ _ELIGIBILITY_SQL_TEMPLATE = """(
         OR ({p}visibility = 'private' AND {p}principal_id = :caller_principal_id)
         OR (
             {p}visibility = 'workspace'
-            AND (
-                {p}workspace_id IS NULL
-                OR {p}workspace_id IN (
-                    SELECT workspace_id FROM workspace_members
-                    WHERE principal_id = :caller_principal_id
-                )
+            AND {p}workspace_id IN (
+                SELECT workspace_id FROM workspace_members
+                WHERE principal_id = :caller_principal_id
             )
         )
     )"""

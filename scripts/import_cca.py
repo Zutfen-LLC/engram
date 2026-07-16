@@ -83,7 +83,30 @@ def main() -> int:
         default=True,
         help="Report counts and duplicates without importing (default)",
     )
+    parser.add_argument(
+        "--visibility",
+        choices=["private", "workspace", "tenant", "public"],
+        default="private",
+        help=(
+            "Visibility to import with (ENG-SCOPE-001). Default: private — an "
+            "import never silently reproduces the old accidental tenant-wide "
+            "behavior. Use 'workspace' with --workspace for workspace-shared "
+            "imports."
+        ),
+    )
+    parser.add_argument(
+        "--workspace",
+        default=None,
+        help="Workspace slug to import into. Required when --visibility=workspace.",
+    )
     args = parser.parse_args()
+
+    if args.visibility == "workspace" and not args.workspace:
+        print(
+            "ERROR: --visibility workspace requires --workspace (no request sent).",
+            file=sys.stderr,
+        )
+        return 1
 
     cca_path = Path(args.cca_file)
     if not cca_path.exists():
@@ -115,20 +138,28 @@ def main() -> int:
 
         seen_hashes.add(chash)
         by_kind[engram_kind] += 1
-        to_import.append(
-            {
-                "content": content,
-                "kind": engram_kind,
-                "source_type": "migration",
-                "source_session": entry.get("session_id") or "",
-                "external_source": "cca",
-                "external_id": entry.get("id"),
-                "metadata": {"captured_at": entry.get("captured_at", "")},
-            }
-        )
+        item: dict[str, Any] = {
+            "content": content,
+            "kind": engram_kind,
+            "source_type": "migration",
+            "source_session": entry.get("session_id") or "",
+            "external_source": "cca",
+            "external_id": entry.get("id"),
+            "metadata": {"captured_at": entry.get("captured_at", "")},
+            "visibility": args.visibility,
+        }
+        if args.workspace is not None:
+            item["workspace"] = args.workspace
+        to_import.append(item)
 
     # Report
+    scope = (
+        f"{args.visibility} (workspace={args.workspace})"
+        if args.workspace
+        else f"{args.visibility} (no workspace)"
+    )
     print(f"CCA file: {cca_path}")
+    print(f"Import scope: {scope}")
     print(f"Total entries: {len(entries)}")
     print(f"To import: {len(to_import)}")
     print(f"Duplicates: {duplicates}")

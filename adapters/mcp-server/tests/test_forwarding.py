@@ -48,7 +48,7 @@ async def test_remember_forwards_full_shape(mcp_server, mock_client) -> None:
         "wing": None,
         "room": None,
         "workspace": None,
-        "visibility": "workspace",
+        "visibility": None,
         "source_type": "manual",
         "importance": 0.9,
         "sensitivity": "restricted",
@@ -65,12 +65,16 @@ async def test_remember_forwards_full_shape(mcp_server, mock_client) -> None:
 
 
 async def test_remember_applies_trust_defaults(mcp_server, mock_client) -> None:
-    """Omitted fields get the documented defaults (manual/workspace/normal)."""
+    """Omitted fields get the documented defaults (manual/None visibility/normal).
+
+    ``visibility=None`` forwards through to the server, which derives the
+    safe default (ENG-SCOPE-001): private with no workspace.
+    """
     await _call(mcp_server, "engram_remember", {"content": "a bare fact"})
 
     kwargs = mock_client.remember.await_args.kwargs
     assert kwargs["source_type"] == "manual"
-    assert kwargs["visibility"] == "workspace"
+    assert kwargs["visibility"] is None
     assert kwargs["sensitivity"] == "normal"
     assert kwargs["importance"] == 0.5
 
@@ -157,6 +161,7 @@ async def test_kg_add_forwards_shape(mcp_server, mock_client) -> None:
             "subject": "users",
             "predicate": "located_in",
             "object": "us-east-1",
+            "visibility": "public",
             "confidence": 0.7,
         },
     )
@@ -164,10 +169,22 @@ async def test_kg_add_forwards_shape(mcp_server, mock_client) -> None:
     assert mock_client.kg_add.await_args.args == ("users", "located_in", "us-east-1")
     assert mock_client.kg_add.await_args.kwargs == {
         "workspace": None,
+        "visibility": "public",
         "source_item_id": None,
         "confidence": 0.7,
     }
     assert result.structuredContent["triple"]["predicate"] == "located_in"
+
+
+async def test_kg_add_preserves_omitted_scope(mcp_server, mock_client) -> None:
+    await _call(
+        mcp_server,
+        "engram_kg_add",
+        {"subject": "a", "predicate": "rel", "object": "b"},
+    )
+
+    assert mock_client.kg_add.await_args.kwargs["workspace"] is None
+    assert mock_client.kg_add.await_args.kwargs["visibility"] is None
 
 
 # ---- engram_kg_query ----

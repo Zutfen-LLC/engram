@@ -216,7 +216,7 @@ async def _insert_item(
                 "importance, source_type, created_at, valid_from"
                 ") VALUES ("
                 ":id, :tenant_id, :principal_id, :content, :content_hash, 'fact', "
-                "'workspace', :review_status, :memory_confidence, 0.5, "
+                "'tenant', :review_status, :memory_confidence, 0.5, "
                 "0.5, 'manual', :created_at, :created_at"
                 ")"
             ),

@@ -41,6 +41,7 @@ from .models import (
     SearchResponse,
     SensitivityKind,
     SourceKind,
+    VisibilityKind,
 )
 
 _DEFAULT_TIMEOUT = 30.0
@@ -190,7 +191,7 @@ class EngramClient:
         wing: str | None = None,
         room: str | None = None,
         workspace: str | None = None,
-        visibility: str = "workspace",
+        visibility: VisibilityKind | None = None,
         source_type: SourceKind = "manual",
         source_session: str | None = None,
         metadata: dict[str, Any] | None = None,
@@ -212,6 +213,12 @@ class EngramClient:
         single usage-telemetry candidate observation rather than two. Omit it
         for a direct remember with no preceding classify — the server
         generates one.
+
+        ``visibility`` defaults to ``None`` (ENG-SCOPE-001): the server
+        derives a safe default — private when no ``workspace`` is given,
+        workspace-shared when one is. Pass ``visibility="workspace"``
+        explicitly only together with ``workspace``; the server rejects
+        ``visibility="workspace"`` with no workspace (422).
         """
         req = RememberRequest(
             content=content,
@@ -380,6 +387,7 @@ class EngramClient:
         object: str,
         *,
         workspace: str | None = None,
+        visibility: VisibilityKind | None = None,
         valid_from: str | None = None,
         source_item_id: UUID | str | None = None,
         confidence: float = 0.5,
@@ -393,6 +401,7 @@ class EngramClient:
             predicate=predicate,
             object=object,
             workspace=workspace,
+            visibility=visibility,
             valid_from=valid_from,
             source_item_id=resolved_id,
             confidence=confidence,

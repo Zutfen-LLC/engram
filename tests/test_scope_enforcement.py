@@ -178,7 +178,10 @@ async def _insert_item(
     principal_id: str,
     content: str,
     review_status: str = "active",
-    visibility: str = "workspace",
+    # ENG-SCOPE-001: visibility='workspace' requires a real workspace_id,
+    # which this helper never sets — 'tenant' keeps the same "broadly
+    # visible, no membership setup needed" test default.
+    visibility: str = "tenant",
     human_verified: bool = False,
 ) -> str:
     item_id = str(uuid.uuid4())

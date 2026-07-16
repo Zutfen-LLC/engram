@@ -129,6 +129,18 @@ async def proof(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[dict[str, Any]
                         "label": f"metadata-patch-{tag}-{name}",
                     },
                 )
+        # ENG-SCOPE-001: strict workspace-visibility eligibility requires real
+        # membership — both actors join the fixture's workspace so a narrow to
+        # visibility='workspace' (test_patch_visibility_narrow) remains
+        # readable by the actor who performed it.
+        for pid, _ptype, _scopes, _ik in actors.values():
+            await conn.execute(
+                text(
+                    "INSERT INTO workspace_members (id,workspace_id,principal_id) "
+                    "VALUES (:id,:wid,:pid)"
+                ),
+                {"id": uuid.uuid4(), "wid": workspace, "pid": pid},
+            )
 
     author_id = actors["author"][0]
     base_time = datetime.now(UTC).replace(microsecond=0)
@@ -145,21 +157,23 @@ async def proof(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[dict[str, Any]
         source_trust: float = 0.6,
         importance: float = 0.5,
         authority: int = 10,
+        workspace_id: uuid.UUID | None = None,
     ) -> uuid.UUID:
         item_id = uuid.uuid4()
         async with owner.begin() as conn:
             cols = (
-                "id,tenant_id,principal_id,content,content_hash,kind,visibility,"
+                "id,tenant_id,workspace_id,principal_id,content,content_hash,kind,visibility,"
                 "review_status,memory_confidence,source_trust,importance,source_type,"
                 "authority,created_at,valid_from"
             )
             vals = (
-                ":id,:tid,:pid,:content,:hash,:kind,:visibility,:review_status,"
+                ":id,:tid,:wid,:pid,:content,:hash,:kind,:visibility,:review_status,"
                 ":mc,:st,:imp,'manual',:authority,:created,:created"
             )
             params: dict[str, Any] = {
                 "id": item_id,
                 "tid": tenant,
+                "wid": workspace_id,
                 "pid": author_id,
                 "content": f"{tag}:{content}",
                 "hash": f"sha256:{item_id.hex}",
@@ -423,9 +437,16 @@ async def test_patch_multifield_one_skipped(proof: dict[str, Any]) -> None:
 
 
 async def test_patch_visibility_narrow(proof: dict[str, Any]) -> None:
-    """A human PATCH can narrow visibility from tenant to workspace."""
+    """A human PATCH can narrow visibility from tenant to workspace.
+
+    ENG-SCOPE-001: visibility='workspace' always requires a real workspace —
+    the item is seeded with the fixture's pre-created workspace so the PATCH
+    target is a legitimate narrow, not the now-invalid workspace-null shape.
+    """
     p = proof
-    item = await p["insert_item"](content="patch-visibility-narrow", visibility="tenant")
+    item = await p["insert_item"](
+        content="patch-visibility-narrow", visibility="tenant", workspace_id=p["workspace"]
+    )
 
     resp = await _patch(p, "user_review", item, visibility="workspace")
     assert resp.status_code == 200, resp.text

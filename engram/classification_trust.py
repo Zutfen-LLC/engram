@@ -40,12 +40,24 @@ _AUTOMATED_CLASSIFIER_WEIGHT = 0.5
 _AUTHORITATIVE_CLASSIFIER_WEIGHT = 0.15
 
 
-def narrow_visibility(requested: str, suggested: str | None) -> str:
+def narrow_visibility(
+    requested: str, suggested: str | None, *, workspace_available: bool = True
+) -> str:
     """Return the narrowest of ``requested`` and ``suggested``.
 
     The classifier may only narrow visibility, never widen it. ``None`` / unknown
     / invalid suggestions are ignored and the requested visibility is preserved
     unchanged. Equal scopes round-trip to the requested value.
+
+    ``workspace_available`` (ENG-SCOPE-001) guards the write-side invariant
+    that ``workspace`` visibility must always carry a real workspace: a
+    classifier may only narrow *to* ``workspace`` when the caller actually
+    resolved one. When it did not, narrowing collapses to ``private`` instead
+    — still strictly narrower than any requested scope above ``workspace``,
+    so "never widen" still holds, but the impossible
+    ``workspace``-with-no-workspace combination is never produced. Defaults to
+    ``True`` (no additional restriction) for callers that already know
+    ``requested`` cannot be ``workspace`` without a workspace.
     """
     if suggested is None:
         return requested
@@ -57,7 +69,10 @@ def narrow_visibility(requested: str, suggested: str | None) -> str:
         return requested
     if sugg_rank is None:
         return requested
-    return suggested if sugg_rank < req_rank else requested
+    narrowed = suggested if sugg_rank < req_rank else requested
+    if narrowed == "workspace" and not workspace_available:
+        return "private"
+    return narrowed
 
 
 def blend_memory_confidence(

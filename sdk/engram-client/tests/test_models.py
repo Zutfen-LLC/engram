@@ -29,6 +29,29 @@ def test_remember_request_accepts_session_end() -> None:
     assert req.source_type == "session_end"
 
 
+def test_remember_request_visibility_defaults_to_none() -> None:
+    """ENG-SCOPE-001: the SDK default is None — the server derives the safe
+    default (private with no workspace, workspace-shared with one)."""
+    req = RememberRequest(content="bare fact")
+    assert req.visibility is None
+
+
+def test_remember_request_omits_none_visibility_from_serialized_json() -> None:
+    """model_dump(exclude_none=True) — the pattern EngramClient.remember uses
+    to serialize — omits visibility entirely when it's None, so the server
+    sees a genuinely-absent field rather than an explicit null."""
+    req = RememberRequest(content="bare fact")
+    payload = req.model_dump(mode="json", exclude_none=True)
+    assert "visibility" not in payload
+
+
+def test_remember_request_forwards_explicit_visibility() -> None:
+    req = RememberRequest(content="shared fact", workspace="alpha", visibility="workspace")
+    payload = req.model_dump(mode="json", exclude_none=True)
+    assert payload["visibility"] == "workspace"
+    assert payload["workspace"] == "alpha"
+
+
 def test_classify_legacy_confidence_is_canonical_alias() -> None:
     response = ClassifyResponse.model_validate(
         {

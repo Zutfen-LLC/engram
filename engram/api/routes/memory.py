@@ -21,12 +21,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram import semantic, trust_policy
 from engram.auth import READ_SCOPE, WRITE_SCOPE
+from engram.auth import Principal as AuthPrincipal
 from engram.authority import authority_allows_supersession, authority_label, derive_memory_authority
 from engram.candidate_ingests import (
     CandidateIdentity,
     create_ingest,
+    get_ingest,
     identity_mismatches,
-    lock_ingest,
 )
 from engram.canonicalize import canonicalize, content_hash
 from engram.classification import ClassificationResult, classify_rules_only
@@ -45,13 +46,13 @@ from engram.feedback import (
 from engram.jobs import enqueue_job
 from engram.memory_access import eligibility_sql, resolve_workspace_scope, tenant_sql
 from engram.memory_kinds import UnknownMemoryKindError, require_enabled_memory_kind
+from engram.memory_scope import resolve_write_scope
 from engram.models import (
     CandidateIngest,
     ClassificationRun,
     ItemEvent,
     MemoryItem,
     Principal,
-    Workspace,
 )
 from engram.safety import has_secrets
 from engram.source_types import SourceType
@@ -92,7 +93,10 @@ class RememberRequest(BaseModel):
     wing: str | None = None
     room: str | None = None
     workspace: str | None = None
-    visibility: str = "workspace"
+    # Omitted/null resolves safely (ENG-SCOPE-001): private with no workspace,
+    # workspace-shared when an authorized workspace is supplied. See
+    # engram.memory_scope.resolve_write_scope for the full resolution table.
+    visibility: str | None = None
     source_type: SourceKind = "manual"
     source_session: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -181,26 +185,6 @@ class FeedbackResponse(BaseModel):
     feedback_event_id: UUID
     importance: float
     startup_recall_count: int
-
-
-async def _resolve_workspace_id(
-    session: AsyncSession,
-    tenant_id: UUID,
-    workspace_slug: str | None,
-) -> UUID | None:
-    """Resolve workspace slug to UUID. Returns None for tenant-level memories."""
-    if workspace_slug is None:
-        return None
-    result = await session.execute(
-        select(Workspace.id).where(
-            Workspace.tenant_id == tenant_id,
-            Workspace.slug == workspace_slug,
-        )
-    )
-    ws_id = result.scalar_one_or_none()
-    if ws_id is None:
-        raise HTTPException(status_code=422, detail=f"workspace '{workspace_slug}' not found")
-    return ws_id
 
 
 async def _resolve_principal(
@@ -477,11 +461,11 @@ def _rrf_fuse(
     "/remember",
     response_model=RememberResponse,
     status_code=201,
-    dependencies=[Depends(WRITE_SCOPE)],
 )
 async def remember(
     req: RememberRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
+    caller: AuthPrincipal = Depends(WRITE_SCOPE),  # noqa: B008
 ) -> RememberResponse:
     """Write a memory item with dedup, trust defaults, and supersession.
 
@@ -519,6 +503,7 @@ async def remember(
             tenant_id=tenant_id, principal_id=principal_id,
             principal_type=_principal_type,
             attempt_id=attempt_id,
+            caller_has_admin_scope=caller.has_scope("admin"),
         )
         outcome_status = result.status
         return result
@@ -549,6 +534,7 @@ async def _remember_impl(
     principal_id: UUID,
     principal_type: str,
     attempt_id: UUID,
+    caller_has_admin_scope: bool,
 ) -> RememberResponse:
     """The actual write logic. See :func:`remember` for the telemetry wrapper.
 
@@ -572,8 +558,22 @@ async def _remember_impl(
     canonical = canonicalize(req.content)
     chash = content_hash(canonical)
 
-    # 3. Resolve workspace (tenant/principal already resolved by the wrapper).
-    workspace_id = await _resolve_workspace_id(session, tenant_id, req.workspace)
+    # 3. Resolve and authorize the write scope (ENG-SCOPE-001): safe default
+    # visibility, workspace existence + membership (or admin bypass), and the
+    # workspace-visibility-requires-workspace invariant. The resolved values —
+    # not req.visibility/req.workspace — are authoritative for everything
+    # below (identity, receipt compatibility, item fields, dedup/supersession
+    # scope, provenance, telemetry).
+    scope = await resolve_write_scope(
+        session,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        caller_has_admin_scope=caller_has_admin_scope,
+        requested_visibility=req.visibility,
+        requested_workspace=req.workspace,
+    )
+    workspace_id = scope.workspace_id
+    caller_visibility = scope.visibility
     outcome_ctx["workspace_id"] = workspace_id
 
     identity = CandidateIdentity(
@@ -627,9 +627,9 @@ async def _remember_impl(
             )
         if receipt.ingest_id is None:  # pragma: no cover - guarded above
             raise RuntimeError("classification run has no ingest identity")
-        ingest = await lock_ingest(session, receipt.ingest_id)
+        ingest = await get_ingest(session, receipt.ingest_id)
     elif req.ingest_id is not None:
-        ingest = await lock_ingest(session, req.ingest_id)
+        ingest = await get_ingest(session, req.ingest_id)
         if ingest is None:
             await record_ingest_reuse_rejected(
                 tenant_id=tenant_id,
@@ -757,17 +757,22 @@ async def _remember_impl(
     # Taxonomy confidence never mutates overall memory confidence. Classification
     # may only narrow visibility; source policy remains the immutable write prior.
     default_confidence = memory_confidence
-    final_visibility = req.visibility
+    final_visibility = caller_visibility
     suggested_visibility: str | None = None
     visibility_narrowed = False
+    workspace_available = workspace_id is not None
     if receipt is not None:
         suggested_visibility = receipt.suggested_visibility
-        final_visibility = narrow_visibility(req.visibility, suggested_visibility)
-        visibility_narrowed = final_visibility != req.visibility
+        final_visibility = narrow_visibility(
+            caller_visibility, suggested_visibility, workspace_available=workspace_available
+        )
+        visibility_narrowed = final_visibility != caller_visibility
     elif classification_result is not None:
         suggested_visibility = classification_result.suggested_visibility
-        final_visibility = narrow_visibility(req.visibility, suggested_visibility)
-        visibility_narrowed = final_visibility != req.visibility
+        final_visibility = narrow_visibility(
+            caller_visibility, suggested_visibility, workspace_available=workspace_available
+        )
+        visibility_narrowed = final_visibility != caller_visibility
 
     # 5. Supersession check for singleton kinds.
     superseded_id, withheld_singleton = await _check_supersession(
@@ -868,10 +873,14 @@ async def _remember_impl(
 
             previous_visibility = existing.visibility
             receipt_requested_visibility = narrow_visibility(
-                req.visibility, receipt.suggested_visibility
+                caller_visibility,
+                receipt.suggested_visibility,
+                workspace_available=workspace_available,
             )
             dedup_final_visibility = narrow_visibility(
-                previous_visibility, receipt_requested_visibility
+                previous_visibility,
+                receipt_requested_visibility,
+                workspace_available=workspace_available,
             )
             if dedup_final_visibility != previous_visibility:
                 visibility_guard = (
@@ -939,7 +948,7 @@ async def _remember_impl(
                             "confidence": receipt.taxonomy_confidence,
                             "retention_confidence": receipt.retention_confidence,
                             "retention_disposition": receipt.retention_disposition,
-                            "requested_visibility": req.visibility,
+                            "requested_visibility": caller_visibility,
                             "suggested_visibility": receipt.suggested_visibility,
                             "previous_visibility": previous_visibility,
                             "final_visibility": dedup_final_visibility,
@@ -995,9 +1004,9 @@ async def _remember_impl(
         "authority_label": authority_label(authority),
         "default_memory_confidence": default_confidence,
         "final_memory_confidence": memory_confidence,
-        "requested_visibility": req.visibility,
+        "requested_visibility": caller_visibility,
         "suggested_visibility": suggested_visibility,
-        "previous_visibility": req.visibility,
+        "previous_visibility": caller_visibility,
         "final_visibility": final_visibility,
         "visibility_narrowed": visibility_narrowed,
     }
@@ -1895,6 +1904,14 @@ async def update_item_metadata(
         old_value = item.get(field)
         if old_value == new_value:
             continue
+        if field == "visibility" and new_value == "workspace" and item.get("workspace_id") is None:
+            # ENG-SCOPE-001: a metadata PATCH cannot change workspace_id, so
+            # "workspace" is only a valid target when the item already has
+            # one. Never silently coerce — fail the same way remember() does.
+            raise HTTPException(
+                status_code=422,
+                detail="visibility='workspace' requires the item to already have a workspace",
+            )
         changes.append({"field": field, "old": old_value, "new": new_value})
 
     events: list[dict[str, Any]] = []

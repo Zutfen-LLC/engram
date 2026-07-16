@@ -748,7 +748,13 @@ async def test_visibility_not_widened_on_remember(client, monkeypatch):
 
 
 async def test_visibility_preserved_when_classifier_has_no_suggestion(client, monkeypatch):
-    """requested=workspace, suggested=None → stored=workspace."""
+    """requested=workspace, suggested=None → stored=workspace.
+
+    Explicit visibility="workspace" requires an authorized workspace
+    (ENG-SCOPE-001); "general" is the seeded default-tenant workspace and the
+    auth-disabled default principal has admin scope, so no membership row is
+    needed.
+    """
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     _patch_classifier(monkeypatch, suggested_visibility=None)
@@ -758,6 +764,7 @@ async def test_visibility_preserved_when_classifier_has_no_suggestion(client, mo
             "content": "No visibility opinion",
             "source_type": "manual",
             "visibility": "workspace",
+            "workspace": "general",
         },
     )
     assert response.status_code == 201
