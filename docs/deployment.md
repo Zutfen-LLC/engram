@@ -624,7 +624,42 @@ failure.
 
 ---
 
-## 10. Troubleshooting
+## 10. Memory profiles (control plane)
+
+Memory profiles are reusable, tenant-scoped policy identities. They are created and revised by an
+`admin`-scoped credential; profile policy is intentionally not enforced by memory reads or writes
+until ENG-SCOPE-002B/002C. Profiles never grant workspace membership.
+
+Create a profile with safe private-only defaults:
+
+```sh
+curl -X POST "$ENGRAM_URL/v1/memory-profiles" -H "Authorization: Bearer $ADMIN_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"name":"Support","slug":"engram-support","reason":"initial policy","policy":{}}'
+```
+
+Issue a bound key only at creation (`POST /v1/admin/api-keys` or `POST /v1/agents`) by adding
+`"memory_profile_id":"<profile UUID>"`. Existing keys remain unprofiled. The one-time key
+response reports the selected stable profile and its revision at issuance; `GET /whoami` reports
+the key ID and current profile identity, not its full policy. A profile revision becomes current for
+all bound keys on their next request. Disabling a profile makes bound keys return the same generic
+401 as invalid credentials; re-enable restores them. There is no bind/rebind endpoint—rotate a key
+to change profiles. `engram bootstrap-key --memory-profile <slug-or-uuid>` is available after a
+profile exists in the default tenant.
+
+Profile administration is deliberately absent from the MCP server. No memory request accepts a
+profile selector/header/query parameter.
+
+### Migration 022 rollout and rollback
+
+Migration 022 is additive: it adds profile tables and a nullable `api_keys.memory_profile_id`, so
+existing credentials remain compatible and no data backfill is required. Apply it before deploying
+profile-aware application code. Roll back application code only after confirming it tolerates the
+new nullable column; do not remove the schema while bound keys exist. The safe rollback is to leave
+the additive schema in place and stop issuing bound keys, or restore a verified pre-migration backup
+if complete removal is required.
+
+## 11. Troubleshooting
 
 | Symptom | Likely cause / fix |
 | --- | --- |

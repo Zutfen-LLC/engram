@@ -1,4 +1,5 @@
 """Engram CLI entry point."""
+# ruff: noqa: E501
 
 from __future__ import annotations
 
@@ -90,6 +91,11 @@ def main() -> None:
         help="Allow creating an additional key even when a non-revoked key "
         "already exists for the seeded admin principal. Without --force the "
         "command refuses (idempotent guard against accidental duplicate keys).",
+    )
+    bootstrap_parser.add_argument(
+        "--memory-profile",
+        default=None,
+        help="Optional enabled profile slug or UUID to bind immutably to the bootstrap key.",
     )
 
     promote_parser = sub.add_parser(
@@ -332,7 +338,10 @@ def main() -> None:
         db_url = args.database_url or settings.owner_database_url or settings.database_url
         raise SystemExit(
             asyncio.run(
-                _run_bootstrap_key(db_url, label=args.label, scopes=args.scopes, force=args.force)
+                _run_bootstrap_key(
+                    db_url, label=args.label, scopes=args.scopes, force=args.force,
+                    memory_profile=args.memory_profile,
+                )
             )
         )
     elif args.command == "promote-proposed":
@@ -607,7 +616,8 @@ def make_bootstrap_key(label: str | None, scopes: list[str]) -> BootstrapKeyMate
 
 
 async def _run_bootstrap_key(
-    database_url: str, *, label: str, scopes: str, force: bool = False
+    database_url: str, *, label: str, scopes: str, force: bool = False,
+    memory_profile: str | None = None,
 ) -> int:
     """Create the first API key for the seeded default/admin principal.
 
@@ -688,11 +698,25 @@ async def _run_bootstrap_key(
             )
             return 1
 
-        await conn.execute(
+        profile = None
+        if memory_profile is not None:
+            profile = await conn.fetchrow(
+                "SELECT p.id::text AS id, p.slug, p.active_revision_id::text AS revision_id, r.version "
+                "FROM memory_profiles p JOIN memory_profile_revisions r "
+                "ON r.id = p.active_revision_id AND r.profile_id = p.id AND r.tenant_id = p.tenant_id "
+                "WHERE p.tenant_id = $1::uuid AND p.disabled_at IS NULL "
+                "AND (p.slug = $2 OR p.id::text = $2)",
+                row["tenant_id"], memory_profile,
+            )
+            if profile is None:
+                print("ERROR: memory profile was not found, enabled, and valid for the default tenant.", file=sys.stderr)
+                return 2
+
+        inserted_key_id = await conn.fetchval(
             "INSERT INTO api_keys "
             "  (tenant_id, principal_id, key_hash, key_id, secret_digest, "
-            "   digest_algorithm, scopes, label, created_at) "
-            "VALUES ($1::uuid, $2::uuid, NULL, $3, $4, $5, $6, $7, now())",
+            "   digest_algorithm, scopes, label, memory_profile_id, created_at) "
+            "VALUES ($1::uuid, $2::uuid, NULL, $3, $4, $5, $6, $7, $8::uuid, now()) RETURNING id::text",
             row["tenant_id"],
             row["principal_id"],
             material.key_id,
@@ -700,7 +724,17 @@ async def _run_bootstrap_key(
             material.digest_algorithm,
             list(material.scopes),
             material.label,
+            profile["id"] if profile else None,
         )
+        if profile is not None:
+            await conn.execute(
+                "INSERT INTO memory_profile_events "
+                "(tenant_id, profile_id, revision_id, actor_principal_id, event_type, reason, details) "
+                "VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, 'profile_bound_at_key_issuance', "
+                "'Bootstrap API key issuance', jsonb_build_object('api_key_id', $5, 'label', $6))",
+                row["tenant_id"], profile["id"], profile["revision_id"], row["principal_id"],
+                inserted_key_id, material.label,
+            )
     finally:
         await conn.close()
 
@@ -714,6 +748,8 @@ async def _run_bootstrap_key(
     print(f"key_id:       {material.key_id}")
     print(f"tenant_id:    {row['tenant_id']}")
     print(f"principal_id: {row['principal_id']}")
+    if profile is not None:
+        print(f"memory_profile: {profile['slug']} (revision {profile['version']})")
     print()
     print(
         "Store this key securely. Only a deterministic digest of the secret is "

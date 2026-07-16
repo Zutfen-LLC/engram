@@ -490,6 +490,12 @@ class ApiKey(Base):
     principal_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("principals.id"), nullable=True
     )
+    # Optional, immutable stable profile identity.  The database trigger added
+    # by migration 022 rejects any post-insert change; keys follow the
+    # profile's active revision at authentication time.
+    memory_profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
     # Bcrypt hash for LEGACY keys (eng_<random>, pre-ENG-AUD-003). Nullable now:
     # new-format keys store a digest instead and leave this NULL.
     key_hash: Mapped[str | None] = mapped_column(Text, nullable=True)

@@ -35,7 +35,7 @@ import secrets
 import string
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 from uuid import UUID
 
@@ -103,6 +103,13 @@ class Principal:
     principal_id: str
     scopes: tuple[str, ...]
     internal_key: str | None = None
+    # Stable key identity is cacheable; active profile revision is intentionally
+    # resolved per request below so disable/revision transitions are immediate.
+    api_key_id: str | None = None
+    memory_profile_id: str | None = None
+    memory_profile_revision_id: str | None = None
+    memory_profile_slug: str | None = None
+    memory_profile_version: int | None = None
 
     @property
     def is_internal(self) -> bool:
@@ -362,6 +369,7 @@ async def _resolve_default_principal(session: AsyncSession) -> Principal:
         principal_id=row.principal_id,
         scopes=("read", "write", "admin", "export"),
         internal_key=None,
+        api_key_id=None,
     )
 
 
@@ -396,13 +404,20 @@ async def _resolve_new_format_key(parsed: ParsedApiKey) -> Principal | None:
         return cached
 
     async with _get_session_factory()() as session:
+        profile_column = (
+            "CAST(api_keys.memory_profile_id AS TEXT) AS memory_profile_id"
+            if session.bind is None or session.bind.dialect.name != "sqlite"
+            else "NULL AS memory_profile_id"
+        )
         row = (
             await session.execute(
                 text(
-                    "SELECT CAST(api_keys.tenant_id AS TEXT) AS tenant_id, "
+                    "SELECT CAST(api_keys.id AS TEXT) AS api_key_id, "
+                    "       CAST(api_keys.tenant_id AS TEXT) AS tenant_id, "
                     "       CAST(api_keys.principal_id AS TEXT) AS principal_id, "
                     "       api_keys.scopes AS scopes, "
                     "       api_keys.secret_digest AS secret_digest, "
+                    f"       {profile_column}, "
                     "       (SELECT p.internal_key FROM principals p "
                     "        WHERE p.id = api_keys.principal_id) AS principal_internal_key "
                     "FROM api_keys "
@@ -438,6 +453,8 @@ async def _resolve_new_format_key(parsed: ParsedApiKey) -> Principal | None:
         principal_id=row.principal_id or "",
         scopes=tuple(_parse_scopes(row.scopes)),
         internal_key=None,
+        api_key_id=row.api_key_id,
+        memory_profile_id=row.memory_profile_id,
     )
     _principal_cache.put(parsed.key_id, secret_digest, principal)
     return principal
@@ -461,12 +478,19 @@ async def _resolve_legacy_key(token: str) -> Principal | None:
     fails fast at the digest/hash check.
     """
     async with _get_session_factory()() as session:
+        profile_column = (
+            "CAST(api_keys.memory_profile_id AS TEXT) AS memory_profile_id"
+            if session.bind is None or session.bind.dialect.name != "sqlite"
+            else "NULL AS memory_profile_id"
+        )
         result = await session.execute(
             text(
-                "SELECT CAST(api_keys.tenant_id AS TEXT) AS tenant_id, "
+                "SELECT CAST(api_keys.id AS TEXT) AS api_key_id, "
+                "       CAST(api_keys.tenant_id AS TEXT) AS tenant_id, "
                 "       CAST(api_keys.principal_id AS TEXT) AS principal_id, "
                 "       api_keys.key_hash AS key_hash, "
                 "       api_keys.scopes AS scopes, "
+                f"       {profile_column}, "
                 "       (SELECT p.internal_key FROM principals p "
                 "        WHERE p.id = api_keys.principal_id) AS principal_internal_key "
                 "FROM api_keys "
@@ -485,8 +509,35 @@ async def _resolve_legacy_key(token: str) -> Principal | None:
                     principal_id=row.principal_id or "",
                     scopes=tuple(_parse_scopes(row.scopes)),
                     internal_key=None,
+                    api_key_id=row.api_key_id,
+                    memory_profile_id=row.memory_profile_id,
                 )
     return None
+
+
+async def _resolve_bound_profile(principal: Principal) -> Principal:
+    """Resolve current profile state, never caching mutable revision state."""
+    if principal.memory_profile_id is None:
+        return principal
+    from engram.memory_profiles import resolve_active_profile
+
+    async with _get_session_factory()() as session:
+        profile = await resolve_active_profile(
+            session, principal.tenant_id, principal.memory_profile_id
+        )
+    if profile is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or revoked API key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return replace(
+        principal,
+        memory_profile_id=str(profile.id),
+        memory_profile_revision_id=str(profile.revision_id),
+        memory_profile_slug=profile.slug,
+        memory_profile_version=profile.version,
+    )
 
 
 async def get_current_principal(
@@ -539,13 +590,13 @@ async def get_current_principal(
     if not parsed.is_legacy:
         principal = await _resolve_new_format_key(parsed)
         if principal is not None:
-            return principal
+            return await _resolve_bound_profile(principal)
         # key_id not found — may be a legacy key whose random segment contained
         # an underscore. Fall through to the legacy bcrypt scan.
 
     principal = await _resolve_legacy_key(token)
     if principal is not None:
-        return principal
+        return await _resolve_bound_profile(principal)
 
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,

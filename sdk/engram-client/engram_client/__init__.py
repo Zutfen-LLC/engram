@@ -18,6 +18,10 @@ from .client import (
     EngramValidationError,
 )
 from .models import (
+    AgentCreated,
+    AgentCreateRequest,
+    ApiKeyCreateRequest,
+    ApiKeyCreateResponse,
     ClassifyRequest,
     ClassifyResponse,
     DiaryWrite,
@@ -27,6 +31,13 @@ from .models import (
     KgTripleOut,
     LifecycleSummaryRequest,
     LifecycleSummaryResponse,
+    MemoryProfile,
+    MemoryProfileCreate,
+    MemoryProfileLifecycle,
+    MemoryProfilePolicy,
+    MemoryProfileRevision,
+    MemoryProfileRevisionCreate,
+    MemoryProfileSummary,
     RecallRequest,
     RecallResponse,
     RememberRequest,
@@ -34,6 +45,8 @@ from .models import (
     SearchRequest,
     SearchResponse,
     VisibilityKind,
+    WhoAmIResponse,
+    WorkspaceGrant,
 )
 
 __version__ = "0.1.0"
@@ -65,4 +78,17 @@ __all__ = [
     "DiaryWriteResponse",
     "LifecycleSummaryRequest",
     "LifecycleSummaryResponse",
+    "WorkspaceGrant",
+    "MemoryProfilePolicy",
+    "MemoryProfileCreate",
+    "MemoryProfileRevisionCreate",
+    "MemoryProfileRevision",
+    "MemoryProfile",
+    "MemoryProfileSummary",
+    "MemoryProfileLifecycle",
+    "ApiKeyCreateRequest",
+    "ApiKeyCreateResponse",
+    "AgentCreateRequest",
+    "AgentCreated",
+    "WhoAmIResponse",
 ]

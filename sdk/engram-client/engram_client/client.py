@@ -11,6 +11,7 @@ Usage::
 The client is a thin wrapper over :class:`httpx.AsyncClient` with bearer-token
 auth and typed exceptions for 4xx/5xx responses.
 """
+# ruff: noqa: E501
 
 from __future__ import annotations
 
@@ -22,6 +23,10 @@ import httpx
 from pydantic import BaseModel
 
 from .models import (
+    AgentCreated,
+    AgentCreateRequest,
+    ApiKeyCreateRequest,
+    ApiKeyCreateResponse,
     ClassifyRequest,
     ClassifyResponse,
     DiaryWrite,
@@ -32,6 +37,12 @@ from .models import (
     LifecycleEvent,
     LifecycleSummaryRequest,
     LifecycleSummaryResponse,
+    MemoryProfile,
+    MemoryProfileCreate,
+    MemoryProfileLifecycle,
+    MemoryProfileRevision,
+    MemoryProfileRevisionCreate,
+    MemoryProfileSummary,
     RecallRequest,
     RecallResponse,
     RememberRequest,
@@ -42,6 +53,7 @@ from .models import (
     SensitivityKind,
     SourceKind,
     VisibilityKind,
+    WhoAmIResponse,
 )
 
 _DEFAULT_TIMEOUT = 30.0
@@ -150,6 +162,47 @@ class EngramClient:
     async def close(self) -> None:
         """Close the underlying HTTP client."""
         await self._client.aclose()
+
+    # ---- control plane: memory profiles (not exposed through MCP) ----
+
+    async def create_memory_profile(self, request: MemoryProfileCreate) -> MemoryProfile:
+        return await self._send("POST", "/v1/memory-profiles", MemoryProfile,
+                                json_body=request.model_dump(mode="json", exclude_none=True))
+
+    async def list_memory_profiles(self, *, include_disabled: bool = False) -> list[MemoryProfileSummary]:
+        return await self._send_list("GET", "/v1/memory-profiles", MemoryProfileSummary,
+                                     params={"include_disabled": include_disabled})
+
+    async def get_memory_profile(self, profile_id: UUID) -> MemoryProfile:
+        return await self._send("GET", f"/v1/memory-profiles/{profile_id}", MemoryProfile)
+
+    async def list_memory_profile_revisions(self, profile_id: UUID) -> list[MemoryProfileRevision]:
+        return await self._send_list("GET", f"/v1/memory-profiles/{profile_id}/revisions", MemoryProfileRevision)
+
+    async def create_memory_profile_revision(
+        self, profile_id: UUID, request: MemoryProfileRevisionCreate
+    ) -> MemoryProfile:
+        return await self._send("POST", f"/v1/memory-profiles/{profile_id}/revisions", MemoryProfile,
+                                json_body=request.model_dump(mode="json", exclude_none=True))
+
+    async def disable_memory_profile(self, profile_id: UUID, reason: str) -> MemoryProfile:
+        return await self._send("POST", f"/v1/memory-profiles/{profile_id}/disable", MemoryProfile,
+                                json_body=MemoryProfileLifecycle(reason=reason).model_dump())
+
+    async def enable_memory_profile(self, profile_id: UUID, reason: str) -> MemoryProfile:
+        return await self._send("POST", f"/v1/memory-profiles/{profile_id}/enable", MemoryProfile,
+                                json_body=MemoryProfileLifecycle(reason=reason).model_dump())
+
+    async def create_api_key(self, request: ApiKeyCreateRequest) -> ApiKeyCreateResponse:
+        return await self._send("POST", "/v1/admin/api-keys", ApiKeyCreateResponse,
+                                json_body=request.model_dump(mode="json", exclude_none=True))
+
+    async def create_agent(self, request: AgentCreateRequest) -> AgentCreated:
+        return await self._send("POST", "/v1/agents", AgentCreated,
+                                json_body=request.model_dump(mode="json", exclude_none=True))
+
+    async def whoami(self) -> WhoAmIResponse:
+        return await self._send("GET", "/whoami", WhoAmIResponse)
 
     # ---- internal request helpers ----
 
