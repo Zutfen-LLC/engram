@@ -35,12 +35,27 @@ four workers. This gives the synchronous callback a hard join bound, prevents a
 stuck session from spawning more workers, and still leaves capacity for other
 gateway sessions.
 
+Normalization and item-ID deduplication happen before local admission. Records
+with a semantic retrieval origin are admitted before startup-only records;
+pinned startup-only records are preferred only while filling the remaining
+slots. The admitted set is still presented startup-origin first for readability,
+so startup-first presentation does not mean startup-first admission. If the
+rendered byte budget is tight, startup-only unpinned records are removed first,
+then startup-only pinned records, before lower-priority semantic records. At
+least one semantic-origin record is retained, with explicit truncation when
+needed, whenever any evidence element can fit.
+
 Timeouts and malformed/transport/client errors never raise into Hermes. A
 semantic failure can return only same-session startup evidence and compact
 prior-turn provenance; there is no process-global last-result cache. Three
-consecutive semantic failures open the default per-session circuit breaker.
-Reset deletes only the old/new session pair, finalize deletes the named session,
-and deterministic oldest/LRU eviction caps retained session states.
+consecutive attempted semantic retrieval failures open the default per-session
+circuit breaker. Same-session in-flight suppression, bridge-wide worker-capacity
+rejection, local thread-start failure, stale-generation discard, and an already
+open breaker do not increment it. If one daemon operation exceeds the outer
+join deadline, that original attempted deadline failure is counted once; turns
+suppressed while the same worker remains in flight are not counted again. Reset
+deletes only the old/new session pair, finalize deletes the named session, and
+deterministic oldest/LRU eviction caps retained session states.
 
 Every record is escaped into a labeled `<engram-evidence>` element. The envelope
 says the records are quoted data—not instructions or verified truth—and that

@@ -9,7 +9,9 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any
 
 from .evidence import CompactTrace, EvidenceItem, merge_evidence, normalize_items, render_envelope
@@ -39,11 +41,58 @@ class _RecallPart:
     recall_log_id: str | None = None
 
 
+class _FetchDisposition(StrEnum):
+    SUCCESS = "success"
+    REMOTE_FAILURE = "remote_failure"
+    REMOTE_DEADLINE_EXCEEDED = "remote_deadline_exceeded"
+    SAME_SESSION_IN_FLIGHT = "same_session_in_flight"
+    LOCAL_CAPACITY_UNAVAILABLE = "local_capacity_unavailable"
+    LOCAL_WORKER_START_FAILED = "local_worker_start_failed"
+    BREAKER_OPEN = "breaker_open"
+    STALE_GENERATION_DISCARDED = "stale_generation_discarded"
+
+
 @dataclass(frozen=True, slots=True)
 class _FetchOutcome:
     startup: _RecallPart
     semantic: _RecallPart
-    timed_out: bool = False
+    disposition: _FetchDisposition
+    semantic_attempted: bool
+    semantic_completed: bool
+
+
+@dataclass(slots=True)
+class _DaemonProgress:
+    """Thread-safe partial result snapshot for an outer join deadline."""
+
+    startup: _RecallPart = field(default_factory=lambda: _RecallPart(False))
+    semantic: _RecallPart = field(default_factory=lambda: _RecallPart(False))
+    semantic_attempted: bool = False
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def mark_semantic_attempted(self) -> None:
+        with self.lock:
+            self.semantic_attempted = True
+
+    def record(self, name: str, part: _RecallPart) -> None:
+        with self.lock:
+            if name == "startup":
+                self.startup = part
+            else:
+                self.semantic = part
+
+    def snapshot(self, failure_disposition: _FetchDisposition) -> _FetchOutcome:
+        with self.lock:
+            disposition = (
+                _FetchDisposition.SUCCESS if self.semantic.completed else failure_disposition
+            )
+            return _FetchOutcome(
+                self.startup,
+                self.semantic,
+                disposition,
+                self.semantic_attempted,
+                self.semantic.completed,
+            )
 
 
 def _digest(value: str) -> str:
@@ -177,20 +226,25 @@ class RecallBridge:
         log_id = raw_log_id.strip()[:256] if isinstance(raw_log_id, str) else None
         return _RecallPart(completed=True, evidence=evidence, recall_log_id=log_id or None)
 
-    async def _fetch_async(self, query: str, want_startup: bool) -> _FetchOutcome:
+    async def _fetch_async(
+        self,
+        query: str,
+        want_startup: bool,
+        record_part: Callable[[str, _RecallPart], None],
+    ) -> _FetchOutcome:
         client = self._client_factory()
         tasks: dict[str, asyncio.Task[_RecallPart]] = {
             "semantic": asyncio.create_task(self._recall_part(client, "semantic", query))
         }
         if want_startup:
             tasks["startup"] = asyncio.create_task(self._recall_part(client, "startup", query))
-        timed_out = False
         parts = {"startup": _RecallPart(False), "semantic": _RecallPart(False)}
+        semantic_pending = False
         try:
             done, pending = await asyncio.wait(
                 set(tasks.values()), timeout=self.config.recall_timeout
             )
-            timed_out = bool(pending)
+            semantic_pending = tasks["semantic"] in pending
             for task in pending:
                 task.cancel()
             for name, task in tasks.items():
@@ -198,37 +252,60 @@ class RecallBridge:
                     continue
                 try:
                     parts[name] = task.result()
-                except Exception as exc:  # noqa: BLE001 - retrieval fails closed
-                    logger.warning("Engram %s recall failed: %s", name, type(exc).__name__)
+                    record_part(name, parts[name])
+                except Exception:  # noqa: BLE001 - retrieval fails closed
+                    pass
         finally:
-            try:
+            with suppress(Exception):
                 await client.close()
-            except Exception as exc:  # noqa: BLE001 - close cannot escape the hook
-                logger.debug("Engram recall client close failed: %s", type(exc).__name__)
-        return _FetchOutcome(parts["startup"], parts["semantic"], timed_out)
+        semantic_completed = parts["semantic"].completed
+        disposition = (
+            _FetchDisposition.SUCCESS
+            if semantic_completed
+            else _FetchDisposition.REMOTE_DEADLINE_EXCEEDED
+            if semantic_pending
+            else _FetchDisposition.REMOTE_FAILURE
+        )
+        return _FetchOutcome(
+            parts["startup"],
+            parts["semantic"],
+            disposition,
+            semantic_attempted=True,
+            semantic_completed=semantic_completed,
+        )
 
     def _run_in_daemon(
         self, session_id: str, query: str, want_startup: bool
     ) -> _FetchOutcome:
-        empty = _FetchOutcome(_RecallPart(False), _RecallPart(False), timed_out=True)
         with self._worker_lock:
-            if session_id in self._worker_sessions or not self._worker_slots.acquire(
-                blocking=False
-            ):
-                logger.warning(
-                    "Engram recall worker capacity unavailable: session=%s",
-                    _digest(session_id),
+            if session_id in self._worker_sessions:
+                return _FetchOutcome(
+                    _RecallPart(False),
+                    _RecallPart(False),
+                    _FetchDisposition.SAME_SESSION_IN_FLIGHT,
+                    semantic_attempted=False,
+                    semantic_completed=False,
                 )
-                return empty
+            if not self._worker_slots.acquire(blocking=False):
+                return _FetchOutcome(
+                    _RecallPart(False),
+                    _RecallPart(False),
+                    _FetchDisposition.LOCAL_CAPACITY_UNAVAILABLE,
+                    semantic_attempted=False,
+                    semantic_completed=False,
+                )
             self._worker_sessions.add(session_id)
 
         results: queue.Queue[_FetchOutcome] = queue.Queue(maxsize=1)
+        progress = _DaemonProgress()
 
         def run() -> None:
             try:
-                results.put_nowait(asyncio.run(self._fetch_async(query, want_startup)))
-            except BaseException as exc:  # daemon boundary must always release the gate
-                logger.warning("Engram recall worker failed: %s", type(exc).__name__)
+                results.put_nowait(
+                    asyncio.run(self._fetch_async(query, want_startup, progress.record))
+                )
+            except BaseException:  # daemon boundary must always release the gate
+                pass
             finally:
                 with self._worker_lock:
                     self._worker_sessions.discard(session_id)
@@ -239,20 +316,25 @@ class RecallBridge:
         )
         try:
             worker.start()
-        except Exception as exc:  # noqa: BLE001 - thread startup fails closed
+        except Exception:  # noqa: BLE001 - thread startup fails closed
             with self._worker_lock:
                 self._worker_sessions.discard(session_id)
                 self._worker_slots.release()
-            logger.warning("Engram recall worker did not start: %s", type(exc).__name__)
-            return empty
+            return _FetchOutcome(
+                _RecallPart(False),
+                _RecallPart(False),
+                _FetchDisposition.LOCAL_WORKER_START_FAILED,
+                semantic_attempted=False,
+                semantic_completed=False,
+            )
+        progress.mark_semantic_attempted()
         worker.join(self.config.recall_timeout + self._THREAD_MARGIN_SECONDS)
         if worker.is_alive():
-            logger.warning("Engram recall daemon exceeded aggregate deadline")
-            return empty
+            return progress.snapshot(_FetchDisposition.REMOTE_DEADLINE_EXCEEDED)
         try:
             return results.get_nowait()
         except queue.Empty:
-            return empty
+            return progress.snapshot(_FetchDisposition.REMOTE_FAILURE)
 
     def _bounded_fetch(
         self, session_id: str, query: str, want_startup: bool
@@ -336,17 +418,26 @@ class RecallBridge:
             turn_index = state.turn_index
             traces = self._live_traces(state)
             if state.breaker_open:
+                evidence = merge_evidence(
+                    state.startup_evidence, (), self.config.recall_item_budget
+                )
                 context = render_envelope(
-                    state.startup_evidence,
+                    evidence,
                     state.startup_recall_log_ids,
                     traces,
                     self.config.recall_max_context_bytes,
                 )
                 logger.info(
-                    "Engram recall skipped: session=%s query=%s breaker=open turn=%d",
+                    "Engram recall: session=%s query=%s turn=%d generation=%d "
+                    "disposition=%s failures=%d breaker=%s elapsed_ms=%d",
                     _digest(session_id),
                     query_digest,
                     turn_index,
+                    state.generation,
+                    _FetchDisposition.BREAKER_OPEN.value,
+                    state.consecutive_failures,
+                    "open",
+                    0,
                 )
                 return {"context": context} if context else None
             state.generation += 1
@@ -364,32 +455,41 @@ class RecallBridge:
                 self._active_sessions.pop(session_id, None)
             else:
                 self._active_sessions[session_id] = active_count - 1
-            state = self._sessions.get(session_id)
-            if state is None or state.generation != generation:
+            current_state = self._sessions.get(session_id)
+            if current_state is None or current_state.generation != generation:
                 logger.info(
-                    "Engram recall discarded stale generation: session=%s query=%s generation=%d",
+                    "Engram recall: session=%s query=%s turn=%d generation=%d "
+                    "disposition=%s failures=%d breaker=%s elapsed_ms=%d",
                     _digest(session_id),
                     query_digest,
+                    turn_index,
                     generation,
+                    _FetchDisposition.STALE_GENERATION_DISCARDED.value,
+                    current_state.consecutive_failures if current_state is not None else 0,
+                    "open"
+                    if current_state is not None and current_state.breaker_open
+                    else "closed",
+                    elapsed_ms,
                 )
                 return None
+            state = current_state
             state.last_touched_monotonic = time.monotonic()
             if outcome.startup.completed:
                 state.startup_loaded = True
-                state.startup_evidence = outcome.startup.evidence[: self.config.recall_item_budget]
+                state.startup_evidence = outcome.startup.evidence
                 state.startup_recall_log_ids = tuple(
                     value for value in (outcome.startup.recall_log_id,) if value
                 )
-            if outcome.semantic.completed:
+            if outcome.semantic_completed:
                 state.consecutive_failures = 0
                 state.breaker_open = False
-            else:
+            elif outcome.semantic_attempted:
                 state.consecutive_failures += 1
                 state.breaker_open = (
                     state.consecutive_failures >= self.config.recall_breaker_failures
                 )
 
-            if outcome.semantic.completed:
+            if outcome.semantic_completed:
                 startup_now = outcome.startup.evidence if outcome.startup.completed else ()
                 evidence = merge_evidence(
                     startup_now,
@@ -407,7 +507,9 @@ class RecallBridge:
                     )
                 )
             else:
-                evidence = state.startup_evidence
+                evidence = merge_evidence(
+                    state.startup_evidence, (), self.config.recall_item_budget
+                )
                 log_ids = state.startup_recall_log_ids
 
             context = render_envelope(
@@ -419,20 +521,17 @@ class RecallBridge:
             if context and evidence and self.config.recall_followup_turns:
                 trace = self._trace(turn_index, query_digest, evidence, log_ids)
                 previous = state.recent_traces[-1] if state.recent_traces else None
-                trace = self._dedupe_adjacent_trace(trace, previous)
-                if trace is not None:
-                    state.recent_traces.append(trace)
+                deduped_trace = self._dedupe_adjacent_trace(trace, previous)
+                if deduped_trace is not None:
+                    state.recent_traces.append(deduped_trace)
             logger.info(
-                "Engram recall: session=%s query=%s turn=%d startup=%s semantic=%s "
-                "items=%d logs=%d timeout=%s failures=%d breaker=%s latency_ms=%d",
+                "Engram recall: session=%s query=%s turn=%d generation=%d "
+                "disposition=%s failures=%d breaker=%s elapsed_ms=%d",
                 _digest(session_id),
                 query_digest,
                 turn_index,
-                outcome.startup.completed,
-                outcome.semantic.completed,
-                len(evidence),
-                len(log_ids),
-                outcome.timed_out,
+                generation,
+                outcome.disposition.value,
                 state.consecutive_failures,
                 "open" if state.breaker_open else "closed",
                 elapsed_ms,

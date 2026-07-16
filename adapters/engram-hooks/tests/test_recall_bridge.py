@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 import time
 import types
 from collections.abc import Awaitable, Callable
@@ -145,6 +146,8 @@ def test_valid_empty_semantic_is_success_and_resets_failures() -> None:
 
     factory = _Factory(empty)
     bridge = RecallBridge(_Config(), client_factory=factory)
+    state = bridge._state("s")
+    state.consecutive_failures = 2
     assert bridge.pre_llm_call(user_message="q", session_id="s") is None
     assert bridge._sessions["s"].consecutive_failures == 0
     assert bridge._sessions["s"].breaker_open is False
@@ -184,6 +187,8 @@ def test_partial_first_turn_uses_semantic_when_startup_times_out() -> None:
     assert result is not None
     assert "semantic survived" in result["context"]
     assert bridge._sessions["s"].startup_loaded is False
+    assert bridge._sessions["s"].consecutive_failures == 0
+    assert bridge._sessions["s"].breaker_open is False
 
 
 def test_timeout_opens_per_session_breaker_and_suppresses_network() -> None:
@@ -258,11 +263,12 @@ async def test_sync_hook_is_safe_inside_running_event_loop() -> None:
 
 
 @pytest.mark.asyncio
-async def test_suspected_stuck_worker_does_not_create_more_threads() -> None:
+async def test_same_session_in_flight_counts_original_timeout_only_once() -> None:
+    release = threading.Event()
+
     async def stuck(**kwargs: Any) -> Any:
-        del kwargs
-        time.sleep(2)
-        return _response("semantic", content="too late")
+        release.wait()
+        return _response(kwargs["mode"], content="eventually available")
 
     config = _Config(recall_timeout=0.03)
     factory = _Factory(stuck)
@@ -271,7 +277,99 @@ async def test_suspected_stuck_worker_does_not_create_more_threads() -> None:
     assert bridge.pre_llm_call(user_message="one", session_id="s") is None
     assert time.monotonic() - started < 0.15
     assert bridge.pre_llm_call(user_message="two", session_id="s") is None
+    assert bridge.pre_llm_call(user_message="three", session_id="s") is None
     assert factory.instances == 1
+    assert bridge._sessions["s"].consecutive_failures == 1
+    assert bridge._sessions["s"].breaker_open is False
+
+    release.set()
+    deadline = time.monotonic() + 1
+    while bridge._worker_sessions and time.monotonic() < deadline:
+        time.sleep(0.01)
+    recovered = bridge.pre_llm_call(user_message="four", session_id="s")
+    assert recovered is not None
+    assert bridge._sessions["s"].consecutive_failures == 0
+
+
+def test_bridge_capacity_rejection_does_not_count_as_engram_failure() -> None:
+    release = threading.Event()
+
+    async def blocked(**kwargs: Any) -> Any:
+        release.wait()
+        return _response(kwargs["mode"], content="released")
+
+    config = _Config(recall_timeout=0.01)
+    factory = _Factory(blocked)
+    bridge = RecallBridge(config, client_factory=factory)
+    for index in range(4):
+        assert bridge.pre_llm_call(user_message="hold", session_id=f"held-{index}") is None
+    assert factory.instances == 4
+
+    assert bridge.pre_llm_call(user_message="fifth", session_id="fifth") is None
+    assert factory.instances == 4
+    assert bridge._sessions["fifth"].consecutive_failures == 0
+    assert bridge._sessions["fifth"].breaker_open is False
+
+    release.set()
+    deadline = time.monotonic() + 1
+    while bridge._worker_sessions and time.monotonic() < deadline:
+        time.sleep(0.01)
+    recovered = bridge.pre_llm_call(user_message="retry", session_id="fifth")
+    assert recovered is not None
+    assert "released" in recovered["context"]
+    assert bridge._sessions["fifth"].consecutive_failures == 0
+
+
+def test_partial_startup_survives_stuck_semantic_and_suppression_counts_once() -> None:
+    release = threading.Event()
+    startup_ready = asyncio.Event()
+
+    async def partial(**kwargs: Any) -> Any:
+        if kwargs["mode"] == "startup":
+            startup_ready.set()
+            return _response("startup", content="safe startup")
+        await startup_ready.wait()
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            release.wait()
+            raise
+
+    bridge = RecallBridge(_Config(recall_timeout=0.03), client_factory=_Factory(partial))
+    first = bridge.pre_llm_call(user_message="first", session_id="s", is_first_turn=True)
+    assert first is not None and "safe startup" in first["context"]
+    assert bridge._sessions["s"].consecutive_failures == 1
+
+    second = bridge.pre_llm_call(user_message="second", session_id="s")
+    assert second is not None and "safe startup" in second["context"]
+    assert bridge._sessions["s"].consecutive_failures == 1
+    release.set()
+
+
+def test_local_worker_start_failure_releases_gates_without_breaker_increment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory = _Factory(_normal)
+    bridge = RecallBridge(_Config(), client_factory=factory)
+    original_start = threading.Thread.start
+    starts = 0
+
+    def fail_once(worker: threading.Thread) -> None:
+        nonlocal starts
+        starts += 1
+        if starts == 1:
+            raise RuntimeError("local thread failure")
+        original_start(worker)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_once)
+    assert bridge.pre_llm_call(user_message="first", session_id="s") is None
+    assert bridge._sessions["s"].consecutive_failures == 0
+    assert bridge._sessions["s"].breaker_open is False
+    assert bridge._worker_sessions == set()
+
+    recovered = bridge.pre_llm_call(user_message="second", session_id="s")
+    assert recovered is not None
+    assert bridge._sessions["s"].consecutive_failures == 0
 
 
 def test_followup_trace_contains_ids_not_content_and_expires() -> None:
