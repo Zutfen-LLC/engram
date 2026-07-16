@@ -1,4 +1,24 @@
-# Migration importers
+# Engram scripts
+
+## Hermes installation and onboarding
+
+`install-hermes.sh` configures an existing Hermes installation with an
+already-provisioned Engram agent key. It prompts securely through `/dev/tty`
+and never creates a principal or mints a key:
+
+```bash
+curl -fsSL \
+  https://raw.githubusercontent.com/Zutfen-LLC/engram/main/scripts/install-hermes.sh \
+  | bash
+```
+
+`onboard-profile.sh` is a separate self-service workflow. It starts with a
+user-level key, calls `/v1/agents`, and creates a new agent principal and scoped
+key for the selected profile. Do not use it when the agent key is already
+provisioned. See [`adapters/engram-hooks/README.md`](../adapters/engram-hooks/README.md)
+for installer options, update behavior, release pinning, and restart guidance.
+
+## Migration importers
 
 These scripts migrate data from existing memory systems into Engram over the
 REST API (they never touch the DB directly). All importers default to

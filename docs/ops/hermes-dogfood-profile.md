@@ -88,19 +88,47 @@ enabled, `provider_prefetch=inert`, and the write interception mode.
 
 ## Installation
 
-1. Install `engram-client` and `engram-hooks` in the Hermes environment.
-2. Copy `adapters/engram-hooks/hermes_plugin/engram_memory/` to
-   `~/.hermes/plugins/engram_memory/`.
-3. Apply both `memory.provider: engram_memory` and
-   `plugins.enabled: [engram_memory]`, preserving other enabled plugins.
-4. Export `ENGRAM_BASE_URL`, `ENGRAM_API_KEY`, and
-   `ENGRAM_HOOKS_RECALL_ENABLED=true` in the profile environment.
-5. Optionally retain `mcp_servers.engram` for explicit operations.
+For an already-provisioned agent key, run the standalone installer (default
+service: `https://engram.zutfen.com`):
 
-[`scripts/onboard-profile.sh`](../../scripts/onboard-profile.sh) performs these
-updates idempotently. Its focused YAML helper preserves unrelated memory
-settings and existing enabled plugins and does not place environment variables
-under `memory:`.
+```bash
+curl -fsSL \
+  https://raw.githubusercontent.com/Zutfen-LLC/engram/main/scripts/install-hermes.sh \
+  | bash
+```
+
+It securely reads the key from `/dev/tty` with terminal echo disabled, validates
+`/health` and `/whoami` before profile writes or plugin installation, installs
+the Git dependencies into the live Hermes interpreter, and uses Hermes' native
+plugin manager for the nested `engram_memory` source. It enables both
+`memory.provider: engram_memory` and the independent general-plugin face while
+preserving unrelated settings and plugins. Reruns upgrade/force-reinstall the
+same components and keep the `.env` idempotent. The requested `--ref` is fetched
+once and resolved to an exact commit before installation; that same commit is
+used for both direct-Git Python dependencies and the detached plugin checkout,
+and both requested and resolved revisions are reported.
+
+Use `bash -s --` for options, for example `--profile dogfood`,
+`--base-url https://engram.example.com`, `--ref main`, or `--dry-run`.
+Non-interactive use may provide `ENGRAM_API_KEY` in the process environment.
+After a successful install, fully exit and relaunch an interactive Hermes CLI,
+or run `hermes gateway restart` for an installed gateway; the installer does
+not restart a running process.
+
+Once a release exists, production use should replace `<release-tag>` with that
+real tag and pin both downloads:
+
+```bash
+curl -fsSL \
+  https://raw.githubusercontent.com/Zutfen-LLC/engram/<release-tag>/scripts/install-hermes.sh \
+  | bash -s -- --ref <release-tag>
+```
+
+This provisioned-key installer never creates a principal or key.
+[`scripts/onboard-profile.sh`](../../scripts/onboard-profile.sh) remains the
+separate self-service flow: it uses a user-level key with `/v1/agents` to create
+a new agent and scoped key. The optional `mcp_servers.engram` configuration can
+remain in either profile for explicit operations.
 
 ## Track A manual dogfood gate
 

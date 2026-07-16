@@ -108,6 +108,60 @@ search — embeddings are the service's job.
 
 ## Install
 
+For an existing Hermes installation and an **already-provisioned Engram agent
+key**, use the standalone installer:
+
+```bash
+curl -fsSL \
+  https://raw.githubusercontent.com/Zutfen-LLC/engram/main/scripts/install-hermes.sh \
+  | bash
+```
+
+The installer discovers the active profile and live Hermes Python environment
+through the Hermes CLI. Key entry is masked and read from `/dev/tty`, so it
+does not enter shell history; non-interactive automation can set
+`ENGRAM_API_KEY` in the process environment. The default service is
+`https://engram.zutfen.com`.
+
+Options can be passed to the piped script with `bash -s --`:
+
+```bash
+curl -fsSL \
+  https://raw.githubusercontent.com/Zutfen-LLC/engram/main/scripts/install-hermes.sh \
+  | bash -s -- --profile work --base-url https://engram.example.com \
+      --ref main --dry-run
+```
+
+`--profile` targets one named profile, `--base-url` selects the service,
+`--ref` selects the update channel, and `--dry-run`
+prints a sanitized plan without prompting, network access, installation, or
+writes. Omit `--dry-run` to install. Before installing anything, the installer
+fetches the requested branch, tag, or SHA once, resolves it to an immutable
+40-character commit, and uses that exact commit for both Python packages and
+the detached plugin checkout. It reports both the requested ref and resolved
+commit. Rerunning authenticates again, resolves the channel again, upgrades the
+same direct Git dependencies, force-reinstalls the canonical nested plugin,
+keeps unrelated plugins/configuration, and consolidates Engram `.env` entries.
+Fully exit and relaunch an interactive Hermes CLI afterward; for an installed
+gateway, run `hermes gateway restart`.
+
+Once a release is cut, production installations should pin both the fetched
+installer and its dependency/plugin ref to that release (replace
+`<release-tag>` with a real tag):
+
+```bash
+curl -fsSL \
+  https://raw.githubusercontent.com/Zutfen-LLC/engram/<release-tag>/scripts/install-hermes.sh \
+  | bash -s -- --ref <release-tag>
+```
+
+This flow never creates a principal or mints a key. By contrast,
+[`scripts/onboard-profile.sh`](../../scripts/onboard-profile.sh) accepts a
+user-level key and calls `/v1/agents` to create a new agent principal and scoped
+key.
+
+For repository development instead, install the editable packages locally:
+
 From the repository root:
 
 ```bash
@@ -162,9 +216,8 @@ store (no classify/remember). This is intentional graceful degradation.
 
 ### As a Hermes plugin
 
-Copy `hermes_plugin/engram_memory/` to
-`~/.hermes/plugins/engram_memory/`, then configure both independently loaded
-faces:
+The standalone installer uses Hermes' native plugin manager to install this
+nested plugin and configures both independently loaded faces:
 
 ```yaml
 memory:

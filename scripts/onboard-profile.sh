@@ -2,6 +2,10 @@
 #
 # Engram Hermes Profile Onboarding
 #
+# This is the self-service agent-creation flow. Given a user-level key, it
+# creates a new agent principal and scoped key through /v1/agents. To install
+# with an already-provisioned agent key, use scripts/install-hermes.sh instead.
+#
 # Creates an agent principal + scoped API key via the self-service /v1/agents
 # endpoint and wires a Hermes profile to use the engram_memory MemoryProvider
 # plugin.
