@@ -1,47 +1,22 @@
-# Hermes dogfood profile — Engram automatic memory capture (ENG-HERMES-001)
-#
-# This is the documented profile variant referenced by
-# docs/ops/hermes-dogfood-profile.md. It is maintained in this repo (Engram),
-# not in the Hermes checkout, because Hermes' own profile/config store lives
-# outside this repo. Copy the relevant blocks into your actual Hermes profile
-# and adjust paths/env for your host.
-#
-# What changed from the prior zutfen_memory-only profile:
-#   - memory.provider is no longer zutfen_memory.
-#   - A `plugins:` entry loads engram_hooks and calls its install() entrypoint
-#     exactly once at process startup (install() is idempotent, so a restart
-#     or a plugin-reload path calling it again is safe).
-#   - mcp_servers.engram is left untouched — MCP remains the manual,
-#     explicit dogfooding interface regardless of whether automatic capture
-#     is active.
-#
-# Assumption flagged for operators: the exact key names Hermes expects for a
-# plugin startup hook (`plugins: - entrypoint: ...`) depend on the Hermes
-# version/plugin-loader API, which is outside this repo. If your Hermes
-# checkout uses a different plugin registration mechanism, wire the same call
-# — `engram_hooks.install()` at startup, once — through whatever mechanism
-# your Hermes version actually exposes. The behavior this file documents
-# (install() call site, config, and the honesty rule below) is what matters,
-# not the exact YAML shape.
+# Stock-Hermes dogfood profile — Engram dual-face integration.
+# Compatibility contract pinned to NousResearch/hermes-agent
+# f8ddf4fd866d4e581a5353f728117faf2736ad4c.
 
 name: engram-dogfood
 
+# MemoryProvider face: governed write interception and lifecycle capture.
 memory:
-  # Was: provider: zutfen_memory
-  # engram-hooks' LifecycleHooks + compat shim are now the memory path.
-  provider: engram_hooks
+  provider: engram_memory
 
+# General-plugin face: safe same-turn reads through pre_llm_call. Selecting
+# memory.provider alone does not enable this independently loaded face.
 plugins:
-  - name: engram_hooks
-    entrypoint: "engram_hooks:install"
-    # install() reads all of its configuration from ENGRAM_* env vars (see
-    # adapters/engram-hooks/README.md). Nothing Hermes-specific is passed in.
-    call_once: true
+  enabled:
+    - engram_memory
 
+# Optional explicit Engram operations remain available through MCP.
 mcp_servers:
   engram:
-    # Unchanged: this is the explicit, always-available dogfooding interface.
-    # Automatic capture (above) is additive, not a replacement.
     command: python
     args: ["-m", "engram_mcp"]
     env:
@@ -51,17 +26,9 @@ mcp_servers:
 env:
   ENGRAM_BASE_URL: "${ENGRAM_BASE_URL}"
   ENGRAM_API_KEY: "${ENGRAM_API_KEY}"
-  # Compat shim is on by default; flip to "false" to disable automatic
-  # capture entirely and fall back to explicit MCP-only dogfooding (e.g. if
-  # the shim ever needs to be pulled out in a hurry).
+  ENGRAM_HOOKS_RECALL_ENABLED: "true"
   ENGRAM_HOOKS_COMPAT_SHIM: "true"
-  # Off by default. Set "true" once you want a hard startup failure (instead
-  # of a quiet degrade) whenever neither the native prepare_memory_write hook
-  # nor the compat shim end up active — see docs/ops/hermes-dogfood-profile.md.
   ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE: "false"
 
-# SOUL.md / prefill guidance rule (see docs/ops/hermes-dogfood-profile.md):
-# Do not claim "Engram automatic memory capture is active" in prefill/SOUL.md
-# text unless the startup log for *this* process actually printed
-# "compatibility shim active" or "native prepare_memory_write active" — check
-# engram_hooks.get_install_status().automatic_capture_active, not this file.
+# HERMES_SAFE_MODE=1 disables all general plugins, including automatic Engram
+# read recall. It does not turn MCP into an automatic read path.

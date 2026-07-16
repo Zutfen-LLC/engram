@@ -1,8 +1,24 @@
 # engram-hooks
 
-Companion library that wires [Hermes](https://github.com/NousResearch/hermes-agent)
-lifecycle hooks into [Engram](../../..) — the trustable institutional memory
-service. It is the successor to the `zutfen_memory` plugin.
+Companion library and one installable plugin directory that wire stock
+[Hermes](https://github.com/NousResearch/hermes-agent) into
+[Engram](../../..). Compatibility is pinned to stock Hermes commit
+`f8ddf4fd866d4e581a5353f728117faf2736ad4c`; no Hermes source patch or fork is
+required.
+
+The installed `~/.hermes/plugins/engram_memory/` directory has two independently
+loaded faces:
+
+- The **general plugin** owns reads. Its synchronous `pre_llm_call` callback
+  performs bounded current-query semantic recall, first-turn startup recall,
+  safe evidence rendering, per-session circuit breaking, and compact follow-up
+  provenance. Stock Hermes appends this context directly to the current user
+  turn.
+- The **MemoryProvider** owns write interception and lifecycle capture. Its
+  `prefetch()` and `queue_prefetch()` methods are permanent no-ops because stock
+  Hermes wraps that path as generic authoritative-reference data.
+- The optional **MCP server** remains the explicit interface for search, recall,
+  explain, and other user/model-selected operations.
 
 The split (per [design.md](../../../docs/design.md) §2, principle 8):
 
@@ -14,6 +30,33 @@ The split (per [design.md](../../../docs/design.md) §2, principle 8):
   have.
 
 ## What it does
+
+### Same-turn read path
+
+The general plugin registers exactly `pre_llm_call`, `on_session_start`,
+`on_session_reset`, and `on_session_finalize`. On each non-empty current query,
+it calls `POST /v1/recall` in semantic mode. The first turn (or a session whose
+startup recall has not successfully completed) also starts startup recall;
+both requests run concurrently under one aggregate deadline. Results are
+normalized into immutable evidence records and rendered as escaped
+`<engram-evidence>` quoted-data blocks. Retrieval errors produce less context,
+never a stale semantic result from another query.
+
+The read bridge is keyed only by Hermes `session_id`, generation-checks
+concurrent turns, caps retained sessions with deterministic LRU eviction, and
+opens a per-session breaker after repeated semantic failures. It retains only
+content-free item/log provenance for the configured follow-up window. A
+per-session gated daemon worker bridges Hermes' synchronous callback to the
+async SDK for both ordinary and already-running-event-loop callers. The bridge
+has a fixed four-worker cap, so a suspected stuck operation cannot accumulate
+threads or block interpreter exit while unrelated gateway sessions retain
+bounded capacity.
+
+`ENGRAM_HOOKS_RECALL_ENABLED=false` (the default) makes all four general read
+hooks fast no-ops. `HERMES_SAFE_MODE=1` prevents Hermes from loading general
+plugins at all, so it also disables automatic Engram reads.
+
+### Write and lifecycle path
 
 Three Hermes lifecycle events are mapped to hook entry points:
 
@@ -103,6 +146,14 @@ through to spawned processes).
 | `ENGRAM_HOOKS_WORKSPACE` | no | — | Default workspace for writes. |
 | `ENGRAM_HOOKS_COMPAT_SHIM` | no | `true` | Apply the `prepare_memory_write` compat shim on install. Set `false` to disable automatic capture entirely (lifecycle hooks/MCP still work). |
 | `ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE` | no | `false` | If `true`, `install()` raises `AutomaticCaptureUnavailable` instead of degrading quietly when neither the native hook nor the compat shim ends up active. |
+| `ENGRAM_HOOKS_RECALL_ENABLED` | no | `false` | Enable safe automatic reads through the general `pre_llm_call` hook. |
+| `ENGRAM_HOOKS_RECALL_TIMEOUT` | no | `1.5` | Aggregate synchronous read deadline in seconds (clamped to `0.1`–`10.0`); independent of `ENGRAM_TIMEOUT`. |
+| `ENGRAM_HOOKS_RECALL_ITEM_BUDGET` | no | `5` | Local and semantic item cap (clamped to `1`–`20`). |
+| `ENGRAM_HOOKS_RECALL_BYTE_BUDGET` | no | `8192` | Byte budget sent to startup/semantic recall. |
+| `ENGRAM_HOOKS_RECALL_MAX_CONTEXT_BYTES` | no | `12000` | Hard UTF-8 cap for the rendered evidence and trace envelope. |
+| `ENGRAM_HOOKS_RECALL_FOLLOWUP_TURNS` | no | `3` | Later turns that receive compact item/log provenance (`0`–`10`). |
+| `ENGRAM_HOOKS_RECALL_BREAKER_FAILURES` | no | `3` | Consecutive semantic failures that open a breaker for that session. |
+| `ENGRAM_HOOKS_RECALL_MAX_SESSIONS` | no | `512` | Maximum read-side session states retained by a plugin module instance. |
 
 ¹ If unset, the plugin still loads but parks every candidate in the volatile
 store (no classify/remember). This is intentional graceful degradation.
@@ -110,6 +161,25 @@ store (no classify/remember). This is intentional graceful degradation.
 ## Usage
 
 ### As a Hermes plugin
+
+Copy `hermes_plugin/engram_memory/` to
+`~/.hermes/plugins/engram_memory/`, then configure both independently loaded
+faces:
+
+```yaml
+memory:
+  provider: engram_memory
+plugins:
+  enabled:
+    - engram_memory
+```
+
+Selecting only `memory.provider` does not enable automatic reads. The provider
+supplies a static system-prompt interpretation policy, but the dynamic evidence
+envelope remains self-contained and safe when another provider is selected.
+
+The following library API describes the provider's write compatibility path;
+general-plugin registration calls neither `install()` nor any monkeypatch:
 
 ```python
 from engram_hooks import install, get_active_hooks, get_install_status

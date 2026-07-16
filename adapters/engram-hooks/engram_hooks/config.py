@@ -57,13 +57,16 @@ def _env(name: str, default: str) -> str:
 
 def _env_float(name: str, default: float) -> float:
     """Parse an env var as float, falling back to ``default`` on any error."""
+    import math
+
     raw = _env(name, "")
     if not raw:
         return default
     try:
-        return float(raw)
+        value = float(raw)
     except (TypeError, ValueError):
         return default
+    return value if math.isfinite(value) else default
 
 
 def _env_int(name: str, default: int) -> int:
@@ -83,6 +86,16 @@ def _env_bool(name: str, default: bool) -> bool:
     if not raw:
         return default
     return raw in ("1", "true", "yes", "on")
+
+
+def _clamp(value: float, minimum: float, maximum: float) -> float:
+    """Clamp a numeric setting to its supported safety range."""
+    return max(minimum, min(value, maximum))
+
+
+def _clamp_int(value: int, minimum: int, maximum: int) -> int:
+    """Clamp an integer setting to its supported safety range."""
+    return max(minimum, min(value, maximum))
 
 
 @dataclass(slots=True)
@@ -155,6 +168,34 @@ class HooksConfig:
         default_factory=lambda: _env_bool("ENGRAM_HOOKS_REPORT_LIFECYCLE_TELEMETRY", False)
     )
 
+    # Stock-Hermes general-plugin read path. This is deliberately independent
+    # of ENGRAM_TIMEOUT: pre_llm_call is synchronous and must have a much
+    # tighter aggregate deadline than write/lifecycle operations.
+    recall_enabled: bool = field(
+        default_factory=lambda: _env_bool("ENGRAM_HOOKS_RECALL_ENABLED", False)
+    )
+    recall_timeout: float = field(
+        default_factory=lambda: _env_float("ENGRAM_HOOKS_RECALL_TIMEOUT", 1.5)
+    )
+    recall_item_budget: int = field(
+        default_factory=lambda: _env_int("ENGRAM_HOOKS_RECALL_ITEM_BUDGET", 5)
+    )
+    recall_byte_budget: int = field(
+        default_factory=lambda: _env_int("ENGRAM_HOOKS_RECALL_BYTE_BUDGET", 8192)
+    )
+    recall_max_context_bytes: int = field(
+        default_factory=lambda: _env_int("ENGRAM_HOOKS_RECALL_MAX_CONTEXT_BYTES", 12000)
+    )
+    recall_followup_turns: int = field(
+        default_factory=lambda: _env_int("ENGRAM_HOOKS_RECALL_FOLLOWUP_TURNS", 3)
+    )
+    recall_breaker_failures: int = field(
+        default_factory=lambda: _env_int("ENGRAM_HOOKS_RECALL_BREAKER_FAILURES", 3)
+    )
+    recall_max_sessions: int = field(
+        default_factory=lambda: _env_int("ENGRAM_HOOKS_RECALL_MAX_SESSIONS", 512)
+    )
+
     def __post_init__(self) -> None:
         import os
 
@@ -170,6 +211,16 @@ class HooksConfig:
                     "ENGRAM_HOOKS_PROMOTE_THRESHOLD", 0.65
                 )
         self.promote_confidence_threshold = self.store_confidence_threshold
+
+        self.recall_timeout = _clamp(self.recall_timeout, 0.1, 10.0)
+        self.recall_item_budget = _clamp_int(self.recall_item_budget, 1, 20)
+        self.recall_byte_budget = _clamp_int(self.recall_byte_budget, 256, 1_000_000)
+        self.recall_max_context_bytes = _clamp_int(
+            self.recall_max_context_bytes, 512, 1_000_000
+        )
+        self.recall_followup_turns = _clamp_int(self.recall_followup_turns, 0, 10)
+        self.recall_breaker_failures = _clamp_int(self.recall_breaker_failures, 1, 100)
+        self.recall_max_sessions = _clamp_int(self.recall_max_sessions, 1, 10_000)
 
     def source_type_for(
         self, event: str

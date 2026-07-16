@@ -1,8 +1,11 @@
 name: engram_memory
-version: 0.1.0
-description: "Engram memory provider — routes lifecycle hooks through engram-hooks to a deployed Engram instance."
-hooks:
-  - on_pre_compress
-  - on_session_end
-  - on_memory_write
-  - prepare_memory_write
+version: 0.2.0
+description: >-
+  Engram integration for Hermes: safe current-turn evidence recall plus
+  governed write and lifecycle capture.
+kind: standalone
+provides_hooks:
+  - pre_llm_call
+  - on_session_start
+  - on_session_reset
+  - on_session_finalize
