@@ -4,7 +4,7 @@
 set -euo pipefail
 
 readonly INSTALLER_VERSION="0.1.0"
-readonly DEFAULT_BASE_URL="https://engram.zutfen.com"
+readonly DEFAULT_BASE_URL="https://api.engram.zutfen.com"
 readonly DEFAULT_REF="main"
 readonly REPOSITORY_URL="https://github.com/Zutfen-LLC/engram.git"
 readonly PLUGIN_SUBDIR="adapters/engram-hooks/hermes_plugin/engram_memory"
@@ -31,7 +31,7 @@ Install Engram dependencies and the engram_memory plugin into the live Hermes
 environment using an already-provisioned agent API key.
 
 Options:
-  --base-url <url>  Engram service URL (default: https://engram.zutfen.com)
+  --base-url <url>  Engram service URL (default: https://api.engram.zutfen.com)
   --profile <name>  Target a named Hermes profile
   --ref <git-ref>   Engram branch or tag to install (default: main)
   --dry-run         Show sanitized planned actions without changing anything
