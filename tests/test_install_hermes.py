@@ -269,6 +269,7 @@ def _combined(result: subprocess.CompletedProcess[str]) -> str:
 def test_help_lists_supported_options_without_external_calls(harness: Harness) -> None:
     result = harness.run("--help", key=None)
     assert result.returncode == 0
+    assert "https://api.engram.zutfen.com" in result.stdout
     assert "--base-url" in result.stdout
     assert "--profile" in result.stdout
     assert "--ref" in result.stdout
@@ -282,6 +283,7 @@ def test_dry_run_has_no_side_effects_or_secret_prompt(harness: Harness) -> None:
     result = harness.run("--dry-run", "--profile", "work", "--ref", "v1.2.3", key=None)
     assert result.returncode == 0
     assert "dry-run" in result.stdout.lower()
+    assert "Base URL: https://api.engram.zutfen.com" in result.stdout
     assert {path: path.read_bytes() for path in harness.profile.iterdir()} == before
     assert not harness.log.exists()
 
