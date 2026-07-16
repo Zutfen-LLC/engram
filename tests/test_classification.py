@@ -434,11 +434,22 @@ async def test_dedup_receipt_visibility_uses_narrowest_scope_and_truthful_events
     content = (
         f"Receipt visibility {existing_visibility} {requested_visibility} {suggested_visibility}"
     )
+    # ENG-SCOPE-001: visibility="workspace" always requires an authorized
+    # workspace. "general" is the seeded default-tenant workspace; supplying
+    # it is harmless for non-workspace visibility values (rule D/E — it's
+    # just an association) and required whenever "workspace" appears below.
     existing = await client.post(
         "/v1/remember",
-        json={"content": content, "kind": "fact", "visibility": existing_visibility},
+        json={
+            "content": content,
+            "kind": "fact",
+            "visibility": existing_visibility,
+            "workspace": "general",
+        },
     )
-    classified = await client.post("/v1/classify", json={"content": content})
+    classified = await client.post(
+        "/v1/classify", json={"content": content, "workspace": "general"}
+    )
     receipt_id = classified.json()["classification_run_id"]
     async with _test_engine.begin() as conn:
         await conn.execute(
@@ -453,6 +464,7 @@ async def test_dedup_receipt_visibility_uses_narrowest_scope_and_truthful_events
         json={
             "content": content,
             "visibility": requested_visibility,
+            "workspace": "general",
             "classification_run_id": receipt_id,
         },
     )

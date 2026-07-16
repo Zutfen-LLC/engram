@@ -263,20 +263,21 @@ async def test_explicit_workspace_visibility_without_workspace_is_422_and_create
 # ---- Workspace authorization ----
 
 
-async def test_member_can_classify_and_write_into_workspace(corpus):
+async def test_member_can_classify_into_workspace(corpus):
     c = corpus
     slug = f"alpha-{c['tag']}"
     classified = await c["client"].post(
-        "/v1/classify", json={"content": "member workspace write", "workspace": slug}, headers=_h(c, "member")
+        "/v1/classify", json={"content": "member workspace classify", "workspace": slug}, headers=_h(c, "member")
     )
     assert classified.status_code == 200, classified.text
+
+
+async def test_member_can_write_into_workspace(corpus):
+    c = corpus
+    slug = f"alpha-{c['tag']}"
     resp = await c["client"].post(
         "/v1/remember",
-        json={
-            "content": "member workspace write",
-            "workspace": slug,
-            "classification_run_id": classified.json()["classification_run_id"],
-        },
+        json={"content": "member workspace write", "workspace": slug},
         headers=_h(c, "member"),
     )
     assert resp.status_code == 201, resp.text
