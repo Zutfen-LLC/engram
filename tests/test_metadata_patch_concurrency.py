@@ -129,6 +129,18 @@ async def proof(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[dict[str, Any]
                         "label": f"metadata-patch-{tag}-{name}",
                     },
                 )
+        # ENG-SCOPE-001: strict workspace-visibility eligibility requires real
+        # membership — both actors join the fixture's workspace so a narrow to
+        # visibility='workspace' (test_patch_visibility_narrow) remains
+        # readable by the actor who performed it.
+        for pid, _ptype, _scopes, _ik in actors.values():
+            await conn.execute(
+                text(
+                    "INSERT INTO workspace_members (id,workspace_id,principal_id) "
+                    "VALUES (:id,:wid,:pid)"
+                ),
+                {"id": uuid.uuid4(), "wid": workspace, "pid": pid},
+            )
 
     author_id = actors["author"][0]
     base_time = datetime.now(UTC).replace(microsecond=0)
