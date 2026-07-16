@@ -103,6 +103,10 @@ fi
 if [[ "${{1:-}}" == "-c" && "${{2:-}}" == *"import engram_client"* ]]; then
   exit 0
 fi
+if [[ "${{1:-}}" == "-c" && "${{2:-}}" == *"tools.memory_tool"* ]]; then
+  [[ "${{INSTALLER_TEST_HERMES_API_DRIFT:-0}}" != 1 ]] || exit 1
+  exit 0
+fi
 if [[ "${{1:-}}" == "-" && "${{2:-}}" == "verify-direct-url" ]]; then
   [[ "${{3:-}}" == "$INSTALLER_TEST_RESOLVED_SHA" ]]
   exit
@@ -372,6 +376,8 @@ def test_env_update_is_atomic_secure_preserving_and_idempotent(harness: Harness)
     assert content.count("ENGRAM_BASE_URL=") == 1
     assert content.count("ENGRAM_API_KEY=") == 1
     assert content.count("ENGRAM_HOOKS_RECALL_ENABLED=") == 1
+    assert content.count("ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE=") == 1
+    assert "ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE=true" in content
     assert content.count(harness.key) == 1
     assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
     assert harness.key not in _combined(first) + _combined(second)
@@ -389,6 +395,22 @@ def test_config_failure_restores_profile_files(harness: Harness) -> None:
     assert config.read_bytes() == config_before
     assert env_file.read_bytes() == env_before
     assert stat.S_IMODE(env_file.stat().st_mode) == mode_before
+    assert harness.key not in _combined(result)
+
+
+def test_hermes_api_drift_rolls_back_profile_and_fails_loudly(harness: Harness) -> None:
+    config = harness.profile / "config.yaml"
+    env_file = harness.profile / ".env"
+    config_before = config.read_bytes()
+    env_before = env_file.read_bytes()
+    harness.env["INSTALLER_TEST_HERMES_API_DRIFT"] = "1"
+
+    result = harness.run()
+
+    assert result.returncode != 0
+    assert "tools.memory_tool.memory_tool" in _combined(result)
+    assert config.read_bytes() == config_before
+    assert env_file.read_bytes() == env_before
     assert harness.key not in _combined(result)
 
 

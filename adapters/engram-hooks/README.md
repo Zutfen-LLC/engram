@@ -84,12 +84,13 @@ candidate → write-boundary guard → (reject) drop
 
 ### Write-boundary guard
 
-Every candidate — and every direct `memory()` write when the compat shim is
-active — passes through `prepare_memory_write_guard`. It **actively rejects**
-ambiguous and ephemeral candidates by returning `{"handled": True, "action":
-"reject", ...}`. It never *passes through* (returning `None`), because that
-would let the write proceed unchanged — the exact failure mode this library
-exists to prevent.
+Every candidate — and every direct `memory()` add when the compat shim is
+active — passes through `prepare_memory_write_guard`. Direct rejected adds
+return a stock-Hermes-safe JSON error and never reach the native writer.
+Accepted adds invoke the active provider's governed callback exactly once and
+return replacement JSON with `provider: "engram"` and `native_write: false`.
+Any batch containing an add is rejected atomically; replace/remove-only calls
+retain stock behavior for this focused compatibility slice.
 
 Rejected categories:
 
@@ -235,16 +236,18 @@ The following library API describes the provider's write compatibility path;
 general-plugin registration calls neither `install()` nor any monkeypatch:
 
 ```python
-from engram_hooks import install, get_active_hooks, get_install_status
+from engram_hooks import get_active_hooks, get_install_status, install
 
-# At plugin load: build the engine, detect native prepare_memory_write vs.
-# apply the compat shim, and return/log which path is active.
-result = install()
+# The EngramMemoryProvider does this during construction, registering its
+# governed prepare callback explicitly. A standalone install without a provider
+# callback deliberately cannot claim automatic writes are active.
+result = install(write_interceptor=provider.prepare_memory_write)
 status = get_install_status()  # same object as result["status"]
 print(status.describe())
 # "native prepare_memory_write active (provider=...)" or
-# "compatibility shim active (patched=hermes_agent.tools.tool_executor, ...)" or
-# "automatic capture DISABLED — <reason>"
+# "compatibility shim active (patched=tools.memory_tool)" or
+# "recall_only: automatic writes INACTIVE — <reason>" or
+# "incompatible: automatic writes INACTIVE — <reason>"
 
 # On each lifecycle event (wire to the Hermes lifecycle bus):
 hooks = get_active_hooks()

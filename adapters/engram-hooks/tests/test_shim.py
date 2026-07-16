@@ -1,291 +1,304 @@
-"""Tests for the compatibility shim: detection routing, patch application,
-guard allow/reject short-circuiting, idempotency, and patch-failure behavior.
-
-These are the compat-path acceptance criteria for ENG-HERMES-001:
-
-* native hook present -> no monkey-patch
-* native hook absent -> dispatch sites patched, logged, inspectable
-* patched dispatch actively rejects -> original Hermes writer never runs
-* patched dispatch allows -> original Hermes writer runs
-* install() is idempotent -> a second call does not double-wrap
-* missing dispatch sites (API drift) -> loud, diagnostic failure
-"""
-
+"""Pinned stock-Hermes governed-write compatibility tests."""
 from __future__ import annotations
 
+import importlib
+import json
+import sys
+import types
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-from engram_hooks import HooksConfig
+from engram_hooks import AutomaticCaptureUnavailable, HooksConfig
+from engram_hooks.guards import is_allowed, prepare_memory_write_guard
 from engram_hooks.hooks import (
     _SHIM_MARKER,
-    LifecycleHooks,
-    get_active_hooks,
+    HERMES_REFERENCE_REPOSITORY,
+    HERMES_REFERENCE_SHA,
     install,
-    install_compat_shim,
 )
 
-
-def _config(**overrides: Any) -> HooksConfig:
-    # No ENGRAM_BASE_URL: LifecycleHooks degrades to volatile-only, no network.
-    return HooksConfig(base_url="", **overrides)
+_CONTRACT_ROOT = Path(__file__).parent / "fixtures" / "hermes_stock_75467998"
 
 
-# ---------------------------------------------------------------------------
-# Native hook present -> no patch
-# ---------------------------------------------------------------------------
+def _config(tmp_path: Path, **overrides: Any) -> HooksConfig:
+    return HooksConfig(
+        base_url="",
+        volatile_path=str(tmp_path / "volatile.jsonl"),
+        **overrides,
+    )
 
 
-def test_native_hook_present_skips_patch(fake_hermes_native: dict[str, Any], tmp_path) -> None:
-    hooks = LifecycleHooks(_config(volatile_path=str(tmp_path / "v.jsonl")))
-    status = install_compat_shim(hooks)
+class _Manager:
+    def __init__(self) -> None:
+        self.notifications: list[tuple[Any, dict[str, Any]]] = []
 
-    assert status.native_hook_available is True
-    assert status.compat_shim_installed is False
-    assert status.patched_modules == []
-    assert status.automatic_capture_active is True
-
-    # The dispatch sites must be untouched — no shim marker anywhere.
-    tool_executor = fake_hermes_native["tool_executor"]
-    assert not getattr(tool_executor.memory, _SHIM_MARKER, False)
+    def notify_memory_tool_write(self, result: Any, args: dict[str, Any]) -> None:
+        self.notifications.append((result, args))
 
 
-# ---------------------------------------------------------------------------
-# Native hook absent -> patch applied
-# ---------------------------------------------------------------------------
+class _Agent:
+    def __init__(self, store: Any) -> None:
+        self._memory_store = store
+        self._memory_manager = _Manager()
 
 
-def test_hook_missing_patches_both_dispatch_sites(
-    fake_hermes_shim_needed: dict[str, Any], tmp_path
-) -> None:
-    hooks = LifecycleHooks(_config(volatile_path=str(tmp_path / "v.jsonl")))
-    status = install_compat_shim(hooks)
+class _GovernedWriter:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.submissions: list[str] = []
 
-    assert status.native_hook_available is False
-    assert status.compat_shim_installed is True
-    assert status.automatic_capture_active is True
-    assert set(status.patched_modules) == {
-        "hermes_agent.tools.tool_executor",
-        "hermes_agent.runtime.agent_runtime_helpers",
-    }
+    def __call__(
+        self,
+        *,
+        action: str,
+        target: str,
+        content: str,
+        metadata: dict[str, Any] | None,
+        old_text: str | None,
+    ) -> dict[str, Any]:
+        self.calls.append(
+            {
+                "action": action,
+                "target": target,
+                "content": content,
+                "metadata": metadata,
+                "old_text": old_text,
+            }
+        )
+        verdict = prepare_memory_write_guard(content)
+        if not is_allowed(verdict):
+            return {
+                "handled": True,
+                "result": {
+                    "success": False,
+                    "error": f"Rejected by Engram guard: {verdict.get('reason')}",
+                },
+            }
+        self.submissions.append(content)
+        return {
+            "handled": True,
+            "result": {"success": True, "message": "Submitted to Engram"},
+        }
 
-    tool_executor = fake_hermes_shim_needed["tool_executor"]
-    agent_runtime_helpers = fake_hermes_shim_needed["agent_runtime_helpers"]
-    assert getattr(tool_executor.memory, _SHIM_MARKER, False) is True
-    assert getattr(agent_runtime_helpers.memory, _SHIM_MARKER, False) is True
 
-
-def test_current_layout_hook_missing_patches_both_dispatch_sites(
-    fake_current_hermes_shim_needed: dict[str, Any], tmp_path
-) -> None:
-    hooks = LifecycleHooks(_config(volatile_path=str(tmp_path / "v.jsonl")))
-    status = install_compat_shim(hooks)
-
-    assert status.native_hook_available is False
-    assert status.compat_shim_installed is True
-    assert status.automatic_capture_active is True
-    assert set(status.patched_modules) == {
+@pytest.fixture
+def stock_contract(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    monkeypatch.syspath_prepend(str(_CONTRACT_ROOT))
+    for name in (
+        "agent",
+        "agent.memory_provider",
         "agent.tool_executor",
         "agent.agent_runtime_helpers",
+        "tools",
+        "tools.memory_tool",
+    ):
+        sys.modules.pop(name, None)
+    memory_tool = importlib.import_module("tools.memory_tool")
+    return {
+        "memory_tool": memory_tool,
+        "tool_executor": importlib.import_module("agent.tool_executor"),
+        "runtime_helpers": importlib.import_module("agent.agent_runtime_helpers"),
+        "provider": importlib.import_module("agent.memory_provider"),
     }
 
-    tool_executor = fake_current_hermes_shim_needed["tool_executor"]
-    agent_runtime_helpers = fake_current_hermes_shim_needed["agent_runtime_helpers"]
-    assert getattr(tool_executor.memory, _SHIM_MARKER, False) is True
-    assert getattr(agent_runtime_helpers.memory, _SHIM_MARKER, False) is True
 
-
-def test_guard_reject_short_circuits_original_writer(
-    fake_hermes_shim_needed: dict[str, Any], tmp_path
+@pytest.mark.parametrize("executor_name", ["tool_executor", "runtime_helpers"])
+def test_accepted_add_routes_once_without_native_mutation(
+    stock_contract: dict[str, Any], tmp_path: Path, executor_name: str
 ) -> None:
-    hooks = LifecycleHooks(_config(volatile_path=str(tmp_path / "v.jsonl")))
-    install_compat_shim(hooks)
+    writer = _GovernedWriter()
+    status = install(_config(tmp_path), write_interceptor=writer)["status"]
+    store = stock_contract["memory_tool"].MemoryStore()
+    agent = _Agent(store)
 
-    # install_compat_shim() alone doesn't set ACTIVE_HOOKS — only install() does.
-    # The wrapper falls back to the stateless guard when no hooks are active,
-    # which still actively rejects ephemeral content.
-    tool_executor = fake_hermes_shim_needed["tool_executor"]
-    original = fake_hermes_shim_needed["memory_fns"]["tool_executor"]
-
-    result = tool_executor.memory("currently editing line 5")
-
-    assert result["handled"] is True
-    assert result["action"] == "reject"
-    assert original.calls == []  # the underlying Hermes writer was never reached
-
-
-def test_guard_allow_reaches_original_writer(
-    fake_hermes_shim_needed: dict[str, Any], tmp_path
-) -> None:
-    hooks = LifecycleHooks(_config(volatile_path=str(tmp_path / "v.jsonl")))
-    install_compat_shim(hooks)
-
-    tool_executor = fake_hermes_shim_needed["tool_executor"]
-    original = fake_hermes_shim_needed["memory_fns"]["tool_executor"]
-
-    result = tool_executor.memory("Always use lowercase table names in this schema.")
-
-    assert result == "wrote:Always use lowercase table names in this schema."
-    assert len(original.calls) == 1
-    assert original.calls[0][0][0] == "Always use lowercase table names in this schema."
-
-
-def test_guard_uses_active_hooks_when_installed_via_install(
-    fake_hermes_shim_needed: dict[str, Any], tmp_path
-) -> None:
-    """When install() (not just install_compat_shim) has run, the wrapper
-    dispatches through the live LifecycleHooks rather than the stateless
-    guard — same guard logic, but proves the dynamic lookup wiring works.
-    """
-    install(_config(volatile_path=str(tmp_path / "v.jsonl")))
-    assert get_active_hooks() is not None
-
-    tool_executor = fake_hermes_shim_needed["tool_executor"]
-    original = fake_hermes_shim_needed["memory_fns"]["tool_executor"]
-
-    reject_result = tool_executor.memory("cursor is at line 3")
-    assert reject_result["action"] == "reject"
-    assert original.calls == []
-
-    allow_result = tool_executor.memory("The staging database is named engram_staging.")
-    assert allow_result == "wrote:The staging database is named engram_staging."
-    assert len(original.calls) == 1
-
-
-# ---------------------------------------------------------------------------
-# Idempotency: a second install does not double-wrap
-# ---------------------------------------------------------------------------
-
-
-def test_install_compat_shim_is_idempotent(
-    fake_hermes_shim_needed: dict[str, Any], tmp_path
-) -> None:
-    hooks = LifecycleHooks(_config(volatile_path=str(tmp_path / "v.jsonl")))
-
-    first = install_compat_shim(hooks)
-    tool_executor = fake_hermes_shim_needed["tool_executor"]
-    wrapped_once = tool_executor.memory
-
-    second = install_compat_shim(hooks)
-    wrapped_twice = tool_executor.memory
-
-    assert first.compat_shim_installed is True
-    assert second.compat_shim_installed is True
-    # The exact same function object — install_compat_shim recognized the
-    # existing marker and did not wrap the wrapper.
-    assert wrapped_once is wrapped_twice
-
-    # A single guard evaluation per call, not two nested ones: calling the
-    # (still) wrapped function with an allowed candidate reaches the original
-    # exactly once.
-    original = fake_hermes_shim_needed["memory_fns"]["tool_executor"]
-    tool_executor.memory("Always deploy from the release branch, never main.")
-    assert len(original.calls) == 1
-
-
-def test_install_top_level_is_idempotent_across_repeated_calls(
-    fake_hermes_shim_needed: dict[str, Any], tmp_path
-) -> None:
-    cfg = _config(volatile_path=str(tmp_path / "v.jsonl"))
-    result1 = install(cfg)
-    result2 = install(cfg)
-
-    assert result1["status"].compat_shim_installed is True
-    assert result2["status"].compat_shim_installed is True
-
-    tool_executor = fake_hermes_shim_needed["tool_executor"]
-    original = fake_hermes_shim_needed["memory_fns"]["tool_executor"]
-    tool_executor.memory("The primary region for this deployment is us-east-1.")
-    assert len(original.calls) == 1  # not called twice by a doubled wrapper
-
-
-# ---------------------------------------------------------------------------
-# Hermes absent -> shim inactive, not an error
-# ---------------------------------------------------------------------------
-
-
-def test_no_hermes_shim_inactive_not_fatal(no_hermes: None, tmp_path) -> None:
-    hooks = LifecycleHooks(_config(volatile_path=str(tmp_path / "v.jsonl")))
-    status = install_compat_shim(hooks)
-
-    assert status.native_hook_available is False
-    assert status.compat_shim_installed is False
-    assert status.automatic_capture_active is False
-    assert status.failure_reason is not None
-
-
-# ---------------------------------------------------------------------------
-# Patch failure: Hermes present, hook absent, dispatch sites missing (drift)
-# ---------------------------------------------------------------------------
-
-
-def test_patch_failure_when_dispatch_sites_missing(
-    fake_hermes_no_dispatch_sites: dict[str, Any], tmp_path
-) -> None:
-    hooks = LifecycleHooks(_config(volatile_path=str(tmp_path / "v.jsonl")))
-    status = install_compat_shim(hooks)
-
-    assert status.native_hook_available is False
-    assert status.compat_shim_installed is False
-    assert status.automatic_capture_active is False
-    assert status.failure_reason is not None
-    assert "hermes_agent.tools.tool_executor" in status.failure_reason
-    assert "hermes_agent.runtime.agent_runtime_helpers" in status.failure_reason
-
-
-# ---------------------------------------------------------------------------
-# require_automatic_capture: fail loudly instead of silently degrading
-# ---------------------------------------------------------------------------
-
-
-def test_install_raises_when_automatic_capture_required_but_unavailable(
-    no_hermes: None, tmp_path
-) -> None:
-    from engram_hooks import AutomaticCaptureUnavailable
-
-    cfg = _config(
-        volatile_path=str(tmp_path / "v.jsonl"),
-        require_automatic_capture=True,
+    result = json.loads(
+        stock_contract[executor_name].execute_memory(
+            agent,
+            {
+                "action": "add",
+                "target": "memory",
+                "content": "Always use PostgreSQL 16 for the Engram database.",
+            },
+        )
     )
+
+    assert status.activation_mode == "stock_compat"
+    assert status.patched_modules == ["tools.memory_tool"]
+    assert result == {
+        "success": True,
+        "message": "Submitted to Engram",
+        "provider": "engram",
+        "native_write": False,
+    }
+    assert writer.submissions == ["Always use PostgreSQL 16 for the Engram database."]
+    assert store.entries == {"memory": [], "user": []}
+
+
+@pytest.mark.parametrize("executor_name", ["tool_executor", "runtime_helpers"])
+def test_rejected_add_never_submits_or_mutates_native_store(
+    stock_contract: dict[str, Any], tmp_path: Path, executor_name: str
+) -> None:
+    writer = _GovernedWriter()
+    install(_config(tmp_path), write_interceptor=writer)
+    store = stock_contract["memory_tool"].MemoryStore()
+
+    result = json.loads(
+        stock_contract[executor_name].execute_memory(
+            _Agent(store),
+            {"action": "add", "target": "user", "content": "currently editing line 5"},
+        )
+    )
+
+    assert result["success"] is False
+    assert "Rejected by Engram guard" in result["error"]
+    assert result["native_write"] is False
+    assert writer.submissions == []
+    assert store.entries == {"memory": [], "user": []}
+
+
+def test_contract_has_nested_lazy_import_shape_not_module_memory_attributes(
+    stock_contract: dict[str, Any], tmp_path: Path
+) -> None:
+    writer = _GovernedWriter()
+    install(_config(tmp_path), write_interceptor=writer)
+
+    assert not hasattr(stock_contract["tool_executor"], "memory")
+    assert not hasattr(stock_contract["runtime_helpers"], "memory")
+    assert getattr(stock_contract["memory_tool"].memory_tool, _SHIM_MARKER) is True
+    assert HERMES_REFERENCE_REPOSITORY == "NousResearch/hermes-agent"
+    assert HERMES_REFERENCE_SHA == "75467998f90ba87adf66e1254a4d163345f23a5f"
+
+
+def test_native_prepare_status_restores_and_skips_compat_wrapper(
+    stock_contract: dict[str, Any], tmp_path: Path
+) -> None:
+    provider_class = stock_contract["provider"].MemoryProvider
+    provider_class.prepare_memory_write = lambda self, **kwargs: None
+    original = stock_contract["memory_tool"].memory_tool
+
+    status = install(_config(tmp_path), write_interceptor=_GovernedWriter())["status"]
+
+    assert status.activation_mode == "native_prepare"
+    assert status.native_hook_available is True
+    assert status.compat_shim_installed is False
+    assert stock_contract["memory_tool"].memory_tool is original
+
+
+def test_reinstall_updates_provider_without_double_wrap_or_duplicate_submission(
+    stock_contract: dict[str, Any], tmp_path: Path
+) -> None:
+    first_writer = _GovernedWriter()
+    second_writer = _GovernedWriter()
+    install(_config(tmp_path), write_interceptor=first_writer)
+    wrapped_once = stock_contract["memory_tool"].memory_tool
+    install(_config(tmp_path), write_interceptor=second_writer)
+    wrapped_twice = stock_contract["memory_tool"].memory_tool
+    store = stock_contract["memory_tool"].MemoryStore()
+
+    stock_contract["tool_executor"].execute_memory(
+        _Agent(store),
+        {
+            "action": "add",
+            "target": "memory",
+            "content": "The active production region is us-east-1.",
+        },
+    )
+
+    assert wrapped_once is wrapped_twice
+    assert first_writer.calls == []
+    assert len(second_writer.calls) == 1
+    assert second_writer.submissions == ["The active production region is us-east-1."]
+    assert store.entries["memory"] == []
+
+
+def test_disabling_compatibility_restores_native_behavior(
+    stock_contract: dict[str, Any], tmp_path: Path
+) -> None:
+    writer = _GovernedWriter()
+    install(_config(tmp_path), write_interceptor=writer)
+    status = install(
+        _config(tmp_path, enable_compat_shim=False), write_interceptor=writer
+    )["status"]
+    store = stock_contract["memory_tool"].MemoryStore()
+
+    result = json.loads(
+        stock_contract["tool_executor"].execute_memory(
+            _Agent(store),
+            {
+                "action": "add",
+                "target": "memory",
+                "content": "This deliberate recall-only call uses native storage.",
+            },
+        )
+    )
+
+    assert status.activation_mode == "recall_only"
+    assert status.automatic_capture_active is False
+    assert result["success"] is True
+    assert store.entries["memory"] == [
+        "This deliberate recall-only call uses native storage."
+    ]
+    assert writer.calls == []
+
+
+def test_add_containing_batch_is_rejected_atomically(
+    stock_contract: dict[str, Any], tmp_path: Path
+) -> None:
+    writer = _GovernedWriter()
+    install(_config(tmp_path), write_interceptor=writer)
+    store = stock_contract["memory_tool"].MemoryStore()
+
+    result = json.loads(
+        stock_contract["runtime_helpers"].execute_memory(
+            _Agent(store),
+            {
+                "target": "memory",
+                "operations": [
+                    {"action": "remove", "old_text": "stale"},
+                    {"action": "add", "content": "Always deploy from release branches."},
+                ],
+            },
+        )
+    )
+
+    assert result["success"] is False
+    assert "add-containing memory batches" in result["error"]
+    assert writer.calls == []
+    assert store.entries == {"memory": [], "user": []}
+
+
+def test_required_capture_fails_loudly_on_api_drift(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    agent = types.ModuleType("agent")
+    provider_mod = types.ModuleType("agent.memory_provider")
+    provider_mod.MemoryProvider = type("MemoryProvider", (), {})
+    tools = types.ModuleType("tools")
+    memory_tool = types.ModuleType("tools.memory_tool")
+    monkeypatch.setitem(sys.modules, "agent", agent)
+    monkeypatch.setitem(sys.modules, "agent.memory_provider", provider_mod)
+    monkeypatch.setitem(sys.modules, "tools", tools)
+    monkeypatch.setitem(sys.modules, "tools.memory_tool", memory_tool)
+
     with pytest.raises(AutomaticCaptureUnavailable) as excinfo:
-        install(cfg)
+        install(
+            _config(tmp_path, require_automatic_capture=True),
+            write_interceptor=_GovernedWriter(),
+        )
 
+    message = str(excinfo.value)
+    assert "tools.memory_tool.memory_tool" in message
+    assert HERMES_REFERENCE_SHA in message
+    assert excinfo.value.status.activation_mode == "incompatible"
+
+
+def test_required_capture_fails_without_registered_provider(
+    stock_contract: dict[str, Any], tmp_path: Path
+) -> None:
+    with pytest.raises(AutomaticCaptureUnavailable) as excinfo:
+        install(_config(tmp_path, require_automatic_capture=True))
+
+    assert "no Engram provider write interceptor" in str(excinfo.value)
     assert excinfo.value.status.automatic_capture_active is False
-    assert "require_automatic_capture" in str(excinfo.value)
-
-
-def test_install_does_not_raise_when_capture_not_required(no_hermes: None, tmp_path) -> None:
-    cfg = _config(volatile_path=str(tmp_path / "v.jsonl"), require_automatic_capture=False)
-    result = install(cfg)  # must not raise
-    assert result["status"].automatic_capture_active is False
-
-
-def test_install_satisfies_requirement_via_native_hook(
-    fake_hermes_native: dict[str, Any], tmp_path
-) -> None:
-    cfg = _config(volatile_path=str(tmp_path / "v.jsonl"), require_automatic_capture=True)
-    result = install(cfg)  # must not raise
-    assert result["status"].native_hook_available is True
-    assert result["status"].automatic_capture_active is True
-
-
-def test_install_satisfies_requirement_via_compat_shim(
-    fake_hermes_shim_needed: dict[str, Any], tmp_path
-) -> None:
-    cfg = _config(volatile_path=str(tmp_path / "v.jsonl"), require_automatic_capture=True)
-    result = install(cfg)  # must not raise
-    assert result["status"].compat_shim_installed is True
-    assert result["status"].automatic_capture_active is True
-
-
-def test_compat_shim_disabled_reports_inactive_without_raising(
-    fake_hermes_shim_needed: dict[str, Any], tmp_path
-) -> None:
-    cfg = _config(volatile_path=str(tmp_path / "v.jsonl"), enable_compat_shim=False)
-    result = install(cfg)
-    assert result["status"].automatic_capture_active is False
-    assert "ENGRAM_HOOKS_COMPAT_SHIM" in result["status"].failure_reason
-
-    tool_executor = fake_hermes_shim_needed["tool_executor"]
-    assert not getattr(tool_executor.memory, _SHIM_MARKER, False)

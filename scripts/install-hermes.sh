@@ -132,6 +132,7 @@ if $DRY_RUN; then
     printf '  Plan: validate health and the provisioned key (credential omitted)\n'
     printf '  Plan: resolve the requested Git ref once to an immutable commit\n'
     printf '  Plan: install Engram packages and nested engram_memory plugin\n'
+    printf '  Plan: require governed automatic capture in the profile environment\n'
     printf '  Plan: atomically update profile environment and configuration\n'
     printf '  No commands, prompts, network requests, installs, or writes were performed.\n'
     exit 0
@@ -369,7 +370,8 @@ PLUGIN_SOURCE="$CHECKOUT/$PLUGIN_SUBDIR"
     || die "plugin enable" "Hermes could not enable engram_memory"
 
 printf '[6/8] Updating the Hermes profile atomically...\n'
-"$HERMES_PYTHON" - "$ENV_FILE" 3< <(printf '%s\0%s\0%s\0' "$BASE_URL" "$API_KEY" "true") <<'PY'
+"$HERMES_PYTHON" - "$ENV_FILE" \
+    3< <(printf '%s\0%s\0%s\0%s\0' "$BASE_URL" "$API_KEY" "true" "true") <<'PY'
 import os
 import pathlib
 import re
@@ -379,11 +381,16 @@ import tempfile
 path = pathlib.Path(sys.argv[1])
 with os.fdopen(3, "rb") as values_stream:
     raw = values_stream.read().split(b"\0")
-if len(raw) < 4:
+if len(raw) < 5:
     raise SystemExit(1)
 values = dict(zip(
-    ("ENGRAM_BASE_URL", "ENGRAM_API_KEY", "ENGRAM_HOOKS_RECALL_ENABLED"),
-    (part.decode("utf-8") for part in raw[:3]),
+    (
+        "ENGRAM_BASE_URL",
+        "ENGRAM_API_KEY",
+        "ENGRAM_HOOKS_RECALL_ENABLED",
+        "ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE",
+    ),
+    (part.decode("utf-8") for part in raw[:4]),
     strict=True,
 ))
 lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
@@ -436,13 +443,24 @@ path = pathlib.Path(sys.argv[1])
 if stat.S_IMODE(path.stat().st_mode) != 0o600:
     raise SystemExit(1)
 text = path.read_text(encoding="utf-8")
-for key in ("ENGRAM_BASE_URL", "ENGRAM_API_KEY", "ENGRAM_HOOKS_RECALL_ENABLED"):
+for key in (
+    "ENGRAM_BASE_URL",
+    "ENGRAM_API_KEY",
+    "ENGRAM_HOOKS_RECALL_ENABLED",
+    "ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE",
+):
     matches = re.findall(rf"(?m)^[ \t]*(?:export[ \t]+)?{key}[ \t]*=", text)
     if len(matches) != 1:
         raise SystemExit(1)
 PY
 "$HERMES_PYTHON" -c 'import engram_client; import engram_hooks' \
     || die "Python import verification" "Engram packages stopped importing"
+"$HERMES_PYTHON" -c '
+from agent.memory_provider import MemoryProvider
+from tools.memory_tool import memory_tool
+assert isinstance(MemoryProvider, type) and callable(memory_tool)
+' || die "Hermes compatibility verification" \
+    "required target tools.memory_tool.memory_tool is unavailable in the live Hermes runtime"
 "$HERMES_PYTHON" - verify-direct-url "$RESOLVED_COMMIT" <<'PY' \
     || die "Python revision verification" "installed Engram packages do not match the resolved commit"
 import importlib.metadata
@@ -493,7 +511,9 @@ else
     printf '  Hermes diagnostics completed.\n'
 fi
 
-printf '\nEngram installation is verified. A Hermes process restart is required.\n'
+printf '\nEngram package, profile, and stock-Hermes API-shape checks are verified.\n'
+printf 'Automatic write interception activates inside Hermes after restart and is configured fail-loud.\n'
 printf 'Installed revision: %s -> %s\n' "$REF" "$RESOLVED_COMMIT"
 printf 'Interactive CLI: fully exit and relaunch Hermes.\n'
 printf 'Installed gateway: hermes gateway restart\n'
+printf 'Post-restart check: confirm logs contain "stock-Hermes interception active: tools.memory_tool.memory_tool".\n'

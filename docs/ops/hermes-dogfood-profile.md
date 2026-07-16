@@ -4,7 +4,7 @@
 service. The Track A manual dogfood gate below has not yet been run.
 
 Compatibility contract: `NousResearch/hermes-agent` at
-`f8ddf4fd866d4e581a5353f728117faf2736ad4c`. Do not patch that repository. The
+`75467998f90ba87adf66e1254a4d163345f23a5f`. Do not patch that repository. The
 checked-in [`profiles/hermes-engram-dogfood.yaml`](../../profiles/hermes-engram-dogfood.yaml)
 models the stock configuration.
 
@@ -81,15 +81,26 @@ contradictions surfaced.
 
 Provider initialization and `/new`/rewind switches clear write-side
 classification context. Ordinary resume updates the session ID without starting
-read recall. The existing native `prepare_memory_write` detection and write-side
-compatibility shim remain available; this is independent from the stock general
-read hook. Startup logs report `read_hook=pre_llm_call`, whether reads are
-enabled, `provider_prefetch=inert`, and the write interception mode.
+read recall. At the pinned stock revision, both `agent/tool_executor.py` and
+`agent/agent_runtime_helpers.py` define nested execution closures that late-import
+`tools.memory_tool.memory_tool`. The shim wraps that shared symbol, not nonexistent
+module-level executor functions. A single allowed `add` to `memory` or `user` is
+submitted to Engram and returns replacement JSON without touching `MEMORY.md` or
+`USER.md`; a rejected add is blocked before either store. Any batch containing an
+`add` is rejected atomically until replace/remove reconciliation is supported.
+
+The supported `pre_tool_call` hook was evaluated but cannot replace this boundary:
+it can inspect arguments and veto execution, but Hermes renders its result as a
+blocked error and offers no successful replacement result. Native
+`prepare_memory_write` remains preferred if a future Hermes revision supplies it.
+Startup logs report `read_hook=pre_llm_call`, whether reads are enabled,
+`provider_prefetch=inert`, and one of `native_prepare`, `stock_compat`,
+`recall_only`, or `incompatible`. Required capture makes the last two fail visibly.
 
 ## Installation
 
 For an already-provisioned agent key, run the standalone installer (default
-service: `https://engram.zutfen.com`):
+service: `https://api.engram.zutfen.com`):
 
 ```bash
 curl -fsSL \
@@ -107,6 +118,12 @@ same components and keep the `.env` idempotent. The requested `--ref` is fetched
 once and resolved to an exact commit before installation; that same commit is
 used for both direct-Git Python dependencies and the detached plugin checkout,
 and both requested and resolved revisions are reported.
+The installer also writes exactly one
+`ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE=true` entry, verifies the pinned stock
+runtime symbol exists, and describes this accurately as an API-shape check. Full
+activation occurs in the restarted Hermes process; startup must log
+`stock-Hermes interception active: tools.memory_tool.memory_tool` or fail instead
+of quietly using native writes.
 
 Use `bash -s --` for options, for example `--profile dogfood`,
 `--base-url https://engram.example.com`, `--ref main`, or `--dry-run`.
@@ -130,7 +147,60 @@ separate self-service flow: it uses a user-level key with `/v1/agents` to create
 a new agent and scoped key. The optional `mcp_servers.engram` configuration can
 remain in either profile for explicit operations.
 
-## Track A manual dogfood gate
+## Governed-write stock-Hermes smoke test
+
+Use a completely stock Hermes profile. Reinstall or update Engram, then restart:
+
+```bash
+export ENGRAM_API_KEY='<agent key>'
+curl -fsSL \
+  https://raw.githubusercontent.com/Zutfen-LLC/engram/main/scripts/install-hermes.sh \
+  | bash -s -- --profile <profile> --ref <engram-ref>
+hermes gateway restart  # gateway; for CLI, fully exit and relaunch instead
+```
+
+Confirm the restarted process logs contain:
+
+```text
+stock-Hermes interception active: tools.memory_tool.memory_tool
+```
+
+Choose a unique token and submit this exact prompt in Hermes:
+
+```text
+Remember this durable fact exactly: the stock Hermes Engram smoke-test identifier is HERMES-ENGRAM-SMOKE-<unique-token>.
+```
+
+Then collect all five acceptance signals:
+
+1. Query Engram with the same agent credential. Because agent-sourced
+   `sync_turn` writes may be proposed, include inactive/proposed items:
+
+   ```bash
+   curl -fsS -H "Authorization: Bearer $ENGRAM_API_KEY" \
+     'https://api.engram.zutfen.com/v1/items?active_only=false&limit=100' \
+     | jq --arg token 'HERMES-ENGRAM-SMOKE-<unique-token>' \
+       '.items[] | select(.content | contains($token)) | {id, content, source_type, review_status}'
+   ```
+
+2. Prove the profile-scoped native files do not contain the token:
+
+   ```bash
+   profile_dir=$(dirname "$(hermes --profile <profile> config path)")
+   ! rg -F 'HERMES-ENGRAM-SMOKE-<unique-token>' \
+     "$profile_dir/memories/MEMORY.md" "$profile_dir/memories/USER.md"
+   ```
+
+3. Start a fresh Hermes session and ask `What is the stock Hermes Engram
+   smoke-test identifier?`; record the response containing the token and Engram
+   attribution.
+4. Preserve the activation log line above with the Engram and Hermes SHAs.
+5. For a source checkout, record `git -C <hermes-checkout> status --short` before
+   and after; both must show no Engram-caused Hermes source changes. For a packaged
+   install, retain the package/version record and confirm only the profile plugin
+   directory changed.
+
+## Track A read-safety gate
 
 Store `The sky is purple on February 30th.` with `human_verified=false`, then
 start a fresh session using stock Hermes and the configuration above.

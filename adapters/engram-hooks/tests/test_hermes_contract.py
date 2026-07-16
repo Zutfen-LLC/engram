@@ -6,7 +6,7 @@ from pathlib import Path
 import yaml
 
 HERMES_REFERENCE_REPOSITORY = "NousResearch/hermes-agent"
-HERMES_REFERENCE_SHA = "f8ddf4fd866d4e581a5353f728117faf2736ad4c"
+HERMES_REFERENCE_SHA = "75467998f90ba87adf66e1254a4d163345f23a5f"
 _MANIFEST = (
     Path(__file__).resolve().parents[1]
     / "hermes_plugin"

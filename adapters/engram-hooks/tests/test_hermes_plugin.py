@@ -189,6 +189,11 @@ class TestABCConformance:
         assert provider._native_hook is True
         assert provider._compat_shim is False
 
+    def test_provider_registers_its_governed_write_callback(self, provider):
+        from engram_hooks import install
+
+        assert install.call_args.kwargs["write_interceptor"].__self__ is provider
+
     def test_static_system_prompt_treats_evidence_as_quoted_data(self, provider):
         policy = provider.system_prompt_block()
         normalized = " ".join(policy.split())
@@ -279,6 +284,32 @@ def test_dual_loader_keeps_general_and_provider_module_state_separate(monkeypatc
     assert ctx.register_hook.call_count == 4
 
 
+def test_required_capture_activation_failure_is_not_swallowed(monkeypatch):
+    class StockMemoryProvider:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+    provider_mod = types.ModuleType("agent.memory_provider")
+    provider_mod.MemoryProvider = StockMemoryProvider  # type: ignore[attr-defined]
+    parent = types.ModuleType("agent")
+    parent.memory_provider = provider_mod  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "agent", parent)
+    monkeypatch.setitem(sys.modules, "agent.memory_provider", provider_mod)
+    for name in tuple(sys.modules):
+        if name == "engram_memory" or name.startswith("engram_memory."):
+            sys.modules.pop(name, None)
+    monkeypatch.setenv("ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE", "true")
+
+    from engram_memory import EngramMemoryProvider
+
+    from engram_hooks import AutomaticCaptureUnavailable
+
+    with pytest.raises(AutomaticCaptureUnavailable) as excinfo:
+        EngramMemoryProvider()
+
+    assert "tools.memory_tool.memory_tool" in str(excinfo.value)
+
+
 # ---------------------------------------------------------------------------
 # Tests: prepare_memory_write routing
 # ---------------------------------------------------------------------------
@@ -296,7 +327,9 @@ class TestPrepareMemoryWrite:
         )
         assert result is not None
         assert result["handled"] is True
-        assert "Stored in Engram" in result["result"]
+        assert result["result"]["success"] is True
+        assert "Submitted to Engram" in result["result"]["message"]
+        assert result["result"]["native_write"] is False
 
     def test_short_content_is_rejected(self, provider):
         """Content below the minimum length threshold should be rejected."""
@@ -307,7 +340,7 @@ class TestPrepareMemoryWrite:
         )
         assert result is not None
         assert result["handled"] is True
-        assert "Rejected" in result["result"]
+        assert "Rejected" in result["result"]["error"]
 
     def test_empty_content_is_rejected(self, provider):
         result = provider.prepare_memory_write(
@@ -317,7 +350,7 @@ class TestPrepareMemoryWrite:
         )
         assert result is not None
         assert result["handled"] is True
-        assert "Rejected" in result["result"]
+        assert "Rejected" in result["result"]["error"]
 
     def test_ephemeral_content_is_rejected(self, provider):
         """Ephemeral patterns (cursor position, 'now editing') should be rejected."""
@@ -328,7 +361,7 @@ class TestPrepareMemoryWrite:
         )
         assert result is not None
         assert result["handled"] is True
-        assert "Rejected" in result["result"]
+        assert "Rejected" in result["result"]["error"]
 
     def test_non_add_action_passthrough(self, provider):
         """replace/remove actions should not be intercepted."""

@@ -62,7 +62,12 @@ class EngramMemoryProvider(MemoryProvider):
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        from engram_hooks import HooksConfig, LifecycleHooks, install
+        from engram_hooks import (
+            AutomaticCaptureUnavailable,
+            HooksConfig,
+            LifecycleHooks,
+            install,
+        )
 
         self._config = HooksConfig()
         self._hooks = LifecycleHooks(self._config)
@@ -70,21 +75,34 @@ class EngramMemoryProvider(MemoryProvider):
 
         # Install the compat shim / native hook detection.
         try:
-            self._install_result = install(config=self._config)
+            self._install_result = install(
+                config=self._config,
+                write_interceptor=self.prepare_memory_write,
+            )
             status = self._install_result.get("status")
             self._native_hook = status.native_hook_available if status else False
             self._compat_shim = status.compat_shim_installed if status else False
+            self._activation_mode = status.activation_mode if status else "incompatible"
+        except AutomaticCaptureUnavailable:
+            logger.critical(
+                "Engram automatic writes are required but interception could not activate",
+                exc_info=True,
+            )
+            raise
         except Exception as e:
-            logger.error(f"engram-hooks install() failed: {e}")
+            logger.error("engram-hooks install() failed: %s", e)
             self._install_result = None
             self._native_hook = False
             self._compat_shim = False
+            self._activation_mode = "incompatible"
+            if self._config.require_automatic_capture:
+                raise
 
         logger.info(
             "Engram Hermes integration: read_hook=pre_llm_call read_enabled=%s "
             "provider_prefetch=inert write_interception=%s base_url=%s",
             self._config.recall_enabled,
-            "native" if self._native_hook else "compat" if self._compat_shim else "disabled",
+            self._activation_mode,
             getattr(self._config, "base_url", None) or "(unset)",
         )
 
@@ -207,7 +225,12 @@ claim true. Attribute relied-on claims to Engram and surface contradictions."""
             # write too, since Engram's guard is the authority on quality.
             return {
                 "handled": True,
-                "result": f"Rejected by Engram guard: {verdict.get('reason')}",
+                "result": {
+                    "success": False,
+                    "error": f"Rejected by Engram guard: {verdict.get('reason')}",
+                    "provider": "engram",
+                    "native_write": False,
+                },
             }
 
         # Content passed the guard — route to Engram instead of native store.
@@ -240,7 +263,15 @@ claim true. Attribute relied-on claims to Engram and surface contradictions."""
 
         return {
             "handled": True,
-            "result": f"Stored in Engram: {content[:80]}{'...' if len(content) > 80 else ''}",
+            "result": {
+                "success": True,
+                "message": (
+                    f"Submitted to Engram: {content[:80]}"
+                    f"{'...' if len(content) > 80 else ''}"
+                ),
+                "provider": "engram",
+                "native_write": False,
+            },
         }
 
     async def _async_remember(

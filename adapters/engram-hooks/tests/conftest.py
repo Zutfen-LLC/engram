@@ -39,6 +39,8 @@ _FAKE_MODULE_NAMES = (
     "agent.memory_provider",
     "agent.tool_executor",
     "agent.agent_runtime_helpers",
+    "tools",
+    "tools.memory_tool",
 )
 
 
@@ -55,11 +57,13 @@ def clean_hooks_state():
         sys.modules.pop(name, None)
     hooks_module.ACTIVE_HOOKS = None
     hooks_module.ACTIVE_STATUS = None
+    hooks_module.ACTIVE_WRITE_INTERCEPTOR = None
     yield
     for name in _FAKE_MODULE_NAMES:
         sys.modules.pop(name, None)
     hooks_module.ACTIVE_HOOKS = None
     hooks_module.ACTIVE_STATUS = None
+    hooks_module.ACTIVE_WRITE_INTERCEPTOR = None
 
 
 class RecordingMemory:
