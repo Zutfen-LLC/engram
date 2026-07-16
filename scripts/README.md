@@ -25,8 +25,12 @@ python scripts/import_mempalace.py --palace ~/.mempalace/palace \
 ```
 
 MemPalace import writes with `source_type='migration'`,
-`external_source='mempalace'`, so imports land as trusted `active` items and are
-dedup-protected by `external_id`/`content_hash`.
+`external_source='mempalace'`, so drawer imports land as trusted `active` items
+and are dedup-protected by `external_id`/`content_hash`. Select the memory scope
+with `--visibility` and optional `--workspace`; the importer forwards that same
+scope to both drawers and auto-backed KG triples. Its dry-run and apply summary
+labels this shared memory-write scope explicitly. Tunnels do not create backing
+memories and are unaffected.
 
 ## import_cca.py
 

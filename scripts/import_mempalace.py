@@ -268,13 +268,19 @@ def _import_kg_triple(
     base_url: str,
     triple: dict[str, Any],
     timeout: float,
+    *,
+    visibility: str,
+    workspace: str | None,
 ) -> bool:
-    """POST a KG triple to /v1/kg. Returns True on success."""
+    """POST a KG triple using the import's selected memory scope."""
     payload = {
         "subject": triple.get("subject", ""),
         "predicate": triple.get("predicate", ""),
         "object": triple.get("object", ""),
+        "visibility": visibility,
     }
+    if workspace is not None:
+        payload["workspace"] = workspace
     if triple.get("valid_from"):
         payload["valid_from"] = triple["valid_from"]
     resp = client.post(f"{base_url}/v1/kg", json=payload, timeout=timeout)
@@ -336,7 +342,10 @@ def _print_dry_run(
     print("=" * 60)
     print("MemPalace → Engram Import (DRY RUN)")
     print("=" * 60)
-    print(f"Import scope             : {_format_scope(visibility, workspace)}")
+    print(
+        "Memory write scope "
+        f"(drawers + KG) : {_format_scope(visibility, workspace)}"
+    )
     print(f"Total drawers in palace : {report.total}")
     print(f"Unique (after dedup)    : {len(records)}")
     print(f"Duplicates detected     : {report.duplicates}")
@@ -519,7 +528,14 @@ def main() -> int:
             if _check_endpoint(client, base_url, "/v1/kg/query"):
                 for triple in kg_triples:
                     try:
-                        if _import_kg_triple(client, base_url, triple, args.timeout):
+                        if _import_kg_triple(
+                            client,
+                            base_url,
+                            triple,
+                            args.timeout,
+                            visibility=args.visibility,
+                            workspace=args.workspace,
+                        ):
                             report.kg_triples += 1
                     except httpx.HTTPError:
                         pass
@@ -543,7 +559,10 @@ def main() -> int:
     print("=" * 60)
     print("MemPalace → Engram Import (APPLY)")
     print("=" * 60)
-    print(f"Import scope      : {_format_scope(args.visibility, args.workspace)}")
+    print(
+        "Memory write scope "
+        f"(drawers + KG): {_format_scope(args.visibility, args.workspace)}"
+    )
     print(f"Drawers imported  : {report.imported}")
     print(f"Drawers errored   : {report.errors}")
     print(f"Duplicates skipped: {report.duplicates}")

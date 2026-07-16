@@ -18,6 +18,7 @@ SourceKind = Literal[
     "manual", "import", "migration", "extraction", "sync_turn", "pre_compress", "session_end"
 ]
 SensitivityKind = Literal["normal", "sensitive", "restricted"]
+VisibilityKind = Literal["private", "workspace", "tenant", "public"]
 SearchMode = Literal["keyword", "semantic", "hybrid"]
 
 
@@ -181,6 +182,7 @@ class KgAddRequest(BaseModel):
     predicate: str
     object: str
     workspace: str | None = None
+    visibility: VisibilityKind | None = None
     valid_from: str | None = None
     source_item_id: UUID | None = None
     confidence: float = 0.5

@@ -34,12 +34,16 @@ def create_ingest(
     )
 
 
-async def lock_ingest(session: AsyncSession, ingest_id: UUID) -> CandidateIngest | None:
+async def get_ingest(session: AsyncSession, ingest_id: UUID) -> CandidateIngest | None:
+    """Load an immutable candidate-ingest identity through ordinary RLS SELECT.
+
+    Candidate ingests cannot be updated by the application role. Receipt
+    serialization is owned by the classification-run row lock, so locking this
+    immutable row is both misleading and incompatible with least privilege.
+    """
     return (
         await session.execute(
-            select(CandidateIngest)
-            .where(CandidateIngest.id == ingest_id)
-            .with_for_update(read=True, key_share=True)
+            select(CandidateIngest).where(CandidateIngest.id == ingest_id)
         )
     ).scalar_one_or_none()
 

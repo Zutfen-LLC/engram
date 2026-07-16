@@ -3,8 +3,9 @@
 ENG-SCOPE-001: the foundational memory-scope invariant is that missing or
 ambiguous scope must never widen memory access. This module is the single
 place that turns a caller's raw ``(visibility, workspace)`` write request into
-a truthful, authorized scope — every write path (``/v1/remember``,
-``/v1/classify``) must resolve through :func:`resolve_write_scope` rather than
+a truthful, authorized scope — every memory-producing write path
+(``/v1/remember``, ``/v1/classify``, and auto-backed ``/v1/kg`` writes) must
+resolve through :func:`resolve_write_scope` rather than
 reimplementing default/authorization logic locally.
 
 Resolution rules:

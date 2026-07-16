@@ -88,6 +88,16 @@ def test_remember_visibility_enum(tools) -> None:
         "private",
         "workspace",
         "tenant",
+        "public",
+    ]
+
+
+def test_kg_add_visibility_enum_matches_memory_contract(tools) -> None:
+    assert _enum_of(_tool(tools, "engram_kg_add"), "visibility") == [
+        "private",
+        "workspace",
+        "tenant",
+        "public",
     ]
 
 

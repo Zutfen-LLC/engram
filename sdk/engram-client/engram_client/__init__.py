@@ -33,6 +33,7 @@ from .models import (
     RememberResponse,
     SearchRequest,
     SearchResponse,
+    VisibilityKind,
 )
 
 __version__ = "0.1.0"
@@ -50,6 +51,7 @@ __all__ = [
     # models
     "RememberRequest",
     "RememberResponse",
+    "VisibilityKind",
     "RecallRequest",
     "RecallResponse",
     "SearchRequest",

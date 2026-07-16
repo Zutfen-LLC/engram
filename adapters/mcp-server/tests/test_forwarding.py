@@ -161,6 +161,7 @@ async def test_kg_add_forwards_shape(mcp_server, mock_client) -> None:
             "subject": "users",
             "predicate": "located_in",
             "object": "us-east-1",
+            "visibility": "public",
             "confidence": 0.7,
         },
     )
@@ -168,10 +169,22 @@ async def test_kg_add_forwards_shape(mcp_server, mock_client) -> None:
     assert mock_client.kg_add.await_args.args == ("users", "located_in", "us-east-1")
     assert mock_client.kg_add.await_args.kwargs == {
         "workspace": None,
+        "visibility": "public",
         "source_item_id": None,
         "confidence": 0.7,
     }
     assert result.structuredContent["triple"]["predicate"] == "located_in"
+
+
+async def test_kg_add_preserves_omitted_scope(mcp_server, mock_client) -> None:
+    await _call(
+        mcp_server,
+        "engram_kg_add",
+        {"subject": "a", "predicate": "rel", "object": "b"},
+    )
+
+    assert mock_client.kg_add.await_args.kwargs["workspace"] is None
+    assert mock_client.kg_add.await_args.kwargs["visibility"] is None
 
 
 # ---- engram_kg_query ----

@@ -1,14 +1,8 @@
 """PostgreSQL migration and RLS proof for ENG-SCOPE-001 (migration 021).
 
-Follows the pattern of tests/test_candidate_ingests_migration.py: re-executes
-the migration SQL directly against the already-migrated CI database (owner
-role), so it proves the file's own idempotency regardless of whether
-``schema_migrations`` already recorded it. Since the CHECK constraint this
-migration adds is already live by the time these tests run (applied via
-docker-entrypoint-initdb.d on container start), the legacy-row scenario is
-simulated by temporarily dropping the constraint, inserting a pre-migration-
-shaped row, then re-running the migration to normalize it and recreate the
-constraint.
+The pre-021 proof runs in an isolated schema so the canonical CI database is
+never observable without its workspace-visibility CHECK. Separate tests prove
+the migrated public schema from owner and non-owner application-role views.
 """
 
 from __future__ import annotations
@@ -44,54 +38,36 @@ def _require_stack() -> None:
         pytest.skip("requires owner and app PostgreSQL URLs")
 
 
-async def _insert_legacy_item(owner, *, tenant, principal, item_id, content, chash) -> None:
+async def _insert_legacy_item(owner, *, item_id) -> None:
     await owner.execute(
-        "INSERT INTO memory_items ("
-        "id, tenant_id, workspace_id, principal_id, content, content_hash, kind, "
-        "visibility, review_status, memory_confidence, source_trust, importance, "
-        "source_type, valid_from"
-        ") VALUES ($1,$2,NULL,$3,$4,$5,'fact','workspace','active',0.8,0.8,0.5,'manual', now())",
+        "INSERT INTO memory_items (id, workspace_id, visibility) VALUES ($1, NULL, 'workspace')",
         item_id,
-        tenant,
-        principal,
-        content,
-        chash,
     )
 
 
 async def test_migration_021_normalizes_legacy_rows_idempotently_and_enforces_invariant() -> None:
     _require_stack()
     owner = await _connect(_owner_dsn())  # type: ignore[arg-type]
-    tenant = uuid.uuid4()
-    principal = uuid.uuid4()
+    schema = f"scope_mig_{uuid.uuid4().hex}"
     item_id = uuid.uuid4()
     try:
+        await owner.execute(f'CREATE SCHEMA "{schema}"')
+        await owner.execute(f'SET search_path TO "{schema}"')
+        await owner.execute("CREATE TABLE workspaces (id UUID PRIMARY KEY)")
         await owner.execute(
-            "INSERT INTO tenants (id, name, slug) VALUES ($1, $2, $3)",
-            tenant,
-            "scope-mig",
-            f"scope-mig-{tenant.hex[:8]}",
+            "CREATE TABLE memory_items ("
+            "id UUID PRIMARY KEY, workspace_id UUID REFERENCES workspaces(id) ON DELETE SET NULL, "
+            "visibility TEXT NOT NULL DEFAULT 'workspace')"
         )
         await owner.execute(
-            "INSERT INTO principals (id, tenant_id, name, type) VALUES ($1, $2, 'admin', 'admin')",
-            principal,
-            tenant,
+            "CREATE TABLE item_events ("
+            "item_id UUID NOT NULL, event_type TEXT NOT NULL, field_name TEXT, "
+            "old_value TEXT, new_value TEXT, actor_principal_id UUID, reason TEXT)"
         )
-
-        # Simulate pre-migration legacy state: drop the (already-applied)
-        # constraint so a workspace-visible/NULL-workspace row can be
-        # inserted, matching what genuinely-historical rows look like.
-        await owner.execute(
-            f"ALTER TABLE memory_items DROP CONSTRAINT IF EXISTS {_CONSTRAINT_NAME}"
-        )
-        await _insert_legacy_item(
-            owner,
-            tenant=tenant,
-            principal=principal,
-            item_id=item_id,
-            content="legacy workspace-null content",
-            chash="sha256:scope-mig-legacy",
-        )
+        await owner.execute("ALTER TABLE memory_items ENABLE ROW LEVEL SECURITY")
+        await owner.execute("ALTER TABLE memory_items FORCE ROW LEVEL SECURITY")
+        await owner.execute("GRANT SELECT, INSERT ON memory_items TO engram_app")
+        await _insert_legacy_item(owner, item_id=item_id)
 
         # --- First application: normalizes the row, writes exactly one event. ---
         await owner.execute(_MIGRATION_SQL)
@@ -119,7 +95,7 @@ async def test_migration_021_normalizes_legacy_rows_idempotently_and_enforces_in
         # --- Reapplication is a no-op: no new event, row unchanged. ---
         await owner.execute(_MIGRATION_SQL)
         events_again = await owner.fetch(
-            "SELECT id FROM item_events WHERE item_id = $1", item_id
+            "SELECT event_type FROM item_events WHERE item_id = $1", item_id
         )
         assert len(events_again) == 1
         row_again = await owner.fetchrow(
@@ -138,20 +114,27 @@ async def test_migration_021_normalizes_legacy_rows_idempotently_and_enforces_in
 
         # --- CHECK constraint exists, is validated, and blocks a fresh violation. ---
         constraint_row = await owner.fetchrow(
-            "SELECT convalidated FROM pg_constraint WHERE conname = $1", _CONSTRAINT_NAME
+            "SELECT convalidated FROM pg_constraint "
+            "WHERE conname = $1 AND conrelid = 'memory_items'::regclass",
+            _CONSTRAINT_NAME,
         )
         assert constraint_row is not None
         assert constraint_row["convalidated"] is True
 
         with pytest.raises(Exception):  # noqa: B017
-            await _insert_legacy_item(
-                owner,
-                tenant=tenant,
-                principal=principal,
-                item_id=uuid.uuid4(),
-                content="new violation attempt",
-                chash="sha256:scope-mig-new-violation",
-            )
+            await _insert_legacy_item(owner, item_id=uuid.uuid4())
+
+        # --- Existing SET NULL FK became restrictive and stays so on reapply. ---
+        fk = await owner.fetchrow(
+            "SELECT confdeltype FROM pg_constraint WHERE contype = 'f' "
+            "AND conrelid = 'memory_items'::regclass"
+        )
+        assert fk["confdeltype"] in (b"a", b"r", "a", "r")
+        await owner.execute(_MIGRATION_SQL)
+        assert await owner.fetchval(
+            "SELECT count(*) FROM pg_constraint WHERE contype = 'f' "
+            "AND conrelid = 'memory_items'::regclass"
+        ) == 1
 
         # --- FORCE RLS is unchanged. ---
         security = await owner.fetchrow(
@@ -160,13 +143,23 @@ async def test_migration_021_normalizes_legacy_rows_idempotently_and_enforces_in
         )
         assert security["relrowsecurity"] is True
         assert security["relforcerowsecurity"] is True
+        assert await owner.fetchval(
+            "SELECT has_table_privilege('engram_app', 'memory_items', 'SELECT, INSERT')"
+        ) is True
     finally:
-        await owner.execute("DELETE FROM tenants WHERE id = $1", tenant)
+        await owner.execute("SET search_path TO public")
+        await owner.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
         await owner.close()
 
 
 async def test_app_role_cannot_insert_workspace_null_visibility_row() -> None:
-    """The non-owner application role is blocked by the same CHECK constraint."""
+    """The old-app write shape intentionally fails after the maintenance migration.
+
+    This is proof of mixed-version incompatibility, not a rolling-upgrade
+    capability: operators must drain old writers before applying migration 021.
+    """
+    import asyncpg
+
     _require_stack()
     owner = await _connect(_owner_dsn())  # type: ignore[arg-type]
     app = await _connect(_app_dsn())  # type: ignore[arg-type]
@@ -187,7 +180,7 @@ async def test_app_role_cannot_insert_workspace_null_visibility_row() -> None:
         await app.execute("SELECT set_config('app.tenant_id', $1, false)", str(tenant))
         await app.execute("SELECT set_config('app.principal_id', $1, false)", str(principal))
 
-        with pytest.raises(Exception):  # noqa: B017
+        with pytest.raises(asyncpg.CheckViolationError) as exc_info:
             await app.execute(
                 "INSERT INTO memory_items ("
                 "id, tenant_id, workspace_id, principal_id, content, content_hash, kind, "
@@ -199,6 +192,7 @@ async def test_app_role_cannot_insert_workspace_null_visibility_row() -> None:
                 tenant,
                 principal,
             )
+        assert _CONSTRAINT_NAME in str(exc_info.value)
 
         # Grants are unchanged: the app role can still write ordinary items.
         good_id = uuid.uuid4()
@@ -218,5 +212,89 @@ async def test_app_role_cannot_insert_workspace_null_visibility_row() -> None:
         ) == "private"
     finally:
         await app.close()
+        await owner.execute("DELETE FROM tenants WHERE id = $1", tenant)
+        await owner.close()
+
+
+async def test_workspace_memory_association_restricts_delete_and_empty_workspace_deletes() -> None:
+    import asyncpg
+
+    _require_stack()
+    owner = await _connect(_owner_dsn())  # type: ignore[arg-type]
+    tenant = uuid.uuid4()
+    principal = uuid.uuid4()
+    occupied_workspace = uuid.uuid4()
+    empty_workspace = uuid.uuid4()
+    item_id = uuid.uuid4()
+    try:
+        await owner.execute(
+            "INSERT INTO tenants (id, name, slug) VALUES ($1, $2, $3)",
+            tenant,
+            "scope-fk",
+            f"scope-fk-{tenant.hex[:8]}",
+        )
+        await owner.execute(
+            "INSERT INTO principals (id, tenant_id, name, type) "
+            "VALUES ($1, $2, 'writer', 'user')",
+            principal,
+            tenant,
+        )
+        await owner.executemany(
+            "INSERT INTO workspaces (id, tenant_id, name, slug) VALUES ($1, $2, $3, $4)",
+            [
+                (occupied_workspace, tenant, "occupied", f"occupied-{tenant.hex[:8]}"),
+                (empty_workspace, tenant, "empty", f"empty-{tenant.hex[:8]}"),
+            ],
+        )
+        await owner.execute(
+            "INSERT INTO memory_items ("
+            "id, tenant_id, workspace_id, principal_id, content, content_hash, kind, "
+            "visibility, review_status, memory_confidence, source_trust, importance, "
+            "source_type, valid_from"
+            ") VALUES ($1,$2,$3,$4,'workspace lifecycle','sha256:scope-fk',"
+            "'fact','workspace','active',0.8,0.8,0.5,'manual',now())",
+            item_id,
+            tenant,
+            occupied_workspace,
+            principal,
+        )
+
+        with pytest.raises(asyncpg.ForeignKeyViolationError) as exc_info:
+            await owner.execute("DELETE FROM workspaces WHERE id = $1", occupied_workspace)
+        assert "fk_memory_items_workspace_restrict" in str(exc_info.value)
+
+        row = await owner.fetchrow(
+            "SELECT workspace_id, visibility FROM memory_items WHERE id = $1", item_id
+        )
+        assert row["workspace_id"] == occupied_workspace
+        assert row["visibility"] == "workspace"
+
+        deleted = await owner.execute("DELETE FROM workspaces WHERE id = $1", empty_workspace)
+        assert deleted == "DELETE 1"
+        assert await owner.fetchval(
+            "SELECT count(*) FROM workspaces WHERE id = $1", empty_workspace
+        ) == 0
+
+        # Reapplication retains one restrictive FK and does not weaken RLS or grants.
+        await owner.execute(_MIGRATION_SQL)
+        fk_rows = await owner.fetch(
+            "SELECT c.conname, c.confdeltype FROM pg_constraint c "
+            "JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) "
+            "WHERE c.contype = 'f' AND c.conrelid = 'memory_items'::regclass "
+            "AND a.attname = 'workspace_id'"
+        )
+        assert len(fk_rows) == 1
+        assert fk_rows[0]["confdeltype"] in (b"a", b"r", "a", "r")
+        security = await owner.fetchrow(
+            "SELECT relrowsecurity, relforcerowsecurity FROM pg_class "
+            "WHERE oid = 'memory_items'::regclass"
+        )
+        assert tuple(security) == (True, True)
+        assert await owner.fetchval(
+            "SELECT has_table_privilege("
+            "'engram_app', 'memory_items', 'SELECT, INSERT, UPDATE, DELETE')"
+        ) is True
+    finally:
+        await owner.execute("DELETE FROM memory_items WHERE id = $1", item_id)
         await owner.execute("DELETE FROM tenants WHERE id = $1", tenant)
         await owner.close()

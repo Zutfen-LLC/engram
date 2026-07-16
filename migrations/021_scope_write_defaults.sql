@@ -1,8 +1,13 @@
 -- ENG-SCOPE-001: truthful scope invariants and safe write defaults.
+-- Coordinated-maintenance migration: stop/drain all memory writers before
+-- applying it, and do not run old application code against the migrated
+-- schema. Application-only rollback is unsupported.
 -- Safe to re-apply: the normalization predicate is self-limiting (matches
 -- zero rows once already normalized), the default change is idempotent by
 -- nature, and the CHECK constraint is added through a guarded existence
--- check + VALIDATE CONSTRAINT (a no-op once already validated).
+-- check + VALIDATE CONSTRAINT (a no-op once already validated). The workspace
+-- FK replacement inspects the catalog and changes only the FK attached to
+-- memory_items.workspace_id when its delete action is not already restrictive.
 --
 -- Does not touch FORCE ROW LEVEL SECURITY, tenant isolation policies, app-role
 -- grants, or append-first/update-delete restrictions on any table.
@@ -56,6 +61,7 @@ BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conname = 'chk_memitems_workspace_visibility_requires_workspace'
+          AND conrelid = 'memory_items'::regclass
     ) THEN
         ALTER TABLE memory_items
             ADD CONSTRAINT chk_memitems_workspace_visibility_requires_workspace
@@ -67,3 +73,43 @@ $$;
 
 ALTER TABLE memory_items
     VALIDATE CONSTRAINT chk_memitems_workspace_visibility_requires_workspace;
+
+-- ============ D. Workspace deletion lifecycle ============
+-- A memory association deliberately prevents workspace deletion. ON DELETE
+-- SET NULL would conflict with the visibility CHECK for workspace-visible
+-- memories and would also erase provenance for private/tenant/public memories
+-- associated with a workspace. Operators must explicitly resolve associated
+-- memories before deleting the workspace.
+DO $$
+DECLARE
+    existing_fk_name text;
+    existing_delete_action "char";
+BEGIN
+    SELECT c.conname, c.confdeltype
+    INTO existing_fk_name, existing_delete_action
+    FROM pg_constraint AS c
+    JOIN pg_attribute AS source_col
+      ON source_col.attrelid = c.conrelid
+     AND source_col.attnum = ANY (c.conkey)
+    JOIN pg_class AS target_table ON target_table.oid = c.confrelid
+    JOIN pg_namespace AS target_ns ON target_ns.oid = target_table.relnamespace
+    WHERE c.contype = 'f'
+      AND c.conrelid = 'memory_items'::regclass
+      AND source_col.attname = 'workspace_id'
+      AND array_length(c.conkey, 1) = 1
+      AND target_table.relname = 'workspaces'
+      AND target_ns.nspname = current_schema()
+    LIMIT 1;
+
+    IF existing_fk_name IS NOT NULL AND existing_delete_action NOT IN ('a', 'r') THEN
+        EXECUTE format('ALTER TABLE memory_items DROP CONSTRAINT %I', existing_fk_name);
+        existing_fk_name := NULL;
+    END IF;
+
+    IF existing_fk_name IS NULL THEN
+        ALTER TABLE memory_items
+            ADD CONSTRAINT fk_memory_items_workspace_restrict
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE RESTRICT;
+    END IF;
+END
+$$;

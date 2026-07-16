@@ -704,8 +704,8 @@ Ordinary principals may reference only workspaces they are members of; an
 authenticated key with effective `admin` scope may reference any workspace in
 its own tenant (never across tenants) without a membership row. An unknown or
 unauthorized workspace returns the same non-disclosing 404 in both cases. See
-`engram/memory_scope.py` for the canonical resolver used by `/v1/remember` and
-`/v1/classify`.
+`engram/memory_scope.py` for the canonical resolver used by `/v1/remember`,
+`/v1/classify`, and KG writes that auto-create backing memories.
 
 Historically, `visibility="workspace"` rows with `workspace_id IS NULL`
 behaved tenant-wide by accident (the default before ENG-SCOPE-001, combined
@@ -717,6 +717,20 @@ access, correcting only the label), a database CHECK constraint
 combination unrepresentable going forward, and no read-eligibility path
 (SQLAlchemy or raw SQL, in `engram/memory_access.py`) retains the old
 fallback.
+
+Memory associations deliberately prevent workspace deletion. The
+`memory_items.workspace_id` foreign key uses restrictive deletion: an operator
+must inspect and explicitly re-scope, archive, export/delete, or otherwise
+resolve every associated memory before deleting its workspace. Engram does not
+silently widen those memories to tenant visibility, erase their workspace
+association, or cascade-delete them. An empty workspace may be deleted.
+
+For `POST /v1/kg`, an auto-created backing memory uses the same canonical
+authorized scope resolution as `POST /v1/remember`. When a caller supplies an
+existing readable `source_item_id`, that source memory is authoritative for
+both visibility and workspace; omitted KG scope derives from it, and explicit
+scope must match it exactly. The triple always carries the source memory's
+workspace and cannot widen its audience.
 
 ### Principal model
 

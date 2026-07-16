@@ -586,7 +586,45 @@ remain supported triggers.
 
 ---
 
-## 9. Troubleshooting
+## 9. Migration 021 deployment and rollback
+
+Migration `021_scope_write_defaults.sql` is a coordinated-maintenance schema
+transition. It is intentionally not compatible with mixed old and new Engram
+writers: old code can insert `visibility='workspace'` with a NULL
+`workspace_id`, while the migrated schema correctly rejects that invalid shape.
+No compatibility trigger silently rewrites it.
+
+Deployment procedure:
+
+1. Stop or drain every Engram service and worker capable of writing memory.
+2. Deploy the new code and apply migration 021 as the database owner.
+3. Restart services and workers only after the migration succeeds.
+4. Never run old application code against the migrated schema.
+
+Application-only rollback after migration 021 is unsupported. Reverting the
+application also requires an explicit database rollback plan that accounts for
+the private default, validated workspace-visibility CHECK, normalized audit
+rows, and restrictive workspace foreign key. Take and verify a database backup
+before the maintenance window. The normal recovery choice is to fix-forward;
+do not restart an old fleet against the migrated database.
+
+If rollback is unavoidable, keep every writer stopped, restore the verified
+pre-021 database backup (or apply an operator-reviewed reverse migration with
+equivalent restoration semantics), verify the restored schema and data as the
+owner and application roles, then deploy the matching old application revision
+before restarting any process. Do not merely drop the CHECK: normalized rows
+and their audit events, the column default, and the workspace FK policy must be
+handled as one database rollback. There is no supported code-only shortcut.
+
+After migration 021, a workspace referenced by any memory cannot be deleted.
+Inspect its memories and explicitly re-scope, archive, export/delete, or
+otherwise resolve them first; deletion succeeds only when no memory reference
+remains. This is a deliberate foreign-key restriction, not an incidental CHECK
+failure.
+
+---
+
+## 10. Troubleshooting
 
 | Symptom | Likely cause / fix |
 | --- | --- |

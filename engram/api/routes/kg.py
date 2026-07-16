@@ -13,10 +13,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.api.routes.memory import _insert_item_event
 from engram.auth import READ_SCOPE, WRITE_SCOPE
+from engram.auth import Principal as AuthPrincipal
 from engram.authority import MemoryAuthority
 from engram.db import get_session
 from engram.memory_access import apply_read_eligibility, eligibility_expression
-from engram.models import KgTriple, MemoryItem, Principal
+from engram.memory_scope import resolve_write_scope
+from engram.models import KgTriple, MemoryItem, Principal, Workspace
 from engram.trust_policy import resolve_trust_defaults
 
 router = APIRouter()
@@ -27,6 +29,7 @@ class KgAddRequest(BaseModel):
     predicate: str
     object: str
     workspace: str | None = None
+    visibility: Literal["private", "workspace", "tenant", "public"] | None = None
     valid_from: str | None = None
     source_item_id: UUID | None = None
     confidence: float = 0.5
@@ -102,23 +105,6 @@ async def _resolve_principal(
     return principal_id, principal_type
 
 
-async def _resolve_workspace_id(
-    session: AsyncSession,
-    tenant_id: UUID,
-    workspace_slug: str | None,
-) -> UUID | None:
-    if workspace_slug is None:
-        return None
-    result = await session.execute(
-        text("SELECT id FROM workspaces WHERE tenant_id = :tid AND slug = :slug"),
-        {"tid": str(tenant_id), "slug": workspace_slug},
-    )
-    ws_id = result.scalar_one_or_none()
-    if ws_id is None:
-        raise HTTPException(status_code=422, detail=f"workspace '{workspace_slug}' not found")
-    return UUID(str(ws_id))
-
-
 def _row_to_triple_out(row: Any) -> KgTripleOut:
     trust = None
     if row.get("review_status") == "proposed":
@@ -138,20 +124,19 @@ def _row_to_triple_out(row: Any) -> KgTripleOut:
     )
 
 
-@router.post(
-    "/kg", response_model=KgAddResponse, status_code=201, dependencies=[Depends(WRITE_SCOPE)]
-)
+@router.post("/kg", response_model=KgAddResponse, status_code=201)
 async def add_triple(
     req: KgAddRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
     tenant_id: UUID = Depends(_resolve_tenant_id),  # noqa: B008
     principal: tuple[UUID, str] = Depends(_resolve_principal),  # noqa: B008
+    caller: AuthPrincipal = Depends(WRITE_SCOPE),  # noqa: B008
 ) -> KgAddResponse:
     principal_id = principal[0]
-    workspace_id = await _resolve_workspace_id(session, tenant_id, req.workspace)
 
     source_item_id: UUID | None = req.source_item_id
     memory_item = None
+    workspace_id: UUID | None
 
     if source_item_id is not None:
         result = await session.execute(
@@ -164,7 +149,48 @@ async def add_triple(
         existing = result.scalar_one_or_none()
         if existing is None:
             raise HTTPException(status_code=404, detail="Item not found")
+        workspace_id = existing.workspace_id
+
+        # The readable source memory is authoritative. Explicit KG scope is
+        # still passed through the canonical resolver (including membership
+        # and admin-scope handling), then must exactly match the source item.
+        if req.visibility is not None or req.workspace is not None:
+            source_workspace: str | None = None
+            if existing.workspace_id is not None:
+                source_workspace = await session.scalar(
+                    select(Workspace.slug).where(
+                        Workspace.id == existing.workspace_id,
+                        Workspace.tenant_id == tenant_id,
+                    )
+                )
+            requested_scope = await resolve_write_scope(
+                session,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                caller_has_admin_scope=caller.has_scope("admin"),
+                requested_visibility=req.visibility or existing.visibility,
+                requested_workspace=(
+                    req.workspace if req.workspace is not None else source_workspace
+                ),
+            )
+            if (
+                requested_scope.visibility != existing.visibility
+                or requested_scope.workspace_id != existing.workspace_id
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail="KG scope does not match source item",
+                )
     else:
+        scope = await resolve_write_scope(
+            session,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            caller_has_admin_scope=caller.has_scope("admin"),
+            requested_visibility=req.visibility,
+            requested_workspace=req.workspace,
+        )
+        workspace_id = scope.workspace_id
         source_trust, source_prior, _ = await resolve_trust_defaults(
             session, tenant_id, "extraction", principal[1]
         )
@@ -175,12 +201,7 @@ async def add_triple(
             content=f"KG triple: {req.subject} {req.predicate} {req.object}",
             content_hash=f"kg-auto-{uuid.uuid4().hex}",
             kind="fact",
-            # ENG-SCOPE-001: visibility='workspace' requires a real workspace.
-            # This auto-created backing item stays workspace-shared when a
-            # workspace was resolved, private otherwise — no workspace
-            # membership authorization is layered on here (unchanged, existing
-            # behavior for this route; out of scope for this slice).
-            visibility="workspace" if workspace_id is not None else "private",
+            visibility=scope.visibility,
             review_status="proposed",
             memory_confidence=source_prior,
             source_trust=source_trust,

@@ -13,6 +13,7 @@ tests/test_review_kg_integrity.py.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -185,6 +186,35 @@ async def _counts(c: dict[str, Any]) -> tuple[int, int, int]:
     return items, ingests, receipts
 
 
+async def _kg_counts(c: dict[str, Any]) -> tuple[int, int]:
+    async with c["owner"].connect() as conn:
+        items = await conn.scalar(
+            text("SELECT count(*) FROM memory_items WHERE tenant_id = :tid"),
+            {"tid": c["ta"]},
+        )
+        triples = await conn.scalar(
+            text("SELECT count(*) FROM kg_triples WHERE tenant_id = :tid"),
+            {"tid": c["ta"]},
+        )
+    return items, triples
+
+
+async def _kg_stored(c: dict[str, Any], triple_id: str) -> dict[str, Any]:
+    async with c["owner"].connect() as conn:
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT k.workspace_id AS triple_workspace_id, "
+                    "m.workspace_id AS item_workspace_id, m.visibility "
+                    "FROM kg_triples k JOIN memory_items m ON m.id = k.source_item_id "
+                    "WHERE k.id = :id"
+                ),
+                {"id": triple_id},
+            )
+        ).mappings().one()
+    return dict(row)
+
+
 # ---- Safe defaults ----
 
 
@@ -346,6 +376,197 @@ async def test_admin_scope_cannot_cross_tenant(corpus):
     assert remember_resp.status_code == 404
 
 
+# ---- KG writes use the same canonical scope contract ----
+
+
+async def test_kg_without_workspace_creates_private_backing_memory(corpus):
+    c = corpus
+    response = await c["client"].post(
+        "/v1/kg",
+        json={"subject": "alice", "predicate": "knows", "object": "bob"},
+        headers=_h(c, "member"),
+    )
+    assert response.status_code == 201, response.text
+    stored = await _kg_stored(c, response.json()["id"])
+    assert stored["visibility"] == "private"
+    assert stored["item_workspace_id"] is None
+    assert stored["triple_workspace_id"] is None
+
+
+async def test_kg_authorized_workspace_defaults_to_workspace_visibility(corpus):
+    c = corpus
+    response = await c["client"].post(
+        "/v1/kg",
+        json={
+            "subject": "alice",
+            "predicate": "works_at",
+            "object": "acme",
+            "workspace": f"alpha-{c['tag']}",
+        },
+        headers=_h(c, "member"),
+    )
+    assert response.status_code == 201, response.text
+    stored = await _kg_stored(c, response.json()["id"])
+    assert stored["visibility"] == "workspace"
+    assert stored["item_workspace_id"] == c["alpha"]
+    assert stored["triple_workspace_id"] == c["alpha"]
+
+
+@pytest.mark.parametrize("visibility", ["private", "tenant", "public"])
+async def test_kg_explicit_non_workspace_visibility(corpus, visibility):
+    c = corpus
+    response = await c["client"].post(
+        "/v1/kg",
+        json={
+            "subject": f"subject-{visibility}",
+            "predicate": "has_scope",
+            "object": visibility,
+            "visibility": visibility,
+        },
+        headers=_h(c, "member"),
+    )
+    assert response.status_code == 201, response.text
+    assert (await _kg_stored(c, response.json()["id"]))["visibility"] == visibility
+
+
+async def test_kg_workspace_visibility_without_workspace_is_422_and_creates_nothing(corpus):
+    c = corpus
+    before = await _kg_counts(c)
+    response = await c["client"].post(
+        "/v1/kg",
+        json={
+            "subject": "invalid",
+            "predicate": "has_scope",
+            "object": "workspace",
+            "visibility": "workspace",
+        },
+        headers=_h(c, "member"),
+    )
+    assert response.status_code == 422
+    assert await _kg_counts(c) == before
+
+
+async def test_kg_unknown_and_nonmember_workspace_are_identical_404s_and_create_nothing(corpus):
+    c = corpus
+    before = await _kg_counts(c)
+    unknown = await c["client"].post(
+        "/v1/kg",
+        json={
+            "subject": "unknown",
+            "predicate": "in",
+            "object": "workspace",
+            "workspace": f"unknown-{c['tag']}",
+        },
+        headers=_h(c, "outsider"),
+    )
+    nonmember = await c["client"].post(
+        "/v1/kg",
+        json={
+            "subject": "nonmember",
+            "predicate": "in",
+            "object": "workspace",
+            "workspace": f"alpha-{c['tag']}",
+        },
+        headers=_h(c, "outsider"),
+    )
+    assert unknown.status_code == nonmember.status_code == 404
+    assert unknown.json() == nonmember.json()
+    assert await _kg_counts(c) == before
+
+
+async def test_kg_admin_same_tenant_bypass_and_cross_tenant_rejection(corpus):
+    c = corpus
+    same_tenant = await c["client"].post(
+        "/v1/kg",
+        json={
+            "subject": "admin",
+            "predicate": "uses",
+            "object": "workspace",
+            "workspace": f"alpha-{c['tag']}",
+        },
+        headers=_h(c, "admin"),
+    )
+    assert same_tenant.status_code == 201, same_tenant.text
+    assert (await _kg_stored(c, same_tenant.json()["id"]))["item_workspace_id"] == c["alpha"]
+
+    before = await _kg_counts(c)
+    cross_tenant = await c["client"].post(
+        "/v1/kg",
+        json={
+            "subject": "admin",
+            "predicate": "crosses",
+            "object": "tenant",
+            "workspace": f"beta-{c['tag']}",
+        },
+        headers=_h(c, "admin"),
+    )
+    assert cross_tenant.status_code == 404
+    assert await _kg_counts(c) == before
+
+
+async def test_kg_existing_source_scope_is_authoritative_and_mismatches_are_rejected(corpus):
+    c = corpus
+    source = await c["client"].post(
+        "/v1/remember",
+        json={"content": "source scope", "workspace": f"alpha-{c['tag']}"},
+        headers=_h(c, "member"),
+    )
+    assert source.status_code == 201, source.text
+
+    derived = await c["client"].post(
+        "/v1/kg",
+        json={
+            "subject": "source",
+            "predicate": "derives",
+            "object": "scope",
+            "source_item_id": source.json()["id"],
+        },
+        headers=_h(c, "member"),
+    )
+    assert derived.status_code == 201, derived.text
+    stored = await _kg_stored(c, derived.json()["id"])
+    assert stored["visibility"] == "workspace"
+    assert stored["triple_workspace_id"] == c["alpha"]
+
+    before = await _kg_counts(c)
+    mismatch = await c["client"].post(
+        "/v1/kg",
+        json={
+            "subject": "source",
+            "predicate": "widens",
+            "object": "scope",
+            "source_item_id": source.json()["id"],
+            "visibility": "tenant",
+        },
+        headers=_h(c, "member"),
+    )
+    assert mismatch.status_code == 422
+    assert await _kg_counts(c) == before
+
+
+async def test_kg_inaccessible_source_item_is_non_disclosing_404(corpus):
+    c = corpus
+    source = await c["client"].post(
+        "/v1/remember",
+        json={"content": "private KG source"},
+        headers=_h(c, "member"),
+    )
+    assert source.status_code == 201
+    before = await _kg_counts(c)
+    response = await c["client"].post(
+        "/v1/kg",
+        json={
+            "subject": "hidden",
+            "predicate": "has",
+            "object": "source",
+            "source_item_id": source.json()["id"],
+        },
+        headers=_h(c, "outsider"),
+    )
+    assert response.status_code == 404
+    assert await _kg_counts(c) == before
+
+
 async def test_direct_private_write_available_without_workspace_membership(corpus):
     c = corpus
     resp = await c["client"].post(
@@ -368,6 +589,7 @@ async def test_membership_revoked_between_classify_and_remember_blocks_consumpti
         "/v1/classify", json={"content": "revoked membership", "workspace": slug}, headers=_h(c, "member")
     )
     assert classified.status_code == 200, classified.text
+    before_items = (await _counts(c))[0]
 
     async with c["owner"].begin() as conn:
         await conn.execute(
@@ -385,6 +607,7 @@ async def test_membership_revoked_between_classify_and_remember_blocks_consumpti
         headers=_h(c, "member"),
     )
     assert resp.status_code == 404
+    assert (await _counts(c))[0] == before_items
 
     async with c["owner"].connect() as conn:
         run = (
@@ -394,3 +617,187 @@ async def test_membership_revoked_between_classify_and_remember_blocks_consumpti
             )
         ).one()
     assert tuple(run) == (None, None)
+
+
+async def test_authenticated_classify_remember_consumes_receipt_and_replay_is_idempotent(corpus):
+    c = corpus
+    content = "authenticated receipt success"
+    before_items = (await _counts(c))[0]
+    async with c["owner"].connect() as conn:
+        assert await conn.scalar(
+            text("SELECT has_table_privilege('engram_app', 'candidate_ingests', 'SELECT')")
+        ) is True
+        assert await conn.scalar(
+            text("SELECT has_table_privilege('engram_app', 'candidate_ingests', 'INSERT')")
+        ) is True
+        assert await conn.scalar(
+            text("SELECT has_table_privilege('engram_app', 'candidate_ingests', 'UPDATE')")
+        ) is False
+        assert await conn.scalar(
+            text("SELECT has_table_privilege('engram_app', 'candidate_ingests', 'DELETE')")
+        ) is False
+    classified = await c["client"].post(
+        "/v1/classify",
+        json={"content": content},
+        headers=_h(c, "member"),
+    )
+    assert classified.status_code == 200, classified.text
+    receipt_id = classified.json()["classification_run_id"]
+    ingest_id = classified.json()["ingest_id"]
+
+    remembered = await c["client"].post(
+        "/v1/remember",
+        json={"content": content, "classification_run_id": receipt_id},
+        headers=_h(c, "member"),
+    )
+    assert remembered.status_code in (200, 201), remembered.text
+    assert remembered.json()["status"] == "created"
+    assert remembered.json()["ingest_id"] == ingest_id
+    assert (await _counts(c))[0] == before_items + 1
+
+    async with c["owner"].connect() as conn:
+        bound_before = (
+            await conn.execute(
+                text(
+                    "SELECT ingest_id, memory_item_id, bound_at FROM classification_runs "
+                    "WHERE id = :id"
+                ),
+                {"id": receipt_id},
+            )
+        ).one()
+    assert str(bound_before.ingest_id) == ingest_id
+    assert str(bound_before.memory_item_id) == remembered.json()["id"]
+    assert bound_before.bound_at is not None
+
+    replay = await c["client"].post(
+        "/v1/remember",
+        json={"content": content, "classification_run_id": receipt_id},
+        headers=_h(c, "member"),
+    )
+    assert replay.status_code in (200, 201), replay.text
+    assert replay.json()["status"] == "deduped"
+    assert replay.json()["id"] == remembered.json()["id"]
+    assert replay.json()["ingest_id"] == ingest_id
+    assert (await _counts(c))[0] == before_items + 1
+
+    async with c["owner"].connect() as conn:
+        bound_after = (
+            await conn.execute(
+                text(
+                    "SELECT ingest_id, memory_item_id, bound_at FROM classification_runs "
+                    "WHERE id = :id"
+                ),
+                {"id": receipt_id},
+            )
+        ).one()
+    assert bound_after == bound_before
+
+
+async def test_matching_body_ingest_succeeds_and_mismatched_ingest_is_safe_conflict(corpus):
+    c = corpus
+    matching_content = "matching body supplied ingest"
+    classified = await c["client"].post(
+        "/v1/classify",
+        json={"content": matching_content},
+        headers=_h(c, "member"),
+    )
+    assert classified.status_code == 200
+    body = classified.json()
+    matched = await c["client"].post(
+        "/v1/remember",
+        json={
+            "content": matching_content,
+            "classification_run_id": body["classification_run_id"],
+            "ingest_id": body["ingest_id"],
+        },
+        headers=_h(c, "member"),
+    )
+    assert matched.status_code in (200, 201), matched.text
+    assert matched.json()["ingest_id"] == body["ingest_id"]
+
+    conflict_content = "mismatched body supplied ingest"
+    conflict_run = await c["client"].post(
+        "/v1/classify",
+        json={"content": conflict_content},
+        headers=_h(c, "member"),
+    )
+    other_run = await c["client"].post(
+        "/v1/classify",
+        json={"content": "different candidate identity"},
+        headers=_h(c, "member"),
+    )
+    assert conflict_run.status_code == other_run.status_code == 200
+    before_items = (await _counts(c))[0]
+    rejected = await c["client"].post(
+        "/v1/remember",
+        json={
+            "content": conflict_content,
+            "classification_run_id": conflict_run.json()["classification_run_id"],
+            "ingest_id": other_run.json()["ingest_id"],
+        },
+        headers=_h(c, "member"),
+    )
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"] == "ingest_id does not match classification run"
+    assert (await _counts(c))[0] == before_items
+
+    async with c["owner"].connect() as conn:
+        rows = (
+            await conn.execute(
+                text(
+                    "SELECT id, ingest_id, memory_item_id, bound_at FROM classification_runs "
+                    "WHERE id IN (:one, :two) ORDER BY id"
+                ),
+                {
+                    "one": conflict_run.json()["classification_run_id"],
+                    "two": other_run.json()["classification_run_id"],
+                },
+            )
+        ).all()
+    assert {str(row.ingest_id) for row in rows} == {
+        conflict_run.json()["ingest_id"],
+        other_run.json()["ingest_id"],
+    }
+    assert all(row.memory_item_id is None and row.bound_at is None for row in rows)
+
+
+async def test_nonmember_classify_creates_no_ingest_or_receipt(corpus):
+    c = corpus
+    before = await _counts(c)
+    response = await c["client"].post(
+        "/v1/classify",
+        json={"content": "nonmember classify proof", "workspace": f"alpha-{c['tag']}"},
+        headers=_h(c, "outsider"),
+    )
+    assert response.status_code == 404
+    assert await _counts(c) == before
+
+
+async def test_concurrent_receipt_use_serializes_binding_without_duplicate_item(corpus):
+    c = corpus
+    content = "concurrent authenticated receipt"
+    classified = await c["client"].post(
+        "/v1/classify",
+        json={"content": content},
+        headers=_h(c, "member"),
+    )
+    assert classified.status_code == 200
+    receipt_id = classified.json()["classification_run_id"]
+    ingest_id = classified.json()["ingest_id"]
+    before_items = (await _counts(c))[0]
+
+    async def consume() -> Any:
+        return await c["client"].post(
+            "/v1/remember",
+            json={"content": content, "classification_run_id": receipt_id},
+            headers=_h(c, "member"),
+        )
+
+    first, second = await asyncio.gather(consume(), consume())
+    assert first.status_code in (200, 201), first.text
+    assert second.status_code in (200, 201), second.text
+    bodies = [first.json(), second.json()]
+    assert {body["status"] for body in bodies} == {"created", "deduped"}
+    assert len({body["id"] for body in bodies}) == 1
+    assert {body["ingest_id"] for body in bodies} == {ingest_id}
+    assert (await _counts(c))[0] == before_items + 1

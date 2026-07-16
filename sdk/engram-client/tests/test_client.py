@@ -354,7 +354,12 @@ async def test_kg_add_success() -> None:
     )
     async with _client(rec) as client:
         resp = await client.kg_add(
-            "users", "located_in", "us-east-1", source_item_id=ITEM_ID, confidence=0.7
+            "users",
+            "located_in",
+            "us-east-1",
+            visibility="tenant",
+            source_item_id=ITEM_ID,
+            confidence=0.7,
         )
     assert isinstance(resp, KgAddResponse)
     assert resp.id == UUID(OTHER_ID)
@@ -364,7 +369,20 @@ async def test_kg_add_success() -> None:
     assert body["subject"] == "users"
     assert body["object"] == "us-east-1"
     assert body["source_item_id"] == ITEM_ID
+    assert body["visibility"] == "tenant"
     assert body["confidence"] == 0.7
+    assert "workspace" not in body
+
+
+async def test_kg_add_omits_unspecified_scope() -> None:
+    rec = _Recorder(
+        status_code=201,
+        payload={"id": OTHER_ID, "triple": {}, "source_item_id": ITEM_ID},
+    )
+    async with _client(rec) as client:
+        await client.kg_add("a", "rel", "b")
+    body = _body(rec.request)
+    assert "visibility" not in body
     assert "workspace" not in body
 
 

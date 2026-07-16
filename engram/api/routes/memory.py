@@ -26,8 +26,8 @@ from engram.authority import authority_allows_supersession, authority_label, der
 from engram.candidate_ingests import (
     CandidateIdentity,
     create_ingest,
+    get_ingest,
     identity_mismatches,
-    lock_ingest,
 )
 from engram.canonicalize import canonicalize, content_hash
 from engram.classification import ClassificationResult, classify_rules_only
@@ -627,9 +627,9 @@ async def _remember_impl(
             )
         if receipt.ingest_id is None:  # pragma: no cover - guarded above
             raise RuntimeError("classification run has no ingest identity")
-        ingest = await lock_ingest(session, receipt.ingest_id)
+        ingest = await get_ingest(session, receipt.ingest_id)
     elif req.ingest_id is not None:
-        ingest = await lock_ingest(session, req.ingest_id)
+        ingest = await get_ingest(session, req.ingest_id)
         if ingest is None:
             await record_ingest_reuse_rejected(
                 tenant_id=tenant_id,

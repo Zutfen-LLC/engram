@@ -113,7 +113,7 @@ class MemoryItem(Base):
         UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
     )
     workspace_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True
+        UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="RESTRICT"), nullable=True
     )
     principal_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("principals.id"), nullable=False
