@@ -114,7 +114,7 @@ async def _insert_item(
                 "source_type, human_verified"
                 ") VALUES ("
                 ":id, :tenant_id, :principal_id, :content, :content_hash, 'fact', "
-                "'workspace', :review_status, 0.8, 0.7, 0.5, "
+                "'tenant', :review_status, 0.8, 0.7, 0.5, "
                 "'manual', :human_verified"
                 ")"
             ),

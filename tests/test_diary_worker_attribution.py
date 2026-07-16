@@ -759,7 +759,7 @@ async def _worker_item(
                 "(id,tenant_id,principal_id,content,content_hash,kind,visibility,review_status,"
                 "memory_confidence,source_trust,importance,source_type,authority,sensitivity,"
                 "created_at,valid_to,superseded_by) VALUES "
-                "(:id,:tenant,:principal,:content,:hash,'fact','workspace',:review,.2,.9,.4,"
+                "(:id,:tenant,:principal,:content,:hash,'fact','tenant',:review,.2,.9,.4,"
                 "'extraction',:authority,'normal',:created,:valid_to,:superseded_by)"
             ),
             {

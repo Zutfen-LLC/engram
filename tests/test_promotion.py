@@ -249,7 +249,7 @@ async def _insert_item(
                 "conflicts_with_item_id, valid_to, superseded_by, created_at, valid_from"
                 ") VALUES ("
                 ":id, :tenant_id, :principal_id, :content, :content_hash, :kind, "
-                "'workspace', :review_status, :memory_confidence, :source_trust, "
+                "'tenant', :review_status, :memory_confidence, :source_trust, "
                 ":source_confidence_prior, :retention_confidence, :retention_disposition, "
                 ":retention_evidence_at, :authority, 0.5, :source_type, "
                 ":conflict_resolution_status, "
@@ -1918,7 +1918,7 @@ async def test_embeddings_off_same_subject_conflict_blocks_promotion():
                     "content_hash, kind, visibility, review_status, memory_confidence, "
                     "source_trust, importance, source_type, subject_type, subject_id, "
                     "created_at, valid_from) VALUES (:id, :tid, :pid, :content, :hash, "
-                    "'fact', 'workspace', :status, 0.9, 0.5, 0.5, 'manual', 'domain_entity', "
+                    "'fact', 'tenant', :status, 0.9, 0.5, 0.5, 'manual', 'domain_entity', "
                     "'alice', :created_at, :created_at)"
                 ),
                 {
@@ -1975,7 +1975,7 @@ async def test_embeddings_off_exact_same_subject_content_still_promotes():
                     "content_hash, kind, visibility, review_status, memory_confidence, "
                     "source_trust, importance, source_type, subject_type, subject_id, "
                     "created_at, valid_from) VALUES (:id, :tid, :pid, 'Bob is an engineer', "
-                    ":hash, 'fact', 'workspace', :status, 0.9, 0.5, 0.5, 'manual', "
+                    ":hash, 'fact', 'tenant', :status, 0.9, 0.5, 0.5, 'manual', "
                     "'domain_entity', 'bob', :created_at, :created_at)"
                 ),
                 {

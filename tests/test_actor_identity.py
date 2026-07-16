@@ -118,7 +118,7 @@ async def _insert_item(
                 "source_type, conflicts_with_item_id, conflict_resolution_status"
                 ") VALUES ("
                 ":id, :tenant_id, :principal_id, :content, :content_hash, 'fact', "
-                "'workspace', :review_status, 0.8, 0.7, 0.5, "
+                "'tenant', :review_status, 0.8, 0.7, 0.5, "
                 "'manual', :conflicts_with_item_id, :conflict_resolution_status"
                 ")"
             ),
