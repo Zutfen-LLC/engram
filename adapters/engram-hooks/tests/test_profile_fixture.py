@@ -31,14 +31,14 @@ def test_profile_fixture_exists() -> None:
     )
 
 
-def test_profile_loads_engram_hooks_install_entrypoint() -> None:
+def test_profile_enables_general_engram_plugin() -> None:
     profile = _load_profile()
-    plugins = profile.get("plugins", [])
-    entrypoints = [p.get("entrypoint") for p in plugins]
-    assert "engram_hooks:install" in entrypoints, (
-        "profile must call engram_hooks:install() at startup — the whole point "
-        "of this slice is that the shim is no longer inert"
-    )
+    assert "engram_memory" in profile.get("plugins", {}).get("enabled", [])
+
+
+def test_profile_selects_engram_memory_provider() -> None:
+    profile = _load_profile()
+    assert profile.get("memory", {}).get("provider") == "engram_memory"
 
 
 def test_profile_no_longer_uses_zutfen_memory() -> None:
@@ -61,3 +61,10 @@ def test_profile_defaults_compat_shim_on_and_hard_fail_off() -> None:
     # require_automatic_capture defaults off so the profile can still start
     # (and fall back to explicit MCP dogfooding) if Hermes' internals drift.
     assert env.get("ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE") == "false"
+    assert env.get("ENGRAM_HOOKS_RECALL_ENABLED") == "true"
+
+
+def test_profile_has_no_obsolete_pseudo_entrypoint() -> None:
+    text = _PROFILE_PATH.read_text()
+    assert "engram_hooks:install" not in text
+    assert "call_once" not in text

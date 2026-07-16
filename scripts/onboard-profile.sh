@@ -40,6 +40,8 @@ if [[ ! -d "$HERMES_HOME/profiles" ]]; then
     HERMES_HOME="$HOME/.hermes"
 fi
 ENGRAM_HOOKS_VENV="${HERMES_VENV:-$HOME/.hermes/hermes-agent/venv}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # --- Arg parsing ------------------------------------------------------------
 
@@ -77,7 +79,7 @@ PROFILE_DIR="$HERMES_HOME/profiles/$PROFILE_NAME"
 [[ ! -d "$PROFILE_DIR" ]] && { echo "ERROR: Profile dir not found: $PROFILE_DIR"; exit 1; }
 
 PLUGIN_DIR="$HERMES_HOME/plugins/engram_memory"
-REPO_PLUGIN="$HOME/code/engram/adapters/engram-hooks/hermes_plugin/engram_memory"
+REPO_PLUGIN="$REPO_ROOT/adapters/engram-hooks/hermes_plugin/engram_memory"
 
 echo "Engram Profile Onboarding"
 echo "=========================="
@@ -175,24 +177,14 @@ else
     touch "$ENV_FILE"
     grep -q "^ENGRAM_BASE_URL=" "$ENV_FILE" && sed -i "s|^ENGRAM_BASE_URL=.*|ENGRAM_BASE_URL=$BASE_URL|" "$ENV_FILE" || echo "ENGRAM_BASE_URL=$BASE_URL" >> "$ENV_FILE"
     grep -q "^ENGRAM_API_KEY=" "$ENV_FILE" && sed -i "s|^ENGRAM_API_KEY=.*|ENGRAM_API_KEY=$NEW_API_KEY|" "$ENV_FILE" || echo "ENGRAM_API_KEY=$NEW_API_KEY" >> "$ENV_FILE"
-    echo "  .env updated with agent key"
+    grep -q "^ENGRAM_HOOKS_RECALL_ENABLED=" "$ENV_FILE" && sed -i "s|^ENGRAM_HOOKS_RECALL_ENABLED=.*|ENGRAM_HOOKS_RECALL_ENABLED=true|" "$ENV_FILE" || echo "ENGRAM_HOOKS_RECALL_ENABLED=true" >> "$ENV_FILE"
+    echo "  .env updated with agent key and same-turn recall flag"
 
-    # config.yaml — set provider
+    # config.yaml — select the provider AND independently enable the general
+    # plugin face. The helper preserves unrelated settings and enabled plugins.
     CONFIG_FILE="$PROFILE_DIR/config.yaml"
     if [[ -f "$CONFIG_FILE" ]]; then
-        if grep -q "^memory:" "$CONFIG_FILE"; then
-            if grep -A 10 "^memory:" "$CONFIG_FILE" | grep -q "provider:"; then
-                sed -i "/^memory:/,/^[^ ]/ s/provider:.*/provider: engram_memory/" "$CONFIG_FILE"
-            else
-                sed -i "/^memory:/a\\  provider: engram_memory" "$CONFIG_FILE"
-            fi
-        else
-            echo -e "\nmemory:\n  memory_enabled: true\n  user_profile_enabled: true\n  provider: engram_memory" >> "$CONFIG_FILE"
-        fi
-
-        if ! grep -q "ENGRAM_HOOKS_COMPAT_SHIM" "$CONFIG_FILE"; then
-            sed -i "/^memory:/a\\  ENGRAM_HOOKS_COMPAT_SHIM: true\n  ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE: false" "$CONFIG_FILE"
-        fi
+        python3 "$SCRIPT_DIR/update-hermes-profile.py" "$CONFIG_FILE"
         echo "  config.yaml updated"
     else
         echo "  WARNING: config.yaml not found at $CONFIG_FILE"
