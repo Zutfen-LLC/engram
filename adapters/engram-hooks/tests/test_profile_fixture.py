@@ -54,13 +54,13 @@ def test_profile_keeps_mcp_server_registration() -> None:
     )
 
 
-def test_profile_defaults_compat_shim_on_and_hard_fail_off() -> None:
+def test_profile_defaults_compat_shim_on_and_hard_fail_on() -> None:
     profile = _load_profile()
     env = profile.get("env", {})
     assert env.get("ENGRAM_HOOKS_COMPAT_SHIM") == "true"
-    # require_automatic_capture defaults off so the profile can still start
-    # (and fall back to explicit MCP dogfooding) if Hermes' internals drift.
-    assert env.get("ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE") == "false"
+    # A provider selected as authoritative must never degrade silently to
+    # recall-only mode if Hermes' internal write contract drifts.
+    assert env.get("ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE") == "true"
     assert env.get("ENGRAM_HOOKS_RECALL_ENABLED") == "true"
 
 

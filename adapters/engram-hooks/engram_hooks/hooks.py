@@ -26,11 +26,11 @@ Compatibility shim
 ------------------
 The upstream ``prepare_memory_write`` hook (PR #59898) is not in stock Hermes.
 :func:`install` detects whether it exists on the ``MemoryProvider`` ABC at load
-time. If present, our guard is registered as the native hook. If missing, a
-~20-line runtime monkey-patch wraps the two memory-tool dispatch sites
-(``tool_executor.memory`` and ``agent_runtime_helpers.memory``) so our guard
-runs before any native write. In both cases the plugin works with stock Hermes
-— no fork, no source editing.
+time. If present, the provider's native hook is authoritative. If missing, the
+shim wraps ``tools.memory_tool.memory_tool``, the late-imported write boundary
+shared by stock Hermes' executor paths. Accepted durable adds are handled by
+the active Engram provider and never reach the native store; rejected adds are
+blocked at the same boundary. No Hermes source is edited.
 """
 
 from __future__ import annotations
@@ -38,8 +38,9 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal, cast
 
 from .config import HooksConfig
 from .guards import GuardVerdict, is_allowed, prepare_memory_write_guard
@@ -120,18 +121,17 @@ class _SessionContext:
 # click away.
 _UPSTREAM_PR_URL = "https://github.com/NousResearch/hermes-agent/pull/59898"
 
-# Hermes internal modules whose memory() dispatch we wrap when the native hook
-# is absent. These are imported lazily so the plugin loads on stock Hermes (and
-# on machines where Hermes isn't installed at all).
-_HERMES_DISPATCH_MODULES = (
-    "hermes_agent.tools.tool_executor",
-    "hermes_agent.runtime.agent_runtime_helpers",
-    # Current Hermes tree / package layout in local installs.
-    "agent.tool_executor",
-    "agent.agent_runtime_helpers",
-)
-# Attribute names the memory() dispatch may live under across Hermes versions.
-_MEMORY_DISPATCH_ATTRS = ("memory", "execute_memory_tool", "call_memory")
+# Source provenance for the stock-Hermes contract implemented below. Both
+# ``agent/tool_executor.py`` and ``agent/agent_runtime_helpers.py`` late-import
+# this exact symbol at execution time. The general pre-tool hook can veto a
+# call, but can only produce a blocked/error result, so it cannot replace a
+# successful accepted write.
+HERMES_REFERENCE_REPOSITORY = "NousResearch/hermes-agent"
+HERMES_REFERENCE_SHA = "75467998f90ba87adf66e1254a4d163345f23a5f"
+_HERMES_MEMORY_TOOL_MODULE = "tools.memory_tool"
+_HERMES_MEMORY_TOOL_ATTR = "memory_tool"
+
+WriteInterceptor = Callable[..., dict[str, Any] | None]
 
 
 # ---------------------------------------------------------------------------
@@ -590,14 +590,17 @@ class InstallStatus:
 
     native_hook_available: bool
     compat_shim_installed: bool
+    activation_mode: Literal[
+        "native_prepare", "stock_compat", "recall_only", "incompatible"
+    ]
     patched_modules: list[str] = field(default_factory=list)
     failure_reason: str | None = None
     detection: dict[str, Any] = field(default_factory=dict)
 
     @property
     def automatic_capture_active(self) -> bool:
-        """True iff Hermes will actually route writes through our guard."""
-        return self.native_hook_available or self.compat_shim_installed
+        """True iff Hermes will route writes through an Engram interceptor."""
+        return self.activation_mode in {"native_prepare", "stock_compat"}
 
     def describe(self) -> str:
         """One-line human-readable summary, used for the startup log line."""
@@ -605,7 +608,7 @@ class InstallStatus:
             return f"native prepare_memory_write active (provider={self.detection.get('provider')})"
         if self.compat_shim_installed:
             return f"compatibility shim active (patched={', '.join(self.patched_modules)})"
-        return f"automatic capture DISABLED — {self.failure_reason}"
+        return f"{self.activation_mode}: automatic writes INACTIVE — {self.failure_reason}"
 
 
 def detect_prepare_memory_write() -> dict[str, Any]:
@@ -675,84 +678,201 @@ def _find_memory_provider() -> type:
     )
 
 
-# Marker attribute set on our wrapper functions. Its presence on a module
-# attribute is how we detect "already patched" so a second install() call
-# (e.g. a test harness re-installing, or a plugin loader calling install()
-# more than once) never wraps a wrapper — the double-wrap idempotency AC.
+# Marker and original attributes are kept on our wrapper so repeated installs
+# update only the active callback, never nest wrappers, and disabled mode can
+# restore the exact pre-shim function.
 _SHIM_MARKER = "__engram_hooks_shim__"
+_SHIM_ORIGINAL = "__engram_hooks_original__"
 
 
-def _patch_memory_dispatch(mod: Any) -> bool:
-    """Wrap one module's memory() dispatch to route through our guard.
+def _replacement_result(result: dict[str, Any] | None) -> str:
+    """Convert the provider interception contract to stock Hermes JSON."""
+    import json
 
-    Returns ``True`` if a dispatch function is patched (or was already
-    patched by a prior :func:`install` call — idempotent no-op), ``False`` if
-    no known dispatch attribute exists on ``mod``.
-
-    The wrapper looks up :func:`get_active_hooks` *at call time* rather than
-    closing over a fixed ``LifecycleHooks`` instance, so a later ``install()``
-    (which rebinds the module-level active hooks) is picked up without
-    re-patching. If no hooks are installed when the wrapper fires, it falls
-    back to the stateless :func:`prepare_memory_write_guard` so the guard is
-    never silently bypassed.
-    """
-    for attr in _MEMORY_DISPATCH_ATTRS:
-        original = getattr(mod, attr, None)
-        if not callable(original):
-            continue
-        if getattr(original, _SHIM_MARKER, False):
-            # Already wrapped by a previous install() — idempotent no-op.
-            return True
-
-        def wrapper(content: str, *args: Any, _orig: Any = original, **kw: Any) -> Any:
-            active = get_active_hooks()
-            verdict = (
-                active.prepare_memory_write(content, **kw)
-                if active is not None
-                else prepare_memory_write_guard(content, **kw)
-            )
-            if not is_allowed(verdict):
-                logger.info(
-                    "engram-hooks compat shim rejected a memory write: %s",
-                    verdict.get("reason"),
-                )
-                return verdict  # {handled: True, action: reject} — active rejection
-            return _orig(content, *args, **kw)
-
-        setattr(wrapper, _SHIM_MARKER, True)
-        setattr(mod, attr, wrapper)
-        logger.info(
-            "engram-hooks compat shim wrapped %s.%s", mod.__name__, attr
+    if not isinstance(result, dict) or result.get("handled") is not True:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "Engram write interceptor did not handle a durable add; "
+                    "native write blocked"
+                ),
+                "provider": "engram",
+                "native_write": False,
+            },
+            ensure_ascii=False,
         )
+    replacement = result.get("result")
+    if isinstance(replacement, dict):
+        payload = dict(replacement)
+    elif isinstance(replacement, str):
+        payload = {"success": True, "message": replacement}
+    else:
+        payload = {"success": True, "message": "Handled by Engram"}
+    payload.setdefault("provider", "engram")
+    payload.setdefault("native_write", False)
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _batch_contains_add(operations: Any) -> bool:
+    """Return true for any batch that could otherwise persist a native add."""
+    return isinstance(operations, list) and any(
+        isinstance(operation, dict) and operation.get("action") == "add"
+        for operation in operations
+    )
+
+
+def _patch_memory_tool(mod: Any) -> bool:
+    """Wrap stock Hermes' shared memory-tool write boundary."""
+    import json
+
+    original = getattr(mod, _HERMES_MEMORY_TOOL_ATTR, None)
+    if not callable(original):
+        return False
+    if getattr(original, _SHIM_MARKER, False):
         return True
-    return False
+
+    def wrapper(
+        action: str | None = None,
+        target: str | None = "memory",
+        content: str | None = None,
+        old_text: str | None = None,
+        operations: Any = None,
+        store: Any = None,
+    ) -> str:
+        # Stock Hermes batches are atomic. Engram does not yet reconcile
+        # replace/remove, so an add-containing batch is rejected as a whole;
+        # no prefix is submitted and the native store remains untouched.
+        if _batch_contains_add(operations):
+            logger.info("engram-hooks rejected unsupported add-containing memory batch")
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        "Engram governs durable adds and does not yet support add-containing "
+                        "memory batches; split the durable add into a single memory call"
+                    ),
+                    "provider": "engram",
+                    "native_write": False,
+                },
+                ensure_ascii=False,
+            )
+
+        effective_target = target or "memory"
+        if action == "add" and effective_target in {"memory", "user"}:
+            interceptor = get_active_write_interceptor()
+            if interceptor is None:
+                logger.error(
+                    "engram-hooks wrapper is active without a write interceptor; "
+                    "blocking native durable add"
+                )
+                return _replacement_result(None)
+            try:
+                result = interceptor(
+                    action="add",
+                    target=effective_target,
+                    content=content or "",
+                    metadata=None,
+                    old_text=old_text,
+                )
+            except Exception as exc:
+                logger.exception("Engram write interception failed; native add blocked")
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": f"Engram write interception failed: {exc}",
+                        "provider": "engram",
+                        "native_write": False,
+                    },
+                    ensure_ascii=False,
+                )
+            return _replacement_result(result)
+
+        return cast(
+            str,
+            original(
+                action=action,
+                target=target,
+                content=content,
+                old_text=old_text,
+                operations=operations,
+                store=store,
+            ),
+        )
+
+    setattr(wrapper, _SHIM_MARKER, True)
+    setattr(wrapper, _SHIM_ORIGINAL, original)
+    setattr(mod, _HERMES_MEMORY_TOOL_ATTR, wrapper)
+    logger.info(
+        "engram-hooks stock-Hermes interception active: %s.%s (reference %s@%s)",
+        _HERMES_MEMORY_TOOL_MODULE,
+        _HERMES_MEMORY_TOOL_ATTR,
+        HERMES_REFERENCE_REPOSITORY,
+        HERMES_REFERENCE_SHA,
+    )
+    return True
 
 
-def install_compat_shim(hooks: LifecycleHooks) -> InstallStatus:
+def _restore_memory_tool() -> bool:
+    """Restore a wrapper installed by this module, if one is present."""
+    try:
+        mod = __import__(_HERMES_MEMORY_TOOL_MODULE, fromlist=["*"])
+    except ImportError:
+        return False
+    current = getattr(mod, _HERMES_MEMORY_TOOL_ATTR, None)
+    original = getattr(current, _SHIM_ORIGINAL, None)
+    if not getattr(current, _SHIM_MARKER, False) or not callable(original):
+        return False
+    setattr(mod, _HERMES_MEMORY_TOOL_ATTR, original)
+    logger.info("engram-hooks restored native %s.memory_tool", _HERMES_MEMORY_TOOL_MODULE)
+    return True
+
+
+def install_compat_shim(
+    hooks: LifecycleHooks,
+    write_interceptor: WriteInterceptor | None = None,
+) -> InstallStatus:
     """Detect ``prepare_memory_write`` and patch dispatch if it's missing.
 
-    This is the ~20-line compatibility shim the task spec calls for. It:
+    It detects whether the hook exists natively (PR #59898), otherwise wraps
+    the pinned stock-Hermes ``tools.memory_tool.memory_tool`` boundary.
 
-    1. Detects whether the hook exists natively (PR #59898 merged).
-    2. If yes: logs that we're using it natively and returns.
-    3. If no: wraps each memory() dispatch site so our guard runs first.
-
-    ``hooks`` is accepted for backward compatibility / explicitness at the
-    call site but the actual patched wrappers dispatch through
-    :func:`get_active_hooks` at call time (see :func:`_patch_memory_dispatch`).
+    ``hooks`` remains explicit at the call site. ``write_interceptor`` must be
+    the active provider's governed pre-write callback. The wrapper resolves it
+    again at call time, so provider reload updates ownership without rewraps.
 
     Returns an :class:`InstallStatus` — the same structure :func:`install`
     returns — so callers and tests never have to parse log output.
     """
+    global ACTIVE_WRITE_INTERCEPTOR
+    del hooks
+    ACTIVE_WRITE_INTERCEPTOR = write_interceptor
     detection = detect_prepare_memory_write()
 
+    if write_interceptor is None:
+        reason = (
+            "no Engram provider write interceptor was registered; refusing to claim "
+            "automatic capture"
+        )
+        return InstallStatus(
+            native_hook_available=False,
+            compat_shim_installed=False,
+            activation_mode="incompatible",
+            failure_reason=reason,
+            detection=detection,
+        )
+
     if detection["hook_present"]:
+        _restore_memory_tool()
         logger.info(
             "prepare_memory_write found natively on %s — using hook directly, "
             "no monkey-patch needed.", detection["provider"]
         )
         return InstallStatus(
-            native_hook_available=True, compat_shim_installed=False, detection=detection,
+            native_hook_available=True,
+            compat_shim_installed=False,
+            activation_mode="native_prepare",
+            detection=detection,
         )
 
     if not detection["hermes_present"]:
@@ -765,6 +885,7 @@ def install_compat_shim(hooks: LifecycleHooks) -> InstallStatus:
         return InstallStatus(
             native_hook_available=False,
             compat_shim_installed=False,
+            activation_mode="recall_only",
             failure_reason=f"Hermes is not installed in this process ({detection['error']})",
             detection=detection,
         )
@@ -774,39 +895,35 @@ def install_compat_shim(hooks: LifecycleHooks) -> InstallStatus:
     # their memory tool dispatch is being wrapped.
     logger.warning(
         "prepare_memory_write NOT found on %s — applying runtime compat shim. "
-        "This monkey-patches the memory() dispatch to route writes through "
-        "engram-hooks' write-boundary guard. See PR #59898: %s",
+        "This wraps stock Hermes' shared memory_tool boundary to route accepted "
+        "adds to Engram and block native persistence. See PR #59898: %s",
         detection["provider"], _UPSTREAM_PR_URL,
     )
 
-    patched: list[str] = []
-    unimportable: list[str] = []
-    for mod_path in _HERMES_DISPATCH_MODULES:
-        try:
-            mod = __import__(mod_path, fromlist=["*"])
-        except ImportError:
-            logger.debug("Hermes module %s not importable — skipping", mod_path)
-            unimportable.append(mod_path)
-            continue
-        if _patch_memory_dispatch(mod):
-            patched.append(mod_path)
+    try:
+        mod = __import__(_HERMES_MEMORY_TOOL_MODULE, fromlist=["*"])
+    except ImportError as exc:
+        mod = None
+        target_error = repr(exc)
+    else:
+        target_error = "attribute missing or non-callable"
 
-    if not patched:
+    if mod is None or not _patch_memory_tool(mod):
         # Hermes is installed but every known dispatch site is gone or
         # renamed — API drift. Fail loudly with actionable diagnostics rather
         # than a debug-level "no patch applied" that an operator would miss.
         reason = (
-            "Hermes is installed but no known memory() dispatch site could be patched "
-            f"(tried modules {_HERMES_DISPATCH_MODULES!r}, attributes {_MEMORY_DISPATCH_ATTRS!r}; "
-            f"unimportable: {unimportable!r}). This usually means Hermes changed its "
-            "internal module layout — update _HERMES_DISPATCH_MODULES / "
-            "_MEMORY_DISPATCH_ATTRS in engram_hooks/hooks.py to match the installed "
-            "Hermes version."
+            "incompatible Hermes API shape: required stock capture target "
+            f"{_HERMES_MEMORY_TOOL_MODULE}.{_HERMES_MEMORY_TOOL_ATTR} unavailable "
+            f"({target_error}). Inspected contract: {HERMES_REFERENCE_REPOSITORY}@"
+            f"{HERMES_REFERENCE_SHA}; reinstall a compatible Engram plugin or disable "
+            "ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE only for deliberate recall-only mode."
         )
         logger.error("engram-hooks compat shim FAILED to patch: %s", reason)
         return InstallStatus(
             native_hook_available=False,
             compat_shim_installed=False,
+            activation_mode="incompatible",
             failure_reason=reason,
             detection=detection,
         )
@@ -814,7 +931,8 @@ def install_compat_shim(hooks: LifecycleHooks) -> InstallStatus:
     return InstallStatus(
         native_hook_available=False,
         compat_shim_installed=True,
-        patched_modules=patched,
+        activation_mode="stock_compat",
+        patched_modules=[_HERMES_MEMORY_TOOL_MODULE],
         detection=detection,
     )
 
@@ -824,7 +942,11 @@ def install_compat_shim(hooks: LifecycleHooks) -> InstallStatus:
 # ===========================================================================
 
 
-def install(config: HooksConfig | None = None) -> dict[str, Any]:
+def install(
+    config: HooksConfig | None = None,
+    *,
+    write_interceptor: WriteInterceptor | None = None,
+) -> dict[str, Any]:
     """Plugin load entry point: build hooks, apply shim, return state.
 
     Call this once per process at plugin load (Hermes' plugin discovery
@@ -838,7 +960,7 @@ def install(config: HooksConfig | None = None) -> dict[str, Any]:
 
     * Native ``prepare_memory_write`` present → registered natively, no patch.
     * Native hook absent, ``enable_compat_shim=True`` (default) → the compat
-      shim patches Hermes' memory() dispatch sites.
+      shim patches Hermes' shared ``tools.memory_tool.memory_tool`` boundary.
     * Native hook absent, ``enable_compat_shim=False`` → automatic capture is
       disabled; lifecycle hooks (``pre_compress``/``sync_turn``/``session_end``)
       still work if the profile wires them explicitly, but direct
@@ -850,7 +972,7 @@ def install(config: HooksConfig | None = None) -> dict[str, Any]:
     Idempotent: calling ``install()`` again re-detects and, if the compat
     shim already patched a module, recognizes the existing patch (via a
     marker attribute) instead of double-wrapping it — see
-    :func:`_patch_memory_dispatch`.
+    :func:`_patch_memory_tool`.
 
     The constructed ``LifecycleHooks`` is also stashed at module level
     (readable via :func:`get_active_hooks`) so the Hermes lifecycle bus can find
@@ -858,18 +980,34 @@ def install(config: HooksConfig | None = None) -> dict[str, Any]:
     handle is mutated by ``install()``, and a ``from … import`` of the name would
     capture the pre-install value.
     """
-    global ACTIVE_HOOKS, ACTIVE_STATUS
+    global ACTIVE_HOOKS, ACTIVE_STATUS, ACTIVE_WRITE_INTERCEPTOR
     hooks = LifecycleHooks(config)
     ACTIVE_HOOKS = hooks
+    ACTIVE_WRITE_INTERCEPTOR = write_interceptor
 
     if hooks.config.enable_compat_shim:
-        status = install_compat_shim(hooks)
+        status = install_compat_shim(hooks, write_interceptor)
     else:
-        status = InstallStatus(
-            native_hook_available=False,
-            compat_shim_installed=False,
-            failure_reason="compat shim disabled (ENGRAM_HOOKS_COMPAT_SHIM=false)",
-        )
+        _restore_memory_tool()
+        detection = detect_prepare_memory_write()
+        if detection["hook_present"] and write_interceptor is not None:
+            status = InstallStatus(
+                native_hook_available=True,
+                compat_shim_installed=False,
+                activation_mode="native_prepare",
+                detection=detection,
+            )
+        else:
+            status = InstallStatus(
+                native_hook_available=False,
+                compat_shim_installed=False,
+                activation_mode="recall_only",
+                failure_reason=(
+                    "compat shim disabled (ENGRAM_HOOKS_COMPAT_SHIM=false) and no active "
+                    "native prepare_memory_write contract"
+                ),
+                detection=detection,
+            )
     ACTIVE_STATUS = status
 
     logger.info(
@@ -905,9 +1043,15 @@ def get_install_status() -> InstallStatus | None:
     return ACTIVE_STATUS
 
 
+def get_active_write_interceptor() -> WriteInterceptor | None:
+    """Return the provider callback currently authoritative for durable adds."""
+    return ACTIVE_WRITE_INTERCEPTOR
+
+
 # Module-level handles set by install(). Read them through the accessor
 # functions above so callers always see the post-install value — a
 # `from engram_hooks import ACTIVE_HOOKS` binds at import time and would miss
 # a later install() rebind.
 ACTIVE_HOOKS: LifecycleHooks | None = None
 ACTIVE_STATUS: InstallStatus | None = None
+ACTIVE_WRITE_INTERCEPTOR: WriteInterceptor | None = None

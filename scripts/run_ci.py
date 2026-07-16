@@ -138,9 +138,8 @@ def main() -> int:
     _run("pytest", "-q", "adapters/mcp-server/tests", env=env)
 
     _section("engram-hooks Tests")
-    # No DB, no network, no real Hermes checkout needed: guard/detection/shim
-    # tests build a fake hermes_agent module tree in-process (see
-    # adapters/engram-hooks/tests/conftest.py).
+    # No DB or network needed: the write-contract suite uses a hermetic fixture
+    # derived from the pinned stock-Hermes revision.
     _run("pytest", "-q", "adapters/engram-hooks/tests")
 
     _section("CI Result")
