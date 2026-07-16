@@ -103,7 +103,10 @@ the Git dependencies into the live Hermes interpreter, and uses Hermes' native
 plugin manager for the nested `engram_memory` source. It enables both
 `memory.provider: engram_memory` and the independent general-plugin face while
 preserving unrelated settings and plugins. Reruns upgrade/force-reinstall the
-same components and keep the `.env` idempotent.
+same components and keep the `.env` idempotent. The requested `--ref` is fetched
+once and resolved to an exact commit before installation; that same commit is
+used for both direct-Git Python dependencies and the detached plugin checkout,
+and both requested and resolved revisions are reported.
 
 Use `bash -s --` for options, for example `--profile dogfood`,
 `--base-url https://engram.example.com`, `--ref main`, or `--dry-run`.

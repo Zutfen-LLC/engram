@@ -28,6 +28,8 @@ class Harness:
     log: Path
     env: dict[str, str]
     key: str
+    resolved_sha: str
+    advanced_sha: str
 
     def run(
         self,
@@ -85,6 +87,8 @@ def harness(tmp_path: Path) -> Harness:
     )
     env_file.chmod(0o640)
     log = tmp_path / "commands.log"
+    resolved_sha = "1" * 40
+    advanced_sha = "2" * 40
 
     live_python = live_bin / "python3"
     _write_executable(
@@ -98,6 +102,10 @@ if [[ "${{1:-}}" == "-m" && "${{2:-}}" == "pip" ]]; then
 fi
 if [[ "${{1:-}}" == "-c" && "${{2:-}}" == *"import engram_client"* ]]; then
   exit 0
+fi
+if [[ "${{1:-}}" == "-" && "${{2:-}}" == "verify-direct-url" ]]; then
+  [[ "${{3:-}}" == "$INSTALLER_TEST_RESOLVED_SHA" ]]
+  exit
 fi
 exec {sys.executable!s} "$@"
 """,
@@ -178,11 +186,48 @@ esac
         """#!/usr/bin/env bash
 set -eu
 printf 'git:%s\\n' "$*" >>"$INSTALLER_TEST_LOG"
-dest="${!#}"
-plugin_dir="$dest/adapters/engram-hooks/hermes_plugin/engram_memory"
-mkdir -p "$plugin_dir"
-printf 'name: engram_memory\nversion: 0.2.0\n' >"$plugin_dir/plugin.yaml"
-printf '# plugin\n' >"$plugin_dir/__init__.py"
+if [[ "$*" == *"$INSTALLER_TEST_MISSING_REF"* && -n "$INSTALLER_TEST_MISSING_REF" ]]; then
+  exit 2
+fi
+if [[ "${1:-}" == "init" ]]; then
+  mkdir -p "${!#}"
+  exit 0
+fi
+if [[ "${1:-}" != "-C" ]]; then
+  exit 64
+fi
+repo=$2
+shift 2
+case "${1:-}" in
+  fetch)
+    count_file="$INSTALLER_TEST_GIT_FETCH_COUNT"
+    count=0
+    [[ ! -f "$count_file" ]] || count=$(cat "$count_file")
+    count=$((count + 1))
+    printf '%s' "$count" >"$count_file"
+    sha="$INSTALLER_TEST_RESOLVED_SHA"
+    if [[ "${INSTALLER_TEST_ADVANCE_BRANCH:-0}" == 1 && "$count" -gt 1 ]]; then
+      sha="$INSTALLER_TEST_ADVANCED_SHA"
+    fi
+    printf '%s' "$sha" >"$repo/.fetch-sha"
+    ;;
+  rev-parse)
+    if [[ "${*: -1}" == 'FETCH_HEAD^{commit}' ]]; then
+      cat "$repo/.fetch-sha"
+    else
+      cat "$repo/.head-sha"
+    fi
+    ;;
+  checkout)
+    sha="${!#}"
+    printf '%s' "$sha" >"$repo/.head-sha"
+    plugin_dir="$repo/adapters/engram-hooks/hermes_plugin/engram_memory"
+    mkdir -p "$plugin_dir"
+    printf 'name: engram_memory\nversion: 0.2.0\n' >"$plugin_dir/plugin.yaml"
+    printf '# plugin\n' >"$plugin_dir/__init__.py"
+    ;;
+  *) exit 65 ;;
+esac
 """,
     )
 
@@ -200,8 +245,21 @@ printf 'uv:%s\\n' "$*" >>"$INSTALLER_TEST_LOG"
         "INSTALLER_TEST_LOG": str(log),
         "INSTALLER_TEST_CONFIG": str(config),
         "INSTALLER_TEST_ENV": str(env_file),
+        "INSTALLER_TEST_RESOLVED_SHA": resolved_sha,
+        "INSTALLER_TEST_ADVANCED_SHA": advanced_sha,
+        "INSTALLER_TEST_GIT_FETCH_COUNT": str(tmp_path / "git-fetch-count"),
+        "INSTALLER_TEST_MISSING_REF": "never-matches",
     }
-    return Harness(tmp_path, bin_dir, profile, log, env, f"eng_test_{secrets.token_hex(16)}")
+    return Harness(
+        tmp_path,
+        bin_dir,
+        profile,
+        log,
+        env,
+        f"eng_test_{secrets.token_hex(16)}",
+        resolved_sha,
+        advanced_sha,
+    )
 
 
 def _combined(result: subprocess.CompletedProcess[str]) -> str:
@@ -250,7 +308,7 @@ def test_http_failure_makes_no_profile_changes_and_never_leaks_key(
     assert "plugins install" not in (harness.log.read_text() if harness.log.exists() else "")
 
 
-def test_success_uses_live_python_ref_nested_plugin_and_safe_profile(harness: Harness) -> None:
+def test_symbolic_ref_is_resolved_once_and_used_for_all_artifacts(harness: Harness) -> None:
     result = harness.run("--profile", "work", "--ref", "release/0.2", stdin_script=True)
     assert result.returncode == 0, _combined(result)
     output = _combined(result)
@@ -259,21 +317,45 @@ def test_success_uses_live_python_ref_nested_plugin_and_safe_profile(harness: Ha
     assert harness.key not in log
     assert "hermes:--profile work config path" in log
     assert "python:-m pip install --upgrade" in log
-    assert (
-        "engram-client @ git+https://github.com/Zutfen-LLC/engram.git@release/0.2"
-        "#subdirectory=sdk/engram-client"
-    ) in log
-    assert (
-        "engram-hooks @ git+https://github.com/Zutfen-LLC/engram.git@release/0.2"
-        "#subdirectory=adapters/engram-hooks"
-    ) in log
-    assert "git:clone --depth 1 --branch release/0.2" in log
+    assert f"engram.git@{harness.resolved_sha}#subdirectory=sdk/engram-client" in log
+    assert f"engram.git@{harness.resolved_sha}#subdirectory=adapters/engram-hooks" in log
+    assert log.count("fetch --depth 1") == 1
+    assert log.count("release/0.2") == 1
+    assert f"checkout --quiet --detach {harness.resolved_sha}" in log
+    assert f"python:- verify-direct-url {harness.resolved_sha}" in log
     assert "adapters/engram-hooks/hermes_plugin/engram_memory" in log
     assert "plugins install --force --enable file://" in log
     assert "plugins enable" in log
     assert "--no-allow-tool-override" in log
     assert log.count("curl:") == 3
+    assert "Requested ref: release/0.2" in output
+    assert f"Resolved commit: {harness.resolved_sha}" in output
     assert "restart" in output.lower()
+
+
+def test_branch_advancing_after_resolution_cannot_mix_artifacts(harness: Harness) -> None:
+    harness.env["INSTALLER_TEST_ADVANCE_BRANCH"] = "1"
+    result = harness.run("--ref", "moving-branch")
+    assert result.returncode == 0, _combined(result)
+    log = harness.log.read_text()
+    assert log.count("moving-branch") == 1
+    assert log.count(f"engram.git@{harness.resolved_sha}#subdirectory=") == 2
+    assert f"checkout --quiet --detach {harness.resolved_sha}" in log
+    assert harness.advanced_sha not in log
+
+
+def test_nonexistent_ref_fails_before_packages_or_profile_mutation(harness: Harness) -> None:
+    missing_ref = "missing-release"
+    harness.env["INSTALLER_TEST_MISSING_REF"] = missing_ref
+    before = {path: path.read_bytes() for path in harness.profile.iterdir()}
+    result = harness.run("--ref", missing_ref)
+    assert result.returncode != 0
+    assert "ref resolution" in _combined(result).lower()
+    assert {path: path.read_bytes() for path in harness.profile.iterdir()} == before
+    log = harness.log.read_text()
+    assert "python:-m pip install" not in log
+    assert "plugins install" not in log
+    assert "config set" not in log
 
 
 def test_env_update_is_atomic_secure_preserving_and_idempotent(harness: Harness) -> None:

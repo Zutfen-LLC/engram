@@ -133,9 +133,13 @@ curl -fsSL \
 ```
 
 `--profile` targets one named profile, `--base-url` selects the service,
-`--ref` pins package and plugin installation to one Git ref, and `--dry-run`
+`--ref` selects the update channel, and `--dry-run`
 prints a sanitized plan without prompting, network access, installation, or
-writes. Omit `--dry-run` to install. Rerunning authenticates again, upgrades the
+writes. Omit `--dry-run` to install. Before installing anything, the installer
+fetches the requested branch, tag, or SHA once, resolves it to an immutable
+40-character commit, and uses that exact commit for both Python packages and
+the detached plugin checkout. It reports both the requested ref and resolved
+commit. Rerunning authenticates again, resolves the channel again, upgrades the
 same direct Git dependencies, force-reinstalls the canonical nested plugin,
 keeps unrelated plugins/configuration, and consolidates Engram `.env` entries.
 Fully exit and relaunch an interactive Hermes CLI afterward; for an installed

@@ -20,6 +20,8 @@ ENV_EXISTED=false
 CONFIG_EXISTED=false
 ENV_FILE=""
 CONFIG_FILE=""
+CHECKOUT=""
+RESOLVED_COMMIT=""
 
 usage() {
     cat <<'EOF'
@@ -128,6 +130,7 @@ if $DRY_RUN; then
     printf '  Git ref: %s\n' "$REF"
     printf '  Plan: discover live Hermes paths and interpreter\n'
     printf '  Plan: validate health and the provisioned key (credential omitted)\n'
+    printf '  Plan: resolve the requested Git ref once to an immutable commit\n'
     printf '  Plan: install Engram packages and nested engram_memory plugin\n'
     printf '  Plan: atomically update profile environment and configuration\n'
     printf '  No commands, prompts, network requests, installs, or writes were performed.\n'
@@ -182,7 +185,7 @@ if [[ -n "$PROFILE" ]]; then
     HERMES+=(--profile "$PROFILE")
 fi
 
-printf '[1/7] Discovering Hermes profile and runtime...\n'
+printf '[1/8] Discovering Hermes profile and runtime...\n'
 CONFIG_FILE=$("${HERMES[@]}" config path) \
     || die "Hermes discovery" "hermes config path failed"
 ENV_FILE=$("${HERMES[@]}" config env-path) \
@@ -294,7 +297,7 @@ print(f"tenant {tenant[:8]}..., principal {principal[:8]}...")
 PY
 }
 
-printf '[2/7] Validating Engram connectivity and credential...\n'
+printf '[2/8] Validating Engram connectivity and credential...\n'
 request "/health" false || die "health request" "could not reach $BASE_URL/health"
 "$HERMES_PYTHON" - "$RESPONSE_FILE" <<'PY' >/dev/null \
     || die "health response" "the service returned an invalid health response"
@@ -309,9 +312,28 @@ request "/whoami" true || die "authentication request" "the provisioned key was 
 WHOAMI_SUMMARY=$(parse_whoami) || die "authentication response" "the service returned an invalid identity response"
 printf '  Authenticated: %s\n' "$WHOAMI_SUMMARY"
 
-CLIENT_REF="engram-client @ git+$REPOSITORY_URL@$REF#subdirectory=sdk/engram-client"
-HOOKS_REF="engram-hooks @ git+$REPOSITORY_URL@$REF#subdirectory=adapters/engram-hooks"
-printf '[3/7] Installing Engram packages into the live Hermes environment...\n'
+printf '[3/8] Resolving the requested Engram ref once...\n'
+CHECKOUT="$TEMP_ROOT/engram"
+git init --quiet "$CHECKOUT" \
+    || die "ref resolution" "could not initialize the temporary Engram checkout"
+git -C "$CHECKOUT" fetch --depth 1 "$REPOSITORY_URL" "$REF" \
+    || die "ref resolution" "requested Engram ref does not exist or could not be fetched"
+RESOLVED_COMMIT=$(git -C "$CHECKOUT" rev-parse --verify 'FETCH_HEAD^{commit}') \
+    || die "ref resolution" "requested Engram ref did not resolve to a commit"
+[[ "$RESOLVED_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]] \
+    || die "ref resolution" "requested Engram ref resolved to an invalid commit ID"
+git -C "$CHECKOUT" checkout --quiet --detach "$RESOLVED_COMMIT" \
+    || die "ref resolution" "could not create the detached plugin checkout"
+CHECKOUT_COMMIT=$(git -C "$CHECKOUT" rev-parse --verify HEAD) \
+    || die "ref resolution" "could not verify the detached plugin checkout"
+[[ "$CHECKOUT_COMMIT" == "$RESOLVED_COMMIT" ]] \
+    || die "ref resolution" "detached plugin checkout does not match the resolved commit"
+printf '  Requested ref: %s\n' "$REF"
+printf '  Resolved commit: %s\n' "$RESOLVED_COMMIT"
+
+CLIENT_REF="engram-client @ git+$REPOSITORY_URL@$RESOLVED_COMMIT#subdirectory=sdk/engram-client"
+HOOKS_REF="engram-hooks @ git+$REPOSITORY_URL@$RESOLVED_COMMIT#subdirectory=adapters/engram-hooks"
+printf '[4/8] Installing Engram packages into the live Hermes environment...\n'
 if "$HERMES_PYTHON" -m pip --version >/dev/null 2>&1; then
     "$HERMES_PYTHON" -m pip install --upgrade "$CLIENT_REF" "$HOOKS_REF" \
         || die "Python package install" "pip could not install Engram into the Hermes environment"
@@ -324,7 +346,7 @@ fi
 "$HERMES_PYTHON" -c 'import engram_client; import engram_hooks' \
     || die "Python import verification" "Engram packages are not importable in the Hermes environment"
 
-printf '[4/7] Installing and enabling the nested Hermes plugin...\n'
+printf '[5/8] Installing and enabling the nested Hermes plugin...\n'
 if [[ -f "$ENV_FILE" ]]; then
     cp -p "$ENV_FILE" "$TEMP_ROOT/env.backup"
     ENV_EXISTED=true
@@ -334,19 +356,10 @@ if [[ -f "$CONFIG_FILE" ]]; then
     CONFIG_EXISTED=true
 fi
 PROFILE_CHANGE_STARTED=true
-CHECKOUT="$TEMP_ROOT/engram"
-if ! git clone --depth 1 --branch "$REF" "$REPOSITORY_URL" "$CHECKOUT"; then
-    # --branch covers branches and tags. Fetching the exact ref also supports
-    # commit SHAs and other server-advertised refs without falling back to main.
-    rm -rf "$CHECKOUT"
-    mkdir -p "$CHECKOUT"
-    git -C "$CHECKOUT" init --quiet \
-        || die "plugin source checkout" "could not initialize the temporary checkout"
-    git -C "$CHECKOUT" fetch --depth 1 "$REPOSITORY_URL" "$REF" \
-        || die "plugin source checkout" "could not fetch the requested Engram ref"
-    git -C "$CHECKOUT" checkout --quiet --detach FETCH_HEAD \
-        || die "plugin source checkout" "could not check out the requested Engram ref"
-fi
+CHECKOUT_COMMIT=$(git -C "$CHECKOUT" rev-parse --verify HEAD) \
+    || die "plugin source checkout" "could not verify the plugin checkout"
+[[ "$CHECKOUT_COMMIT" == "$RESOLVED_COMMIT" ]] \
+    || die "plugin source checkout" "plugin checkout no longer matches the resolved commit"
 PLUGIN_SOURCE="$CHECKOUT/$PLUGIN_SUBDIR"
 [[ -f "$PLUGIN_SOURCE/plugin.yaml" ]] \
     || die "plugin source checkout" "the requested ref does not contain the engram_memory plugin"
@@ -355,7 +368,7 @@ PLUGIN_SOURCE="$CHECKOUT/$PLUGIN_SUBDIR"
 "${HERMES[@]}" plugins enable engram_memory --no-allow-tool-override \
     || die "plugin enable" "Hermes could not enable engram_memory"
 
-printf '[5/7] Updating the Hermes profile atomically...\n'
+printf '[6/8] Updating the Hermes profile atomically...\n'
 "$HERMES_PYTHON" - "$ENV_FILE" 3< <(printf '%s\0%s\0%s\0' "$BASE_URL" "$API_KEY" "true") <<'PY'
 import os
 import pathlib
@@ -410,7 +423,7 @@ PY
 "${HERMES[@]}" config set memory.provider engram_memory \
     || die "Hermes configuration" "could not select the engram_memory provider"
 
-printf '[6/7] Verifying installation...\n'
+printf '[7/8] Verifying installation...\n'
 "$HERMES_PYTHON" - "$ENV_FILE" <<'PY' \
     || die "environment verification" "required Engram entries are missing or duplicated"
 import os
@@ -430,6 +443,23 @@ for key in ("ENGRAM_BASE_URL", "ENGRAM_API_KEY", "ENGRAM_HOOKS_RECALL_ENABLED"):
 PY
 "$HERMES_PYTHON" -c 'import engram_client; import engram_hooks' \
     || die "Python import verification" "Engram packages stopped importing"
+"$HERMES_PYTHON" - verify-direct-url "$RESOLVED_COMMIT" <<'PY' \
+    || die "Python revision verification" "installed Engram packages do not match the resolved commit"
+import importlib.metadata
+import json
+import sys
+
+expected = sys.argv[2]
+for distribution_name in ("engram-client", "engram-hooks"):
+    distribution = importlib.metadata.distribution(distribution_name)
+    direct_url_text = distribution.read_text("direct_url.json")
+    if direct_url_text is None:
+        raise SystemExit(1)
+    direct_url = json.loads(direct_url_text)
+    commit = str(direct_url.get("vcs_info", {}).get("commit_id", ""))
+    if commit != expected:
+        raise SystemExit(1)
+PY
 PLUGIN_LIST=$("${HERMES[@]}" plugins list --plain --no-bundled) \
     || die "plugin verification" "Hermes could not list installed plugins"
 printf '%s\n' "$PLUGIN_LIST" | "$HERMES_PYTHON" -c '
@@ -452,7 +482,7 @@ parse_whoami >/dev/null || die "final authentication" "final identity response w
 PROFILE_CHANGE_COMMITTED=true
 unset API_KEY
 
-printf '[7/7] Running Hermes diagnostics...\n'
+printf '[8/8] Running Hermes diagnostics...\n'
 set +e
 "${HERMES[@]}" doctor >/dev/null 2>&1
 DOCTOR_STATUS=$?
@@ -464,5 +494,6 @@ else
 fi
 
 printf '\nEngram installation is verified. A Hermes process restart is required.\n'
+printf 'Installed revision: %s -> %s\n' "$REF" "$RESOLVED_COMMIT"
 printf 'Interactive CLI: fully exit and relaunch Hermes.\n'
 printf 'Installed gateway: hermes gateway restart\n'
