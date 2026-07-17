@@ -23,8 +23,10 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from engram.auth import Principal
 from engram.config import settings
-from engram.models import MemoryEdge, MemoryItem, Tunnel
+from engram.memory_context import ResolvedMemoryContext, unrestricted_memory_context
+from engram.models import MemoryEdge, MemoryItem, Tunnel, Workspace
 
 _engine = create_async_engine(settings.database_url, poolclass=NullPool)
 _session_factory = async_sessionmaker(_engine, class_=AsyncSession, expire_on_commit=False)
@@ -197,6 +199,7 @@ async def _expand(
     *,
     workspace_id: str | None = None,
     scores: dict[UUID, float] | None = None,
+    memory_context: ResolvedMemoryContext | None = None,
 ) -> list[dict[str, Any]]:
     from engram.relationship_recall import expand_recall_candidates
 
@@ -204,8 +207,10 @@ async def _expand(
     semantic_items = [_seed_dict(i, scores.get(i.id, 0.8)) for i in seed_items]
     return await expand_recall_candidates(
         session,
-        tenant_id=tenant_id,
-        principal_id=principal_id,
+        memory_context=memory_context
+        or unrestricted_memory_context(
+            Principal(tenant_id=tenant_id, principal_id=principal_id, scopes=("read",))
+        ),
         workspace_id=workspace_id,
         semantic_items=semantic_items,
         item_by_id=item_by_id,
@@ -327,6 +332,118 @@ async def test_graph_expansion_respects_max_neighbors_per_item():
     assert len(graph_ids) == 2
     # Strongest weights win — deterministic ordering.
     assert graph_ids == {str(neighbors[4].id), str(neighbors[3].id)}
+
+
+async def test_profile_filter_precedes_graph_and_tunnel_neighbor_caps():
+    """An ineligible stronger neighbor cannot consume either bounded window."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    settings.max_graph_neighbors_per_item = 1
+    settings.max_graph_expanded_items = 1
+    settings.max_tunnel_neighbors_per_item = 1
+    settings.max_tunnel_additions = 1
+    async with _session_factory() as session:
+        tenant_id, principal_id = await _default_tenant_principal(session)
+        workspace_a = Workspace(
+            tenant_id=UUID(tenant_id), name="Other allowed", slug=f"other-a-{uuid4().hex}"
+        )
+        workspace_b = Workspace(
+            tenant_id=UUID(tenant_id), name="Other denied", slug=f"other-b-{uuid4().hex}"
+        )
+        session.add_all((workspace_a, workspace_b))
+        await session.flush()
+
+        seed = await _mk_item(
+            session,
+            tenant_id,
+            principal_id,
+            content="profile seed",
+            wing="ProfileSource",
+            room="seed",
+        )
+        graph_allowed = await _mk_item(
+            session,
+            tenant_id,
+            principal_id,
+            content="graph allowed",
+            workspace_id=str(workspace_a.id),
+        )
+        graph_denied = await _mk_item(
+            session,
+            tenant_id,
+            principal_id,
+            content="graph denied",
+            workspace_id=str(workspace_b.id),
+        )
+        tunnel_allowed = await _mk_item(
+            session,
+            tenant_id,
+            principal_id,
+            content="tunnel allowed",
+            wing="ProfileTarget",
+            room="neighbors",
+            workspace_id=str(workspace_a.id),
+            importance=0.1,
+        )
+        tunnel_denied = await _mk_item(
+            session,
+            tenant_id,
+            principal_id,
+            content="tunnel denied",
+            wing="ProfileTarget",
+            room="neighbors",
+            workspace_id=str(workspace_b.id),
+            importance=1.0,
+        )
+        await _mk_edge(session, tenant_id, seed, graph_allowed, "mentions", weight=0.1)
+        await _mk_edge(session, tenant_id, seed, graph_denied, "mentions", weight=1.0)
+        await _mk_tunnel(
+            session,
+            tenant_id,
+            source_wing="ProfileSource",
+            source_room="seed",
+            target_wing="ProfileTarget",
+            target_room="neighbors",
+        )
+        await session.commit()
+
+        context = ResolvedMemoryContext(
+            version="memory-context-v1",
+            tenant_id=UUID(tenant_id),
+            principal_id=UUID(principal_id),
+            api_key_id=uuid4(),
+            memory_profile_id=uuid4(),
+            memory_profile_revision_id=uuid4(),
+            memory_profile_slug="profile-cap-test",
+            memory_profile_version=1,
+            include_private=False,
+            include_tenant=True,
+            include_public=False,
+            readable_workspace_ids=frozenset({workspace_a.id}),
+        )
+        result = await _expand(
+            session,
+            tenant_id,
+            principal_id,
+            [seed],
+            {
+                item.id: item
+                for item in (
+                    seed,
+                    graph_allowed,
+                    graph_denied,
+                    tunnel_allowed,
+                    tunnel_denied,
+                )
+            },
+            memory_context=context,
+        )
+
+    result_ids = {row["id"] for row in result}
+    assert str(graph_allowed.id) in result_ids
+    assert str(tunnel_allowed.id) in result_ids
+    assert str(graph_denied.id) not in result_ids
+    assert str(tunnel_denied.id) not in result_ids
 
 
 async def test_graph_expansion_respects_overall_cap():

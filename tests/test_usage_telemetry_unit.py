@@ -9,6 +9,7 @@ counting, and the disabled-telemetry no-op path (must not open a DB session).
 from __future__ import annotations
 
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
@@ -83,6 +84,37 @@ async def test_legacy_retrieval_without_embedding_fields_preserves_absence(monke
     assert isinstance(metadata, dict)
     assert "embedding_outcome" not in metadata
     assert "embedding_call_occurred" not in metadata
+
+
+async def test_retrieval_metadata_carries_only_bounded_memory_context_provenance(monkeypatch):
+    captured: dict[str, object] = {}
+
+    async def capture(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    profile_id, revision_id = uuid4(), uuid4()
+    monkeypatch.setattr("engram.usage.record_usage_event_best_effort", capture)
+    await record_retrieval_request(
+        tenant_id=uuid4(),
+        principal_id=uuid4(),
+        workspace_id=None,
+        operation="hybrid_search",
+        status="succeeded",
+        memory_context_version="memory-context-v1",
+        memory_profile_id=profile_id,
+        memory_profile_revision_id=revision_id,
+        memory_profile_version=7,
+    )
+    metadata = captured["metadata"]
+    assert metadata == {
+        "memory_context_version": "memory-context-v1",
+        "memory_profile_id": str(profile_id),
+        "memory_profile_revision_id": str(revision_id),
+        "memory_profile_version": 7,
+    }
+    assert "query" not in str(metadata).lower()
+    assert "content" not in str(metadata).lower()
+    assert "workspace_ids" not in str(metadata).lower()
 
 
 def test_utf8_byte_len_counts_bytes_not_characters():

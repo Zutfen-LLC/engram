@@ -482,6 +482,10 @@ async def record_retrieval_request(
     config_version: str | None = None,
     embedding_call_occurred: bool | None = None,
     embedding_outcome: EmbeddingOutcome | None = None,
+    memory_context_version: str | None = None,
+    memory_profile_id: UUID | str | None = None,
+    memory_profile_revision_id: UUID | str | None = None,
+    memory_profile_version: int | None = None,
 ) -> UUID | None:
     """Record one ``retrieval.request`` event (success OR failure).
 
@@ -516,6 +520,12 @@ async def record_retrieval_request(
             "scoring_version": scoring_version,
             "config_version": config_version,
             "embedding_outcome": embedding_outcome,
+            "memory_context_version": memory_context_version,
+            "memory_profile_id": str(memory_profile_id) if memory_profile_id else None,
+            "memory_profile_revision_id": str(memory_profile_revision_id)
+            if memory_profile_revision_id
+            else None,
+            "memory_profile_version": memory_profile_version,
         }.items()
         if v is not None
     })

@@ -26,7 +26,9 @@ from sqlalchemy import insert, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from engram.auth import Principal
 from engram.config import settings
+from engram.memory_context import unrestricted_memory_context
 from engram.models import MemoryItem
 from engram.recall import execute_startup_recall
 
@@ -139,8 +141,9 @@ async def _run_startup_recall(tenant_id: str, principal_id: str) -> dict:
         await _apply_rls(session, tenant_id, principal_id)
         return await execute_startup_recall(
             session=session,
-            tenant_id=tenant_id,
-            principal_id=principal_id,
+            memory_context=unrestricted_memory_context(
+                Principal(tenant_id=tenant_id, principal_id=principal_id, scopes=("read",))
+            ),
             workspace=None,
             byte_budget=10_000_000,
             token_budget=None,

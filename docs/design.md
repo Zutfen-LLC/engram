@@ -90,11 +90,14 @@ Single-agent memory is the on-ramp. Multi-agent institutional memory is the moat
    principal, workspace, group, nor audience and never grants workspace membership. A stable,
    tenant-scoped profile selects one immutable active revision; API keys may bind to that stable
    identity only at issuance and follow later active-revision changes. Disabling a profile makes
-   its bound credentials fail closed. In ENG-SCOPE-002A profile policy is declarative only: memory
-   access remains unchanged. ENG-SCOPE-002B/002C will apply the narrowing intersection:
+   its bound credentials fail closed. ENG-SCOPE-002B enforces reads through one immutable,
+   request-scoped `ResolvedMemoryContext`:
    tenant/RLS boundary ∩ principal visibility and workspace membership ∩ key-bound active profile
-   revision ∩ later task-bound narrowing. There is no request-time profile selector and changing a
-   key's profile requires revoking it and issuing a new key.
+   revision ∩ optional explicit workspace narrowing. Authentication pins the exact revision; the
+   primary request session resolves its flags and readable grants once, and read-replica queries
+   receive that immutable value rather than querying policy independently. There is no
+   request-time profile selector and changing a key's profile requires revoking it and issuing a
+   new key. Profile-enforced writes remain deferred to ENG-SCOPE-002C.
 
 7. **The memory model concepts are the product, not the storage.** Wings/rooms/drawers, knowledge graph triples, tunnels, and diaries are Engram's product vocabulary.
 
@@ -797,6 +800,57 @@ Review scope grants access to review functionality, not broader memory visibilit
 Review reports apply the canonical item predicate, conflict reports require both
 memories to be eligible, and review statistics are relative to the caller's eligible
 current corpus rather than tenant-global administrative counts.
+
+### Resolved memory read context (ENG-SCOPE-002B)
+
+Every caller-facing operation that returns or derives from `memory_items` uses
+`memory-context-v1`. The immutable context records the tenant, principal, API key,
+bound profile/revision identity and version, three visibility flags, and the set of
+`can_read=true` workspace grants. `readable_workspace_ids=NULL` means an unprofiled
+compatibility caller; an empty set means a bound profile with no readable workspaces.
+Unprofiled keys and auth-disabled development retain the pre-profile predicate.
+
+The profile predicate intersects the existing audience; it never creates membership
+or reveals another principal's private item. For a profile-bound key the exact table is:
+
+| Item visibility | Existing principal requirement | Profile requirement |
+| --- | --- | --- |
+| `private` | caller owns the item | `include_private=true` |
+| `tenant` | tenant/RLS eligibility | `include_tenant=true` |
+| `public` | tenant/RLS eligibility (public remains tenant-isolated) | `include_public=true` |
+| `workspace` | caller is a workspace member | matching `can_read=true` grant |
+
+Independently of visibility, every non-NULL `workspace_id` must have a matching
+profile read grant. Thus private/tenant/public items associated with workspace A need
+their visibility flag *and* an A grant. NULL-workspace items need only their category
+flag. Tenant/public workspace association does not add a principal-membership
+requirement; workspace visibility still does. An all-false profile with no readable
+grants returns no MemoryItem-backed data. `admin` remains an operation-scope
+super-set, but it does not bypass a bound profile on data-plane reads.
+
+Explicit workspace reads succeed only when the workspace exists in the tenant, the
+caller is a member, and a bound profile grants it. Unknown, non-member, and ungranted
+workspaces return empty collections/recall results or the same item 404; an explicit
+request never falls back to an unscoped read.
+
+The enforced surfaces are startup/full-corpus/semantic recall (including every
+bounded sub-pool, graph and tunnel expansion), keyword/semantic/hybrid search, item
+list/detail/history and provenance, KG query/timeline, review queues and statistics,
+diary reads, CCA export, and taxonomy counts. Filtering occurs in SQL before ordering,
+LIMIT, candidate caps, HNSW windows, and expansion caps. Empty or impossible semantic
+sets avoid an embedding-provider call and record `not_attempted`. Standalone tunnel
+definitions and non-MemoryItem control-plane metadata remain unaffected.
+
+New startup and semantic `recall_logs` rows record the exact profile/revision pair and
+`memory-context-v1`; new unprofiled reads record NULL profile IDs with the same context
+version, while pre-002B rows are labeled `legacy-unprofiled-v0`. Search
+`retrieval.request` metadata carries only bounded profile identity/version fields—no
+queries, content, policy JSON, or grant lists.
+
+This is a read boundary, not yet a complete read/write sandbox. Remember, classify,
+KG/diary writes, feedback, item metadata and lifecycle mutations, review transitions,
+workers, imports, and hooks intentionally retain pre-002B behavior until
+ENG-SCOPE-002C.
 
 Caller-facing conflict resolution is a human-governed operation. API `review` scope
 permits an attempt, but only authenticated users and administrators may decide a

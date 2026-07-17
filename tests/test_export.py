@@ -20,6 +20,7 @@ CREATE_STATEMENTS = [
     "CREATE TABLE tenants (id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL, created_at TEXT NOT NULL)",
     "CREATE TABLE workspaces (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, name TEXT NOT NULL, slug TEXT NOT NULL, created_at TEXT NOT NULL)",
     "CREATE TABLE principals (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, name TEXT NOT NULL, type TEXT NOT NULL, internal_key TEXT, created_at TEXT NOT NULL)",
+    "CREATE TABLE workspace_members (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, principal_id TEXT NOT NULL)",
     """
     CREATE TABLE memory_items (
         id TEXT PRIMARY KEY,
@@ -70,6 +71,10 @@ CREATE_STATEMENTS = [
     """,
 ]
 
+_TENANT_ID = uuid4()
+_WORKSPACE_ID = uuid4()
+_PRINCIPAL_ID = uuid4()
+
 
 @pytest.fixture()
 async def session_factory(tmp_path: Path):
@@ -97,7 +102,11 @@ async def client(session_factory):
         # via get_current_principal — so this override exists solely to keep
         # V2-BL-004's ScopeGuard dependencies from resolving the real
         # (unreachable-in-this-test) Postgres-backed default principal.
-        return Principal(tenant_id="test-tenant", principal_id="test-principal", scopes=("admin",))
+        return Principal(
+            tenant_id=str(_TENANT_ID),
+            principal_id=str(_PRINCIPAL_ID),
+            scopes=("admin",),
+        )
 
     app.dependency_overrides[get_session] = override_get_session
     app.dependency_overrides[get_current_principal] = override_get_current_principal
@@ -108,9 +117,9 @@ async def client(session_factory):
 
 
 async def _seed_base(session: AsyncSession) -> dict[str, str]:
-    tenant_id = str(uuid4())
-    workspace_id = str(uuid4())
-    principal_id = str(uuid4())
+    tenant_id = str(_TENANT_ID)
+    workspace_id = str(_WORKSPACE_ID)
+    principal_id = str(_PRINCIPAL_ID)
     created_at = "2026-01-01T00:00:00"
     await session.execute(
         text("INSERT INTO tenants (id, name, slug, created_at) VALUES (:id, :name, :slug, :created_at)"),
@@ -123,6 +132,17 @@ async def _seed_base(session: AsyncSession) -> dict[str, str]:
     await session.execute(
         text("INSERT INTO principals (id, tenant_id, name, type, created_at) VALUES (:id, :tenant_id, :name, :type, :created_at)"),
         {"id": principal_id, "tenant_id": tenant_id, "name": "Agent", "type": "agent", "created_at": created_at},
+    )
+    await session.execute(
+        text(
+            "INSERT INTO workspace_members (id, workspace_id, principal_id) "
+            "VALUES (:id, :workspace_id, :principal_id)"
+        ),
+        {
+            "id": uuid4().hex,
+            "workspace_id": workspace_id,
+            "principal_id": principal_id,
+        },
     )
     return {"tenant_id": tenant_id, "workspace_id": workspace_id, "principal_id": principal_id}
 

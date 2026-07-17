@@ -19,6 +19,8 @@ from engram.auth import Principal as AuthPrincipal
 from engram.authority import authority_label, derive_memory_authority
 from engram.canonicalize import canonicalize, content_hash
 from engram.db import get_session
+from engram.memory_access import profile_read_scope_expression
+from engram.memory_context import ResolvedMemoryContext, resolve_memory_context
 from engram.models import ItemEvent, MemoryItem, Principal
 from engram.safety import has_secrets
 from engram.trust_policy import resolve_trust_defaults
@@ -354,6 +356,7 @@ async def read_diary(
     limit: int = 10,
     session: AsyncSession = Depends(get_session),  # noqa: B008
     caller: AuthPrincipal = Depends(get_current_principal),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> list[DiaryEntry]:
     if limit < 1 or limit > 200:
         raise HTTPException(status_code=422, detail="limit must be between 1 and 200")
@@ -372,6 +375,11 @@ async def read_diary(
                 MemoryItem.principal_id == target.id,
                 MemoryItem.kind == "diary_entry",
                 MemoryItem.valid_to.is_(None),
+                # Diary ownership/access is established by the route-specific
+                # policy above. Apply the profile boundary without replacing
+                # that established user/admin represented-read behavior with
+                # the generic private-item ownership predicate.
+                profile_read_scope_expression(memory_context),
             )
             .order_by(MemoryItem.created_at.desc(), MemoryItem.id.desc())
             .limit(limit)

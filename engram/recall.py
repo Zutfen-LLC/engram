@@ -38,7 +38,8 @@ from engram import semantic
 from engram.config import settings
 from engram.embeddings import generate_embedding
 from engram.jobs import enqueue_job
-from engram.memory_access import eligibility_expression, resolve_workspace_scope
+from engram.memory_access import read_eligibility_expression, resolve_workspace_scope
+from engram.memory_context import ResolvedMemoryContext
 from engram.memory_kinds import get_disputed_stay_kind_names
 from engram.models import MemoryItem, RecallLog, TenantConfig
 from engram.promotion import maybe_auto_promote_for_startup_recall
@@ -213,8 +214,7 @@ def _resolve_recall_budgets(
 
 async def _fetch_active_items(
     session: AsyncSession,
-    tenant_id: str,
-    principal_id: str,
+    memory_context: ResolvedMemoryContext,
     workspace_id: str | None,
 ) -> list[MemoryItem]:
     """Fetch EVERY active, non-expired, eligible item — the pre-ENG-AUD-011 path.
@@ -235,13 +235,12 @@ async def _fetch_active_items(
     :func:`score_item`, against the bounded pipeline's output on the same
     fixtures.
     """
-    stay_kinds = await get_disputed_stay_kind_names(session, tenant_id)
+    stay_kinds = await get_disputed_stay_kind_names(session, memory_context.tenant_id)
     review_status_clause = _review_status_clause(stay_kinds)
     stmt = select(MemoryItem).where(
-        MemoryItem.tenant_id == tenant_id,
         review_status_clause,
         MemoryItem.valid_to.is_(None),
-        eligibility_expression(principal_id),
+        read_eligibility_expression(memory_context),
     )
     if workspace_id is not None:
         stmt = stmt.where(MemoryItem.workspace_id == workspace_id)
@@ -345,17 +344,15 @@ def _candidate_allocation(candidate_limit: int) -> dict[str, int]:
 
 def _base_candidate_filters(
     *,
-    tenant_id: str,
-    principal_id: str,
+    memory_context: ResolvedMemoryContext,
     workspace_id: str | None,
     review_status_clause: ColumnElement[bool],
 ) -> list[Any]:
     """Shared WHERE clauses for every candidate sub-query (tenant/eligibility/kind)."""
     filters: list[Any] = [
-        MemoryItem.tenant_id == tenant_id,
         review_status_clause,
         MemoryItem.valid_to.is_(None),
-        eligibility_expression(principal_id),
+        read_eligibility_expression(memory_context),
     ]
     if workspace_id is not None:
         filters.append(MemoryItem.workspace_id == workspace_id)
@@ -389,8 +386,7 @@ class CandidateStats:
 async def _fetch_startup_candidates(
     session: AsyncSession,
     *,
-    tenant_id: str,
-    principal_id: str,
+    memory_context: ResolvedMemoryContext,
     workspace_id: str | None,
     now: datetime,
     config: TenantConfig | None,
@@ -418,12 +414,11 @@ async def _fetch_startup_candidates(
     that would rank highly under detailed Python scoring (requirement 6).
     """
     stats = CandidateStats()
-    stay_kinds = await get_disputed_stay_kind_names(session, tenant_id)
+    stay_kinds = await get_disputed_stay_kind_names(session, memory_context.tenant_id)
     stats.query_count += 1
     review_status_clause = _review_status_clause(stay_kinds)
     filters = _base_candidate_filters(
-        tenant_id=tenant_id,
-        principal_id=principal_id,
+        memory_context=memory_context,
         workspace_id=workspace_id,
         review_status_clause=review_status_clause,
     )
@@ -587,8 +582,7 @@ def _enforce_budget(
 
 async def execute_startup_recall(
     session: AsyncSession,
-    tenant_id: str,
-    principal_id: str,
+    memory_context: ResolvedMemoryContext,
     workspace: str | None,
     byte_budget: int | None,
     token_budget: int | None,
@@ -611,6 +605,8 @@ async def execute_startup_recall(
     7. Return working_set + items with reasons.
     """
     now = datetime.now(UTC)
+    tenant_id = str(memory_context.tenant_id)
+    principal_id = str(memory_context.principal_id)
     config = await _get_tenant_config(session, tenant_id)
 
     # Apply configured defaults for omitted budgets so startup recall is
@@ -625,7 +621,7 @@ async def execute_startup_recall(
     # doesn't resolve, or where the caller isn't a member, must not fall back
     # to an unscoped read — it yields zero items instead.
     workspace_id, workspace_accessible = await resolve_workspace_scope(
-        session, tenant_id=tenant_id, principal_id=principal_id, workspace=workspace
+        session, memory_context=memory_context, workspace=workspace
     )
 
     # 0. Lazy, bounded, tenant-scoped Path A promotion pass (design.md §3,
@@ -650,14 +646,15 @@ async def execute_startup_recall(
         settings.startup_recall_candidate_limit_max,
     )
     read_source = "primary"
-    if workspace is not None and not workspace_accessible:
+    if not memory_context.may_read_anything or (
+        workspace is not None and not workspace_accessible
+    ):
         candidates: list[MemoryItem] = []
         candidate_stats = CandidateStats()
     elif promotion_result.promoted > 0:
         candidates, candidate_stats = await _fetch_startup_candidates(
             session,
-            tenant_id=tenant_id,
-            principal_id=principal_id,
+            memory_context=memory_context,
             workspace_id=workspace_id,
             now=now,
             config=config,
@@ -671,8 +668,7 @@ async def execute_startup_recall(
             )
             candidates, candidate_stats = await _fetch_startup_candidates(
                 read_session,
-                tenant_id=tenant_id,
-                principal_id=principal_id,
+                memory_context=memory_context,
                 workspace_id=workspace_id,
                 now=now,
                 config=config,
@@ -787,6 +783,9 @@ async def execute_startup_recall(
         item_ids=item_ids,
         scoring_version=scoring_version,
         config_version=config_version,
+        memory_profile_id=memory_context.memory_profile_id,
+        memory_profile_revision_id=memory_context.memory_profile_revision_id,
+        memory_context_version=memory_context.version,
     )
     session.add(recall_log)
     await session.commit()
@@ -916,8 +915,7 @@ def _enforce_semantic_budget(
 
 async def execute_semantic_recall(
     session: AsyncSession,
-    tenant_id: str,
-    principal_id: str,
+    memory_context: ResolvedMemoryContext,
     workspace: str | None,
     query: str,
     *,
@@ -937,6 +935,8 @@ async def execute_semantic_recall(
     than raising — and still writes a recall_logs audit row.
     """
     now = datetime.now(UTC)
+    tenant_id = str(memory_context.tenant_id)
+    principal_id = str(memory_context.principal_id)
     config = await _get_tenant_config(session, tenant_id)
 
     # Apply configured defaults for omitted budgets so semantic recall is
@@ -951,39 +951,45 @@ async def execute_semantic_recall(
     # doesn't resolve, or where the caller isn't a member, must not fall back
     # to an unscoped read — it yields zero candidates instead.
     workspace_id, workspace_accessible = await resolve_workspace_scope(
-        session, tenant_id=tenant_id, principal_id=principal_id, workspace=workspace
+        session, memory_context=memory_context, workspace=workspace
     )
 
-    # 1. Generate the query embedding. This is the single place the query
-    #    vector is produced; the shared semantic.search() never embeds.
+    # 1. Resolve the embedding profile and count the eligible corpus before
+    #    calling the provider. Empty/denied contexts are a truthful
+    #    ``not_attempted`` embedding outcome.
     import inspect
 
     from engram.embedding_profiles import get_active_profile
 
-    active_profile = await get_active_profile(session)
-    if len(inspect.signature(generate_embedding).parameters) >= 2:
-        query_embedding = await generate_embedding(
-            query,
-            active_profile,
-            tenant_id=tenant_id,
-            principal_id=principal_id,
-            operation="embedding_query_recall",
-            usage_class="request",
-        )
-    else:
-        query_embedding = await generate_embedding(query)
-
-    if workspace is not None and not workspace_accessible:
+    embedding_profile = await get_active_profile(session)
+    if not memory_context.may_read_anything or (
+        workspace is not None and not workspace_accessible
+    ):
         candidate_total = 0
     else:
         candidate_total = await semantic.candidate_count(
             session,
-            tenant_id=tenant_id,
-            principal_id=principal_id,
+            memory_context=memory_context,
             workspace_id=workspace_id,
             review_statuses=_SEMANTIC_REVIEW_STATUSES,
-            profile=active_profile,
+            embedding_profile=embedding_profile,
         )
+
+    query_embedding: list[float] | None = None
+    embedding_outcome = "not_attempted"
+    if candidate_total > 0:
+        if len(inspect.signature(generate_embedding).parameters) >= 2:
+            query_embedding = await generate_embedding(
+                query,
+                embedding_profile,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                operation="embedding_query_recall",
+                usage_class="request",
+            )
+        else:
+            query_embedding = await generate_embedding(query)
+        embedding_outcome = "succeeded" if query_embedding is not None else "disabled"
 
     if query_embedding is None or candidate_total == 0:
         # Empty, non-error response. Still log the attempt for auditability.
@@ -998,6 +1004,9 @@ async def execute_semantic_recall(
             item_ids=[],
             scoring_version=RECALL_SCORING_VERSION,
             config_version=config_version,
+            memory_profile_id=memory_context.memory_profile_id,
+            memory_profile_revision_id=memory_context.memory_profile_revision_id,
+            memory_context_version=memory_context.version,
         )
         session.add(recall_log)
         await session.commit()
@@ -1015,7 +1024,7 @@ async def execute_semantic_recall(
             # Telemetry context (ENG-METER-001).
             "workspace_id": str(workspace_id) if workspace_id else None,
             "candidate_count": 0,
-            "embedding_outcome": "disabled" if query_embedding is None else "succeeded",
+            "embedding_outcome": embedding_outcome,
         }
 
     # 2. Retrieve nearest candidates by cosine similarity, scoped to the
@@ -1027,11 +1036,10 @@ async def execute_semantic_recall(
         session,
         query_embedding,
         fetch_limit,
-        tenant_id=tenant_id,
-        principal_id=principal_id,
+        memory_context=memory_context,
         workspace_id=workspace_id,
         review_statuses=_SEMANTIC_REVIEW_STATUSES,
-        profile=active_profile,
+        embedding_profile=embedding_profile,
     )
 
     # 4. Enrich candidates with full MemoryItem trust fields (pinned,
@@ -1044,7 +1052,7 @@ async def execute_semantic_recall(
         rows = await session.execute(
             select(MemoryItem).where(
                 MemoryItem.id.in_(candidate_ids),
-                MemoryItem.tenant_id == tenant_id,
+                read_eligibility_expression(memory_context),
             )
         )
         item_by_id = {item.id: item for item in rows.scalars().all()}
@@ -1098,8 +1106,7 @@ async def execute_semantic_recall(
     #     equal footing with direct semantic hits; never bypasses eligibility.
     enriched = await expand_recall_candidates(
         session,
-        tenant_id=tenant_id,
-        principal_id=principal_id,
+        memory_context=memory_context,
         workspace_id=workspace_id,
         semantic_items=enriched,
         item_by_id=item_by_id,
@@ -1133,6 +1140,9 @@ async def execute_semantic_recall(
         item_ids=selected_ids,
         scoring_version=RECALL_SCORING_VERSION,
         config_version=config_version,
+        memory_profile_id=memory_context.memory_profile_id,
+        memory_profile_revision_id=memory_context.memory_profile_revision_id,
+        memory_context_version=memory_context.version,
     )
     session.add(recall_log)
 

@@ -2,7 +2,8 @@
 """Startup recall performance baseline / benchmark (ENG-AUD-011 / F18).
 
 Populates a scratch tenant with a synthetic corpus at each requested size,
-runs startup recall, and reports:
+runs startup recall through one unprofiled ``ResolvedMemoryContext``, and
+reports:
 
 * eligible corpus rows
 * rows loaded into Python (old full-corpus path, for comparison)
@@ -27,13 +28,16 @@ import asyncio
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from sqlalchemy import insert, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from engram.auth import Principal
 from engram.config import settings
 from engram.db import apply_rls_context
+from engram.memory_context import ResolvedMemoryContext, unrestricted_memory_context
 from engram.models import MemoryItem
 from engram.recall import _fetch_active_items, execute_startup_recall
 
@@ -68,6 +72,37 @@ def _rows(tenant_id: str, principal_id: str, n: int) -> list[dict[str, object]]:
     return rows
 
 
+async def _measure_recall_paths(
+    factory: async_sessionmaker[AsyncSession],
+    memory_context: ResolvedMemoryContext,
+) -> tuple[list[MemoryItem], dict[str, Any], float, float]:
+    """Run the reference and bounded paths with the same immutable context."""
+    tenant_id = str(memory_context.tenant_id)
+    principal_id = str(memory_context.principal_id)
+
+    # Old path: full-corpus load into Python (for comparison only).
+    async with factory() as session:
+        await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
+        start = time.perf_counter()
+        full_corpus = await _fetch_active_items(session, memory_context, None)
+        old_ms = (time.perf_counter() - start) * 1000
+
+    # New path: bounded two-stage pipeline.
+    async with factory() as session:
+        await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
+        start = time.perf_counter()
+        result = await execute_startup_recall(
+            session=session,
+            memory_context=memory_context,
+            workspace=None,
+            byte_budget=10_000_000,
+            token_budget=None,
+        )
+        new_ms = (time.perf_counter() - start) * 1000
+
+    return full_corpus, result, old_ms, new_ms
+
+
 async def _run(sizes: list[int]) -> None:
     engine = create_async_engine(settings.database_url, poolclass=NullPool)
     factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -89,6 +124,13 @@ async def _run(sizes: list[int]) -> None:
             .one()
         )
     tenant_id, principal_id = str(row["tenant_id"]), str(row["principal_id"])
+    memory_context = unrestricted_memory_context(
+        Principal(
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            scopes=("read",),
+        )
+    )
 
     print(
         f"{'items':>8} {'eligible':>8} {'py_loaded(old)':>15} {'candidates(new)':>16} "
@@ -106,26 +148,7 @@ async def _run(sizes: list[int]) -> None:
             await session.execute(insert(MemoryItem), _rows(tenant_id, principal_id, n))
             await session.commit()
 
-        # Old path: full-corpus load into Python (for comparison only).
-        async with factory() as session:
-            await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
-            start = time.perf_counter()
-            full_corpus = await _fetch_active_items(session, tenant_id, principal_id, None)
-            old_ms = (time.perf_counter() - start) * 1000
-
-        # New path: bounded two-stage pipeline.
-        async with factory() as session:
-            await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
-            start = time.perf_counter()
-            result = await execute_startup_recall(
-                session=session,
-                tenant_id=tenant_id,
-                principal_id=principal_id,
-                workspace=None,
-                byte_budget=10_000_000,
-                token_budget=None,
-            )
-            new_ms = (time.perf_counter() - start) * 1000
+        full_corpus, result, old_ms, new_ms = await _measure_recall_paths(factory, memory_context)
 
         print(
             f"{n:>8} {len(full_corpus):>8} {len(full_corpus):>15} "

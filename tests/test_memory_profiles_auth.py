@@ -158,8 +158,10 @@ async def test_profiled_auth_resolves_mutable_state_after_every_warm_cache_hit()
             assert transitioned.json()["memory_profile"]["active_revision_id"] == str(revision_v2)
             assert transitioned.json()["memory_profile"]["version"] == 2
 
-            # ENG-SCOPE-002A is declarative: include_private=false does not yet
-            # suppress writes or reads for an otherwise-equivalent principal.
+            # ENG-SCOPE-002B enforces reads but intentionally leaves writes at
+            # their pre-002C behavior. include_private=false therefore permits
+            # this write while hiding the resulting private item from the
+            # profiled key.
             content = f"profile non-enforcement {uuid.uuid4()}"
             remembered = await client.post(
                 "/v1/remember",
@@ -168,14 +170,20 @@ async def test_profiled_auth_resolves_mutable_state_after_every_warm_cache_hit()
             )
             assert remembered.status_code == 201, remembered.text
             item_id = remembered.json()["id"]
-            for key in (profiled_key, unprofiled_key):
-                search = await client.post(
-                    "/v1/search",
-                    json={"query": content, "mode": "keyword", "limit": 10},
-                    headers=_bearer(key),
-                )
-                assert search.status_code == 200, search.text
-                assert item_id in {item["id"] for item in search.json()["results"]}
+            profiled_search = await client.post(
+                "/v1/search",
+                json={"query": content, "mode": "keyword", "limit": 10},
+                headers=_bearer(profiled_key),
+            )
+            assert profiled_search.status_code == 200, profiled_search.text
+            assert item_id not in {item["id"] for item in profiled_search.json()["results"]}
+            unprofiled_search = await client.post(
+                "/v1/search",
+                json={"query": content, "mode": "keyword", "limit": 10},
+                headers=_bearer(unprofiled_key),
+            )
+            assert unprofiled_search.status_code == 200, unprofiled_search.text
+            assert item_id in {item["id"] for item in unprofiled_search.json()["results"]}
 
             operation_text = str((await client.get("/openapi.json")).json()["paths"])
             for data_plane_path in (

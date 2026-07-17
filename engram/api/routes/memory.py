@@ -44,7 +44,12 @@ from engram.feedback import (
     record_feedback,
 )
 from engram.jobs import enqueue_job
-from engram.memory_access import eligibility_sql, resolve_workspace_scope, tenant_sql
+from engram.memory_access import (
+    principal_eligibility_sql,
+    read_eligibility_sql,
+    resolve_workspace_scope,
+)
+from engram.memory_context import ResolvedMemoryContext, resolve_memory_context
 from engram.memory_kinds import UnknownMemoryKindError, require_enabled_memory_kind
 from engram.memory_scope import resolve_write_scope
 from engram.models import (
@@ -321,8 +326,7 @@ async def _keyword_search(
     query: str,
     limit: int,
     *,
-    tenant_id: UUID | str,
-    principal_id: UUID | str,
+    memory_context: ResolvedMemoryContext,
     kind: str | None = None,
     wing: str | None = None,
     room: str | None = None,
@@ -334,18 +338,19 @@ async def _keyword_search(
     ``kind``/``wing``/``room`` filters apply with AND semantics before the
     rank/limit so ineligible rows don't displace matches.
     """
+    read_scope = read_eligibility_sql(
+        memory_context, alias="mi", parameter_prefix="keyword_item"
+    )
     clauses: list[str] = [
         "mi.review_status = 'active'",
         "mi.valid_to IS NULL",
-        tenant_sql("mi"),
-        eligibility_sql("mi"),
+        read_scope.clause,
         "mi.content_tsv @@ plainto_tsquery('english', :query)",
     ]
     params: dict[str, Any] = {
         "query": query,
         "limit": limit,
-        "caller_tenant_id": str(tenant_id),
-        "caller_principal_id": str(principal_id),
+        **read_scope.params,
     }
     if kind is not None:
         clauses.append("mi.kind = :kind")
@@ -1139,6 +1144,7 @@ async def _remember_impl(
 async def recall(
     req: RecallRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> RecallResponse:
     """Bounded recall: deterministic startup set or semantic query."""
     from engram.recall import execute_semantic_recall, execute_startup_recall
@@ -1157,8 +1163,8 @@ async def recall(
         )
 
     # Resolve RLS context
-    tenant_id = await _resolve_tenant_id(session)
-    principal_id, _ = await _resolve_principal(session, tenant_id)
+    tenant_id = memory_context.tenant_id
+    principal_id = memory_context.principal_id
 
     timer = Timer()
     operation = "semantic_recall" if mode == "semantic" else "startup_recall"
@@ -1167,8 +1173,7 @@ async def recall(
             # execute_semantic_recall owns the query-embedding generation flow.
             result = await execute_semantic_recall(
                 session=session,
-                tenant_id=str(tenant_id),
-                principal_id=str(principal_id),
+                memory_context=memory_context,
                 workspace=req.workspace,
                 query=req.query or "",
                 byte_budget=req.byte_budget,
@@ -1178,8 +1183,7 @@ async def recall(
         else:
             result = await execute_startup_recall(
                 session=session,
-                tenant_id=str(tenant_id),
-                principal_id=str(principal_id),
+                memory_context=memory_context,
                 workspace=req.workspace,
                 byte_budget=req.byte_budget,
                 token_budget=req.token_budget,
@@ -1200,6 +1204,10 @@ async def recall(
             latency_ms=timer.elapsed_ms(),
             embedding_call_occurred=None,
             embedding_outcome="unknown" if mode == "semantic" else "not_required",
+            memory_context_version=memory_context.version,
+            memory_profile_id=memory_context.memory_profile_id,
+            memory_profile_revision_id=memory_context.memory_profile_revision_id,
+            memory_profile_version=memory_context.memory_profile_version,
         )
         raise
 
@@ -1223,6 +1231,10 @@ async def recall(
         config_version=result.get("config_version"),
         embedding_call_occurred=embedding_call_occurred_for(resolved_embedding_outcome),
         embedding_outcome=resolved_embedding_outcome,
+        memory_context_version=memory_context.version,
+        memory_profile_id=memory_context.memory_profile_id,
+        memory_profile_revision_id=memory_context.memory_profile_revision_id,
+        memory_profile_version=memory_context.memory_profile_version,
     )
 
     return RecallResponse(
@@ -1243,6 +1255,7 @@ async def recall(
 async def search(
     req: SearchRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> SearchResponse:
     """Keyword, semantic, or hybrid search.
 
@@ -1252,8 +1265,8 @@ async def search(
     or workspace memory from a workspace they aren't a member of.
     """
     mode = req.mode
-    tenant_id = await _resolve_tenant_id(session)
-    principal_id, _ = await _resolve_principal(session, tenant_id)
+    tenant_id = memory_context.tenant_id
+    principal_id = memory_context.principal_id
     timer = Timer()
 
     # Tracks the actual embedding stage as _search_impl progresses, so the
@@ -1282,11 +1295,15 @@ async def search(
             latency_ms=timer.elapsed_ms(),
             embedding_call_occurred=embedding_call_occurred_for(outcome),
             embedding_outcome=outcome,
+            memory_context_version=memory_context.version,
+            memory_profile_id=memory_context.memory_profile_id,
+            memory_profile_revision_id=memory_context.memory_profile_revision_id,
+            memory_profile_version=memory_context.memory_profile_version,
         )
 
     try:
         return await _search_impl(
-            req, session, tenant_id, principal_id, timer, _record_search, embedding_stage
+            req, session, memory_context, timer, _record_search, embedding_stage
         )
     except Exception:
         # Record the failed search request before re-raising — previously no
@@ -1305,8 +1322,7 @@ async def search(
 async def _search_impl(
     req: SearchRequest,
     session: AsyncSession,
-    tenant_id: UUID,
-    principal_id: UUID,
+    memory_context: ResolvedMemoryContext,
     timer: Any,
     _record_search: Any,
     embedding_stage: dict[str, EmbeddingOutcome],
@@ -1324,6 +1340,8 @@ async def _search_impl(
     kind = req.kind
     wing = req.wing
     room = req.room
+    tenant_id = memory_context.tenant_id
+    principal_id = memory_context.principal_id
 
     if mode == "keyword":
         # Keyword search never calls an embedding provider.
@@ -1332,8 +1350,7 @@ async def _search_impl(
             session,
             req.query,
             limit,
-            tenant_id=tenant_id,
-            principal_id=principal_id,
+            memory_context=memory_context,
             kind=kind,
             wing=wing,
             room=room,
@@ -1345,12 +1362,44 @@ async def _search_impl(
 
     from engram.embedding_profiles import get_active_profile
 
-    active_profile = await get_active_profile(session)
+    embedding_profile = await get_active_profile(session)
+    semantic_count = (
+        0
+        if not memory_context.may_read_anything
+        else await semantic.candidate_count(
+            session,
+            memory_context=memory_context,
+            kind=kind,
+            wing=wing,
+            room=room,
+            embedding_profile=embedding_profile,
+        )
+    )
+    if semantic_count == 0:
+        if mode == "semantic":
+            await _record_search("semantic_search", [])
+            return SearchResponse(results=[], total=0, message=_SEARCH_HELPFUL_MESSAGE)
+        keyword_results = await _keyword_search(
+            session,
+            req.query,
+            max(limit * 5, limit),
+            memory_context=memory_context,
+            kind=kind,
+            wing=wing,
+            room=room,
+        )
+        limited = keyword_results[:limit]
+        await _record_search("hybrid_search", limited)
+        return SearchResponse(
+            results=limited,
+            total=min(len(keyword_results), limit),
+            message=_SEARCH_HELPFUL_MESSAGE,
+        )
     try:
         if len(inspect.signature(generate_embedding).parameters) >= 2:
             query_embedding = await generate_embedding(
                 req.query,
-                active_profile,
+                embedding_profile,
                 tenant_id=tenant_id,
                 principal_id=principal_id,
                 operation="embedding_query_search",
@@ -1365,15 +1414,6 @@ async def _search_impl(
     # An embedding provider WAS attempted; whether it produced a vector
     # (succeeded) or came back disabled/empty (disabled) is the signal.
     embedding_stage["value"] = "succeeded" if query_embedding is not None else "disabled"
-    semantic_count = await semantic.candidate_count(
-        session,
-        tenant_id=tenant_id,
-        principal_id=principal_id,
-        kind=kind,
-        wing=wing,
-        room=room,
-        profile=active_profile,
-    )
 
     if mode == "semantic":
         if query_embedding is None or semantic_count == 0:
@@ -1386,12 +1426,11 @@ async def _search_impl(
             session,
             query_embedding,
             fetch_limit,
-            tenant_id=tenant_id,
-            principal_id=principal_id,
+            memory_context=memory_context,
             kind=kind,
             wing=wing,
             room=room,
-            profile=active_profile,
+            embedding_profile=embedding_profile,
         )
         if not raw:
             await _record_search("semantic_search", [])
@@ -1404,8 +1443,7 @@ async def _search_impl(
         session,
         req.query,
         max(limit * 5, limit),
-        tenant_id=tenant_id,
-        principal_id=principal_id,
+        memory_context=memory_context,
         kind=kind,
         wing=wing,
         room=room,
@@ -1423,12 +1461,11 @@ async def _search_impl(
         session,
         query_embedding,
         max(limit * 5, limit),
-        tenant_id=tenant_id,
-        principal_id=principal_id,
+        memory_context=memory_context,
         kind=kind,
         wing=wing,
         room=room,
-        profile=active_profile,
+        embedding_profile=embedding_profile,
     )
     semantic_results = [_format_semantic_result(row) for row in raw_semantic]
     results = _rrf_fuse(keyword_results, semantic_results, limit=limit)
@@ -1456,15 +1493,13 @@ async def feedback(
     principal_id, principal_type = await _resolve_principal(session, tenant_id)
 
     # Missing and caller-ineligible items deliberately share the same response.
-    item = await _fetch_readable_item(
+    item = await _require_eligible_item(
         session,
         req.item_id,
         tenant_id=tenant_id,
         principal_id=principal_id,
         for_update=True,
     )
-    if item is None:
-        raise HTTPException(status_code=404, detail="Item not found")
     try:
         result: FeedbackResult = await record_feedback(
             session,
@@ -1595,34 +1630,29 @@ def _decode_cursor(cursor: str) -> tuple[str, str]:
     return created_at, item_id
 
 
-async def _fetch_readable_item(
+async def _fetch_profile_readable_item(
     session: AsyncSession,
     item_id: UUID,
     *,
-    tenant_id: UUID | str,
-    principal_id: UUID | str,
-    for_update: bool = False,
+    memory_context: ResolvedMemoryContext,
 ) -> dict[str, Any] | None:
-    """Fetch a memory item for a caller-facing read, applying the shared
-    tenant + visibility eligibility predicate (``engram.memory_access``).
+    """Fetch a caller-facing item through principal + profile eligibility.
 
     Returns ``None`` both when the item doesn't exist and when it exists but
     the caller is ineligible to read it — callers should map both cases to a
     404, never a 403, to avoid disclosing item existence.
     """
-    dialect_name = session.bind.dialect.name if session.bind is not None else None
-    lock_clause = " FOR UPDATE" if for_update and dialect_name == "postgresql" else ""
+    read_scope = read_eligibility_sql(memory_context, parameter_prefix="item_detail")
     stmt = text(
         "SELECT * FROM memory_items WHERE (id = :item_id OR id = :item_id_hex) "
-        f"AND {tenant_sql()} AND {eligibility_sql()}{lock_clause}"
+        f"AND {read_scope.clause}"
     )
     result = await session.execute(
         stmt,
         {
             "item_id": str(item_id),
             "item_id_hex": item_id.hex,
-            "caller_tenant_id": str(tenant_id),
-            "caller_principal_id": str(principal_id),
+            **read_scope.params,
         },
     )
     row = result.mappings().first()
@@ -1756,14 +1786,30 @@ async def _require_eligible_item(
     principal_id: UUID | str,
     for_update: bool = False,
 ) -> dict[str, Any]:
-    """Resolve a caller-supplied mutation target through read eligibility."""
-    item = await _fetch_readable_item(
-        session,
-        item_id,
-        tenant_id=tenant_id,
-        principal_id=principal_id,
-        for_update=for_update,
+    """Resolve a mutation target through pre-002C principal authorization.
+
+    Profile write policy is intentionally not enforced in this slice.
+    """
+    dialect_name = session.bind.dialect.name if session.bind is not None else None
+    lock_clause = " FOR UPDATE" if for_update and dialect_name == "postgresql" else ""
+    principal_scope = principal_eligibility_sql(
+        principal_id, parameter_prefix="mutation_item"
     )
+    stmt = text(
+        "SELECT * FROM memory_items WHERE (id = :item_id OR id = :item_id_hex) "
+        f"AND tenant_id = :mutation_tenant_id AND {principal_scope.clause}{lock_clause}"
+    )
+    result = await session.execute(
+        stmt,
+        {
+            "item_id": str(item_id),
+            "item_id_hex": item_id.hex,
+            "mutation_tenant_id": str(tenant_id),
+            **principal_scope.params,
+        },
+    )
+    row = result.mappings().first()
+    item = _row_to_dict(row) if row else None
     if item is None:
         raise HTTPException(status_code=404, detail="Item not found")
     return item
@@ -1779,24 +1825,24 @@ async def list_items(
     limit: int = 50,
     cursor: str | None = None,
     session: AsyncSession = Depends(get_session),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> dict[str, Any]:
     """List items with stable cursor pagination, scoped to the caller's
     tenant and read eligibility (``engram.memory_access``)."""
     limit = max(1, min(limit, 100))
-    tenant_id = await _resolve_tenant_id(session)
-    principal_id, _ = await _resolve_principal(session, tenant_id)
-
     workspace_id, workspace_accessible = await resolve_workspace_scope(
-        session, tenant_id=tenant_id, principal_id=principal_id, workspace=workspace
+        session, memory_context=memory_context, workspace=workspace
     )
-    if workspace is not None and not workspace_accessible:
+    if not memory_context.may_read_anything or (
+        workspace is not None and not workspace_accessible
+    ):
         return {"items": [], "count": 0, "next_cursor": None, "cursor": None}
 
-    clauses: list[str] = [tenant_sql(), eligibility_sql()]
+    read_scope = read_eligibility_sql(memory_context, parameter_prefix="item_list")
+    clauses: list[str] = [read_scope.clause]
     params: dict[str, Any] = {
         "limit": limit + 1,
-        "caller_tenant_id": str(tenant_id),
-        "caller_principal_id": str(principal_id),
+        **read_scope.params,
     }
     if workspace_id is not None:
         clauses.append("workspace_id = :workspace_id")
@@ -1843,6 +1889,7 @@ async def list_items(
 async def get_item(
     item_id: UUID,
     session: AsyncSession = Depends(get_session),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> dict[str, Any]:
     """Full detail with provenance and linked KG facts.
 
@@ -1850,10 +1897,8 @@ async def get_item(
     an ineligible item is indistinguishable from a nonexistent one (404, not
     403) so its existence is never disclosed.
     """
-    tenant_id = await _resolve_tenant_id(session)
-    principal_id, _ = await _resolve_principal(session, tenant_id)
-    item = await _fetch_readable_item(
-        session, item_id, tenant_id=tenant_id, principal_id=principal_id
+    item = await _fetch_profile_readable_item(
+        session, item_id, memory_context=memory_context
     )
     if item is None:
         raise HTTPException(status_code=404, detail="Item not found")

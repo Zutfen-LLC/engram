@@ -9,11 +9,23 @@ import pytest
 
 from engram.api.routes import memory as memory_routes
 from engram.api.routes.memory import SearchRequest
+from engram.auth import Principal
+from engram.memory_context import unrestricted_memory_context
 from engram.usage import EmbeddingOutcome, embedding_call_occurred_for
 
 
 async def _noop_record(*args: Any, **kwargs: Any) -> None:
     return None
+
+
+def _memory_context():
+    return unrestricted_memory_context(
+        Principal(
+            tenant_id=str(uuid4()),
+            principal_id=str(uuid4()),
+            scopes=("read",),
+        )
+    )
 
 
 async def _run_search(
@@ -23,8 +35,7 @@ async def _run_search(
     result = await memory_routes._search_impl(
         request,
         object(),  # type: ignore[arg-type]
-        uuid4(),
-        uuid4(),
+        _memory_context(),
         object(),
         _noop_record,
         stage,
@@ -54,8 +65,7 @@ async def test_semantic_failure_before_embedding_is_not_attempted(monkeypatch):
         await memory_routes._search_impl(
             SearchRequest(query="semantic", mode="semantic"),
             object(),  # type: ignore[arg-type]
-            uuid4(),
-            uuid4(),
+            _memory_context(),
             object(),
             _noop_record,
             stage,
@@ -64,7 +74,7 @@ async def test_semantic_failure_before_embedding_is_not_attempted(monkeypatch):
     assert embedding_call_occurred_for(stage["value"]) is False
 
 
-async def test_semantic_disabled_embedding_is_disabled(monkeypatch):
+async def test_empty_semantic_corpus_does_not_attempt_embedding(monkeypatch):
     import engram.embedding_profiles as profiles
 
     async def active_profile(*args: Any, **kwargs: Any) -> object:
@@ -80,7 +90,7 @@ async def test_semantic_disabled_embedding_is_disabled(monkeypatch):
     monkeypatch.setattr(memory_routes, "generate_embedding", disabled)
     monkeypatch.setattr(memory_routes.semantic, "candidate_count", no_candidates)
     stage, _ = await _run_search(SearchRequest(query="semantic", mode="semantic"), monkeypatch)
-    assert stage["value"] == "disabled"
+    assert stage["value"] == "not_attempted"
     assert embedding_call_occurred_for(stage["value"]) is False
 
 
@@ -93,15 +103,18 @@ async def test_semantic_embedding_provider_exception_is_failed(monkeypatch):
     async def provider_failure(*args: Any, **kwargs: Any) -> None:
         raise RuntimeError("provider failed")
 
+    async def candidates(*args: Any, **kwargs: Any) -> int:
+        return 1
+
     monkeypatch.setattr(profiles, "get_active_profile", active_profile)
     monkeypatch.setattr(memory_routes, "generate_embedding", provider_failure)
+    monkeypatch.setattr(memory_routes.semantic, "candidate_count", candidates)
     stage: dict[str, EmbeddingOutcome] = {"value": "not_attempted"}
     with pytest.raises(RuntimeError):
         await memory_routes._search_impl(
             SearchRequest(query="semantic", mode="semantic"),
             object(),  # type: ignore[arg-type]
-            uuid4(),
-            uuid4(),
+            _memory_context(),
             object(),
             _noop_record,
             stage,
@@ -110,7 +123,7 @@ async def test_semantic_embedding_provider_exception_is_failed(monkeypatch):
     assert embedding_call_occurred_for(stage["value"]) is True
 
 
-async def test_database_failure_after_embedding_stays_succeeded(monkeypatch):
+async def test_candidate_count_failure_precedes_embedding(monkeypatch):
     import engram.embedding_profiles as profiles
 
     async def active_profile(*args: Any, **kwargs: Any) -> object:
@@ -130,11 +143,10 @@ async def test_database_failure_after_embedding_stays_succeeded(monkeypatch):
         await memory_routes._search_impl(
             SearchRequest(query="semantic", mode="semantic"),
             object(),  # type: ignore[arg-type]
-            uuid4(),
-            uuid4(),
+            _memory_context(),
             object(),
             _noop_record,
             stage,
         )
-    assert stage["value"] == "succeeded"
-    assert embedding_call_occurred_for(stage["value"]) is True
+    assert stage["value"] == "not_attempted"
+    assert embedding_call_occurred_for(stage["value"]) is False
