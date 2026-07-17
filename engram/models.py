@@ -736,10 +736,12 @@ class RecallLog(Base):
     memory_profile_revision_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
     )
+    # The fallback means the writer did not explicitly attest an enforced
+    # context. Enforcing read paths must always supply memory-context-v1.
     memory_context_version: Mapped[str] = mapped_column(
         Text,
-        default="memory-context-v1",
-        server_default=text("'memory-context-v1'"),
+        default="legacy-unprofiled-v0",
+        server_default=text("'legacy-unprofiled-v0'"),
         nullable=False,
     )
     created_at: Mapped[datetime] = mapped_column(

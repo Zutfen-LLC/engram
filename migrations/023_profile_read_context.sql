@@ -11,7 +11,10 @@ SET memory_context_version = 'legacy-unprofiled-v0'
 WHERE memory_context_version IS NULL;
 
 ALTER TABLE recall_logs
-    ALTER COLUMN memory_context_version SET DEFAULT 'memory-context-v1',
+    -- An omitted value means the writer did not attest that it enforced 002B.
+    -- Execute this unconditionally so reapplication repairs unsafe development
+    -- copies that installed the earlier memory-context-v1 default.
+    ALTER COLUMN memory_context_version SET DEFAULT 'legacy-unprofiled-v0',
     ALTER COLUMN memory_context_version SET NOT NULL;
 
 DO $$ BEGIN

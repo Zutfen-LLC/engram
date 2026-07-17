@@ -498,14 +498,26 @@ async def test_profile_read_matrix_revision_audit_and_write_non_enforcement(
             assert unprofiled_recall.status_code == 200, unprofiled_recall.text
             unprofiled_log_id = uuid.UUID(unprofiled_recall.json()["recall_log_id"])
             recall_log_ids.append(unprofiled_log_id)
-            unprofiled_log = await owner.fetchrow(
-                "SELECT memory_profile_id, memory_profile_revision_id, memory_context_version "
-                "FROM recall_logs WHERE id = $1",
-                unprofiled_log_id,
+            unprofiled_semantic_recall = await client.post(
+                "/v1/recall",
+                json={"mode": "semantic", "query": "scope profile", "item_budget": 1},
+                headers=_headers(unprofiled_key),
             )
-            assert unprofiled_log["memory_profile_id"] is None
-            assert unprofiled_log["memory_profile_revision_id"] is None
-            assert unprofiled_log["memory_context_version"] == "memory-context-v1"
+            assert unprofiled_semantic_recall.status_code == 200, unprofiled_semantic_recall.text
+            unprofiled_semantic_log_id = uuid.UUID(
+                unprofiled_semantic_recall.json()["recall_log_id"]
+            )
+            recall_log_ids.append(unprofiled_semantic_log_id)
+
+            for unprofiled_id in (unprofiled_log_id, unprofiled_semantic_log_id):
+                unprofiled_log = await owner.fetchrow(
+                    "SELECT memory_profile_id, memory_profile_revision_id, "
+                    "memory_context_version FROM recall_logs WHERE id = $1",
+                    unprofiled_id,
+                )
+                assert unprofiled_log["memory_profile_id"] is None
+                assert unprofiled_log["memory_profile_revision_id"] is None
+                assert unprofiled_log["memory_context_version"] == "memory-context-v1"
 
             queue = await client.get("/v1/review/queue", headers=_headers(all_a_key))
             assert queue.status_code == 200, queue.text
