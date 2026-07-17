@@ -494,6 +494,7 @@ class MemoryProfile(Base):
             ["tenant_id", "created_by_principal_id"],
             ["principals.tenant_id", "principals.id"],
             name="fk_memory_profiles_tenant_creator",
+            ondelete="SET NULL (created_by_principal_id)",
         ),
         ForeignKeyConstraint(
             ["active_revision_id", "id", "tenant_id"],
@@ -550,12 +551,15 @@ class MemoryProfileRevision(Base):
             ["tenant_id", "created_by_principal_id"],
             ["principals.tenant_id", "principals.id"],
             name="fk_memory_profile_revisions_tenant_creator",
+            ondelete="SET NULL (created_by_principal_id)",
         ),
         ForeignKeyConstraint(
             ["tenant_id", "default_write_workspace_id"],
             ["workspaces.tenant_id", "workspaces.id"],
             name="fk_memory_profile_revision_default_workspace",
-            ondelete="RESTRICT",
+            ondelete="NO ACTION",
+            deferrable=True,
+            initially="DEFERRED",
         ),
     )
 
@@ -596,7 +600,9 @@ class MemoryProfileWorkspaceGrant(Base):
             ["tenant_id", "workspace_id"],
             ["workspaces.tenant_id", "workspaces.id"],
             name="fk_memory_profile_grant_workspace",
-            ondelete="RESTRICT",
+            ondelete="NO ACTION",
+            deferrable=True,
+            initially="DEFERRED",
         ),
     )
 
@@ -635,6 +641,7 @@ class MemoryProfileEvent(Base):
             ["tenant_id", "actor_principal_id"],
             ["principals.tenant_id", "principals.id"],
             name="fk_memory_profile_events_tenant_actor",
+            ondelete="SET NULL (actor_principal_id)",
         ),
     )
 

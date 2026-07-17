@@ -106,6 +106,12 @@ async def test_migration_022_applies_to_pre022_schema_and_reapplies_cleanly() ->
         )
 
         await owner.execute(MIGRATION_SQL)
+        # Simulate the broad privilege left by the earlier development copy;
+        # reapplication must repair it as well as remain object-idempotent.
+        await owner.execute("GRANT UPDATE ON memory_profiles TO engram_app")
+        assert await owner.fetchval(
+            "SELECT has_table_privilege('engram_app', 'memory_profiles', 'UPDATE')"
+        )
         await owner.execute(MIGRATION_SQL)
 
         expected = {
@@ -139,6 +145,27 @@ async def test_migration_022_applies_to_pre022_schema_and_reapplies_cleanly() ->
                 "relrowsecurity": True,
                 "relforcerowsecurity": True,
             }
+        assert not await owner.fetchval(
+            "SELECT has_table_privilege('engram_app', 'memory_profiles', 'UPDATE')"
+        )
+        for column in ("active_revision_id", "disabled_at", "updated_at"):
+            assert await owner.fetchval(
+                "SELECT has_column_privilege('engram_app', 'memory_profiles', $1, 'UPDATE')",
+                column,
+            )
+        for column in (
+            "id",
+            "tenant_id",
+            "name",
+            "slug",
+            "description",
+            "created_by_principal_id",
+            "created_at",
+        ):
+            assert not await owner.fetchval(
+                "SELECT has_column_privilege('engram_app', 'memory_profiles', $1, 'UPDATE')",
+                column,
+            )
     finally:
         await owner.execute("SET search_path TO public")
         await owner.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
@@ -221,6 +248,172 @@ async def test_audit_identity_and_revision_references_are_tenant_and_profile_saf
         assert revision_a != revision_b
     finally:
         await owner.execute("DELETE FROM tenants WHERE id = ANY($1::uuid[])", [tenant_a, tenant_b])
+        await owner.close()
+
+
+async def test_creator_deletion_preserves_history_and_app_cannot_mutate_attribution() -> None:
+    import asyncpg
+
+    _require_stack()
+    owner = await _connect(_owner_dsn())  # type: ignore[arg-type]
+    app = await _connect(_app_dsn())  # type: ignore[arg-type]
+    tenant, creator, caller = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    workspace = uuid.uuid4()
+    profile: uuid.UUID | None = None
+    tenant_deleted = False
+    try:
+        await _seed_identity(owner, tenant, creator, "creator-delete")
+        await owner.execute(
+            "INSERT INTO principals (id, tenant_id, name, type) "
+            "VALUES ($1, $2, 'lifecycle-admin', 'admin')",
+            caller,
+            tenant,
+        )
+        await owner.execute(
+            "INSERT INTO workspaces (id, tenant_id, name, slug) "
+            "VALUES ($1, $2, 'History', 'history')",
+            workspace,
+            tenant,
+        )
+        profile, revision = await _seed_profile(
+            owner, tenant=tenant, principal=creator, slug="creator-history"
+        )
+        await owner.execute(
+            "INSERT INTO memory_profile_workspace_grants "
+            "(tenant_id, revision_id, workspace_id, can_read, can_write) "
+            "VALUES ($1, $2, $3, true, true)",
+            tenant,
+            revision,
+            workspace,
+        )
+        await owner.execute(
+            "UPDATE memory_profile_revisions "
+            "SET default_write_visibility = 'workspace', default_write_workspace_id = $1 "
+            "WHERE id = $2",
+            workspace,
+            revision,
+        )
+        await owner.executemany(
+            "INSERT INTO memory_profile_events "
+            "(tenant_id, profile_id, revision_id, actor_principal_id, event_type, reason) "
+            "VALUES ($1, $2, $3, $4, $5, $6)",
+            [
+                (tenant, profile, revision, creator, "profile_created", "initial"),
+                (tenant, profile, None, creator, "profile_disabled", "lifecycle"),
+            ],
+        )
+
+        await app.execute("SELECT set_config('app.tenant_id', $1, false)", str(tenant))
+        await app.execute("SELECT set_config('app.principal_id', $1, false)", str(caller))
+        for value in (None, caller):
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await app.execute(
+                    "UPDATE memory_profiles SET created_by_principal_id = $1 WHERE id = $2",
+                    value,
+                    profile,
+                )
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await app.execute(
+                "UPDATE memory_profile_revisions SET created_by_principal_id = NULL WHERE id = $1",
+                revision,
+            )
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await app.execute(
+                "UPDATE memory_profile_events SET actor_principal_id = NULL WHERE profile_id = $1",
+                profile,
+            )
+
+        assert (
+            await app.execute(
+                "UPDATE memory_profiles SET disabled_at = now(), updated_at = now() WHERE id = $1",
+                profile,
+            )
+            == "UPDATE 1"
+        )
+        assert await app.fetchval(
+            "SELECT disabled_at IS NOT NULL FROM memory_profiles WHERE id = $1", profile
+        )
+        assert (
+            await app.execute(
+                "UPDATE memory_profiles SET disabled_at = NULL, updated_at = now() WHERE id = $1",
+                profile,
+            )
+            == "UPDATE 1"
+        )
+
+        # The profile immutability trigger fires during this FK action.  Its
+        # narrow non-null -> NULL exception must allow all three attribution
+        # references to clear while retaining the historical control plane.
+        assert await owner.execute("DELETE FROM principals WHERE id = $1", creator) == "DELETE 1"
+        profile_row = await owner.fetchrow(
+            "SELECT created_by_principal_id, active_revision_id, disabled_at "
+            "FROM memory_profiles WHERE id = $1",
+            profile,
+        )
+        assert dict(profile_row) == {
+            "created_by_principal_id": None,
+            "active_revision_id": revision,
+            "disabled_at": None,
+        }
+        assert (
+            await owner.fetchval(
+                "SELECT created_by_principal_id FROM memory_profile_revisions WHERE id = $1",
+                revision,
+            )
+            is None
+        )
+        assert (
+            await owner.fetchval(
+                "SELECT count(*) FROM memory_profile_events "
+                "WHERE profile_id = $1 AND actor_principal_id IS NULL",
+                profile,
+            )
+            == 2
+        )
+        counts = await owner.fetchrow(
+            "SELECT "
+            "(SELECT count(*) FROM memory_profiles WHERE id = $1) AS profiles, "
+            "(SELECT count(*) FROM memory_profile_revisions WHERE profile_id = $1) AS revisions, "
+            "(SELECT count(*) FROM memory_profile_workspace_grants WHERE revision_id = $2) "
+            "AS grants, "
+            "(SELECT count(*) FROM memory_profile_events WHERE profile_id = $1) AS events",
+            profile,
+            revision,
+        )
+        assert dict(counts) == {"profiles": 1, "revisions": 1, "grants": 1, "events": 2}
+
+        with pytest.raises(asyncpg.ForeignKeyViolationError):
+            await owner.execute("DELETE FROM workspaces WHERE id = $1", workspace)
+
+        assert await owner.execute("DELETE FROM tenants WHERE id = $1", tenant) == "DELETE 1"
+        tenant_deleted = True
+        assert await owner.fetchval("SELECT count(*) FROM tenants WHERE id = $1", tenant) == 0
+        assert (
+            await owner.fetchval("SELECT count(*) FROM memory_profiles WHERE id = $1", profile) == 0
+        )
+        assert (
+            await owner.fetchval(
+                "SELECT count(*) FROM memory_profile_revisions WHERE id = $1", revision
+            )
+            == 0
+        )
+        assert (
+            await owner.fetchval(
+                "SELECT count(*) FROM memory_profile_workspace_grants WHERE revision_id = $1",
+                revision,
+            )
+            == 0
+        )
+        assert (
+            await owner.fetchval(
+                "SELECT count(*) FROM memory_profile_events WHERE profile_id = $1", profile
+            )
+            == 0
+        )
+    finally:
+        await app.close()
+        if not tenant_deleted:
+            await owner.execute("DELETE FROM tenants WHERE id = $1", tenant)
         await owner.close()
 
 

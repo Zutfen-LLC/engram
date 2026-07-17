@@ -53,7 +53,8 @@ CREATE TABLE IF NOT EXISTS memory_profile_revisions (
         REFERENCES memory_profiles(tenant_id, id) ON DELETE CASCADE,
     CONSTRAINT fk_memory_profile_revision_default_workspace
         FOREIGN KEY (tenant_id, default_write_workspace_id)
-        REFERENCES workspaces(tenant_id, id) ON DELETE RESTRICT,
+        REFERENCES workspaces(tenant_id, id)
+        ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
     CONSTRAINT fk_memory_profile_revisions_tenant_creator
         FOREIGN KEY (tenant_id, created_by_principal_id)
         REFERENCES principals(tenant_id, id)
@@ -84,7 +85,8 @@ CREATE TABLE IF NOT EXISTS memory_profile_workspace_grants (
     CONSTRAINT fk_memory_profile_grant_revision FOREIGN KEY (tenant_id, revision_id)
         REFERENCES memory_profile_revisions(tenant_id, id) ON DELETE CASCADE,
     CONSTRAINT fk_memory_profile_grant_workspace FOREIGN KEY (tenant_id, workspace_id)
-        REFERENCES workspaces(tenant_id, id) ON DELETE RESTRICT,
+        REFERENCES workspaces(tenant_id, id)
+        ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
     CONSTRAINT chk_memory_profile_grant_write_read CHECK (NOT can_write OR can_read),
     CONSTRAINT chk_memory_profile_grant_nonempty CHECK (can_read OR can_write)
 );
@@ -123,6 +125,26 @@ ALTER TABLE memory_profile_revisions
     DROP CONSTRAINT IF EXISTS memory_profile_revisions_created_by_principal_id_fkey;
 ALTER TABLE memory_profile_events
     DROP CONSTRAINT IF EXISTS memory_profile_events_actor_principal_id_fkey;
+
+-- An earlier development copy used RESTRICT for workspace references.  That
+-- blocks a tenant cascade because PostgreSQL can reach the workspace before
+-- the profile-owned grant/revision rows.  Deferred NO ACTION still rejects a
+-- standalone workspace deletion at commit, while allowing the complete
+-- tenant graph to disappear in one transaction.
+ALTER TABLE memory_profile_revisions
+    DROP CONSTRAINT IF EXISTS fk_memory_profile_revision_default_workspace;
+ALTER TABLE memory_profile_revisions
+    ADD CONSTRAINT fk_memory_profile_revision_default_workspace
+    FOREIGN KEY (tenant_id, default_write_workspace_id)
+    REFERENCES workspaces(tenant_id, id)
+    ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED;
+ALTER TABLE memory_profile_workspace_grants
+    DROP CONSTRAINT IF EXISTS fk_memory_profile_grant_workspace;
+ALTER TABLE memory_profile_workspace_grants
+    ADD CONSTRAINT fk_memory_profile_grant_workspace
+    FOREIGN KEY (tenant_id, workspace_id)
+    REFERENCES workspaces(tenant_id, id)
+    ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED;
 
 DO $$ BEGIN
     IF NOT EXISTS (
@@ -222,13 +244,19 @@ CREATE TRIGGER trg_api_keys_memory_profile_immutable
     BEFORE UPDATE ON api_keys FOR EACH ROW EXECUTE FUNCTION enforce_api_key_memory_profile_immutable();
 
 -- Stable identity metadata is immutable; only lifecycle state/pointer changes.
+-- The creator may move from a recorded principal to NULL solely so the
+-- composite FK's ON DELETE SET NULL action can preserve historical profiles
+-- when that principal is deleted.  The application role has no UPDATE grant
+-- on this column, so callers cannot invoke this exception directly.
 CREATE OR REPLACE FUNCTION enforce_memory_profile_mutability()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     IF NEW.id IS DISTINCT FROM OLD.id OR NEW.tenant_id IS DISTINCT FROM OLD.tenant_id
        OR NEW.name IS DISTINCT FROM OLD.name OR NEW.slug IS DISTINCT FROM OLD.slug
        OR NEW.description IS DISTINCT FROM OLD.description
-       OR NEW.created_by_principal_id IS DISTINCT FROM OLD.created_by_principal_id
+       OR (NEW.created_by_principal_id IS DISTINCT FROM OLD.created_by_principal_id
+           AND NOT (OLD.created_by_principal_id IS NOT NULL
+                    AND NEW.created_by_principal_id IS NULL))
        OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
         RAISE EXCEPTION 'memory profile identity is immutable' USING ERRCODE = 'check_violation';
     END IF;
@@ -264,7 +292,12 @@ CREATE POLICY tenant_isolation_memory_profile_events ON memory_profile_events
     USING (tenant_id::text = current_setting('app.tenant_id', true))
     WITH CHECK (tenant_id::text = current_setting('app.tenant_id', true));
 
-GRANT SELECT, INSERT, UPDATE ON memory_profiles TO engram_app;
+GRANT SELECT, INSERT ON memory_profiles TO engram_app;
+-- Remove the broad grant from any earlier development application of this
+-- still-unmerged migration before installing the narrow lifecycle authority.
+REVOKE UPDATE ON memory_profiles FROM engram_app;
+GRANT UPDATE (active_revision_id, disabled_at, updated_at)
+    ON memory_profiles TO engram_app;
 GRANT SELECT, INSERT ON memory_profile_revisions, memory_profile_workspace_grants, memory_profile_events TO engram_app;
 REVOKE DELETE ON memory_profiles, memory_profile_revisions, memory_profile_workspace_grants, memory_profile_events FROM engram_app;
 REVOKE UPDATE, DELETE ON memory_profile_revisions, memory_profile_workspace_grants, memory_profile_events FROM engram_app;
