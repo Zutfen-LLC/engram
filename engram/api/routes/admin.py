@@ -4,6 +4,7 @@ All endpoints require the ``admin`` scope when auth is enabled. When auth is
 disabled the default principal already carries all scopes, so these endpoints
 work in dev mode without a token.
 """
+# ruff: noqa: E501
 
 from __future__ import annotations
 
@@ -25,10 +26,12 @@ from engram.auth import (
     canonicalize_scopes,
     digest_api_key_secret,
     generate_api_key,
+    get_current_principal,
     parse_api_key,
     validate_principal_name,
     validate_principal_type,
 )
+from engram.auth import Principal as AuthPrincipal
 from engram.classification import invalidate_vocab_cache
 from engram.db import get_session
 from engram.memory_kinds import (
@@ -37,6 +40,7 @@ from engram.memory_kinds import (
     invalidate_memory_kind_cache,
     seed_builtin_kinds,
 )
+from engram.memory_profiles import ProfileNotFoundError, validate_key_binding
 from engram.models import ApiKey, MemoryKind, Tenant, TenantConfig, Workspace
 from engram.models import Principal as PrincipalModel
 from engram.promotion import auto_promote_proposed_memories, summarize
@@ -96,6 +100,7 @@ class ApiKeyCreate(BaseModel):
     principal_id: uuid.UUID | None = None
     scopes: list[str] = Field(default=["read", "write"])
     label: str | None = None
+    memory_profile_id: uuid.UUID | None = None
 
     @field_validator("scopes")
     @classmethod
@@ -115,6 +120,10 @@ class ApiKeyOut(BaseModel):
     principal_id: uuid.UUID | None
     scopes: list[str]
     label: str | None
+    memory_profile_id: uuid.UUID | None = None
+    memory_profile_revision_id: uuid.UUID | None = None
+    memory_profile_slug: str | None = None
+    memory_profile_version: int | None = None
     key: str  # plaintext, shown once
 
 
@@ -341,6 +350,7 @@ async def create_principal(
 async def create_api_key(
     body: ApiKeyCreate,
     session: AsyncSession = Depends(get_session),  # noqa: B008
+    caller: AuthPrincipal = Depends(get_current_principal),  # noqa: B008
 ) -> ApiKeyOut:
     # Reject key issuance for internal (non-credentialable) principals
     # (V2-BL-003B). The validation resolves the principal inside the caller's
@@ -357,12 +367,17 @@ async def create_api_key(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="API keys cannot be issued for this principal",
             ) from exc
+    try:
+        active_profile = await validate_key_binding(session, body.tenant_id, body.memory_profile_id)
+    except ProfileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="memory profile not found") from exc
     plaintext = generate_api_key()
     parsed = parse_api_key(plaintext)
     assert parsed.key_id is not None  # new-format keys always carry a key_id
     api_key = ApiKey(
         tenant_id=body.tenant_id,
         principal_id=body.principal_id,
+        memory_profile_id=body.memory_profile_id,
         key_hash=None,
         key_id=parsed.key_id,
         secret_digest=digest_api_key_secret(parsed.secret),
@@ -372,6 +387,21 @@ async def create_api_key(
         created_at=datetime.now(UTC),
     )
     session.add(api_key)
+    await session.flush()
+    if active_profile is not None:
+        await session.execute(
+            text(
+                "INSERT INTO memory_profile_events "
+                "(tenant_id, profile_id, revision_id, actor_principal_id, event_type, reason, details) "
+                "VALUES (:tenant_id, :profile_id, :revision_id, :actor_principal_id, "
+                "'profile_bound_at_key_issuance', 'API key issuance', "
+                "jsonb_build_object('api_key_id', CAST(:key_id AS text), "
+                "'label', CAST(:label AS text)))"
+            ),
+            {"tenant_id": str(body.tenant_id), "profile_id": str(active_profile.id),
+             "revision_id": str(active_profile.revision_id), "key_id": str(api_key.id),
+             "label": body.label, "actor_principal_id": caller.principal_id},
+        )
     await session.commit()
     await session.refresh(api_key)
     return ApiKeyOut(
@@ -380,6 +410,10 @@ async def create_api_key(
         principal_id=api_key.principal_id,
         scopes=list(api_key.scopes),
         label=api_key.label,
+        memory_profile_id=body.memory_profile_id,
+        memory_profile_revision_id=active_profile.revision_id if active_profile else None,
+        memory_profile_slug=active_profile.slug if active_profile else None,
+        memory_profile_version=active_profile.version if active_profile else None,
         key=plaintext,
     )
 

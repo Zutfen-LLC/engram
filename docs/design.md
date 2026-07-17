@@ -86,6 +86,16 @@ Single-agent memory is the on-ramp. Multi-agent institutional memory is the moat
 
 6. **Principal/workspace scoping is first-class.** Memory items belong to a tenant, workspace, and principal. Visibility levels and workspace membership control access.
 
+7. **Memory profiles are credential-bound narrowing policy identities.** A profile is neither a
+   principal, workspace, group, nor audience and never grants workspace membership. A stable,
+   tenant-scoped profile selects one immutable active revision; API keys may bind to that stable
+   identity only at issuance and follow later active-revision changes. Disabling a profile makes
+   its bound credentials fail closed. In ENG-SCOPE-002A profile policy is declarative only: memory
+   access remains unchanged. ENG-SCOPE-002B/002C will apply the narrowing intersection:
+   tenant/RLS boundary ∩ principal visibility and workspace membership ∩ key-bound active profile
+   revision ∩ later task-bound narrowing. There is no request-time profile selector and changing a
+   key's profile requires revoking it and issuing a new key.
+
 7. **The memory model concepts are the product, not the storage.** Wings/rooms/drawers, knowledge graph triples, tunnels, and diaries are Engram's product vocabulary.
 
 8. **Classification intelligence is a service feature; lifecycle hooks are client-side.** The service provides content classification — what kind, what wing, what room — as an endpoint. Lifecycle hooks such as when to extract, when to promote, and when to write are client-side because they are framework-specific.

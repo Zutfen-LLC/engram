@@ -20,6 +20,147 @@ SourceKind = Literal[
 SensitivityKind = Literal["normal", "sensitive", "restricted"]
 VisibilityKind = Literal["private", "workspace", "tenant", "public"]
 SearchMode = Literal["keyword", "semantic", "hybrid"]
+ProfileVisibility = Literal["private", "workspace", "tenant", "public"]
+
+
+# ---- /v1/memory-profiles and profile-aware credential issuance ----
+
+
+class WorkspaceGrantInput(BaseModel):
+    workspace_id: UUID
+    can_read: bool
+    can_write: bool
+
+
+class WorkspaceGrantOut(WorkspaceGrantInput):
+    workspace_slug: str
+
+
+class MemoryProfilePolicy(BaseModel):
+    include_private: bool = True
+    include_tenant: bool = False
+    include_public: bool = False
+    allow_tenant_write: bool = False
+    allow_public_write: bool = False
+    default_write_visibility: ProfileVisibility = "private"
+    default_write_workspace_id: UUID | None = None
+    workspace_grants: list[WorkspaceGrantInput] = Field(default_factory=list)
+
+
+class MemoryProfileCreate(BaseModel):
+    name: str
+    slug: str
+    description: str | None = None
+    policy: MemoryProfilePolicy = Field(default_factory=MemoryProfilePolicy)
+    reason: str
+
+
+class MemoryProfileRevisionCreate(BaseModel):
+    expected_active_revision_id: UUID
+    policy: MemoryProfilePolicy
+    reason: str
+
+
+class MemoryProfileRevision(BaseModel):
+    id: UUID
+    version: int
+    include_private: bool
+    include_tenant: bool
+    include_public: bool
+    allow_tenant_write: bool
+    allow_public_write: bool
+    default_write_visibility: ProfileVisibility
+    default_write_workspace_id: UUID | None
+    created_by_principal_id: UUID | None
+    reason: str
+    created_at: datetime
+    workspace_grants: list[WorkspaceGrantOut]
+
+
+class MemoryProfile(BaseModel):
+    id: UUID
+    name: str
+    slug: str
+    description: str | None
+    enabled: bool
+    active_revision_id: UUID
+    active_revision: MemoryProfileRevision
+    created_at: datetime
+    updated_at: datetime
+
+
+class MemoryProfileSummary(BaseModel):
+    id: UUID
+    name: str
+    slug: str
+    description: str | None
+    enabled: bool
+    active_revision_id: UUID | None
+    active_revision_version: int | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class MemoryProfileLifecycle(BaseModel):
+    reason: str
+
+
+class ApiKeyCreateRequest(BaseModel):
+    tenant_id: UUID
+    principal_id: UUID | None = None
+    scopes: list[str] = Field(default_factory=lambda: ["read", "write"])
+    label: str | None = None
+    memory_profile_id: UUID | None = None
+
+
+class ApiKeyCreateResponse(BaseModel):
+    id: UUID
+    tenant_id: UUID
+    principal_id: UUID | None
+    scopes: list[str]
+    label: str | None
+    key: str
+    memory_profile_id: UUID | None = None
+    memory_profile_revision_id: UUID | None = None
+    memory_profile_slug: str | None = None
+    memory_profile_version: int | None = None
+
+
+class AgentCreateRequest(BaseModel):
+    name: str
+    scopes: list[str] = Field(default_factory=lambda: ["read", "write"])
+    label: str | None = None
+    memory_profile_id: UUID | None = None
+
+
+class AgentCreated(BaseModel):
+    id: UUID
+    name: str
+    type: str
+    created_at: datetime
+    key: str
+    key_id: UUID
+    scopes: list[str]
+    label: str | None
+    memory_profile_id: UUID | None = None
+    memory_profile_revision_id: UUID | None = None
+    memory_profile_slug: str | None = None
+    memory_profile_version: int | None = None
+
+
+class WhoAmIMemoryProfile(BaseModel):
+    id: UUID
+    slug: str
+    active_revision_id: UUID
+    version: int
+
+
+class WhoAmIResponse(BaseModel):
+    principal_id: UUID
+    tenant_id: UUID
+    scopes: list[str]
+    api_key_id: UUID | None
+    memory_profile: WhoAmIMemoryProfile | None
 
 
 # ---- /v1/remember ----

@@ -11,6 +11,7 @@ for cross-tenant platform operators. These self-service endpoints are the
 user-facing layer that will power hosted onboarding and multi-agent fleets on
 a self-hosted instance.
 """
+# ruff: noqa: E501
 
 from __future__ import annotations
 
@@ -38,6 +39,7 @@ from engram.auth import (
     Principal as AuthPrincipal,
 )
 from engram.db import get_session
+from engram.memory_profiles import ProfileNotFoundError, validate_key_binding
 from engram.models import Principal as PrincipalModel
 
 router = APIRouter()
@@ -54,6 +56,7 @@ class AgentCreate(BaseModel):
     # — the minimum useful set for an agent that reads and writes memory.
     scopes: list[str] = Field(default=["read", "write"])
     label: str | None = None
+    memory_profile_id: uuid.UUID | None = None
 
     def validated_scopes(self) -> list[str]:
         return canonicalize_scopes(self.scopes)
@@ -75,6 +78,10 @@ class AgentCreated(AgentOut):
     key_id: uuid.UUID
     scopes: list[str]
     label: str | None
+    memory_profile_id: uuid.UUID | None = None
+    memory_profile_revision_id: uuid.UUID | None = None
+    memory_profile_slug: str | None = None
+    memory_profile_version: int | None = None
 
 
 class AgentListOut(BaseModel):
@@ -119,6 +126,10 @@ async def create_agent(
         ) from exc
 
     scopes = body.validated_scopes()
+    try:
+        active_profile = await validate_key_binding(session, tenant_id, body.memory_profile_id)
+    except ProfileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="memory profile not found") from exc
 
     # Create the agent principal.
     principal = PrincipalModel(
@@ -144,14 +155,7 @@ async def create_agent(
     is_sqlite = dialect_name == "sqlite"
     scopes_value: str | list[str] = ",".join(scopes) if is_sqlite else scopes
 
-    await session.execute(
-        text(
-            "INSERT INTO api_keys "
-            "  (id, tenant_id, principal_id, key_hash, key_id, secret_digest, "
-            "   digest_algorithm, scopes, label, created_at, revoked_at) "
-            "VALUES (:id, :tid, :pid, NULL, :kid, :sd, :da, :sc, :lbl, :ts, NULL)"
-        ),
-        {
+    key_params: dict[str, object] = {
             "id": str(key_id_uuid),
             "tid": str(tenant_id),
             "pid": str(principal.id),
@@ -160,9 +164,41 @@ async def create_agent(
             "da": DIGEST_ALGORITHM,
             "sc": scopes_value,
             "lbl": key_label,
+            "mpid": str(body.memory_profile_id) if body.memory_profile_id else None,
             "ts": datetime.now(UTC),
-        },
-    )
+        }
+    if is_sqlite:
+        await session.execute(
+            text(
+                "INSERT INTO api_keys "
+                "(id, tenant_id, principal_id, key_hash, key_id, secret_digest, "
+                "digest_algorithm, scopes, label, created_at, revoked_at) "
+                "VALUES (:id, :tid, :pid, NULL, :kid, :sd, :da, :sc, :lbl, :ts, NULL)"
+            ), key_params,
+        )
+    else:
+        await session.execute(
+            text(
+                "INSERT INTO api_keys "
+                "(id, tenant_id, principal_id, key_hash, key_id, secret_digest, "
+                "digest_algorithm, scopes, label, memory_profile_id, created_at, revoked_at) "
+                "VALUES (:id, :tid, :pid, NULL, :kid, :sd, :da, :sc, :lbl, :mpid, :ts, NULL)"
+            ), key_params,
+        )
+    if active_profile is not None:
+        await session.execute(
+            text(
+                "INSERT INTO memory_profile_events "
+                "(tenant_id, profile_id, revision_id, actor_principal_id, event_type, reason, details) "
+                "VALUES (:tenant_id, :profile_id, :revision_id, :actor_principal_id, "
+                "'profile_bound_at_key_issuance', 'Agent API key issuance', "
+                "jsonb_build_object('api_key_id', CAST(:key_id AS text), "
+                "'label', CAST(:label AS text)))"
+            ),
+            {"tenant_id": str(tenant_id), "profile_id": str(active_profile.id),
+             "revision_id": str(active_profile.revision_id), "actor_principal_id": str(caller.principal_id),
+             "key_id": str(key_id_uuid), "label": key_label},
+        )
     await session.commit()
     await session.refresh(principal)
 
@@ -175,6 +211,10 @@ async def create_agent(
         key_id=key_id_uuid,
         scopes=scopes,
         label=key_label,
+        memory_profile_id=body.memory_profile_id,
+        memory_profile_revision_id=active_profile.revision_id if active_profile else None,
+        memory_profile_slug=active_profile.slug if active_profile else None,
+        memory_profile_version=active_profile.version if active_profile else None,
     )
 
 

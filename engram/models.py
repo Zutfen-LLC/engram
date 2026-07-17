@@ -19,6 +19,7 @@ from sqlalchemy import (
     SmallInteger,
     String,
     Text,
+    UniqueConstraint,
     text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
@@ -45,6 +46,7 @@ class Tenant(Base):
 
 class Workspace(Base):
     __tablename__ = "workspaces"
+    __table_args__ = (UniqueConstraint("tenant_id", "id", name="idx_workspaces_tenant_identity"),)
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(
@@ -62,6 +64,7 @@ class Workspace(Base):
 
 class Principal(Base):
     __tablename__ = "principals"
+    __table_args__ = (UniqueConstraint("tenant_id", "id", name="idx_principals_tenant_identity"),)
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(
@@ -480,8 +483,191 @@ class MemoryKind(Base):
     )
 
 
+class MemoryProfile(Base):
+    """Stable tenant-scoped memory-profile identity (ENG-SCOPE-002A)."""
+
+    __tablename__ = "memory_profiles"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "id", name="uq_memory_profiles_tenant_id_id"),
+        UniqueConstraint("tenant_id", "slug", name="uq_memory_profiles_tenant_slug"),
+        ForeignKeyConstraint(
+            ["tenant_id", "created_by_principal_id"],
+            ["principals.tenant_id", "principals.id"],
+            name="fk_memory_profiles_tenant_creator",
+            ondelete="SET NULL (created_by_principal_id)",
+        ),
+        ForeignKeyConstraint(
+            ["active_revision_id", "id", "tenant_id"],
+            [
+                "memory_profile_revisions.id",
+                "memory_profile_revisions.profile_id",
+                "memory_profile_revisions.tenant_id",
+            ],
+            name="fk_memory_profiles_active_revision",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    slug: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    active_revision_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by_principal_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class MemoryProfileRevision(Base):
+    """Immutable policy revision selected by a stable memory profile."""
+
+    __tablename__ = "memory_profile_revisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "profile_id", "version", name="uq_memory_profile_revisions_profile_version"
+        ),
+        UniqueConstraint("tenant_id", "id", name="uq_memory_profile_revisions_tenant_id_id"),
+        UniqueConstraint(
+            "id", "profile_id", "tenant_id", name="uq_memory_profile_revisions_identity"
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "profile_id"],
+            ["memory_profiles.tenant_id", "memory_profiles.id"],
+            name="fk_memory_profile_revision_profile",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "created_by_principal_id"],
+            ["principals.tenant_id", "principals.id"],
+            name="fk_memory_profile_revisions_tenant_creator",
+            ondelete="SET NULL (created_by_principal_id)",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "default_write_workspace_id"],
+            ["workspaces.tenant_id", "workspaces.id"],
+            name="fk_memory_profile_revision_default_workspace",
+            ondelete="NO ACTION",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    profile_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    include_private: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    include_tenant: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    include_public: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    allow_tenant_write: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    allow_public_write: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    default_write_visibility: Mapped[str] = mapped_column(Text, default="private", nullable=False)
+    default_write_workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    created_by_principal_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class MemoryProfileWorkspaceGrant(Base):
+    """Immutable workspace grant belonging to one profile revision."""
+
+    __tablename__ = "memory_profile_workspace_grants"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "revision_id"],
+            ["memory_profile_revisions.tenant_id", "memory_profile_revisions.id"],
+            name="fk_memory_profile_grant_revision",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "workspace_id"],
+            ["workspaces.tenant_id", "workspaces.id"],
+            name="fk_memory_profile_grant_workspace",
+            ondelete="NO ACTION",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+    )
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    revision_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    can_read: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    can_write: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class MemoryProfileEvent(Base):
+    """Append-only audit event for profile lifecycle and key binding."""
+
+    __tablename__ = "memory_profile_events"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "profile_id"],
+            ["memory_profiles.tenant_id", "memory_profiles.id"],
+            name="fk_memory_profile_event_profile",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["revision_id", "profile_id", "tenant_id"],
+            [
+                "memory_profile_revisions.id",
+                "memory_profile_revisions.profile_id",
+                "memory_profile_revisions.tenant_id",
+            ],
+            name="fk_memory_profile_event_revision",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "actor_principal_id"],
+            ["principals.tenant_id", "principals.id"],
+            name="fk_memory_profile_events_tenant_actor",
+            ondelete="SET NULL (actor_principal_id)",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    profile_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    revision_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    actor_principal_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    event_type: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    details: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
 class ApiKey(Base):
     __tablename__ = "api_keys"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "memory_profile_id"],
+            ["memory_profiles.tenant_id", "memory_profiles.id"],
+            name="fk_api_keys_memory_profile",
+            ondelete="RESTRICT",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(
@@ -490,6 +676,10 @@ class ApiKey(Base):
     principal_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("principals.id"), nullable=True
     )
+    # Optional, immutable stable profile identity.  The database trigger added
+    # by migration 022 rejects any post-insert change; keys follow the
+    # profile's active revision at authentication time.
+    memory_profile_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     # Bcrypt hash for LEGACY keys (eng_<random>, pre-ENG-AUD-003). Nullable now:
     # new-format keys store a digest instead and leave this NULL.
     key_hash: Mapped[str | None] = mapped_column(Text, nullable=True)

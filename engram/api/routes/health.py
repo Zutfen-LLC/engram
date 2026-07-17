@@ -114,14 +114,24 @@ async def readiness(
 @router.get("/whoami", response_model=None, dependencies=[Depends(READ_SCOPE)])
 async def whoami(
     principal: Principal = Depends(get_current_principal),  # noqa: B008
-) -> dict[str, str | list[str]]:
+) -> dict[str, object]:
     """Return the caller's resolved principal and tenant.
 
     Lets API clients discover their own tenant_id from their API key,
     without needing to pass it as a query parameter or know it out of band.
     """
+    memory_profile: dict[str, object] | None = None
+    if principal.memory_profile_id is not None:
+        memory_profile = {
+            "id": principal.memory_profile_id,
+            "slug": principal.memory_profile_slug,
+            "active_revision_id": principal.memory_profile_revision_id,
+            "version": principal.memory_profile_version,
+        }
     return {
         "principal_id": principal.principal_id,
         "tenant_id": principal.tenant_id,
         "scopes": list(principal.scopes),
+        "api_key_id": principal.api_key_id,
+        "memory_profile": memory_profile,
     }
