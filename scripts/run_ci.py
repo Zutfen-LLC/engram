@@ -119,14 +119,11 @@ def main() -> int:
     _section("Root Service Tests")
     env = dict(os.environ)
     env["ENGRAM_FAIL_ON_DB_SKIP"] = "1"
-    _run("pytest", "-q", "tests", env=env)
+    _run("pytest", "-q", "--durations=25", "tests", env=env)
 
-    # NOTE: The canonical trust-proof selector (scripts/trust_proof_files.py)
-    # selects the Gate B invariant subset from the same suite above. It is
-    # available as ``make trust-proof`` and ``make compose-trust-proof`` for
-    # operators who want to verify only the trust invariants. CI runs the
-    # full suite (which is a superset of the trust proofs) so a separate
-    # in-CI re-run would be redundant.
+    # Hosted CI runs the complete root suite once. The canonical trust proof
+    # remains an explicit operator/local selector via ``make trust-proof`` and
+    # ``make compose-trust-proof`` and must not be rerun inside the hosted gate.
 
     _section("SDK Tests")
     _run("pytest", "-q", "-c", "sdk/engram-client/pyproject.toml", "sdk/engram-client/tests")
