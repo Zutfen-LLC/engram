@@ -8,6 +8,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from engram.memory_context import ResolvedMemoryContext, context_provenance
 from engram.models import CandidateIngest
 
 
@@ -21,9 +22,14 @@ class CandidateIdentity:
 
 
 def create_ingest(
-    *, identity: CandidateIdentity, client_correlation_id: UUID | None
+    *,
+    identity: CandidateIdentity,
+    client_correlation_id: UUID | None,
+    memory_context: ResolvedMemoryContext | None = None,
 ) -> CandidateIngest:
     """Build a new server-issued ingest row; the caller owns flush/commit."""
+    provenance = context_provenance(memory_context) if memory_context is not None else {}
+    provenance.pop("tenant_id", None)
     return CandidateIngest(
         tenant_id=identity.tenant_id,
         principal_id=identity.principal_id,
@@ -31,6 +37,7 @@ def create_ingest(
         source_type=identity.source_type,
         content_hash=identity.content_hash,
         client_correlation_id=client_correlation_id,
+        **provenance,
     )
 
 

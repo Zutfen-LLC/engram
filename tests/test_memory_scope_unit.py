@@ -10,16 +10,70 @@ resolver through ``/v1/remember``/``/v1/classify``) lives in
 
 from __future__ import annotations
 
-from uuid import uuid4
+from dataclasses import replace
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from engram.memory_scope import authorize_workspace, resolve_write_scope
+from engram.auth import Principal
+from engram.memory_context import unrestricted_memory_context
+from engram.memory_scope import authorize_workspace
+from engram.memory_scope import resolve_write_scope as _resolve_write_scope
 
 pytestmark = pytest.mark.asyncio
+
+
+def _context(tenant_id: str, principal_id: str):
+    return unrestricted_memory_context(
+        Principal(tenant_id=tenant_id, principal_id=principal_id, scopes=())
+    )
+
+
+def _profile_context(
+    tenant_id: str,
+    principal_id: str,
+    *,
+    readable: frozenset,
+    writable: frozenset,
+    default_visibility: str = "private",
+    default_workspace_id=None,
+    allow_tenant_write: bool = False,
+    allow_public_write: bool = False,
+):
+    return replace(
+        _context(tenant_id, principal_id),
+        memory_profile_id=uuid4(),
+        memory_profile_revision_id=uuid4(),
+        memory_profile_slug="write-profile",
+        memory_profile_version=1,
+        readable_workspace_ids=readable,
+        writable_workspace_ids=writable,
+        allow_tenant_write=allow_tenant_write,
+        allow_public_write=allow_public_write,
+        default_write_visibility=default_visibility,
+        default_write_workspace_id=default_workspace_id,
+    )
+
+
+async def resolve_write_scope(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    principal_id: str,
+    caller_has_admin_scope: bool,
+    requested_visibility: str | None,
+    requested_workspace: str | None,
+):
+    return await _resolve_write_scope(
+        session,
+        memory_context=_context(tenant_id, principal_id),
+        caller_has_admin_scope=caller_has_admin_scope,
+        requested_visibility=requested_visibility,
+        requested_workspace=requested_workspace,
+    )
 
 
 @pytest.fixture()
@@ -262,3 +316,49 @@ async def test_direct_authorize_workspace_helper_matches_resolver(session):
         workspace_slug="alpha",
     )
     assert str(resolved) == workspace_id
+
+
+async def test_profile_fully_omitted_scope_uses_exact_workspace_default(session):
+    tenant_id, principal_id = str(uuid4()), str(uuid4())
+    workspace_id = await _seed_workspace(session, tenant_id=tenant_id, slug="alpha")
+    await _add_member(session, workspace_id=workspace_id, principal_id=principal_id)
+    context = _profile_context(
+        tenant_id,
+        principal_id,
+        readable=frozenset({UUID(workspace_id)}),
+        writable=frozenset({UUID(workspace_id)}),
+        default_visibility="workspace",
+        default_workspace_id=UUID(workspace_id),
+    )
+    scope = await _resolve_write_scope(
+        session,
+        memory_context=context,
+        caller_has_admin_scope=False,
+        requested_visibility=None,
+        requested_workspace=None,
+    )
+    assert scope.visibility == "workspace"
+    assert scope.workspace_id == UUID(workspace_id)
+    assert scope.visibility_from_profile_default
+    assert scope.workspace_from_profile_default
+    assert not scope.request_scope_was_explicit
+
+
+async def test_profile_admin_cannot_bypass_missing_write_grant(session):
+    tenant_id, principal_id = str(uuid4()), str(uuid4())
+    workspace_id = await _seed_workspace(session, tenant_id=tenant_id, slug="alpha")
+    context = _profile_context(
+        tenant_id,
+        principal_id,
+        readable=frozenset({UUID(workspace_id)}),
+        writable=frozenset(),
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        await _resolve_write_scope(
+            session,
+            memory_context=context,
+            caller_has_admin_scope=True,
+            requested_visibility="private",
+            requested_workspace="alpha",
+        )
+    assert exc_info.value.status_code == 404

@@ -94,10 +94,10 @@ Single-agent memory is the on-ramp. Multi-agent institutional memory is the moat
    request-scoped `ResolvedMemoryContext`:
    tenant/RLS boundary ∩ principal visibility and workspace membership ∩ key-bound active profile
    revision ∩ optional explicit workspace narrowing. Authentication pins the exact revision; the
-   primary request session resolves its flags and readable grants once, and read-replica queries
-   receive that immutable value rather than querying policy independently. There is no
+   primary request session resolves its read/write flags and grants once, and read-replica queries
+   and mutation paths receive that immutable value rather than querying policy independently. There is no
    request-time profile selector and changing a key's profile requires revoking it and issuing a
-   new key. Profile-enforced writes remain deferred to ENG-SCOPE-002C.
+   new key. ENG-SCOPE-002C extends the same boundary to caller writes and mutations.
 
 7. **The memory model concepts are the product, not the storage.** Wings/rooms/drawers, knowledge graph triples, tunnels, and diaries are Engram's product vocabulary.
 
@@ -801,12 +801,13 @@ Review reports apply the canonical item predicate, conflict reports require both
 memories to be eligible, and review statistics are relative to the caller's eligible
 current corpus rather than tenant-global administrative counts.
 
-### Resolved memory read context (ENG-SCOPE-002B)
+### Resolved memory context (ENG-SCOPE-002B/002C)
 
 Every caller-facing operation that returns or derives from `memory_items` uses
-`memory-context-v1`. The immutable context records the tenant, principal, API key,
+`memory-context-v2`. The immutable context records the tenant, principal, API key,
 bound profile/revision identity and version, three visibility flags, and the set of
-`can_read=true` workspace grants. `readable_workspace_ids=NULL` means an unprofiled
+`can_read=true` workspace grants, plus tenant/public write flags, the write default, and
+`can_write=true` grants. A NULL grant set means an unprofiled
 compatibility caller; an empty set means a bound profile with no readable workspaces.
 Unprofiled keys and auth-disabled development retain the pre-profile predicate.
 
@@ -842,15 +843,32 @@ sets avoid an embedding-provider call and record `not_attempted`. Standalone tun
 definitions and non-MemoryItem control-plane metadata remain unaffected.
 
 New startup and semantic `recall_logs` rows record the exact profile/revision pair and
-`memory-context-v1`; new unprofiled reads record NULL profile IDs with the same context
+`memory-context-v2`; new unprofiled reads record NULL profile IDs with the same context
 version, while pre-002B rows are labeled `legacy-unprofiled-v0`. Search
 `retrieval.request` metadata carries only bounded profile identity/version fields—no
 queries, content, policy JSON, or grant lists.
 
-This is a read boundary, not yet a complete read/write sandbox. Remember, classify,
-KG/diary writes, feedback, item metadata and lifecycle mutations, review transitions,
-workers, imports, and hooks intentionally retain pre-002B behavior until
-ENG-SCOPE-002C.
+ENG-SCOPE-002C applies the same immutable context to prospective writes and existing-item
+mutations. Fully omitted scope uses the profile default; a partially explicit request never
+borrows the missing half from that default. Private/no-workspace creation is controlled by the
+API `write` scope and is independent of `include_private`. Tenant and public creation require
+`allow_tenant_write` and `allow_public_write` respectively, independent of their read flags.
+Every non-NULL workspace association requires `can_write=true` in addition to existing
+membership (or the established admin membership bypass). `admin` never bypasses profile policy.
+
+Existing-item mutation is the intersection of tenant/RLS, established principal eligibility,
+profile read eligibility, and profile write eligibility for the current scope. A denied target is
+indistinguishable from a missing target. Scope-changing operations separately authorize the
+resulting scope, and classification receipts never preserve authority for a later request.
+Candidate ingests pin the exact context used to accept work; candidate-origin workers reconstruct
+that exact revision without consulting the current active revision. Item-local enrichment remains
+allowed, while cross-item scans and mutations use the initiating boundary and fail closed when v2
+provenance cannot be reconstructed.
+
+Candidate ingests and caller-originated item events record `memory-context-v2` with tenant-safe
+API-key/profile/revision provenance. Internal maintenance records `internal-system-v1`.
+Historical or mixed-version omitted rows remain `legacy-unprofiled-v0`; historical 002B recall
+rows remain v1 and are never relabeled.
 
 Caller-facing conflict resolution is a human-governed operation. API `review` scope
 permits an attempt, but only authenticated users and administrators may decide a

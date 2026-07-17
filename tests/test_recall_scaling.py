@@ -310,7 +310,7 @@ async def test_profile_context_is_applied_on_read_engine_without_policy_query():
             await session.commit()
 
         context = ResolvedMemoryContext(
-            version="memory-context-v1",
+            version="memory-context-v2",
             tenant_id=uuid.UUID(tenant_id),
             principal_id=uuid.UUID(principal_id),
             api_key_id=uuid.uuid4(),
@@ -322,6 +322,11 @@ async def test_profile_context_is_applied_on_read_engine_without_policy_query():
             include_tenant=True,
             include_public=False,
             readable_workspace_ids=frozenset({workspace_ids[0]}),
+            allow_tenant_write=True,
+            allow_public_write=False,
+            default_write_visibility="private",
+            default_write_workspace_id=None,
+            writable_workspace_ids=frozenset({workspace_ids[0]}),
         )
         async with read_factory() as read_session:
             await _apply_rls(read_session, tenant_id, principal_id)

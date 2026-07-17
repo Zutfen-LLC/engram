@@ -17,9 +17,9 @@ from engram.auth import Principal as AuthPrincipal
 from engram.authority import MemoryAuthority
 from engram.db import get_session
 from engram.memory_access import (
-    apply_principal_eligibility,
-    principal_eligibility_expression,
+    apply_write_eligibility,
     read_eligibility_expression,
+    write_eligibility_expression,
 )
 from engram.memory_context import ResolvedMemoryContext, resolve_memory_context
 from engram.memory_scope import resolve_write_scope
@@ -136,6 +136,7 @@ async def add_triple(
     tenant_id: UUID = Depends(_resolve_tenant_id),  # noqa: B008
     principal: tuple[UUID, str] = Depends(_resolve_principal),  # noqa: B008
     caller: AuthPrincipal = Depends(WRITE_SCOPE),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> KgAddResponse:
     principal_id = principal[0]
 
@@ -145,10 +146,9 @@ async def add_triple(
 
     if source_item_id is not None:
         result = await session.execute(
-            apply_principal_eligibility(
+            apply_write_eligibility(
                 select(MemoryItem).where(MemoryItem.id == source_item_id),
-                tenant_id=tenant_id,
-                principal_id=principal_id,
+                memory_context,
             )
         )
         existing = result.scalar_one_or_none()
@@ -170,8 +170,7 @@ async def add_triple(
                 )
             requested_scope = await resolve_write_scope(
                 session,
-                tenant_id=tenant_id,
-                principal_id=principal_id,
+                memory_context=memory_context,
                 caller_has_admin_scope=caller.has_scope("admin"),
                 requested_visibility=req.visibility or existing.visibility,
                 requested_workspace=(
@@ -189,8 +188,7 @@ async def add_triple(
     else:
         scope = await resolve_write_scope(
             session,
-            tenant_id=tenant_id,
-            principal_id=principal_id,
+            memory_context=memory_context,
             caller_has_admin_scope=caller.has_scope("admin"),
             requested_visibility=req.visibility,
             requested_workspace=req.workspace,
@@ -240,6 +238,17 @@ async def add_triple(
     session.add(triple)
     await session.flush()
     await session.refresh(triple)
+    await _insert_item_event(
+        session,
+        item_id=source_item_id,
+        event_type="kg_add",
+        field_name="kg_triple",
+        old_value=None,
+        new_value=str(triple.id),
+        actor_principal_id=principal_id,
+        reason=None,
+        memory_context=memory_context,
+    )
 
     triple_dict = {
         "id": str(triple.id),
@@ -324,6 +333,7 @@ async def invalidate_triple(
     session: AsyncSession = Depends(get_session),  # noqa: B008
     tenant_id: UUID = Depends(_resolve_tenant_id),  # noqa: B008
     principal: tuple[UUID, str] = Depends(_resolve_principal),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> KgInvalidateResponse:
     principal_id, principal_type = principal
     stmt = (
@@ -339,7 +349,7 @@ async def invalidate_triple(
             KgTriple.id == req.triple_id,
             KgTriple.tenant_id == tenant_id,
             MemoryItem.tenant_id == tenant_id,
-            principal_eligibility_expression(principal_id),
+            write_eligibility_expression(memory_context),
         )
         .with_for_update(of=KgTriple)
     )
@@ -380,6 +390,7 @@ async def invalidate_triple(
         new_value=json.dumps(details, sort_keys=True),
         actor_principal_id=principal_id,
         reason=req.reason,
+        memory_context=memory_context,
     )
     await session.flush()
     await session.commit()

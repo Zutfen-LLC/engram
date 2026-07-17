@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import uuid
 from datetime import UTC, datetime
 
 import pytest
@@ -432,7 +433,8 @@ async def test_dedup_receipt_visibility_uses_narrowest_scope_and_truthful_events
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     content = (
-        f"Receipt visibility {existing_visibility} {requested_visibility} {suggested_visibility}"
+        f"Receipt visibility {existing_visibility} {requested_visibility} "
+        f"{suggested_visibility} {uuid.uuid4()}"
     )
     # ENG-SCOPE-001: visibility="workspace" always requires an authorized
     # workspace. "general" is the seeded default-tenant workspace; supplying
@@ -447,9 +449,11 @@ async def test_dedup_receipt_visibility_uses_narrowest_scope_and_truthful_events
             "workspace": "general",
         },
     )
+    assert existing.status_code == 201, existing.text
     classified = await client.post(
         "/v1/classify", json={"content": content, "workspace": "general"}
     )
+    assert classified.status_code == 200, classified.text
     receipt_id = classified.json()["classification_run_id"]
     async with _test_engine.begin() as conn:
         await conn.execute(
@@ -468,7 +472,7 @@ async def test_dedup_receipt_visibility_uses_narrowest_scope_and_truthful_events
             "classification_run_id": receipt_id,
         },
     )
-    assert response.status_code == 201
+    assert response.status_code == 201, response.text
     async with _test_engine.connect() as conn:
         visibility = await conn.scalar(
             text("SELECT visibility FROM memory_items WHERE id=:id"),

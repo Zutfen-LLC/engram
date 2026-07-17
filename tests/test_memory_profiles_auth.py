@@ -158,10 +158,9 @@ async def test_profiled_auth_resolves_mutable_state_after_every_warm_cache_hit()
             assert transitioned.json()["memory_profile"]["active_revision_id"] == str(revision_v2)
             assert transitioned.json()["memory_profile"]["version"] == 2
 
-            # ENG-SCOPE-002B enforces reads but intentionally leaves writes at
-            # their pre-002C behavior. include_private=false therefore permits
-            # this write while hiding the resulting private item from the
-            # profiled key.
+            # ENG-SCOPE-002C deliberately keeps private/no-workspace creation
+            # independent of include_private. The write succeeds while the
+            # resulting item remains hidden from this read profile.
             content = f"profile non-enforcement {uuid.uuid4()}"
             remembered = await client.post(
                 "/v1/remember",
@@ -214,6 +213,10 @@ async def test_profiled_auth_resolves_mutable_state_after_every_warm_cache_hit()
         reset_principal_cache()
         await owner.execute(
             "DELETE FROM memory_items WHERE content LIKE 'profile non-enforcement %'"
+        )
+        await owner.execute(
+            "DELETE FROM candidate_ingests WHERE api_key_id = ANY($1::uuid[])",
+            key_ids + [legacy_key_id],
         )
         await owner.execute(
             "DELETE FROM api_keys WHERE id = ANY($1::uuid[])", key_ids + [legacy_key_id]

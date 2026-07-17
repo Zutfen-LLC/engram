@@ -35,6 +35,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.auth import check_workspace_membership
+from engram.memory_context import ResolvedMemoryContext
 
 VALID_VISIBILITIES: frozenset[str] = frozenset({"private", "workspace", "tenant", "public"})
 
@@ -57,6 +58,9 @@ class ResolvedWriteScope:
     workspace_id: UUID | None
     workspace_slug: str | None
     visibility_was_defaulted: bool
+    visibility_from_profile_default: bool
+    workspace_from_profile_default: bool
+    request_scope_was_explicit: bool
 
 
 async def authorize_workspace(
@@ -91,11 +95,54 @@ async def authorize_workspace(
     return UUID(str(workspace_id))
 
 
+async def _authorize_workspace_id(
+    session: AsyncSession,
+    *,
+    memory_context: ResolvedMemoryContext,
+    caller_has_admin_scope: bool,
+    workspace_id: UUID,
+) -> tuple[UUID, str]:
+    row = (
+        await session.execute(
+            text("SELECT id, slug FROM workspaces WHERE tenant_id = :tid AND id = :wid"),
+            {"tid": str(memory_context.tenant_id), "wid": str(workspace_id)},
+        )
+    ).mappings().first()
+    if row is None:
+        raise HTTPException(status_code=404, detail=_WORKSPACE_NOT_FOUND_DETAIL)
+    if not caller_has_admin_scope and not await check_workspace_membership(
+        session,
+        principal_id=str(memory_context.principal_id),
+        workspace_id=str(workspace_id),
+    ):
+        raise HTTPException(status_code=404, detail=_WORKSPACE_NOT_FOUND_DETAIL)
+    return UUID(str(row["id"])), str(row["slug"])
+
+
+def assert_write_scope_allowed(
+    memory_context: ResolvedMemoryContext,
+    *,
+    visibility: str,
+    workspace_id: UUID | None,
+) -> None:
+    """Revalidate a final/classifier-narrowed scope against profile policy."""
+    if visibility not in VALID_VISIBILITIES:
+        raise HTTPException(status_code=422, detail=f"invalid visibility: {visibility!r}")
+    if visibility == "workspace" and workspace_id is None:
+        raise HTTPException(
+            status_code=422,
+            detail="visibility='workspace' requires an authorized workspace",
+        )
+    if not memory_context.allows_new_write_scope(visibility, workspace_id):
+        if workspace_id is not None and not memory_context.allows_workspace_write(workspace_id):
+            raise HTTPException(status_code=404, detail=_WORKSPACE_NOT_FOUND_DETAIL)
+        raise HTTPException(status_code=403, detail="memory write scope is not permitted")
+
+
 async def resolve_write_scope(
     session: AsyncSession,
     *,
-    tenant_id: UUID | str,
-    principal_id: UUID | str,
+    memory_context: ResolvedMemoryContext,
     caller_has_admin_scope: bool,
     requested_visibility: str | None,
     requested_workspace: str | None,
@@ -119,17 +166,46 @@ async def resolve_write_scope(
         )
 
     workspace_id: UUID | None = None
+    workspace_slug: str | None = None
+    resolved_visibility: str
+    from_profile_default = (
+        memory_context.is_profile_bound
+        and requested_visibility is None
+        and requested_workspace is None
+    )
+    if from_profile_default:
+        resolved_visibility = memory_context.default_write_visibility
+        if memory_context.default_write_workspace_id is not None:
+            workspace_id, workspace_slug = await _authorize_workspace_id(
+                session,
+                memory_context=memory_context,
+                caller_has_admin_scope=caller_has_admin_scope,
+                workspace_id=memory_context.default_write_workspace_id,
+            )
+        assert_write_scope_allowed(
+            memory_context, visibility=resolved_visibility, workspace_id=workspace_id
+        )
+        return ResolvedWriteScope(
+            visibility=resolved_visibility,
+            workspace_id=workspace_id,
+            workspace_slug=workspace_slug,
+            visibility_was_defaulted=True,
+            visibility_from_profile_default=True,
+            workspace_from_profile_default=workspace_id is not None,
+            request_scope_was_explicit=False,
+        )
+
     if requested_workspace is not None:
         workspace_id = await authorize_workspace(
             session,
-            tenant_id=tenant_id,
-            principal_id=principal_id,
+            tenant_id=memory_context.tenant_id,
+            principal_id=memory_context.principal_id,
             caller_has_admin_scope=caller_has_admin_scope,
             workspace_slug=requested_workspace,
         )
+        workspace_slug = requested_workspace
 
     visibility_was_defaulted = requested_visibility is None
-    resolved_visibility: str
     if requested_visibility is None:
         resolved_visibility = "workspace" if workspace_id is not None else "private"
     else:
@@ -140,9 +216,17 @@ async def resolve_write_scope(
                 detail="visibility='workspace' requires an authorized workspace",
             )
 
+    assert_write_scope_allowed(
+        memory_context, visibility=resolved_visibility, workspace_id=workspace_id
+    )
     return ResolvedWriteScope(
         visibility=resolved_visibility,
         workspace_id=workspace_id,
-        workspace_slug=requested_workspace if workspace_id is not None else None,
+        workspace_slug=workspace_slug,
         visibility_was_defaulted=visibility_was_defaulted,
+        visibility_from_profile_default=False,
+        workspace_from_profile_default=False,
+        request_scope_was_explicit=(
+            requested_visibility is not None or requested_workspace is not None
+        ),
     )

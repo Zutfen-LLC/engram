@@ -34,6 +34,7 @@ from engram.auth import (
 from engram.auth import Principal as AuthPrincipal
 from engram.classification import invalidate_vocab_cache
 from engram.db import get_session
+from engram.memory_context import ResolvedMemoryContext, resolve_memory_context
 from engram.memory_kinds import (
     BUILTIN_KIND_NAMES,
     NAME_PATTERN,
@@ -583,6 +584,7 @@ async def promote_proposed(
     dry_run: bool = False,
     limit: int | None = None,
     session: AsyncSession = Depends(get_session),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> PromotionResponse:
     """Run auto-promotion Path A for the caller's tenant.
 
@@ -593,7 +595,12 @@ async def promote_proposed(
     """
     tenant_id = await _resolve_tenant_id(session)
     result = await auto_promote_proposed_memories(
-        session, tenant_id, source="admin_endpoint", dry_run=dry_run, limit=limit
+        session,
+        tenant_id,
+        source="admin_endpoint",
+        dry_run=dry_run,
+        limit=limit,
+        memory_context=memory_context,
     )
     return PromotionResponse(
         tenant_id=result.tenant_id,

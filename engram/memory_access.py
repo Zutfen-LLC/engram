@@ -30,6 +30,7 @@ def principal_eligibility_expression(
     principal_id: str | UUID,
     *,
     item_entity: Any = MemoryItem,
+    workspace_membership_bypass: bool = False,
 ) -> ColumnElement[bool]:
     """Existing visibility/membership rule, without profile narrowing."""
     member_workspaces = (
@@ -43,7 +44,10 @@ def principal_eligibility_expression(
         and_(item_entity.visibility == "private", item_entity.principal_id == principal_id),
         and_(
             item_entity.visibility == "workspace",
-            item_entity.workspace_id.in_(member_workspaces),
+            or_(
+                literal(workspace_membership_bypass),
+                item_entity.workspace_id.in_(member_workspaces),
+            ),
         ),
     )
 
@@ -86,6 +90,46 @@ def read_eligibility_expression(
     )
 
 
+def profile_write_scope_expression(
+    memory_context: ResolvedMemoryContext,
+    *,
+    item_entity: Any = MemoryItem,
+) -> ColumnElement[bool]:
+    """Profile write scope for an existing, already-readable item."""
+    workspace_ids = memory_context.writable_workspace_ids
+    if workspace_ids is None:
+        return true()
+    writable_workspace = (
+        item_entity.workspace_id.in_(workspace_ids) if workspace_ids else false()
+    )
+    association = or_(item_entity.workspace_id.is_(None), writable_workspace)
+    visibility = or_(
+        item_entity.visibility == "private",
+        and_(item_entity.visibility == "workspace", writable_workspace),
+        and_(item_entity.visibility == "tenant", literal(memory_context.allow_tenant_write)),
+        and_(item_entity.visibility == "public", literal(memory_context.allow_public_write)),
+    )
+    return and_(visibility, association)
+
+
+def write_eligibility_expression(
+    memory_context: ResolvedMemoryContext,
+    *,
+    item_entity: Any = MemoryItem,
+) -> ColumnElement[bool]:
+    """Tenant ∩ principal ∩ profile read ∩ profile write eligibility."""
+    return and_(
+        item_entity.tenant_id == memory_context.tenant_id,
+        principal_eligibility_expression(
+            memory_context.principal_id,
+            item_entity=item_entity,
+            workspace_membership_bypass=memory_context.admin_workspace_bypass,
+        ),
+        profile_read_scope_expression(memory_context, item_entity=item_entity),
+        profile_write_scope_expression(memory_context, item_entity=item_entity),
+    )
+
+
 def apply_read_eligibility(
     stmt: Any,
     memory_context: ResolvedMemoryContext,
@@ -95,6 +139,15 @@ def apply_read_eligibility(
     return stmt.where(read_eligibility_expression(memory_context, item_entity=item_entity))
 
 
+def apply_write_eligibility(
+    stmt: Any,
+    memory_context: ResolvedMemoryContext,
+    *,
+    item_entity: Any = MemoryItem,
+) -> Any:
+    return stmt.where(write_eligibility_expression(memory_context, item_entity=item_entity))
+
+
 def apply_principal_eligibility(
     stmt: Any,
     *,
@@ -102,7 +155,7 @@ def apply_principal_eligibility(
     principal_id: str | UUID,
     item_entity: Any = MemoryItem,
 ) -> Any:
-    """Pre-002C mutation authorization; intentionally principal-only."""
+    """Compatibility helper for non-mutation callers needing principal-only scope."""
     return stmt.where(
         item_entity.tenant_id == tenant_id,
         principal_eligibility_expression(principal_id, item_entity=item_entity),
@@ -122,18 +175,26 @@ def principal_eligibility_sql(
     *,
     alias: str = "",
     parameter_prefix: str = "memory",
+    workspace_membership_bypass: bool = False,
 ) -> SqlPredicate:
     p, key = _sql_names(alias, parameter_prefix)
     principal_param = f"{key}_principal_id"
+    membership = (
+        f"{p}workspace_id IN (SELECT workspace_id FROM workspace_members "
+        f"WHERE principal_id = :{principal_param})"
+    )
+    params: dict[str, object] = {principal_param: str(principal_id)}
+    if workspace_membership_bypass:
+        admin_param = f"{key}_admin_bypass"
+        membership = f"(:{admin_param} OR {membership})"
+        params[admin_param] = True
     return SqlPredicate(
         clause=(
             f"({p}visibility = 'tenant' OR {p}visibility = 'public' "
             f"OR ({p}visibility = 'private' AND {p}principal_id = :{principal_param}) "
-            f"OR ({p}visibility = 'workspace' AND {p}workspace_id IN "
-            f"(SELECT workspace_id FROM workspace_members "
-            f"WHERE principal_id = :{principal_param})))"
+            f"OR ({p}visibility = 'workspace' AND {membership}))"
         ),
-        params={principal_param: str(principal_id)},
+        params=params,
     )
 
 
@@ -199,9 +260,73 @@ def read_eligibility_sql(
     )
 
 
+def profile_write_scope_sql(
+    memory_context: ResolvedMemoryContext,
+    *,
+    alias: str = "",
+    parameter_prefix: str = "memory_write",
+) -> SqlPredicate:
+    p, key = _sql_names(alias, parameter_prefix)
+    workspace_ids = memory_context.writable_workspace_ids
+    if workspace_ids is None:
+        return SqlPredicate("TRUE", {})
+
+    params: dict[str, object] = {}
+    placeholders: list[str] = []
+    for index, workspace_id in enumerate(sorted(workspace_ids, key=str)):
+        name = f"{key}_workspace_{index}"
+        placeholders.append(f":{name}")
+        params[name] = str(workspace_id)
+    workspace_clause = (
+        f"{p}workspace_id IN ({', '.join(placeholders)})" if placeholders else "FALSE"
+    )
+    visibility_parts = [f"{p}visibility = 'private'"]
+    if placeholders:
+        visibility_parts.append(f"({p}visibility = 'workspace' AND {workspace_clause})")
+    if memory_context.allow_tenant_write:
+        visibility_parts.append(f"{p}visibility = 'tenant'")
+    if memory_context.allow_public_write:
+        visibility_parts.append(f"{p}visibility = 'public'")
+    return SqlPredicate(
+        f"(({' OR '.join(visibility_parts)}) "
+        f"AND ({p}workspace_id IS NULL OR {workspace_clause}))",
+        params,
+    )
+
+
+def write_eligibility_sql(
+    memory_context: ResolvedMemoryContext,
+    *,
+    alias: str = "",
+    parameter_prefix: str = "memory_write",
+) -> SqlPredicate:
+    p, key = _sql_names(alias, parameter_prefix)
+    principal = principal_eligibility_sql(
+        memory_context.principal_id,
+        alias=alias,
+        parameter_prefix=f"{parameter_prefix}_principal",
+        workspace_membership_bypass=memory_context.admin_workspace_bypass,
+    )
+    read_scope = profile_read_scope_sql(
+        memory_context, alias=alias, parameter_prefix=f"{parameter_prefix}_read"
+    )
+    write = profile_write_scope_sql(
+        memory_context, alias=alias, parameter_prefix=f"{parameter_prefix}_scope"
+    )
+    return SqlPredicate(
+        f"({p}tenant_id = :{key}_tenant_id AND {principal.clause} "
+        f"AND {read_scope.clause} AND {write.clause})",
+        {
+            f"{key}_tenant_id": str(memory_context.tenant_id),
+            **principal.params,
+            **read_scope.params,
+            **write.params,
+        },
+    )
+
+
 # Compatibility aliases for external imports and pre-002B tests. Production
-# caller-facing reads use the explicit complete helpers above; mutation paths
-# use the clearly named principal-only helpers until ENG-SCOPE-002C.
+# caller-facing reads and mutations use the explicit complete helpers above.
 eligibility_expression = principal_eligibility_expression
 
 

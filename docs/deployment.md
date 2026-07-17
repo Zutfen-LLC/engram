@@ -627,9 +627,9 @@ failure.
 ## 10. Memory profiles (control plane)
 
 Memory profiles are reusable, tenant-scoped policy identities. They are created and revised by an
-`admin`-scoped credential. ENG-SCOPE-002B enforces the active revision as a narrowing boundary on
-every MemoryItem-backed read; profiles never grant workspace membership. Write policy remains
-declarative until ENG-SCOPE-002C.
+`admin`-scoped credential. ENG-SCOPE-002B/002C enforce the active revision as a narrowing boundary
+on every MemoryItem-backed read, prospective write, and mutation; profiles never grant workspace
+membership, principal authority, review authority, or an API scope.
 
 Create a profile with safe private-only defaults:
 
@@ -665,9 +665,18 @@ records only the context/profile identifiers and profile version, never policy J
 grants, query text, or memory content. When a profile or explicit workspace makes a semantic set
 impossible, Engram skips the embedding provider and reports `not_attempted`.
 
-> A bound key is not yet a complete read/write sandbox. Remember, classify, KG/diary writes,
-> feedback, item/review mutations, workers, imports, and hooks retain pre-002B behavior until
-> ENG-SCOPE-002C.
+For writes, fully omitted visibility/workspace uses the revision's exact default. Explicit tenant
+and public writes require their `allow_*_write` flags. Private/no-workspace creation remains
+available to a credential with API `write` scope even when `include_private=false`; that read flag
+does not create a second write-scope switch. Every workspace association requires `can_write=true`
+plus established membership (or the existing admin membership bypass). Existing-item mutation
+requires both profile read and write eligibility, and profile denial uses the normal non-disclosing
+missing-item response. `admin` never bypasses profile policy.
+
+Classify stores the exact accepted context on its candidate ingest, but remember re-authorizes the
+final scope under its own pinned revision. Candidate-origin workers use the ingest's exact revision
+for cross-item effects even after active-revision changes or profile disablement. Trusted scheduled
+maintenance remains explicitly internal and is not an API-key profile sandbox.
 
 ### Migration 022 rollout and rollback
 
@@ -695,6 +704,21 @@ retain pre-002B reads. Roll out in this order:
 Rolling application code back from 002B widens reads for profile-bound keys and is not
 security-neutral. Before rollback, disable or revoke every bound key, or explicitly accept the
 loss of read enforcement. The additive migration may remain in place.
+
+### Migration 024 profile-write rollout and rollback
+
+Migration 024 adds immutable context provenance to candidate ingests and item events. Historical
+and omitted rows remain `legacy-unprofiled-v0`; current caller work records `memory-context-v2`,
+and trusted maintenance records `internal-system-v1`.
+
+Apply 022, 023, then 024 before deploying 002C. Drain or replace every pre-002C API instance and
+drain, complete, or explicitly classify queued pre-002C candidate jobs. Only after every API and
+worker runs 002C may profile-bound credentials be described as complete read/write sandboxes.
+Mixed old/new instances are not an enforcement deployment.
+
+Application rollback widens writes even if migration 024 remains installed. Before rollback,
+disable or revoke profile-bound keys, or explicitly accept the loss of write enforcement. Direct
+trusted operator database maintenance is outside the API-key profile contract.
 
 ## 11. Troubleshooting
 

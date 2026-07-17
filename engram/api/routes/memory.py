@@ -45,13 +45,18 @@ from engram.feedback import (
 )
 from engram.jobs import enqueue_job
 from engram.memory_access import (
-    principal_eligibility_sql,
+    apply_write_eligibility,
     read_eligibility_sql,
     resolve_workspace_scope,
+    write_eligibility_sql,
 )
-from engram.memory_context import ResolvedMemoryContext, resolve_memory_context
+from engram.memory_context import (
+    ResolvedMemoryContext,
+    context_provenance,
+    resolve_memory_context,
+)
 from engram.memory_kinds import UnknownMemoryKindError, require_enabled_memory_kind
-from engram.memory_scope import resolve_write_scope
+from engram.memory_scope import assert_write_scope_allowed, resolve_write_scope
 from engram.models import (
     CandidateIngest,
     ClassificationRun,
@@ -242,6 +247,7 @@ async def _check_supersession(
     *,
     singleton: bool,
     new_authority: int,
+    memory_context: ResolvedMemoryContext,
 ) -> tuple[UUID | None, dict[str, Any] | None]:
     """For singleton kinds (memory_kinds.singleton), find an existing active
     item with the same family key and return its ID for supersession.
@@ -266,6 +272,7 @@ async def _check_supersession(
         .limit(1)
         .with_for_update()
     )
+    stmt = apply_write_eligibility(stmt, memory_context)
     if workspace_id is None:
         stmt = stmt.where(MemoryItem.workspace_id.is_(None))
     else:
@@ -471,6 +478,7 @@ async def remember(
     req: RememberRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
     caller: AuthPrincipal = Depends(WRITE_SCOPE),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> RememberResponse:
     """Write a memory item with dedup, trust defaults, and supersession.
 
@@ -497,8 +505,11 @@ async def remember(
     # A 403 here (no tenant/principal context) is an auth failure, not a
     # candidate outcome — it propagates without recording, matching the
     # pre-existing behavior for unauthenticated requests.
-    tenant_id = await _resolve_tenant_id(session)
-    principal_id, _principal_type = await _resolve_principal(session, tenant_id)
+    tenant_id = memory_context.tenant_id
+    principal_id = memory_context.principal_id
+    _resolved_principal_id, _principal_type = await _resolve_principal(session, tenant_id)
+    if _resolved_principal_id != principal_id:
+        raise HTTPException(status_code=403, detail="invalid principal context")
     outcome_ctx["tenant_id"] = tenant_id
     outcome_ctx["principal_id"] = principal_id
     outcome_status = "failed"
@@ -509,6 +520,7 @@ async def remember(
             principal_type=_principal_type,
             attempt_id=attempt_id,
             caller_has_admin_scope=caller.has_scope("admin"),
+            memory_context=memory_context,
         )
         outcome_status = result.status
         return result
@@ -540,6 +552,7 @@ async def _remember_impl(
     principal_type: str,
     attempt_id: UUID,
     caller_has_admin_scope: bool,
+    memory_context: ResolvedMemoryContext,
 ) -> RememberResponse:
     """The actual write logic. See :func:`remember` for the telemetry wrapper.
 
@@ -571,8 +584,7 @@ async def _remember_impl(
     # scope, provenance, telemetry).
     scope = await resolve_write_scope(
         session,
-        tenant_id=tenant_id,
-        principal_id=principal_id,
+        memory_context=memory_context,
         caller_has_admin_scope=caller_has_admin_scope,
         requested_visibility=req.visibility,
         requested_workspace=req.workspace,
@@ -609,7 +621,11 @@ async def _remember_impl(
     # The locked receipt is authoritative. Historical pre-migration receipts
     # acquire a newly issued ingest here; a body-supplied id never chooses it.
     if receipt is not None and receipt.ingest_id is None:
-        ingest = create_ingest(identity=identity, client_correlation_id=req.correlation_id)
+        ingest = create_ingest(
+            identity=identity,
+            client_correlation_id=req.correlation_id,
+            memory_context=memory_context,
+        )
         session.add(ingest)
         receipt.ingest_id = ingest.id
         await session.commit()
@@ -646,7 +662,11 @@ async def _remember_impl(
             )
             raise HTTPException(status_code=404, detail="candidate ingest not found")
     else:
-        ingest = create_ingest(identity=identity, client_correlation_id=req.correlation_id)
+        ingest = create_ingest(
+            identity=identity,
+            client_correlation_id=req.correlation_id,
+            memory_context=memory_context,
+        )
         session.add(ingest)
         # Authoritative identity must be durable before the rest of remember.
         await session.commit()
@@ -683,7 +703,10 @@ async def _remember_impl(
             if receipt.memory_item_id is None:
                 raise HTTPException(status_code=409, detail="classification run is already bound")
             bound_item = await session.scalar(
-                select(MemoryItem).where(MemoryItem.id == receipt.memory_item_id)
+                apply_write_eligibility(
+                    select(MemoryItem).where(MemoryItem.id == receipt.memory_item_id),
+                    memory_context,
+                )
             )
             if bound_item is None:
                 raise HTTPException(status_code=409, detail="classification run is already bound")
@@ -772,12 +795,17 @@ async def _remember_impl(
             caller_visibility, suggested_visibility, workspace_available=workspace_available
         )
         visibility_narrowed = final_visibility != caller_visibility
+
     elif classification_result is not None:
         suggested_visibility = classification_result.suggested_visibility
         final_visibility = narrow_visibility(
             caller_visibility, suggested_visibility, workspace_available=workspace_available
         )
         visibility_narrowed = final_visibility != caller_visibility
+
+    assert_write_scope_allowed(
+        memory_context, visibility=final_visibility, workspace_id=workspace_id
+    )
 
     # 5. Supersession check for singleton kinds.
     superseded_id, withheld_singleton = await _check_supersession(
@@ -790,6 +818,7 @@ async def _remember_impl(
         req.subject_id,
         singleton=kind_row.singleton,
         new_authority=authority,
+        memory_context=memory_context,
     )
     if withheld_singleton is not None:
         review_status = "proposed"
@@ -844,6 +873,7 @@ async def _remember_impl(
             MemoryItem.valid_to.is_(None),
             MemoryItem.review_status != "rejected",
         )
+        dedup_stmt = apply_write_eligibility(dedup_stmt, memory_context)
         if workspace_id is None:
             dedup_stmt = dedup_stmt.where(MemoryItem.workspace_id.is_(None))
         else:
@@ -887,6 +917,11 @@ async def _remember_impl(
                 receipt_requested_visibility,
                 workspace_available=workspace_available,
             )
+            assert_write_scope_allowed(
+                memory_context,
+                visibility=dedup_final_visibility,
+                workspace_id=workspace_id,
+            )
             if dedup_final_visibility != previous_visibility:
                 visibility_guard = (
                     update(MemoryItem)
@@ -919,6 +954,7 @@ async def _remember_impl(
                 session.add(
                     ItemEvent(
                         item_id=existing.id,
+                        **context_provenance(memory_context),
                         event_type="metadata_patch",
                         field_name="visibility",
                         old_value=previous_visibility,
@@ -935,6 +971,7 @@ async def _remember_impl(
             session.add(
                 ItemEvent(
                     item_id=existing.id,
+                    **context_provenance(memory_context),
                     event_type="classification",
                     field_name="kind",
                     old_value=None,
@@ -1043,6 +1080,7 @@ async def _remember_impl(
     session.add(
         ItemEvent(
             item_id=item.id,
+            **context_provenance(memory_context),
             event_type="classification",
             field_name="kind",
             old_value=None,
@@ -1056,6 +1094,7 @@ async def _remember_impl(
         session.add(
             ItemEvent(
                 item_id=item.id,
+                **context_provenance(memory_context),
                 event_type="conflict_detected",
                 field_name="conflicts_with_item_id",
                 old_value=None,
@@ -1487,6 +1526,7 @@ async def feedback(
     req: FeedbackRequest,
     response: Response,
     session: AsyncSession = Depends(get_session),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> FeedbackResponse | JSONResponse:
     """Record or replace the caller's canonical verdict on an eligible item."""
     tenant_id = await _resolve_tenant_id(session)
@@ -1496,8 +1536,7 @@ async def feedback(
     item = await _require_eligible_item(
         session,
         req.item_id,
-        tenant_id=tenant_id,
-        principal_id=principal_id,
+        memory_context=memory_context,
         for_update=True,
     )
     try:
@@ -1509,6 +1548,7 @@ async def feedback(
             item=item,
             verdict=req.feedback,
             recall_log_id=req.recall_log_id,
+            memory_context=memory_context,
         )
     except RecallLogNotFoundError as exc:
         await session.rollback()
@@ -1755,6 +1795,7 @@ async def _insert_item_event(
     new_value: Any,
     actor_principal_id: UUID,
     reason: str | None,
+    memory_context: ResolvedMemoryContext,
     on_behalf_of_principal_id: UUID | None = None,
 ) -> dict[str, Any]:
     """Write an ``item_events`` audit row. ``actor_principal_id`` is required —
@@ -1766,6 +1807,7 @@ async def _insert_item_event(
     event = {
         "id": uuid.uuid4(),
         "item_id": item_id,
+        **context_provenance(memory_context),
         "event_type": event_type,
         "field_name": field_name,
         "old_value": _stringify(old_value),
@@ -1782,30 +1824,25 @@ async def _require_eligible_item(
     session: AsyncSession,
     item_id: UUID,
     *,
-    tenant_id: UUID | str,
-    principal_id: UUID | str,
+    memory_context: ResolvedMemoryContext,
     for_update: bool = False,
 ) -> dict[str, Any]:
-    """Resolve a mutation target through pre-002C principal authorization.
-
-    Profile write policy is intentionally not enforced in this slice.
-    """
+    """Resolve a mutation target through the complete non-disclosing boundary."""
     dialect_name = session.bind.dialect.name if session.bind is not None else None
     lock_clause = " FOR UPDATE" if for_update and dialect_name == "postgresql" else ""
-    principal_scope = principal_eligibility_sql(
-        principal_id, parameter_prefix="mutation_item"
+    mutation_scope = write_eligibility_sql(
+        memory_context, parameter_prefix="mutation_item"
     )
     stmt = text(
         "SELECT * FROM memory_items WHERE (id = :item_id OR id = :item_id_hex) "
-        f"AND tenant_id = :mutation_tenant_id AND {principal_scope.clause}{lock_clause}"
+        f"AND {mutation_scope.clause}{lock_clause}"
     )
     result = await session.execute(
         stmt,
         {
             "item_id": str(item_id),
             "item_id_hex": item_id.hex,
-            "mutation_tenant_id": str(tenant_id),
-            **principal_scope.params,
+            **mutation_scope.params,
         },
     )
     row = result.mappings().first()
@@ -1919,6 +1956,7 @@ async def update_item_metadata(
     item_id: UUID,
     req: ItemMetadataPatchRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> dict[str, Any]:
     """Update metadata (wing, room, visibility, importance, pinned) — not content.
 
@@ -1934,8 +1972,7 @@ async def update_item_metadata(
     item = await _require_eligible_item(
         session,
         item_id,
-        tenant_id=tenant_id,
-        principal_id=principal_id,
+        memory_context=memory_context,
         for_update=True,
     )
     actor, on_behalf_of = await _resolve_actor_and_delegation(
@@ -1956,6 +1993,16 @@ async def update_item_metadata(
             raise HTTPException(
                 status_code=422,
                 detail="visibility='workspace' requires the item to already have a workspace",
+            )
+        if field == "visibility":
+            assert_write_scope_allowed(
+                memory_context,
+                visibility=str(new_value),
+                workspace_id=(
+                    UUID(str(item["workspace_id"]))
+                    if item.get("workspace_id") is not None
+                    else None
+                ),
             )
         changes.append({"field": field, "old": old_value, "new": new_value})
 
@@ -2003,11 +2050,12 @@ async def update_item_metadata(
             actor_principal_id=actor,
             on_behalf_of_principal_id=on_behalf_of,
             reason=req.reason,
+            memory_context=memory_context,
         )
         events.append(event)
 
     updated = await _require_eligible_item(
-        session, item_id, tenant_id=tenant_id, principal_id=principal_id
+        session, item_id, memory_context=memory_context
     )
     await session.commit()
     return {"item": updated, "event": events[0] if events else None, "events": events}
@@ -2018,6 +2066,7 @@ async def supersede_item(
     item_id: UUID,
     req: MutationAuditRequest | None = None,
     session: AsyncSession = Depends(get_session),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> dict[str, Any]:
     """Atomically expire an item and write its replacement.
 
@@ -2034,8 +2083,7 @@ async def supersede_item(
     item = await _require_eligible_item(
         session,
         item_id,
-        tenant_id=tenant_id,
-        principal_id=principal_id,
+        memory_context=memory_context,
         for_update=True,
     )
     actor, on_behalf_of = await _resolve_actor_and_delegation(
@@ -2155,6 +2203,7 @@ async def supersede_item(
         actor_principal_id=actor,
         on_behalf_of_principal_id=on_behalf_of,
         reason=reason,
+        memory_context=memory_context,
     )
     replacement_event = await _insert_item_event(
         session,
@@ -2166,12 +2215,13 @@ async def supersede_item(
         actor_principal_id=actor,
         on_behalf_of_principal_id=on_behalf_of,
         reason=reason,
+        memory_context=memory_context,
     )
     old_item = await _require_eligible_item(
-        session, item_id, tenant_id=tenant_id, principal_id=principal_id
+        session, item_id, memory_context=memory_context
     )
     new_item = await _require_eligible_item(
-        session, new_id, tenant_id=tenant_id, principal_id=principal_id
+        session, new_id, memory_context=memory_context
     )
     await session.commit()
     return {
@@ -2189,6 +2239,7 @@ async def invalidate_item(
     item_id: UUID,
     req: MutationAuditRequest | None = None,
     session: AsyncSession = Depends(get_session),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> dict[str, Any]:
     """Mark invalid (set valid_to).
 
@@ -2207,8 +2258,7 @@ async def invalidate_item(
     item = await _require_eligible_item(
         session,
         item_id,
-        tenant_id=tenant_id,
-        principal_id=principal_id,
+        memory_context=memory_context,
         for_update=True,
     )
     actor, on_behalf_of = await _resolve_actor_and_delegation(
@@ -2273,9 +2323,10 @@ async def invalidate_item(
         actor_principal_id=actor,
         on_behalf_of_principal_id=on_behalf_of,
         reason=reason,
+        memory_context=memory_context,
     )
     updated = await _require_eligible_item(
-        session, item_id, tenant_id=tenant_id, principal_id=principal_id
+        session, item_id, memory_context=memory_context
     )
     await session.commit()
     return {"item": updated, "event": event}

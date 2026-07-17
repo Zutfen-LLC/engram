@@ -18,6 +18,12 @@ from engram.internal_actors import (
     InternalActorInvariantError,
     resolve_internal_system_actor,
 )
+from engram.memory_access import profile_read_scope_expression, profile_write_scope_expression
+from engram.memory_context import (
+    INTERNAL_MEMORY_CONTEXT_VERSION,
+    ResolvedMemoryContext,
+    context_provenance,
+)
 from engram.models import (
     ClassificationRun,
     FeedbackEvent,
@@ -530,6 +536,7 @@ async def auto_promote_proposed_memories(
     dry_run: bool = False,
     item_id: uuid.UUID | None = None,
     classification_run_id: uuid.UUID | None = None,
+    memory_context: ResolvedMemoryContext | None = None,
 ) -> PromotionResult:
     moment = now or datetime.now(UTC)
     if tenant_id is None:
@@ -552,6 +559,19 @@ async def auto_promote_proposed_memories(
         MemoryItem.tenant_id == tenant_id,
         MemoryItem.review_status == "proposed",
         MemoryItem.valid_to.is_(None),
+    )
+    if memory_context is not None and memory_context.is_profile_bound:
+        base_stmt = base_stmt.where(
+            profile_read_scope_expression(memory_context),
+            profile_write_scope_expression(memory_context),
+        )
+    event_provenance = (
+        context_provenance(memory_context)
+        if memory_context is not None
+        else {
+            "tenant_id": uuid.UUID(str(tenant_id)),
+            "memory_context_version": INTERNAL_MEMORY_CONTEXT_VERSION,
+        }
     )
     if item_id is not None:
         base_stmt = base_stmt.where(MemoryItem.id == item_id)
@@ -592,7 +612,9 @@ async def auto_promote_proposed_memories(
         )
         conflict: PromotionConflictCheck | None = None
         if candidate.would_promote:
-            conflict = await check_promotion_conflict(session, item)
+            conflict = await check_promotion_conflict(
+                session, item, memory_context=memory_context
+            )
             candidate.conflict_recheck_status = "blocked" if conflict else "clear"
             if conflict is not None:
                 candidate.blockers.append(BLOCK_RECHECK)
@@ -620,6 +642,7 @@ async def auto_promote_proposed_memories(
                     session.add(
                         ItemEvent(
                             item_id=item.id,
+                            **event_provenance,
                             event_type="conflict_resolution",
                             field_name="conflict_resolution_status",
                             old_value=item.conflict_resolution_status,
@@ -697,6 +720,7 @@ async def auto_promote_proposed_memories(
         session.add(
             ItemEvent(
                 item_id=item.id,
+                **event_provenance,
                 event_type="review_change",
                 field_name="review_status",
                 old_value="proposed",
@@ -726,6 +750,7 @@ async def auto_promote_item(
     *,
     now: datetime | None = None,
     dry_run: bool = False,
+    memory_context: ResolvedMemoryContext | None = None,
 ) -> PromotionResult:
     return await auto_promote_proposed_memories(
         session,
@@ -735,6 +760,7 @@ async def auto_promote_item(
         dry_run=dry_run,
         item_id=item_id,
         classification_run_id=classification_run_id,
+        memory_context=memory_context,
     )
 
 
