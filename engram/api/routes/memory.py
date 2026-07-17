@@ -471,6 +471,24 @@ def _rrf_fuse(
 # ---- Endpoints ----
 
 
+async def _commit_remember_success(session: AsyncSession) -> None:
+    """Single commit boundary for every successful ``/v1/remember`` terminal path.
+
+    The request session (``get_session``) never auto-commits, and
+    ``pin_execution_context`` only stages the immutable execution-context row
+    on the session. Every path that returns a successful ``RememberResponse``
+    after pinning must commit through this helper so the execution-context pin,
+    the memory mutation, audit events, receipt binding, and queued jobs all
+    become durable together as one first-successful-execution outcome.
+
+    Failed paths never reach here, so a rolled-back request cannot permanently
+    consume an ingest. ``apply_rls_context`` re-applies the tenant GUC at the
+    start of the new transaction this commit opens, so RLS context survives the
+    commit (already relied on by the created/dedup-with-receipt paths).
+    """
+    await session.commit()
+
+
 @router.post(
     "/remember",
     response_model=RememberResponse,
@@ -737,6 +755,10 @@ async def _remember_impl(
             outcome_ctx["final_kind"] = bound_item.kind
             outcome_ctx["final_review_status"] = bound_item.review_status
             outcome_ctx["final_visibility"] = bound_item.visibility
+            # The bound item/receipt were persisted by the original binding
+            # request; this commit persists only the execution-context pin so
+            # the replay cannot later be re-pinned under a different authority.
+            await _commit_remember_success(session)
             return RememberResponse(
                 id=bound_item.id,
                 status="deduped",
@@ -1013,7 +1035,10 @@ async def _remember_impl(
                     reason=receipt.reason,
                 )
             )
-            await session.commit()
+        # Commit covers BOTH the receipt-dedup binding/narrowing above and the
+        # ordinary-dedup path (receipt is None): the execution-context pin must
+        # become durable on every successful dedup, not only receipt-backed ones.
+        await _commit_remember_success(session)
         outcome_ctx["final_kind"] = existing.kind
         outcome_ctx["final_review_status"] = existing.review_status
         outcome_ctx["final_visibility"] = existing.visibility
@@ -1171,7 +1196,7 @@ async def _remember_impl(
                 dedupe_key=f"embedding.generate:{item.id}:{profile.id}",
             )
 
-    await session.commit()
+    await _commit_remember_success(session)
 
     outcome_ctx["final_kind"] = kind
     outcome_ctx["final_review_status"] = review_status

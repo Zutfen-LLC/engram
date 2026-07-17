@@ -160,6 +160,20 @@ async def test_profile_bound_mutation_regressions() -> None:
                 "UPDATE tenant_config SET auto_promote_enabled=false WHERE tenant_id=$1",
                 tenant_id,
             )
+            # The promotion scan runs against the shared default tenant. Other
+            # suites can leave admin-owned proposed rows behind, which a broad
+            # admin profile would legitimately scan (private + owned by admin).
+            # Remove only the caller-principal's stale proposed rows so this
+            # assertion measures exactly the hidden other-principal item, which
+            # the profile-bound admin must never see. Other principals' rows are
+            # untouched.
+            await owner.execute(
+                "DELETE FROM memory_items "
+                "WHERE tenant_id=$1 AND principal_id=$2 "
+                "AND review_status='proposed' AND valid_to IS NULL",
+                tenant_id,
+                principal_id,
+            )
             preview = await client.post(
                 "/v1/admin/promote?dry_run=true", headers=_headers(keys["broad"])
             )

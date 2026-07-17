@@ -1,9 +1,15 @@
 -- Pin remember-time authority separately from immutable candidate origin provenance.
+--
+-- Relational contract mirrors candidate_ingests (migration 020): tenant-scoped
+-- composite foreign keys to tenants and principals (tenant_id, id), so an
+-- execution row's tenant and principal are guaranteed to belong together. Safe
+-- to re-apply: every object is guarded or uses IF NOT EXISTS, and the RLS
+-- policy is recreated idempotently.
 
 CREATE TABLE IF NOT EXISTS candidate_ingest_executions (
     ingest_id uuid PRIMARY KEY,
     tenant_id uuid NOT NULL,
-    principal_id uuid NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+    principal_id uuid NOT NULL,
     api_key_id uuid,
     memory_profile_id uuid,
     memory_profile_revision_id uuid,
@@ -17,8 +23,35 @@ CREATE TABLE IF NOT EXISTS candidate_ingest_executions (
     )
 );
 
+-- A prior revision of this table declared principal_id with an inline
+-- single-column FK to principals(id). That admitted a tenant-A principal_id
+-- paired with a tenant-B row. Replace it with the tenant-scoped composite FK
+-- used by candidate_ingests (references idx_principals_tenant_identity).
+ALTER TABLE candidate_ingest_executions
+    DROP CONSTRAINT IF EXISTS candidate_ingest_executions_principal_id_fkey;
+
 DO $$
 BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_candidate_ingest_executions_tenant'
+          AND conrelid = 'candidate_ingest_executions'::regclass
+    ) THEN
+        ALTER TABLE candidate_ingest_executions
+            ADD CONSTRAINT fk_candidate_ingest_executions_tenant
+            FOREIGN KEY (tenant_id)
+            REFERENCES tenants (id) ON DELETE CASCADE;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_candidate_ingest_executions_tenant_principal'
+          AND conrelid = 'candidate_ingest_executions'::regclass
+    ) THEN
+        ALTER TABLE candidate_ingest_executions
+            ADD CONSTRAINT fk_candidate_ingest_executions_tenant_principal
+            FOREIGN KEY (tenant_id, principal_id)
+            REFERENCES principals (tenant_id, id) ON DELETE CASCADE;
+    END IF;
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conname = 'fk_candidate_ingest_executions_api_key'
@@ -51,19 +84,26 @@ CREATE INDEX IF NOT EXISTS idx_candidate_ingest_executions_context
 ALTER TABLE candidate_ingest_executions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE candidate_ingest_executions FORCE ROW LEVEL SECURITY;
 
+-- Match the tenant_isolation convention used by candidate_ingests (migration
+-- 020) and the rest of the schema: the two-argument current_setting returns
+-- NULL when the GUC is unset instead of raising, so a missing tenant context
+-- simply sees zero rows. Recreate idempotently if a prior revision installed
+-- the single-argument form.
 DO $$
 BEGIN
-    IF NOT EXISTS (
+    IF EXISTS (
         SELECT 1 FROM pg_policies
         WHERE schemaname = 'public'
           AND tablename = 'candidate_ingest_executions'
           AND policyname = 'tenant_isolation_candidate_ingest_executions'
     ) THEN
-        CREATE POLICY tenant_isolation_candidate_ingest_executions
-            ON candidate_ingest_executions
-            USING (tenant_id = current_setting('app.tenant_id')::uuid)
-            WITH CHECK (tenant_id = current_setting('app.tenant_id')::uuid);
+        DROP POLICY tenant_isolation_candidate_ingest_executions
+            ON candidate_ingest_executions;
     END IF;
+    CREATE POLICY tenant_isolation_candidate_ingest_executions
+        ON candidate_ingest_executions
+        USING (tenant_id::text = current_setting('app.tenant_id', true))
+        WITH CHECK (tenant_id::text = current_setting('app.tenant_id', true));
 END $$;
 
 GRANT SELECT, INSERT ON candidate_ingest_executions TO engram_app;

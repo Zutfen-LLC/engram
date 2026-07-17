@@ -1011,9 +1011,22 @@ class CandidateIngestExecution(Base):
     __tablename__ = "candidate_ingest_executions"
     __table_args__ = (
         ForeignKeyConstraint(
+            ["tenant_id"],
+            ["tenants.id"],
+            ondelete="CASCADE",
+            name="fk_candidate_ingest_executions_tenant",
+        ),
+        ForeignKeyConstraint(
             ["tenant_id", "ingest_id"],
             ["candidate_ingests.tenant_id", "candidate_ingests.id"],
             ondelete="CASCADE",
+            name="fk_candidate_ingest_executions_ingest",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "principal_id"],
+            ["principals.tenant_id", "principals.id"],
+            ondelete="CASCADE",
+            name="fk_candidate_ingest_executions_tenant_principal",
         ),
         ForeignKeyConstraint(
             ["tenant_id", "api_key_id"],
@@ -1021,6 +1034,7 @@ class CandidateIngestExecution(Base):
             ondelete="SET NULL",
             deferrable=True,
             initially="DEFERRED",
+            name="fk_candidate_ingest_executions_api_key",
         ),
         ForeignKeyConstraint(
             ["memory_profile_revision_id", "memory_profile_id", "tenant_id"],
@@ -1032,14 +1046,13 @@ class CandidateIngestExecution(Base):
             ondelete="NO ACTION",
             deferrable=True,
             initially="DEFERRED",
+            name="fk_candidate_ingest_executions_profile_revision",
         ),
     )
 
     ingest_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
-    principal_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("principals.id", ondelete="CASCADE"), nullable=False
-    )
+    principal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     api_key_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     memory_profile_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     memory_profile_revision_id: Mapped[uuid.UUID | None] = mapped_column(
