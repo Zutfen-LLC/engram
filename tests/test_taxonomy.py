@@ -114,7 +114,10 @@ async def _seed_item(
         {
             "id": item_id, "tid": tenant_id, "ws": workspace_id, "pid": principal_id,
             "content": body, "chash": f"hash-{item_id}", "kind": kind,
-            "wing": wing, "room": room, "vis": "workspace", "rs": review_status,
+            # These tests exercise taxonomy grouping, not workspace access.
+            # Tenant visibility keeps the fixture eligible under the shared
+            # MemoryItem read predicate introduced by ENG-SCOPE-002B.
+            "wing": wing, "room": room, "vis": "tenant", "rs": review_status,
             "mc": 0.8, "st": 0.7, "hv": False, "imp": 0.5, "pin": False,
             "rc": 0, "src": 0, "sotype": "manual", "sens": "normal",
         },

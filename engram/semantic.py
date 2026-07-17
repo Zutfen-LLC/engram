@@ -19,13 +19,13 @@ slightly-closer low-trust item cannot outrank a high-trust memory. See
 from __future__ import annotations
 
 from typing import Any
-from uuid import UUID
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import and_, cast, func, literal_column, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from engram.memory_access import eligibility_expression
+from engram.memory_access import read_eligibility_expression
+from engram.memory_context import ResolvedMemoryContext
 from engram.models import EmbeddingProfile, MemoryEmbedding, MemoryItem
 
 # Scoring version exposed in search/recall results and recall_logs so the
@@ -92,14 +92,13 @@ def compute_semantic_trust_score(
 async def candidate_count(
     session: AsyncSession,
     *,
-    tenant_id: str | UUID,
-    principal_id: str | UUID,
+    memory_context: ResolvedMemoryContext,
     workspace_id: str | None = None,
     review_statuses: tuple[str, ...] = ("active",),
     kind: str | None = None,
     wing: str | None = None,
     room: str | None = None,
-    profile: EmbeddingProfile | None = None,
+    embedding_profile: EmbeddingProfile | None = None,
 ) -> int:
     """Count recall/search-eligible embeddings currently in the corpus.
 
@@ -110,10 +109,10 @@ async def candidate_count(
     (see ``engram.memory_access``). Optional ``kind``/``wing``/``room``
     filters further narrow the candidate set (matching :func:`search`).
     """
-    if profile is None:
+    if embedding_profile is None:
         from engram.embedding_profiles import get_active_profile
 
-        profile = await get_active_profile(session)
+        embedding_profile = await get_active_profile(session)
     stmt = (
         select(func.count())
         .select_from(MemoryEmbedding)
@@ -125,14 +124,13 @@ async def candidate_count(
             ),
         )
         .where(
-            MemoryEmbedding.profile_id == profile.id,
-            MemoryEmbedding.embedding_dim == profile.dimensions,
+            MemoryEmbedding.profile_id == embedding_profile.id,
+            MemoryEmbedding.embedding_dim == embedding_profile.dimensions,
             MemoryEmbedding.embedding_status == "ready",
             MemoryEmbedding.embedding.is_not(None),
             MemoryItem.review_status.in_(review_statuses),
             MemoryItem.valid_to.is_(None),
-            MemoryItem.tenant_id == tenant_id,
-            eligibility_expression(principal_id),
+            read_eligibility_expression(memory_context),
         )
     )
     if workspace_id is not None:
@@ -151,14 +149,13 @@ async def search(
     query_embedding: list[float],
     limit: int,
     *,
-    tenant_id: str | UUID,
-    principal_id: str | UUID,
+    memory_context: ResolvedMemoryContext,
     workspace_id: str | None = None,
     review_statuses: tuple[str, ...] = ("active",),
     kind: str | None = None,
     wing: str | None = None,
     room: str | None = None,
-    profile: EmbeddingProfile | None = None,
+    embedding_profile: EmbeddingProfile | None = None,
 ) -> list[dict[str, Any]]:
     """Return the top-``limit`` items for ``query_embedding``, trust-ranked.
 
@@ -181,21 +178,21 @@ async def search(
     ordered by ``score`` descending, then distance ascending, then
     ``created_at`` descending.
     """
-    if profile is None:
+    if embedding_profile is None:
         from engram.embedding_profiles import get_active_profile
 
-        profile = await get_active_profile(session)
-    if len(query_embedding) != profile.dimensions:
+        embedding_profile = await get_active_profile(session)
+    if len(query_embedding) != embedding_profile.dimensions:
         raise ValueError(
             f"query vector dimension {len(query_embedding)} does not match active "
-            f"profile {profile.profile_key} ({profile.dimensions})"
+            f"profile {embedding_profile.profile_key} ({embedding_profile.dimensions})"
         )
     # strict_order handles tenant-filtered queries without recall degradation.
     await session.execute(text("SET LOCAL hnsw.iterative_scan = strict_order"))
-    typed_embedding = cast(MemoryEmbedding.embedding, Vector(profile.dimensions))
+    typed_embedding = cast(MemoryEmbedding.embedding, Vector(embedding_profile.dimensions))
     distance = typed_embedding.cosine_distance(query_embedding)
-    profile_id_sql: Any = literal_column(f"'{profile.id}'::uuid")
-    dimensions_sql: Any = literal_column(str(int(profile.dimensions)))
+    profile_id_sql: Any = literal_column(f"'{embedding_profile.id}'::uuid")
+    dimensions_sql: Any = literal_column(str(int(embedding_profile.dimensions)))
     stmt = (
         select(
             MemoryItem.id.label("id"),
@@ -228,8 +225,7 @@ async def search(
             MemoryEmbedding.embedding.is_not(None),
             MemoryItem.review_status.in_(review_statuses),
             MemoryItem.valid_to.is_(None),
-            MemoryItem.tenant_id == tenant_id,
-            eligibility_expression(principal_id),
+            read_eligibility_expression(memory_context),
         )
         # Fetch the nearest candidates from the HNSW index; trust re-ranking
         # happens in Python below. Callers over-fetch (search route + recall)
@@ -273,7 +269,7 @@ async def search(
                 "score": semantic_score,
                 "embedding_model": row["embedding_model"],
                 "embedding_dim": row["embedding_dim"],
-                "embedding_profile": profile.profile_key,
+                "embedding_profile": embedding_profile.profile_key,
                 "created_at": row["created_at"],
             }
         )

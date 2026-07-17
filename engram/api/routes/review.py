@@ -21,7 +21,14 @@ from engram.api.routes.memory import (
 )
 from engram.auth import REVIEW_SCOPE, WRITE_OR_REVIEW_SCOPE, Principal
 from engram.db import get_session
-from engram.memory_access import eligibility_expression, eligibility_sql, resolve_workspace_scope
+from engram.memory_access import (
+    principal_eligibility_expression,
+    principal_eligibility_sql,
+    read_eligibility_expression,
+    read_eligibility_sql,
+    resolve_workspace_scope,
+)
+from engram.memory_context import ResolvedMemoryContext, resolve_memory_context
 from engram.models import MemoryItem, TenantConfig
 from engram.promotion import _config_values, assess_promotion_candidate, load_promotion_support
 from engram.review_policy import (
@@ -162,6 +169,7 @@ async def review_queue(
     workspace: str | None = None,
     limit: int = 50,
     session: AsyncSession = Depends(get_session),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> list[dict[str, Any]]:
     """Items awaiting review (review_status='proposed').
 
@@ -171,13 +179,14 @@ async def review_queue(
     an explicit ``promotion_conflict_recheck_status='not_run'``. Previewing
     never performs a semantic conflict check or mutates state.
     """
-    tenant_id = await _resolve_tenant_id(session)
-    principal_id, _ = await _resolve_principal(session, tenant_id)
+    tenant_id = memory_context.tenant_id
+    if not memory_context.may_read_anything:
+        return []
 
     stmt = (
         select(MemoryItem)
         .where(
-            MemoryItem.tenant_id == tenant_id,
+            read_eligibility_expression(memory_context),
             MemoryItem.review_status == "proposed",
             MemoryItem.valid_to.is_(None),
             MemoryItem.superseded_by.is_(None),
@@ -188,7 +197,12 @@ async def review_queue(
     if kind is not None:
         stmt = stmt.where(MemoryItem.kind == kind)
     if workspace is not None:
-        stmt = stmt.where(MemoryItem.workspace_id == UUID(workspace))
+        workspace_id, accessible = await resolve_workspace_scope(
+            session, memory_context=memory_context, workspace=workspace
+        )
+        if not accessible:
+            return []
+        stmt = stmt.where(MemoryItem.workspace_id == workspace_id)
 
     items = list((await session.execute(stmt)).scalars())
     config = (
@@ -264,10 +278,10 @@ async def review_queue(
 )
 async def conflict_queue(
     session: AsyncSession = Depends(get_session),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> ConflictListResponse:
     """Items with unresolved conflicts (conflict_resolution_status='unresolved')."""
     tenant_id = await _resolve_tenant_id(session)
-    principal_id, _ = await _resolve_principal(session, tenant_id)
     counterpart = aliased(MemoryItem)
     stmt = (
         select(
@@ -283,9 +297,9 @@ async def conflict_queue(
         .join(counterpart, counterpart.id == MemoryItem.conflicts_with_item_id)
         .where(
             MemoryItem.tenant_id == tenant_id,
-            eligibility_expression(principal_id),
+            read_eligibility_expression(memory_context),
             counterpart.tenant_id == tenant_id,
-            eligibility_expression(principal_id, item_entity=counterpart),
+            read_eligibility_expression(memory_context, item_entity=counterpart),
             MemoryItem.conflict_resolution_status == "unresolved",
             MemoryItem.conflicts_with_item_id.is_not(None),
         )
@@ -315,6 +329,7 @@ async def stale_items(
     kind: str | None = None,
     limit: int = 100,
     session: AsyncSession = Depends(get_session),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> StaleListResponse:
     """Active items not recalled in N days.
 
@@ -325,33 +340,31 @@ async def stale_items(
     """
     if days < 0:
         raise HTTPException(status_code=422, detail="days must be non-negative")
-    tenant_id = await _resolve_tenant_id(session)
-    principal_id, _ = await _resolve_principal(session, tenant_id)
+    if not memory_context.may_read_anything:
+        return StaleListResponse(items=[], total=0, days=days)
     limit = max(1, min(limit, 500))
     # Keep this as a datetime so asyncpg binds it as TIMESTAMPTZ.  Passing an
     # ISO string works with permissive test backends but is rejected by the
     # real PostgreSQL driver once the comparison type is inferred.
     cutoff = datetime.now(UTC) - timedelta(days=days)
 
+    read_scope = read_eligibility_sql(memory_context, parameter_prefix="stale_item")
     clauses = [
-        "tenant_id = :caller_tenant_id",
-        eligibility_sql(),
+        read_scope.clause,
         "review_status = 'active'",
         "valid_to IS NULL",
         "superseded_by IS NULL",
         "COALESCE(last_recalled_at, valid_from) < :cutoff",
     ]
     params: dict[str, Any] = {
-        "caller_tenant_id": str(tenant_id),
-        "caller_principal_id": str(principal_id),
+        **read_scope.params,
         "cutoff": cutoff,
         "limit": limit,
     }
     if workspace is not None:
         ws_id, accessible = await resolve_workspace_scope(
             session,
-            tenant_id=tenant_id,
-            principal_id=principal_id,
+            memory_context=memory_context,
             workspace=workspace,
         )
         if not accessible:
@@ -380,19 +393,16 @@ async def stale_items(
 )
 async def review_stats(
     session: AsyncSession = Depends(get_session),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> ReviewStatsResponse:
     """Hygiene report: counts by review_status, kind, and confidence buckets.
 
     Counts only current memories (``valid_to IS NULL``). Confidence buckets:
     low (< 0.4), medium (0.4–< 0.7), high (>= 0.7).
     """
-    tenant_id = await _resolve_tenant_id(session)
-    principal_id, _ = await _resolve_principal(session, tenant_id)
-    params = {
-        "caller_tenant_id": str(tenant_id),
-        "caller_principal_id": str(principal_id),
-    }
-    base = f"{eligibility_sql()} AND tenant_id = :caller_tenant_id AND valid_to IS NULL "
+    read_scope = read_eligibility_sql(memory_context, parameter_prefix="review_stat_item")
+    params = read_scope.params
+    base = f"{read_scope.clause} AND valid_to IS NULL "
 
     status_rows = (
         await session.execute(
@@ -623,7 +633,7 @@ async def resolve_conflict(
         .where(
             MemoryItem.id.in_(pair_ids),
             MemoryItem.tenant_id == tenant_id,
-            eligibility_expression(principal_id),
+            principal_eligibility_expression(principal_id),
         )
         .order_by(MemoryItem.id)
         .with_for_update()
@@ -757,9 +767,12 @@ async def bulk_archive(
     sorted_ids = sorted(requested)
 
     fetch_placeholders: list[str] = []
+    principal_scope = principal_eligibility_sql(
+        principal_id, parameter_prefix="bulk_archive_item"
+    )
     fetch_params: dict[str, Any] = {
         "tenant_id": str(tenant_id),
-        "caller_principal_id": str(principal_id),
+        **principal_scope.params,
     }
     for i, item_id in enumerate(sorted_ids):
         fetch_placeholders.append(f":id{i}")
@@ -769,7 +782,7 @@ async def bulk_archive(
     fetch_sql = text(
         "SELECT id, review_status, principal_id FROM memory_items "
         "WHERE tenant_id = :tenant_id AND "
-        f"{eligibility_sql()} AND "
+        f"{principal_scope.clause} AND "
         f"CAST(id AS TEXT) IN ({', '.join(fetch_placeholders)})"
         f" ORDER BY id{lock_suffix}"
     )

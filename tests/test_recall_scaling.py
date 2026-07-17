@@ -17,13 +17,20 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import insert, text
+from sqlalchemy import event, insert, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from engram.auth import Principal
 from engram.config import settings
-from engram.models import MemoryItem
-from engram.recall import _fetch_active_items, execute_startup_recall, score_item
+from engram.memory_context import ResolvedMemoryContext, unrestricted_memory_context
+from engram.models import MemoryItem, Workspace
+from engram.recall import (
+    _fetch_active_items,
+    _fetch_startup_candidates,
+    execute_startup_recall,
+    score_item,
+)
 
 _test_engine = create_async_engine(settings.database_url, poolclass=NullPool)
 _test_session_factory = async_sessionmaker(
@@ -151,8 +158,9 @@ async def _run_startup_recall(tenant_id: str, principal_id: str, **kwargs: objec
         await _apply_rls(session, tenant_id, principal_id)
         return await execute_startup_recall(
             session=session,
-            tenant_id=tenant_id,
-            principal_id=principal_id,
+            memory_context=unrestricted_memory_context(
+                Principal(tenant_id=tenant_id, principal_id=principal_id, scopes=("read",))
+            ),
             workspace=None,
             byte_budget=kwargs.get("byte_budget", 10_000_000),
             token_budget=kwargs.get("token_budget"),
@@ -172,7 +180,13 @@ async def test_below_candidate_limit_matches_full_corpus_scoring():
 
     async with _test_session_factory() as session:
         await _apply_rls(session, tenant_id, principal_id)
-        full_corpus = await _fetch_active_items(session, tenant_id, principal_id, None)
+        full_corpus = await _fetch_active_items(
+            session,
+            unrestricted_memory_context(
+                Principal(tenant_id=tenant_id, principal_id=principal_id, scopes=("read",))
+            ),
+            None,
+        )
     now = datetime.now(UTC)
     reference = sorted(
         ((i, score_item(i, None, now).score) for i in full_corpus),
@@ -224,6 +238,124 @@ async def test_query_count_bounded_regardless_of_corpus_size(monkeypatch):
     assert small_queries == large_queries
     # 1 disputed-kind lookup + 1 pinned + 4 sub-pools = 6, fixed regardless of N.
     assert large_queries <= 10
+
+
+async def test_profile_context_is_applied_on_read_engine_without_policy_query():
+    """The replica receives resolved values and never reloads profile tables."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    tenant_id, principal_id = await _default_tenant_principal()
+    workspace_ids = (uuid.uuid4(), uuid.uuid4())
+    allowed_id, denied_id = uuid.uuid4(), uuid.uuid4()
+    read_engine = create_async_engine(settings.database_url, poolclass=NullPool)
+    read_factory = async_sessionmaker(read_engine, class_=AsyncSession, expire_on_commit=False)
+    statements: list[str] = []
+
+    def capture_statement(
+        _conn: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: object,
+    ) -> None:
+        statements.append(statement.lower())
+
+    event.listen(read_engine.sync_engine, "before_cursor_execute", capture_statement)
+    try:
+        async with _test_session_factory() as session:
+            session.add_all(
+                (
+                    Workspace(
+                        id=workspace_ids[0],
+                        tenant_id=uuid.UUID(tenant_id),
+                        name="Replica allowed",
+                        slug=f"replica-allowed-{uuid.uuid4().hex}",
+                    ),
+                    Workspace(
+                        id=workspace_ids[1],
+                        tenant_id=uuid.UUID(tenant_id),
+                        name="Replica denied",
+                        slug=f"replica-denied-{uuid.uuid4().hex}",
+                    ),
+                )
+            )
+            await session.flush()
+            session.add_all(
+                (
+                    MemoryItem(
+                        id=allowed_id,
+                        tenant_id=uuid.UUID(tenant_id),
+                        workspace_id=workspace_ids[0],
+                        principal_id=uuid.UUID(principal_id),
+                        content="replica allowed",
+                        content_hash=f"sha256:{uuid.uuid4().hex}",
+                        kind="fact",
+                        visibility="tenant",
+                        review_status="active",
+                    ),
+                    MemoryItem(
+                        id=denied_id,
+                        tenant_id=uuid.UUID(tenant_id),
+                        workspace_id=workspace_ids[1],
+                        principal_id=uuid.UUID(principal_id),
+                        content="replica denied",
+                        content_hash=f"sha256:{uuid.uuid4().hex}",
+                        kind="fact",
+                        visibility="tenant",
+                        review_status="active",
+                    ),
+                )
+            )
+            await session.commit()
+
+        context = ResolvedMemoryContext(
+            version="memory-context-v1",
+            tenant_id=uuid.UUID(tenant_id),
+            principal_id=uuid.UUID(principal_id),
+            api_key_id=uuid.uuid4(),
+            memory_profile_id=uuid.uuid4(),
+            memory_profile_revision_id=uuid.uuid4(),
+            memory_profile_slug="replica-test",
+            memory_profile_version=1,
+            include_private=False,
+            include_tenant=True,
+            include_public=False,
+            readable_workspace_ids=frozenset({workspace_ids[0]}),
+        )
+        async with read_factory() as read_session:
+            await _apply_rls(read_session, tenant_id, principal_id)
+            candidates, _stats = await _fetch_startup_candidates(
+                read_session,
+                memory_context=context,
+                workspace_id=None,
+                now=datetime.now(UTC),
+                config=None,
+                candidate_limit=10,
+            )
+
+        assert {item.id for item in candidates} == {allowed_id}
+        assert not any(
+            table in statement
+            for statement in statements
+            for table in (
+                "memory_profiles",
+                "memory_profile_revisions",
+                "memory_profile_workspace_grants",
+            )
+        )
+    finally:
+        event.remove(read_engine.sync_engine, "before_cursor_execute", capture_statement)
+        await read_engine.dispose()
+        async with _test_engine.begin() as conn:
+            await conn.execute(
+                text("DELETE FROM memory_items WHERE id IN (:allowed, :denied)"),
+                {"allowed": allowed_id, "denied": denied_id},
+            )
+            await conn.execute(
+                text("DELETE FROM workspaces WHERE id IN (:allowed, :denied)"),
+                {"allowed": workspace_ids[0], "denied": workspace_ids[1]},
+            )
 
 
 async def test_pinned_items_never_displaced_by_candidate_cap(monkeypatch):

@@ -1,78 +1,39 @@
-"""Shared memory-item read eligibility.
-
-Every read path that can return memory-item content (recall, search, item
-list/detail) must apply the same predicate: the item belongs to the caller's
-tenant, and its visibility permits the caller to see it.
-
-Note on RLS: ``memory_items`` (and every other tenant-scoped table) have
-``ENABLE`` + ``FORCE ROW LEVEL SECURITY`` (see migrations/001_init.sql and
-migrations/003_app_role_and_force_rls.sql) keyed off
-``current_setting('app.tenant_id')``. The runtime service connects as the
-non-owner application role (``engram_app``), which is subject to those policies
-— so a forgotten ``tenant_id`` filter here would be caught at the database
-level. This predicate remains the *primary* semantic visibility rule
-(visibility/workspace logic the DB cannot express); RLS is defense-in-depth
-tenant isolation beneath it. Both layers are required.
-
-Visibility rules (design.md):
-    visibility = 'tenant'
-    OR visibility = 'public'
-    OR (visibility = 'private' AND principal_id = :caller_principal_id)
-    OR (
-        visibility = 'workspace'
-        AND workspace_id IN (
-            SELECT workspace_id FROM workspace_members
-            WHERE principal_id = :caller_principal_id
-        )
-    )
-
-ENG-SCOPE-001: ``visibility='workspace' AND workspace_id IS NULL`` is no
-longer a supported semantic state. Historically this combination was treated
-as tenant-wide (the accidental result of a caller omitting both fields, which
-defaulted to ``workspace``); migration 021 truthfully relabels every such
-legacy row to ``visibility='tenant'`` and a database CHECK constraint
-(``visibility <> 'workspace' OR workspace_id IS NOT NULL``) now makes the
-combination unrepresentable going forward. This predicate is intentionally
-strict: a ``workspace_id IS NULL`` row can only match here via the ``tenant``/
-``public``/owned-``private`` arms, never the ``workspace`` arm.
-"""
+"""Canonical principal eligibility and profile read narrowing."""
 
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import and_, or_, text
-from sqlalchemy import select as sa_select
+from sqlalchemy import and_, false, literal, or_, select, text, true
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
 from engram.auth import check_workspace_membership
+from engram.memory_context import ResolvedMemoryContext
 from engram.models import MemoryItem, WorkspaceMember
 
+_SQL_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-def eligibility_expression(
+
+@dataclass(frozen=True)
+class SqlPredicate:
+    """A parameterized raw-SQL predicate and its bind values."""
+
+    clause: str
+    params: dict[str, object]
+
+
+def principal_eligibility_expression(
     principal_id: str | UUID,
     *,
     item_entity: Any = MemoryItem,
 ) -> ColumnElement[bool]:
-    """SQLAlchemy boolean expression: is a ``MemoryItem`` row visible to ``principal_id``?
-
-    Does NOT check ``tenant_id`` — callers must additionally filter
-    ``MemoryItem.tenant_id == <caller tenant>``. RLS now enforces tenant
-    isolation at the DB level too, but the app layer keeps the explicit filter
-    as the primary rule (and so non-DB tests stay correct).
-
-    ``visibility='workspace'`` is strict membership-only (ENG-SCOPE-001): a
-    row must name a real ``workspace_id`` that the caller belongs to. A
-    ``workspace_id IS NULL`` row is unrepresentable for ``visibility=
-    'workspace'`` after migration 021 (enforced by a DB CHECK constraint), so
-    no tenant-wide fallback is applied here — a manually-constructed row of
-    that shape (e.g. in a non-DB unit test) is correctly excluded, not
-    admitted.
-    """
+    """Existing visibility/membership rule, without profile narrowing."""
     member_workspaces = (
-        sa_select(WorkspaceMember.workspace_id)
+        select(WorkspaceMember.workspace_id)
         .where(WorkspaceMember.principal_id == principal_id)
         .scalar_subquery()
     )
@@ -87,84 +48,206 @@ def eligibility_expression(
     )
 
 
-def apply_read_eligibility(
-    stmt: Any, *, tenant_id: str | UUID, principal_id: str | UUID
-) -> Any:
-    """Apply tenant + visibility eligibility to a ``MemoryItem``-selecting statement."""
-    return stmt.where(
-        MemoryItem.tenant_id == tenant_id,
-        eligibility_expression(principal_id),
+def profile_read_scope_expression(
+    memory_context: ResolvedMemoryContext,
+    *,
+    item_entity: Any = MemoryItem,
+) -> ColumnElement[bool]:
+    """Profile visibility flags plus workspace-association narrowing."""
+    workspace_ids = memory_context.readable_workspace_ids
+    if workspace_ids is None:
+        return true()
+    if not memory_context.may_read_anything:
+        return false()
+
+    readable_workspace = item_entity.workspace_id.in_(workspace_ids)
+    visibility = or_(
+        and_(item_entity.visibility == "private", literal(memory_context.include_private)),
+        and_(item_entity.visibility == "tenant", literal(memory_context.include_tenant)),
+        and_(item_entity.visibility == "public", literal(memory_context.include_public)),
+        and_(item_entity.visibility == "workspace", readable_workspace),
+    )
+    association = or_(item_entity.workspace_id.is_(None), readable_workspace)
+    return and_(visibility, association)
+
+
+def read_eligibility_expression(
+    memory_context: ResolvedMemoryContext,
+    *,
+    item_entity: Any = MemoryItem,
+) -> ColumnElement[bool]:
+    """Tenant ∩ principal eligibility ∩ profile read scope."""
+    return and_(
+        item_entity.tenant_id == memory_context.tenant_id,
+        principal_eligibility_expression(
+            memory_context.principal_id, item_entity=item_entity
+        ),
+        profile_read_scope_expression(memory_context, item_entity=item_entity),
     )
 
 
-_ELIGIBILITY_SQL_TEMPLATE = """(
-        {p}visibility = 'tenant'
-        OR {p}visibility = 'public'
-        OR ({p}visibility = 'private' AND {p}principal_id = :caller_principal_id)
-        OR (
-            {p}visibility = 'workspace'
-            AND {p}workspace_id IN (
-                SELECT workspace_id FROM workspace_members
-                WHERE principal_id = :caller_principal_id
-            )
-        )
-    )"""
+def apply_read_eligibility(
+    stmt: Any,
+    memory_context: ResolvedMemoryContext,
+    *,
+    item_entity: Any = MemoryItem,
+) -> Any:
+    return stmt.where(read_eligibility_expression(memory_context, item_entity=item_entity))
+
+
+def apply_principal_eligibility(
+    stmt: Any,
+    *,
+    tenant_id: str | UUID,
+    principal_id: str | UUID,
+    item_entity: Any = MemoryItem,
+) -> Any:
+    """Pre-002C mutation authorization; intentionally principal-only."""
+    return stmt.where(
+        item_entity.tenant_id == tenant_id,
+        principal_eligibility_expression(principal_id, item_entity=item_entity),
+    )
+
+
+def _sql_names(alias: str, parameter_prefix: str) -> tuple[str, str]:
+    if alias and not _SQL_IDENTIFIER.fullmatch(alias):
+        raise ValueError("alias must be a SQL identifier")
+    if not _SQL_IDENTIFIER.fullmatch(parameter_prefix):
+        raise ValueError("parameter_prefix must be a SQL identifier")
+    return (f"{alias}." if alias else "", parameter_prefix)
+
+
+def principal_eligibility_sql(
+    principal_id: str | UUID,
+    *,
+    alias: str = "",
+    parameter_prefix: str = "memory",
+) -> SqlPredicate:
+    p, key = _sql_names(alias, parameter_prefix)
+    principal_param = f"{key}_principal_id"
+    return SqlPredicate(
+        clause=(
+            f"({p}visibility = 'tenant' OR {p}visibility = 'public' "
+            f"OR ({p}visibility = 'private' AND {p}principal_id = :{principal_param}) "
+            f"OR ({p}visibility = 'workspace' AND {p}workspace_id IN "
+            f"(SELECT workspace_id FROM workspace_members "
+            f"WHERE principal_id = :{principal_param})))"
+        ),
+        params={principal_param: str(principal_id)},
+    )
+
+
+def profile_read_scope_sql(
+    memory_context: ResolvedMemoryContext,
+    *,
+    alias: str = "",
+    parameter_prefix: str = "memory",
+) -> SqlPredicate:
+    p, key = _sql_names(alias, parameter_prefix)
+    workspace_ids = memory_context.readable_workspace_ids
+    if workspace_ids is None:
+        return SqlPredicate("TRUE", {})
+    if not memory_context.may_read_anything:
+        return SqlPredicate("FALSE", {})
+
+    params: dict[str, object] = {}
+    placeholders: list[str] = []
+    for index, workspace_id in enumerate(sorted(workspace_ids, key=str)):
+        name = f"{key}_workspace_{index}"
+        placeholders.append(f":{name}")
+        params[name] = str(workspace_id)
+    workspace_clause = (
+        f"{p}workspace_id IN ({', '.join(placeholders)})" if placeholders else "FALSE"
+    )
+    visibility_parts: list[str] = []
+    if memory_context.include_private:
+        visibility_parts.append(f"{p}visibility = 'private'")
+    if memory_context.include_tenant:
+        visibility_parts.append(f"{p}visibility = 'tenant'")
+    if memory_context.include_public:
+        visibility_parts.append(f"{p}visibility = 'public'")
+    if placeholders:
+        visibility_parts.append(f"({p}visibility = 'workspace' AND {workspace_clause})")
+    visibility_clause = " OR ".join(visibility_parts) if visibility_parts else "FALSE"
+    return SqlPredicate(
+        f"(({visibility_clause}) AND ({p}workspace_id IS NULL OR {workspace_clause}))",
+        params,
+    )
+
+
+def read_eligibility_sql(
+    memory_context: ResolvedMemoryContext,
+    *,
+    alias: str = "",
+    parameter_prefix: str = "memory",
+) -> SqlPredicate:
+    p, key = _sql_names(alias, parameter_prefix)
+    principal = principal_eligibility_sql(
+        memory_context.principal_id, alias=alias, parameter_prefix=parameter_prefix
+    )
+    profile = profile_read_scope_sql(
+        memory_context, alias=alias, parameter_prefix=parameter_prefix
+    )
+    tenant_param = f"{key}_tenant_id"
+    return SqlPredicate(
+        f"({p}tenant_id = :{tenant_param} AND {principal.clause} AND {profile.clause})",
+        {
+            tenant_param: str(memory_context.tenant_id),
+            **principal.params,
+            **profile.params,
+        },
+    )
+
+
+# Compatibility aliases for external imports and pre-002B tests. Production
+# caller-facing reads use the explicit complete helpers above; mutation paths
+# use the clearly named principal-only helpers until ENG-SCOPE-002C.
+eligibility_expression = principal_eligibility_expression
 
 
 def eligibility_sql(alias: str = "") -> str:
-    """Raw-SQL boolean fragment equivalent to :func:`eligibility_expression`.
-
-    For use inside ``text(...)`` queries over ``memory_items``. Callers must
-    bind ``caller_principal_id`` in their execute params, and should also
-    include :func:`tenant_sql` (bind ``caller_tenant_id``) — this fragment
-    alone does not scope by tenant.
-    """
-    prefix = f"{alias}." if alias else ""
-    return _ELIGIBILITY_SQL_TEMPLATE.format(p=prefix)
+    return principal_eligibility_sql(
+        UUID(int=0), alias=alias, parameter_prefix="caller"
+    ).clause
 
 
 def tenant_sql(alias: str = "") -> str:
-    """Raw-SQL tenant fragment to pair with :func:`eligibility_sql`."""
-    prefix = f"{alias}." if alias else ""
-    return f"{prefix}tenant_id = :caller_tenant_id"
+    p, _ = _sql_names(alias, "caller")
+    return f"{p}tenant_id = :caller_tenant_id"
 
 
 async def resolve_workspace_scope(
     session: AsyncSession,
     *,
-    tenant_id: str | UUID,
-    principal_id: str | UUID,
     workspace: str | None,
+    memory_context: ResolvedMemoryContext | None = None,
+    tenant_id: str | UUID | None = None,
+    principal_id: str | UUID | None = None,
 ) -> tuple[str | None, bool]:
-    """Resolve an optional workspace slug/name for a read request.
-
-    Returns ``(workspace_id, accessible)``:
-
-    - ``workspace`` is ``None`` -> ``(None, True)``: no workspace restriction.
-    - ``workspace`` doesn't resolve within the caller's tenant, or resolves but
-      the caller isn't a member -> ``(None, False)``: callers must treat this
-      as zero accessible results rather than silently falling back to an
-      unscoped read (an explicit workspace request must not bypass
-      membership).
-    - ``workspace`` resolves and the caller is a member -> ``(workspace_id, True)``.
-    """
+    """Resolve explicit workspace narrowing without disclosure or fallback."""
     if workspace is None:
         return None, True
+    if memory_context is not None:
+        tenant_id = memory_context.tenant_id
+        principal_id = memory_context.principal_id
+    if tenant_id is None or principal_id is None:
+        raise ValueError("memory_context or tenant_id/principal_id is required")
 
-    result = await session.execute(
-        text(
-            "SELECT id FROM workspaces WHERE tenant_id = :tid AND (slug = :ws OR name = :ws)"
-        ),
-        {"tid": str(tenant_id), "ws": workspace},
-    )
-    workspace_id = result.scalar_one_or_none()
+    workspace_id = (
+        await session.execute(
+            text(
+                "SELECT id FROM workspaces WHERE tenant_id = :tid "
+                "AND (slug = :ws OR name = :ws OR CAST(id AS TEXT) = :ws)"
+            ),
+            {"tid": str(tenant_id), "ws": workspace},
+        )
+    ).scalar_one_or_none()
     if workspace_id is None:
         return None, False
-
-    is_member = await check_workspace_membership(
+    if not await check_workspace_membership(
         session, principal_id=str(principal_id), workspace_id=str(workspace_id)
-    )
-    if not is_member:
+    ):
         return None, False
-
+    if memory_context is not None and not memory_context.allows_workspace(workspace_id):
+        return None, False
     return str(workspace_id), True

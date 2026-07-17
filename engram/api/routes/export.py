@@ -18,6 +18,8 @@ from engram.auth import EXPORT_SCOPE
 from engram.authority import authority_label
 from engram.canonicalize import canonicalize
 from engram.db import get_session
+from engram.memory_access import read_eligibility_sql
+from engram.memory_context import ResolvedMemoryContext, resolve_memory_context
 
 router = APIRouter()
 
@@ -28,6 +30,7 @@ _CCA_KINDS = ("doctrine", "decision", "invariant", "preference")
 @router.get("/export/cca", response_model=None, dependencies=[Depends(EXPORT_SCOPE)])
 async def export_cca(
     session: AsyncSession = Depends(get_session),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> dict[str, Any]:
     """Export the CCA ledger as git-friendly JSON (cca_lite_memory_packet@v1).
 
@@ -36,15 +39,17 @@ async def export_cca(
     memory-packet format, enriched with Engram trust fields.
     """
     kind_list = ", ".join(f"'{k}'" for k in _CCA_KINDS)
+    read_scope = read_eligibility_sql(memory_context, parameter_prefix="export_item")
     sql = text(
         "SELECT id, kind, content, content_hash, "
         "source_type, source_session, wing, room, "
         "review_status, memory_confidence, source_trust, authority, human_verified, "
         "valid_from "
-        f"FROM memory_items WHERE kind IN ({kind_list}) AND valid_to IS NULL "
+        f"FROM memory_items WHERE {read_scope.clause} "
+        f"AND kind IN ({kind_list}) AND valid_to IS NULL "
         "ORDER BY valid_from ASC"
     )
-    result = await session.execute(sql)
+    result = await session.execute(sql, read_scope.params)
     entries: list[dict[str, Any]] = []
     for row in result.mappings().all():
         content = row["content"]

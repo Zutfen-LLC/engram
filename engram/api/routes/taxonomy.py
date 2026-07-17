@@ -19,6 +19,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.auth import READ_SCOPE, WRITE_SCOPE
 from engram.db import get_session
+from engram.memory_access import read_eligibility_sql
+from engram.memory_context import ResolvedMemoryContext, resolve_memory_context
 from engram.models import Tunnel
 
 router = APIRouter()
@@ -94,6 +96,7 @@ def _tunnel_to_out(t: Tunnel) -> TunnelOut:
 async def get_taxonomy(
     session: AsyncSession = Depends(get_session),  # noqa: B008
     tenant_id: UUID = Depends(_resolve_tenant_id),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> TaxonomyResponse:
     """Return nested wing → room → item_count for active memory items.
 
@@ -101,21 +104,22 @@ async def get_taxonomy(
     trust gate that startup recall uses. Items with a NULL wing are grouped
     under the synthetic wing ``"_(unassigned)"`` so they remain visible.
     """
+    read_scope = read_eligibility_sql(memory_context, parameter_prefix="taxonomy_item")
     sql = text(
-        """
+        f"""
         SELECT
             COALESCE(wing, '_(unassigned)') AS wing,
             COALESCE(room, '_(unassigned)') AS room,
             COUNT(*) AS item_count
         FROM memory_items
-        WHERE tenant_id = :tenant_id
+        WHERE {read_scope.clause}
           AND review_status = 'active'
           AND valid_to IS NULL
         GROUP BY wing, room
         ORDER BY wing ASC, room ASC
         """
     )
-    rows = (await session.execute(sql, {"tenant_id": str(tenant_id)})).mappings().all()
+    rows = (await session.execute(sql, read_scope.params)).mappings().all()
 
     wings_map: dict[str, dict[str, Any]] = {}
     total = 0

@@ -28,7 +28,14 @@ import pytest
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from engram.memory_access import eligibility_expression, eligibility_sql, tenant_sql
+from engram.memory_access import (
+    eligibility_expression,
+    eligibility_sql,
+    read_eligibility_expression,
+    read_eligibility_sql,
+    tenant_sql,
+)
+from engram.memory_context import MEMORY_CONTEXT_VERSION, ResolvedMemoryContext
 from engram.models import MemoryItem
 
 pytestmark = pytest.mark.asyncio
@@ -130,6 +137,56 @@ async def _raw_eligible_ids(
     return {uuid.UUID(r) for r in rows}
 
 
+def _context(
+    tenant_id: uuid.UUID,
+    principal_id: uuid.UUID,
+    *,
+    private: bool,
+    tenant: bool,
+    public: bool,
+    workspaces: frozenset[uuid.UUID],
+) -> ResolvedMemoryContext:
+    return ResolvedMemoryContext(
+        version=MEMORY_CONTEXT_VERSION,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        api_key_id=uuid.uuid4(),
+        memory_profile_id=uuid.uuid4(),
+        memory_profile_revision_id=uuid.uuid4(),
+        memory_profile_slug="unit-profile",
+        memory_profile_version=1,
+        include_private=private,
+        include_tenant=tenant,
+        include_public=public,
+        readable_workspace_ids=workspaces,
+    )
+
+
+async def _context_ids(
+    session: AsyncSession, context: ResolvedMemoryContext
+) -> tuple[set[uuid.UUID], set[uuid.UUID]]:
+    orm = set(
+        (
+            await session.execute(
+                select(MemoryItem.id).where(read_eligibility_expression(context))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    predicate = read_eligibility_sql(context, parameter_prefix="unit_item")
+    sqlite_params = {
+        key: value.replace("-", "") if isinstance(value, str) else value
+        for key, value in predicate.params.items()
+    }
+    raw_rows = (
+        await session.execute(
+            text(f"SELECT id FROM memory_items WHERE {predicate.clause}"), sqlite_params
+        )
+    ).scalars().all()
+    return orm, {uuid.UUID(value) for value in raw_rows}
+
+
 async def test_manually_constructed_workspace_null_row_excluded_by_both_forms(session):
     tenant_id, owner_id, other_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     # The impossible-after-migration shape: visibility='workspace', no workspace.
@@ -207,3 +264,108 @@ async def test_orm_and_raw_sql_predicates_agree_across_visibility_categories(ses
         orm_ids = await _orm_eligible_ids(session, tenant_id=tenant_id, principal_id=principal_id)
         raw_ids = await _raw_eligible_ids(session, tenant_id=tenant_id, principal_id=principal_id)
         assert orm_ids == raw_ids == expected, principal_id
+
+
+async def test_profile_predicate_truth_table_and_raw_orm_parity(session):
+    tenant_id = uuid.uuid4()
+    owner_id, other_id = uuid.uuid4(), uuid.uuid4()
+    workspace_a, workspace_b = uuid.uuid4(), uuid.uuid4()
+    await session.execute(
+        text("INSERT INTO workspace_members (workspace_id, principal_id) VALUES (:wid, :pid)"),
+        {"wid": workspace_a.hex, "pid": owner_id.hex},
+    )
+    await session.commit()
+
+    private_null = await _insert_item(
+        session,
+        tenant_id=tenant_id,
+        principal_id=owner_id,
+        visibility="private",
+        workspace_id=None,
+    )
+    private_a = await _insert_item(
+        session,
+        tenant_id=tenant_id,
+        principal_id=owner_id,
+        visibility="private",
+        workspace_id=workspace_a,
+    )
+    await _insert_item(
+        session,
+        tenant_id=tenant_id,
+        principal_id=other_id,
+        visibility="private",
+        workspace_id=None,
+    )
+    tenant_null = await _insert_item(
+        session,
+        tenant_id=tenant_id,
+        principal_id=other_id,
+        visibility="tenant",
+        workspace_id=None,
+    )
+    tenant_a = await _insert_item(
+        session,
+        tenant_id=tenant_id,
+        principal_id=other_id,
+        visibility="tenant",
+        workspace_id=workspace_a,
+    )
+    await _insert_item(
+        session,
+        tenant_id=tenant_id,
+        principal_id=other_id,
+        visibility="tenant",
+        workspace_id=workspace_b,
+    )
+    public_null = await _insert_item(
+        session,
+        tenant_id=tenant_id,
+        principal_id=other_id,
+        visibility="public",
+        workspace_id=None,
+    )
+    workspace_item_a = await _insert_item(
+        session,
+        tenant_id=tenant_id,
+        principal_id=other_id,
+        visibility="workspace",
+        workspace_id=workspace_a,
+    )
+
+    cases = (
+        (_context(tenant_id, owner_id, private=True, tenant=False, public=False,
+                  workspaces=frozenset()), {private_null}),
+        (_context(tenant_id, owner_id, private=False, tenant=True, public=False,
+                  workspaces=frozenset()), {tenant_null}),
+        (_context(tenant_id, owner_id, private=False, tenant=False, public=True,
+                  workspaces=frozenset()), {public_null}),
+        (_context(tenant_id, owner_id, private=True, tenant=True, public=True,
+                  workspaces=frozenset({workspace_a})),
+         {private_null, private_a, tenant_null, tenant_a, public_null, workspace_item_a}),
+        (_context(tenant_id, owner_id, private=False, tenant=False, public=False,
+                  workspaces=frozenset({workspace_a})), {workspace_item_a}),
+        (_context(tenant_id, owner_id, private=False, tenant=False, public=False,
+                  workspaces=frozenset()), set()),
+    )
+    for context, expected in cases:
+        orm, raw = await _context_ids(session, context)
+        assert orm == raw == expected
+
+
+async def test_raw_predicates_support_independent_alias_prefixes() -> None:
+    tenant_id, principal_id, workspace_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    context = _context(
+        tenant_id,
+        principal_id,
+        private=True,
+        tenant=True,
+        public=True,
+        workspaces=frozenset({workspace_id}),
+    )
+    left = read_eligibility_sql(context, alias="left_item", parameter_prefix="left")
+    right = read_eligibility_sql(context, alias="right_item", parameter_prefix="right")
+    assert set(left.params).isdisjoint(right.params)
+    assert "left_item." in left.clause
+    assert "right_item." in right.clause
+    assert str(workspace_id) not in left.clause + right.clause

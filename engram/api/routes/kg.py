@@ -16,7 +16,12 @@ from engram.auth import READ_SCOPE, WRITE_SCOPE
 from engram.auth import Principal as AuthPrincipal
 from engram.authority import MemoryAuthority
 from engram.db import get_session
-from engram.memory_access import apply_read_eligibility, eligibility_expression
+from engram.memory_access import (
+    apply_principal_eligibility,
+    principal_eligibility_expression,
+    read_eligibility_expression,
+)
+from engram.memory_context import ResolvedMemoryContext, resolve_memory_context
 from engram.memory_scope import resolve_write_scope
 from engram.models import KgTriple, MemoryItem, Principal, Workspace
 from engram.trust_policy import resolve_trust_defaults
@@ -140,7 +145,7 @@ async def add_triple(
 
     if source_item_id is not None:
         result = await session.execute(
-            apply_read_eligibility(
+            apply_principal_eligibility(
                 select(MemoryItem).where(MemoryItem.id == source_item_id),
                 tenant_id=tenant_id,
                 principal_id=principal_id,
@@ -269,14 +274,11 @@ async def query_kg(
     predicate: str | None = None,
     session: AsyncSession = Depends(get_session),  # noqa: B008
     tenant_id: UUID = Depends(_resolve_tenant_id),  # noqa: B008
-    principal: tuple[UUID, str] = Depends(_resolve_principal),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> list[KgTripleOut]:
-    principal_id = principal[0]
-
     conditions = [
         KgTriple.tenant_id == tenant_id,
-        MemoryItem.tenant_id == tenant_id,
-        eligibility_expression(principal_id),
+        read_eligibility_expression(memory_context),
     ]
     if direction == "outbound":
         conditions.append(KgTriple.subject == entity)
@@ -337,7 +339,7 @@ async def invalidate_triple(
             KgTriple.id == req.triple_id,
             KgTriple.tenant_id == tenant_id,
             MemoryItem.tenant_id == tenant_id,
-            eligibility_expression(principal_id),
+            principal_eligibility_expression(principal_id),
         )
         .with_for_update(of=KgTriple)
     )
@@ -400,14 +402,11 @@ async def kg_timeline(
     limit: int = 100,
     session: AsyncSession = Depends(get_session),  # noqa: B008
     tenant_id: UUID = Depends(_resolve_tenant_id),  # noqa: B008
-    principal: tuple[UUID, str] = Depends(_resolve_principal),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> KgTimelineResponse:
-    principal_id = principal[0]
-
     conditions = [
         KgTriple.tenant_id == tenant_id,
-        MemoryItem.tenant_id == tenant_id,
-        eligibility_expression(principal_id),
+        read_eligibility_expression(memory_context),
     ]
 
     if entity is not None:

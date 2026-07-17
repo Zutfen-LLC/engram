@@ -699,6 +699,20 @@ class RecallLog(Base):
     """Audit record of recall operations."""
 
     __tablename__ = "recall_logs"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["memory_profile_revision_id", "memory_profile_id", "tenant_id"],
+            [
+                "memory_profile_revisions.id",
+                "memory_profile_revisions.profile_id",
+                "memory_profile_revisions.tenant_id",
+            ],
+            name="fk_recall_logs_memory_profile_revision",
+            ondelete="NO ACTION",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(
@@ -716,6 +730,18 @@ class RecallLog(Base):
     token_budget: Mapped[int | None] = mapped_column(nullable=True)
     scoring_version: Mapped[str] = mapped_column(String(20), default="v1")
     config_version: Mapped[str] = mapped_column(String(20), default="v1")
+    memory_profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    memory_profile_revision_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    memory_context_version: Mapped[str] = mapped_column(
+        Text,
+        default="memory-context-v1",
+        server_default=text("'memory-context-v1'"),
+        nullable=False,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )

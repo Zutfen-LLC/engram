@@ -627,8 +627,9 @@ failure.
 ## 10. Memory profiles (control plane)
 
 Memory profiles are reusable, tenant-scoped policy identities. They are created and revised by an
-`admin`-scoped credential; profile policy is intentionally not enforced by memory reads or writes
-until ENG-SCOPE-002B/002C. Profiles never grant workspace membership.
+`admin`-scoped credential. ENG-SCOPE-002B enforces the active revision as a narrowing boundary on
+every MemoryItem-backed read; profiles never grant workspace membership. Write policy remains
+declarative until ENG-SCOPE-002C.
 
 Create a profile with safe private-only defaults:
 
@@ -650,6 +651,24 @@ profile exists in the default tenant.
 Profile administration is deliberately absent from the MCP server. No memory request accepts a
 profile selector/header/query parameter.
 
+A profile-bound request resolves one immutable `ResolvedMemoryContext` on the primary request
+session. Private, tenant, and public items require their corresponding include flag. Every item
+with a non-NULL workspace association additionally requires a matching `can_read=true` grant;
+workspace-visible items also retain the existing principal-membership requirement. A grant never
+widens an item's audience. `admin` scope does not bypass these data-plane rules. Unknown,
+non-member, and profile-ungranted explicit workspaces return the same empty collection/recall or
+item 404 behavior and never fall back to an unscoped read. Existing unprofiled keys and
+auth-disabled development retain compatibility behavior.
+
+Recall audit rows record the exact profile and revision enforced by the request. Search telemetry
+records only the context/profile identifiers and profile version, never policy JSON, workspace
+grants, query text, or memory content. When a profile or explicit workspace makes a semantic set
+impossible, Engram skips the embedding provider and reports `not_attempted`.
+
+> A bound key is not yet a complete read/write sandbox. Remember, classify, KG/diary writes,
+> feedback, item/review mutations, workers, imports, and hooks retain pre-002B behavior until
+> ENG-SCOPE-002C.
+
 ### Migration 022 rollout and rollback
 
 Migration 022 is additive: it adds profile tables and a nullable `api_keys.memory_profile_id`, so
@@ -658,6 +677,24 @@ profile-aware application code. Roll back application code only after confirming
 new nullable column; do not remove the schema while bound keys exist. The safe rollback is to leave
 the additive schema in place and stop issuing bound keys, or restore a verified pre-migration backup
 if complete removal is required.
+
+### Migration 023 profile-read rollout and rollback
+
+Migration 023 is additive. It adds nullable profile/revision provenance and a non-null context
+version to `recall_logs`, labeling historical rows `legacy-unprofiled-v0`. Apply it before the
+002B application code.
+
+Mixed old/new service instances are not a valid enforcement deployment: an old instance would
+retain pre-002B reads. Roll out in this order:
+
+1. Apply migration 023.
+2. Drain or replace every old service instance.
+3. Verify every serving instance runs 002B code.
+4. Only then treat profile-bound keys as read-isolated.
+
+Rolling application code back from 002B widens reads for profile-bound keys and is not
+security-neutral. Before rollback, disable or revoke every bound key, or explicitly accept the
+loss of read enforcement. The additive migration may remain in place.
 
 ## 11. Troubleshooting
 

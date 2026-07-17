@@ -347,6 +347,13 @@ gets `403 Forbidden` with a body like `{"detail": "Requires scope: write"}`
 (or `"Requires one of scopes: write, review"`) — scope denial always happens
 before any handler-level mutation or eligibility disclosure.
 
+For a memory-profile-bound key, scopes authorize the operation but do not bypass the
+profile's active read revision. Even `admin` and `export` remain narrowed on
+MemoryItem-backed data. The server pins one `ResolvedMemoryContext` per request; there is no
+request field, header, SDK option, MCP argument, or Hermes setting that selects another profile.
+Unprofiled keys retain compatibility behavior. Profile-enforced writes are intentionally deferred
+to ENG-SCOPE-002C, so a bound key is not yet a complete read/write sandbox.
+
 `POST /v1/items/{item_id}/review` is a mixed-purpose endpoint: an agent with
 only `write` may dispute an item or withdraw its own still-`proposed`
 proposal, but activating, reactivating, rejecting, or archiving someone

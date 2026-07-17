@@ -22,7 +22,7 @@ semantic.search() and budget packing):
         -> ceiling truncation (recall_candidate_ceiling)
 
 Every expanded candidate is re-filtered through the exact same trust
-predicate semantic recall itself uses (tenant + eligibility_expression +
+predicate semantic recall itself uses (tenant + read_eligibility_expression +
 active/proposed review status + optional workspace scope) — expansion is
 never an eligibility bypass. No recursive traversal: graph/tunnel neighbors
 are found only for the original semantic seeds, never for neighbors of
@@ -41,7 +41,8 @@ from sqlalchemy import Select, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.config import settings
-from engram.memory_access import eligibility_expression
+from engram.memory_access import read_eligibility_expression
+from engram.memory_context import ResolvedMemoryContext
 from engram.models import MemoryEdge, MemoryItem, Tunnel
 
 # Recall-pipeline scoring version (distinct from engram.semantic.SEMANTIC_SCORING_VERSION,
@@ -106,16 +107,14 @@ class _MergedCandidate:
 def _eligible_items_stmt(
     ids: set[UUID],
     *,
-    tenant_id: str,
-    principal_id: str,
+    memory_context: ResolvedMemoryContext,
     workspace_id: str | None,
 ) -> Select[tuple[MemoryItem]]:
     stmt = select(MemoryItem).where(
         MemoryItem.id.in_(ids),
-        MemoryItem.tenant_id == tenant_id,
         MemoryItem.valid_to.is_(None),
         MemoryItem.review_status.in_(_EXPANSION_REVIEW_STATUSES),
-        eligibility_expression(principal_id),
+        read_eligibility_expression(memory_context),
     )
     if workspace_id is not None:
         stmt = stmt.where(MemoryItem.workspace_id == workspace_id)
@@ -125,8 +124,7 @@ def _eligible_items_stmt(
 async def _fetch_graph_neighbors(
     session: AsyncSession,
     *,
-    tenant_id: str,
-    principal_id: str,
+    memory_context: ResolvedMemoryContext,
     workspace_id: str | None,
     seed_ids: list[UUID],
 ) -> dict[UUID, list[_GraphLink]]:
@@ -141,13 +139,37 @@ async def _fetch_graph_neighbors(
 
     seed_id_set = set(seed_ids)
     stmt = select(MemoryEdge).where(
-        MemoryEdge.tenant_id == tenant_id,
+        MemoryEdge.tenant_id == memory_context.tenant_id,
         or_(
             MemoryEdge.source_item_id.in_(seed_id_set),
             MemoryEdge.target_item_id.in_(seed_id_set),
         ),
     )
     edges = list((await session.execute(stmt)).scalars().all())
+
+    # Resolve every potential neighbor through the complete item predicate
+    # before applying the per-seed cap. Otherwise high-weight ineligible
+    # neighbors could consume the bounded window and displace eligible ones.
+    potential_neighbor_ids: set[UUID] = set()
+    for edge in edges:
+        if edge.source_item_id in seed_id_set:
+            potential_neighbor_ids.add(edge.target_item_id)
+        if edge.target_item_id in seed_id_set:
+            potential_neighbor_ids.add(edge.source_item_id)
+    if not potential_neighbor_ids:
+        return {}
+    eligible_ids = {
+        row.id
+        for row in (
+            await session.execute(
+                _eligible_items_stmt(
+                    potential_neighbor_ids,
+                    memory_context=memory_context,
+                    workspace_id=workspace_id,
+                )
+            )
+        ).scalars()
+    }
 
     # Group candidate (edge, neighbor_id) pairs per seed, bounded per seed to
     # max_graph_neighbors_per_item (requirement 11: a highly-connected node
@@ -160,9 +182,9 @@ async def _fetch_graph_neighbors(
     per_seed: dict[UUID, list[tuple[float, str, UUID]]] = defaultdict(list)
     for edge in edges:
         weight = effective_edge_weight(edge.edge_type, edge.weight)
-        if edge.source_item_id in seed_id_set:
+        if edge.source_item_id in seed_id_set and edge.target_item_id in eligible_ids:
             per_seed[edge.source_item_id].append((weight, edge.edge_type, edge.target_item_id))
-        if edge.target_item_id in seed_id_set:
+        if edge.target_item_id in seed_id_set and edge.source_item_id in eligible_ids:
             per_seed[edge.target_item_id].append((weight, edge.edge_type, edge.source_item_id))
 
     candidate_links: dict[UUID, list[_GraphLink]] = defaultdict(list)
@@ -176,27 +198,14 @@ async def _fetch_graph_neighbors(
     if not candidate_links:
         return {}
 
-    eligible_ids = {
-        row.id
-        for row in (
-            await session.execute(
-                _eligible_items_stmt(
-                    set(candidate_links.keys()),
-                    tenant_id=tenant_id,
-                    principal_id=principal_id,
-                    workspace_id=workspace_id,
-                )
-            )
-        ).scalars()
-    }
-
     # Existing semantic seeds are enriched unconditionally (no budget cost —
     # they're already part of the result set). Only genuinely new neighbors
     # compete for the max_graph_expanded_items cap, strongest first
     # (requirement 8: bounded graph additions).
-    seed_neighbor_ids = eligible_ids & seed_id_set
+    linked_ids = set(candidate_links)
+    seed_neighbor_ids = linked_ids & seed_id_set
     new_neighbor_ids = sorted(
-        eligible_ids - seed_id_set,
+        linked_ids - seed_id_set,
         key=lambda nid: (
             -max(link.weight for link in candidate_links[nid]),
             str(nid),
@@ -209,8 +218,7 @@ async def _fetch_graph_neighbors(
 async def _fetch_tunnel_neighbors(
     session: AsyncSession,
     *,
-    tenant_id: str,
-    principal_id: str,
+    memory_context: ResolvedMemoryContext,
     workspace_id: str | None,
     seed_items: list[MemoryItem],
     exclude_ids: set[UUID],
@@ -230,7 +238,7 @@ async def _fetch_tunnel_neighbors(
     tunnel_stmt = (
         select(Tunnel)
         .where(
-            Tunnel.tenant_id == tenant_id,
+            Tunnel.tenant_id == memory_context.tenant_id,
             or_(Tunnel.source_wing.in_(wings), Tunnel.target_wing.in_(wings)),
         )
         .order_by(Tunnel.created_at.asc(), Tunnel.id.asc())
@@ -266,11 +274,10 @@ async def _fetch_tunnel_neighbors(
         if remaining <= 0:
             break
         filters: list[Any] = [
-            MemoryItem.tenant_id == tenant_id,
             MemoryItem.wing == target_wing,
             MemoryItem.valid_to.is_(None),
             MemoryItem.review_status.in_(_EXPANSION_REVIEW_STATUSES),
-            eligibility_expression(principal_id),
+            read_eligibility_expression(memory_context),
         ]
         if target_room is not None:
             filters.append(MemoryItem.room == target_room)
@@ -353,8 +360,7 @@ def _origin_label(origins: set[str]) -> str:
 async def expand_recall_candidates(
     session: AsyncSession,
     *,
-    tenant_id: str,
-    principal_id: str,
+    memory_context: ResolvedMemoryContext,
     workspace_id: str | None,
     semantic_items: list[dict[str, Any]],
     item_by_id: dict[UUID, MemoryItem],
@@ -396,8 +402,7 @@ async def expand_recall_candidates(
 
     graph_neighbors = await _fetch_graph_neighbors(
         session,
-        tenant_id=tenant_id,
-        principal_id=principal_id,
+        memory_context=memory_context,
         workspace_id=workspace_id,
         seed_ids=seed_ids,
     )
@@ -406,7 +411,10 @@ async def expand_recall_candidates(
             row.id: row
             for row in (
                 await session.execute(
-                    select(MemoryItem).where(MemoryItem.id.in_(graph_neighbors.keys()))
+                    select(MemoryItem).where(
+                        MemoryItem.id.in_(graph_neighbors.keys()),
+                        read_eligibility_expression(memory_context),
+                    )
                 )
             ).scalars()
         }
@@ -431,8 +439,7 @@ async def expand_recall_candidates(
     # being silently skipped.
     tunnel_neighbors = await _fetch_tunnel_neighbors(
         session,
-        tenant_id=tenant_id,
-        principal_id=principal_id,
+        memory_context=memory_context,
         workspace_id=workspace_id,
         seed_items=seed_items,
         exclude_ids=seed_id_set,
@@ -442,7 +449,10 @@ async def expand_recall_candidates(
             row.id: row
             for row in (
                 await session.execute(
-                    select(MemoryItem).where(MemoryItem.id.in_(tunnel_neighbors.keys()))
+                    select(MemoryItem).where(
+                        MemoryItem.id.in_(tunnel_neighbors.keys()),
+                        read_eligibility_expression(memory_context),
+                    )
                 )
             ).scalars()
         }

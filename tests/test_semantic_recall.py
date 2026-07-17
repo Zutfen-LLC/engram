@@ -333,7 +333,7 @@ async def test_recall_unknown_mode_returns_422(client):
 
 
 async def test_semantic_recall_no_embeddings_returns_empty_non_500(client):
-    """provider=none → generate_embedding returns None → empty 200 with a message."""
+    """provider=none leaves no eligible embeddings and returns an empty 200."""
     if not await _db_ok():
         pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
     settings.embedding_provider = "none"
@@ -354,7 +354,9 @@ async def test_semantic_recall_no_embeddings_returns_empty_non_500(client):
     # audit row still written
     assert body["recall_log_id"]
     metadata = await _latest_retrieval("semantic_recall")
-    assert metadata["embedding_outcome"] == "disabled"
+    # Eligibility is counted before a provider call. With provider=none the
+    # queued item has no ready vector, so no query embedding is attempted.
+    assert metadata["embedding_outcome"] == "not_attempted"
     assert metadata["embedding_call_occurred"] is False
 
 
