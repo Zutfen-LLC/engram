@@ -46,7 +46,8 @@ from .models import (
     SearchResponse,
     VisibilityKind,
     WhoAmIResponse,
-    WorkspaceGrant,
+    WorkspaceGrantInput,
+    WorkspaceGrantOut,
 )
 
 __version__ = "0.1.0"
@@ -78,7 +79,8 @@ __all__ = [
     "DiaryWriteResponse",
     "LifecycleSummaryRequest",
     "LifecycleSummaryResponse",
-    "WorkspaceGrant",
+    "WorkspaceGrantInput",
+    "WorkspaceGrantOut",
     "MemoryProfilePolicy",
     "MemoryProfileCreate",
     "MemoryProfileRevisionCreate",

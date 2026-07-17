@@ -26,10 +26,14 @@ ProfileVisibility = Literal["private", "workspace", "tenant", "public"]
 # ---- /v1/memory-profiles and profile-aware credential issuance ----
 
 
-class WorkspaceGrant(BaseModel):
+class WorkspaceGrantInput(BaseModel):
     workspace_id: UUID
     can_read: bool
     can_write: bool
+
+
+class WorkspaceGrantOut(WorkspaceGrantInput):
+    workspace_slug: str
 
 
 class MemoryProfilePolicy(BaseModel):
@@ -40,7 +44,7 @@ class MemoryProfilePolicy(BaseModel):
     allow_public_write: bool = False
     default_write_visibility: ProfileVisibility = "private"
     default_write_workspace_id: UUID | None = None
-    workspace_grants: list[WorkspaceGrant] = Field(default_factory=list)
+    workspace_grants: list[WorkspaceGrantInput] = Field(default_factory=list)
 
 
 class MemoryProfileCreate(BaseModel):
@@ -70,7 +74,7 @@ class MemoryProfileRevision(BaseModel):
     created_by_principal_id: UUID | None
     reason: str
     created_at: datetime
-    workspace_grants: list[WorkspaceGrant]
+    workspace_grants: list[WorkspaceGrantOut]
 
 
 class MemoryProfile(BaseModel):

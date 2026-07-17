@@ -644,6 +644,8 @@ async def _run_bootstrap_key(
     material = make_bootstrap_key(label, scope_list)
     dsn = normalize_asyncpg_url(database_url)
     conn = await asyncpg.connect(dsn)
+    transaction = conn.transaction()
+    await transaction.start()
     try:
         row = await conn.fetchrow(
             "SELECT CAST(t.id AS TEXT) AS tenant_id, "
@@ -652,7 +654,7 @@ async def _run_bootstrap_key(
             "FROM tenants t "
             "JOIN principals p "
             "  ON p.tenant_id = t.id AND p.name = $1 "
-            "WHERE t.slug = $2",
+            "WHERE t.slug = $2 FOR UPDATE OF p",
             _DEFAULT_PRINCIPAL_NAME,
             _DEFAULT_TENANT_SLUG,
         )
@@ -666,6 +668,7 @@ async def _run_bootstrap_key(
                 "first-boot initdb.d run on an empty volume).",
                 file=sys.stderr,
             )
+            await transaction.rollback()
             return 1
 
         # Fail-closed: the seed admin principal must be an ordinary principal
@@ -678,6 +681,7 @@ async def _run_bootstrap_key(
                 "principal and cannot receive API keys.",
                 file=sys.stderr,
             )
+            await transaction.rollback()
             return 1
 
         existing = await conn.fetchval(
@@ -696,6 +700,7 @@ async def _run_bootstrap_key(
                 "keys, use the admin API (POST /v1/admin/api-keys).",
                 file=sys.stderr,
             )
+            await transaction.rollback()
             return 1
 
         profile = None
@@ -705,11 +710,12 @@ async def _run_bootstrap_key(
                 "FROM memory_profiles p JOIN memory_profile_revisions r "
                 "ON r.id = p.active_revision_id AND r.profile_id = p.id AND r.tenant_id = p.tenant_id "
                 "WHERE p.tenant_id = $1::uuid AND p.disabled_at IS NULL "
-                "AND (p.slug = $2 OR p.id::text = $2)",
+                "AND (p.slug = $2 OR p.id::text = $2) FOR UPDATE OF p",
                 row["tenant_id"], memory_profile,
             )
             if profile is None:
                 print("ERROR: memory profile was not found, enabled, and valid for the default tenant.", file=sys.stderr)
+                await transaction.rollback()
                 return 2
 
         inserted_key_id = await conn.fetchval(
@@ -731,10 +737,19 @@ async def _run_bootstrap_key(
                 "INSERT INTO memory_profile_events "
                 "(tenant_id, profile_id, revision_id, actor_principal_id, event_type, reason, details) "
                 "VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, 'profile_bound_at_key_issuance', "
-                "'Bootstrap API key issuance', jsonb_build_object('api_key_id', $5, 'label', $6))",
+                "'Bootstrap API key issuance', "
+                "jsonb_build_object('api_key_id', $5::text, 'label', $6::text))",
                 row["tenant_id"], profile["id"], profile["revision_id"], row["principal_id"],
                 inserted_key_id, material.label,
             )
+        await transaction.commit()
+    except Exception:
+        await transaction.rollback()
+        print(
+            "ERROR: bootstrap API key issuance failed; no key was created.",
+            file=sys.stderr,
+        )
+        return 1
     finally:
         await conn.close()
 

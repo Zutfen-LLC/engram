@@ -395,7 +395,8 @@ async def create_api_key(
                 "(tenant_id, profile_id, revision_id, actor_principal_id, event_type, reason, details) "
                 "VALUES (:tenant_id, :profile_id, :revision_id, :actor_principal_id, "
                 "'profile_bound_at_key_issuance', 'API key issuance', "
-                "jsonb_build_object('api_key_id', :key_id, 'label', :label))"
+                "jsonb_build_object('api_key_id', CAST(:key_id AS text), "
+                "'label', CAST(:label AS text)))"
             ),
             {"tenant_id": str(body.tenant_id), "profile_id": str(active_profile.id),
              "revision_id": str(active_profile.revision_id), "key_id": str(api_key.id),

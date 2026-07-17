@@ -1,8 +1,14 @@
 -- ENG-SCOPE-002A: revisioned memory-profile registry and immutable key binding.
 -- This migration is deliberately additive. Existing API keys remain unbound.
 
--- Composite tenant-safe workspace references require this candidate key.
-CREATE UNIQUE INDEX IF NOT EXISTS uq_workspaces_tenant_id_id ON workspaces (tenant_id, id);
+-- Composite tenant-safe references reuse the candidate keys introduced by
+-- migration 020.  Keep these guards here as well so a pre-022 database that
+-- was provisioned from an older/custom baseline still has the exact keys the
+-- foreign keys below require.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_principals_tenant_identity
+    ON principals (tenant_id, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_tenant_identity
+    ON workspaces (tenant_id, id);
 
 CREATE TABLE IF NOT EXISTS memory_profiles (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -12,11 +18,15 @@ CREATE TABLE IF NOT EXISTS memory_profiles (
     description TEXT,
     active_revision_id UUID,
     disabled_at TIMESTAMPTZ,
-    created_by_principal_id UUID REFERENCES principals(id),
+    created_by_principal_id UUID,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT uq_memory_profiles_tenant_id_id UNIQUE (tenant_id, id),
     CONSTRAINT uq_memory_profiles_tenant_slug UNIQUE (tenant_id, slug),
+    CONSTRAINT fk_memory_profiles_tenant_creator
+        FOREIGN KEY (tenant_id, created_by_principal_id)
+        REFERENCES principals(tenant_id, id)
+        ON DELETE SET NULL (created_by_principal_id),
     CONSTRAINT chk_memory_profiles_slug
         CHECK (slug ~ '^[a-z0-9]+(?:-[a-z0-9]+)*$')
 );
@@ -33,7 +43,7 @@ CREATE TABLE IF NOT EXISTS memory_profile_revisions (
     allow_public_write BOOLEAN NOT NULL DEFAULT false,
     default_write_visibility TEXT NOT NULL DEFAULT 'private',
     default_write_workspace_id UUID,
-    created_by_principal_id UUID REFERENCES principals(id),
+    created_by_principal_id UUID,
     reason TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT uq_memory_profile_revisions_profile_version UNIQUE (profile_id, version),
@@ -44,6 +54,10 @@ CREATE TABLE IF NOT EXISTS memory_profile_revisions (
     CONSTRAINT fk_memory_profile_revision_default_workspace
         FOREIGN KEY (tenant_id, default_write_workspace_id)
         REFERENCES workspaces(tenant_id, id) ON DELETE RESTRICT,
+    CONSTRAINT fk_memory_profile_revisions_tenant_creator
+        FOREIGN KEY (tenant_id, created_by_principal_id)
+        REFERENCES principals(tenant_id, id)
+        ON DELETE SET NULL (created_by_principal_id),
     CONSTRAINT chk_memory_profile_revision_version CHECK (version > 0),
     CONSTRAINT chk_memory_profile_revision_visibility
         CHECK (default_write_visibility IN ('private', 'workspace', 'tenant', 'public')),
@@ -80,21 +94,98 @@ CREATE TABLE IF NOT EXISTS memory_profile_events (
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     profile_id UUID NOT NULL,
     revision_id UUID,
-    actor_principal_id UUID REFERENCES principals(id),
+    actor_principal_id UUID,
     event_type TEXT NOT NULL,
     reason TEXT NOT NULL,
     details JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT fk_memory_profile_event_profile FOREIGN KEY (tenant_id, profile_id)
         REFERENCES memory_profiles(tenant_id, id) ON DELETE CASCADE,
+    CONSTRAINT fk_memory_profile_event_revision
+        FOREIGN KEY (revision_id, profile_id, tenant_id)
+        REFERENCES memory_profile_revisions(id, profile_id, tenant_id) ON DELETE CASCADE,
+    CONSTRAINT fk_memory_profile_events_tenant_actor
+        FOREIGN KEY (tenant_id, actor_principal_id)
+        REFERENCES principals(tenant_id, id)
+        ON DELETE SET NULL (actor_principal_id),
     CONSTRAINT chk_memory_profile_event_type CHECK (event_type IN (
         'profile_created', 'revision_activated', 'profile_disabled',
         'profile_enabled', 'profile_bound_at_key_issuance'
     ))
 );
 
+-- Repair safety for a database on which an earlier development copy of this
+-- still-unmerged migration was applied.  Each guard is scoped to the owning
+-- relation; constraint names alone are not globally unique in PostgreSQL.
+ALTER TABLE memory_profiles
+    DROP CONSTRAINT IF EXISTS memory_profiles_created_by_principal_id_fkey;
+ALTER TABLE memory_profile_revisions
+    DROP CONSTRAINT IF EXISTS memory_profile_revisions_created_by_principal_id_fkey;
+ALTER TABLE memory_profile_events
+    DROP CONSTRAINT IF EXISTS memory_profile_events_actor_principal_id_fkey;
+
 DO $$ BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_memory_profiles_active_revision') THEN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_memory_profiles_tenant_creator'
+          AND conrelid = 'memory_profiles'::regclass
+    ) THEN
+        ALTER TABLE memory_profiles
+            ADD CONSTRAINT fk_memory_profiles_tenant_creator
+            FOREIGN KEY (tenant_id, created_by_principal_id)
+            REFERENCES principals(tenant_id, id)
+            ON DELETE SET NULL (created_by_principal_id);
+    END IF;
+END $$;
+
+DO $$ BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_memory_profile_revisions_tenant_creator'
+          AND conrelid = 'memory_profile_revisions'::regclass
+    ) THEN
+        ALTER TABLE memory_profile_revisions
+            ADD CONSTRAINT fk_memory_profile_revisions_tenant_creator
+            FOREIGN KEY (tenant_id, created_by_principal_id)
+            REFERENCES principals(tenant_id, id)
+            ON DELETE SET NULL (created_by_principal_id);
+    END IF;
+END $$;
+
+DO $$ BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_memory_profile_events_tenant_actor'
+          AND conrelid = 'memory_profile_events'::regclass
+    ) THEN
+        ALTER TABLE memory_profile_events
+            ADD CONSTRAINT fk_memory_profile_events_tenant_actor
+            FOREIGN KEY (tenant_id, actor_principal_id)
+            REFERENCES principals(tenant_id, id)
+            ON DELETE SET NULL (actor_principal_id);
+    END IF;
+END $$;
+
+DO $$ BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_memory_profile_event_revision'
+          AND conrelid = 'memory_profile_events'::regclass
+    ) THEN
+        ALTER TABLE memory_profile_events
+            ADD CONSTRAINT fk_memory_profile_event_revision
+            FOREIGN KEY (revision_id, profile_id, tenant_id)
+            REFERENCES memory_profile_revisions(id, profile_id, tenant_id)
+            ON DELETE CASCADE;
+    END IF;
+END $$;
+
+DO $$ BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_memory_profiles_active_revision'
+          AND conrelid = 'memory_profiles'::regclass
+    ) THEN
         ALTER TABLE memory_profiles ADD CONSTRAINT fk_memory_profiles_active_revision
             FOREIGN KEY (active_revision_id, id, tenant_id)
             REFERENCES memory_profile_revisions(id, profile_id, tenant_id)
@@ -104,7 +195,11 @@ END $$;
 
 ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS memory_profile_id UUID;
 DO $$ BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_api_keys_memory_profile') THEN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_api_keys_memory_profile'
+          AND conrelid = 'api_keys'::regclass
+    ) THEN
         ALTER TABLE api_keys ADD CONSTRAINT fk_api_keys_memory_profile
             FOREIGN KEY (tenant_id, memory_profile_id)
             REFERENCES memory_profiles(tenant_id, id) ON DELETE RESTRICT;
