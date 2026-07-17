@@ -3,12 +3,12 @@ name = "engram"
 version = "0.1.0"
 description = "Shared structured memory for multi-agent AI teams"
 readme = "README.md"
-license = { file = "LICENSE" }
+license = { file = "LICENSE.md" }
 requires-python = ">=3.11"
 keywords = ["ai", "agents", "memory", "multi-agent", "rag", "knowledge-graph"]
 classifiers = [
     "Development Status :: 3 - Alpha",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
