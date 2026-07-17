@@ -21,6 +21,8 @@ services:
       retries: 20
 
   engram-test:
+    image: ${ENGRAM_CI_IMAGE:-engram-ci:local}
+    pull_policy: never
     build:
       context: .
       target: ci
