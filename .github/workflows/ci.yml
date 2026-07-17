@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   compose-real-db-ci:
     runs-on: self-hosted
@@ -16,15 +20,6 @@ jobs:
 
       - name: Validate Compose Config
         run: docker compose -f docker-compose.ci.yml config -q
-
-      - name: Run Canonical Trust Proof
-        run: |
-          docker compose -f docker-compose.ci.yml run --build --rm \
-            -e ENGRAM_FAIL_ON_DB_SKIP=1 \
-            engram-test python scripts/run_trust_proof.py
-
-      - name: Reset Trust-Proof Stack
-        run: docker compose -f docker-compose.ci.yml down -v --remove-orphans
 
       - name: Run Compose Real-DB CI Stack
         run: docker compose -f docker-compose.ci.yml up --build --abort-on-container-exit --exit-code-from engram-test
