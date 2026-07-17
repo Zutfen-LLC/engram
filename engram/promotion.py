@@ -18,7 +18,7 @@ from engram.internal_actors import (
     InternalActorInvariantError,
     resolve_internal_system_actor,
 )
-from engram.memory_access import profile_read_scope_expression, profile_write_scope_expression
+from engram.memory_access import write_eligibility_expression
 from engram.memory_context import (
     INTERNAL_MEMORY_CONTEXT_VERSION,
     ResolvedMemoryContext,
@@ -561,10 +561,7 @@ async def auto_promote_proposed_memories(
         MemoryItem.valid_to.is_(None),
     )
     if memory_context is not None and memory_context.is_profile_bound:
-        base_stmt = base_stmt.where(
-            profile_read_scope_expression(memory_context),
-            profile_write_scope_expression(memory_context),
-        )
+        base_stmt = base_stmt.where(write_eligibility_expression(memory_context))
     event_provenance = (
         context_provenance(memory_context)
         if memory_context is not None

@@ -25,9 +25,11 @@ from engram.auth import Principal as AuthPrincipal
 from engram.authority import authority_allows_supersession, authority_label, derive_memory_authority
 from engram.candidate_ingests import (
     CandidateIdentity,
+    ExecutionContextMismatchError,
     create_ingest,
     get_ingest,
     identity_mismatches,
+    pin_execution_context,
 )
 from engram.canonicalize import canonicalize, content_hash
 from engram.classification import ClassificationResult, classify_rules_only
@@ -685,6 +687,13 @@ async def _remember_impl(
         )
         raise HTTPException(status_code=409, detail="candidate ingest does not match request")
     outcome_ctx["ingest_id"] = ingest.id
+    try:
+        await pin_execution_context(session, ingest=ingest, memory_context=memory_context)
+    except ExecutionContextMismatchError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="candidate ingest was already consumed under a different memory context",
+        ) from exc
 
     await record_candidate_once(
         tenant_id=tenant_id,
@@ -2054,11 +2063,10 @@ async def update_item_metadata(
         )
         events.append(event)
 
-    updated = await _require_eligible_item(
-        session, item_id, memory_context=memory_context
-    )
+        item[field] = new_val
+
     await session.commit()
-    return {"item": updated, "event": events[0] if events else None, "events": events}
+    return {"item": item, "event": events[0] if events else None, "events": events}
 
 
 @router.post("/items/{item_id}/supersede", response_model=None, dependencies=[Depends(WRITE_SCOPE)])

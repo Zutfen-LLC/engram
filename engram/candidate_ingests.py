@@ -6,10 +6,11 @@ from dataclasses import dataclass
 from uuid import UUID
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.memory_context import ResolvedMemoryContext, context_provenance
-from engram.models import CandidateIngest
+from engram.models import CandidateIngest, CandidateIngestExecution
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,10 @@ class CandidateIdentity:
     workspace_id: UUID | None
     source_type: str
     content_hash: str
+
+
+class ExecutionContextMismatchError(ValueError):
+    """The ingest was already consumed under a different request authority."""
 
 
 def create_ingest(
@@ -70,3 +75,49 @@ def identity_mismatches(
     if ingest.content_hash != identity.content_hash:
         mismatches.append("content_hash_mismatch")
     return tuple(mismatches)
+
+
+async def pin_execution_context(
+    session: AsyncSession,
+    *,
+    ingest: CandidateIngest,
+    memory_context: ResolvedMemoryContext,
+) -> None:
+    """Pin the first remember-time authority without altering ingest provenance."""
+    provenance = context_provenance(memory_context)
+    provenance.pop("tenant_id", None)
+    inserted_id = await session.scalar(
+        insert(CandidateIngestExecution)
+        .values(
+            ingest_id=ingest.id,
+            tenant_id=ingest.tenant_id,
+            principal_id=ingest.principal_id,
+            **provenance,
+        )
+        .on_conflict_do_nothing(index_elements=[CandidateIngestExecution.ingest_id])
+        .returning(CandidateIngestExecution.ingest_id)
+    )
+    if inserted_id is not None:
+        return
+    pinned = await session.scalar(
+        select(CandidateIngestExecution).where(
+            CandidateIngestExecution.ingest_id == ingest.id,
+            CandidateIngestExecution.tenant_id == ingest.tenant_id,
+        )
+    )
+    if pinned is None:
+        raise RuntimeError("candidate execution context conflict without a pinned row")
+    expected = (
+        memory_context.api_key_id,
+        memory_context.memory_profile_id,
+        memory_context.memory_profile_revision_id,
+        memory_context.version,
+    )
+    actual = (
+        pinned.api_key_id,
+        pinned.memory_profile_id,
+        pinned.memory_profile_revision_id,
+        pinned.memory_context_version,
+    )
+    if actual != expected:
+        raise ExecutionContextMismatchError

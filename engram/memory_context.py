@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Literal, cast
 from uuid import UUID
 
 from fastapi import Depends, HTTPException, status
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.auth import Principal, get_current_principal
@@ -19,7 +19,7 @@ from engram.config import settings
 from engram.db import get_session
 
 if TYPE_CHECKING:
-    from engram.models import CandidateIngest
+    from engram.models import CandidateIngest, CandidateIngestExecution
 
 MEMORY_CONTEXT_VERSION = "memory-context-v2"
 LEGACY_MEMORY_CONTEXT_VERSION = "legacy-unprofiled-v0"
@@ -316,17 +316,26 @@ async def resolve_memory_context(
 async def memory_context_from_ingest(
     session: AsyncSession, ingest: CandidateIngest
 ) -> ResolvedMemoryContext | None:
-    """Recover the exact accepted v2 context; legacy work returns ``None``."""
-    if ingest.memory_context_version == LEGACY_MEMORY_CONTEXT_VERSION:
+    """Recover remember-time authority, falling back to origin for legacy work."""
+    from engram.models import CandidateIngestExecution
+
+    execution = await session.scalar(
+        select(CandidateIngestExecution).where(
+            CandidateIngestExecution.ingest_id == ingest.id,
+            CandidateIngestExecution.tenant_id == ingest.tenant_id,
+        )
+    )
+    context_source: CandidateIngest | CandidateIngestExecution = execution or ingest
+    if context_source.memory_context_version == LEGACY_MEMORY_CONTEXT_VERSION:
         return None
-    if ingest.memory_context_version != MEMORY_CONTEXT_VERSION:
+    if context_source.memory_context_version != MEMORY_CONTEXT_VERSION:
         raise ValueError("unsupported candidate memory context")
     # API-key deletion truthfully nulls the historical key reference.  Without
     # durable evidence of an admin scope, worker reconstruction must not infer
     # the membership bypass from that NULL and accidentally widen cross-item
     # effects.
     admin_workspace_bypass = False
-    if ingest.api_key_id is not None:
+    if context_source.api_key_id is not None:
         scopes = await session.scalar(
             text(
                 "SELECT scopes FROM api_keys WHERE tenant_id = :tenant_id "
@@ -334,18 +343,18 @@ async def memory_context_from_ingest(
             ),
             {
                 "tenant_id": str(ingest.tenant_id),
-                "api_key_id": str(ingest.api_key_id),
+                "api_key_id": str(context_source.api_key_id),
             },
         )
         admin_workspace_bypass = scopes is not None and "admin" in scopes
-    if ingest.memory_profile_id is None:
-        if ingest.memory_profile_revision_id is not None:
+    if context_source.memory_profile_id is None:
+        if context_source.memory_profile_revision_id is not None:
             raise ValueError("candidate memory profile provenance is incoherent")
         return ResolvedMemoryContext(
             version=MEMORY_CONTEXT_VERSION,
             tenant_id=ingest.tenant_id,
             principal_id=ingest.principal_id,
-            api_key_id=ingest.api_key_id,
+            api_key_id=context_source.api_key_id,
             memory_profile_id=None,
             memory_profile_revision_id=None,
             memory_profile_slug=None,
@@ -361,7 +370,7 @@ async def memory_context_from_ingest(
             writable_workspace_ids=None,
             admin_workspace_bypass=admin_workspace_bypass,
         )
-    if ingest.memory_profile_revision_id is None:
+    if context_source.memory_profile_revision_id is None:
         raise ValueError("candidate memory profile provenance is incoherent")
     row = (
         await session.execute(
@@ -385,8 +394,8 @@ async def memory_context_from_ingest(
             ),
             {
                 "tenant_id": str(ingest.tenant_id),
-                "profile_id": str(ingest.memory_profile_id),
-                "revision_id": str(ingest.memory_profile_revision_id),
+                "profile_id": str(context_source.memory_profile_id),
+                "revision_id": str(context_source.memory_profile_revision_id),
             },
         )
     ).mappings().first()
@@ -404,9 +413,9 @@ async def memory_context_from_ingest(
         version=MEMORY_CONTEXT_VERSION,
         tenant_id=ingest.tenant_id,
         principal_id=ingest.principal_id,
-        api_key_id=ingest.api_key_id,
-        memory_profile_id=ingest.memory_profile_id,
-        memory_profile_revision_id=ingest.memory_profile_revision_id,
+        api_key_id=context_source.api_key_id,
+        memory_profile_id=context_source.memory_profile_id,
+        memory_profile_revision_id=context_source.memory_profile_revision_id,
         memory_profile_slug=str(row["slug"]),
         memory_profile_version=int(row["version"]),
         include_private=bool(row["include_private"]),
