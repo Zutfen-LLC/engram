@@ -1,0 +1,154 @@
+{
+  "name": "009-whitespace-case-content",
+  "description": "Whitespace/case content: trailing-space + mixed-case content. The served_content_hash reflects exact bytes (no case/whitespace normalization).",
+  "schema": "engram.context-manifest-vector",
+  "schema_version": "1.0",
+  "input": {
+    "response": {
+      "working_set": "[fact] Alpha  ",
+      "item_count": 1,
+      "pinned_omitted_count": 0,
+      "omitted_count": 0,
+      "message": null,
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-0000000000a1",
+          "kind": "fact",
+          "content": "Alpha  ",
+          "review_status": "active",
+          "score": 0.8123,
+          "reasons": [
+            "importance=0.90"
+          ],
+          "warnings": [],
+          "pinned": false,
+          "importance": 0.9,
+          "source_trust": 0.8,
+          "memory_confidence": 0.75,
+          "human_verified": true,
+          "authority": 10,
+          "visibility": "private",
+          "workspace_id": null,
+          "conflict_type": null,
+          "conflict_resolution_status": null
+        }
+      ]
+    },
+    "subject_context": {
+      "tenant_id": "00000000-0000-0000-0000-000000000001",
+      "principal_id": "00000000-0000-0000-0000-000000000002",
+      "workspace_id": null,
+      "memory_context_version": "memory-context-v2",
+      "memory_profile_id": null,
+      "memory_profile_revision_id": null,
+      "memory_profile_version": null
+    },
+    "request_context": {
+      "requested": {
+        "workspace_supplied": false,
+        "byte_budget": null,
+        "token_budget": null,
+        "item_budget": null
+      },
+      "effective": {
+        "workspace_id": null,
+        "byte_budget": 4096,
+        "token_budget": null,
+        "item_budget": null
+      },
+      "query_digest": null
+    },
+    "decision_versions": {
+      "scoring_version": "v1",
+      "config_version": "v1",
+      "candidate_strategy_version": "startup-candidates-v1",
+      "manifest_contract_version": "context-manifest-v1",
+      "packet_render_version": "working-set-v1"
+    },
+    "reorder_inputs": false
+  },
+  "expected": {
+    "manifest": {
+      "schema": "engram.context-manifest",
+      "schema_version": "1.0",
+      "canonicalization": "rfc8785",
+      "mode": "startup",
+      "subject": {
+        "tenant_id": "00000000-0000-0000-0000-000000000001",
+        "principal_id": "00000000-0000-0000-0000-000000000002",
+        "workspace_id": null,
+        "memory_context_version": "memory-context-v2",
+        "memory_profile_id": null,
+        "memory_profile_revision_id": null,
+        "memory_profile_version": null
+      },
+      "request": {
+        "requested": {
+          "workspace_supplied": false,
+          "byte_budget": null,
+          "token_budget": null,
+          "item_budget": null
+        },
+        "effective": {
+          "workspace_id": null,
+          "byte_budget": 4096,
+          "token_budget": null,
+          "item_budget": null
+        },
+        "query_digest": null,
+        "request_digest": "sha256:2fdadda4e5f8b9dd350a5ea717b901e68425974baf1641214f16aafef5bd7204"
+      },
+      "versions": {
+        "scoring_version": "v1",
+        "config_version": "v1",
+        "candidate_strategy_version": "startup-candidates-v1",
+        "manifest_contract_version": "context-manifest-v1",
+        "packet_render_version": "working-set-v1"
+      },
+      "result": {
+        "item_count": 1,
+        "served_content_byte_count": 7,
+        "rendered_packet_byte_count": 14,
+        "pinned_omitted_count": 0,
+        "omitted_count": 0,
+        "message": null
+      },
+      "packet": {
+        "media_type": "text/plain; charset=utf-8",
+        "render_version": "working-set-v1",
+        "hash": "sha256:e00b0203b8c661f2820054ce7d930b6ef35394feac2e1f34231e4cbba0b64bb6"
+      },
+      "items": [
+        {
+          "ordinal": 0,
+          "item_id": "00000000-0000-0000-0000-0000000000a1",
+          "kind": "fact",
+          "served_content_hash": "sha256:d0593c7b158b8977419f8060f4fef18a21cd0818824e215f598070d8f50ce6ea",
+          "review_status": "active",
+          "authority": 10,
+          "visibility": "private",
+          "workspace_id": null,
+          "score": 0.8123,
+          "reasons": [
+            "importance=0.90"
+          ],
+          "warnings": [],
+          "pinned": false,
+          "importance": 0.9,
+          "source_trust": 0.8,
+          "memory_confidence": 0.75,
+          "human_verified": true,
+          "conflict_type": null,
+          "conflict_resolution_status": null
+        }
+      ]
+    },
+    "canonical_json": "{\"canonicalization\":\"rfc8785\",\"items\":[{\"authority\":10,\"conflict_resolution_status\":null,\"conflict_type\":null,\"human_verified\":true,\"importance\":0.9,\"item_id\":\"00000000-0000-0000-0000-0000000000a1\",\"kind\":\"fact\",\"memory_confidence\":0.75,\"ordinal\":0,\"pinned\":false,\"reasons\":[\"importance=0.90\"],\"review_status\":\"active\",\"score\":0.8123,\"served_content_hash\":\"sha256:d0593c7b158b8977419f8060f4fef18a21cd0818824e215f598070d8f50ce6ea\",\"source_trust\":0.8,\"visibility\":\"private\",\"warnings\":[],\"workspace_id\":null}],\"mode\":\"startup\",\"packet\":{\"hash\":\"sha256:e00b0203b8c661f2820054ce7d930b6ef35394feac2e1f34231e4cbba0b64bb6\",\"media_type\":\"text/plain; charset=utf-8\",\"render_version\":\"working-set-v1\"},\"request\":{\"effective\":{\"byte_budget\":4096,\"item_budget\":null,\"token_budget\":null,\"workspace_id\":null},\"query_digest\":null,\"request_digest\":\"sha256:2fdadda4e5f8b9dd350a5ea717b901e68425974baf1641214f16aafef5bd7204\",\"requested\":{\"byte_budget\":null,\"item_budget\":null,\"token_budget\":null,\"workspace_supplied\":false}},\"result\":{\"item_count\":1,\"message\":null,\"omitted_count\":0,\"pinned_omitted_count\":0,\"rendered_packet_byte_count\":14,\"served_content_byte_count\":7},\"schema\":\"engram.context-manifest\",\"schema_version\":\"1.0\",\"subject\":{\"memory_context_version\":\"memory-context-v2\",\"memory_profile_id\":null,\"memory_profile_revision_id\":null,\"memory_profile_version\":null,\"principal_id\":\"00000000-0000-0000-0000-000000000002\",\"tenant_id\":\"00000000-0000-0000-0000-000000000001\",\"workspace_id\":null},\"versions\":{\"candidate_strategy_version\":\"startup-candidates-v1\",\"config_version\":\"v1\",\"manifest_contract_version\":\"context-manifest-v1\",\"packet_render_version\":\"working-set-v1\",\"scoring_version\":\"v1\"}}",
+    "manifest_hash": "sha256:50f1075140d96c41bd19e59fb56fcc65ecbdb08f690cd775db285cad4a3c6033",
+    "packet_hash": "sha256:e00b0203b8c661f2820054ce7d930b6ef35394feac2e1f34231e4cbba0b64bb6",
+    "request_digest": "sha256:2fdadda4e5f8b9dd350a5ea717b901e68425974baf1641214f16aafef5bd7204",
+    "served_content_hashes": [
+      "sha256:d0593c7b158b8977419f8060f4fef18a21cd0818824e215f598070d8f50ce6ea"
+    ]
+  }
+}

@@ -1,0 +1,198 @@
+{
+  "name": "004-unicode-and-escaping",
+  "description": "Unicode content and JSON escaping: emoji, non-ASCII, quotes, backslash, newline. Proves exact Unicode scalar preservation.",
+  "schema": "engram.context-manifest-vector",
+  "schema_version": "1.0",
+  "input": {
+    "response": {
+      "working_set": "[fact] héllo \"wörld\" \\ \n 🚀 𝔸\n[preference] 日本語のテキスト",
+      "item_count": 2,
+      "pinned_omitted_count": 0,
+      "omitted_count": 0,
+      "message": null,
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-0000000000a1",
+          "kind": "fact",
+          "content": "héllo \"wörld\" \\ \n 🚀 𝔸",
+          "review_status": "active",
+          "score": 0.8123,
+          "reasons": [
+            "unicode=\"héllo\""
+          ],
+          "warnings": [],
+          "pinned": false,
+          "importance": 0.9,
+          "source_trust": 0.8,
+          "memory_confidence": 0.75,
+          "human_verified": true,
+          "authority": 10,
+          "visibility": "private",
+          "workspace_id": null,
+          "conflict_type": null,
+          "conflict_resolution_status": null
+        },
+        {
+          "id": "00000000-0000-0000-0000-0000000000a2",
+          "kind": "preference",
+          "content": "日本語のテキスト",
+          "review_status": "active",
+          "score": 0.8123,
+          "reasons": [
+            "importance=0.90"
+          ],
+          "warnings": [],
+          "pinned": false,
+          "importance": 0.9,
+          "source_trust": 0.8,
+          "memory_confidence": 0.75,
+          "human_verified": true,
+          "authority": 10,
+          "visibility": "private",
+          "workspace_id": null,
+          "conflict_type": null,
+          "conflict_resolution_status": null
+        }
+      ]
+    },
+    "subject_context": {
+      "tenant_id": "00000000-0000-0000-0000-000000000001",
+      "principal_id": "00000000-0000-0000-0000-000000000002",
+      "workspace_id": null,
+      "memory_context_version": "memory-context-v2",
+      "memory_profile_id": null,
+      "memory_profile_revision_id": null,
+      "memory_profile_version": null
+    },
+    "request_context": {
+      "requested": {
+        "workspace_supplied": false,
+        "byte_budget": null,
+        "token_budget": null,
+        "item_budget": null
+      },
+      "effective": {
+        "workspace_id": null,
+        "byte_budget": 4096,
+        "token_budget": null,
+        "item_budget": null
+      },
+      "query_digest": null
+    },
+    "decision_versions": {
+      "scoring_version": "v1",
+      "config_version": "v1",
+      "candidate_strategy_version": "startup-candidates-v1",
+      "manifest_contract_version": "context-manifest-v1",
+      "packet_render_version": "working-set-v1"
+    },
+    "reorder_inputs": false
+  },
+  "expected": {
+    "manifest": {
+      "schema": "engram.context-manifest",
+      "schema_version": "1.0",
+      "canonicalization": "rfc8785",
+      "mode": "startup",
+      "subject": {
+        "tenant_id": "00000000-0000-0000-0000-000000000001",
+        "principal_id": "00000000-0000-0000-0000-000000000002",
+        "workspace_id": null,
+        "memory_context_version": "memory-context-v2",
+        "memory_profile_id": null,
+        "memory_profile_revision_id": null,
+        "memory_profile_version": null
+      },
+      "request": {
+        "requested": {
+          "workspace_supplied": false,
+          "byte_budget": null,
+          "token_budget": null,
+          "item_budget": null
+        },
+        "effective": {
+          "workspace_id": null,
+          "byte_budget": 4096,
+          "token_budget": null,
+          "item_budget": null
+        },
+        "query_digest": null,
+        "request_digest": "sha256:2fdadda4e5f8b9dd350a5ea717b901e68425974baf1641214f16aafef5bd7204"
+      },
+      "versions": {
+        "scoring_version": "v1",
+        "config_version": "v1",
+        "candidate_strategy_version": "startup-candidates-v1",
+        "manifest_contract_version": "context-manifest-v1",
+        "packet_render_version": "working-set-v1"
+      },
+      "result": {
+        "item_count": 2,
+        "served_content_byte_count": 53,
+        "rendered_packet_byte_count": 74,
+        "pinned_omitted_count": 0,
+        "omitted_count": 0,
+        "message": null
+      },
+      "packet": {
+        "media_type": "text/plain; charset=utf-8",
+        "render_version": "working-set-v1",
+        "hash": "sha256:43be6c94e282a27fa0e07d9d60608b4bac41c53950f821c26977f37103dbc14e"
+      },
+      "items": [
+        {
+          "ordinal": 0,
+          "item_id": "00000000-0000-0000-0000-0000000000a1",
+          "kind": "fact",
+          "served_content_hash": "sha256:0442913ba162cd18939e904b65e8926fc30d0d2e9992b0659008fbe3ed935c91",
+          "review_status": "active",
+          "authority": 10,
+          "visibility": "private",
+          "workspace_id": null,
+          "score": 0.8123,
+          "reasons": [
+            "unicode=\"héllo\""
+          ],
+          "warnings": [],
+          "pinned": false,
+          "importance": 0.9,
+          "source_trust": 0.8,
+          "memory_confidence": 0.75,
+          "human_verified": true,
+          "conflict_type": null,
+          "conflict_resolution_status": null
+        },
+        {
+          "ordinal": 1,
+          "item_id": "00000000-0000-0000-0000-0000000000a2",
+          "kind": "preference",
+          "served_content_hash": "sha256:d4192d3b01dfa9f5b08388f13e5c7492e3cfdc5611bf8c77784dc97523f03efb",
+          "review_status": "active",
+          "authority": 10,
+          "visibility": "private",
+          "workspace_id": null,
+          "score": 0.8123,
+          "reasons": [
+            "importance=0.90"
+          ],
+          "warnings": [],
+          "pinned": false,
+          "importance": 0.9,
+          "source_trust": 0.8,
+          "memory_confidence": 0.75,
+          "human_verified": true,
+          "conflict_type": null,
+          "conflict_resolution_status": null
+        }
+      ]
+    },
+    "canonical_json": "{\"canonicalization\":\"rfc8785\",\"items\":[{\"authority\":10,\"conflict_resolution_status\":null,\"conflict_type\":null,\"human_verified\":true,\"importance\":0.9,\"item_id\":\"00000000-0000-0000-0000-0000000000a1\",\"kind\":\"fact\",\"memory_confidence\":0.75,\"ordinal\":0,\"pinned\":false,\"reasons\":[\"unicode=\\\"héllo\\\"\"],\"review_status\":\"active\",\"score\":0.8123,\"served_content_hash\":\"sha256:0442913ba162cd18939e904b65e8926fc30d0d2e9992b0659008fbe3ed935c91\",\"source_trust\":0.8,\"visibility\":\"private\",\"warnings\":[],\"workspace_id\":null},{\"authority\":10,\"conflict_resolution_status\":null,\"conflict_type\":null,\"human_verified\":true,\"importance\":0.9,\"item_id\":\"00000000-0000-0000-0000-0000000000a2\",\"kind\":\"preference\",\"memory_confidence\":0.75,\"ordinal\":1,\"pinned\":false,\"reasons\":[\"importance=0.90\"],\"review_status\":\"active\",\"score\":0.8123,\"served_content_hash\":\"sha256:d4192d3b01dfa9f5b08388f13e5c7492e3cfdc5611bf8c77784dc97523f03efb\",\"source_trust\":0.8,\"visibility\":\"private\",\"warnings\":[],\"workspace_id\":null}],\"mode\":\"startup\",\"packet\":{\"hash\":\"sha256:43be6c94e282a27fa0e07d9d60608b4bac41c53950f821c26977f37103dbc14e\",\"media_type\":\"text/plain; charset=utf-8\",\"render_version\":\"working-set-v1\"},\"request\":{\"effective\":{\"byte_budget\":4096,\"item_budget\":null,\"token_budget\":null,\"workspace_id\":null},\"query_digest\":null,\"request_digest\":\"sha256:2fdadda4e5f8b9dd350a5ea717b901e68425974baf1641214f16aafef5bd7204\",\"requested\":{\"byte_budget\":null,\"item_budget\":null,\"token_budget\":null,\"workspace_supplied\":false}},\"result\":{\"item_count\":2,\"message\":null,\"omitted_count\":0,\"pinned_omitted_count\":0,\"rendered_packet_byte_count\":74,\"served_content_byte_count\":53},\"schema\":\"engram.context-manifest\",\"schema_version\":\"1.0\",\"subject\":{\"memory_context_version\":\"memory-context-v2\",\"memory_profile_id\":null,\"memory_profile_revision_id\":null,\"memory_profile_version\":null,\"principal_id\":\"00000000-0000-0000-0000-000000000002\",\"tenant_id\":\"00000000-0000-0000-0000-000000000001\",\"workspace_id\":null},\"versions\":{\"candidate_strategy_version\":\"startup-candidates-v1\",\"config_version\":\"v1\",\"manifest_contract_version\":\"context-manifest-v1\",\"packet_render_version\":\"working-set-v1\",\"scoring_version\":\"v1\"}}",
+    "manifest_hash": "sha256:d11e6405ecbc6f5c6a5e1e03e4b7b07a0829f03fbc86cad6de0237f978db4aaa",
+    "packet_hash": "sha256:43be6c94e282a27fa0e07d9d60608b4bac41c53950f821c26977f37103dbc14e",
+    "request_digest": "sha256:2fdadda4e5f8b9dd350a5ea717b901e68425974baf1641214f16aafef5bd7204",
+    "served_content_hashes": [
+      "sha256:0442913ba162cd18939e904b65e8926fc30d0d2e9992b0659008fbe3ed935c91",
+      "sha256:d4192d3b01dfa9f5b08388f13e5c7492e3cfdc5611bf8c77784dc97523f03efb"
+    ]
+  }
+}

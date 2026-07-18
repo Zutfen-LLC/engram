@@ -1,0 +1,194 @@
+{
+  "name": "002-mixed-pinned-scored",
+  "description": "Mixed pinned (score=null) and scored items.",
+  "schema": "engram.context-manifest-vector",
+  "schema_version": "1.0",
+  "input": {
+    "response": {
+      "working_set": "[fact] alpha\n[preference] beta",
+      "item_count": 2,
+      "pinned_omitted_count": 0,
+      "omitted_count": 4,
+      "message": null,
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-0000000000a1",
+          "kind": "fact",
+          "content": "alpha",
+          "review_status": "active",
+          "score": null,
+          "reasons": [],
+          "warnings": [],
+          "pinned": true,
+          "importance": 0.9,
+          "source_trust": 0.8,
+          "memory_confidence": 0.75,
+          "human_verified": true,
+          "authority": 10,
+          "visibility": "private",
+          "workspace_id": null,
+          "conflict_type": null,
+          "conflict_resolution_status": null
+        },
+        {
+          "id": "00000000-0000-0000-0000-0000000000a2",
+          "kind": "preference",
+          "content": "beta",
+          "review_status": "active",
+          "score": 0.55,
+          "reasons": [
+            "importance=0.90"
+          ],
+          "warnings": [],
+          "pinned": false,
+          "importance": 0.9,
+          "source_trust": 0.8,
+          "memory_confidence": 0.75,
+          "human_verified": true,
+          "authority": 10,
+          "visibility": "private",
+          "workspace_id": null,
+          "conflict_type": null,
+          "conflict_resolution_status": null
+        }
+      ]
+    },
+    "subject_context": {
+      "tenant_id": "00000000-0000-0000-0000-000000000001",
+      "principal_id": "00000000-0000-0000-0000-000000000002",
+      "workspace_id": null,
+      "memory_context_version": "memory-context-v2",
+      "memory_profile_id": null,
+      "memory_profile_revision_id": null,
+      "memory_profile_version": null
+    },
+    "request_context": {
+      "requested": {
+        "workspace_supplied": false,
+        "byte_budget": null,
+        "token_budget": null,
+        "item_budget": null
+      },
+      "effective": {
+        "workspace_id": null,
+        "byte_budget": 4096,
+        "token_budget": null,
+        "item_budget": null
+      },
+      "query_digest": null
+    },
+    "decision_versions": {
+      "scoring_version": "v1",
+      "config_version": "v1",
+      "candidate_strategy_version": "startup-candidates-v1",
+      "manifest_contract_version": "context-manifest-v1",
+      "packet_render_version": "working-set-v1"
+    },
+    "reorder_inputs": false
+  },
+  "expected": {
+    "manifest": {
+      "schema": "engram.context-manifest",
+      "schema_version": "1.0",
+      "canonicalization": "rfc8785",
+      "mode": "startup",
+      "subject": {
+        "tenant_id": "00000000-0000-0000-0000-000000000001",
+        "principal_id": "00000000-0000-0000-0000-000000000002",
+        "workspace_id": null,
+        "memory_context_version": "memory-context-v2",
+        "memory_profile_id": null,
+        "memory_profile_revision_id": null,
+        "memory_profile_version": null
+      },
+      "request": {
+        "requested": {
+          "workspace_supplied": false,
+          "byte_budget": null,
+          "token_budget": null,
+          "item_budget": null
+        },
+        "effective": {
+          "workspace_id": null,
+          "byte_budget": 4096,
+          "token_budget": null,
+          "item_budget": null
+        },
+        "query_digest": null,
+        "request_digest": "sha256:2fdadda4e5f8b9dd350a5ea717b901e68425974baf1641214f16aafef5bd7204"
+      },
+      "versions": {
+        "scoring_version": "v1",
+        "config_version": "v1",
+        "candidate_strategy_version": "startup-candidates-v1",
+        "manifest_contract_version": "context-manifest-v1",
+        "packet_render_version": "working-set-v1"
+      },
+      "result": {
+        "item_count": 2,
+        "served_content_byte_count": 9,
+        "rendered_packet_byte_count": 30,
+        "pinned_omitted_count": 0,
+        "omitted_count": 4,
+        "message": null
+      },
+      "packet": {
+        "media_type": "text/plain; charset=utf-8",
+        "render_version": "working-set-v1",
+        "hash": "sha256:8b921c077d6fa6867673d6e29ce64f416b7a94eb25d387359b841fab64741aa1"
+      },
+      "items": [
+        {
+          "ordinal": 0,
+          "item_id": "00000000-0000-0000-0000-0000000000a1",
+          "kind": "fact",
+          "served_content_hash": "sha256:8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8",
+          "review_status": "active",
+          "authority": 10,
+          "visibility": "private",
+          "workspace_id": null,
+          "score": null,
+          "reasons": [],
+          "warnings": [],
+          "pinned": true,
+          "importance": 0.9,
+          "source_trust": 0.8,
+          "memory_confidence": 0.75,
+          "human_verified": true,
+          "conflict_type": null,
+          "conflict_resolution_status": null
+        },
+        {
+          "ordinal": 1,
+          "item_id": "00000000-0000-0000-0000-0000000000a2",
+          "kind": "preference",
+          "served_content_hash": "sha256:f44e64e75f3948e9f73f8dfa94721c4ce8cbb4f265c4790c702b2d41cfbf2753",
+          "review_status": "active",
+          "authority": 10,
+          "visibility": "private",
+          "workspace_id": null,
+          "score": 0.55,
+          "reasons": [
+            "importance=0.90"
+          ],
+          "warnings": [],
+          "pinned": false,
+          "importance": 0.9,
+          "source_trust": 0.8,
+          "memory_confidence": 0.75,
+          "human_verified": true,
+          "conflict_type": null,
+          "conflict_resolution_status": null
+        }
+      ]
+    },
+    "canonical_json": "{\"canonicalization\":\"rfc8785\",\"items\":[{\"authority\":10,\"conflict_resolution_status\":null,\"conflict_type\":null,\"human_verified\":true,\"importance\":0.9,\"item_id\":\"00000000-0000-0000-0000-0000000000a1\",\"kind\":\"fact\",\"memory_confidence\":0.75,\"ordinal\":0,\"pinned\":true,\"reasons\":[],\"review_status\":\"active\",\"score\":null,\"served_content_hash\":\"sha256:8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8\",\"source_trust\":0.8,\"visibility\":\"private\",\"warnings\":[],\"workspace_id\":null},{\"authority\":10,\"conflict_resolution_status\":null,\"conflict_type\":null,\"human_verified\":true,\"importance\":0.9,\"item_id\":\"00000000-0000-0000-0000-0000000000a2\",\"kind\":\"preference\",\"memory_confidence\":0.75,\"ordinal\":1,\"pinned\":false,\"reasons\":[\"importance=0.90\"],\"review_status\":\"active\",\"score\":0.55,\"served_content_hash\":\"sha256:f44e64e75f3948e9f73f8dfa94721c4ce8cbb4f265c4790c702b2d41cfbf2753\",\"source_trust\":0.8,\"visibility\":\"private\",\"warnings\":[],\"workspace_id\":null}],\"mode\":\"startup\",\"packet\":{\"hash\":\"sha256:8b921c077d6fa6867673d6e29ce64f416b7a94eb25d387359b841fab64741aa1\",\"media_type\":\"text/plain; charset=utf-8\",\"render_version\":\"working-set-v1\"},\"request\":{\"effective\":{\"byte_budget\":4096,\"item_budget\":null,\"token_budget\":null,\"workspace_id\":null},\"query_digest\":null,\"request_digest\":\"sha256:2fdadda4e5f8b9dd350a5ea717b901e68425974baf1641214f16aafef5bd7204\",\"requested\":{\"byte_budget\":null,\"item_budget\":null,\"token_budget\":null,\"workspace_supplied\":false}},\"result\":{\"item_count\":2,\"message\":null,\"omitted_count\":4,\"pinned_omitted_count\":0,\"rendered_packet_byte_count\":30,\"served_content_byte_count\":9},\"schema\":\"engram.context-manifest\",\"schema_version\":\"1.0\",\"subject\":{\"memory_context_version\":\"memory-context-v2\",\"memory_profile_id\":null,\"memory_profile_revision_id\":null,\"memory_profile_version\":null,\"principal_id\":\"00000000-0000-0000-0000-000000000002\",\"tenant_id\":\"00000000-0000-0000-0000-000000000001\",\"workspace_id\":null},\"versions\":{\"candidate_strategy_version\":\"startup-candidates-v1\",\"config_version\":\"v1\",\"manifest_contract_version\":\"context-manifest-v1\",\"packet_render_version\":\"working-set-v1\",\"scoring_version\":\"v1\"}}",
+    "manifest_hash": "sha256:d59169b4312ad3499f196049a1661b12b7ad9c5165a1cdf5ce85f7622b2155d1",
+    "packet_hash": "sha256:8b921c077d6fa6867673d6e29ce64f416b7a94eb25d387359b841fab64741aa1",
+    "request_digest": "sha256:2fdadda4e5f8b9dd350a5ea717b901e68425974baf1641214f16aafef5bd7204",
+    "served_content_hashes": [
+      "sha256:8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8",
+      "sha256:f44e64e75f3948e9f73f8dfa94721c4ce8cbb4f265c4790c702b2d41cfbf2753"
+    ]
+  }
+}

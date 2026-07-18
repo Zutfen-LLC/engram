@@ -1,0 +1,154 @@
+{
+  "name": "003-profile-bound-workspace",
+  "description": "Profile-bound workspace recall: non-null profile and workspace.",
+  "schema": "engram.context-manifest-vector",
+  "schema_version": "1.0",
+  "input": {
+    "response": {
+      "working_set": "[fact] workspace secret",
+      "item_count": 1,
+      "pinned_omitted_count": 0,
+      "omitted_count": 0,
+      "message": null,
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-0000000000a1",
+          "kind": "fact",
+          "content": "workspace secret",
+          "review_status": "active",
+          "score": 0.8123,
+          "reasons": [
+            "importance=0.90"
+          ],
+          "warnings": [],
+          "pinned": false,
+          "importance": 0.9,
+          "source_trust": 0.8,
+          "memory_confidence": 0.75,
+          "human_verified": true,
+          "authority": 10,
+          "visibility": "workspace",
+          "workspace_id": "00000000-0000-0000-0000-000000000003",
+          "conflict_type": null,
+          "conflict_resolution_status": null
+        }
+      ]
+    },
+    "subject_context": {
+      "tenant_id": "00000000-0000-0000-0000-000000000001",
+      "principal_id": "00000000-0000-0000-0000-000000000002",
+      "workspace_id": "00000000-0000-0000-0000-000000000003",
+      "memory_context_version": "memory-context-v2",
+      "memory_profile_id": "00000000-0000-0000-0000-00000000009a",
+      "memory_profile_revision_id": "00000000-0000-0000-0000-00000000009b",
+      "memory_profile_version": 3
+    },
+    "request_context": {
+      "requested": {
+        "workspace_supplied": true,
+        "byte_budget": null,
+        "token_budget": null,
+        "item_budget": null
+      },
+      "effective": {
+        "workspace_id": "00000000-0000-0000-0000-000000000003",
+        "byte_budget": 4096,
+        "token_budget": null,
+        "item_budget": null
+      },
+      "query_digest": null
+    },
+    "decision_versions": {
+      "scoring_version": "v1",
+      "config_version": "v1",
+      "candidate_strategy_version": "startup-candidates-v1",
+      "manifest_contract_version": "context-manifest-v1",
+      "packet_render_version": "working-set-v1"
+    },
+    "reorder_inputs": false
+  },
+  "expected": {
+    "manifest": {
+      "schema": "engram.context-manifest",
+      "schema_version": "1.0",
+      "canonicalization": "rfc8785",
+      "mode": "startup",
+      "subject": {
+        "tenant_id": "00000000-0000-0000-0000-000000000001",
+        "principal_id": "00000000-0000-0000-0000-000000000002",
+        "workspace_id": "00000000-0000-0000-0000-000000000003",
+        "memory_context_version": "memory-context-v2",
+        "memory_profile_id": "00000000-0000-0000-0000-00000000009a",
+        "memory_profile_revision_id": "00000000-0000-0000-0000-00000000009b",
+        "memory_profile_version": 3
+      },
+      "request": {
+        "requested": {
+          "workspace_supplied": true,
+          "byte_budget": null,
+          "token_budget": null,
+          "item_budget": null
+        },
+        "effective": {
+          "workspace_id": "00000000-0000-0000-0000-000000000003",
+          "byte_budget": 4096,
+          "token_budget": null,
+          "item_budget": null
+        },
+        "query_digest": null,
+        "request_digest": "sha256:614ab031f3e7aafb99d6f1a12d88952469ffc20e43e3fe36634c06d82938a4de"
+      },
+      "versions": {
+        "scoring_version": "v1",
+        "config_version": "v1",
+        "candidate_strategy_version": "startup-candidates-v1",
+        "manifest_contract_version": "context-manifest-v1",
+        "packet_render_version": "working-set-v1"
+      },
+      "result": {
+        "item_count": 1,
+        "served_content_byte_count": 16,
+        "rendered_packet_byte_count": 23,
+        "pinned_omitted_count": 0,
+        "omitted_count": 0,
+        "message": null
+      },
+      "packet": {
+        "media_type": "text/plain; charset=utf-8",
+        "render_version": "working-set-v1",
+        "hash": "sha256:e924d31b36e7dafc9faa5a77cd395c82bea05d48e293cb6f819b9c8cdb8bc1b5"
+      },
+      "items": [
+        {
+          "ordinal": 0,
+          "item_id": "00000000-0000-0000-0000-0000000000a1",
+          "kind": "fact",
+          "served_content_hash": "sha256:ef3aa431ec4a5ff2b4396ac282ad0737a8b16d1a41cc90b7637740d841f99271",
+          "review_status": "active",
+          "authority": 10,
+          "visibility": "workspace",
+          "workspace_id": "00000000-0000-0000-0000-000000000003",
+          "score": 0.8123,
+          "reasons": [
+            "importance=0.90"
+          ],
+          "warnings": [],
+          "pinned": false,
+          "importance": 0.9,
+          "source_trust": 0.8,
+          "memory_confidence": 0.75,
+          "human_verified": true,
+          "conflict_type": null,
+          "conflict_resolution_status": null
+        }
+      ]
+    },
+    "canonical_json": "{\"canonicalization\":\"rfc8785\",\"items\":[{\"authority\":10,\"conflict_resolution_status\":null,\"conflict_type\":null,\"human_verified\":true,\"importance\":0.9,\"item_id\":\"00000000-0000-0000-0000-0000000000a1\",\"kind\":\"fact\",\"memory_confidence\":0.75,\"ordinal\":0,\"pinned\":false,\"reasons\":[\"importance=0.90\"],\"review_status\":\"active\",\"score\":0.8123,\"served_content_hash\":\"sha256:ef3aa431ec4a5ff2b4396ac282ad0737a8b16d1a41cc90b7637740d841f99271\",\"source_trust\":0.8,\"visibility\":\"workspace\",\"warnings\":[],\"workspace_id\":\"00000000-0000-0000-0000-000000000003\"}],\"mode\":\"startup\",\"packet\":{\"hash\":\"sha256:e924d31b36e7dafc9faa5a77cd395c82bea05d48e293cb6f819b9c8cdb8bc1b5\",\"media_type\":\"text/plain; charset=utf-8\",\"render_version\":\"working-set-v1\"},\"request\":{\"effective\":{\"byte_budget\":4096,\"item_budget\":null,\"token_budget\":null,\"workspace_id\":\"00000000-0000-0000-0000-000000000003\"},\"query_digest\":null,\"request_digest\":\"sha256:614ab031f3e7aafb99d6f1a12d88952469ffc20e43e3fe36634c06d82938a4de\",\"requested\":{\"byte_budget\":null,\"item_budget\":null,\"token_budget\":null,\"workspace_supplied\":true}},\"result\":{\"item_count\":1,\"message\":null,\"omitted_count\":0,\"pinned_omitted_count\":0,\"rendered_packet_byte_count\":23,\"served_content_byte_count\":16},\"schema\":\"engram.context-manifest\",\"schema_version\":\"1.0\",\"subject\":{\"memory_context_version\":\"memory-context-v2\",\"memory_profile_id\":\"00000000-0000-0000-0000-00000000009a\",\"memory_profile_revision_id\":\"00000000-0000-0000-0000-00000000009b\",\"memory_profile_version\":3,\"principal_id\":\"00000000-0000-0000-0000-000000000002\",\"tenant_id\":\"00000000-0000-0000-0000-000000000001\",\"workspace_id\":\"00000000-0000-0000-0000-000000000003\"},\"versions\":{\"candidate_strategy_version\":\"startup-candidates-v1\",\"config_version\":\"v1\",\"manifest_contract_version\":\"context-manifest-v1\",\"packet_render_version\":\"working-set-v1\",\"scoring_version\":\"v1\"}}",
+    "manifest_hash": "sha256:2daab65cb44b622dc437993b25452c77f90c35115bbfe18c79e3997ef8a51784",
+    "packet_hash": "sha256:e924d31b36e7dafc9faa5a77cd395c82bea05d48e293cb6f819b9c8cdb8bc1b5",
+    "request_digest": "sha256:614ab031f3e7aafb99d6f1a12d88952469ffc20e43e3fe36634c06d82938a4de",
+    "served_content_hashes": [
+      "sha256:ef3aa431ec4a5ff2b4396ac282ad0737a8b16d1a41cc90b7637740d841f99271"
+    ]
+  }
+}

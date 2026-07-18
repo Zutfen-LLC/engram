@@ -55,12 +55,14 @@ def test_hosted_workflow_uses_read_only_github_hosted_runners() -> None:
     workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text()
 
     assert "runs-on: self-hosted" not in workflow
-    assert workflow.count("runs-on: ubuntu-24.04") == 2
+    # Three read-only hosted jobs: compose-real-db-ci, compose-validate, and
+    # the parallel conformance-vectors cross-language job (ENG-CONTEXT-001).
+    assert workflow.count("runs-on: ubuntu-24.04") == 3
     assert re.search(r"^permissions:\s*\n  contents: read\s*$", workflow, re.MULTILINE)
     assert not re.search(r"^\s+[a-z-]+: write\s*$", workflow, re.MULTILINE)
     assert "pull_request_target" not in workflow
-    assert workflow.count("uses: actions/checkout@v6") == 2
-    assert workflow.count("persist-credentials: false") == 2
+    assert workflow.count("uses: actions/checkout@v6") == 3
+    assert workflow.count("persist-credentials: false") == 3
 
 
 def test_hosted_workflow_builds_once_with_event_isolated_cache() -> None:
