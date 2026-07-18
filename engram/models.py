@@ -1006,7 +1006,12 @@ class CandidateIngest(Base):
 
 
 class CandidateIngestExecution(Base):
-    """Immutable context that authorized the ingest's actual remember execution."""
+    """Immutable context that authorized the ingest's actual remember execution.
+
+    1:1 with its candidate ingest (PK ingest_id + composite ingest FK). The
+    ingest's own principal is authoritative, so principal_id is not duplicated
+    here; workers derive it from the ingest loaded through the composite key.
+    """
 
     __tablename__ = "candidate_ingest_executions"
     __table_args__ = (
@@ -1021,12 +1026,6 @@ class CandidateIngestExecution(Base):
             ["candidate_ingests.tenant_id", "candidate_ingests.id"],
             ondelete="CASCADE",
             name="fk_candidate_ingest_executions_ingest",
-        ),
-        ForeignKeyConstraint(
-            ["tenant_id", "principal_id"],
-            ["principals.tenant_id", "principals.id"],
-            ondelete="CASCADE",
-            name="fk_candidate_ingest_executions_tenant_principal",
         ),
         ForeignKeyConstraint(
             ["tenant_id", "api_key_id"],
@@ -1052,7 +1051,6 @@ class CandidateIngestExecution(Base):
 
     ingest_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
-    principal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     api_key_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     memory_profile_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     memory_profile_revision_id: Mapped[uuid.UUID | None] = mapped_column(

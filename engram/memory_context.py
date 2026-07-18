@@ -316,7 +316,27 @@ async def resolve_memory_context(
 async def memory_context_from_ingest(
     session: AsyncSession, ingest: CandidateIngest
 ) -> ResolvedMemoryContext | None:
-    """Recover remember-time authority, falling back to origin for legacy work."""
+    """Recover remember-time execution authority for an ingest.
+
+    The execution row (``candidate_ingest_executions``) is the durable record of
+    the context under which ``/v1/remember`` actually accepted the ingest. It is
+    the only source a cross-item worker may reconstruct a *profiled* boundary
+    from — never the candidate-origin ingest alone.
+
+    Fail-closed rules:
+
+    * legacy-unprofiled ingest (``legacy-unprofiled-v0``) with no execution row
+      → return ``None`` (legacy/unprofiled compatibility; callers retain the
+      established principal-only behavior);
+    * a ``memory-context-v2`` ingest with NO execution row → raise
+      ``ValueError``. A v2 ingest must have proven its execution authority
+      durably; an absent record means queued work from a pre-025 or partially
+      rolled-out instance, a corrupt/missing row, or any path where origin
+      (e.g. a broad classify profile) must NOT be silently substituted for the
+      narrower (or unprovable) remember-time authority. Cross-item worker
+      behavior must fail closed rather than scan under the origin profile.
+    * an unsupported context version → raise ``ValueError``.
+    """
     from engram.models import CandidateIngestExecution
 
     execution = await session.scalar(
@@ -325,7 +345,17 @@ async def memory_context_from_ingest(
             CandidateIngestExecution.tenant_id == ingest.tenant_id,
         )
     )
-    context_source: CandidateIngest | CandidateIngestExecution = execution or ingest
+    if execution is None:
+        # No durable execution authority. Legacy-unprofiled work remains
+        # compatible; a v2 ingest without its execution row fails closed.
+        if ingest.memory_context_version == LEGACY_MEMORY_CONTEXT_VERSION:
+            return None
+        raise ValueError(
+            "candidate ingest has memory-context-v2 provenance but no durable "
+            "execution-context row; refusing to reconstruct a profiled worker "
+            "boundary from candidate origin alone"
+        )
+    context_source: CandidateIngest | CandidateIngestExecution = execution
     if context_source.memory_context_version == LEGACY_MEMORY_CONTEXT_VERSION:
         return None
     if context_source.memory_context_version != MEMORY_CONTEXT_VERSION:

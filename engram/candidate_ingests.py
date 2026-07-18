@@ -91,7 +91,6 @@ async def pin_execution_context(
         .values(
             ingest_id=ingest.id,
             tenant_id=ingest.tenant_id,
-            principal_id=ingest.principal_id,
             **provenance,
         )
         .on_conflict_do_nothing(index_elements=[CandidateIngestExecution.ingest_id])

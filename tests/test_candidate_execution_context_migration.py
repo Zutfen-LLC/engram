@@ -19,11 +19,14 @@ def test_execution_context_relational_contract_is_tenant_safe() -> None:
     # tenant_id references tenants(id) so an execution row cannot outlive its tenant.
     assert "fk_candidate_ingest_executions_tenant" in SQL
     assert "REFERENCES tenants (id) ON DELETE CASCADE" in SQL
-    # principal_id is tenant-scoped via the composite FK to principals(tenant_id, id),
-    # matching candidate_ingests — a tenant-A row cannot reference a tenant-B principal.
-    assert "fk_candidate_ingest_executions_tenant_principal" in SQL
-    assert "REFERENCES principals (tenant_id, id) ON DELETE CASCADE" in SQL
-    # The legacy single-column principal FK is removed so the composite one is authoritative.
+    # The execution row is 1:1 with its ingest via the composite FK
+    # (tenant_id, ingest_id) -> candidate_ingests(tenant_id, id). The ingest's
+    # own principal is authoritative, so the principal is derived from the ingest
+    # rather than duplicated here. The redundant principal_id column and its
+    # legacy constraint are dropped idempotently.
+    assert "fk_candidate_ingest_executions_ingest" in SQL
+    assert "REFERENCES candidate_ingests (tenant_id, id) ON DELETE CASCADE" in SQL
+    assert "DROP COLUMN IF EXISTS principal_id" in SQL
     assert "DROP CONSTRAINT IF EXISTS candidate_ingest_executions_principal_id_fkey" in SQL
     # A profile pair is either both set or both null.
     assert "chk_candidate_ingest_executions_profile_pair" in SQL

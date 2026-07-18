@@ -132,11 +132,10 @@ async def test_app_role_can_select_and_insert_but_not_update_or_delete() -> None
         # (ingest_id is both PK and FK to candidate_ingests.id).
         await app.execute(
             "INSERT INTO candidate_ingest_executions "
-            "(ingest_id, tenant_id, principal_id, memory_context_version) "
-            "VALUES ($1, $2, $3, 'legacy-unprofiled-v0')",
+            "(ingest_id, tenant_id, memory_context_version) "
+            "VALUES ($1, $2, 'legacy-unprofiled-v0')",
             ingest_id,
             tenant_id,
-            principal_id,
         )
         inserted = True
 
@@ -219,11 +218,10 @@ async def test_cross_tenant_select_and_insert_blocked() -> None:
             )
         await owner.execute(
             "INSERT INTO candidate_ingest_executions "
-            "(ingest_id, tenant_id, principal_id, memory_context_version) "
-            "VALUES ($1, $2, $3, 'legacy-unprofiled-v0')",
+            "(ingest_id, tenant_id, memory_context_version) "
+            "VALUES ($1, $2, 'legacy-unprofiled-v0')",
             ingest_b,
             tenant_b,
-            principal_b,
         )
 
         # Scoped to tenant A: tenant B's execution row is invisible.
@@ -243,11 +241,10 @@ async def test_cross_tenant_select_and_insert_blocked() -> None:
         with pytest.raises(asyncpg.PostgresError) as exc_info:
             await app.execute(
                 "INSERT INTO candidate_ingest_executions "
-                "(ingest_id, tenant_id, principal_id, memory_context_version) "
-                "VALUES ($1, $2, $3, 'legacy-unprofiled-v0')",
+                "(ingest_id, tenant_id, memory_context_version) "
+                "VALUES ($1, $2, 'legacy-unprofiled-v0')",
                 ingest_b,
                 tenant_b,
-                principal_b,
             )
         assert _denied(exc_info.value)
         # The rejected row did not land (still exactly the owner-created one).
@@ -291,7 +288,9 @@ async def test_missing_tenant_context_leaks_nothing() -> None:
 async def test_relational_integrity_tenant_safe_foreign_keys() -> None:
     owner = await _owner_with_025()
     try:
-        # The composite tenant + principal FK and the tenant FK exist.
+        # The tenant FK and the composite ingest FK exist. The principal is not
+        # stored on the execution row (it is derived from the ingest), so there
+        # is no principal FK here.
         fks = {
             row["conname"]
             for row in await owner.fetch(
@@ -300,12 +299,20 @@ async def test_relational_integrity_tenant_safe_foreign_keys() -> None:
             )
         }
         assert "fk_candidate_ingest_executions_tenant" in fks
-        assert "fk_candidate_ingest_executions_tenant_principal" in fks
         assert "fk_candidate_ingest_executions_ingest" in fks
         assert "fk_candidate_ingest_executions_api_key" in fks
         assert "fk_candidate_ingest_executions_profile_revision" in fks
-        # The legacy single-column principal FK must be gone.
+        # No principal FK or legacy principal column remains.
+        assert "fk_candidate_ingest_executions_tenant_principal" not in fks
         assert "candidate_ingest_executions_principal_id_fkey" not in fks
+        columns = {
+            row["column_name"]
+            for row in await owner.fetch(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'candidate_ingest_executions'"
+            )
+        }
+        assert "principal_id" not in columns
 
         # profile-pair CHECK: both null or both set.
         check = await owner.fetchval(
@@ -364,24 +371,22 @@ async def test_api_key_deletion_nulls_only_api_key_id() -> None:
         )
         await owner.execute(
             "INSERT INTO candidate_ingest_executions "
-            "(ingest_id, tenant_id, principal_id, api_key_id, memory_context_version) "
-            "VALUES ($1, $2, $3, $4, 'memory-context-v2')",
+            "(ingest_id, tenant_id, api_key_id, memory_context_version) "
+            "VALUES ($1, $2, $3, 'memory-context-v2')",
             ingest_id,
             tenant_id,
-            principal_id,
             api_key_id,
         )
         # Deleting the API key nulls only api_key_id; the execution row survives.
         await owner.execute("DELETE FROM api_keys WHERE id = $1", api_key_id)
         row = await owner.fetchrow(
-            "SELECT api_key_id, tenant_id, principal_id, ingest_id "
+            "SELECT api_key_id, tenant_id, ingest_id "
             "FROM candidate_ingest_executions WHERE ingest_id = $1",
             ingest_id,
         )
         assert row is not None
         assert row["api_key_id"] is None
         assert row["tenant_id"] == tenant_id
-        assert row["principal_id"] == principal_id
         assert row["ingest_id"] == ingest_id
     finally:
         with contextlib.suppress(Exception):
@@ -425,11 +430,10 @@ async def test_candidate_ingest_deletion_cascades_execution_row() -> None:
         )
         await owner.execute(
             "INSERT INTO candidate_ingest_executions "
-            "(ingest_id, tenant_id, principal_id, memory_context_version) "
-            "VALUES ($1, $2, $3, 'legacy-unprofiled-v0')",
+            "(ingest_id, tenant_id, memory_context_version) "
+            "VALUES ($1, $2, 'legacy-unprofiled-v0')",
             ingest_id,
             tenant_id,
-            principal_id,
         )
         assert (
             await owner.fetchval(

@@ -142,7 +142,15 @@ async def _insert_event(
         )
         if ingest is None:
             raise ValueError("candidate ingest provenance is unavailable")
-        context = await memory_context_from_ingest(session, ingest)
+        # Audit-event provenance is descriptive metadata, not an authorization
+        # boundary (the handler already resolved the worker context and would
+        # have skipped on a provenance failure). If the execution authority
+        # cannot be reconstructed, record the event with neutral internal
+        # provenance rather than dropping the audit row or widening it.
+        try:
+            context = await memory_context_from_ingest(session, ingest)
+        except ValueError:
+            context = None
         if context is not None:
             provenance = context_provenance(context)
         else:

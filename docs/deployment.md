@@ -624,7 +624,86 @@ failure.
 
 ---
 
-## 10. Memory profiles (control plane)
+## 10. Migrations 024 + 025 — profile write context and execution authority (ENG-SCOPE-002C)
+
+Migrations `024_profile_write_context.sql` and `025_candidate_execution_context.sql`
+are a coordinated rollout. They split candidate provenance into two immutable
+layers:
+
+- `candidate_ingests` — the **origin** context under which a candidate entered
+  the pipeline (set at classify time);
+- `candidate_ingest_executions` (migration 025) — the **execution authority**
+  under which `/v1/remember` actually accepted/executed it, durable on the first
+  successful remember.
+
+Workers (conflict-check, promotion, deduplication) reconstruct the
+**execution authority** when present and use it as their cross-item boundary.
+For a `memory-context-v2` ingest with **no** execution row, cross-item worker
+behavior **fails closed** (the job is skipped, not run under the origin
+profile) — this covers queued work produced by a pre-025 or partially
+rolled-out instance, and any missing/corrupt execution row. Legacy
+(`legacy-unprofiled-v0`) ingests with no execution row retain compatibility
+behavior.
+
+### Rollout order (strict)
+
+```
+022 → 023 → 024 → 025
+       → deploy all API instances
+       → deploy all worker instances
+       → account for pre-002C queued work
+       → verify fleet version
+       → declare profile-bound keys read/write isolated
+```
+
+**Application code that references `candidate_ingest_executions` must never be
+deployed before migration 025.** Deploying the 002C API before 025 exists will
+fail on every remember execution that pins the execution context.
+
+### Procedure
+
+1. Back up first (`./deploy/backup.sh`).
+2. Apply migrations through 025 as the database owner
+   (`engram init-db`, which connects via `ENGRAM_OWNER_DATABASE_URL`).
+3. Deploy **all** API instances, then **all** worker instances. A mixed API
+   fleet where some instances pin execution rows and others do not is not a
+   supported steady state.
+4. Drain or explicitly classify/re-submit pre-002C queued work. Jobs enqueued
+   by a pre-025 instance may reference a `memory-context-v2` ingest that has no
+   execution row; those cross-item jobs will skip under the fail-closed rule
+   rather than scan under the origin profile. Re-submitting the work through a
+   002C API records the execution authority durably.
+5. Verify every API and worker instance reports the 002C version before
+   declaring profile-bound credentials read/write isolated.
+
+### Mixed-version and rollback behavior
+
+- **Rolling application code back after 025 is applied** widens write behavior
+  back to pre-002C semantics even though the schema remains. Profile-bound
+  credentials must be **disabled/revoked** (or the loss of enforcement
+  explicitly accepted) before running the old fleet against the migrated
+  database. Execution rows already recorded are historical provenance — they
+  are **not** proof that rolled-back code continues to enforce profiles.
+- Schema 025 may safely remain during an application rollback (it is additive:
+  a new table with RLS, least-privilege grants, and no change to existing
+  columns). There is no supported code-only shortcut that restores enforcement
+  once the rolled-back fleet is running; the only safe states are "fix-forward"
+  or "old fleet with profile-bound keys revoked."
+- Do not run a pre-025 API against a database where 025 has not been applied,
+  and do not run a 002C API against a database where 025 has not been applied.
+  Both are unsupported; the latter fails on remember.
+
+### Idempotency
+
+Both migrations are safe to re-apply: every object is guarded (`IF NOT EXISTS`
+or `DO $$ IF NOT EXISTS ...`), the 025 RLS policy is recreated idempotently
+(drop-if-exists + create), and the redundant `principal_id` column (present in
+an earlier revision of 025) is dropped idempotently. `engram init-db` skips
+already-applied migrations via the `schema_migrations` table.
+
+---
+
+## 11. Memory profiles (control plane)
 
 Memory profiles are reusable, tenant-scoped policy identities. They are created and revised by an
 `admin`-scoped credential. ENG-SCOPE-002B/002C enforce the active revision as a narrowing boundary
@@ -705,22 +784,29 @@ Rolling application code back from 002B widens reads for profile-bound keys and 
 security-neutral. Before rollback, disable or revoke every bound key, or explicitly accept the
 loss of read enforcement. The additive migration may remain in place.
 
-### Migration 024 profile-write rollout and rollback
+### Profile-write rollout and rollback (migrations 024 + 025)
 
-Migration 024 adds immutable context provenance to candidate ingests and item events. Historical
-and omitted rows remain `legacy-unprofiled-v0`; current caller work records `memory-context-v2`,
-and trusted maintenance records `internal-system-v1`.
+Migration 024 adds immutable context provenance to candidate ingests and item events; migration
+025 adds the durable remember-time execution authority (`candidate_ingest_executions`) that
+workers reconstruct for cross-item behavior. Historical and omitted rows remain
+`legacy-unprofiled-v0`; current caller work records `memory-context-v2`, and trusted maintenance
+records `internal-system-v1`.
 
-Apply 022, 023, then 024 before deploying 002C. Drain or replace every pre-002C API instance and
-drain, complete, or explicitly classify queued pre-002C candidate jobs. Only after every API and
-worker runs 002C may profile-bound credentials be described as complete read/write sandboxes.
-Mixed old/new instances are not an enforcement deployment.
+Apply `022 → 023 → 024 → 025` before deploying 002C — see [§10](#10-migrations-024--025--profile-write-context-and-execution-authority-eng-scope-002c)
+for the full rollout order, mixed-version behavior, and rollback guidance. The 002C API must not
+be deployed before 025 exists (it reads/writes `candidate_ingest_executions` on every successful
+remember). Drain or replace every pre-002C API instance and drain, complete, or explicitly
+classify queued pre-002C candidate jobs. Only after every API and worker runs 002C may
+profile-bound credentials be described as complete read/write sandboxes. Mixed old/new instances
+are not an enforcement deployment.
 
-Application rollback widens writes even if migration 024 remains installed. Before rollback,
-disable or revoke profile-bound keys, or explicitly accept the loss of write enforcement. Direct
-trusted operator database maintenance is outside the API-key profile contract.
+Application rollback widens writes even if migrations 024/025 remain installed. Before rollback,
+disable or revoke profile-bound keys, or explicitly accept the loss of write enforcement.
+Recorded execution rows are historical provenance, not proof that rolled-back code keeps
+enforcing profiles. Direct trusted operator database maintenance is outside the API-key profile
+contract.
 
-## 11. Troubleshooting
+## 12. Troubleshooting
 
 | Symptom | Likely cause / fix |
 | --- | --- |

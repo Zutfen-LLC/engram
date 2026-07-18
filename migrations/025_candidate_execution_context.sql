@@ -1,15 +1,18 @@
 -- Pin remember-time authority separately from immutable candidate origin provenance.
 --
--- Relational contract mirrors candidate_ingests (migration 020): tenant-scoped
--- composite foreign keys to tenants and principals (tenant_id, id), so an
--- execution row's tenant and principal are guaranteed to belong together. Safe
--- to re-apply: every object is guarded or uses IF NOT EXISTS, and the RLS
+-- The execution row is 1:1 with its candidate ingest (PRIMARY KEY ingest_id, and
+-- a composite FK (tenant_id, ingest_id) -> candidate_ingests). The ingest's own
+-- principal_id is therefore the authoritative principal, so this table does NOT
+-- duplicate principal_id: an execution row cannot disagree with its ingest about
+-- the principal because the principal is not stored here at all. Workers derive
+-- it from the ingest loaded through the same composite key.
+--
+-- Safe to re-apply: every object is guarded or uses IF NOT EXISTS, and the RLS
 -- policy is recreated idempotently.
 
 CREATE TABLE IF NOT EXISTS candidate_ingest_executions (
     ingest_id uuid PRIMARY KEY,
     tenant_id uuid NOT NULL,
-    principal_id uuid NOT NULL,
     api_key_id uuid,
     memory_profile_id uuid,
     memory_profile_revision_id uuid,
@@ -23,12 +26,13 @@ CREATE TABLE IF NOT EXISTS candidate_ingest_executions (
     )
 );
 
--- A prior revision of this table declared principal_id with an inline
--- single-column FK to principals(id). That admitted a tenant-A principal_id
--- paired with a tenant-B row. Replace it with the tenant-scoped composite FK
--- used by candidate_ingests (references idx_principals_tenant_identity).
+-- Prior revisions of this table carried a principal_id column. It was redundant
+-- (the composite ingest FK already pins the ingest whose principal is
+-- authoritative) and was not relationally tied to that ingest's principal. Drop
+-- the column and any legacy constraint that referenced it, idempotently.
 ALTER TABLE candidate_ingest_executions
     DROP CONSTRAINT IF EXISTS candidate_ingest_executions_principal_id_fkey;
+ALTER TABLE candidate_ingest_executions DROP COLUMN IF EXISTS principal_id;
 
 DO $$
 BEGIN
@@ -41,16 +45,6 @@ BEGIN
             ADD CONSTRAINT fk_candidate_ingest_executions_tenant
             FOREIGN KEY (tenant_id)
             REFERENCES tenants (id) ON DELETE CASCADE;
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'fk_candidate_ingest_executions_tenant_principal'
-          AND conrelid = 'candidate_ingest_executions'::regclass
-    ) THEN
-        ALTER TABLE candidate_ingest_executions
-            ADD CONSTRAINT fk_candidate_ingest_executions_tenant_principal
-            FOREIGN KEY (tenant_id, principal_id)
-            REFERENCES principals (tenant_id, id) ON DELETE CASCADE;
     END IF;
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint

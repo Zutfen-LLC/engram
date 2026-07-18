@@ -860,10 +860,23 @@ Existing-item mutation is the intersection of tenant/RLS, established principal 
 profile read eligibility, and profile write eligibility for the current scope. A denied target is
 indistinguishable from a missing target. Scope-changing operations separately authorize the
 resulting scope, and classification receipts never preserve authority for a later request.
-Candidate ingests pin the exact context used to accept work; candidate-origin workers reconstruct
-that exact revision without consulting the current active revision. Item-local enrichment remains
-allowed, while cross-item scans and mutations use the initiating boundary and fail closed when v2
-provenance cannot be reconstructed.
+
+Candidate provenance is split into two immutable layers. `candidate_ingests` record the
+**origin** context under which a candidate entered the pipeline (set at classify time).
+`candidate_ingest_executions` (migration 025) record the **execution authority** under which
+`/v1/remember` actually accepted/executed the candidate, durable on the first successful remember
+— the two are deliberately separate because classify may run under a broad profile while the
+authoritative remember execution is narrower (or cannot be proven). The execution row is 1:1 with
+its ingest; its principal is not duplicated but derived from the ingest. Workers (conflict-check,
+promotion, deduplication) reconstruct the **execution authority** when present and use it as their
+cross-item boundary; classify-origin context never overrides remember-time execution authority.
+
+Cross-item worker behavior fails closed when v2 execution provenance cannot be reconstructed: a
+`memory-context-v2` ingest with no execution row (queued work from a pre-025 or partially
+rolled-out instance, a corrupt/missing row, or any path where origin must not be substituted for
+the narrower remember-time authority) causes the worker to skip the operation rather than scan or
+mutate under the origin profile. Legacy (`legacy-unprofiled-v0`) ingests with no execution row
+retain the established compatibility behavior.
 
 Candidate ingests and caller-originated item events record `memory-context-v2` with tenant-safe
 API-key/profile/revision provenance. Internal maintenance records `internal-system-v1`.

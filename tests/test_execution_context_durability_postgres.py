@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -383,6 +384,194 @@ async def test_concurrent_first_consumption_serializes() -> None:
             )
             assert bound_item is not None
             item_ids.append(bound_item["id"])
+
+            key_ids = [ctx["broad_key_id"], ctx["private_key_id"]]
+            profile_ids = [ctx["broad_profile_id"], ctx["private_profile_id"]]
+    finally:
+        settings.auth_enabled = original_auth
+        settings.embedding_provider = original_provider
+        reset_principal_cache()
+        if ingest_id is not None:
+            await _cleanup_ingest(owner, ingest_id)
+        if item_ids:
+            await owner.execute("DELETE FROM memory_items WHERE id=ANY($1::uuid[])", item_ids)
+        if key_ids:
+            await owner.execute("DELETE FROM api_keys WHERE id=ANY($1::uuid[])", key_ids)
+        if profile_ids:
+            await owner.execute(
+                "DELETE FROM memory_profiles WHERE id=ANY($1::uuid[])", profile_ids
+            )
+        await owner.close()
+
+
+async def test_missing_v2_execution_row_fails_closed() -> None:
+    """A memory-context-v2 ingest with no durable execution row must not let a
+    cross-item worker reconstruct a boundary from candidate origin alone.
+
+    Simulates queued work from a pre-025 / partially rolled-out instance (or a
+    corrupt/missing execution row): a broad-profile classify created a v2
+    ingest, but no execution row was ever durably pinned. ``memory_context_from_ingest``
+    must raise, so the conflict-check / promotion / dedup worker paths skip the
+    cross-item operation instead of scanning under the broad origin profile.
+    """
+    from sqlalchemy import select
+
+    from engram.db import owner_session_factory
+    from engram.memory_context import memory_context_from_ingest
+    from engram.models import CandidateIngest
+
+    owner = await _owner()
+    token = uuid.uuid4().hex[:10]
+    original_auth = settings.auth_enabled
+    original_provider = settings.embedding_provider
+    ingest_id: uuid.UUID | None = None
+    item_ids: list[uuid.UUID] = []
+    key_ids: list[uuid.UUID] = []
+    profile_ids: list[uuid.UUID] = []
+    try:
+        settings.auth_enabled = False
+        settings.embedding_provider = "none"
+        app = create_app()
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            ctx = await _bootstrap(client, owner, token)
+
+            settings.auth_enabled = True
+            reset_principal_cache()
+
+            # Classify under the broad profile to create a v2 candidate ingest.
+            content = f"missing execution row {token}"
+            classified = await client.post(
+                "/v1/classify",
+                json={"content": content},
+                headers=_headers(ctx["broad_key"]),
+            )
+            assert classified.status_code == 200, classified.text
+            ingest_id = uuid.UUID(classified.json()["ingest_id"])
+
+            # The ingest is memory-context-v2 (profiled origin) and classify
+            # alone never pins an execution row.
+            async with owner_session_factory() as session:
+                ingest = await session.scalar(
+                    select(CandidateIngest).where(CandidateIngest.id == ingest_id)
+                )
+            assert ingest is not None
+            assert ingest.memory_context_version != "legacy-unprofiled-v0"
+            assert (
+                await owner.fetchval(
+                    "SELECT count(*) FROM candidate_ingest_executions WHERE ingest_id=$1",
+                    ingest_id,
+                )
+                == 0
+            )
+
+            # Worker context reconstruction must raise, not fall back to origin.
+            async with owner_session_factory() as session:
+                with pytest.raises(ValueError, match="no durable execution-context"):
+                    await memory_context_from_ingest(session, ingest)
+
+            key_ids = [ctx["broad_key_id"], ctx["private_key_id"]]
+            profile_ids = [ctx["broad_profile_id"], ctx["private_profile_id"]]
+    finally:
+        settings.auth_enabled = original_auth
+        settings.embedding_provider = original_provider
+        reset_principal_cache()
+        if ingest_id is not None:
+            await _cleanup_ingest(owner, ingest_id)
+        if item_ids:
+            await owner.execute("DELETE FROM memory_items WHERE id=ANY($1::uuid[])", item_ids)
+        if key_ids:
+            await owner.execute("DELETE FROM api_keys WHERE id=ANY($1::uuid[])", key_ids)
+        if profile_ids:
+            await owner.execute(
+                "DELETE FROM memory_profiles WHERE id=ANY($1::uuid[])", profile_ids
+            )
+        await owner.close()
+
+
+async def test_worker_skips_conflict_check_when_execution_row_missing() -> None:
+    """The conflict.check worker path skips (rather than scanning) when the
+    ingest's v2 execution authority cannot be reconstructed.
+
+    Exercises the real handler guard: ``_job_memory_context`` raises ValueError
+    and the conflict-check handler catches it and returns without running
+    ``detect_conflicts``. The proof is that no conflict event is written for a
+    counterpart item the broad origin profile would otherwise scan.
+    """
+    from engram.db import apply_rls_context, owner_session_factory
+    from engram.worker import handle_conflict_check
+
+    owner = await _owner()
+    token = uuid.uuid4().hex[:10]
+    original_auth = settings.auth_enabled
+    original_provider = settings.embedding_provider
+    ingest_id: uuid.UUID | None = None
+    item_ids: list[uuid.UUID] = []
+    key_ids: list[uuid.UUID] = []
+    profile_ids: list[uuid.UUID] = []
+    try:
+        settings.auth_enabled = False
+        settings.embedding_provider = "none"
+        app = create_app()
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            ctx = await _bootstrap(client, owner, token)
+            tenant_id = ctx["tenant_id"]
+
+            settings.auth_enabled = True
+            reset_principal_cache()
+
+            # A counterpart the broad origin profile would see if it scanned.
+            counterpart = uuid.uuid4()
+            item_ids.append(counterpart)
+            await owner.execute(
+                "INSERT INTO memory_items "
+                "(id,tenant_id,principal_id,content,content_hash,kind,visibility,"
+                "review_status,memory_confidence,source_trust,importance,source_type) "
+                "VALUES ($1,$2,$3,$4,$5,'fact','tenant','active',.9,.9,.5,'manual')",
+                counterpart,
+                tenant_id,
+                ctx["principal_id"],
+                f"counterpart {token}",
+                f"sha256:{uuid.uuid4().hex}",
+            )
+
+            # Classify under broad to create a v2 ingest with no execution row.
+            content = f"conflict skip {token}"
+            classified = await client.post(
+                "/v1/classify",
+                json={"content": content},
+                headers=_headers(ctx["broad_key"]),
+            )
+            assert classified.status_code == 200, classified.text
+            ingest_id = uuid.UUID(classified.json()["ingest_id"])
+
+            # Synthetic job payload referencing the un-executed ingest. The
+            # handler loads the item, resolves the ingest context, and must skip
+            # because the execution row is missing — without writing any event.
+            stub_job = SimpleNamespace(
+                id=uuid.uuid4(),
+                tenant_id=tenant_id,
+                payload={
+                    "memory_item_id": str(counterpart),
+                    "ingest_id": str(ingest_id),
+                    "correlation_id": str(uuid.uuid4()),
+                },
+            )
+
+            async with owner_session_factory() as session:
+                await apply_rls_context(
+                    session, tenant_id=tenant_id, principal_id=ctx["principal_id"]
+                )
+                await handle_conflict_check(session, stub_job)  # type: ignore[arg-type]
+                await session.rollback()
+
+            assert (
+                await owner.fetchval(
+                    "SELECT count(*) FROM item_events "
+                    "WHERE item_id=$1 AND event_type='conflict_detected'",
+                    counterpart,
+                )
+                == 0
+            ), "conflict.check scanned under origin authority despite missing execution row"
 
             key_ids = [ctx["broad_key_id"], ctx["private_key_id"]]
             profile_ids = [ctx["broad_profile_id"], ctx["private_profile_id"]]
