@@ -1,21 +1,17 @@
 """Pure unit tests for the startup context-receipt dark-write orchestrator
 (ENG-CONTEXT-002B).
 
-These tests are DB-free. They exercise the orchestrator's:
+These tests are DB-free. They exercise:
 
-- ``disabled`` short-circuit (no manifest, no DB session, no telemetry);
-- requested/effective descriptor mapping (caller nulls preserved, engine
-  values used, effective item budget always null);
-- ``workspace_supplied`` Boolean exactness;
-- profile IDs/version copied from ``ResolvedMemoryContext``;
-- candidate-strategy version copied from the executed result;
-- manifest built from the supplied finalized response (mutation boundary);
-- timeout returns ``timed_out``;
-- ordinary failure returns ``failed`` with a bounded failure_stage and
-  exception *type*;
-- asyncio cancellation is NOT swallowed;
-- safe logging excludes exception messages and content;
-- usage telemetry receives only bounded aggregate metadata.
+- the disabled route guard — no receipt-specific work runs at all;
+- the executed-result parser — every required key, every malformed value;
+- public ``RecallResponse`` defaults never feed the receipt manifest;
+- the unified best-effort entrypoint — one result, one log, one telemetry
+  attempt per enabled attempt, including ``build_decision_context`` failures;
+- the monotonic deadline — primary + telemetry never exceed the configured
+  timeout; a hard timeout records ``telemetry_status=skipped_deadline``;
+- ``asyncio`` cancellation is NOT swallowed;
+- safe logging excludes exception messages and content.
 
 Real-PostgreSQL proofs live in ``test_context_receipt_dark_write_postgres``.
 """
@@ -37,8 +33,11 @@ from engram.context_manifest import (
     compute_manifest_hash,
 )
 from engram.context_receipt_dark_write import (
+    ContextReceiptDarkWriteResult,
+    StartupDecisionContextError,
     StartupReceiptDecisionContext,
-    _build_manifest,
+    StartupReceiptExecutedContext,
+    parse_startup_executed_context,
     write_startup_context_receipt_best_effort,
 )
 from engram.context_receipts import (
@@ -54,6 +53,11 @@ PROFILE = uuid.UUID("00000000-0000-0000-0000-000000000004")
 PROFILE_REV = uuid.UUID("00000000-0000-0000-0000-000000000005")
 ITEM_A = "00000000-0000-0000-0000-000000000010"
 ITEM_B = "00000000-0000-0000-0000-000000000011"
+
+RECALL_LOG_ID = "00000000-0000-0000-0000-000000000099"
+# A UUID with hex letters so uppercase/noncanonical transforms are observable.
+HEX_RECALL_LOG_ID = "11111111-2222-aaaa-bbbb-ccccddddffff"
+HEX_WORKSPACE = uuid.UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeffff1111")
 
 
 def _unrestricted_context(
@@ -147,32 +151,36 @@ class _Response:
         self.message = message
 
 
-def _decision_context(
+def _valid_raw_result(
     *,
-    workspace_supplied: bool = False,
-    requested_byte_budget: int | None = None,
-    requested_token_budget: int | None = None,
-    requested_item_budget: int | None = None,
-    effective_workspace_id: uuid.UUID | None = None,
+    workspace_id: str | None = None,
+    recall_log_id: str = RECALL_LOG_ID,
     effective_byte_budget: int | None = 4096,
     effective_token_budget: int | None = None,
     scoring_version: str = "v1",
     config_version: str = "v1",
     candidate_strategy_version: str = "startup-candidates-v1",
-) -> StartupReceiptDecisionContext:
-    return StartupReceiptDecisionContext(
-        workspace_supplied=workspace_supplied,
-        requested_byte_budget=requested_byte_budget,
-        requested_token_budget=requested_token_budget,
-        requested_item_budget=requested_item_budget,
-        effective_workspace_id=effective_workspace_id,
-        effective_byte_budget=effective_byte_budget,
-        effective_token_budget=effective_token_budget,
-        effective_item_budget=None,
-        scoring_version=scoring_version,
-        config_version=config_version,
-        candidate_strategy_version=candidate_strategy_version,
-    )
+) -> dict[str, Any]:
+    """A raw startup engine result that satisfies every required provenance key.
+
+    Mirrors the exact shape ``engram.recall.execute_startup_recall`` returns.
+    """
+    return {
+        "working_set": "",
+        "item_count": 0,
+        "byte_count": 0,
+        "pinned_omitted_count": 0,
+        "omitted_count": 0,
+        "items": [],
+        "scoring_version": scoring_version,
+        "config_version": config_version,
+        "recall_log_id": recall_log_id,
+        "candidate_strategy_version": candidate_strategy_version,
+        "workspace_id": workspace_id,
+        "effective_byte_budget": effective_byte_budget,
+        "effective_token_budget": effective_token_budget,
+        "effective_item_budget": None,
+    }
 
 
 class _FakeSession:
@@ -220,10 +228,47 @@ def _patch_session_factory(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+async def _best_effort(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    raw_result: dict[str, Any] | None = None,
+    response: _Response | None = None,
+    memory_context: ResolvedMemoryContext | None = None,
+    requested_workspace_supplied: bool = False,
+    requested_byte_budget: int | None = None,
+    requested_token_budget: int | None = None,
+    requested_item_budget: int | None = None,
+    enabled: bool = True,
+    timeout_seconds: float = 5.0,
+) -> ContextReceiptDarkWriteResult:
+    """Run the best-effort wrapper with defaults that would otherwise succeed.
+
+    Per-call patches (store/manifest/telemetry) are the caller's
+    responsibility.
+    """
+    monkeypatch.setattr(
+        settings, "context_receipt_dark_write_enabled", enabled
+    )
+    monkeypatch.setattr(
+        settings, "context_receipt_dark_write_timeout_seconds", timeout_seconds
+    )
+    return await write_startup_context_receipt_best_effort(
+        response=response or _Response(),
+        raw_result=raw_result or _valid_raw_result(),
+        memory_context=memory_context or _unrestricted_context(),
+        requested_workspace_supplied=requested_workspace_supplied,
+        requested_byte_budget=requested_byte_budget,
+        requested_token_budget=requested_token_budget,
+        requested_item_budget=requested_item_budget,
+    )
+
+
 # ─── Disabled path ──────────────────────────────────────────────────────
 
 
-async def test_disabled_returns_disabled_immediately(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_disabled_returns_disabled_immediately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", False)
 
     def _boom_session(*args: Any, **kwargs: Any) -> Any:
@@ -232,26 +277,40 @@ async def test_disabled_returns_disabled_immediately(monkeypatch: pytest.MonkeyP
     def _boom_telemetry(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("must not record telemetry when disabled")
 
-    monkeypatch.setattr("engram.context_receipt_dark_write.async_session_factory", _boom_session)
-    monkeypatch.setattr("engram.usage.record_context_receipt_dark_write", _boom_telemetry)
+    def _boom_parser(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("must not parse executed result when disabled")
 
-    response = _Response()
-    memory_context = _unrestricted_context()
-    decision_context = _decision_context()
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write.async_session_factory", _boom_session
+    )
+    monkeypatch.setattr(
+        "engram.usage.record_context_receipt_dark_write", _boom_telemetry
+    )
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write.parse_startup_executed_context",
+        _boom_parser,
+    )
+
     result = await write_startup_context_receipt_best_effort(
-        response=response,
-        recall_log_id=uuid.uuid4(),
-        memory_context=memory_context,
-        decision_context=decision_context,
+        response=_Response(),
+        raw_result=_valid_raw_result(),
+        memory_context=_unrestricted_context(),
+        requested_workspace_supplied=False,
+        requested_byte_budget=None,
+        requested_token_budget=None,
+        requested_item_budget=None,
     )
     assert result.status == "disabled"
     assert result.latency_ms == 0
     assert result.receipt_id is None
     assert result.failure_stage is None
     assert result.exception_type is None
+    assert result.telemetry_status is None
 
 
-async def test_disabled_does_not_construct_manifest(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_disabled_does_not_construct_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", False)
 
     def _boom_build(*args: Any, **kwargs: Any) -> Any:
@@ -263,242 +322,317 @@ async def test_disabled_does_not_construct_manifest(monkeypatch: pytest.MonkeyPa
 
     result = await write_startup_context_receipt_best_effort(
         response=_Response(),
-        recall_log_id=uuid.uuid4(),
+        raw_result=_valid_raw_result(),
         memory_context=_unrestricted_context(),
-        decision_context=_decision_context(),
+        requested_workspace_supplied=False,
+        requested_byte_budget=None,
+        requested_token_budget=None,
+        requested_item_budget=None,
     )
     assert result.status == "disabled"
 
 
-# ─── Descriptor mapping ─────────────────────────────────────────────────
+# ─── Executed-result parser ─────────────────────────────────────────────
 
 
-def test_requested_descriptor_preserves_caller_null_values() -> None:
-    memory_context = _unrestricted_context()
-    decision_context = _decision_context(
-        workspace_supplied=False,
-        requested_byte_budget=None,
-        requested_token_budget=None,
-        requested_item_budget=None,
-        effective_byte_budget=4096,
-        effective_token_budget=None,
-    )
-    manifest = _build_manifest(
-        response=_Response(),
-        memory_context=memory_context,
-        decision_context=decision_context,
-    )
-    requested = manifest.request.requested
-    assert requested.workspace_supplied is False
-    assert requested.byte_budget is None
-    assert requested.token_budget is None
-    assert requested.item_budget is None
-
-
-def test_requested_descriptor_preserves_caller_non_null_values() -> None:
-    memory_context = _unrestricted_context()
-    decision_context = _decision_context(
-        workspace_supplied=True,
-        requested_byte_budget=2048,
-        requested_token_budget=512,
-        requested_item_budget=7,
-    )
-    manifest = _build_manifest(
-        response=_Response(),
-        memory_context=memory_context,
-        decision_context=decision_context,
-    )
-    requested = manifest.request.requested
-    assert requested.workspace_supplied is True
-    assert requested.byte_budget == 2048
-    assert requested.token_budget == 512
-    assert requested.item_budget == 7
-
-
-def test_effective_descriptor_uses_engine_values() -> None:
-    memory_context = _unrestricted_context()
-    decision_context = _decision_context(
-        effective_workspace_id=WORKSPACE,
+def _full_raw() -> dict[str, Any]:
+    return _valid_raw_result(
+        workspace_id=str(WORKSPACE),
         effective_byte_budget=4096,
         effective_token_budget=1000,
     )
-    manifest = _build_manifest(
-        response=_Response(),
-        memory_context=memory_context,
-        decision_context=decision_context,
-    )
-    effective = manifest.request.effective
-    assert effective.workspace_id == str(WORKSPACE)
-    assert effective.byte_budget == 4096
-    assert effective.token_budget == 1000
 
 
-def test_effective_item_budget_remains_null() -> None:
-    memory_context = _unrestricted_context()
-    decision_context = _decision_context(
-        requested_item_budget=7,
-        effective_byte_budget=4096,
-    )
-    manifest = _build_manifest(
-        response=_Response(),
-        memory_context=memory_context,
-        decision_context=decision_context,
-    )
-    # Requested may be non-null (caller asked for one), but effective is always
-    # null for startup v1.
-    assert manifest.request.requested.item_budget == 7
-    assert manifest.request.effective.item_budget is None
+def test_parse_valid_result_builds_executed_context() -> None:
+    executed = parse_startup_executed_context(_full_raw())
+    assert isinstance(executed, StartupReceiptExecutedContext)
+    assert executed.recall_log_id == uuid.UUID(RECALL_LOG_ID)
+    assert executed.workspace_id == WORKSPACE
+    assert executed.scoring_version == "v1"
+    assert executed.config_version == "v1"
+    assert executed.candidate_strategy_version == "startup-candidates-v1"
+    assert executed.effective_byte_budget == 4096
+    assert executed.effective_token_budget == 1000
+    assert executed.effective_item_budget is None
 
 
-def test_workspace_supplied_boolean_is_exact() -> None:
-    memory_context = _unrestricted_context()
-    for supplied in (True, False):
-        decision_context = _decision_context(workspace_supplied=supplied)
-        manifest = _build_manifest(
-            response=_Response(),
-            memory_context=memory_context,
-            decision_context=decision_context,
+@pytest.mark.parametrize(
+    "missing_key",
+    [
+        "recall_log_id",
+        "workspace_id",
+        "scoring_version",
+        "config_version",
+        "candidate_strategy_version",
+        "effective_byte_budget",
+        "effective_token_budget",
+        "effective_item_budget",
+    ],
+)
+def test_parse_missing_required_key_raises(missing_key: str) -> None:
+    raw = _full_raw()
+    del raw[missing_key]
+    with pytest.raises(StartupDecisionContextError):
+        parse_startup_executed_context(raw)
+
+
+def test_parse_null_recall_log_id_raises() -> None:
+    raw = _full_raw()
+    raw["recall_log_id"] = None
+    with pytest.raises(StartupDecisionContextError):
+        parse_startup_executed_context(raw)
+
+
+def test_parse_malformed_recall_log_id_raises() -> None:
+    raw = _full_raw()
+    raw["recall_log_id"] = "not-a-uuid"
+    with pytest.raises(StartupDecisionContextError):
+        parse_startup_executed_context(raw)
+
+
+def test_parse_noncanonical_uppercase_recall_log_id_raises() -> None:
+    raw = _full_raw()
+    raw["recall_log_id"] = HEX_RECALL_LOG_ID.upper()
+    with pytest.raises(StartupDecisionContextError):
+        parse_startup_executed_context(raw)
+
+
+def test_parse_noncanonical_no_hyphen_recall_log_id_raises() -> None:
+    raw = _full_raw()
+    raw["recall_log_id"] = HEX_RECALL_LOG_ID.replace("-", "")
+    with pytest.raises(StartupDecisionContextError):
+        parse_startup_executed_context(raw)
+
+
+def test_parse_whitespace_padded_recall_log_id_raises() -> None:
+    raw = _full_raw()
+    raw["recall_log_id"] = f"  {RECALL_LOG_ID}  "
+    with pytest.raises(StartupDecisionContextError):
+        parse_startup_executed_context(raw)
+
+
+def test_parse_explicit_null_workspace_is_valid() -> None:
+    raw = _full_raw()
+    raw["workspace_id"] = None
+    executed = parse_startup_executed_context(raw)
+    assert executed.workspace_id is None
+
+
+def test_parse_empty_string_workspace_raises_not_null() -> None:
+    raw = _full_raw()
+    raw["workspace_id"] = ""
+    with pytest.raises(StartupDecisionContextError):
+        parse_startup_executed_context(raw)
+
+
+def test_parse_malformed_workspace_uuid_raises() -> None:
+    raw = _full_raw()
+    raw["workspace_id"] = "not-a-uuid"
+    with pytest.raises(StartupDecisionContextError):
+        parse_startup_executed_context(raw)
+
+
+def test_parse_noncanonical_workspace_uuid_raises() -> None:
+    raw = _full_raw()
+    raw["workspace_id"] = str(HEX_WORKSPACE).upper()
+    with pytest.raises(StartupDecisionContextError):
+        parse_startup_executed_context(raw)
+
+
+def test_parse_blank_scoring_version_raises() -> None:
+    raw = _full_raw()
+    raw["scoring_version"] = "   "
+    with pytest.raises(StartupDecisionContextError):
+        parse_startup_executed_context(raw)
+
+
+def test_parse_boolean_scoring_version_raises() -> None:
+    raw = _full_raw()
+    raw["scoring_version"] = True  # type: ignore[dict-item]
+    with pytest.raises(StartupDecisionContextError):
+        parse_startup_executed_context(raw)
+
+
+def test_parse_non_string_scoring_version_raises() -> None:
+    raw = _full_raw()
+    raw["scoring_version"] = 1  # type: ignore[dict-item]
+    with pytest.raises(StartupDecisionContextError):
+        parse_startup_executed_context(raw)
+
+
+def test_parse_blank_config_version_raises() -> None:
+    raw = _full_raw()
+    raw["config_version"] = ""
+    with pytest.raises(StartupDecisionContextError):
+        parse_startup_executed_context(raw)
+
+
+def test_parse_boolean_config_version_raises() -> None:
+    raw = _full_raw()
+    raw["config_version"] = False  # type: ignore[dict-item]
+    with pytest.raises(StartupDecisionContextError):
+        parse_startup_executed_context(raw)
+
+
+def test_parse_blank_candidate_strategy_raises() -> None:
+    raw = _full_raw()
+    raw["candidate_strategy_version"] = "\t"
+    with pytest.raises(StartupDecisionContextError):
+        parse_startup_executed_context(raw)
+
+
+def test_parse_boolean_candidate_strategy_raises() -> None:
+    raw = _full_raw()
+    raw["candidate_strategy_version"] = True  # type: ignore[dict-item]
+    with pytest.raises(StartupDecisionContextError):
+        parse_startup_executed_context(raw)
+
+
+def test_parse_boolean_byte_budget_raises() -> None:
+    raw = _full_raw()
+    raw["effective_byte_budget"] = True  # type: ignore[dict-item]
+    with pytest.raises(StartupDecisionContextError):
+        parse_startup_executed_context(raw)
+
+
+def test_parse_negative_byte_budget_raises() -> None:
+    raw = _full_raw()
+    raw["effective_byte_budget"] = -1
+    with pytest.raises(StartupDecisionContextError):
+        parse_startup_executed_context(raw)
+
+
+def test_parse_boolean_token_budget_raises() -> None:
+    raw = _full_raw()
+    raw["effective_token_budget"] = False  # type: ignore[dict-item]
+    with pytest.raises(StartupDecisionContextError):
+        parse_startup_executed_context(raw)
+
+
+def test_parse_negative_token_budget_raises() -> None:
+    raw = _full_raw()
+    raw["effective_token_budget"] = -7
+    with pytest.raises(StartupDecisionContextError):
+        parse_startup_executed_context(raw)
+
+
+def test_parse_non_null_effective_item_budget_raises() -> None:
+    raw = _full_raw()
+    raw["effective_item_budget"] = 3
+    with pytest.raises(StartupDecisionContextError):
+        parse_startup_executed_context(raw)
+
+
+def test_parse_returns_frozen_dataclass() -> None:
+    import dataclasses
+
+    executed = parse_startup_executed_context(_full_raw())
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        executed.scoring_version = "v2"  # type: ignore[misc]
+
+
+# ─── Public defaults must NOT enter evidence ────────────────────────────
+
+
+async def test_public_response_defaults_do_not_enter_receipt_when_key_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Public ``RecallResponse`` defaults remain available but must never
+    feed the receipt manifest. When a raw result provenance key is removed,
+    the receipt must fail open rather than substitute the response default.
+    """
+    _patch_session_factory(monkeypatch)
+
+    # Build a response that carries the public compatibility defaults
+    # (scoring_version='v1', config_version='v1') — these are the values the
+    # route would have fed into the decision context under the old code.
+    class _DefaultedResponse(_Response):
+        scoring_version = "v1"
+        config_version = "v1"
+
+    response = _DefaultedResponse()
+
+    # Remove a required provenance key from the raw result. The response
+    # default must NOT mask the absence.
+    raw = _valid_raw_result()
+    del raw["scoring_version"]
+
+    with caplog.at_level(logging.INFO, logger="engram.context_receipt_dark_write"):
+        result = await _best_effort(
+            monkeypatch,
+            raw_result=raw,
+            response=response,
         )
-        assert manifest.request.requested.workspace_supplied is supplied
 
-
-def test_profile_ids_version_copied_from_memory_context() -> None:
-    memory_context = _unrestricted_context(
-        profile_id=PROFILE,
-        profile_revision_id=PROFILE_REV,
-        profile_version=3,
-    )
-    decision_context = _decision_context()
-    manifest = _build_manifest(
-        response=_Response(),
-        memory_context=memory_context,
-        decision_context=decision_context,
-    )
-    subject = manifest.subject
-    assert subject.memory_profile_id == str(PROFILE)
-    assert subject.memory_profile_revision_id == str(PROFILE_REV)
-    assert subject.memory_profile_version == 3
-    assert subject.memory_context_version == MEMORY_CONTEXT_VERSION
-
-
-def test_unprofiled_context_subject_has_null_profile_fields() -> None:
-    memory_context = _unrestricted_context()
-    decision_context = _decision_context()
-    manifest = _build_manifest(
-        response=_Response(),
-        memory_context=memory_context,
-        decision_context=decision_context,
-    )
-    subject = manifest.subject
-    assert subject.memory_profile_id is None
-    assert subject.memory_profile_revision_id is None
-    assert subject.memory_profile_version is None
-
-
-def test_candidate_strategy_version_copied_from_executed_result() -> None:
-    memory_context = _unrestricted_context()
-    decision_context = _decision_context(
-        candidate_strategy_version="startup-candidates-v2"
-    )
-    manifest = _build_manifest(
-        response=_Response(),
-        memory_context=memory_context,
-        decision_context=decision_context,
-    )
-    assert manifest.versions.candidate_strategy_version == "startup-candidates-v2"
-
-
-def test_subject_workspace_id_matches_effective_workspace_id() -> None:
-    memory_context = _unrestricted_context()
-    decision_context = _decision_context(effective_workspace_id=WORKSPACE)
-    manifest = _build_manifest(
-        response=_Response(),
-        memory_context=memory_context,
-        decision_context=decision_context,
-    )
-    assert manifest.subject.workspace_id == str(WORKSPACE)
-    assert manifest.subject.workspace_id == manifest.request.effective.workspace_id
-
-
-# ─── Manifest is built from the supplied finalized response ─────────────
-
-
-def test_manifest_built_from_supplied_finalized_response() -> None:
-    memory_context = _unrestricted_context()
-    decision_context = _decision_context(effective_byte_budget=4096)
-    items = [_item(content="alpha"), _item(id_=ITEM_B, content="beta")]
-    response = _Response(items=items)
-    manifest = _build_manifest(
-        response=response,
-        memory_context=memory_context,
-        decision_context=decision_context,
-    )
-    assert manifest.result.item_count == 2
-    assert [i.served_content_hash for i in manifest.items] == [
-        # served_content_hash is exact-byte SHA-256 of served content.
-        "sha256:" + hashlib.sha256(b"alpha").hexdigest(),
-        "sha256:" + hashlib.sha256(b"beta").hexdigest(),
-    ]
-
-
-def test_manifest_is_immutable_to_post_build_response_mutation() -> None:
-    """The manifest must reflect the served snapshot at build time; mutating
-    the response afterward must not change the already-built manifest."""
-    memory_context = _unrestricted_context()
-    decision_context = _decision_context(effective_byte_budget=4096)
-    items = [_item(content="served-alpha"), _item(id_=ITEM_B, content="served-beta")]
-    response = _Response(items=items)
-    manifest = _build_manifest(
-        response=response,
-        memory_context=memory_context,
-        decision_context=decision_context,
-    )
-    original_hash = compute_manifest_hash(manifest)
-    # Mutate the underlying response after the build.
-    response.items[0]["content"] = "MUTATED-alpha"
-    response.items.clear()
-    response.working_set = ""
-    response.item_count = 0
-    # Re-dump the manifest — it must be unchanged (it is a snapshot).
-    dumped = manifest.model_dump(mode="json", exclude_none=False, by_alias=True)
-    rebuilt = ContextManifestV1.model_validate(dumped)
-    rebuilt_hash = compute_manifest_hash(rebuilt)
-    assert rebuilt_hash == original_hash
+    assert result.status == "failed"
+    assert result.failure_stage == "build_decision_context"
+    assert result.exception_type == "StartupDecisionContextError"
+    assert result.receipt_id is None
+    # Public response compatibility defaults remain intact.
+    assert response.scoring_version == "v1"
+    assert response.config_version == "v1"
 
 
 # ─── Timeout / failure / cancellation ────────────────────────────────────
 
 
-async def test_timeout_returns_timed_out(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A configured timeout that fires before the attempt completes returns
-    ``timed_out`` and never raises into the route."""
-    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
-    monkeypatch.setattr(settings, "context_receipt_dark_write_timeout_seconds", 0.01)
+async def test_decision_context_failure_within_deadline_returns_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``build_decision_context`` failure is an enabled attempt: it
+    produces one ``failed`` result and one bounded usage-event attempt when
+    the deadline still has room."""
+    monkeypatch.setattr(settings, "usage_telemetry_enabled", True)
+    _patch_session_factory(monkeypatch)
+
+    captured: dict[str, Any] = {}
+
+    async def _capture_usage(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr(
+        "engram.usage.record_context_receipt_dark_write", _capture_usage
+    )
+
+    raw = _valid_raw_result()
+    del raw["candidate_strategy_version"]
+
+    result = await _best_effort(monkeypatch, raw_result=raw)
+    assert result.status == "failed"
+    assert result.failure_stage == "build_decision_context"
+    assert result.exception_type == "StartupDecisionContextError"
+    assert result.verification_status == "failed"
+    # Telemetry was attempted (deadline had room).
+    assert result.telemetry_status == "recorded"
+    assert captured["status"] == "failed"
+    assert captured["failure_stage"] == "build_decision_context"
+    assert captured["exception_type"] == "StartupDecisionContextError"
+
+
+async def test_db_operation_timeout_returns_timed_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured timeout that fires before the DB attempt completes
+    returns ``timed_out`` and never raises into the route."""
     _patch_session_factory(monkeypatch)
 
     async def _slow_store(*args: Any, **kwargs: Any) -> Any:
         await asyncio.sleep(10)
         return None
 
-    # Patch store_context_receipt to hang so the timeout fires.
     monkeypatch.setattr(
         "engram.context_receipt_dark_write.store_context_receipt", _slow_store
     )
 
-    result = await write_startup_context_receipt_best_effort(
-        response=_Response(),
-        recall_log_id=uuid.uuid4(),
-        memory_context=_unrestricted_context(),
-        decision_context=_decision_context(),
-    )
+    result = await _best_effort(monkeypatch, timeout_seconds=0.01)
     assert result.status == "timed_out"
     assert result.failure_stage == "timeout"
     assert result.receipt_id is None
 
 
 async def test_ordinary_failure_returns_failed(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
-    monkeypatch.setattr(settings, "context_receipt_dark_write_timeout_seconds", 5.0)
     _patch_session_factory(monkeypatch)
 
     class _StoreError(Exception):
@@ -507,14 +641,11 @@ async def test_ordinary_failure_returns_failed(monkeypatch: pytest.MonkeyPatch) 
     async def _raise_store(*args: Any, **kwargs: Any) -> Any:
         raise _StoreError("store blew up with SECRET-SENTINEL-VALUE")
 
-    monkeypatch.setattr("engram.context_receipt_dark_write.store_context_receipt", _raise_store)
-
-    result = await write_startup_context_receipt_best_effort(
-        response=_Response(),
-        recall_log_id=uuid.uuid4(),
-        memory_context=_unrestricted_context(),
-        decision_context=_decision_context(),
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write.store_context_receipt", _raise_store
     )
+
+    result = await _best_effort(monkeypatch)
     assert result.status == "failed"
     assert result.failure_stage == "store"
     assert result.exception_type == "_StoreError"
@@ -524,8 +655,7 @@ async def test_ordinary_failure_returns_failed(monkeypatch: pytest.MonkeyPatch) 
 async def test_builder_value_error_returns_failed_build_manifest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
-    monkeypatch.setattr(settings, "context_receipt_dark_write_timeout_seconds", 5.0)
+    _patch_session_factory(monkeypatch)
 
     def _raise_build(*args: Any, **kwargs: Any) -> Any:
         raise ValueError("bad manifest input SECRET")
@@ -533,54 +663,41 @@ async def test_builder_value_error_returns_failed_build_manifest(
     monkeypatch.setattr(
         "engram.context_receipt_dark_write._build_manifest", _raise_build
     )
-    result = await write_startup_context_receipt_best_effort(
-        response=_Response(),
-        recall_log_id=uuid.uuid4(),
-        memory_context=_unrestricted_context(),
-        decision_context=_decision_context(),
-    )
+    result = await _best_effort(monkeypatch)
     assert result.status == "failed"
     assert result.failure_stage == "build_manifest"
 
 
-async def test_asyncio_cancellation_is_not_swallowed(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_asyncio_cancellation_is_not_swallowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """asyncio.CancelledError must propagate out of the best-effort wrapper,
     never be translated into a ``failed`` result."""
-    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
-    monkeypatch.setattr(settings, "context_receipt_dark_write_timeout_seconds", 5.0)
     _patch_session_factory(monkeypatch)
 
     async def _raise_cancel(*args: Any, **kwargs: Any) -> Any:
         raise asyncio.CancelledError()
 
-    monkeypatch.setattr("engram.context_receipt_dark_write.store_context_receipt", _raise_cancel)
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write.store_context_receipt", _raise_cancel
+    )
 
     with pytest.raises(asyncio.CancelledError):
-        await write_startup_context_receipt_best_effort(
-            response=_Response(),
-            recall_log_id=uuid.uuid4(),
-            memory_context=_unrestricted_context(),
-            decision_context=_decision_context(),
-        )
+        await _best_effort(monkeypatch)
 
 
 async def test_context_receipt_conflict_error_is_fail_open(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
-    monkeypatch.setattr(settings, "context_receipt_dark_write_timeout_seconds", 5.0)
     _patch_session_factory(monkeypatch)
 
     async def _raise_conflict(*args: Any, **kwargs: Any) -> Any:
         raise ContextReceiptConflictError("conflict SECRET")
 
-    monkeypatch.setattr("engram.context_receipt_dark_write.store_context_receipt", _raise_conflict)
-    result = await write_startup_context_receipt_best_effort(
-        response=_Response(),
-        recall_log_id=uuid.uuid4(),
-        memory_context=_unrestricted_context(),
-        decision_context=_decision_context(),
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write.store_context_receipt", _raise_conflict
     )
+    result = await _best_effort(monkeypatch)
     assert result.status == "failed"
     assert result.failure_stage == "store"
     assert result.exception_type == "ContextReceiptConflictError"
@@ -589,8 +706,6 @@ async def test_context_receipt_conflict_error_is_fail_open(
 async def test_context_receipt_integrity_error_is_fail_open(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
-    monkeypatch.setattr(settings, "context_receipt_dark_write_timeout_seconds", 5.0)
     _patch_session_factory(monkeypatch)
 
     from engram.context_receipts import ContextReceiptStoreResult
@@ -619,30 +734,18 @@ async def test_context_receipt_integrity_error_is_fail_open(
         "engram.context_receipt_dark_write.verify_context_receipt_record",
         _raise_integrity,
     )
-    result = await write_startup_context_receipt_best_effort(
-        response=_Response(),
-        recall_log_id=uuid.uuid4(),
-        memory_context=_unrestricted_context(),
-        decision_context=_decision_context(),
-    )
+    result = await _best_effort(monkeypatch)
     assert result.status == "failed"
     assert result.failure_stage == "verify"
     assert result.exception_type == "ContextReceiptIntegrityError"
 
 
-async def test_unexpected_helper_exception_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_unexpected_helper_exception_never_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """If the helper itself violates its no-raise contract with a bare
-    Exception, the route-level guard catches it; here we simulate by making
-    the wrapper itself raise via a patched settings attribute access."""
-    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
-    monkeypatch.setattr(settings, "context_receipt_dark_write_timeout_seconds", 5.0)
-
-    # Simulate the enabled check raising a non-Exception (SystemExit) — but
-    # SystemExit is NOT an Exception subclass, so it should propagate. Test
-    # that a plain Exception inside _write_startup_context_receipt_once is
-    # handled: patch session creation to raise a bare Exception before any
-    # stage is reached.
-    call_count = {"n": 0}
+    Exception, the best-effort boundary catches it."""
+    _patch_session_factory(monkeypatch)
 
     class _SessionCM:
         def __init__(self) -> None:
@@ -655,32 +758,196 @@ async def test_unexpected_helper_exception_never_raises(monkeypatch: pytest.Monk
             return None
 
     def _factory() -> Any:
-        call_count["n"] += 1
         return _SessionCM()
 
     monkeypatch.setattr(
         "engram.context_receipt_dark_write.async_session_factory", _factory
     )
-    result = await write_startup_context_receipt_best_effort(
-        response=_Response(),
-        recall_log_id=uuid.uuid4(),
-        memory_context=_unrestricted_context(),
-        decision_context=_decision_context(),
-    )
+    result = await _best_effort(monkeypatch)
     assert result.status == "failed"
     assert result.failure_stage == "open_session"
     assert result.exception_type == "RuntimeError"
+
+
+# ─── Deadline / telemetry boundary ──────────────────────────────────────
+
+
+async def test_slow_telemetry_bounded_by_remaining_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stalled telemetry connection must not hold the request beyond the
+    configured receipt timeout. The telemetry call is bounded with the
+    REMAINING deadline; the receipt result is preserved when telemetry times
+    out.
+    """
+    monkeypatch.setattr(settings, "usage_telemetry_enabled", True)
+    _patch_session_factory(monkeypatch)
+
+    # Make the main attempt fail fast so most of the timeout budget remains.
+    async def _raise_store(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("fast store failure")
+
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write.store_context_receipt", _raise_store
+    )
+
+    telemetry_called = {"n": 0}
+
+    async def _slow_telemetry(**kwargs: Any) -> Any:
+        telemetry_called["n"] += 1
+        await asyncio.sleep(10)  # would hold far beyond the timeout
+
+    monkeypatch.setattr(
+        "engram.usage.record_context_receipt_dark_write", _slow_telemetry
+    )
+
+    start = asyncio.get_event_loop().time()
+    result = await _best_effort(monkeypatch, timeout_seconds=0.1)
+    elapsed = asyncio.get_event_loop().time() - start
+    # The receipt result is preserved (the store failure).
+    assert result.status == "failed"
+    assert result.failure_stage == "store"
+    assert result.telemetry_status == "timed_out"
+    # Telemetry was called but bounded — total elapsed must be within the
+    # configured timeout plus a small grace.
+    assert telemetry_called["n"] == 1
+    assert elapsed < 2.0, f"telemetry held the request for {elapsed:.2f}s"
+
+
+async def test_primary_consumes_whole_deadline_skips_telemetry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the primary operation consumes the entire deadline, the wrapper
+    emits the standardized structured log, records
+    ``telemetry_status=skipped_deadline``, and returns promptly without
+    extending the total request time to write telemetry.
+    """
+    monkeypatch.setattr(settings, "usage_telemetry_enabled", True)
+    _patch_session_factory(monkeypatch)
+
+    async def _slow_store(*args: Any, **kwargs: Any) -> Any:
+        await asyncio.sleep(0.2)  # consumes the whole 0.1s deadline
+        return None
+
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write.store_context_receipt", _slow_store
+    )
+
+    telemetry_called = {"n": 0}
+
+    async def _should_not_be_called(**kwargs: Any) -> Any:
+        telemetry_called["n"] += 1
+        return None
+
+    monkeypatch.setattr(
+        "engram.usage.record_context_receipt_dark_write", _should_not_be_called
+    )
+
+    result = await _best_effort(monkeypatch, timeout_seconds=0.1)
+    assert result.status == "timed_out"
+    assert result.failure_stage == "timeout"
+    assert result.telemetry_status == "skipped_deadline"
+    assert telemetry_called["n"] == 0
+
+
+async def test_total_elapsed_is_bounded_with_grace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The total elapsed time (primary + telemetry) must never exceed the
+    configured timeout by more than a small nonflaky grace. Shared CI may
+    schedule slowly, so the grace is generous but still bounded."""
+    monkeypatch.setattr(settings, "usage_telemetry_enabled", True)
+    _patch_session_factory(monkeypatch)
+
+    async def _slow_store(*args: Any, **kwargs: Any) -> Any:
+        await asyncio.sleep(0.05)
+
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write.store_context_receipt", _slow_store
+    )
+
+    async def _slow_telemetry(**kwargs: Any) -> Any:
+        await asyncio.sleep(0.05)
+
+    monkeypatch.setattr(
+        "engram.usage.record_context_receipt_dark_write", _slow_telemetry
+    )
+
+    start = asyncio.get_event_loop().time()
+    await _best_effort(monkeypatch, timeout_seconds=0.1)
+    elapsed = asyncio.get_event_loop().time() - start
+    # 0.1s configured timeout + a 2s grace for shared-CI scheduling jitter.
+    assert elapsed < 2.0, f"total elapsed {elapsed:.2f}s exceeded the grace"
+
+
+async def test_no_untracked_telemetry_task_remains(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Telemetry must be awaited inline (no fire-and-forget background task),
+    so no untracked task remains after the wrapper returns."""
+    monkeypatch.setattr(settings, "usage_telemetry_enabled", True)
+    _patch_session_factory(monkeypatch)
+
+    async def _raise_store(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("fail to exercise telemetry path")
+
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write.store_context_receipt", _raise_store
+    )
+
+    async def _fast_telemetry(**kwargs: Any) -> Any:
+        return None
+
+    monkeypatch.setattr(
+        "engram.usage.record_context_receipt_dark_write", _fast_telemetry
+    )
+
+    before = len(asyncio.all_tasks())
+    await _best_effort(monkeypatch)
+    after = len(asyncio.all_tasks())
+    # Only the current task may differ; no extra telemetry task should linger.
+    assert after <= before + 1
+
+
+async def test_cancellation_propagates_through_telemetry_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation must propagate through the telemetry wait, not be
+    translated into a result."""
+    monkeypatch.setattr(settings, "usage_telemetry_enabled", True)
+    _patch_session_factory(monkeypatch)
+
+    async def _raise_store(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("fail primary so telemetry runs")
+
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write.store_context_receipt", _raise_store
+    )
+
+    async def _slow_telemetry(**kwargs: Any) -> Any:
+        await asyncio.sleep(10)
+
+    monkeypatch.setattr(
+        "engram.usage.record_context_receipt_dark_write", _slow_telemetry
+    )
+
+    async def _runner() -> None:
+        await _best_effort(monkeypatch, timeout_seconds=5.0)
+
+    task = asyncio.ensure_future(_runner())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 # ─── Safe logging excludes exception messages and content ──────────────
 
 
 async def test_safe_logging_excludes_exception_messages_and_content(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
-    monkeypatch.setattr(settings, "context_receipt_dark_write_timeout_seconds", 5.0)
     monkeypatch.setattr(settings, "usage_telemetry_enabled", False)
+    _patch_session_factory(monkeypatch)
 
     class _StoreError(Exception):
         pass
@@ -690,15 +957,12 @@ async def test_safe_logging_excludes_exception_messages_and_content(
     async def _raise_store(*args: Any, **kwargs: Any) -> Any:
         raise _StoreError(f"store failed with {secret}")
 
-    monkeypatch.setattr("engram.context_receipt_dark_write.store_context_receipt", _raise_store)
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write.store_context_receipt", _raise_store
+    )
 
-    with caplog.at_level(logging.WARNING, logger="engram.context_receipt_dark_write"):
-        result = await write_startup_context_receipt_best_effort(
-            response=_Response(),
-            recall_log_id=uuid.uuid4(),
-            memory_context=_unrestricted_context(),
-            decision_context=_decision_context(),
-        )
+    with caplog.at_level(logging.INFO, logger="engram.context_receipt_dark_write"):
+        result = await _best_effort(monkeypatch)
     assert result.status == "failed"
     # The secret sentinel must not appear anywhere in the captured logs.
     for record in caplog.records:
@@ -710,30 +974,70 @@ async def test_safe_logging_excludes_exception_messages_and_content(
 
 
 async def test_no_logger_exception_on_fail_open_path(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """``logger.exception`` is prohibited on this fail-open path because
     exception representations may include bound values. The wrapper must use
-    safe warning logs containing exception type only."""
-    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
-    monkeypatch.setattr(settings, "context_receipt_dark_write_timeout_seconds", 5.0)
+    safe logs containing exception type only."""
     monkeypatch.setattr(settings, "usage_telemetry_enabled", False)
+    _patch_session_factory(monkeypatch)
 
     async def _raise_store(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError("store failed SECRET")
 
-    monkeypatch.setattr("engram.context_receipt_dark_write.store_context_receipt", _raise_store)
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write.store_context_receipt", _raise_store
+    )
 
     with caplog.at_level(logging.DEBUG, logger="engram.context_receipt_dark_write"):
-        await write_startup_context_receipt_best_effort(
-            response=_Response(),
-            recall_log_id=uuid.uuid4(),
-            memory_context=_unrestricted_context(),
-            decision_context=_decision_context(),
-        )
+        await _best_effort(monkeypatch)
     # No record may carry an exception traceback (exc_info).
     for record in caplog.records:
         assert record.exc_info is None
+
+
+async def test_standardized_log_fields_present_on_every_enabled_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One standardized structured log per enabled attempt, with all required
+    fields present."""
+    monkeypatch.setattr(settings, "usage_telemetry_enabled", False)
+    _patch_session_factory(monkeypatch)
+
+    async def _raise_store(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("forced store failure")
+
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write.store_context_receipt", _raise_store
+    )
+
+    with caplog.at_level(logging.INFO, logger="engram.context_receipt_dark_write"):
+        await _best_effort(monkeypatch)
+
+    dark_logs = [
+        r
+        for r in caplog.records
+        if r.name == "engram.context_receipt_dark_write"
+        and "context_receipt_dark_write" in r.getMessage()
+    ]
+    assert len(dark_logs) == 1
+    msg = dark_logs[0].getMessage()
+    for field in (
+        "event=context_receipt_dark_write",
+        "status=",
+        "tenant_id=",
+        "principal_id=",
+        "mode=startup",
+        "latency_ms=",
+        "item_count=",
+        "failure_stage=",
+        "exception_type=",
+        "verification_status=",
+        "telemetry_status=",
+    ):
+        assert field in msg, f"standardized log missing {field!r}"
 
 
 # ─── Usage telemetry receives only bounded aggregate metadata ───────────
@@ -742,8 +1046,6 @@ async def test_no_logger_exception_on_fail_open_path(
 async def test_usage_telemetry_receives_only_bounded_aggregate_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
-    monkeypatch.setattr(settings, "context_receipt_dark_write_timeout_seconds", 5.0)
     monkeypatch.setattr(settings, "usage_telemetry_enabled", True)
     _patch_session_factory(monkeypatch)
 
@@ -762,20 +1064,13 @@ async def test_usage_telemetry_receives_only_bounded_aggregate_metadata(
     async def _raise_store(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError("SECRET store failure with raw content 'hello world'")
 
-    monkeypatch.setattr("engram.context_receipt_dark_write.store_context_receipt", _raise_store)
-
-    result = await write_startup_context_receipt_best_effort(
-        response=_Response(),
-        recall_log_id=uuid.uuid4(),
-        memory_context=_unrestricted_context(),
-        decision_context=_decision_context(),
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write.store_context_receipt", _raise_store
     )
+
+    result = await _best_effort(monkeypatch)
     assert result.status == "failed"
-    # Telemetry must have been called with bounded aggregate metadata. The
-    # wrapper (record_context_receipt_dark_write) is patched here, so the
-    # captured kwargs are the bounded inputs the orchestrator passes — NOT
-    # event_type (which the wrapper itself would add when it calls
-    # record_usage_event_best_effort).
+    # Telemetry must have been called with bounded aggregate metadata.
     assert captured["status"] == "failed"
     assert captured["mode"] == "startup"
     assert captured["failure_stage"] == "store"
@@ -793,8 +1088,6 @@ async def test_usage_telemetry_failure_does_not_alter_dark_write_result(
 ) -> None:
     """A telemetry insert failure must not alter the dark-write result or
     the recall response."""
-    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
-    monkeypatch.setattr(settings, "context_receipt_dark_write_timeout_seconds", 5.0)
     monkeypatch.setattr(settings, "usage_telemetry_enabled", True)
     _patch_session_factory(monkeypatch)
 
@@ -811,67 +1104,204 @@ async def test_usage_telemetry_failure_does_not_alter_dark_write_result(
     async def _fake_store(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError("no db SECRET")
 
-    monkeypatch.setattr("engram.context_receipt_dark_write.store_context_receipt", _fake_store)
-
-    result = await write_startup_context_receipt_best_effort(
-        response=_Response(),
-        recall_log_id=uuid.uuid4(),
-        memory_context=_unrestricted_context(),
-        decision_context=_decision_context(),
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write.store_context_receipt", _fake_store
     )
+
+    result = await _best_effort(monkeypatch)
     # The telemetry failure must not have changed the dark-write result.
     assert result.status == "failed"
     assert result.failure_stage == "store"
+    assert result.telemetry_status == "failed"
 
 
-# ─── Fix #3b: telemetry bounded within the configured timeout ──────────
+# ─── Manifest descriptor mapping (still pure) ───────────────────────────
 
 
-async def test_slow_telemetry_bounded_by_remaining_deadline(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A stalled telemetry connection must not hold the request beyond the
-    configured receipt timeout (Fix #3b). The telemetry call is wrapped in a
-    ``wait_for`` with the remaining deadline; the receipt result is preserved
-    when telemetry times out.
-    """
-    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
-    monkeypatch.setattr(settings, "context_receipt_dark_write_timeout_seconds", 0.1)
-    monkeypatch.setattr(settings, "usage_telemetry_enabled", True)
-    _patch_session_factory(monkeypatch)
-
-    # Make the main attempt fail fast so most of the timeout budget remains.
-    async def _raise_store(*args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError("fast store failure")
-
-    monkeypatch.setattr("engram.context_receipt_dark_write.store_context_receipt", _raise_store)
-
-    telemetry_called = {"n": 0}
-
-    async def _slow_telemetry(**kwargs: Any) -> Any:
-        telemetry_called["n"] += 1
-        await asyncio.sleep(10)  # would hold far beyond the timeout
-
-    monkeypatch.setattr("engram.usage.record_context_receipt_dark_write", _slow_telemetry)
-
-    start = asyncio.get_event_loop().time()
-    result = await write_startup_context_receipt_best_effort(
-        response=_Response(),
-        recall_log_id=uuid.uuid4(),
-        memory_context=_unrestricted_context(),
-        decision_context=_decision_context(),
+def _decision_context(
+    *,
+    workspace_supplied: bool = False,
+    requested_byte_budget: int | None = None,
+    requested_token_budget: int | None = None,
+    requested_item_budget: int | None = None,
+    effective_workspace_id: uuid.UUID | None = None,
+    effective_byte_budget: int | None = 4096,
+    effective_token_budget: int | None = None,
+    scoring_version: str = "v1",
+    config_version: str = "v1",
+    candidate_strategy_version: str = "startup-candidates-v1",
+) -> StartupReceiptDecisionContext:
+    return StartupReceiptDecisionContext(
+        workspace_supplied=workspace_supplied,
+        requested_byte_budget=requested_byte_budget,
+        requested_token_budget=requested_token_budget,
+        requested_item_budget=requested_item_budget,
+        effective_workspace_id=effective_workspace_id,
+        effective_byte_budget=effective_byte_budget,
+        effective_token_budget=effective_token_budget,
+        effective_item_budget=None,
+        scoring_version=scoring_version,
+        config_version=config_version,
+        candidate_strategy_version=candidate_strategy_version,
     )
-    elapsed = asyncio.get_event_loop().time() - start
-    # The receipt result is preserved (the store failure).
-    assert result.status == "failed"
-    assert result.failure_stage == "store"
-    # Telemetry was called but bounded — total elapsed must be within the
-    # configured timeout (0.1s) plus a small grace.
-    assert telemetry_called["n"] == 1
-    assert elapsed < 2.0, f"telemetry held the request for {elapsed:.2f}s"
 
 
-# ─── Fix #3a: timeout validator rejects NaN / ±Infinity ────────────────
+def _build_manifest(
+    *,
+    response: _Response | None = None,
+    memory_context: ResolvedMemoryContext | None = None,
+    decision_context: StartupReceiptDecisionContext | None = None,
+) -> ContextManifestV1:
+    from engram.context_receipt_dark_write import _build_manifest as _bm
+
+    return _bm(
+        response=response or _Response(),
+        memory_context=memory_context or _unrestricted_context(),
+        decision_context=decision_context or _decision_context(),
+    )
+
+
+def test_requested_descriptor_preserves_caller_null_values() -> None:
+    manifest = _build_manifest(
+        decision_context=_decision_context(
+            workspace_supplied=False,
+            requested_byte_budget=None,
+            requested_token_budget=None,
+            requested_item_budget=None,
+        ),
+    )
+    requested = manifest.request.requested
+    assert requested.workspace_supplied is False
+    assert requested.byte_budget is None
+    assert requested.token_budget is None
+    assert requested.item_budget is None
+
+
+def test_requested_descriptor_preserves_caller_non_null_values() -> None:
+    manifest = _build_manifest(
+        decision_context=_decision_context(
+            workspace_supplied=True,
+            requested_byte_budget=2048,
+            requested_token_budget=512,
+            requested_item_budget=7,
+        ),
+    )
+    requested = manifest.request.requested
+    assert requested.workspace_supplied is True
+    assert requested.byte_budget == 2048
+    assert requested.token_budget == 512
+    assert requested.item_budget == 7
+
+
+def test_effective_descriptor_uses_engine_values() -> None:
+    manifest = _build_manifest(
+        decision_context=_decision_context(
+            effective_workspace_id=WORKSPACE,
+            effective_byte_budget=4096,
+            effective_token_budget=1000,
+        ),
+    )
+    effective = manifest.request.effective
+    assert effective.workspace_id == str(WORKSPACE)
+    assert effective.byte_budget == 4096
+    assert effective.token_budget == 1000
+
+
+def test_effective_item_budget_remains_null() -> None:
+    manifest = _build_manifest(
+        decision_context=_decision_context(
+            requested_item_budget=7,
+            effective_byte_budget=4096,
+        ),
+    )
+    # Requested may be non-null (caller asked for one), but effective is always
+    # null for startup v1.
+    assert manifest.request.requested.item_budget == 7
+    assert manifest.request.effective.item_budget is None
+
+
+def test_workspace_supplied_boolean_is_exact() -> None:
+    for supplied in (True, False):
+        manifest = _build_manifest(
+            decision_context=_decision_context(workspace_supplied=supplied),
+        )
+        assert manifest.request.requested.workspace_supplied is supplied
+
+
+def test_profile_ids_version_copied_from_memory_context() -> None:
+    memory_context = _unrestricted_context(
+        profile_id=PROFILE,
+        profile_revision_id=PROFILE_REV,
+        profile_version=3,
+    )
+    manifest = _build_manifest(memory_context=memory_context)
+    subject = manifest.subject
+    assert subject.memory_profile_id == str(PROFILE)
+    assert subject.memory_profile_revision_id == str(PROFILE_REV)
+    assert subject.memory_profile_version == 3
+    assert subject.memory_context_version == MEMORY_CONTEXT_VERSION
+
+
+def test_unprofiled_context_subject_has_null_profile_fields() -> None:
+    manifest = _build_manifest()
+    subject = manifest.subject
+    assert subject.memory_profile_id is None
+    assert subject.memory_profile_revision_id is None
+    assert subject.memory_profile_version is None
+
+
+def test_candidate_strategy_version_copied_from_executed_result() -> None:
+    manifest = _build_manifest(
+        decision_context=_decision_context(
+            candidate_strategy_version="startup-candidates-v2"
+        ),
+    )
+    assert manifest.versions.candidate_strategy_version == "startup-candidates-v2"
+
+
+def test_subject_workspace_id_matches_effective_workspace_id() -> None:
+    manifest = _build_manifest(
+        decision_context=_decision_context(effective_workspace_id=WORKSPACE),
+    )
+    assert manifest.subject.workspace_id == str(WORKSPACE)
+    assert manifest.subject.workspace_id == manifest.request.effective.workspace_id
+
+
+# ─── Manifest is built from the supplied finalized response ─────────────
+
+
+def test_manifest_built_from_supplied_finalized_response() -> None:
+    items = [_item(content="alpha"), _item(id_=ITEM_B, content="beta")]
+    response = _Response(items=items)
+    manifest = _build_manifest(response=response)
+    assert manifest.result.item_count == 2
+    assert [i.served_content_hash for i in manifest.items] == [
+        # served_content_hash is exact-byte SHA-256 of served content.
+        "sha256:" + hashlib.sha256(b"alpha").hexdigest(),
+        "sha256:" + hashlib.sha256(b"beta").hexdigest(),
+    ]
+
+
+def test_manifest_is_immutable_to_post_build_response_mutation() -> None:
+    """The manifest must reflect the served snapshot at build time; mutating
+    the response afterward must not change the already-built manifest."""
+    items = [_item(content="served-alpha"), _item(id_=ITEM_B, content="served-beta")]
+    response = _Response(items=items)
+    manifest = _build_manifest(response=response)
+    original_hash = compute_manifest_hash(manifest)
+    # Mutate the underlying response after the build.
+    response.items[0]["content"] = "MUTATED-alpha"
+    response.items.clear()
+    response.working_set = ""
+    response.item_count = 0
+    # Re-dump the manifest — it must be unchanged (it is a snapshot).
+    dumped = manifest.model_dump(mode="json", exclude_none=False, by_alias=True)
+    rebuilt = ContextManifestV1.model_validate(dumped)
+    rebuilt_hash = compute_manifest_hash(rebuilt)
+    assert rebuilt_hash == original_hash
+
+
+# ─── Config: NaN / ±Infinity timeout validator ─────────────────────────
 
 
 def test_config_rejects_nan_timeout() -> None:
@@ -900,154 +1330,3 @@ def test_config_accepts_valid_finite_positive_timeout() -> None:
 
     s = Settings(context_receipt_dark_write_timeout_seconds=2.5)
     assert s.context_receipt_dark_write_timeout_seconds == 2.5
-
-
-# ─── Fix #4: decision-context factory requires exact engine keys ────────
-
-
-def test_decision_context_factory_missing_candidate_strategy_raises() -> None:
-    from engram.context_receipt_dark_write import (
-        StartupDecisionContextError,
-        build_startup_decision_context_from_result,
-    )
-
-    result = {
-        "effective_byte_budget": 4096,
-        "effective_token_budget": None,
-        "effective_item_budget": None,
-    }
-    with pytest.raises(StartupDecisionContextError):
-        build_startup_decision_context_from_result(
-            req_workspace_supplied=False,
-            req_byte_budget=None,
-            req_token_budget=None,
-            req_item_budget=None,
-            result=result,
-            scoring_version="v1",
-            config_version="v1",
-        )
-
-
-def test_decision_context_factory_missing_effective_byte_budget_raises() -> None:
-    from engram.context_receipt_dark_write import (
-        StartupDecisionContextError,
-        build_startup_decision_context_from_result,
-    )
-
-    result = {
-        "candidate_strategy_version": "startup-candidates-v1",
-        "effective_token_budget": None,
-        "effective_item_budget": None,
-    }
-    with pytest.raises(StartupDecisionContextError):
-        build_startup_decision_context_from_result(
-            req_workspace_supplied=False,
-            req_byte_budget=None,
-            req_token_budget=None,
-            req_item_budget=None,
-            result=result,
-            scoring_version="v1",
-            config_version="v1",
-        )
-
-
-def test_decision_context_factory_missing_effective_item_budget_raises() -> None:
-    from engram.context_receipt_dark_write import (
-        StartupDecisionContextError,
-        build_startup_decision_context_from_result,
-    )
-
-    result = {
-        "candidate_strategy_version": "startup-candidates-v1",
-        "effective_byte_budget": 4096,
-        "effective_token_budget": None,
-    }
-    with pytest.raises(StartupDecisionContextError):
-        build_startup_decision_context_from_result(
-            req_workspace_supplied=False,
-            req_byte_budget=None,
-            req_token_budget=None,
-            req_item_budget=None,
-            result=result,
-            scoring_version="v1",
-            config_version="v1",
-        )
-
-
-def test_decision_context_factory_non_null_effective_item_budget_raises() -> None:
-    from engram.context_receipt_dark_write import (
-        StartupDecisionContextError,
-        build_startup_decision_context_from_result,
-    )
-
-    result = {
-        "candidate_strategy_version": "startup-candidates-v1",
-        "effective_byte_budget": 4096,
-        "effective_token_budget": None,
-        "effective_item_budget": 7,  # must be None for startup
-    }
-    with pytest.raises(StartupDecisionContextError):
-        build_startup_decision_context_from_result(
-            req_workspace_supplied=False,
-            req_byte_budget=None,
-            req_token_budget=None,
-            req_item_budget=None,
-            result=result,
-            scoring_version="v1",
-            config_version="v1",
-        )
-
-
-def test_decision_context_factory_wrong_type_candidate_strategy_raises() -> None:
-    from engram.context_receipt_dark_write import (
-        StartupDecisionContextError,
-        build_startup_decision_context_from_result,
-    )
-
-    result = {
-        "candidate_strategy_version": 123,  # must be str
-        "effective_byte_budget": 4096,
-        "effective_token_budget": None,
-        "effective_item_budget": None,
-    }
-    with pytest.raises(StartupDecisionContextError):
-        build_startup_decision_context_from_result(
-            req_workspace_supplied=False,
-            req_byte_budget=None,
-            req_token_budget=None,
-            req_item_budget=None,
-            result=result,
-            scoring_version="v1",
-            config_version="v1",
-        )
-
-
-def test_decision_context_factory_valid_result_builds_context() -> None:
-    from engram.context_receipt_dark_write import (
-        build_startup_decision_context_from_result,
-    )
-
-    result = {
-        "candidate_strategy_version": "startup-candidates-v1",
-        "effective_byte_budget": 4096,
-        "effective_token_budget": None,
-        "effective_item_budget": None,
-        "workspace_id": None,
-    }
-    dc = build_startup_decision_context_from_result(
-        req_workspace_supplied=True,
-        req_byte_budget=2048,
-        req_token_budget=None,
-        req_item_budget=5,
-        result=result,
-        scoring_version="v1",
-        config_version="v1",
-    )
-    assert dc.candidate_strategy_version == "startup-candidates-v1"
-    assert dc.effective_byte_budget == 4096
-    assert dc.effective_token_budget is None
-    assert dc.effective_item_budget is None
-    assert dc.effective_workspace_id is None
-    assert dc.workspace_supplied is True
-    assert dc.requested_byte_budget == 2048
-    assert dc.requested_item_budget == 5

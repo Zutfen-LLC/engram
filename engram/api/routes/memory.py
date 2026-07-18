@@ -5,6 +5,7 @@ This is a skeleton — implementation in Phase 1 PR 4-5.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -38,7 +39,6 @@ from engram.classification_evidence import bind_run, lock_run
 from engram.classification_trust import narrow_visibility
 from engram.config import settings
 from engram.context_receipt_dark_write import (
-    build_startup_decision_context_from_result,
     write_startup_context_receipt_best_effort,
 )
 from engram.db import get_session
@@ -1320,58 +1320,42 @@ async def recall(
     # dark-write time (the client waits for the attempt before receiving the
     # response). The dedicated receipt event records the dark-write latency
     # separately. Semantic recall never invokes the dark write. A receipt
-    # failure must never fail recall or modify the response; the helper itself
-    # is contracted to be no-raise, but a route-level defense-in-depth guard
-    # still returns the successful response if it ever violates that contract.
-    if mode == "startup" and result.get("recall_log_id"):
-        recall_log_id_str = result.get("recall_log_id")
-        assert recall_log_id_str is not None
+    # failure must never fail recall or modify the response.
+    #
+    # The OUTER guard checks the feature flag before ANY receipt-specific
+    # work: no manifest work, no decision-context parsing, no receipt DB
+    # session, no receipt telemetry, no receipt-related warning logs run
+    # while the feature is disabled. The helper's own disabled check is
+    # retained as defense in depth. The route supplies the finalized
+    # RecallResponse, the raw executed engine result, and the caller's
+    # original request values; the helper owns executed-result validation,
+    # manifest construction, persistence, reload, verification, commit,
+    # bounded telemetry, and the standardized structured log. The route does
+    # NOT duplicate evidence parsing — public RecallResponse defaults must
+    # never feed the receipt manifest.
+    if settings.context_receipt_dark_write_enabled and mode == "startup":
         try:
-            recall_log_uuid = UUID(str(recall_log_id_str))
-        except (ValueError, AttributeError, TypeError):
-            recall_log_uuid = None
-        if recall_log_uuid is not None:
-            # Build the decision context from the EXACT executed engine values
-            # — no defaults. A missing/malformed internal key raises
-            # StartupDecisionContextError, which the guard below catches and
-            # logs as a bounded failure. Evidence code must never infer an
-            # executed value from a missing key.
-            try:
-                decision_context = build_startup_decision_context_from_result(
-                    req_workspace_supplied=req.workspace is not None,
-                    req_byte_budget=req.byte_budget,
-                    req_token_budget=req.token_budget,
-                    req_item_budget=req.item_budget,
-                    result=result,
-                    scoring_version=response.scoring_version,
-                    config_version=response.config_version,
-                )
-            except Exception as exc:  # noqa: BLE001 — bounded failure, no receipt
-                logger.warning(
-                    "context_receipt_dark_write decision context invalid "
-                    "mode=startup failure_stage=build_decision_context "
-                    "exc_type=%s",
-                    type(exc).__name__,
-                )
-            else:
-                try:
-                    await write_startup_context_receipt_best_effort(
-                        response=response,
-                        recall_log_id=recall_log_uuid,
-                        memory_context=memory_context,
-                        decision_context=decision_context,
-                    )
-                except Exception as exc:  # noqa: BLE001 — defense-in-depth no-raise guard
-                    # The helper is contracted to never raise an ordinary
-                    # dark-write failure. If it ever does, the route still
-                    # returns the successful recall response and logs only the
-                    # exception type (never the message — it may include bound
-                    # values).
-                    logger.warning(
-                        "context_receipt_dark_write helper raised unexpectedly "
-                        "mode=startup exc_type=%s",
-                        type(exc).__name__,
-                    )
+            await write_startup_context_receipt_best_effort(
+                response=response,
+                raw_result=result,
+                memory_context=memory_context,
+                requested_workspace_supplied=req.workspace is not None,
+                requested_byte_budget=req.byte_budget,
+                requested_token_budget=req.token_budget,
+                requested_item_budget=req.item_budget,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — defense-in-depth no-raise guard
+            # The helper is contracted to never raise an ordinary dark-write
+            # failure. If it ever does, the route still returns the
+            # successful recall response and logs only the exception type
+            # (never the message — it may include bound values).
+            logger.warning(
+                "context_receipt_dark_write helper raised unexpectedly "
+                "mode=startup exc_type=%s",
+                type(exc).__name__,
+            )
 
     await record_retrieval_request(
         tenant_id=tenant_id,

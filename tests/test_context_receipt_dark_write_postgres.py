@@ -3,14 +3,14 @@
 Exercises the full orchestrator and the production ``POST /v1/recall`` route
 against a live PostgreSQL, proving:
 
-- default-off: disabled startup creates no receipt;
+- default-off: disabled startup performs NO receipt-specific work (no parse,
+  no manifest, no receipt DB session, no telemetry, no receipt log);
 - enabled startup recall creates exactly one receipt that references the
   response's recall_log_id and verifies;
 - the stored manifest matches the exact HTTP response;
 - empty startup recall creates a valid empty receipt;
 - requested budgets are preserved; effective budgets reflect actual execution;
 - workspace-scoped startup records the resolved workspace ID;
-- profile-bound startup records profile identity;
 - semantic recall creates no receipt while the feature is enabled;
 - existing RecallResponse JSON is identical with the feature on and off
   (excluding naturally unique recall_log_id);
@@ -20,16 +20,24 @@ against a live PostgreSQL, proving:
 - receipt insertion failure leaves the recall log committed;
 - manifest construction failure leaves the recall log committed;
 - timeout leaves the recall log committed;
+- malformed executed provenance leaves the recall log committed and creates
+  no receipt, with the standardized failure observability emitted;
 - every failure still returns HTTP 200 for an otherwise successful recall;
 - retrieval telemetry status remains succeeded after receipt failure;
 - a subsequent recall works after a timed-out or failed receipt attempt;
 - RLS tenant/principal ownership is applied to the dedicated session;
 - identical helper retry for one recall log returns idempotent;
 - the finalized-response snapshot boundary holds: later memory mutations
-  cannot alter the stored served snapshot.
+  cannot alter the stored served snapshot;
+- the dedicated receipt session connects as the non-owner app role subject
+  to FORCE RLS.
 
 Skips without the Compose real-PostgreSQL stack (see ``make compose-ci``).
-``ENGRAM_FAIL_ON_DB_SKIP=1`` must produce zero database skips.
+``ENGRAM_FAIL_ON_DB_SKIP=1`` must produce zero database skips. With
+``ENGRAM_FAIL_ON_DB_SKIP=1`` the absence of ``ENGRAM_APP_DATABASE_URL``
+(non-owner app role) fails the authoritative RLS suite rather than producing
+a hidden skip — the receipt must be written through the app role, not the
+owner.
 """
 
 from __future__ import annotations
@@ -60,7 +68,6 @@ from engram.context_manifest import (
     ContextManifestV1,
 )
 from engram.context_receipt_dark_write import (
-    StartupReceiptDecisionContext,
     write_startup_context_receipt_best_effort,
 )
 from engram.context_receipts import (
@@ -135,15 +142,38 @@ async def _db_ok() -> bool:
         return False
 
 
+# The canonical database-required skip reason. Used only for genuinely
+# non-authoritative local runs where PostgreSQL is unavailable. With
+# ENGRAM_FAIL_ON_DB_SKIP=1 any test that emits this reason fails the suite
+# (see conftest.py).
+_DB_SKIP_REASON = "requires a live PostgreSQL with the v2 schema"
+_APP_ROLE_SKIP_REASON = (
+    "requires ENGRAM_APP_DATABASE_URL (non-owner app role) for RLS proofs"
+)
+
+
 def _require_db() -> None:
-    pytest.skip("requires a live PostgreSQL with the v2 schema")
+    pytest.skip(_DB_SKIP_REASON)
 
 
 def _require_app_role() -> None:
-    """Skip when the non-owner app-role DSN is unavailable (Fix #2)."""
-    pytest.skip(
-        "requires ENGRAM_APP_DATABASE_URL (non-owner app role) for RLS proofs"
-    )
+    """Skip when the non-owner app-role DSN is unavailable (Fix #2).
+
+    With ``ENGRAM_FAIL_ON_DB_SKIP=1`` this skip must NOT be hidden — the
+    authoritative CI suite sets that flag, so the absence of the app-role DSN
+    in CI is a configuration failure rather than a tolerated local skip. The
+    conftest hook only fails on the canonical ``_DB_SKIP_REASON``, so this
+    helper emits the canonical reason too when the fail flag is set.
+    """
+    import os
+
+    if os.environ.get("ENGRAM_FAIL_ON_DB_SKIP") == "1":
+        # Authoritative CI path: the app-role DSN is required, not optional.
+        pytest.fail(
+            "ENGRAM_APP_DATABASE_URL is required for app-role RLS proofs under "
+            "ENGRAM_FAIL_ON_DB_SKIP=1"
+        )
+    pytest.skip(_APP_ROLE_SKIP_REASON)
 
 
 async def _receipts_table_exists() -> bool:
@@ -157,6 +187,16 @@ async def _receipts_table_exists() -> bool:
 
 @pytest.fixture(autouse=True)
 async def _clean_db() -> None:
+    """Wipe every dark-write-relevant row before each test.
+
+    Tests in this file insert items under the default tenant's admin
+    principal (via ``_default_tenant_principal``). Cleanup by principal-name
+    prefix would never match those rows, leaving items accumulated across
+    tests and breaking count-sensitive assertions (e.g. the empty-recall
+    proof and the on/off parity proof). Wipe by content prefix and — because
+    the admin principal is shared — wipe all default-tenant items/recall
+    logs/receipts/events so each test starts from a known-empty state.
+    """
     if not await _db_ok():
         return
     async with _test_engine.begin() as conn:
@@ -164,19 +204,21 @@ async def _clean_db() -> None:
             await conn.execute(text("DELETE FROM context_receipts"))
         await conn.execute(text("DELETE FROM item_events"))
         await conn.execute(text("DELETE FROM recall_logs"))
+        # Delete every memory item for the default tenant. These tests own
+        # the only items they insert; no cross-file coupling relies on rows
+        # surviving between tests in this module.
         await conn.execute(
             text(
-                "DELETE FROM memory_items WHERE principal_id IN ("
-                "SELECT id FROM principals WHERE tenant_id = "
-                "(SELECT id FROM tenants WHERE slug = 'default') "
-                f"AND name LIKE '{_NAME_PREFIX}%')"
+                "DELETE FROM memory_items WHERE tenant_id = "
+                "(SELECT id FROM tenants WHERE slug = 'default')"
             )
         )
+        # Remove any test-only principals (e.g. the RLS cross-principal proof).
         await conn.execute(
             text(
                 "DELETE FROM principals WHERE tenant_id = "
                 "(SELECT id FROM tenants WHERE slug = 'default') "
-                f"AND name LIKE '{_NAME_PREFIX}%'"
+                "AND name IN ('other-rls', 'engctx002b-other')"
             )
         )
         with contextlib.suppress(Exception):
@@ -198,6 +240,22 @@ def _patch_orchestrator_app_factory(monkeypatch: pytest.MonkeyPatch) -> None:
             "engram.context_receipt_dark_write.async_session_factory",
             _app_session_factory,
         )
+
+
+@pytest.fixture(scope="session", autouse=True)
+async def _dispose_app_engine() -> None:
+    """Dispose the module-level app-role test engine at session teardown.
+
+    Keeps NullPool (no cross-loop connection reuse) while still releasing the
+    engine's resources cleanly so no event-loop or open-connection leakage
+    occurs between test sessions.
+    """
+    yield
+    global _app_engine
+    if _app_engine is not None:
+        with contextlib.suppress(Exception):
+            await _app_engine.dispose()
+        _app_engine = None
 
 
 async def _default_tenant_principal() -> tuple[str, str]:
@@ -303,31 +361,39 @@ def _unrestricted_context(
     )
 
 
-def _decision_context_for_result(
-    result: dict[str, Any],
+def _raw_result_from_response(
+    response: RecallResponse,
     *,
-    req_byte_budget: int | None = None,
-    req_token_budget: int | None = None,
-    req_item_budget: int | None = None,
-    workspace_supplied: bool = False,
-) -> StartupReceiptDecisionContext:
-    return StartupReceiptDecisionContext(
-        workspace_supplied=workspace_supplied,
-        requested_byte_budget=req_byte_budget,
-        requested_token_budget=req_token_budget,
-        requested_item_budget=req_item_budget,
-        effective_workspace_id=(
-            uuid.UUID(result["workspace_id"]) if result.get("workspace_id") else None
-        ),
-        effective_byte_budget=result.get("effective_byte_budget"),
-        effective_token_budget=result.get("effective_token_budget"),
-        effective_item_budget=None,
-        scoring_version=result.get("scoring_version", "v1"),
-        config_version=result.get("config_version", "v1"),
-        candidate_strategy_version=result.get(
-            "candidate_strategy_version", "startup-candidates-v1"
-        ),
-    )
+    effective_byte_budget: int | None,
+    effective_token_budget: int | None = None,
+    workspace_id: str | None = None,
+    candidate_strategy_version: str = "startup-candidates-v1",
+) -> dict[str, Any]:
+    """Build a raw startup engine result dict that mirrors what
+    ``engram.recall.execute_startup_recall`` returns for the given response.
+
+    This is the production-shaped input the orchestrator parses. Tests build
+    it from a real finalized ``RecallResponse`` (so the manifest provenance
+    matches what was actually served) plus the engine-attested effective
+    budgets. No defaults are invented for provenance fields the engine must
+    attest — the parser would reject them.
+    """
+    return {
+        "working_set": response.working_set,
+        "item_count": response.item_count,
+        "byte_count": response.byte_count,
+        "pinned_omitted_count": response.pinned_omitted_count,
+        "omitted_count": response.omitted_count,
+        "items": response.items,
+        "scoring_version": response.scoring_version,
+        "config_version": response.config_version,
+        "recall_log_id": response.recall_log_id,
+        "candidate_strategy_version": candidate_strategy_version,
+        "workspace_id": workspace_id,
+        "effective_byte_budget": effective_byte_budget,
+        "effective_token_budget": effective_token_budget,
+        "effective_item_budget": None,
+    }
 
 
 async def _count_receipts() -> int:
@@ -349,7 +415,77 @@ async def _receipt_for_recall_log(
     return result
 
 
+async def _count_usage_events(event_type: str) -> int:
+    async with _test_session_factory() as session:
+        return (
+            await session.scalar(
+                select(func.count())
+                .select_from(UsageEvent)
+                .where(UsageEvent.event_type == event_type)
+            )
+        ) or 0
+
+
 # ─── Route-level integration ────────────────────────────────────────────
+
+
+async def test_disabled_startup_invokes_no_receipt_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A disabled startup recall performs NO receipt-specific work at all:
+    no executed-result parse, no manifest build, no receipt session, no
+    receipt telemetry, no receipt usage event, no receipt row. The response
+    is the unchanged RecallResponse.
+    """
+    if not await _db_ok() or not await _receipts_table_exists():
+        _require_db()
+    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", False)
+    tenant_id, principal_id = await _default_tenant_principal()
+    await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content=f"{_NAME_PREFIX}disabled-item",
+    )
+
+    # Each receipt-specific callable must raise if invoked while disabled.
+    def _boom_parse(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("parse_startup_executed_context must not run when disabled")
+
+    def _boom_build(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("_build_manifest must not run when disabled")
+
+    def _boom_factory(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("async_session_factory must not run when disabled")
+
+    async def _boom_telemetry(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("record_context_receipt_dark_write must not run when disabled")
+
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write.parse_startup_executed_context", _boom_parse
+    )
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write._build_manifest", _boom_build
+    )
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write.async_session_factory", _boom_factory
+    )
+    monkeypatch.setattr(
+        "engram.usage.record_context_receipt_dark_write", _boom_telemetry
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=create_app()), base_url="http://test"
+    ) as client:
+        resp = await client.post("/v1/recall", json={"mode": "startup"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # The response is the unchanged RecallResponse.
+    assert body["item_count"] == 1
+    assert "receipt_id" not in body
+    # No receipt row.
+    assert await _count_receipts() == 0
+    # No context_receipt.dark_write usage event.
+    assert await _count_usage_events("context_receipt.dark_write") == 0
 
 
 async def test_disabled_startup_creates_no_receipt(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -609,16 +745,22 @@ async def test_response_json_identical_on_and_off_excluding_recall_log_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Existing RecallResponse JSON is identical with the feature on and off,
-    excluding naturally unique recall_log_id values."""
+    excluding naturally unique recall_log_id values.
+
+    Inserts exactly one item before BOTH recalls so the served working set is
+    identical across the two calls (no per-call item insertion that would
+    differ between off and on).
+    """
     if not await _db_ok() or not await _receipts_table_exists():
         _require_db()
     tenant_id, principal_id = await _default_tenant_principal()
     content = f"{_NAME_PREFIX}parity-item"
+    # Insert ONE item before either recall; do not insert again between them.
+    await _insert_item(
+        tenant_id=tenant_id, principal_id=principal_id, content=content
+    )
 
     async def _recall() -> dict[str, Any]:
-        await _insert_item(
-            tenant_id=tenant_id, principal_id=principal_id, content=content
-        )
         async with AsyncClient(
             transport=ASGITransport(app=create_app()), base_url="http://test"
         ) as client:
@@ -690,6 +832,14 @@ async def test_retrieval_telemetry_status_succeeded_after_receipt_failure(
 async def test_subsequent_recall_works_after_failed_receipt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A subsequent recall works normally after a failed receipt attempt.
+
+    Replaces a broad ``monkeypatch.undo()`` (which would also remove the
+    autouse app-role receipt-factory patch and the feature-setting
+    restoration) with a targeted restore of only the one patched production
+    callable, so the second recall continues to write the receipt through
+    the app role.
+    """
     if not await _db_ok() or not await _receipts_table_exists():
         _require_db()
     monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
@@ -700,6 +850,11 @@ async def test_subsequent_recall_works_after_failed_receipt(
         principal_id=principal_id,
         content=f"{_NAME_PREFIX}subsequent-item",
     )
+
+    # Save the real production store callable so we can restore ONLY it after
+    # the first (forced-failure) recall. This preserves the autouse
+    # app-role receipt-factory patch and the feature-flag settings.
+    from engram.context_receipt_dark_write import store_context_receipt as _real_store
 
     async def _raise_store(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError("forced store failure")
@@ -713,10 +868,12 @@ async def test_subsequent_recall_works_after_failed_receipt(
         resp1 = await client.post("/v1/recall", json={"mode": "startup"})
     assert resp1.status_code == 200
 
-    # Remove the failure patch; a subsequent recall must work normally.
-    monkeypatch.undo()
-    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
-    monkeypatch.setattr(settings, "context_receipt_dark_write_timeout_seconds", 5.0)
+    # Restore ONLY the store callable — the app-role factory patch and the
+    # feature settings from the autouse fixture / explicit sets above remain
+    # in effect, so the second recall writes its receipt through the app role.
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write.store_context_receipt", _real_store
+    )
     async with AsyncClient(
         transport=ASGITransport(app=create_app()), base_url="http://test"
     ) as client:
@@ -752,19 +909,22 @@ async def test_semantic_recall_creates_no_receipt_when_enabled(
 # ─── Direct orchestrator: idempotency, dedicated session, RLS ───────────
 
 
-async def _build_real_response_and_log(
+async def _build_real_response_and_raw_result(
     monkeypatch: pytest.MonkeyPatch,
     *,
     content: str = f"{_NAME_PREFIX}direct-item",
-) -> tuple[RecallResponse, str, str, str]:
-    """Execute a real startup recall and return the finalized response +
-    recall_log_id + tenant_id + principal_id, WITHOUT creating a receipt.
+    byte_budget: int | None = None,
+    token_budget: int | None = None,
+) -> tuple[RecallResponse, dict[str, Any], str, str]:
+    """Execute a real startup recall and return the finalized response, a
+    raw-result dict the orchestrator can parse, and the tenant/principal ids
+    — WITHOUT creating a receipt.
 
     The dark-write feature is temporarily disabled for this setup recall only
     (so the route produces a recall log but no receipt), then RESTORED to its
     prior value. Callers that want the feature enabled for the subsequent
     direct orchestrator call must re-enable it explicitly after this helper
-    returns (Fix #1: the helper must not leave global state disabled).
+    returns.
     """
     saved = settings.context_receipt_dark_write_enabled
     monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", False)
@@ -772,10 +932,15 @@ async def _build_real_response_and_log(
     await _insert_item(
         tenant_id=tenant_id, principal_id=principal_id, content=content
     )
+    request_json: dict[str, Any] = {"mode": "startup"}
+    if byte_budget is not None:
+        request_json["byte_budget"] = byte_budget
+    if token_budget is not None:
+        request_json["token_budget"] = token_budget
     async with AsyncClient(
         transport=ASGITransport(app=create_app()), base_url="http://test"
     ) as client:
-        resp = await client.post("/v1/recall", json={"mode": "startup"})
+        resp = await client.post("/v1/recall", json=request_json)
     # Restore the prior value so callers control the feature state.
     monkeypatch.setattr(
         settings, "context_receipt_dark_write_enabled", saved
@@ -783,7 +948,36 @@ async def _build_real_response_and_log(
     assert resp.status_code == 200
     response = RecallResponse(**resp.json())
     assert response.recall_log_id is not None
-    return response, str(response.recall_log_id), tenant_id, principal_id
+    raw_result = _raw_result_from_response(
+        response,
+        effective_byte_budget=(
+            byte_budget if byte_budget is not None else settings.recall_byte_budget
+        ),
+        effective_token_budget=token_budget,
+    )
+    return response, raw_result, tenant_id, principal_id
+
+
+async def _direct_best_effort(
+    monkeypatch: pytest.MonkeyPatch,
+    response: RecallResponse,
+    raw_result: dict[str, Any],
+    tenant_id: str,
+    principal_id: str,
+) -> Any:
+    """Call the orchestrator directly with the new raw-result API."""
+    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
+    monkeypatch.setattr(settings, "context_receipt_dark_write_timeout_seconds", 5.0)
+    memory_context = _unrestricted_context(tenant_id, principal_id)
+    return await write_startup_context_receipt_best_effort(
+        response=response,
+        raw_result=raw_result,
+        memory_context=memory_context,
+        requested_workspace_supplied=False,
+        requested_byte_budget=None,
+        requested_token_budget=None,
+        requested_item_budget=None,
+    )
 
 
 async def test_idempotent_retry_returns_created_then_idempotent(
@@ -795,46 +989,21 @@ async def test_idempotent_retry_returns_created_then_idempotent(
         _require_db()
     if _app_session_factory is None:
         _require_app_role()
-    # The helper produces a recall log WITHOUT a receipt (feature disabled for
-    # the setup recall, then restored). Re-enable explicitly before the direct
-    # orchestrator calls (Fix #1).
-    response, recall_log_id, tenant_id, principal_id = await _build_real_response_and_log(
-        monkeypatch
+    response, raw_result, tenant_id, principal_id = (
+        await _build_real_response_and_raw_result(monkeypatch)
     )
-    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
-    monkeypatch.setattr(settings, "context_receipt_dark_write_timeout_seconds", 5.0)
-    memory_context = _unrestricted_context(tenant_id, principal_id)
-    decision_context = StartupReceiptDecisionContext(
-        workspace_supplied=False,
-        requested_byte_budget=None,
-        requested_token_budget=None,
-        requested_item_budget=None,
-        effective_workspace_id=None,
-        effective_byte_budget=settings.recall_byte_budget,
-        effective_token_budget=None,
-        effective_item_budget=None,
-        scoring_version=response.scoring_version,
-        config_version=response.config_version,
-        candidate_strategy_version="startup-candidates-v1",
-    )
-    first = await write_startup_context_receipt_best_effort(
-        response=response,
-        recall_log_id=uuid.UUID(recall_log_id),
-        memory_context=memory_context,
-        decision_context=decision_context,
+    first = await _direct_best_effort(
+        monkeypatch, response, raw_result, tenant_id, principal_id
     )
     assert first.status == "created"
     assert first.receipt_id is not None
-    second = await write_startup_context_receipt_best_effort(
-        response=response,
-        recall_log_id=uuid.UUID(recall_log_id),
-        memory_context=memory_context,
-        decision_context=decision_context,
+    second = await _direct_best_effort(
+        monkeypatch, response, raw_result, tenant_id, principal_id
     )
     assert second.status == "idempotent"
     assert second.receipt_id == first.receipt_id
     # Exactly one receipt for this recall log.
-    receipt = await _receipt_for_recall_log(recall_log_id)
+    receipt = await _receipt_for_recall_log(response.recall_log_id)
     assert receipt is not None
 
 
@@ -853,30 +1022,11 @@ async def test_receipt_written_through_app_role_subject_to_rls(
         _require_db()
     if _app_session_factory is None or _app_role_name is None:
         _require_app_role()
-    response, recall_log_id, tenant_id, principal_id = await _build_real_response_and_log(
-        monkeypatch
+    response, raw_result, tenant_id, principal_id = (
+        await _build_real_response_and_raw_result(monkeypatch)
     )
-    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
-    monkeypatch.setattr(settings, "context_receipt_dark_write_timeout_seconds", 5.0)
-    memory_context = _unrestricted_context(tenant_id, principal_id)
-    decision_context = StartupReceiptDecisionContext(
-        workspace_supplied=False,
-        requested_byte_budget=None,
-        requested_token_budget=None,
-        requested_item_budget=None,
-        effective_workspace_id=None,
-        effective_byte_budget=settings.recall_byte_budget,
-        effective_token_budget=None,
-        effective_item_budget=None,
-        scoring_version=response.scoring_version,
-        config_version=response.config_version,
-        candidate_strategy_version="startup-candidates-v1",
-    )
-    result = await write_startup_context_receipt_best_effort(
-        response=response,
-        recall_log_id=uuid.UUID(recall_log_id),
-        memory_context=memory_context,
-        decision_context=decision_context,
+    result = await _direct_best_effort(
+        monkeypatch, response, raw_result, tenant_id, principal_id
     )
     assert result.status == "created"
 
@@ -927,7 +1077,7 @@ async def test_receipt_written_through_app_role_subject_to_rls(
                 s,
                 tenant_id=t,
                 principal_id=p,
-                recall_log_id=uuid.UUID(recall_log_id),
+                recall_log_id=uuid.UUID(str(response.recall_log_id)),
             )
 
     receipt_owned = await _app_get_receipt(uuid.UUID(tenant_id), uuid.UUID(principal_id))
@@ -948,6 +1098,11 @@ async def test_mutation_boundary_served_snapshot_preserved(
     underlying MemoryItem metadata before receipt persistence, completes the
     receipt write, and verifies the stored manifest contains the served
     values from RecallResponse — not the later database values.
+
+    Uses a CHECK-valid authority value (20) for the mutation so the UPDATE
+    succeeds under the ``chk_memory_authority`` constraint
+    (authority ∈ {10,20,30,40,50}) — the proof only needs a value DIFFERENT
+    from the served one (10).
     """
     if not await _db_ok() or not await _receipts_table_exists():
         _require_db()
@@ -983,10 +1138,12 @@ async def test_mutation_boundary_served_snapshot_preserved(
     served_human_verified = served_item["human_verified"]
 
     # Mutate the underlying MemoryItem metadata BEFORE receipt persistence.
+    # authority=20 is CHECK-valid (the constraint requires {10,20,30,40,50})
+    # and different from the served 10 — sufficient for the snapshot proof.
     async with _test_session_factory() as session:
         await session.execute(
             text(
-                "UPDATE memory_items SET authority = 1, visibility = 'private', "
+                "UPDATE memory_items SET authority = 20, visibility = 'private', "
                 "review_status = 'disputed', importance = 0.01, source_trust = 0.01, "
                 "memory_confidence = 0.01, human_verified = false "
                 "WHERE id = :id"
@@ -996,27 +1153,11 @@ async def test_mutation_boundary_served_snapshot_preserved(
         await session.commit()
 
     # Now persist the receipt from the ORIGINAL served response.
-    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
-    monkeypatch.setattr(settings, "context_receipt_dark_write_timeout_seconds", 5.0)
-    memory_context = _unrestricted_context(tenant_id, principal_id)
-    decision_context = StartupReceiptDecisionContext(
-        workspace_supplied=False,
-        requested_byte_budget=None,
-        requested_token_budget=None,
-        requested_item_budget=None,
-        effective_workspace_id=None,
-        effective_byte_budget=settings.recall_byte_budget,
-        effective_token_budget=None,
-        effective_item_budget=None,
-        scoring_version=response.scoring_version,
-        config_version=response.config_version,
-        candidate_strategy_version="startup-candidates-v1",
+    raw_result = _raw_result_from_response(
+        response, effective_byte_budget=settings.recall_byte_budget
     )
-    result = await write_startup_context_receipt_best_effort(
-        response=response,
-        recall_log_id=uuid.UUID(str(response.recall_log_id)),
-        memory_context=memory_context,
-        decision_context=decision_context,
+    result = await _direct_best_effort(
+        monkeypatch, response, raw_result, tenant_id, principal_id
     )
     assert result.status == "created"
 
@@ -1033,7 +1174,7 @@ async def test_mutation_boundary_served_snapshot_preserved(
     assert stored_item.memory_confidence == served_memory_confidence
     assert stored_item.human_verified == served_human_verified
     # NOT the mutated values.
-    assert stored_item.authority != 1
+    assert stored_item.authority != 20
     assert stored_item.visibility != "private"
     assert stored_item.importance != 0.01
 
@@ -1046,43 +1187,26 @@ async def test_verification_failure_rolls_back_new_receipt(
 ) -> None:
     if not await _db_ok() or not await _receipts_table_exists():
         _require_db()
-    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
-    monkeypatch.setattr(settings, "context_receipt_dark_write_timeout_seconds", 5.0)
-    response, recall_log_id, tenant_id, principal_id = await _build_real_response_and_log(
-        monkeypatch, content=f"{_NAME_PREFIX}verify-fail-item"
+    response, raw_result, tenant_id, principal_id = (
+        await _build_real_response_and_raw_result(
+            monkeypatch, content=f"{_NAME_PREFIX}verify-fail-item"
+        )
     )
 
-    async def _raise_integrity(*args: Any, **kwargs: Any) -> Any:
+    def _raise_integrity(*args: Any, **kwargs: Any) -> Any:
         raise ContextReceiptIntegrityError("tampered SECRET")
 
     monkeypatch.setattr(
         "engram.context_receipt_dark_write.verify_context_receipt_record",
         _raise_integrity,
     )
-    memory_context = _unrestricted_context(tenant_id, principal_id)
-    decision_context = StartupReceiptDecisionContext(
-        workspace_supplied=False,
-        requested_byte_budget=None,
-        requested_token_budget=None,
-        requested_item_budget=None,
-        effective_workspace_id=None,
-        effective_byte_budget=settings.recall_byte_budget,
-        effective_token_budget=None,
-        effective_item_budget=None,
-        scoring_version=response.scoring_version,
-        config_version=response.config_version,
-        candidate_strategy_version="startup-candidates-v1",
-    )
-    result = await write_startup_context_receipt_best_effort(
-        response=response,
-        recall_log_id=uuid.UUID(recall_log_id),
-        memory_context=memory_context,
-        decision_context=decision_context,
+    result = await _direct_best_effort(
+        monkeypatch, response, raw_result, tenant_id, principal_id
     )
     assert result.status == "failed"
     assert result.failure_stage == "verify"
     # The newly inserted receipt must have been rolled back.
-    receipt = await _receipt_for_recall_log(recall_log_id)
+    receipt = await _receipt_for_recall_log(response.recall_log_id)
     assert receipt is None
 
 
@@ -1091,10 +1215,10 @@ async def test_manifest_construction_failure_leaves_recall_log_committed(
 ) -> None:
     if not await _db_ok() or not await _receipts_table_exists():
         _require_db()
-    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
-    monkeypatch.setattr(settings, "context_receipt_dark_write_timeout_seconds", 5.0)
-    response, recall_log_id, tenant_id, principal_id = await _build_real_response_and_log(
-        monkeypatch, content=f"{_NAME_PREFIX}manifest-fail-item"
+    response, raw_result, tenant_id, principal_id = (
+        await _build_real_response_and_raw_result(
+            monkeypatch, content=f"{_NAME_PREFIX}manifest-fail-item"
+        )
     )
 
     def _raise_build(*args: Any, **kwargs: Any) -> Any:
@@ -1103,25 +1227,8 @@ async def test_manifest_construction_failure_leaves_recall_log_committed(
     monkeypatch.setattr(
         "engram.context_receipt_dark_write._build_manifest", _raise_build
     )
-    memory_context = _unrestricted_context(tenant_id, principal_id)
-    decision_context = StartupReceiptDecisionContext(
-        workspace_supplied=False,
-        requested_byte_budget=None,
-        requested_token_budget=None,
-        requested_item_budget=None,
-        effective_workspace_id=None,
-        effective_byte_budget=settings.recall_byte_budget,
-        effective_token_budget=None,
-        effective_item_budget=None,
-        scoring_version=response.scoring_version,
-        config_version=response.config_version,
-        candidate_strategy_version="startup-candidates-v1",
-    )
-    result = await write_startup_context_receipt_best_effort(
-        response=response,
-        recall_log_id=uuid.UUID(recall_log_id),
-        memory_context=memory_context,
-        decision_context=decision_context,
+    result = await _direct_best_effort(
+        monkeypatch, response, raw_result, tenant_id, principal_id
     )
     assert result.status == "failed"
     assert result.failure_stage == "build_manifest"
@@ -1129,11 +1236,11 @@ async def test_manifest_construction_failure_leaves_recall_log_committed(
     async with _test_session_factory() as session:
         rl = await session.scalar(
             text("SELECT id FROM recall_logs WHERE id = :id"),
-            {"id": recall_log_id},
+            {"id": str(response.recall_log_id)},
         )
     assert rl is not None
     # No receipt.
-    receipt = await _receipt_for_recall_log(recall_log_id)
+    receipt = await _receipt_for_recall_log(response.recall_log_id)
     assert receipt is None
 
 
@@ -1142,10 +1249,10 @@ async def test_receipt_insertion_failure_leaves_recall_log_committed(
 ) -> None:
     if not await _db_ok() or not await _receipts_table_exists():
         _require_db()
-    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
-    monkeypatch.setattr(settings, "context_receipt_dark_write_timeout_seconds", 5.0)
-    response, recall_log_id, tenant_id, principal_id = await _build_real_response_and_log(
-        monkeypatch, content=f"{_NAME_PREFIX}insert-fail-item"
+    response, raw_result, tenant_id, principal_id = (
+        await _build_real_response_and_raw_result(
+            monkeypatch, content=f"{_NAME_PREFIX}insert-fail-item"
+        )
     )
 
     async def _raise_conflict(*args: Any, **kwargs: Any) -> Any:
@@ -1154,25 +1261,8 @@ async def test_receipt_insertion_failure_leaves_recall_log_committed(
     monkeypatch.setattr(
         "engram.context_receipt_dark_write.store_context_receipt", _raise_conflict
     )
-    memory_context = _unrestricted_context(tenant_id, principal_id)
-    decision_context = StartupReceiptDecisionContext(
-        workspace_supplied=False,
-        requested_byte_budget=None,
-        requested_token_budget=None,
-        requested_item_budget=None,
-        effective_workspace_id=None,
-        effective_byte_budget=settings.recall_byte_budget,
-        effective_token_budget=None,
-        effective_item_budget=None,
-        scoring_version=response.scoring_version,
-        config_version=response.config_version,
-        candidate_strategy_version="startup-candidates-v1",
-    )
-    result = await write_startup_context_receipt_best_effort(
-        response=response,
-        recall_log_id=uuid.UUID(recall_log_id),
-        memory_context=memory_context,
-        decision_context=decision_context,
+    result = await _direct_best_effort(
+        monkeypatch, response, raw_result, tenant_id, principal_id
     )
     assert result.status == "failed"
     assert result.failure_stage == "store"
@@ -1180,7 +1270,7 @@ async def test_receipt_insertion_failure_leaves_recall_log_committed(
     async with _test_session_factory() as session:
         rl = await session.scalar(
             text("SELECT id FROM recall_logs WHERE id = :id"),
-            {"id": recall_log_id},
+            {"id": str(response.recall_log_id)},
         )
     assert rl is not None
 
@@ -1190,12 +1280,13 @@ async def test_timeout_leaves_recall_log_committed(
 ) -> None:
     if not await _db_ok() or not await _receipts_table_exists():
         _require_db()
-    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
-    monkeypatch.setattr(settings, "context_receipt_dark_write_timeout_seconds", 5.0)
-    response, recall_log_id, tenant_id, principal_id = await _build_real_response_and_log(
-        monkeypatch, content=f"{_NAME_PREFIX}timeout-item"
+    response, raw_result, tenant_id, principal_id = (
+        await _build_real_response_and_raw_result(
+            monkeypatch, content=f"{_NAME_PREFIX}timeout-item"
+        )
     )
     # Now set a very short timeout and patch store to hang.
+    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
     monkeypatch.setattr(settings, "context_receipt_dark_write_timeout_seconds", 0.01)
 
     async def _slow_store(*args: Any, **kwargs: Any) -> Any:
@@ -1205,33 +1296,101 @@ async def test_timeout_leaves_recall_log_committed(
         "engram.context_receipt_dark_write.store_context_receipt", _slow_store
     )
     memory_context = _unrestricted_context(tenant_id, principal_id)
-    decision_context = StartupReceiptDecisionContext(
-        workspace_supplied=False,
+    result = await write_startup_context_receipt_best_effort(
+        response=response,
+        raw_result=raw_result,
+        memory_context=memory_context,
+        requested_workspace_supplied=False,
         requested_byte_budget=None,
         requested_token_budget=None,
         requested_item_budget=None,
-        effective_workspace_id=None,
-        effective_byte_budget=settings.recall_byte_budget,
-        effective_token_budget=None,
-        effective_item_budget=None,
-        scoring_version=response.scoring_version,
-        config_version=response.config_version,
-        candidate_strategy_version="startup-candidates-v1",
-    )
-    result = await write_startup_context_receipt_best_effort(
-        response=response,
-        recall_log_id=uuid.UUID(recall_log_id),
-        memory_context=memory_context,
-        decision_context=decision_context,
     )
     assert result.status == "timed_out"
     # Recall log still committed.
     async with _test_session_factory() as session:
         rl = await session.scalar(
             text("SELECT id FROM recall_logs WHERE id = :id"),
-            {"id": recall_log_id},
+            {"id": str(response.recall_log_id)},
         )
     assert rl is not None
+
+
+# ─── Malformed executed provenance (real-DB proof) ──────────────────────
+
+
+async def test_malformed_provenance_leaves_recall_log_committed_no_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When the startup engine result omits a required provenance key, the
+    route still returns HTTP 200, the recall log persists, no receipt is
+    created, and the standardized receipt-failure observability is emitted.
+
+    Monkeypatches the startup engine result to omit ``candidate_strategy_
+    version`` — a key the receipt must attest exactly. The route's public
+    ``RecallResponse`` defaults must NOT mask the absence.
+    """
+    if not await _db_ok() or not await _receipts_table_exists():
+        _require_db()
+    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
+    monkeypatch.setattr(settings, "context_receipt_dark_write_timeout_seconds", 5.0)
+    tenant_id, principal_id = await _default_tenant_principal()
+    await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content=f"{_NAME_PREFIX}malformed-prov-item",
+    )
+
+    # Wrap execute_startup_recall so the returned dict omits a required key.
+    # The route imports this callable inside the function body, so patch it at
+    # its source module — the route's local import resolves the patched
+    # attribute at call time.
+    import engram.recall as recall_module
+    from engram.recall import execute_startup_recall as _real_execute
+
+    async def _stripped_execute(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        result = await _real_execute(*args, **kwargs)
+        # Remove a required provenance key — the receipt must fail open.
+        result.pop("candidate_strategy_version", None)
+        return result
+
+    monkeypatch.setattr(
+        recall_module, "execute_startup_recall", _stripped_execute
+    )
+
+    with caplog.at_level(logging.INFO, logger="engram.context_receipt_dark_write"):
+        async with AsyncClient(
+            transport=ASGITransport(app=create_app()), base_url="http://test"
+        ) as client:
+            resp = await client.post("/v1/recall", json={"mode": "startup"})
+
+    assert resp.status_code == 200
+    response = RecallResponse(**resp.json())
+    assert response.recall_log_id is not None
+    # Recall log persists.
+    async with _test_session_factory() as session:
+        rl = await session.scalar(
+            text("SELECT id FROM recall_logs WHERE id = :id"),
+            {"id": str(response.recall_log_id)},
+        )
+    assert rl is not None
+    # No receipt.
+    assert await _receipt_for_recall_log(response.recall_log_id) is None
+    # The standardized receipt failure log was emitted with the bounded
+    # build_decision_context stage.
+    dark_logs = [
+        r
+        for r in caplog.records
+        if r.name == "engram.context_receipt_dark_write"
+        and "context_receipt_dark_write" in r.getMessage()
+    ]
+    assert len(dark_logs) == 1
+    msg = dark_logs[0].getMessage()
+    assert "status=failed" in msg
+    assert "failure_stage=build_decision_context" in msg
+    assert "exception_type=StartupDecisionContextError" in msg
+    # No raw content or exception message leaked.
+    assert "malformed-prov" not in msg
 
 
 # ─── Privacy: no raw content/query/exception leakage ────────────────────
@@ -1249,7 +1408,7 @@ async def test_no_raw_content_in_receipt_or_logs(
     await _insert_item(
         tenant_id=tenant_id, principal_id=principal_id, content=secret_content
     )
-    with caplog.at_level(logging.WARNING, logger="engram.context_receipt_dark_write"):
+    with caplog.at_level(logging.INFO, logger="engram.context_receipt_dark_write"):
         async with AsyncClient(
             transport=ASGITransport(app=create_app()), base_url="http://test"
         ) as client:
@@ -1283,7 +1442,7 @@ async def test_exception_message_not_in_logs_on_failure(
     monkeypatch.setattr(
         "engram.context_receipt_dark_write.store_context_receipt", _raise_store
     )
-    with caplog.at_level(logging.WARNING, logger="engram.context_receipt_dark_write"):
+    with caplog.at_level(logging.INFO, logger="engram.context_receipt_dark_write"):
         async with AsyncClient(
             transport=ASGITransport(app=create_app()), base_url="http://test"
         ) as client:

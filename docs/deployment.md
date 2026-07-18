@@ -827,31 +827,47 @@ load with no silent negative-to-positive coercion.
 
 When `ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_ENABLED=false`:
 
+- no executed-result provenance is parsed;
 - no manifest is built;
 - no context-receipt database session is opened;
 - no receipt query is executed;
 - no dark-write telemetry event is emitted;
+- no receipt-related structured log is emitted;
 - startup and semantic recall behavior is **unchanged**.
 
-The disabled branch is a cheap Boolean check.
+The route's outer guard checks the flag before any receipt-specific parsing
+or validation, so a disabled deployment is behaviorally identical to a
+pre-002B deployment. The orchestrator's own disabled check is retained as
+defense in depth.
 
 ### Enabled behavior (startup only)
 
 When enabled, a successful `POST /v1/recall` with `mode=startup` additionally:
 
 1. executes startup recall normally and finalizes one `RecallResponse` object;
-2. builds `ContextManifestV1` from that finalized response and the actual
+2. parses the required executed-result provenance from the raw startup
+   engine result (no inferred defaults; public `RecallResponse` defaults
+   never feed the manifest) — a missing/malformed key fails open with
+   `failure_stage=build_decision_context` and no receipt;
+3. builds `ContextManifestV1` from that finalized response and the actual
    resolved execution context (no re-reads of mutable memory rows);
-3. opens a dedicated, short-lived, non-owner app-role session
+4. opens a dedicated, short-lived, non-owner app-role session
    (`engram.db.async_session_factory`) with tenant/principal RLS applied;
-4. persists one immutable `context_receipts` row linked to the committed
+5. persists one immutable `context_receipts` row linked to the committed
    recall log (idempotent on retry);
-5. forces a database reload of the stored JSONB through PostgreSQL;
-6. recanonicalizes and verifies the reloaded manifest and hashes;
-7. commits the receipt **only after** verification succeeds;
-8. records a bounded `context_receipt.dark_write` usage event (when usage
-   telemetry is enabled);
-9. returns the **original** `RecallResponse` unchanged.
+6. forces a database reload of the stored JSONB through PostgreSQL;
+7. recanonicalizes and verifies the reloaded manifest and hashes;
+8. commits the receipt **only after** verification succeeds;
+9. records a bounded `context_receipt.dark_write` usage event **best-effort**
+   (when usage telemetry is enabled and sufficient deadline remains);
+10. returns the **original** `RecallResponse` unchanged.
+
+All of steps 2–9 run under one monotonic deadline
+(`ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_TIMEOUT_SECONDS`) that starts before
+executed-result validation; each awaited stage runs against the remaining
+deadline. When the primary operation exhausts the deadline, the wrapper
+records `telemetry_status=skipped_deadline` in the structured log and writes
+**no** usage-event row.
 
 Semantic recall (`mode=semantic`) **never** invokes the dark write. No
 semantic Context Manifest support is implemented in this slice.
@@ -859,7 +875,8 @@ semantic Context Manifest support is implemented in this slice.
 ### Fail-open contract
 
 All ordinary manifest, database, integrity, telemetry, and timeout failures
-are fail-open:
+are fail-open — including a `build_decision_context` failure from missing or
+malformed executed-result provenance:
 
 - the route still returns the exact successful startup `RecallResponse`;
 - a receipt failure never fails the recall request, modifies the response,
@@ -869,6 +886,17 @@ are fail-open:
 - no raw content, `working_set`, query text, manifest JSON, canonical JSON,
   or exception messages are logged or stored in usage metadata — only
   bounded aggregate metadata and the exception *type*.
+
+### Observability
+
+**Structured logs are authoritative for every enabled attempt.** Exactly
+one bounded structured log per enabled attempt carries `event`, `status`,
+`tenant_id`, `principal_id`, `mode=startup`, `latency_ms`, `item_count`,
+`failure_stage`, `exception_type`, `verification_status`, and
+`telemetry_status`. Usage events are best-effort: a hard timeout that
+exhausts the total deadline may have **no** usage-event row
+(`telemetry_status=skipped_deadline`). Correlate gap calculations with both
+sources.
 
 ### Dogfood rollout
 

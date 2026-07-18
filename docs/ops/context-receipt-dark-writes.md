@@ -20,6 +20,59 @@ The manifest proves **what Engram served and which Engram policy/version
 admitted it**. It does **not** prove that the memory was factually true or
 that an agent relied on it.
 
+## Disabled-path guarantee
+
+When `ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_ENABLED=false` (the default), the
+recall route performs **no receipt-specific work at all**:
+
+- the executed-result provenance parser is never called;
+- no `ContextManifestV1` is built;
+- no dedicated receipt DB session is opened;
+- no `context_receipt.dark_write` usage event is recorded;
+- no receipt-related structured log is emitted.
+
+The route's outer guard checks the flag before any receipt-specific parsing
+or validation. The orchestrator's own disabled check is retained as defense
+in depth. A disabled deployment is behaviorally identical to a pre-002B
+deployment.
+
+## Executed-result provenance contract
+
+The receipt is built **only** from required executed-result values attested
+by the startup engine. The orchestrator parses these keys from the raw
+startup result and rejects (fail-open, no receipt) if any is missing or
+malformed:
+
+- `recall_log_id` — canonical UUID (reject null, malformed, whitespace-padded,
+  or noncanonical representations);
+- `workspace_id` — explicit `null` or canonical UUID (missing is an error;
+  empty string is an error, not null);
+- `scoring_version`, `config_version`, `candidate_strategy_version` —
+  nonempty strings (reject Boolean, non-string, or blank);
+- `effective_byte_budget`, `effective_token_budget` — `null` or nonnegative
+  integer (reject Boolean or negative);
+- `effective_item_budget` — must be exactly `null` for startup v1.
+
+A missing field is **never** inferred to a default. Public `RecallResponse`
+compatibility defaults (e.g. `scoring_version='v1'`) remain available to
+clients but **must never feed the receipt manifest** — the receipt path uses
+the raw executed values after strict validation. A `build_decision_context`
+failure uses the same fail-open result, structured log, and bounded
+usage-event attempt as any other enabled failure.
+
+## Total deadline
+
+The configured timeout (`ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_TIMEOUT_SECONDS`,
+default 1.0) is a single monotonic deadline that starts **before**
+executed-result validation and covers every stage of the enabled attempt:
+provenance parsing, manifest construction, dedicated-session creation, RLS,
+storage, reload, verification, commit, and the bounded usage-event attempt.
+Each awaited stage runs against the **remaining** deadline, so no single
+stage can consume the entire configured timeout. When the primary operation
+exhausts the deadline, the wrapper records
+`telemetry_status=skipped_deadline` in the structured log and returns
+promptly without extending the request to write telemetry.
+
 ## Prerequisites
 
 - Migration 026 (`context_receipts` table) applied. This slice adds **no
@@ -60,8 +113,15 @@ docker compose up -d --no-deps engram-service
 ```
 
 `ENGRAM_USAGE_TELEMETRY_ENABLED=true` is recommended so the bounded
-`context_receipt.dark_write` usage events are recorded. Structured logs
-remain the rollout signal even when usage telemetry is off.
+`context_receipt.dark_write` usage events are recorded. **Structured logs
+are authoritative for every enabled attempt**; usage events are best-effort.
+A hard timeout that exhausts the total dark-write deadline may have **no
+usage-event row** (the wrapper records `telemetry_status=skipped_deadline`
+in the structured log and returns promptly rather than extending the request
+to write telemetry). Gap calculations below must therefore correlate both
+sources: count gaps from `recall_logs` ↔ `context_receipts`, and cross-check
+failure/timeout signals against the structured logs, not only against
+`usage_events`.
 
 ## Stage 2 — verify
 
@@ -88,8 +148,17 @@ WHERE created_at >= '<enable_time>';
 
 ### Recall logs without receipts (gaps)
 
-A gap is expected when a dark-write attempt failed or timed out (fail-open).
-Sustained zero receipts means the feature is silently failing.
+A gap is expected when a dark-write attempt failed or timed out (fail-open),
+including a `build_decision_context` failure where the executed result was
+missing a required provenance key. Sustained zero receipts means the feature
+is silently failing. Cross-check any gap against the structured
+`event=context_receipt_dark_write` logs (authoritative for every enabled
+attempt) — a gap with no corresponding log line indicates the route guard
+never reached the helper, while a gap with a `status=failed`/`status=timed_out`
+log is the expected fail-open outcome. Note that a hard timeout may produce
+a log line with `telemetry_status=skipped_deadline` and **no** usage-event
+row, so absence from `usage_events` alone does not prove the attempt did not
+run.
 
 ```sql
 SELECT count(*) AS missing_receipts
@@ -128,6 +197,12 @@ WHERE event_type = 'context_receipt.dark_write'
 GROUP BY status;
 -- expected statuses: created, idempotent, failed, timed_out
 ```
+
+Usage events are best-effort. A hard timeout that exhausts the total
+dark-write deadline records `telemetry_status=skipped_deadline` in the
+structured log and writes **no** usage-event row, so the count above may
+undercount `timed_out` attempts relative to the structured logs. Correlate
+gap calculations with both sources.
 
 ### p50 / p95 receipt latency
 

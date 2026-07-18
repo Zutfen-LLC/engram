@@ -1620,14 +1620,24 @@ Auditability is part of the trust model, not a compliance afterthought.
 > production startup-recall path as a default-off, fail-open dark write**
 > (`engram/context_receipt_dark_write.py`, ENG-CONTEXT-002B): when
 > `ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_ENABLED=true`, a successful
-> `mode=startup` recall builds a manifest from the finalized `RecallResponse`
-> and persists one immutable receipt on a dedicated app-role session; the row
-> is reloaded and verified before commit, and any receipt failure is
-> swallowed (the recall response is returned unchanged). Receipt IDs/hashes
-> remain **invisible to clients** (exposure lands in ENG-CONTEXT-002C); an
-> **inspect/verify API** is deferred to ENG-CONTEXT-003. Only
-> `mode="startup"` is supported; semantic recall creates no receipt while
-> the feature is enabled.
+> `mode=startup` recall parses the required executed-result provenance from
+> the raw engine result (no inferred defaults; public `RecallResponse`
+> compatibility defaults never feed the manifest), builds a manifest from the
+> finalized `RecallResponse`, and persists one immutable receipt on a
+> dedicated app-role session; the row is reloaded and verified before
+> commit, and any receipt failure — including a `build_decision_context`
+> failure from missing/malformed provenance — is swallowed (the recall
+> response is returned unchanged) and recorded through the same fail-open
+> result/log/telemetry path. The total dark-write timeout is one monotonic
+> deadline that starts before executed-result validation and bounds every
+> stage including telemetry; a hard timeout records
+> `telemetry_status=skipped_deadline` and may write **no** usage-event row,
+> so structured logs are authoritative for every enabled attempt. When the
+> feature is `false` (the default) the route guard performs **no
+> receipt-specific work at all**. Receipt IDs/hashes remain **invisible to
+> clients** (exposure lands in ENG-CONTEXT-002C); an **inspect/verify API**
+> is deferred to ENG-CONTEXT-003. Only `mode="startup"` is supported;
+> semantic recall creates no receipt while the feature is enabled.
 
 The context manifest is the deterministic, content-addressed artifact that
 lets Engram prove **what context it served and which policy/version admitted
@@ -1674,10 +1684,18 @@ retention metadata are outside the manifest hash; no raw memory content or
 `working_set` is duplicated. Verification recanonicalizes the stored JSONB
 through `ContextManifestV1` and compares the recomputed hash to the stored
 `manifest_hash`. ENG-CONTEXT-002A is storage-only; ENG-CONTEXT-002B wires it
-into the production startup-recall path as a default-off, fail-open dark write
-(the route finalizes one `RecallResponse`, builds the manifest from it,
-persists on a dedicated app-role session, reloads and verifies before
-commit, and returns the response unchanged on any receipt failure).
+into the production startup-recall path as a default-off, fail-open dark
+write. The route's outer guard checks the flag before any receipt-specific
+work; when enabled, a single best-effort entrypoint owns executed-result
+provenance parsing, manifest construction, dedicated-session persistence,
+reload, verification, commit, bounded telemetry, and the standardized
+structured log under one monotonic deadline. The receipt is built only
+from required executed-result values attested by the engine — no inferred
+defaults, no public-response defaults. Any failure (including a
+`build_decision_context` failure) is fail-open and returns the response
+unchanged. Structured logs are authoritative for every enabled attempt;
+usage events are best-effort and may be absent on a hard timeout
+(`telemetry_status=skipped_deadline`).
 Retrieval and authorized rehydration land in ENG-CONTEXT-003.
 
 ---
