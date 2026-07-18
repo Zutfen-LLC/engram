@@ -155,6 +155,7 @@ PROFILE_EXECUTION_PROOFS = (
     "tests/test_profile_authorization_regressions_postgres.py",
     "tests/test_profile_write_context_migration.py",
     "tests/test_profile_write_context_unit.py",
+    "tests/test_worker_audit_provenance_postgres.py",
 )
 
 # ── Canonical aggregate ─────────────────────────────────────────────

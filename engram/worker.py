@@ -144,20 +144,36 @@ async def _insert_event(
             raise ValueError("candidate ingest provenance is unavailable")
         # Audit-event provenance is descriptive metadata, not an authorization
         # boundary (the handler already resolved the worker context and would
-        # have skipped on a provenance failure). If the execution authority
-        # cannot be reconstructed, record the event with neutral internal
-        # provenance rather than dropping the audit row or widening it.
+        # have skipped on a provenance failure). The three outcomes are kept
+        # explicit and truthfully distinct:
+        #   * valid execution authority  -> exact caller profile/API-key provenance;
+        #   * genuine legacy ingest      -> legacy-unprofiled-v0 (compatibility);
+        #   * missing/corrupt/incoherent v2 authority -> neutral internal-system-v1.
+        # A v2 provenance failure must never be relabeled legacy: the two are
+        # materially different states. No profile/revision/API-key identity is
+        # ever fabricated. Catch only the provenance-reconstruction ValueError
+        # from memory_context_from_ingest; unrelated database errors propagate.
         try:
             context = await memory_context_from_ingest(session, ingest)
         except ValueError:
-            context = None
-        if context is not None:
-            provenance = context_provenance(context)
-        else:
+            logger.warning(
+                "%s ingest=%s audit provenance unavailable: execution authority "
+                "could not be reconstructed; recording neutral internal provenance",
+                event_type,
+                ingest_id,
+            )
             provenance = {
                 "tenant_id": tenant_id,
-                "memory_context_version": LEGACY_MEMORY_CONTEXT_VERSION,
+                "memory_context_version": INTERNAL_MEMORY_CONTEXT_VERSION,
             }
+        else:
+            if context is None:
+                provenance = {
+                    "tenant_id": tenant_id,
+                    "memory_context_version": LEGACY_MEMORY_CONTEXT_VERSION,
+                }
+            else:
+                provenance = context_provenance(context)
     await session.execute(
         insert(ItemEvent).values(
             id=uuid.uuid4(),
@@ -1743,7 +1759,23 @@ async def handle_promotion_path_a(session: AsyncSession, job: Job) -> None:
         raw_run_id = job.payload.get("classification_run_id")
         if raw_run_id is None:
             raise ValueError("targeted promotion job missing classification_run_id")
-        memory_context = await _job_memory_context(session, job)
+        # Targeted candidate-origin promotion reconstructs the remember-time
+        # execution authority. Missing v2 authority is a permanent condition
+        # (a pre-025 queued job, a deleted/corrupt execution row) that retry
+        # cannot heal, and replaying under candidate-origin authority is
+        # forbidden. Mirror conflict.check's intentional fail-closed skip so
+        # the outer loop marks the job succeeded instead of retrying it toward
+        # a dead letter. Catch only the provenance-reconstruction ValueError;
+        # genuine transient DB failures and programming defects still reach the
+        # retry/dead-letter machinery via the outer handler.
+        try:
+            memory_context = await _job_memory_context(session, job)
+        except ValueError:
+            logger.warning(
+                "promotion.path_a item=%s skipped: execution authority unavailable",
+                raw_item_id,
+            )
+            return
         result = await auto_promote_item(
             session,
             str(job.tenant_id),

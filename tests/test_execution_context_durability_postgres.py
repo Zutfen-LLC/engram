@@ -590,3 +590,131 @@ async def test_worker_skips_conflict_check_when_execution_row_missing() -> None:
                 "DELETE FROM memory_profiles WHERE id=ANY($1::uuid[])", profile_ids
             )
         await owner.close()
+
+
+async def test_targeted_promotion_skips_when_execution_row_missing(
+    monkeypatch,  # noqa: ANN001 - pytest fixture
+) -> None:
+    """Targeted candidate-origin promotion must fail closed like conflict.check.
+
+    A targeted promotion job referencing a v2 ingest with no execution row must
+    return without raising, must NOT call auto_promote_item, must not scan,
+    mutate, or promote any proposed item, and must not emit a promotion event.
+    The job is treated as a completed fail-closed no-op (the outer worker loop
+    marks it succeeded because the handler returns normally).
+    """
+    from engram.db import apply_rls_context, owner_session_factory
+    from engram.promotion import auto_promote_item as _real_auto_promote_item  # noqa: F401
+    from engram.worker import handle_promotion_path_a
+
+    owner = await _owner()
+    token = uuid.uuid4().hex[:10]
+    original_auth = settings.auth_enabled
+    original_provider = settings.embedding_provider
+    ingest_id: uuid.UUID | None = None
+    item_ids: list[uuid.UUID] = []
+    key_ids: list[uuid.UUID] = []
+    profile_ids: list[uuid.UUID] = []
+    try:
+        settings.auth_enabled = False
+        settings.embedding_provider = "none"
+        app = create_app()
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            ctx = await _bootstrap(client, owner, token)
+            tenant_id = ctx["tenant_id"]
+
+            settings.auth_enabled = True
+            reset_principal_cache()
+
+            # A proposed item the broad origin profile might otherwise promote.
+            target = uuid.uuid4()
+            item_ids.append(target)
+            await owner.execute(
+                "INSERT INTO memory_items "
+                "(id,tenant_id,principal_id,content,content_hash,kind,visibility,"
+                "review_status,memory_confidence,source_trust,importance,source_type) "
+                "VALUES ($1,$2,$3,$4,$5,'fact','private','proposed',.95,.9,.5,'manual')",
+                target,
+                tenant_id,
+                ctx["principal_id"],
+                f"promotion skip target {token}",
+                f"sha256:{uuid.uuid4().hex}",
+            )
+
+            # Classify under broad to create a v2 ingest with no execution row.
+            content = f"promotion skip {token}"
+            classified = await client.post(
+                "/v1/classify",
+                json={"content": content},
+                headers=_headers(ctx["broad_key"]),
+            )
+            assert classified.status_code == 200, classified.text
+            ingest_id = uuid.UUID(classified.json()["ingest_id"])
+
+            # Assert auto_promote_item is never invoked for this job. The handler
+            # imports it locally from engram.promotion, so patch the source module.
+            promote_calls: list[Any] = []
+
+            async def _spy_auto_promote_item(*args: Any, **kwargs: Any) -> None:
+                promote_calls.append((args, kwargs))
+
+            import engram.promotion as promotion_module
+
+            monkeypatch.setattr(
+                promotion_module, "auto_promote_item", _spy_auto_promote_item
+            )
+
+            stub_job = SimpleNamespace(
+                id=uuid.uuid4(),
+                tenant_id=tenant_id,
+                payload={
+                    "memory_item_id": str(target),
+                    "classification_run_id": str(uuid.uuid4()),
+                    "ingest_id": str(ingest_id),
+                },
+            )
+
+            # The handler must return without raising.
+            async with owner_session_factory() as session:
+                await apply_rls_context(
+                    session, tenant_id=tenant_id, principal_id=ctx["principal_id"]
+                )
+                await handle_promotion_path_a(session, stub_job)
+                await session.rollback()
+
+            assert promote_calls == [], "auto_promote_item ran despite missing execution authority"
+
+            # No state change on the proposed target.
+            assert (
+                await owner.fetchval(
+                    "SELECT review_status FROM memory_items WHERE id=$1", target
+                )
+                == "proposed"
+            )
+            # No promotion event was emitted.
+            assert (
+                await owner.fetchval(
+                    "SELECT count(*) FROM item_events WHERE item_id=$1 "
+                    "AND event_type='promotion'",
+                    target,
+                )
+                == 0
+            )
+
+            key_ids = [ctx["broad_key_id"], ctx["private_key_id"]]
+            profile_ids = [ctx["broad_profile_id"], ctx["private_profile_id"]]
+    finally:
+        settings.auth_enabled = original_auth
+        settings.embedding_provider = original_provider
+        reset_principal_cache()
+        if ingest_id is not None:
+            await _cleanup_ingest(owner, ingest_id)
+        if item_ids:
+            await owner.execute("DELETE FROM memory_items WHERE id=ANY($1::uuid[])", item_ids)
+        if key_ids:
+            await owner.execute("DELETE FROM api_keys WHERE id=ANY($1::uuid[])", key_ids)
+        if profile_ids:
+            await owner.execute(
+                "DELETE FROM memory_profiles WHERE id=ANY($1::uuid[])", profile_ids
+            )
+        await owner.close()

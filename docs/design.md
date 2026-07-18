@@ -875,8 +875,19 @@ Cross-item worker behavior fails closed when v2 execution provenance cannot be r
 `memory-context-v2` ingest with no execution row (queued work from a pre-025 or partially
 rolled-out instance, a corrupt/missing row, or any path where origin must not be substituted for
 the narrower remember-time authority) causes the worker to skip the operation rather than scan or
-mutate under the origin profile. Legacy (`legacy-unprofiled-v0`) ingests with no execution row
-retain the established compatibility behavior.
+mutate under the origin profile. Both conflict checking (deduplication, supersession, flagging)
+and targeted candidate-origin promotion treat the missing authority as an intentional completed
+no-op — they return before any cross-item scan, lock, or mutation, so the outer worker loop marks
+the job succeeded instead of retrying a permanent condition toward a dead letter. Genuine legacy
+(`legacy-unprofiled-v0`) ingests with no execution row retain the established compatibility
+behavior.
+
+Audit-event provenance is descriptive metadata, not an authorization boundary, and is kept
+truthfully distinct across the three states: a valid execution authority records the exact caller
+profile/API-key/revision provenance (`memory-context-v2`); a genuine legacy ingest records
+`legacy-unprofiled-v0`; and a missing/corrupt/incoherent v2 authority records neutral
+`internal-system-v1` — never `legacy-unprofiled-v0`, and never a fabricated profile, revision, or
+API-key identity.
 
 Candidate ingests and caller-originated item events record `memory-context-v2` with tenant-safe
 API-key/profile/revision provenance. Internal maintenance records `internal-system-v1`.

@@ -638,12 +638,17 @@ layers:
 
 Workers (conflict-check, promotion, deduplication) reconstruct the
 **execution authority** when present and use it as their cross-item boundary.
-For a `memory-context-v2` ingest with **no** execution row, cross-item worker
-behavior **fails closed** (the job is skipped, not run under the origin
-profile) — this covers queued work produced by a pre-025 or partially
-rolled-out instance, and any missing/corrupt execution row. Legacy
-(`legacy-unprofiled-v0`) ingests with no execution row retain compatibility
-behavior.
+For a `memory-context-v2` ingest whose execution authority is unavailable,
+cross-item worker behavior **fails closed**: conflict checking and targeted
+promotion intentionally skip before any cross-item scan, lock, or mutation, and
+the job is treated as a completed fail-closed no-op rather than retried toward
+a dead letter. This covers queued work produced by a pre-025 or partially
+rolled-out instance, and any missing/corrupt execution row; operators may
+re-submit the underlying work through a current 002C API if processing is still
+desired. Audit events for such a row record neutral `internal-system-v1`
+provenance, never `legacy-unprofiled-v0` and never a fabricated profile/API-key
+identity. Legacy (`legacy-unprofiled-v0`) ingests with no execution row retain
+compatibility behavior.
 
 ### Rollout order (strict)
 
@@ -752,10 +757,18 @@ plus established membership (or the existing admin membership bypass). Existing-
 requires both profile read and write eligibility, and profile denial uses the normal non-disclosing
 missing-item response. `admin` never bypasses profile policy.
 
-Classify stores the exact accepted context on its candidate ingest, but remember re-authorizes the
-final scope under its own pinned revision. Candidate-origin workers use the ingest's exact revision
-for cross-item effects even after active-revision changes or profile disablement. Trusted scheduled
-maintenance remains explicitly internal and is not an API-key profile sandbox.
+Classify stores the classify-time **origin** context on its candidate ingest; remember re-authorizes
+the final scope and pins the **execution authority** durably (migration 025). Cross-item workers
+reconstruct the remember-time execution authority only — never the candidate-origin revision — so a
+narrower remember execution is honored even when classify ran under a broad profile. For a
+`memory-context-v2` ingest whose execution authority is unavailable (a pre-025 queued job, a
+deleted/corrupt execution row), cross-item worker behavior fails closed: conflict checking and
+targeted promotion intentionally skip before any cross-item scan, lock, or mutation, and the job is
+treated as a completed fail-closed no-op rather than retried toward a dead letter. Audit events for
+such a row record neutral `internal-system-v1` provenance (never `legacy-unprofiled-v0`, and never a
+fabricated profile/API-key identity); genuine legacy ingests keep `legacy-unprofiled-v0`. Operators
+may re-submit the underlying work through a current 002C API if processing is still desired. Trusted
+scheduled maintenance remains explicitly internal and is not an API-key profile sandbox.
 
 ### Migration 022 rollout and rollback
 
