@@ -176,6 +176,14 @@ def _seed_dict(item: MemoryItem, score: float = 0.8) -> dict[str, Any]:
         "source_trust": item.source_trust,
         "memory_confidence": item.memory_confidence,
         "human_verified": item.human_verified,
+        # Additive served-decision fields (ENG-CONTEXT-001): mirror the
+        # production enriched-item shape so expanded genuine candidates carry
+        # the same fields through dict(candidate.original).
+        "authority": item.authority,
+        "visibility": item.visibility,
+        "workspace_id": str(item.workspace_id) if item.workspace_id else None,
+        "conflict_type": item.conflict_type,
+        "conflict_resolution_status": item.conflict_resolution_status,
         "distance": 0.0,
         "similarity_score": score,
         "trust_score": 1.0,

@@ -158,6 +158,20 @@ PROFILE_EXECUTION_PROOFS = (
     "tests/test_worker_audit_provenance_postgres.py",
 )
 
+# ── Context manifest contract (ENG-CONTEXT-001) ─────────────────────
+# The real-PostgreSQL route-parity proof: exercises the live startup recall
+# route and proves the manifest built from the served response matches the
+# HTTP response exactly (ordered IDs, scores, reasons, warnings, counts,
+# packet bytes) and contains no raw content. The schema contract-integrity
+# proof (drift + positive/negative JSON Schema validation) is DB-free but
+# is gated here so compose-trust-proof enforces it with no skips.
+# Pure-Python determinism / privacy / golden-vector coverage runs in the
+# root suite.
+CONTEXT_MANIFEST_PROOFS = (
+    "tests/test_context_manifest_route.py",
+    "tests/test_context_manifest_schema.py",
+)
+
 # ── Canonical aggregate ─────────────────────────────────────────────
 TRUST_PROOF_FILES: tuple[str, ...] = (
     SCOPE_PROOFS
@@ -175,6 +189,7 @@ TRUST_PROOF_FILES: tuple[str, ...] = (
     + CLASSIFICATION_PROOFS
     + SESSION_END_PROOFS
     + PROFILE_EXECUTION_PROOFS
+    + CONTEXT_MANIFEST_PROOFS
 )
 
 

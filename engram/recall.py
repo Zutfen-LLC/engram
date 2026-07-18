@@ -759,6 +759,15 @@ async def execute_startup_recall(
             "source_trust": item.source_trust,
             "memory_confidence": item.memory_confidence,
             "human_verified": item.human_verified,
+            # Additive served-decision fields (ENG-CONTEXT-001): exposed so the
+            # canonical context manifest can snapshot the exact mutable
+            # decision state that was served. These are append-only and do not
+            # change startup selection, ordering, scores, or rendering.
+            "authority": item.authority,
+            "visibility": item.visibility,
+            "workspace_id": str(item.workspace_id) if item.workspace_id else None,
+            "conflict_type": item.conflict_type,
+            "conflict_resolution_status": item.conflict_resolution_status,
         }
         response_items.append(item_dict)
 
@@ -1095,6 +1104,14 @@ async def execute_semantic_recall(
                 "source_trust": item.source_trust,
                 "memory_confidence": item.memory_confidence,
                 "human_verified": item.human_verified,
+                # Additive served-decision fields (ENG-CONTEXT-001): keep
+                # startup and semantic item contracts aligned so the manifest
+                # can snapshot the same mutable decision fields in both modes.
+                "authority": item.authority,
+                "visibility": item.visibility,
+                "workspace_id": str(item.workspace_id) if item.workspace_id else None,
+                "conflict_type": item.conflict_type,
+                "conflict_resolution_status": item.conflict_resolution_status,
             }
         )
 

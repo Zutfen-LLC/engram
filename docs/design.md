@@ -1604,6 +1604,50 @@ Metadata changes are recorded as events.
 
 Auditability is part of the trust model, not a compliance afterthought.
 
+### Context manifest contract
+
+> **Implementation status (ENG-CONTEXT-001):** The canonical, versioned
+> `ContextManifestV1` and its deterministic hash contract are **defined and
+> proven** (`engram/context_manifest.py`). Cross-language golden vectors and
+> independent Python + JavaScript verifiers are checked in. **Durable receipt
+> persistence** (`context_receipts` table, migration, RLS, retention) is
+> **designed but deferred** to ENG-CONTEXT-002; an **inspect/verify API** is
+> deferred to ENG-CONTEXT-003. Only `mode="startup"` is supported.
+
+The context manifest is the deterministic, content-addressed artifact that
+lets Engram prove **what context it served and which policy/version admitted
+it**. It is the foundation for the Context Ledger.
+
+The manifest is built **only** from a finalized recall response — never from a
+live database session, ORM row, or recall log — so mutable post-response state
+has no path into it. Canonical JSON uses RFC 8785 (JCS); `manifest_hash` is
+SHA-256 of the canonical bytes and is never a field in the hashed object;
+`packet_hash` is SHA-256 of the exact served `working_set` bytes; per-item
+`served_content_hash` is exact-byte SHA-256 of served content (it deliberately
+does not reuse the dedup `content_hash`, which normalizes whitespace/case).
+Receipt IDs, timestamps, and trace IDs are excluded from the deterministic
+manifest — they belong in the future receipt envelope (ENG-CONTEXT-002).
+
+The wire model round-trips: it emits the normative `"schema"` wire key and
+parses that exact shape back. Stable protocol markers are required `Literal`
+constants. The builder verifies finalized-response coherence (item count, byte
+count, and the `working-set-v1` render of items — `packet_hash` is still
+hashed directly from the served `working_set`, never from the reconstruction),
+startup subject/request invariants (`query_digest` null, workspace agreement,
+no effective item budget), and strict field types (no silent coercion). Profile
+identity (`memory_profile_id` / `memory_profile_revision_id` /
+`memory_profile_version`) is all-or-none: all null together or all non-null and
+valid together, enforced by both the Python `model_validator` and a `oneOf` the
+normative JSON Schema encodes deterministically. The checked-in JSON Schema is
+generated from the strict model so it cannot drift; a shared negative-fixture
+set proves both the Python and JavaScript verifiers reject malformed UUIDs,
+hashes, visibility, counts, budgets, and partial profiles.
+
+The manifest proves what was served and which policy admitted it. It does
+**not** prove that a memory was factually true or that an agent relied on it.
+Full normative detail, the deterministic/volatile boundary, and the hash
+preimages are in [`docs/context-manifest-v1.md`](context-manifest-v1.md).
+
 ---
 
 ## 12. Vocabulary

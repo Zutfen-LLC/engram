@@ -1,0 +1,584 @@
+{
+  "$defs": {
+    "ContextManifestEffectiveV1": {
+      "additionalProperties": false,
+      "description": "What the server actually used after applying defaults and resolution.\n\n``workspace_id`` is the resolved authorized workspace reference (null when\nrecall is principal-scoped). Startup v1 does not enforce an item budget, so\n``item_budget`` is always null here (the builder verifies this).",
+      "properties": {
+        "workspace_id": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Workspace Id"
+        },
+        "byte_budget": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Byte Budget"
+        },
+        "token_budget": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Token Budget"
+        },
+        "item_budget": {
+          "title": "Item Budget",
+          "type": "null"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "byte_budget",
+        "token_budget",
+        "item_budget"
+      ],
+      "title": "ContextManifestEffectiveV1",
+      "type": "object"
+    },
+    "ContextManifestItemV1": {
+      "additionalProperties": false,
+      "description": "One served item's stable ordinal and mutable decision fields.\n\nItem array order is the exact response order; ``ordinal`` must equal the\narray position. ``score`` may be null for pinned items. Reason and warning\narray order is significant (never alphabetized). Full memory content is\nabsent — only ``served_content_hash`` (exact UTF-8 SHA-256 of the served\ncontent) is stored. ``conflicts_with_item_id`` is excluded: a counterpart\nmay not be independently eligible.",
+      "properties": {
+        "ordinal": {
+          "minimum": 0,
+          "title": "Ordinal",
+          "type": "integer"
+        },
+        "item_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Item Id",
+          "type": "string"
+        },
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "served_content_hash": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Served Content Hash",
+          "type": "string"
+        },
+        "review_status": {
+          "title": "Review Status",
+          "type": "string"
+        },
+        "authority": {
+          "title": "Authority",
+          "type": "integer"
+        },
+        "visibility": {
+          "enum": [
+            "private",
+            "workspace",
+            "tenant",
+            "public"
+          ],
+          "title": "Visibility",
+          "type": "string"
+        },
+        "workspace_id": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Workspace Id"
+        },
+        "score": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Score"
+        },
+        "reasons": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Reasons",
+          "type": "array"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Warnings",
+          "type": "array"
+        },
+        "pinned": {
+          "title": "Pinned",
+          "type": "boolean"
+        },
+        "importance": {
+          "title": "Importance",
+          "type": "number"
+        },
+        "source_trust": {
+          "title": "Source Trust",
+          "type": "number"
+        },
+        "memory_confidence": {
+          "title": "Memory Confidence",
+          "type": "number"
+        },
+        "human_verified": {
+          "title": "Human Verified",
+          "type": "boolean"
+        },
+        "conflict_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Conflict Type"
+        },
+        "conflict_resolution_status": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Conflict Resolution Status"
+        }
+      },
+      "required": [
+        "ordinal",
+        "item_id",
+        "kind",
+        "served_content_hash",
+        "review_status",
+        "authority",
+        "visibility",
+        "workspace_id",
+        "score",
+        "reasons",
+        "warnings",
+        "pinned",
+        "importance",
+        "source_trust",
+        "memory_confidence",
+        "human_verified",
+        "conflict_type",
+        "conflict_resolution_status"
+      ],
+      "title": "ContextManifestItemV1",
+      "type": "object"
+    },
+    "ContextManifestPacketV1": {
+      "additionalProperties": false,
+      "description": "The rendered packet served to the caller (``working_set``).\n\nThe current packet is the exact ``working_set`` string:\n\n    [kind] content\n    [kind] content\n\nIts hash preserves item order, exact content, exact kind, LF separators,\nand the presence/absence of a trailing newline. It is computed over\n``response.working_set`` directly — never reconstructed from item rows.",
+      "properties": {
+        "media_type": {
+          "const": "text/plain; charset=utf-8",
+          "title": "Media Type",
+          "type": "string"
+        },
+        "render_version": {
+          "const": "working-set-v1",
+          "title": "Render Version",
+          "type": "string"
+        },
+        "hash": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Hash",
+          "type": "string"
+        }
+      },
+      "required": [
+        "media_type",
+        "render_version",
+        "hash"
+      ],
+      "title": "ContextManifestPacketV1",
+      "type": "object"
+    },
+    "ContextManifestRequestV1": {
+      "additionalProperties": false,
+      "description": "The request descriptor placed in the manifest, with computed digest.\n\n``request_digest`` is the SHA-256 of the canonical RFC 8785 bytes of this\nobject *without* the ``request_digest`` field itself.",
+      "properties": {
+        "requested": {
+          "$ref": "#/$defs/ContextManifestRequestedV1"
+        },
+        "effective": {
+          "$ref": "#/$defs/ContextManifestEffectiveV1"
+        },
+        "query_digest": {
+          "anyOf": [
+            {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Query Digest"
+        },
+        "request_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Request Digest",
+          "type": "string"
+        }
+      },
+      "required": [
+        "requested",
+        "effective",
+        "query_digest",
+        "request_digest"
+      ],
+      "title": "ContextManifestRequestV1",
+      "type": "object"
+    },
+    "ContextManifestRequestedV1": {
+      "additionalProperties": false,
+      "description": "What the caller asked for (before server defaults applied).",
+      "properties": {
+        "workspace_supplied": {
+          "title": "Workspace Supplied",
+          "type": "boolean"
+        },
+        "byte_budget": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Byte Budget"
+        },
+        "token_budget": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Token Budget"
+        },
+        "item_budget": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Item Budget"
+        }
+      },
+      "required": [
+        "workspace_supplied",
+        "byte_budget",
+        "token_budget",
+        "item_budget"
+      ],
+      "title": "ContextManifestRequestedV1",
+      "type": "object"
+    },
+    "ContextManifestResultV1": {
+      "additionalProperties": false,
+      "description": "Bounded aggregate counts over the served response.\n\n``served_content_byte_count`` corresponds to the recall ``byte_count``\nsemantics (sum of served item content byte sizes). ``rendered_packet_byte_\ncount`` is the exact UTF-8 size of ``working_set``. The two are not\ninterchangeable (the packet adds ``[kind] `` prefixes and LF separators).\nOnly bounded aggregate omission counts are stored — never a list of\nrejected or unauthorized candidates.",
+      "properties": {
+        "item_count": {
+          "minimum": 0,
+          "title": "Item Count",
+          "type": "integer"
+        },
+        "served_content_byte_count": {
+          "minimum": 0,
+          "title": "Served Content Byte Count",
+          "type": "integer"
+        },
+        "rendered_packet_byte_count": {
+          "minimum": 0,
+          "title": "Rendered Packet Byte Count",
+          "type": "integer"
+        },
+        "pinned_omitted_count": {
+          "minimum": 0,
+          "title": "Pinned Omitted Count",
+          "type": "integer"
+        },
+        "omitted_count": {
+          "minimum": 0,
+          "title": "Omitted Count",
+          "type": "integer"
+        },
+        "message": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Message"
+        }
+      },
+      "required": [
+        "item_count",
+        "served_content_byte_count",
+        "rendered_packet_byte_count",
+        "pinned_omitted_count",
+        "omitted_count",
+        "message"
+      ],
+      "title": "ContextManifestResultV1",
+      "type": "object"
+    },
+    "ContextManifestSubjectV1": {
+      "additionalProperties": false,
+      "description": "The resolved identity and profile that admitted the served context.\n\n``workspace_id`` is the *resolved authorized* workspace reference, not an\nunresolved caller slug. An unprofiled context uses null profile fields.\nProfile and revision identity must be coherent (see validator).",
+      "properties": {
+        "tenant_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Tenant Id",
+          "type": "string"
+        },
+        "principal_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Principal Id",
+          "type": "string"
+        },
+        "workspace_id": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Workspace Id"
+        },
+        "memory_context_version": {
+          "const": "memory-context-v2",
+          "title": "Memory Context Version",
+          "type": "string"
+        },
+        "memory_profile_id": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Memory Profile Id"
+        },
+        "memory_profile_revision_id": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Memory Profile Revision Id"
+        },
+        "memory_profile_version": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Memory Profile Version"
+        }
+      },
+      "required": [
+        "tenant_id",
+        "principal_id",
+        "workspace_id",
+        "memory_context_version",
+        "memory_profile_id",
+        "memory_profile_revision_id",
+        "memory_profile_version"
+      ],
+      "title": "ContextManifestSubjectV1",
+      "type": "object",
+      "oneOf": [
+        {
+          "description": "Unprofiled: all three profile fields are null.",
+          "properties": {
+            "memory_profile_id": {
+              "type": "null"
+            },
+            "memory_profile_revision_id": {
+              "type": "null"
+            },
+            "memory_profile_version": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "description": "Profiled: all three profile fields are non-null and valid.",
+          "properties": {
+            "memory_profile_id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            "memory_profile_revision_id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            "memory_profile_version": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      ]
+    },
+    "ContextManifestVersionsV1": {
+      "additionalProperties": false,
+      "description": "Runtime version identifiers from the completed recall operation.\n\nGit provenance is intentionally NOT hashed here — it is not a stable\nprotocol version. A future receipt envelope may carry commit SHAs.",
+      "properties": {
+        "scoring_version": {
+          "title": "Scoring Version",
+          "type": "string"
+        },
+        "config_version": {
+          "title": "Config Version",
+          "type": "string"
+        },
+        "candidate_strategy_version": {
+          "title": "Candidate Strategy Version",
+          "type": "string"
+        },
+        "manifest_contract_version": {
+          "const": "context-manifest-v1",
+          "title": "Manifest Contract Version",
+          "type": "string"
+        },
+        "packet_render_version": {
+          "const": "working-set-v1",
+          "title": "Packet Render Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "scoring_version",
+        "config_version",
+        "candidate_strategy_version",
+        "manifest_contract_version",
+        "packet_render_version"
+      ],
+      "title": "ContextManifestVersionsV1",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Canonical, deterministic served-context manifest (ENG-CONTEXT-001). Canonical JSON is RFC 8785; manifest_hash is SHA-256 of the canonical bytes and is NOT a field in this object. The normative wire parser requires canonical UUID/hash representations.",
+  "properties": {
+    "schema": {
+      "const": "engram.context-manifest",
+      "title": "Schema",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "canonicalization": {
+      "const": "rfc8785",
+      "title": "Canonicalization",
+      "type": "string"
+    },
+    "mode": {
+      "const": "startup",
+      "title": "Mode",
+      "type": "string"
+    },
+    "subject": {
+      "$ref": "#/$defs/ContextManifestSubjectV1"
+    },
+    "request": {
+      "$ref": "#/$defs/ContextManifestRequestV1"
+    },
+    "versions": {
+      "$ref": "#/$defs/ContextManifestVersionsV1"
+    },
+    "result": {
+      "$ref": "#/$defs/ContextManifestResultV1"
+    },
+    "packet": {
+      "$ref": "#/$defs/ContextManifestPacketV1"
+    },
+    "items": {
+      "items": {
+        "$ref": "#/$defs/ContextManifestItemV1"
+      },
+      "title": "Items",
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "canonicalization",
+    "mode",
+    "subject",
+    "request",
+    "versions",
+    "result",
+    "packet",
+    "items"
+  ],
+  "title": "ContextManifestV1",
+  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

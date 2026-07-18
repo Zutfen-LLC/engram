@@ -1,0 +1,89 @@
+{
+  "name": "negative-effective-budget",
+  "mutation": "effective.byte_budget is negative",
+  "expected_error": "byte_budget",
+  "input": {
+    "response": {
+      "working_set": "[fact] alpha\n[preference] beta",
+      "item_count": 2,
+      "byte_count": 9,
+      "pinned_omitted_count": 0,
+      "omitted_count": 4,
+      "message": null,
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-0000000000a1",
+          "kind": "fact",
+          "content": "alpha",
+          "review_status": "active",
+          "score": null,
+          "reasons": [],
+          "warnings": [],
+          "pinned": true,
+          "importance": 0.9,
+          "source_trust": 0.8,
+          "memory_confidence": 0.75,
+          "human_verified": true,
+          "authority": 10,
+          "visibility": "private",
+          "workspace_id": null,
+          "conflict_type": null,
+          "conflict_resolution_status": null
+        },
+        {
+          "id": "00000000-0000-0000-0000-0000000000a2",
+          "kind": "preference",
+          "content": "beta",
+          "review_status": "active",
+          "score": 0.55,
+          "reasons": [
+            "importance=0.50"
+          ],
+          "warnings": [],
+          "pinned": false,
+          "importance": 0.5,
+          "source_trust": 0.5,
+          "memory_confidence": 0.5,
+          "human_verified": true,
+          "authority": 10,
+          "visibility": "private",
+          "workspace_id": null,
+          "conflict_type": null,
+          "conflict_resolution_status": null
+        }
+      ]
+    },
+    "subject_context": {
+      "tenant_id": "00000000-0000-0000-0000-000000000001",
+      "principal_id": "00000000-0000-0000-0000-000000000002",
+      "workspace_id": null,
+      "memory_context_version": "memory-context-v2",
+      "memory_profile_id": null,
+      "memory_profile_revision_id": null,
+      "memory_profile_version": null
+    },
+    "request_context": {
+      "requested": {
+        "workspace_supplied": false,
+        "byte_budget": null,
+        "token_budget": null,
+        "item_budget": null
+      },
+      "effective": {
+        "workspace_id": null,
+        "byte_budget": -256,
+        "token_budget": null,
+        "item_budget": null
+      },
+      "query_digest": null
+    },
+    "decision_versions": {
+      "scoring_version": "v1",
+      "config_version": "v1",
+      "candidate_strategy_version": "startup-candidates-v1",
+      "manifest_contract_version": "context-manifest-v1",
+      "packet_render_version": "working-set-v1"
+    },
+    "reorder_inputs": false
+  }
+}

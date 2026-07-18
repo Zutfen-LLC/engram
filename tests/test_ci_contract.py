@@ -44,6 +44,30 @@ def test_hosted_workflow_runs_one_complete_real_db_gate() -> None:
     assert re.search(r"^  compose-real-db-ci:\s*$", workflow, re.MULTILINE)
     assert re.search(r"^  compose-validate:\s*$", workflow, re.MULTILINE)
 
+
+def test_hosted_workflow_runs_conformance_and_lock_drift_gates() -> None:
+    workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text()
+
+    # The parallel cross-language conformance job (ENG-CONTEXT-001): runs both
+    # verifiers and the shared negative-fixture set against the same checked-in
+    # artifacts. Kept off the Compose real-DB critical path.
+    assert re.search(r"^  conformance-vectors:\s*$", workflow, re.MULTILINE)
+    assert "python scripts/verify_context_manifest_vectors.py" in workflow
+    assert "node conformance/context-manifest-v1/verify.mjs" in workflow
+    assert "python scripts/verify_context_manifest_negatives.py" in workflow
+    assert "node conformance/context-manifest-v1/verify_negatives.mjs" in workflow
+    # Node comes only from actions/setup-node here, never from the CI image.
+    assert "actions/setup-node@v5" in workflow
+
+    # The parallel lock-drift gate: uv.lock must match pyproject.toml. Uses the
+    # pinned uv version and a non-rewriting check, so a drifted lock fails CI.
+    assert re.search(r"^  lock-drift:\s*$", workflow, re.MULTILINE)
+    assert "astral-sh/setup-uv@v6" in workflow
+    assert "version: \"0.11.29\"" in workflow
+    assert "uv lock --check" in workflow
+    # The lock gate never rewrites the lockfile.
+    assert "uv lock\n" not in workflow
+
     assert (
         "group: ${{ github.workflow }}-"
         "${{ github.event.pull_request.number || github.ref }}"
@@ -55,12 +79,15 @@ def test_hosted_workflow_uses_read_only_github_hosted_runners() -> None:
     workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text()
 
     assert "runs-on: self-hosted" not in workflow
-    assert workflow.count("runs-on: ubuntu-24.04") == 2
+    # Four read-only hosted jobs: compose-real-db-ci, compose-validate, the
+    # parallel conformance-vectors cross-language job (ENG-CONTEXT-001), and
+    # the parallel lock-drift gate (uv.lock ↔ pyproject.toml consistency).
+    assert workflow.count("runs-on: ubuntu-24.04") == 4
     assert re.search(r"^permissions:\s*\n  contents: read\s*$", workflow, re.MULTILINE)
     assert not re.search(r"^\s+[a-z-]+: write\s*$", workflow, re.MULTILINE)
     assert "pull_request_target" not in workflow
-    assert workflow.count("uses: actions/checkout@v6") == 2
-    assert workflow.count("persist-credentials: false") == 2
+    assert workflow.count("uses: actions/checkout@v6") == 4
+    assert workflow.count("persist-credentials: false") == 4
 
 
 def test_hosted_workflow_builds_once_with_event_isolated_cache() -> None:
