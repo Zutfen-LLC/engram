@@ -33,10 +33,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Mapping
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeVar, cast
 from uuid import UUID
 
 from engram.context_manifest import (
@@ -576,6 +577,68 @@ def _verification_status_for(
     return "failed"
 
 
+# ─── Deadline-aware await helpers ────────────────────────────────────────
+
+
+_T = TypeVar("_T")
+
+
+async def _await_before_deadline(
+    awaitable: Awaitable[_T],
+    *,
+    deadline: float,
+) -> _T:
+    """Await ``awaitable`` under the shared monotonic ``deadline``.
+
+    Raises :class:`TimeoutError` if the deadline has already passed or the
+    await exceeds the remaining budget. ``asyncio.CancelledError`` propagates
+    normally (``asyncio.wait_for`` re-raises it).
+
+    This is the single chokepoint that guarantees no awaited operation in the
+    enabled path — session entry, RLS, store, flush, reload, commit, session
+    cleanup, telemetry — can hold startup recall beyond the configured
+    timeout.
+
+    When the deadline is already exhausted on entry, the unawaited
+    coroutine/future is closed before raising so no "coroutine was never
+    awaited" warning leaks.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        close = getattr(awaitable, "close", None)
+        if close is not None:
+            close()
+        raise TimeoutError
+    return cast("_T", await asyncio.wait_for(awaitable, timeout=remaining))
+
+
+async def _bounded_stage(
+    coro: Awaitable[_T],
+    *,
+    deadline: float,
+    stage: str,
+    start: float,
+) -> _T:
+    """Await one stage under the shared deadline.
+
+    Translates a missed deadline into ``_DarkWriteFailure(timeout)`` and any
+    other ordinary exception into ``_DarkWriteFailure(stage)``.
+    ``asyncio.CancelledError`` propagates normally without wrapping.
+    """
+    try:
+        return await _await_before_deadline(coro, deadline=deadline)
+    except TimeoutError as exc:
+        raise _DarkWriteFailure(
+            stage=_FAILURE_STAGE_TIMEOUT, latency_ms=_elapsed_ms(start)
+        ) from exc
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        raise _DarkWriteFailure(
+            stage=stage, latency_ms=_elapsed_ms(start)
+        ) from exc
+
+
 # ─── Raising implementation (testable) ──────────────────────────────────
 
 
@@ -590,19 +653,19 @@ async def _write_startup_context_receipt_once(
     """Execute one enabled dark-write attempt end to end under a shared
     monotonic ``deadline``.
 
-    Raises on any failure (manifest construction, DB, integrity). The
-    best-effort wrapper (:func:`write_startup_context_receipt_best_effort`)
+    Raises on any failure (manifest construction, DB, integrity, timeout).
+    The best-effort wrapper (:func:`write_startup_context_receipt_best_effort`)
     translates these into ``failed``/``timed_out`` results. ``deadline`` is a
-    ``time.monotonic()`` absolute cutoff; each awaited stage checks the
-    remaining budget before running and translates a missed deadline into
-    ``_DarkWriteFailure(stage=timeout)``.
+    ``time.monotonic()`` absolute cutoff; **every** awaited operation —
+    session ``__aenter__``, RLS application, store, flush, reload, commit,
+    and session ``__aexit__`` cleanup — runs under the remaining budget via
+    :func:`_bounded_stage` / :func:`_await_before_deadline`, so a database
+    connectivity problem cannot hold startup recall beyond the configured
+    timeout.
     """
     start = time.monotonic()
 
-    def _remaining() -> float:
-        return deadline - time.monotonic()
-
-    # 1. Build manifest from the finalized response (no DB work).
+    # 1. Build manifest from the finalized response (synchronous, no DB).
     try:
         manifest = _build_manifest(
             response=response,
@@ -620,7 +683,8 @@ async def _write_startup_context_receipt_once(
     # 2. Dedicated, short-lived, non-owner app-role session. The caller's
     #    request session is never used: the recall log is already committed,
     #    a receipt DB error must not poison the request session, and rollback
-    #    must affect only the optional receipt attempt.
+    #    must affect only the optional receipt attempt. Session entry
+    #    (connection acquisition) is bounded by the shared deadline.
     try:
         session_cm = async_session_factory()
     except Exception as exc:
@@ -628,75 +692,61 @@ async def _write_startup_context_receipt_once(
             stage=_FAILURE_STAGE_OPEN_SESSION, latency_ms=_elapsed_ms(start)
         ) from exc
 
-    async with session_cm as session:
-        # 2a. Apply tenant/principal RLS.
-        try:
-            await apply_rls_context(
+    session_entered = False
+    try:
+        # 2a. Enter session (acquires a pooled connection) — bounded.
+        session = await _bounded_stage(
+            session_cm.__aenter__(),
+            deadline=deadline,
+            stage=_FAILURE_STAGE_OPEN_SESSION,
+            start=start,
+        )
+        session_entered = True
+
+        # 2b. Apply tenant/principal RLS — bounded.
+        await _bounded_stage(
+            apply_rls_context(
                 session, tenant_id=tenant_id, principal_id=principal_id
-            )
-        except Exception as exc:
-            raise _DarkWriteFailure(
-                stage=_FAILURE_STAGE_APPLY_RLS, latency_ms=_elapsed_ms(start)
-            ) from exc
+            ),
+            deadline=deadline,
+            stage=_FAILURE_STAGE_APPLY_RLS,
+            start=start,
+        )
 
         # 3. Store (idempotent insert; loads parent recall log + validates
-        #    overlap). Does not commit. Bounded by the remaining deadline so
-        #    one slow DB stage cannot consume the entire configured timeout.
-        remaining = _remaining()
-        if remaining <= 0:
-            raise _DarkWriteFailure(
-                stage=_FAILURE_STAGE_TIMEOUT, latency_ms=_elapsed_ms(start)
-            )
-        try:
-            stored_result = await asyncio.wait_for(
-                store_context_receipt(
-                    session,
-                    tenant_id=tenant_id,
-                    principal_id=principal_id,
-                    recall_log_id=recall_log_id,
-                    manifest=manifest,
-                ),
-                timeout=remaining,
-            )
-        except TimeoutError as exc:
-            raise _DarkWriteFailure(
-                stage=_FAILURE_STAGE_TIMEOUT, latency_ms=_elapsed_ms(start)
-            ) from exc
-        except Exception as exc:
-            raise _DarkWriteFailure(
-                stage=_FAILURE_STAGE_STORE, latency_ms=_elapsed_ms(start)
-            ) from exc
+        #    overlap). Does not commit. Bounded by the shared deadline.
+        stored_result = await _bounded_stage(
+            store_context_receipt(
+                session,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                recall_log_id=recall_log_id,
+                manifest=manifest,
+            ),
+            deadline=deadline,
+            stage=_FAILURE_STAGE_STORE,
+            start=start,
+        )
 
-        # 4. Flush so the row reflects the INSERT.
-        try:
-            await session.flush()
-        except Exception as exc:
-            raise _DarkWriteFailure(
-                stage=_FAILURE_STAGE_STORE, latency_ms=_elapsed_ms(start)
-            ) from exc
+        # 4. Flush so the row reflects the INSERT — bounded.
+        await _bounded_stage(
+            session.flush(),
+            deadline=deadline,
+            stage=_FAILURE_STAGE_STORE,
+            start=start,
+        )
 
         # 5. Force a database reload of the receipt (all envelope + JSONB
-        #    fields from PostgreSQL).
-        remaining = _remaining()
-        if remaining <= 0:
-            raise _DarkWriteFailure(
-                stage=_FAILURE_STAGE_TIMEOUT, latency_ms=_elapsed_ms(start)
-            )
-        try:
-            await asyncio.wait_for(
-                session.refresh(stored_result.receipt), timeout=remaining
-            )
-        except TimeoutError as exc:
-            raise _DarkWriteFailure(
-                stage=_FAILURE_STAGE_TIMEOUT, latency_ms=_elapsed_ms(start)
-            ) from exc
-        except Exception as exc:
-            raise _DarkWriteFailure(
-                stage=_FAILURE_STAGE_RELOAD, latency_ms=_elapsed_ms(start)
-            ) from exc
+        #    fields from PostgreSQL) — bounded.
+        await _bounded_stage(
+            session.refresh(stored_result.receipt),
+            deadline=deadline,
+            stage=_FAILURE_STAGE_RELOAD,
+            start=start,
+        )
 
         # 6. Verify the reloaded record and compare against the original
-        #    built manifest before commit.
+        #    built manifest before commit (synchronous, no DB).
         try:
             _verify_reloaded_record(
                 reloaded_receipt_id=stored_result.receipt.id,
@@ -711,33 +761,42 @@ async def _write_startup_context_receipt_once(
                 stage=_FAILURE_STAGE_VERIFY, latency_ms=_elapsed_ms(start)
             ) from exc
 
-        # 7. Commit only after verification succeeds.
-        remaining = _remaining()
-        if remaining <= 0:
-            raise _DarkWriteFailure(
-                stage=_FAILURE_STAGE_TIMEOUT, latency_ms=_elapsed_ms(start)
-            )
-        try:
-            await asyncio.wait_for(session.commit(), timeout=remaining)
-        except TimeoutError as exc:
-            raise _DarkWriteFailure(
-                stage=_FAILURE_STAGE_TIMEOUT, latency_ms=_elapsed_ms(start)
-            ) from exc
-        except Exception as exc:
-            raise _DarkWriteFailure(
-                stage=_FAILURE_STAGE_COMMIT, latency_ms=_elapsed_ms(start)
-            ) from exc
+        # 7. Commit only after verification succeeds — bounded.
+        await _bounded_stage(
+            session.commit(),
+            deadline=deadline,
+            stage=_FAILURE_STAGE_COMMIT,
+            start=start,
+        )
 
-    latency = _elapsed_ms(start)
-    status: ContextReceiptDarkWriteStatus = (
-        "created" if stored_result.created else "idempotent"
-    )
-    return ContextReceiptDarkWriteResult(
-        status=status,
-        latency_ms=latency,
-        receipt_id=stored_result.receipt.id,
-        verification_status="passed",
-    )
+        latency = _elapsed_ms(start)
+        status: ContextReceiptDarkWriteStatus = (
+            "created" if stored_result.created else "idempotent"
+        )
+        return ContextReceiptDarkWriteResult(
+            status=status,
+            latency_ms=latency,
+            receipt_id=stored_result.receipt.id,
+            verification_status="passed",
+        )
+    finally:
+        # Bounded session cleanup. ``sys.exc_info()`` returns the in-flight
+        # exception (if any) so SQLAlchemy's ``__aexit__`` rolls back an
+        # aborted attempt, or ``(None, None, None)`` on success so it just
+        # closes. Cleanup is bounded by the remaining deadline so a stalled
+        # rollback/close cannot hold the request beyond the configured
+        # timeout. A cleanup failure does NOT alter the already-determined
+        # receipt result; only ``asyncio.CancelledError`` propagates.
+        if session_entered:
+            exc_info = sys.exc_info()
+            try:
+                await _await_before_deadline(
+                    session_cm.__aexit__(*exc_info), deadline=deadline
+                )
+            except asyncio.CancelledError:
+                raise
+            except (TimeoutError, Exception):  # noqa: BLE001 — best-effort cleanup
+                pass
 
 
 # ─── Best-effort wrapper (route boundary) ───────────────────────────────
@@ -939,9 +998,17 @@ async def write_startup_context_receipt_best_effort(
     # enabled (the recommended dogfood config), a stalled telemetry
     # connection could otherwise hold the recall request beyond the
     # configured receipt timeout. Bound it with the REMAINING deadline so
-    # the total dark-write time never exceeds the configured timeout. The
-    # already-determined receipt result is preserved regardless of the
-    # telemetry outcome.
+    # the total dark-write time never exceeds the configured timeout.
+    #
+    # ``telemetry_status`` MUST reflect the actual outcome:
+    #   - ``skipped_deadline``: the primary operation consumed the entire
+    #     deadline; emit the structured log and return without extending the
+    #     request to write telemetry;
+    #   - ``disabled``: ``usage_telemetry_enabled`` is false — the telemetry
+    #     helper is never even called;
+    #   - ``recorded``: the helper returned a non-None event id;
+    #   - ``failed``: the helper returned None (insertion failed) or raised;
+    #   - ``timed_out``: the telemetry await exceeded the remaining deadline.
     elapsed = time.monotonic() - outer_start
     remaining = timeout_seconds - elapsed
     telemetry_status: TelemetryStatus
@@ -951,9 +1018,14 @@ async def write_startup_context_receipt_best_effort(
         # ``skipped_deadline``, and return promptly. Do NOT extend the total
         # request time merely to write telemetry.
         telemetry_status = "skipped_deadline"
+    elif not settings.usage_telemetry_enabled:
+        # Telemetry is globally disabled. The helper is never called, so no
+        # usage-event row is written and the status honestly reports
+        # ``disabled`` — never ``recorded``.
+        telemetry_status = "disabled"
     else:
         try:
-            await asyncio.wait_for(
+            event_id = await asyncio.wait_for(
                 record_context_receipt_dark_write(
                     tenant_id=tenant_id,
                     principal_id=principal_id,
@@ -968,7 +1040,12 @@ async def write_startup_context_receipt_best_effort(
                 ),
                 timeout=remaining,
             )
-            telemetry_status = "recorded"
+            # The helper returns the event UUID on success (including the
+            # idempotent duplicate case) or None when the insertion failed.
+            # ``recorded`` requires a non-None id; None is an honest
+            # ``failed`` — the structured log claiming ``recorded`` with no
+            # usage-event row would be a false signal.
+            telemetry_status = "recorded" if event_id is not None else "failed"
         except TimeoutError:
             telemetry_status = "timed_out"
         except asyncio.CancelledError:

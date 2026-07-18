@@ -64,12 +64,15 @@ usage-event attempt as any other enabled failure.
 
 The configured timeout (`ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_TIMEOUT_SECONDS`,
 default 1.0) is a single monotonic deadline that starts **before**
-executed-result validation and covers every stage of the enabled attempt:
-provenance parsing, manifest construction, dedicated-session creation, RLS,
-storage, reload, verification, commit, and the bounded usage-event attempt.
-Each awaited stage runs against the **remaining** deadline, so no single
-stage can consume the entire configured timeout. When the primary operation
-exhausts the deadline, the wrapper records
+executed-result validation and covers every awaited operation of the
+enabled attempt: provenance parsing, manifest construction, **session entry
+(connection acquisition)**, RLS application, storage, flush, reload,
+verification, commit, **session cleanup (rollback/close)**, and the bounded
+usage-event attempt. Each awaited stage runs against the **remaining**
+deadline through a single deadline-aware await helper, so a database
+connectivity problem cannot hold startup recall beyond the configured
+timeout — not even in session entry, RLS, flush, or cleanup. When the
+primary operation exhausts the deadline, the wrapper records
 `telemetry_status=skipped_deadline` in the structured log and returns
 promptly without extending the request to write telemetry.
 

@@ -864,10 +864,13 @@ When enabled, a successful `POST /v1/recall` with `mode=startup` additionally:
 
 All of steps 2–9 run under one monotonic deadline
 (`ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_TIMEOUT_SECONDS`) that starts before
-executed-result validation; each awaited stage runs against the remaining
-deadline. When the primary operation exhausts the deadline, the wrapper
-records `telemetry_status=skipped_deadline` in the structured log and writes
-**no** usage-event row.
+executed-result validation. **Every** awaited operation — session entry
+(connection acquisition), RLS application, store, flush, reload, commit,
+and session cleanup (rollback/close) — runs against the remaining deadline,
+so no single stage can hold startup recall beyond the configured timeout.
+When the primary operation exhausts the deadline, the wrapper records
+`telemetry_status=skipped_deadline` in the structured log and writes **no**
+usage-event row.
 
 Semantic recall (`mode=semantic`) **never** invokes the dark write. No
 semantic Context Manifest support is implemented in this slice.
@@ -895,8 +898,12 @@ one bounded structured log per enabled attempt carries `event`, `status`,
 `failure_stage`, `exception_type`, `verification_status`, and
 `telemetry_status`. Usage events are best-effort: a hard timeout that
 exhausts the total deadline may have **no** usage-event row
-(`telemetry_status=skipped_deadline`). Correlate gap calculations with both
-sources.
+(`telemetry_status=skipped_deadline`). `telemetry_status` honestly reports
+the outcome: `recorded` (insert returned a UUID), `disabled`
+(`usage_telemetry_enabled` is false — the helper is never called), `failed`
+(insert returned `None` or raised), `timed_out` (await exceeded the
+remaining deadline), or `skipped_deadline` (no deadline remained).
+Correlate gap calculations with both sources.
 
 ### Dogfood rollout
 

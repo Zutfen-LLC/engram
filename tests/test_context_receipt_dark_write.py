@@ -590,7 +590,8 @@ async def test_decision_context_failure_within_deadline_returns_failed(
 
     async def _capture_usage(**kwargs: Any) -> Any:
         captured.update(kwargs)
-        return None
+        # Return a UUID to simulate a successful insertion.
+        return uuid.uuid4()
 
     monkeypatch.setattr(
         "engram.usage.record_context_receipt_dark_write", _capture_usage
@@ -604,7 +605,8 @@ async def test_decision_context_failure_within_deadline_returns_failed(
     assert result.failure_stage == "build_decision_context"
     assert result.exception_type == "StartupDecisionContextError"
     assert result.verification_status == "failed"
-    # Telemetry was attempted (deadline had room).
+    # Telemetry was attempted (deadline had room) and the helper returned a
+    # UUID — the status honestly reports ``recorded``.
     assert result.telemetry_status == "recorded"
     assert captured["status"] == "failed"
     assert captured["failure_stage"] == "build_decision_context"
@@ -1115,7 +1117,337 @@ async def test_usage_telemetry_failure_does_not_alter_dark_write_result(
     assert result.telemetry_status == "failed"
 
 
-# ─── Manifest descriptor mapping (still pure) ───────────────────────────
+# ─── Telemetry status correctness ───────────────────────────────────────
+
+
+async def test_telemetry_disabled_reports_disabled_no_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``usage_telemetry_enabled`` is false, ``telemetry_status`` is
+    ``disabled`` and the telemetry helper is never called."""
+    monkeypatch.setattr(settings, "usage_telemetry_enabled", False)
+    _patch_session_factory(monkeypatch)
+
+    def _boom(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("telemetry helper must not be called when disabled")
+
+    monkeypatch.setattr(
+        "engram.usage.record_context_receipt_dark_write", _boom
+    )
+
+    result = await _best_effort(monkeypatch)
+    # The dark-write outcome (created/failed/etc.) is irrelevant to this
+    # test — the point is that telemetry_status honestly reports ``disabled``
+    # and the helper was never invoked.
+    assert result.telemetry_status == "disabled"
+
+
+async def test_telemetry_returns_none_reports_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the telemetry helper returns ``None`` (insertion failed),
+    ``telemetry_status`` is ``failed`` — never ``recorded``."""
+    monkeypatch.setattr(settings, "usage_telemetry_enabled", True)
+    _patch_session_factory(monkeypatch)
+
+    async def _returns_none(**kwargs: Any) -> Any:
+        return None
+
+    monkeypatch.setattr(
+        "engram.usage.record_context_receipt_dark_write", _returns_none
+    )
+
+    result = await _best_effort(monkeypatch)
+    assert result.telemetry_status == "failed"
+
+
+async def test_telemetry_returns_uuid_reports_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the telemetry helper returns a UUID, ``telemetry_status`` is
+    ``recorded``."""
+    monkeypatch.setattr(settings, "usage_telemetry_enabled", True)
+    _patch_session_factory(monkeypatch)
+
+    async def _returns_uuid(**kwargs: Any) -> Any:
+        return uuid.uuid4()
+
+    monkeypatch.setattr(
+        "engram.usage.record_context_receipt_dark_write", _returns_uuid
+    )
+
+    result = await _best_effort(monkeypatch)
+    assert result.telemetry_status == "recorded"
+
+
+async def test_telemetry_timeout_reports_timed_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the telemetry await exceeds the remaining deadline,
+    ``telemetry_status`` is ``timed_out``."""
+    monkeypatch.setattr(settings, "usage_telemetry_enabled", True)
+    _patch_session_factory(monkeypatch)
+
+    async def _slow_telemetry(**kwargs: Any) -> Any:
+        await asyncio.sleep(10)
+
+    monkeypatch.setattr(
+        "engram.usage.record_context_receipt_dark_write", _slow_telemetry
+    )
+
+    result = await _best_effort(monkeypatch, timeout_seconds=0.1)
+    assert result.telemetry_status == "timed_out"
+
+
+async def test_telemetry_exhausted_deadline_reports_skipped_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the primary operation consumes the entire deadline,
+    ``telemetry_status`` is ``skipped_deadline`` and the telemetry helper is
+    never called."""
+    monkeypatch.setattr(settings, "usage_telemetry_enabled", True)
+    _patch_session_factory(monkeypatch)
+
+    async def _slow_store(*args: Any, **kwargs: Any) -> Any:
+        await asyncio.sleep(0.2)  # consumes the whole 0.1s deadline
+
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write.store_context_receipt", _slow_store
+    )
+
+    def _boom(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("telemetry helper must not be called when deadline exhausted")
+
+    monkeypatch.setattr(
+        "engram.usage.record_context_receipt_dark_write", _boom
+    )
+
+    result = await _best_effort(monkeypatch, timeout_seconds=0.1)
+    assert result.status == "timed_out"
+    assert result.telemetry_status == "skipped_deadline"
+
+
+# ─── Deadline coverage for every awaited DB stage ───────────────────────
+
+
+class _SlowSession:
+    """Fake session whose configurable methods sleep to prove the deadline
+    bounds session entry, RLS, flush, and cleanup — not just store/refresh/
+    commit."""
+
+    def __init__(
+        self,
+        *,
+        slow_enter: float = 0.0,
+        slow_rls: float = 0.0,
+        slow_flush: float = 0.0,
+        slow_exit: float = 0.0,
+    ) -> None:
+        self._slow_enter = slow_enter
+        self._slow_rls = slow_rls
+        self._slow_flush = slow_flush
+        self._slow_exit = slow_exit
+
+    async def __aenter__(self) -> _SlowSession:
+        if self._slow_enter:
+            await asyncio.sleep(self._slow_enter)
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        if self._slow_exit:
+            await asyncio.sleep(self._slow_exit)
+        return None
+
+    async def flush(self) -> None:
+        if self._slow_flush:
+            await asyncio.sleep(self._slow_flush)
+
+    async def refresh(self, _obj: Any) -> None:
+        pass
+
+    async def commit(self) -> None:
+        pass
+
+
+def _patch_slow_session(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    slow_enter: float = 0.0,
+    slow_rls: float = 0.0,
+    slow_flush: float = 0.0,
+    slow_exit: float = 0.0,
+) -> None:
+    session = _SlowSession(
+        slow_enter=slow_enter,
+        slow_rls=slow_rls,
+        slow_flush=slow_flush,
+        slow_exit=slow_exit,
+    )
+
+    def _factory() -> Any:
+        return session
+
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write.async_session_factory", _factory
+    )
+
+    rls_sleep = slow_rls
+
+    async def _rls(*args: Any, **kwargs: Any) -> None:
+        if rls_sleep:
+            await asyncio.sleep(rls_sleep)
+
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write.apply_rls_context", _rls
+    )
+
+
+async def test_slow_session_enter_bounded_by_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session ``__aenter__`` (connection acquisition) is bounded by the
+    shared deadline."""
+    _patch_slow_session(monkeypatch, slow_enter=10.0)
+
+    start = asyncio.get_event_loop().time()
+    result = await _best_effort(monkeypatch, timeout_seconds=0.05)
+    elapsed = asyncio.get_event_loop().time() - start
+    assert result.status == "timed_out"
+    assert result.failure_stage == "timeout"
+    assert elapsed < 2.0
+
+
+async def test_slow_apply_rls_bounded_by_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``apply_rls_context`` is bounded by the shared deadline."""
+    _patch_slow_session(monkeypatch, slow_rls=10.0)
+
+    start = asyncio.get_event_loop().time()
+    result = await _best_effort(monkeypatch, timeout_seconds=0.05)
+    elapsed = asyncio.get_event_loop().time() - start
+    assert result.status == "timed_out"
+    assert result.failure_stage == "timeout"
+    assert elapsed < 2.0
+
+
+async def test_slow_flush_bounded_by_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``session.flush()`` is bounded by the shared deadline."""
+    # A fake session whose flush hangs past the deadline.
+    class _SlowFlushSession(_FakeSession):
+        async def flush(self) -> None:
+            await asyncio.sleep(10)
+
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write.async_session_factory",
+        lambda: _SlowFlushSession(),
+    )
+
+    async def _noop_rls(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write.apply_rls_context", _noop_rls
+    )
+
+    async def _fast_store(*args: Any, **kwargs: Any) -> Any:
+        from engram.context_receipts import ContextReceiptStoreResult
+
+        class _R:
+            id = uuid.uuid4()
+            recall_log_id = uuid.UUID(RECALL_LOG_ID)
+            tenant_id = TENANT
+            principal_id = PRINCIPAL
+            manifest_hash = "sha256:" + "0" * 64
+            packet_hash = "sha256:" + "0" * 64
+
+        return ContextReceiptStoreResult(receipt=_R(), created=True)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write.store_context_receipt", _fast_store
+    )
+
+    start = asyncio.get_event_loop().time()
+    result = await _best_effort(monkeypatch, timeout_seconds=0.05)
+    elapsed = asyncio.get_event_loop().time() - start
+    assert result.status == "timed_out"
+    assert result.failure_stage == "timeout"
+    assert elapsed < 2.0
+
+
+async def test_slow_session_cleanup_bounded_by_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session ``__aexit__`` (rollback/close after a store failure) is
+    bounded by the shared deadline — a stalled cleanup cannot hold the
+    request beyond the configured timeout."""
+    _patch_slow_session(monkeypatch, slow_exit=10.0)
+
+    async def _raise_store(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("forced store failure so cleanup runs")
+
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write.store_context_receipt", _raise_store
+    )
+
+    start = asyncio.get_event_loop().time()
+    result = await _best_effort(monkeypatch, timeout_seconds=0.1)
+    elapsed = asyncio.get_event_loop().time() - start
+    # The store failure (not timeout) is the result — cleanup is best-effort.
+    assert result.status == "failed"
+    assert result.failure_stage == "store"
+    # But the slow cleanup was bounded — total elapsed stays within grace.
+    assert elapsed < 2.0, f"slow cleanup held request for {elapsed:.2f}s"
+
+
+async def test_manifest_construction_consuming_deadline_still_bounds_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If synchronous manifest construction consumes the entire deadline,
+    the code still attempts session entry but the deadline check fires
+    immediately (no unbounded DB wait)."""
+    import time as _time
+
+    _patch_session_factory(monkeypatch)
+
+    # Save the real builder before patching so the slow wrapper produces a
+    # valid manifest (not a TypeError from wrong kwargs).
+    from engram.context_receipt_dark_write import _build_manifest as _real_build
+
+    def _slow_build(*args: Any, **kwargs: Any) -> Any:
+        # Consume the whole deadline synchronously.
+        _time.sleep(0.15)
+        return _real_build(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write._build_manifest", _slow_build
+    )
+
+    # Make session entry hang if it somehow ran unbounded.
+    def _factory() -> Any:
+        class _Hang:
+            async def __aenter__(self) -> Any:
+                await asyncio.sleep(10)
+                return self
+
+            async def __aexit__(self, *exc: Any) -> None:
+                pass
+
+        return _Hang()
+
+    monkeypatch.setattr(
+        "engram.context_receipt_dark_write.async_session_factory", _factory
+    )
+
+    start = asyncio.get_event_loop().time()
+    result = await _best_effort(monkeypatch, timeout_seconds=0.1)
+    elapsed = asyncio.get_event_loop().time() - start
+    # The session entry is bounded — the deadline fires before the 10s hang.
+    assert result.status == "timed_out"
+    assert result.failure_stage == "timeout"
+    assert elapsed < 2.0
 
 
 def _decision_context(
