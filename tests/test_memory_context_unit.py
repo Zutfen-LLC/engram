@@ -30,6 +30,11 @@ def _bound_context(**overrides: object) -> ResolvedMemoryContext:
         "include_tenant": False,
         "include_public": False,
         "readable_workspace_ids": frozenset(),
+        "allow_tenant_write": False,
+        "allow_public_write": False,
+        "default_write_visibility": "private",
+        "default_write_workspace_id": None,
+        "writable_workspace_ids": frozenset(),
     }
     values.update(overrides)
     return ResolvedMemoryContext(**values)  # type: ignore[arg-type]
@@ -106,13 +111,19 @@ async def test_profile_resolution_loads_revision_and_grants_once(monkeypatch) ->
             "include_private": True,
             "include_tenant": False,
             "include_public": True,
+            "allow_tenant_write": False,
+            "allow_public_write": True,
+            "default_write_visibility": "private",
+            "default_write_workspace_id": None,
             "readable_workspace_ids": [workspace_a, workspace_b],
+            "writable_workspace_ids": [workspace_a],
         }
     )
     context = await resolve_memory_context(session, principal)  # type: ignore[arg-type]
     assert session.query_count == 1
     assert context.memory_profile_revision_id == revision_id
     assert context.readable_workspace_ids == frozenset({workspace_a, workspace_b})
+    assert context.writable_workspace_ids == frozenset({workspace_a})
 
 
 @pytest.mark.parametrize("row", [None, {"disabled_at": datetime.now(UTC)}])

@@ -19,8 +19,12 @@ from engram.auth import Principal as AuthPrincipal
 from engram.authority import authority_label, derive_memory_authority
 from engram.canonicalize import canonicalize, content_hash
 from engram.db import get_session
-from engram.memory_access import profile_read_scope_expression
-from engram.memory_context import ResolvedMemoryContext, resolve_memory_context
+from engram.memory_access import profile_read_scope_expression, profile_write_scope_expression
+from engram.memory_context import (
+    ResolvedMemoryContext,
+    context_provenance,
+    resolve_memory_context,
+)
 from engram.models import ItemEvent, MemoryItem, Principal
 from engram.safety import has_secrets
 from engram.trust_policy import resolve_trust_defaults
@@ -241,6 +245,7 @@ async def write_diary(
     req: DiaryWrite,
     session: AsyncSession = Depends(get_session),  # noqa: B008
     caller: AuthPrincipal = Depends(get_current_principal),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> DiaryWriteResponse:
     if has_secrets(req.entry):
         raise HTTPException(
@@ -308,6 +313,8 @@ async def write_diary(
                     MemoryItem.content_hash == chash,
                     MemoryItem.valid_to.is_(None),
                     MemoryItem.review_status != "rejected",
+                    profile_read_scope_expression(memory_context),
+                    profile_write_scope_expression(memory_context),
                 )
             )
         ).scalar_one_or_none()
@@ -331,6 +338,7 @@ async def write_diary(
     session.add(
         ItemEvent(
             item_id=item.id,
+            **context_provenance(memory_context),
             event_type="diary_create",
             field_name="principal_id",
             old_value=None,

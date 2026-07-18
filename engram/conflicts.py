@@ -25,6 +25,7 @@ from engram.authority import (
     qualifies_for_auto_supersession,
 )
 from engram.config import settings
+from engram.memory_context import ResolvedMemoryContext
 from engram.models import EmbeddingProfile, MemoryEmbedding, MemoryItem
 from engram.provider_clients import resolve_classification_provider
 from engram.usage import (
@@ -110,6 +111,7 @@ async def detect_conflicts(
     ingest_id: UUID | None = None,
     job_id: UUID | None = None,
     usage_class: UsageClass = "async_enrichment",
+    memory_context: ResolvedMemoryContext | None = None,
 ) -> ConflictResult | None:
     """Check ``new_item`` against active items in scope for semantic conflicts.
 
@@ -177,6 +179,10 @@ async def detect_conflicts(
         stmt = stmt.where(MemoryItem.workspace_id.is_(None))
     else:
         stmt = stmt.where(MemoryItem.workspace_id == new_item.workspace_id)
+    if memory_context is not None:
+        from engram.memory_access import write_eligibility_expression
+
+        stmt = stmt.where(write_eligibility_expression(memory_context))
     stmt = stmt.order_by(distance.asc()).limit(1)
 
     row = (await session.execute(stmt)).mappings().one_or_none()
@@ -670,6 +676,7 @@ async def find_promotion_conflict_candidates(
     item: MemoryItem,
     *,
     k: int | None = None,
+    memory_context: ResolvedMemoryContext | None = None,
 ) -> list[ConflictCandidate]:
     """Top-k plausible active-item conflict candidates for ``item``.
 
@@ -713,9 +720,11 @@ async def find_promotion_conflict_candidates(
 
     if query_embedding is not None:
         return await _find_candidates_by_embedding(
-            session, item, query_embedding, resolved_k, profile
+            session, item, query_embedding, resolved_k, profile, memory_context
         )
-    return await _find_candidates_by_heuristic(session, item, resolved_k)
+    return await _find_candidates_by_heuristic(
+        session, item, resolved_k, memory_context
+    )
 
 
 async def _find_candidates_by_embedding(
@@ -724,6 +733,7 @@ async def _find_candidates_by_embedding(
     query_embedding: Any,
     k: int,
     profile: EmbeddingProfile,
+    memory_context: ResolvedMemoryContext | None,
 ) -> list[ConflictCandidate]:
     await session.execute(text("SET LOCAL hnsw.iterative_scan = strict_order"))
     typed_embedding = cast(MemoryEmbedding.embedding, Vector(profile.dimensions))
@@ -761,6 +771,10 @@ async def _find_candidates_by_embedding(
         stmt = stmt.where(MemoryItem.workspace_id.is_(None))
     else:
         stmt = stmt.where(MemoryItem.workspace_id == item.workspace_id)
+    if memory_context is not None:
+        from engram.memory_access import write_eligibility_expression
+
+        stmt = stmt.where(write_eligibility_expression(memory_context))
     stmt = stmt.order_by(distance.asc()).limit(k)
 
     rows = (await session.execute(stmt)).mappings().all()
@@ -785,6 +799,7 @@ async def _find_candidates_by_heuristic(
     session: AsyncSession,
     item: MemoryItem,
     k: int,
+    memory_context: ResolvedMemoryContext | None,
 ) -> list[ConflictCandidate]:
     """Non-embedding fallback candidate search (see docstring above)."""
     subject_clauses = []
@@ -821,6 +836,10 @@ async def _find_candidates_by_heuristic(
         stmt = stmt.where(MemoryItem.workspace_id.is_(None))
     else:
         stmt = stmt.where(MemoryItem.workspace_id == item.workspace_id)
+    if memory_context is not None:
+        from engram.memory_access import write_eligibility_expression
+
+        stmt = stmt.where(write_eligibility_expression(memory_context))
     stmt = stmt.order_by(MemoryItem.created_at.desc()).limit(k)
 
     rows = (await session.execute(stmt)).mappings().all()
@@ -842,6 +861,7 @@ async def check_promotion_conflict(
     item: MemoryItem,
     *,
     k: int | None = None,
+    memory_context: ResolvedMemoryContext | None = None,
 ) -> PromotionConflictCheck | None:
     """Conservative promotion-time conflict recheck (design.md §3 Path A).
 
@@ -866,7 +886,9 @@ async def check_promotion_conflict(
 
     Returns ``None`` when no candidate blocks promotion.
     """
-    candidates = await find_promotion_conflict_candidates(session, item, k=k)
+    candidates = await find_promotion_conflict_candidates(
+        session, item, k=k, memory_context=memory_context
+    )
     for candidate in candidates:
         if candidate.similarity is not None:
             verdict, _confidence, reason, _provenance = await _classify_relationship(

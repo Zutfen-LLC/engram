@@ -50,7 +50,22 @@ from engram.jobs import (
     mark_job_failed_or_retry,
     mark_job_succeeded,
 )
-from engram.models import EmbeddingProfile, ItemEvent, Job, MemoryEmbedding, MemoryItem, Principal
+from engram.memory_context import (
+    INTERNAL_MEMORY_CONTEXT_VERSION,
+    LEGACY_MEMORY_CONTEXT_VERSION,
+    ResolvedMemoryContext,
+    context_provenance,
+    memory_context_from_ingest,
+)
+from engram.models import (
+    CandidateIngest,
+    EmbeddingProfile,
+    ItemEvent,
+    Job,
+    MemoryEmbedding,
+    MemoryItem,
+    Principal,
+)
 
 if TYPE_CHECKING:
     from engram.conflicts import ConflictAction, ConflictResult
@@ -111,12 +126,59 @@ async def _insert_event(
     new_value: Any,
     actor_principal_id: UUID | str | None,
     reason: str | None,
+    ingest_id: UUID | None = None,
 ) -> None:
     """Write an item_events audit row (mirrors the PATCH path's helper)."""
+    tenant_id = (
+        await session.execute(select(MemoryItem.tenant_id).where(MemoryItem.id == item_id))
+    ).scalar_one()
+    provenance: dict[str, object] = {
+        "tenant_id": tenant_id,
+        "memory_context_version": INTERNAL_MEMORY_CONTEXT_VERSION,
+    }
+    if ingest_id is not None:
+        ingest = await session.scalar(
+            select(CandidateIngest).where(CandidateIngest.id == ingest_id)
+        )
+        if ingest is None:
+            raise ValueError("candidate ingest provenance is unavailable")
+        # Audit-event provenance is descriptive metadata, not an authorization
+        # boundary (the handler already resolved the worker context and would
+        # have skipped on a provenance failure). The three outcomes are kept
+        # explicit and truthfully distinct:
+        #   * valid execution authority  -> exact caller profile/API-key provenance;
+        #   * genuine legacy ingest      -> legacy-unprofiled-v0 (compatibility);
+        #   * missing/corrupt/incoherent v2 authority -> neutral internal-system-v1.
+        # A v2 provenance failure must never be relabeled legacy: the two are
+        # materially different states. No profile/revision/API-key identity is
+        # ever fabricated. Catch only the provenance-reconstruction ValueError
+        # from memory_context_from_ingest; unrelated database errors propagate.
+        try:
+            context = await memory_context_from_ingest(session, ingest)
+        except ValueError:
+            logger.warning(
+                "%s ingest=%s audit provenance unavailable: execution authority "
+                "could not be reconstructed; recording neutral internal provenance",
+                event_type,
+                ingest_id,
+            )
+            provenance = {
+                "tenant_id": tenant_id,
+                "memory_context_version": INTERNAL_MEMORY_CONTEXT_VERSION,
+            }
+        else:
+            if context is None:
+                provenance = {
+                    "tenant_id": tenant_id,
+                    "memory_context_version": LEGACY_MEMORY_CONTEXT_VERSION,
+                }
+            else:
+                provenance = context_provenance(context)
     await session.execute(
         insert(ItemEvent).values(
             id=uuid.uuid4(),
             item_id=item_id,
+            **provenance,
             event_type=event_type,
             field_name=field_name,
             old_value=_stringify(old_value),
@@ -155,6 +217,20 @@ def _payload_item_id(job: Job) -> UUID:
     if raw is None:
         raise ValueError("payload missing memory_item_id")
     return _parse_uuid(raw)
+
+
+async def _job_memory_context(
+    session: AsyncSession, job: Job
+) -> ResolvedMemoryContext | None:
+    raw_ingest_id = job.payload.get("ingest_id")
+    if raw_ingest_id is None:
+        return None
+    ingest = await session.scalar(
+        select(CandidateIngest).where(CandidateIngest.id == _parse_uuid(raw_ingest_id))
+    )
+    if ingest is None or str(ingest.tenant_id) != str(job.tenant_id):
+        raise ValueError("candidate ingest provenance is unavailable")
+    return await memory_context_from_ingest(session, ingest)
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +424,11 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
 
     raw_correlation_id = job.payload.get("correlation_id")
     raw_ingest_id = job.payload.get("ingest_id")
+    try:
+        memory_context = await _job_memory_context(session, job)
+    except ValueError:
+        logger.exception("conflict.check id=%s skipped: invalid memory context", item_id)
+        return
     result = await detect_conflicts(
         item,
         session,
@@ -356,6 +437,7 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
         ingest_id=_parse_uuid(raw_ingest_id) if raw_ingest_id else None,
         job_id=job.id,
         usage_class="async_enrichment",
+        memory_context=memory_context,
     )
     if result is None:
         return
@@ -407,6 +489,7 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
             counterpart_id=result.existing_item_id,
             result=result,
             profile=profile,
+            memory_context=memory_context,
         )
         await session.commit()
         return
@@ -431,6 +514,7 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
             counterpart_id=result.existing_item_id,
             result=result,
             profile=profile,
+            memory_context=memory_context,
         )
         await session.commit()
         return
@@ -469,6 +553,7 @@ async def handle_conflict_check(session: AsyncSession, job: Job) -> None:
         counterpart_id=result.existing_item_id,
         action=action,
         result=result,
+        memory_context=memory_context,
     )
     await session.commit()
 
@@ -507,6 +592,7 @@ async def _lock_conflict_pair(
     job_item_id: UUID,
     counterpart_id: UUID,
     tenant_id: str,
+    memory_context: ResolvedMemoryContext | None,
 ) -> tuple[MemoryItem, MemoryItem] | None:
     """Lock both conflict rows in canonical UUID order (SELECT ... FOR UPDATE).
 
@@ -537,6 +623,17 @@ async def _lock_conflict_pair(
         return None
     if str(job_item.tenant_id) != tenant_id or str(counterpart.tenant_id) != tenant_id:
         return None
+    if memory_context is not None:
+        from engram.memory_access import apply_write_eligibility
+
+        eligible_counterpart = await session.scalar(
+            apply_write_eligibility(
+                select(MemoryItem.id).where(MemoryItem.id == counterpart_id),
+                memory_context,
+            )
+        )
+        if eligible_counterpart is None:
+            return None
     return job_item, counterpart
 
 
@@ -548,6 +645,7 @@ async def _apply_flagging(
     counterpart_id: UUID,
     action: ConflictAction,
     result: ConflictResult,
+    memory_context: ResolvedMemoryContext | None,
 ) -> None:
     """Serialize the flagging mutation: lock, revalidate, guarded write, event.
 
@@ -562,6 +660,7 @@ async def _apply_flagging(
         job_item_id=job_item.id,
         counterpart_id=counterpart_id,
         tenant_id=tenant_id,
+        memory_context=memory_context,
     )
     if locked is None:
         return
@@ -697,6 +796,7 @@ async def _apply_flagging(
         new_value=str(target_counterpart),
         actor_principal_id=actor,
         reason=json.dumps(payload, sort_keys=True),
+        ingest_id=_parse_uuid(job.payload["ingest_id"]) if job.payload.get("ingest_id") else None,
     )
 
 
@@ -909,6 +1009,7 @@ async def _apply_dedup(
     counterpart_id: UUID,
     result: ConflictResult,
     profile: EmbeddingProfile,
+    memory_context: ResolvedMemoryContext | None,
 ) -> None:
     """Serialize the DEDUP rejection: lock, revalidate, guarded reject, event.
 
@@ -935,6 +1036,7 @@ async def _apply_dedup(
         job_item_id=job_item.id,
         counterpart_id=counterpart_id,
         tenant_id=tenant_id,
+        memory_context=memory_context,
     )
     if locked is None:
         return
@@ -1061,6 +1163,7 @@ async def _apply_dedup(
         new_value="rejected",
         actor_principal_id=actor,
         reason=json.dumps(provenance, sort_keys=True),
+        ingest_id=_parse_uuid(job.payload["ingest_id"]) if job.payload.get("ingest_id") else None,
     )
 
 
@@ -1072,6 +1175,7 @@ async def _apply_auto_supersede(
     counterpart_id: UUID,
     result: ConflictResult,
     profile: EmbeddingProfile,
+    memory_context: ResolvedMemoryContext | None,
 ) -> None:
     """Serialize the AUTO_SUPERSEDE mutation: lock, revalidate, guarded write,
     truthful event.
@@ -1121,6 +1225,7 @@ async def _apply_auto_supersede(
         job_item_id=job_item.id,
         counterpart_id=counterpart_id,
         tenant_id=tenant_id,
+        memory_context=memory_context,
     )
     if locked is None:
         return
@@ -1293,6 +1398,7 @@ async def _apply_auto_supersede(
         new_value=str(new_id),
         actor_principal_id=actor,
         reason=json.dumps(payload, sort_keys=True),
+        ingest_id=_parse_uuid(job.payload["ingest_id"]) if job.payload.get("ingest_id") else None,
     )
 
 
@@ -1336,6 +1442,7 @@ async def _guarded_field_update(
     reason: str | None,
     provenance: dict[str, Any],
     result_reason: str,
+    ingest_id: UUID | None,
 ) -> bool:
     """Guarded UPDATE for a single metadata field. Re-checks the old value in
     the WHERE clause, uses RETURNING to confirm the mutation, and writes the
@@ -1370,6 +1477,7 @@ async def _guarded_field_update(
         new_value=new_value,
         actor_principal_id=actor,
         reason=json.dumps({**provenance, "reason": result_reason}, sort_keys=True),
+        ingest_id=ingest_id,
     )
     return True
 
@@ -1486,6 +1594,11 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
                 reason=None,
                 provenance=provenance,
                 result_reason=result.reason,
+                ingest_id=(
+                    _parse_uuid(job.payload["ingest_id"])
+                    if job.payload.get("ingest_id")
+                    else None
+                ),
             ):
                 changed = True
         if result.suggested_wing and result.suggested_wing != (locked_item.wing or ""):  # noqa: SIM102
@@ -1500,6 +1613,11 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
                 reason=None,
                 provenance=provenance,
                 result_reason=result.reason,
+                ingest_id=(
+                    _parse_uuid(job.payload["ingest_id"])
+                    if job.payload.get("ingest_id")
+                    else None
+                ),
             ):
                 changed = True
         if result.suggested_room and result.suggested_room != (locked_item.room or ""):  # noqa: SIM102
@@ -1514,6 +1632,11 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
                 reason=None,
                 provenance=provenance,
                 result_reason=result.reason,
+                ingest_id=(
+                    _parse_uuid(job.payload["ingest_id"])
+                    if job.payload.get("ingest_id")
+                    else None
+                ),
             ):
                 changed = True
 
@@ -1536,6 +1659,11 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
             reason=None,
             provenance=provenance,
             result_reason=result.reason,
+            ingest_id=(
+                _parse_uuid(job.payload["ingest_id"])
+                if job.payload.get("ingest_id")
+                else None
+            ),
         ):
             changed = True
 
@@ -1614,6 +1742,7 @@ async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
         ),
         actor_principal_id=actor,
         reason=json.dumps({**provenance, "reason": run.reason}, sort_keys=True),
+        ingest_id=_parse_uuid(job.payload["ingest_id"]) if job.payload.get("ingest_id") else None,
     )
 
     await session.commit()
@@ -1630,8 +1759,29 @@ async def handle_promotion_path_a(session: AsyncSession, job: Job) -> None:
         raw_run_id = job.payload.get("classification_run_id")
         if raw_run_id is None:
             raise ValueError("targeted promotion job missing classification_run_id")
+        # Targeted candidate-origin promotion reconstructs the remember-time
+        # execution authority. Missing v2 authority is a permanent condition
+        # (a pre-025 queued job, a deleted/corrupt execution row) that retry
+        # cannot heal, and replaying under candidate-origin authority is
+        # forbidden. Mirror conflict.check's intentional fail-closed skip so
+        # the outer loop marks the job succeeded instead of retrying it toward
+        # a dead letter. Catch only the provenance-reconstruction ValueError;
+        # genuine transient DB failures and programming defects still reach the
+        # retry/dead-letter machinery via the outer handler.
+        try:
+            memory_context = await _job_memory_context(session, job)
+        except ValueError:
+            logger.warning(
+                "promotion.path_a item=%s skipped: execution authority unavailable",
+                raw_item_id,
+            )
+            return
         result = await auto_promote_item(
-            session, str(job.tenant_id), _parse_uuid(raw_item_id), _parse_uuid(raw_run_id)
+            session,
+            str(job.tenant_id),
+            _parse_uuid(raw_item_id),
+            _parse_uuid(raw_run_id),
+            memory_context=memory_context,
         )
     logger.info(
         "promotion.path_a tenant=%s scanned=%s promoted=%s",

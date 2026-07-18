@@ -24,7 +24,7 @@ _MEMORY_ITEM_READ_ROUTES = {
     ("GET", "/v1/taxonomy"),
 }
 
-_PRE_002C_MUTATIONS = {
+_PROFILE_ENFORCED_MUTATIONS = {
     ("POST", "/v1/remember"),
     ("POST", "/v1/classify"),
     ("POST", "/v1/kg"),
@@ -38,6 +38,7 @@ _PRE_002C_MUTATIONS = {
     ("POST", "/v1/items/{item_id}/verify"),
     ("POST", "/v1/items/{item_id}/resolve-conflict"),
     ("POST", "/v1/items/bulk-archive"),
+    ("POST", "/v1/admin/promote"),
 }
 
 _EXPLICITLY_UNAFFECTED_GET_ROUTES = {
@@ -93,11 +94,12 @@ def test_every_memory_item_read_surface_resolves_one_context() -> None:
         assert calls.count(resolve_memory_context) == 1, key
 
 
-def test_pre_002c_mutations_do_not_resolve_profile_read_policy() -> None:
+def test_every_memory_mutation_resolves_one_unified_context() -> None:
     routes = _routes()
-    assert routes.keys() >= _PRE_002C_MUTATIONS
-    for key in _PRE_002C_MUTATIONS:
-        assert resolve_memory_context not in set(_dependency_calls(routes[key])), key
+    assert routes.keys() >= _PROFILE_ENFORCED_MUTATIONS
+    for key in _PROFILE_ENFORCED_MUTATIONS:
+        calls = list(_dependency_calls(routes[key]))
+        assert calls.count(resolve_memory_context) == 1, key
 
 
 def test_no_data_plane_schema_accepts_a_profile_selector() -> None:

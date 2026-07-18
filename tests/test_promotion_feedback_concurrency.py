@@ -658,10 +658,12 @@ async def test_promotion_first_then_feedback_commits_against_active(
     assert st["feedback"][0]["principal_id"] == str(p["actors"]["external"])
     # Importance contains exactly the feedback effect (external agent noise: -0.05).
     assert st["item"]["importance"] == pytest.approx(initial_importance - 0.05)
-    # Event/history ordering is consistent: promotion event precedes feedback
-    # (feedback leaves no item_event; it writes only to feedback_events). The
-    # single item_event is the promotion transition.
-    assert len(st["events"]) == 1
+    # Event/history ordering is consistent: promotion precedes the canonical
+    # context-bearing feedback audit event introduced by ENG-SCOPE-002C.
+    assert [event["event_type"] for event in st["events"]] == [
+        "review_change",
+        "feedback",
+    ]
 
 
 # ===========================================================================

@@ -149,8 +149,18 @@ async def _clean_state():
                 text("DELETE FROM memory_kinds WHERE is_builtin = FALSE AND name LIKE 'test_%'")
             )
     yield
+    # Wipe in teardown too, so the last test in this file does not leak
+    # memory_items into later suites that share the default tenant (e.g. the
+    # profile authorization regressions, which assert a clean promotion scan).
     invalidate_vocab_cache()
     invalidate_memory_kind_cache()
+    if await _db_ok():
+        async with _test_engine.begin() as conn:
+            await conn.execute(text("DELETE FROM memory_embeddings"))
+            await conn.execute(text("DELETE FROM memory_items"))
+            await conn.execute(
+                text("DELETE FROM memory_kinds WHERE is_builtin = FALSE AND name LIKE 'test_%'")
+            )
 
 
 def _require_db():

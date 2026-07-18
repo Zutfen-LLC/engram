@@ -348,11 +348,13 @@ gets `403 Forbidden` with a body like `{"detail": "Requires scope: write"}`
 before any handler-level mutation or eligibility disclosure.
 
 For a memory-profile-bound key, scopes authorize the operation but do not bypass the
-profile's active read revision. Even `admin` and `export` remain narrowed on
+profile's active read/write revision. Even `admin` and `export` remain narrowed on
 MemoryItem-backed data. The server pins one `ResolvedMemoryContext` per request; there is no
 request field, header, SDK option, MCP argument, or Hermes setting that selects another profile.
-Unprofiled keys retain compatibility behavior. Profile-enforced writes are intentionally deferred
-to ENG-SCOPE-002C, so a bound key is not yet a complete read/write sandbox.
+Unprofiled keys retain compatibility behavior. Fully omitted write scope uses the profile default;
+tenant/public writes require their explicit write flags, every workspace association requires a
+writable grant, and existing-item mutation requires both read and write eligibility. Private
+no-workspace creation remains governed by API `write` scope, not `include_private`.
 
 `POST /v1/items/{item_id}/review` is a mixed-purpose endpoint: an agent with
 only `write` may dispute an item or withdraw its own still-`proposed`

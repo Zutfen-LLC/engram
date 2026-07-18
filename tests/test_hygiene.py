@@ -102,6 +102,11 @@ CREATE_STATEMENTS = [
     CREATE TABLE item_events (
         id TEXT PRIMARY KEY,
         item_id TEXT NOT NULL,
+        tenant_id TEXT NOT NULL,
+        api_key_id TEXT,
+        memory_profile_id TEXT,
+        memory_profile_revision_id TEXT,
+        memory_context_version TEXT NOT NULL,
         event_type TEXT NOT NULL,
         field_name TEXT,
         old_value TEXT,

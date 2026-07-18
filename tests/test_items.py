@@ -129,6 +129,11 @@ CREATE_STATEMENTS = [
     CREATE TABLE item_events (
         id TEXT PRIMARY KEY,
         item_id TEXT NOT NULL,
+        tenant_id TEXT NOT NULL,
+        api_key_id TEXT,
+        memory_profile_id TEXT,
+        memory_profile_revision_id TEXT,
+        memory_context_version TEXT NOT NULL,
         event_type TEXT NOT NULL,
         field_name TEXT,
         old_value TEXT,
@@ -200,7 +205,11 @@ async def client(session_factory):
         # get_current_principal — this override only keeps V2-BL-004's
         # ScopeGuard dependencies from hitting the real (unreachable-in-this-
         # test) Postgres-backed default principal.
-        return Principal(tenant_id="test-tenant", principal_id="test-principal", scopes=("admin",))
+        return Principal(
+            tenant_id=_rls_context["tenant_id"],
+            principal_id=_rls_context["principal_id"],
+            scopes=("admin",),
+        )
 
     app.dependency_overrides[get_session] = override_get_session
     app.dependency_overrides[get_current_principal] = override_get_current_principal

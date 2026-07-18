@@ -11,7 +11,8 @@ from typing import Any, Literal, cast
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from engram.models import FeedbackEvent, MemoryItem, Principal, RecallLog, TenantConfig
+from engram.memory_context import ResolvedMemoryContext, context_provenance
+from engram.models import FeedbackEvent, ItemEvent, MemoryItem, Principal, RecallLog, TenantConfig
 
 FeedbackVerdict = Literal["useful", "noise"]
 FeedbackStatus = Literal["recorded", "updated", "unchanged"]
@@ -99,6 +100,7 @@ async def record_feedback(
     verdict: FeedbackVerdict,
     recall_log_id: uuid.UUID | None,
     now: datetime | None = None,
+    memory_context: ResolvedMemoryContext | None = None,
 ) -> FeedbackResult:
     """Apply one serializable canonical transition; caller has already locked the item.
 
@@ -217,6 +219,20 @@ async def record_feedback(
         )
     ).one()
     await session.flush()
+    if memory_context is not None:
+        session.add(
+            ItemEvent(
+                item_id=item_id,
+                **context_provenance(memory_context),
+                event_type="feedback",
+                field_name="feedback",
+                old_value=previous,
+                new_value=verdict,
+                actor_principal_id=principal_id,
+                reason=f"feedback_event_id={event.id}",
+                created_at=timestamp,
+            )
+        )
     await session.commit()
     return FeedbackResult(
         status="updated" if current is not None else "recorded",

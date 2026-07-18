@@ -83,7 +83,7 @@ async def _create_key(
     return uuid.UUID(response.json()["id"]), response.json()["key"]
 
 
-async def test_profile_read_matrix_revision_audit_and_write_non_enforcement(
+async def test_profile_read_matrix_revision_audit_and_private_write_independence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     owner = await _owner()
@@ -199,6 +199,30 @@ async def test_profile_read_matrix_revision_audit_and_write_non_enforcement(
                     workspace_ids=[],
                 ),
             )
+            writable_response = await client.post(
+                "/v1/memory-profiles",
+                json={
+                    "name": f"writable-{token}",
+                    "slug": f"writable-{token}",
+                    "reason": "profile write matrix",
+                    "policy": {
+                        "include_private": True,
+                        "include_tenant": False,
+                        "include_public": False,
+                        "allow_tenant_write": True,
+                        "allow_public_write": True,
+                        "default_write_visibility": "workspace",
+                        "default_write_workspace_id": str(workspace_ids[0]),
+                        "workspace_grants": [
+                            {
+                                "workspace_id": str(workspace_ids[0]),
+                                "can_read": True,
+                                "can_write": True,
+                            }
+                        ],
+                    },
+                },
+            )
             for response in (
                 all_a_response,
                 empty_response,
@@ -206,6 +230,7 @@ async def test_profile_read_matrix_revision_audit_and_write_non_enforcement(
                 private_response,
                 tenant_response,
                 public_response,
+                writable_response,
             ):
                 assert response.status_code == 201, response.text
             all_a = all_a_response.json()
@@ -215,8 +240,17 @@ async def test_profile_read_matrix_revision_audit_and_write_non_enforcement(
             private_id = uuid.UUID(private_response.json()["id"])
             tenant_id_profile = uuid.UUID(tenant_response.json()["id"])
             public_id = uuid.UUID(public_response.json()["id"])
+            writable_id = uuid.UUID(writable_response.json()["id"])
             created_profiles.extend(
-                (all_a_id, empty_id, workspace_id, private_id, tenant_id_profile, public_id)
+                (
+                    all_a_id,
+                    empty_id,
+                    workspace_id,
+                    private_id,
+                    tenant_id_profile,
+                    public_id,
+                    writable_id,
+                )
             )
 
             for label, profile_id in (
@@ -227,6 +261,7 @@ async def test_profile_read_matrix_revision_audit_and_write_non_enforcement(
                 (f"private-{token}", private_id),
                 (f"tenant-{token}", tenant_id_profile),
                 (f"public-{token}", public_id),
+                (f"writable-{token}", writable_id),
             ):
                 key_id, key = await _create_key(
                     client,
@@ -248,8 +283,10 @@ async def test_profile_read_matrix_revision_audit_and_write_non_enforcement(
                     private_key = key
                 elif profile_id == tenant_id_profile:
                     tenant_key = key
-                else:
+                elif profile_id == public_id:
                     public_key = key
+                else:
+                    writable_key = key
 
             other_key_id, other_key = await _create_key(
                 client,
@@ -348,6 +385,87 @@ async def test_profile_read_matrix_revision_audit_and_write_non_enforcement(
             settings.auth_enabled = True
             settings.embedding_provider = "openai"
             settings.usage_telemetry_enabled = True
+
+            denied_workspace_write = await client.post(
+                "/v1/remember",
+                json={
+                    "content": f"scopeprofiletoken {token} denied-workspace-write",
+                    "kind": "fact",
+                    "workspace": f"profile-0-{token}",
+                },
+                headers=_headers(all_a_key),
+            )
+            assert denied_workspace_write.status_code == 404
+            denied_tenant_write = await client.post(
+                "/v1/remember",
+                json={
+                    "content": f"scopeprofiletoken {token} denied-tenant-write",
+                    "kind": "fact",
+                    "visibility": "tenant",
+                },
+                headers=_headers(all_a_key),
+            )
+            assert denied_tenant_write.status_code == 403
+            denied_classify = await client.post(
+                "/v1/classify",
+                json={
+                    "content": f"scopeprofiletoken {token} denied-classify-workspace",
+                    "workspace": f"profile-0-{token}",
+                },
+                headers=_headers(all_a_key),
+            )
+            assert denied_classify.status_code == 404
+
+            defaulted_write = await client.post(
+                "/v1/remember",
+                json={
+                    "content": f"profile-default-workspace-{uuid.uuid4().hex}",
+                    "kind": "fact",
+                },
+                headers=_headers(writable_key),
+            )
+            assert defaulted_write.status_code == 201, defaulted_write.text
+            item_ids.append(uuid.UUID(defaulted_write.json()["id"]))
+            ingest_ids.append(uuid.UUID(defaulted_write.json()["ingest_id"]))
+            defaulted_row = await owner.fetchrow(
+                "SELECT visibility, workspace_id FROM memory_items WHERE id = $1",
+                uuid.UUID(defaulted_write.json()["id"]),
+            )
+            assert defaulted_row["visibility"] == "workspace"
+            assert defaulted_row["workspace_id"] == workspace_ids[0]
+            ingest_context = await owner.fetchrow(
+                "SELECT api_key_id, memory_profile_id, memory_profile_revision_id, "
+                "memory_context_version FROM candidate_ingests WHERE id = $1",
+                uuid.UUID(defaulted_write.json()["ingest_id"]),
+            )
+            assert ingest_context["memory_profile_id"] == writable_id
+            assert ingest_context["memory_context_version"] == "memory-context-v2"
+            assert ingest_context["api_key_id"] in created_keys
+            assert ingest_context["memory_profile_revision_id"] == uuid.UUID(
+                writable_response.json()["active_revision_id"]
+            )
+
+            write_only_tenant = await client.post(
+                "/v1/remember",
+                json={
+                    "content": f"write-only-tenant-{uuid.uuid4().hex}",
+                    "kind": "fact",
+                    "visibility": "tenant",
+                },
+                headers=_headers(writable_key),
+            )
+            assert write_only_tenant.status_code == 201, write_only_tenant.text
+            item_ids.append(uuid.UUID(write_only_tenant.json()["id"]))
+            ingest_ids.append(uuid.UUID(write_only_tenant.json()["ingest_id"]))
+            event_context = await owner.fetchrow(
+                "SELECT tenant_id, api_key_id, memory_profile_id, "
+                "memory_profile_revision_id, memory_context_version "
+                "FROM item_events WHERE item_id = $1 ORDER BY created_at DESC LIMIT 1",
+                uuid.UUID(write_only_tenant.json()["id"]),
+            )
+            assert event_context["tenant_id"] == tenant_id
+            assert event_context["memory_profile_id"] == writable_id
+            assert event_context["memory_context_version"] == "memory-context-v2"
 
             async def fake_embedding(*_args: object, **_kwargs: object) -> list[float]:
                 return [1.0] + [0.0] * (embedding_dim - 1)
@@ -454,7 +572,7 @@ async def test_profile_read_matrix_revision_audit_and_write_non_enforcement(
                 principal_id,
             )
             telemetry_metadata = json.loads(telemetry["metadata"])
-            assert telemetry_metadata["memory_context_version"] == "memory-context-v1"
+            assert telemetry_metadata["memory_context_version"] == "memory-context-v2"
             assert telemetry_metadata["memory_profile_id"] == str(all_a_id)
             assert telemetry_metadata["memory_profile_revision_id"] == all_a[
                 "active_revision_id"
@@ -517,7 +635,7 @@ async def test_profile_read_matrix_revision_audit_and_write_non_enforcement(
                 )
                 assert unprofiled_log["memory_profile_id"] is None
                 assert unprofiled_log["memory_profile_revision_id"] is None
-                assert unprofiled_log["memory_context_version"] == "memory-context-v1"
+                assert unprofiled_log["memory_context_version"] == "memory-context-v2"
 
             queue = await client.get("/v1/review/queue", headers=_headers(all_a_key))
             assert queue.status_code == 200, queue.text
@@ -561,7 +679,7 @@ async def test_profile_read_matrix_revision_audit_and_write_non_enforcement(
                 assert str(log["memory_profile_revision_id"]) == all_a[
                     "active_revision_id"
                 ]
-                assert log["memory_context_version"] == "memory-context-v1"
+                assert log["memory_context_version"] == "memory-context-v2"
 
             revision = await client.post(
                 f"/v1/memory-profiles/{all_a_id}/revisions",
@@ -583,7 +701,7 @@ async def test_profile_read_matrix_revision_audit_and_write_non_enforcement(
             remembered = await client.post(
                 "/v1/remember",
                 json={
-                    "content": f"scopeprofiletoken {token} write-still-allowed",
+                    "content": f"scopeprofiletoken {token} private-write-allowed",
                     "kind": "fact",
                     "visibility": "private",
                 },
@@ -593,8 +711,8 @@ async def test_profile_read_matrix_revision_audit_and_write_non_enforcement(
             remembered_id = uuid.UUID(remembered.json()["id"])
             item_ids.append(remembered_id)
             ingest_ids.append(uuid.UUID(remembered.json()["ingest_id"]))
-            assert "write-still-allowed" not in await listed(empty_key)
-            assert "write-still-allowed" in await listed(unprofiled_key)
+            assert "private-write-allowed" not in await listed(empty_key)
+            assert "private-write-allowed" in await listed(unprofiled_key)
     finally:
         settings.auth_enabled = False
         settings.embedding_provider = original_embedding_provider

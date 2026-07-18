@@ -144,6 +144,20 @@ SESSION_END_PROOFS = (
     "tests/test_session_end_migration.py",
 )
 
+# ── Profile write-context / execution authority (ENG-SCOPE-002C) ─────
+# Candidate origin vs remember-time execution authority, durable
+# first-successful-execution pinning, concurrent ingest serialization,
+# migration-025 RLS/privilege isolation, and profile-bound mutation scope.
+PROFILE_EXECUTION_PROOFS = (
+    "tests/test_candidate_execution_context_migration.py",
+    "tests/test_candidate_execution_context_postgres.py",
+    "tests/test_execution_context_durability_postgres.py",
+    "tests/test_profile_authorization_regressions_postgres.py",
+    "tests/test_profile_write_context_migration.py",
+    "tests/test_profile_write_context_unit.py",
+    "tests/test_worker_audit_provenance_postgres.py",
+)
+
 # ── Canonical aggregate ─────────────────────────────────────────────
 TRUST_PROOF_FILES: tuple[str, ...] = (
     SCOPE_PROOFS
@@ -160,6 +174,7 @@ TRUST_PROOF_FILES: tuple[str, ...] = (
     + WORKER_CONCURRENCY_PROOFS
     + CLASSIFICATION_PROOFS
     + SESSION_END_PROOFS
+    + PROFILE_EXECUTION_PROOFS
 )
 
 

@@ -408,7 +408,7 @@ async def test_profile_filter_precedes_graph_and_tunnel_neighbor_caps():
         await session.commit()
 
         context = ResolvedMemoryContext(
-            version="memory-context-v1",
+            version="memory-context-v2",
             tenant_id=UUID(tenant_id),
             principal_id=UUID(principal_id),
             api_key_id=uuid4(),
@@ -420,6 +420,11 @@ async def test_profile_filter_precedes_graph_and_tunnel_neighbor_caps():
             include_tenant=True,
             include_public=False,
             readable_workspace_ids=frozenset({workspace_a.id}),
+            allow_tenant_write=True,
+            allow_public_write=False,
+            default_write_visibility="private",
+            default_write_workspace_id=None,
+            writable_workspace_ids=frozenset({workspace_a.id}),
         )
         result = await _expand(
             session,

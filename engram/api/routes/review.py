@@ -22,11 +22,11 @@ from engram.api.routes.memory import (
 from engram.auth import REVIEW_SCOPE, WRITE_OR_REVIEW_SCOPE, Principal
 from engram.db import get_session
 from engram.memory_access import (
-    principal_eligibility_expression,
-    principal_eligibility_sql,
+    apply_write_eligibility,
     read_eligibility_expression,
     read_eligibility_sql,
     resolve_workspace_scope,
+    write_eligibility_sql,
 )
 from engram.memory_context import ResolvedMemoryContext, resolve_memory_context
 from engram.models import MemoryItem, TenantConfig
@@ -457,6 +457,7 @@ async def change_review_status(
     req: ReviewChangeRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
     caller: Principal = Depends(WRITE_OR_REVIEW_SCOPE),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> dict[str, Any]:
     """Change review_status (proposed -> active, dispute, etc.). Writes item_event.
 
@@ -481,7 +482,7 @@ async def change_review_status(
     tenant_id = await _resolve_tenant_id(session)
     principal_id, principal_type = await _resolve_principal(session, tenant_id)
     item = await _require_eligible_item(
-        session, item_id, tenant_id=tenant_id, principal_id=principal_id, for_update=True
+        session, item_id, memory_context=memory_context, for_update=True
     )
     is_author = UUID(str(item["principal_id"])) == principal_id
     required_scope = required_scope_for_review_transition(
@@ -524,6 +525,7 @@ async def change_review_status(
         actor_principal_id=actor,
         on_behalf_of_principal_id=on_behalf_of,
         reason=req.reason,
+        memory_context=memory_context,
     )
     assignments = ["review_status = :review_status"]
     params: dict[str, Any] = {"review_status": req.review_status, "item_id": str(item_id)}
@@ -535,7 +537,7 @@ async def change_review_status(
         params,
     )
     updated = await _require_eligible_item(
-        session, item_id, tenant_id=tenant_id, principal_id=principal_id
+        session, item_id, memory_context=memory_context
     )
     await session.commit()
     return {"item": updated, "event": event}
@@ -546,12 +548,13 @@ async def verify_item(
     item_id: UUID,
     req: VerifyRequest | None = None,
     session: AsyncSession = Depends(get_session),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> dict[str, Any]:
     """Mark an eligible, non-terminal item as verified by the human caller."""
     tenant_id = await _resolve_tenant_id(session)
     principal_id, principal_type = await _resolve_principal(session, tenant_id)
     item = await _require_eligible_item(
-        session, item_id, tenant_id=tenant_id, principal_id=principal_id, for_update=True
+        session, item_id, memory_context=memory_context, for_update=True
     )
     if not can_human_verify(principal_type):
         raise HTTPException(status_code=403, detail="human verification requires a user or admin")
@@ -581,6 +584,7 @@ async def verify_item(
         actor_principal_id=actor,
         on_behalf_of_principal_id=on_behalf_of,
         reason=reason,
+        memory_context=memory_context,
     )
     await session.execute(
         text(
@@ -595,7 +599,7 @@ async def verify_item(
         },
     )
     updated = await _require_eligible_item(
-        session, item_id, tenant_id=tenant_id, principal_id=principal_id
+        session, item_id, memory_context=memory_context
     )
     await session.commit()
     return {"item": updated, "event": event}
@@ -610,6 +614,7 @@ async def resolve_conflict(
     item_id: UUID,
     req: ConflictResolution,
     session: AsyncSession = Depends(get_session),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> ConflictResolutionResponse:
     """Human adjudication of conflict metadata, serialized over the item pair."""
     tenant_id = await _resolve_tenant_id(session)
@@ -618,7 +623,7 @@ async def resolve_conflict(
     # This first eligible read identifies the candidate pair only.  The locked
     # rows below are the mutation authority.
     item_data = await _require_eligible_item(
-        session, item_id, tenant_id=tenant_id, principal_id=principal_id
+        session, item_id, memory_context=memory_context
     )
     counterpart_id = item_data.get("conflicts_with_item_id")
     if counterpart_id is None:
@@ -628,15 +633,14 @@ async def resolve_conflict(
         raise HTTPException(status_code=409, detail="conflict changed; retry")
 
     pair_ids = sorted((item_id, candidate_counterpart_id), key=str)
-    pair_stmt = (
+    pair_stmt = apply_write_eligibility(
         select(MemoryItem)
         .where(
             MemoryItem.id.in_(pair_ids),
-            MemoryItem.tenant_id == tenant_id,
-            principal_eligibility_expression(principal_id),
         )
         .order_by(MemoryItem.id)
-        .with_for_update()
+        .with_for_update(),
+        memory_context,
     )
     locked_items = list((await session.execute(pair_stmt)).scalars().all())
     if len(locked_items) != 2:
@@ -720,6 +724,7 @@ async def resolve_conflict(
         actor_principal_id=actor,
         on_behalf_of_principal_id=on_behalf_of,
         reason=req.reason,
+        memory_context=memory_context,
     )
     await session.commit()
     return ConflictResolutionResponse(
@@ -740,6 +745,7 @@ async def resolve_conflict(
 async def bulk_archive(
     req: BulkArchiveRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> BulkArchiveResponse:
     """Archive multiple items: set review_status='archived'.
 
@@ -767,12 +773,12 @@ async def bulk_archive(
     sorted_ids = sorted(requested)
 
     fetch_placeholders: list[str] = []
-    principal_scope = principal_eligibility_sql(
-        principal_id, parameter_prefix="bulk_archive_item"
+    mutation_scope = write_eligibility_sql(
+        memory_context, parameter_prefix="bulk_archive_item"
     )
     fetch_params: dict[str, Any] = {
         "tenant_id": str(tenant_id),
-        **principal_scope.params,
+        **mutation_scope.params,
     }
     for i, item_id in enumerate(sorted_ids):
         fetch_placeholders.append(f":id{i}")
@@ -782,7 +788,7 @@ async def bulk_archive(
     fetch_sql = text(
         "SELECT id, review_status, principal_id FROM memory_items "
         "WHERE tenant_id = :tenant_id AND "
-        f"{principal_scope.clause} AND "
+        f"{mutation_scope.clause} AND "
         f"CAST(id AS TEXT) IN ({', '.join(fetch_placeholders)})"
         f" ORDER BY id{lock_suffix}"
     )
@@ -857,6 +863,7 @@ async def bulk_archive(
                 actor_principal_id=actor,
                 on_behalf_of_principal_id=on_behalf_of,
                 reason=req.reason,
+                memory_context=memory_context,
             )
 
         # Update to_archive to only include items that were actually archived.

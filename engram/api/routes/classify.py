@@ -18,7 +18,8 @@ from engram.classification import ClassificationResult, RetentionDisposition
 from engram.classification import classify as classify_content
 from engram.classification_evidence import new_run
 from engram.db import get_session
-from engram.memory_scope import authorize_workspace
+from engram.memory_context import ResolvedMemoryContext, resolve_memory_context
+from engram.memory_scope import resolve_write_scope
 from engram.models import Principal
 from engram.source_types import SourceType
 from engram.usage import record_candidate_once
@@ -30,6 +31,7 @@ class ClassifyRequest(BaseModel):
     content: str
     context: str | None = None  # optional conversation excerpt or source_type hint
     workspace: str | None = None
+    visibility: str | None = None
     source_type: SourceType = "manual"
     # Optional client trace shared with /v1/remember. It does not control
     # candidate uniqueness; the server-issued ingest_id is authoritative.
@@ -102,6 +104,7 @@ async def classify(
     req: ClassifyRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
     caller: AuthPrincipal = Depends(READ_SCOPE),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> ClassifyResponse:
     """Classify raw text: suggest kind, wing, room, visibility.
 
@@ -113,17 +116,16 @@ async def classify(
     revoked after classify() still blocks the later workspace write.
     """
 
-    tenant_id = await _resolve_tenant_id(session)
-    principal_id = await _resolve_principal_id(session, tenant_id)
-    workspace_id: UUID | None = None
-    if req.workspace is not None:
-        workspace_id = await authorize_workspace(
-            session,
-            tenant_id=tenant_id,
-            principal_id=principal_id,
-            caller_has_admin_scope=caller.has_scope("admin"),
-            workspace_slug=req.workspace,
-        )
+    tenant_id = memory_context.tenant_id
+    principal_id = memory_context.principal_id
+    scope = await resolve_write_scope(
+        session,
+        memory_context=memory_context,
+        caller_has_admin_scope=caller.has_scope("admin"),
+        requested_visibility=req.visibility,
+        requested_workspace=req.workspace,
+    )
+    workspace_id = scope.workspace_id
     correlation_id = req.correlation_id or uuid4()
 
     identity = CandidateIdentity(
@@ -133,7 +135,11 @@ async def classify(
         source_type=req.source_type,
         content_hash=content_hash(canonicalize(req.content)),
     )
-    ingest = create_ingest(identity=identity, client_correlation_id=req.correlation_id)
+    ingest = create_ingest(
+        identity=identity,
+        client_correlation_id=req.correlation_id,
+        memory_context=memory_context,
+    )
     session.add(ingest)
     # The ingest is authoritative business state, not best-effort telemetry.
     # Commit it before provider execution so fallback/failure still has the

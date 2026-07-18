@@ -159,6 +159,11 @@ def _context(
         include_tenant=tenant,
         include_public=public,
         readable_workspace_ids=workspaces,
+        allow_tenant_write=False,
+        allow_public_write=False,
+        default_write_visibility="private",
+        default_write_workspace_id=None,
+        writable_workspace_ids=frozenset(),
     )
 
 

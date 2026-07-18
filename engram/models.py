@@ -359,17 +359,61 @@ class ItemEvent(Base):
     """Audit trail for metadata mutations (content stays append-first)."""
 
     __tablename__ = "item_events"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["item_id", "tenant_id"],
+            ["memory_items.id", "memory_items.tenant_id"],
+            name="fk_item_events_tenant_item",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "actor_principal_id"],
+            ["principals.tenant_id", "principals.id"],
+            name="fk_item_events_tenant_actor",
+            ondelete="SET NULL",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "api_key_id"],
+            ["api_keys.tenant_id", "api_keys.id"],
+            name="fk_item_events_api_key",
+            ondelete="SET NULL",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        ForeignKeyConstraint(
+            ["memory_profile_revision_id", "memory_profile_id", "tenant_id"],
+            [
+                "memory_profile_revisions.id",
+                "memory_profile_revisions.profile_id",
+                "memory_profile_revisions.tenant_id",
+            ],
+            name="fk_item_events_memory_profile_revision",
+            ondelete="NO ACTION",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    item_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("memory_items.id", ondelete="CASCADE"), nullable=False
+    item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    api_key_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    memory_profile_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    memory_profile_revision_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    memory_context_version: Mapped[str] = mapped_column(
+        Text,
+        default="legacy-unprofiled-v0",
+        server_default=text("'legacy-unprofiled-v0'"),
+        nullable=False,
     )
     event_type: Mapped[str] = mapped_column(String(50), nullable=False)
     field_name: Mapped[str | None] = mapped_column(Text, nullable=True)
     old_value: Mapped[str | None] = mapped_column(Text, nullable=True)
     new_value: Mapped[str | None] = mapped_column(Text, nullable=True)
     actor_principal_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("principals.id"), nullable=True
+        UUID(as_uuid=True), nullable=True
     )
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -679,7 +723,9 @@ class ApiKey(Base):
     # Optional, immutable stable profile identity.  The database trigger added
     # by migration 022 rejects any post-insert change; keys follow the
     # profile's active revision at authentication time.
-    memory_profile_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    memory_profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
     # Bcrypt hash for LEGACY keys (eng_<random>, pre-ENG-AUD-003). Nullable now:
     # new-format keys store a digest instead and leave this NULL.
     key_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -730,14 +776,13 @@ class RecallLog(Base):
     token_budget: Mapped[int | None] = mapped_column(nullable=True)
     scoring_version: Mapped[str] = mapped_column(String(20), default="v1")
     config_version: Mapped[str] = mapped_column(String(20), default="v1")
-    memory_profile_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), nullable=True
-    )
+    memory_profile_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     memory_profile_revision_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
     )
     # The fallback means the writer did not explicitly attest an enforced
-    # context. Enforcing read paths must always supply memory-context-v1.
+    # context. Current enforcing paths explicitly supply memory-context-v2;
+    # historical 002B rows remain memory-context-v1.
     memory_context_version: Mapped[str] = mapped_column(
         Text,
         default="legacy-unprofiled-v0",
@@ -906,6 +951,28 @@ class CandidateIngest(Base):
     """Immutable server-issued identity for one candidate entering the pipeline."""
 
     __tablename__ = "candidate_ingests"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "api_key_id"],
+            ["api_keys.tenant_id", "api_keys.id"],
+            name="fk_candidate_ingests_api_key",
+            ondelete="SET NULL",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        ForeignKeyConstraint(
+            ["memory_profile_revision_id", "memory_profile_id", "tenant_id"],
+            [
+                "memory_profile_revisions.id",
+                "memory_profile_revisions.profile_id",
+                "memory_profile_revisions.tenant_id",
+            ],
+            name="fk_candidate_ingests_memory_profile_revision",
+            ondelete="NO ACTION",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(
@@ -922,6 +989,74 @@ class CandidateIngest(Base):
     client_correlation_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
     )
+    api_key_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    memory_profile_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    memory_profile_revision_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    memory_context_version: Mapped[str] = mapped_column(
+        Text,
+        default="legacy-unprofiled-v0",
+        server_default=text("'legacy-unprofiled-v0'"),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class CandidateIngestExecution(Base):
+    """Immutable context that authorized the ingest's actual remember execution.
+
+    1:1 with its candidate ingest (PK ingest_id + composite ingest FK). The
+    ingest's own principal is authoritative, so principal_id is not duplicated
+    here; workers derive it from the ingest loaded through the composite key.
+    """
+
+    __tablename__ = "candidate_ingest_executions"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id"],
+            ["tenants.id"],
+            ondelete="CASCADE",
+            name="fk_candidate_ingest_executions_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "ingest_id"],
+            ["candidate_ingests.tenant_id", "candidate_ingests.id"],
+            ondelete="CASCADE",
+            name="fk_candidate_ingest_executions_ingest",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "api_key_id"],
+            ["api_keys.tenant_id", "api_keys.id"],
+            ondelete="SET NULL",
+            deferrable=True,
+            initially="DEFERRED",
+            name="fk_candidate_ingest_executions_api_key",
+        ),
+        ForeignKeyConstraint(
+            ["memory_profile_revision_id", "memory_profile_id", "tenant_id"],
+            [
+                "memory_profile_revisions.id",
+                "memory_profile_revisions.profile_id",
+                "memory_profile_revisions.tenant_id",
+            ],
+            ondelete="NO ACTION",
+            deferrable=True,
+            initially="DEFERRED",
+            name="fk_candidate_ingest_executions_profile_revision",
+        ),
+    )
+
+    ingest_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    api_key_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    memory_profile_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    memory_profile_revision_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    memory_context_version: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )
