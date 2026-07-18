@@ -1181,6 +1181,209 @@ async def test_manifest_hash_field_inside_manifest_rejected() -> None:
         await owner.close()
 
 
+# ─── Absent JSON key rejection (IS TRUE CHECK semantics) ───────────────
+# PostgreSQL passes a CHECK when its expression is TRUE OR NULL. JSON
+# accessors return NULL for absent keys, so the migration wraps each nullable
+# JSON comparison in IS TRUE. These tests prove an envelope with absent
+# contract fields is rejected at the database level.
+
+
+async def _assert_manifest_insert_rejected(
+    owner: Any,
+    *,
+    tenant_id: uuid.UUID,
+    principal_id: uuid.UUID,
+    recall_log_id: uuid.UUID,
+    manifest_jsonb: str,
+    packet_hash: str = "sha256:" + "c" * 64,
+) -> None:
+    import asyncpg
+
+    with pytest.raises(asyncpg.PostgresError) as exc_info:
+        await owner.execute(
+            "INSERT INTO context_receipts (tenant_id, principal_id, "
+            "recall_log_id, manifest_schema, manifest_schema_version, "
+            "canonicalization, mode, manifest, manifest_hash, packet_hash) "
+            "VALUES ($1, $2, $3, 'engram.context-manifest', '1.0', "
+            "'rfc8785', 'startup', $4::jsonb, $5, $6)",
+            tenant_id, principal_id, recall_log_id,
+            manifest_jsonb, "sha256:" + "a" * 64, packet_hash,
+        )
+    assert _check_violation(exc_info.value), (
+        f"expected CHECK violation, got: {exc_info.value!r}"
+    )
+
+
+async def test_empty_jsonb_manifest_rejected() -> None:
+    owner = await _owner_with_026()
+    tenant_id = uuid.uuid4()
+    principal_id = uuid.uuid4()
+    recall_log_id = uuid.uuid4()
+    item_ids = [uuid.uuid4()]
+    try:
+        await _seed_tenant_principal(
+            owner, tenant_id=tenant_id, principal_id=principal_id, label="empty"
+        )
+        await _insert_recall_log(
+            owner,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            recall_log_id=recall_log_id,
+            item_ids=item_ids,
+        )
+        await _assert_manifest_insert_rejected(
+            owner,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            recall_log_id=recall_log_id,
+            manifest_jsonb="{}",
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            await owner.execute("DELETE FROM tenants WHERE id = $1", tenant_id)
+        await owner.close()
+
+
+async def test_missing_required_top_level_section_rejected() -> None:
+    owner = await _owner_with_026()
+    tenant_id = uuid.uuid4()
+    principal_id = uuid.uuid4()
+    recall_log_id = uuid.uuid4()
+    item_ids = [uuid.uuid4()]
+    try:
+        await _seed_tenant_principal(
+            owner, tenant_id=tenant_id, principal_id=principal_id, label="misssec"
+        )
+        await _insert_recall_log(
+            owner,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            recall_log_id=recall_log_id,
+            item_ids=item_ids,
+        )
+        # Drop each required section in turn and prove rejection.
+        for section in ("subject", "request", "versions", "result", "packet", "items"):
+            manifest = _valid_manifest_jsonb(
+                tenant_id=tenant_id, principal_id=principal_id, item_ids=item_ids
+            )
+            manifest.pop(section, None)
+            await _assert_manifest_insert_rejected(
+                owner,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                recall_log_id=recall_log_id,
+                manifest_jsonb=json.dumps(manifest),
+            )
+    finally:
+        with contextlib.suppress(Exception):
+            await owner.execute("DELETE FROM tenants WHERE id = $1", tenant_id)
+        await owner.close()
+
+
+async def test_missing_envelope_protocol_marker_rejected() -> None:
+    owner = await _owner_with_026()
+    tenant_id = uuid.uuid4()
+    principal_id = uuid.uuid4()
+    recall_log_id = uuid.uuid4()
+    item_ids = [uuid.uuid4()]
+    try:
+        await _seed_tenant_principal(
+            owner, tenant_id=tenant_id, principal_id=principal_id, label="missmarker"
+        )
+        await _insert_recall_log(
+            owner,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            recall_log_id=recall_log_id,
+            item_ids=item_ids,
+        )
+        for marker in ("schema", "schema_version", "canonicalization", "mode"):
+            manifest = _valid_manifest_jsonb(
+                tenant_id=tenant_id, principal_id=principal_id, item_ids=item_ids
+            )
+            manifest.pop(marker, None)
+            await _assert_manifest_insert_rejected(
+                owner,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                recall_log_id=recall_log_id,
+                manifest_jsonb=json.dumps(manifest),
+            )
+    finally:
+        with contextlib.suppress(Exception):
+            await owner.execute("DELETE FROM tenants WHERE id = $1", tenant_id)
+        await owner.close()
+
+
+async def test_missing_subject_tenant_or_principal_rejected() -> None:
+    owner = await _owner_with_026()
+    tenant_id = uuid.uuid4()
+    principal_id = uuid.uuid4()
+    recall_log_id = uuid.uuid4()
+    item_ids = [uuid.uuid4()]
+    try:
+        await _seed_tenant_principal(
+            owner, tenant_id=tenant_id, principal_id=principal_id, label="misssub"
+        )
+        await _insert_recall_log(
+            owner,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            recall_log_id=recall_log_id,
+            item_ids=item_ids,
+        )
+        for field in ("tenant_id", "principal_id"):
+            manifest = _valid_manifest_jsonb(
+                tenant_id=tenant_id, principal_id=principal_id, item_ids=item_ids
+            )
+            manifest["subject"].pop(field, None)
+            await _assert_manifest_insert_rejected(
+                owner,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                recall_log_id=recall_log_id,
+                manifest_jsonb=json.dumps(manifest),
+            )
+    finally:
+        with contextlib.suppress(Exception):
+            await owner.execute("DELETE FROM tenants WHERE id = $1", tenant_id)
+        await owner.close()
+
+
+async def test_missing_packet_hash_rejected() -> None:
+    owner = await _owner_with_026()
+    tenant_id = uuid.uuid4()
+    principal_id = uuid.uuid4()
+    recall_log_id = uuid.uuid4()
+    item_ids = [uuid.uuid4()]
+    try:
+        await _seed_tenant_principal(
+            owner, tenant_id=tenant_id, principal_id=principal_id, label="misspkt"
+        )
+        await _insert_recall_log(
+            owner,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            recall_log_id=recall_log_id,
+            item_ids=item_ids,
+        )
+        manifest = _valid_manifest_jsonb(
+            tenant_id=tenant_id, principal_id=principal_id, item_ids=item_ids
+        )
+        manifest["packet"].pop("hash", None)
+        await _assert_manifest_insert_rejected(
+            owner,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            recall_log_id=recall_log_id,
+            manifest_jsonb=json.dumps(manifest),
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            await owner.execute("DELETE FROM tenants WHERE id = $1", tenant_id)
+        await owner.close()
+
+
 async def test_migration_is_reapplicable() -> None:
     """Re-running migration 026 must not duplicate objects or fail."""
     owner = await _owner_with_026()

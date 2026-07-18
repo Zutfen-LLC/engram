@@ -500,6 +500,193 @@ async def test_budget_mismatch_rejected(env) -> None:
         await session.rollback()
 
 
+async def test_log_token_null_manifest_token_non_null_rejected(env) -> None:
+    # The recall log in env has token_budget=None. A manifest claiming a
+    # non-null effective token_budget must be rejected (the receipt would
+    # attest a decision input the parent recall did not use).
+    manifest = build_manifest(
+        tenant_id=str(env["tenant_id"]),
+        principal_id=str(env["principal_id"]),
+        item_ids=[str(i) for i in env["item_ids"]],
+        byte_budget=8192,
+        token_budget=500,
+    )
+    async with env["factory"]() as session:
+        await _apply_rls(
+            session, tenant_id=env["tenant_id"], principal_id=env["principal_id"]
+        )
+        with pytest.raises(ContextReceiptConflictError):
+            await store_context_receipt(
+                session,
+                tenant_id=env["tenant_id"],
+                principal_id=env["principal_id"],
+                recall_log_id=env["recall_log_id"],
+                manifest=manifest,
+            )
+        await session.rollback()
+
+
+async def test_log_token_non_null_manifest_token_null_rejected(env) -> None:
+    # Recall log attests token_budget=500; manifest claims token_budget=None.
+    rl = uuid.uuid4()
+    await _insert_recall_log(
+        env["owner"],
+        tenant_id=env["tenant_id"],
+        principal_id=env["principal_id"],
+        recall_log_id=rl,
+        item_ids=env["item_ids"],
+        byte_budget=8192,
+        token_budget=500,
+    )
+    manifest = build_manifest(
+        tenant_id=str(env["tenant_id"]),
+        principal_id=str(env["principal_id"]),
+        item_ids=[str(i) for i in env["item_ids"]],
+        byte_budget=8192,
+        token_budget=None,
+    )
+    async with env["factory"]() as session:
+        await _apply_rls(
+            session, tenant_id=env["tenant_id"], principal_id=env["principal_id"]
+        )
+        with pytest.raises(ContextReceiptConflictError):
+            await store_context_receipt(
+                session,
+                tenant_id=env["tenant_id"],
+                principal_id=env["principal_id"],
+                recall_log_id=rl,
+                manifest=manifest,
+            )
+        await session.rollback()
+
+
+async def test_unequal_non_null_token_budgets_rejected(env) -> None:
+    rl = uuid.uuid4()
+    await _insert_recall_log(
+        env["owner"],
+        tenant_id=env["tenant_id"],
+        principal_id=env["principal_id"],
+        recall_log_id=rl,
+        item_ids=env["item_ids"],
+        byte_budget=8192,
+        token_budget=500,
+    )
+    manifest = build_manifest(
+        tenant_id=str(env["tenant_id"]),
+        principal_id=str(env["principal_id"]),
+        item_ids=[str(i) for i in env["item_ids"]],
+        byte_budget=8192,
+        token_budget=1000,
+    )
+    async with env["factory"]() as session:
+        await _apply_rls(
+            session, tenant_id=env["tenant_id"], principal_id=env["principal_id"]
+        )
+        with pytest.raises(ContextReceiptConflictError):
+            await store_context_receipt(
+                session,
+                tenant_id=env["tenant_id"],
+                principal_id=env["principal_id"],
+                recall_log_id=rl,
+                manifest=manifest,
+            )
+        await session.rollback()
+
+
+async def test_log_byte_budget_null_manifest_byte_budget_non_null_rejected(env) -> None:
+    # Recall log attests byte_budget=None; manifest claims byte_budget=8192.
+    rl = uuid.uuid4()
+    await _insert_recall_log(
+        env["owner"],
+        tenant_id=env["tenant_id"],
+        principal_id=env["principal_id"],
+        recall_log_id=rl,
+        item_ids=env["item_ids"],
+        byte_budget=None,
+    )
+    manifest = build_manifest(
+        tenant_id=str(env["tenant_id"]),
+        principal_id=str(env["principal_id"]),
+        item_ids=[str(i) for i in env["item_ids"]],
+        byte_budget=8192,
+    )
+    async with env["factory"]() as session:
+        await _apply_rls(
+            session, tenant_id=env["tenant_id"], principal_id=env["principal_id"]
+        )
+        with pytest.raises(ContextReceiptConflictError):
+            await store_context_receipt(
+                session,
+                tenant_id=env["tenant_id"],
+                principal_id=env["principal_id"],
+                recall_log_id=rl,
+                manifest=manifest,
+            )
+        await session.rollback()
+
+
+async def test_matching_null_budgets_accepted(env) -> None:
+    # Both recall log and manifest attest byte_budget=None and token_budget=None.
+    rl = uuid.uuid4()
+    await _insert_recall_log(
+        env["owner"],
+        tenant_id=env["tenant_id"],
+        principal_id=env["principal_id"],
+        recall_log_id=rl,
+        item_ids=env["item_ids"],
+        byte_budget=None,
+        token_budget=None,
+    )
+    manifest = build_manifest(
+        tenant_id=str(env["tenant_id"]),
+        principal_id=str(env["principal_id"]),
+        item_ids=[str(i) for i in env["item_ids"]],
+        byte_budget=None,
+        token_budget=None,
+    )
+    async with env["factory"]() as session:
+        await _apply_rls(
+            session, tenant_id=env["tenant_id"], principal_id=env["principal_id"]
+        )
+        result = await store_context_receipt(
+            session,
+            tenant_id=env["tenant_id"],
+            principal_id=env["principal_id"],
+            recall_log_id=rl,
+            manifest=manifest,
+        )
+        await session.commit()
+    assert result.created is True
+
+
+async def test_startup_recall_log_with_non_null_query_rejected(env) -> None:
+    # A startup recall log with a non-null query cannot be the parent of a
+    # startup manifest (startup query data must remain absent).
+    rl = uuid.uuid4()
+    await env["owner"].execute(
+        "INSERT INTO recall_logs (id, tenant_id, principal_id, mode, query, "
+        "item_ids, byte_budget, token_budget, scoring_version, config_version, "
+        "memory_context_version) "
+        "VALUES ($1, $2, $3, 'startup', 'leaked-query', $4, 8192, NULL, 'v1', "
+        "'v1', 'memory-context-v2')",
+        rl, env["tenant_id"], env["principal_id"], env["item_ids"],
+    )
+    manifest = _manifest_for(env)
+    async with env["factory"]() as session:
+        await _apply_rls(
+            session, tenant_id=env["tenant_id"], principal_id=env["principal_id"]
+        )
+        with pytest.raises(ContextReceiptConflictError):
+            await store_context_receipt(
+                session,
+                tenant_id=env["tenant_id"],
+                principal_id=env["principal_id"],
+                recall_log_id=rl,
+                manifest=manifest,
+            )
+        await session.rollback()
+
+
 async def test_scoring_config_mismatch_rejected(env) -> None:
     manifest = build_manifest(
         tenant_id=str(env["tenant_id"]),

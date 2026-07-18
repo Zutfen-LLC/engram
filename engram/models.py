@@ -10,6 +10,7 @@ from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
@@ -747,6 +748,16 @@ class RecallLog(Base):
 
     __tablename__ = "recall_logs"
     __table_args__ = (
+        # Composite unique identity backing the context_receipts composite FK
+        # (migration 026). A receipt's (tenant_id, principal_id, recall_log_id)
+        # pins all three columns to one parent row, so the parent must expose a
+        # unique key over exactly those columns.
+        UniqueConstraint(
+            "tenant_id",
+            "principal_id",
+            "id",
+            name="uq_recall_logs_tenant_principal_id",
+        ),
         ForeignKeyConstraint(
             ["memory_profile_revision_id", "memory_profile_id", "tenant_id"],
             [
@@ -1183,6 +1194,72 @@ class ContextReceipt(Base):
         UniqueConstraint(
             "recall_log_id",
             name="idx_context_receipts_recall_log",
+        ),
+        # ── CHECK constraints mirroring migration 026 ──────────────────
+        # JSON accessors return NULL for absent keys, and a CHECK passes when
+        # its expression is TRUE OR NULL, so each nullable JSON comparison is
+        # wrapped in ``IS TRUE`` to reject an absent contract field. These
+        # keep SQLAlchemy metadata aligned with the migration schema.
+        CheckConstraint(
+            "manifest_schema = 'engram.context-manifest'",
+            name="chk_context_receipts_schema",
+        ),
+        CheckConstraint(
+            "manifest_schema_version = '1.0'",
+            name="chk_context_receipts_schema_version",
+        ),
+        CheckConstraint(
+            "canonicalization = 'rfc8785'",
+            name="chk_context_receipts_canonicalization",
+        ),
+        CheckConstraint("mode = 'startup'", name="chk_context_receipts_mode"),
+        CheckConstraint(
+            "manifest_hash ~ '^sha256:[0-9a-f]{64}$'",
+            name="chk_context_receipts_manifest_hash",
+        ),
+        CheckConstraint(
+            "packet_hash ~ '^sha256:[0-9a-f]{64}$'",
+            name="chk_context_receipts_packet_hash",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(manifest) = 'object'",
+            name="chk_context_receipts_manifest_is_object",
+        ),
+        CheckConstraint(
+            "(jsonb_typeof(manifest -> 'subject') = 'object') IS TRUE "
+            "AND (jsonb_typeof(manifest -> 'request') = 'object') IS TRUE "
+            "AND (jsonb_typeof(manifest -> 'versions') = 'object') IS TRUE "
+            "AND (jsonb_typeof(manifest -> 'result') = 'object') IS TRUE "
+            "AND (jsonb_typeof(manifest -> 'packet') = 'object') IS TRUE "
+            "AND (jsonb_typeof(manifest -> 'items') = 'array') IS TRUE",
+            name="chk_context_receipts_manifest_sections",
+        ),
+        CheckConstraint(
+            "(manifest ->> 'schema' = manifest_schema) IS TRUE "
+            "AND (manifest ->> 'schema_version' = manifest_schema_version) IS TRUE "
+            "AND (manifest ->> 'canonicalization' = canonicalization) IS TRUE "
+            "AND (manifest ->> 'mode' = mode) IS TRUE",
+            name="chk_context_receipts_schema_agreement",
+        ),
+        CheckConstraint(
+            "(manifest -> 'subject' ->> 'tenant_id' = tenant_id::text) IS TRUE",
+            name="chk_context_receipts_subject_tenant",
+        ),
+        CheckConstraint(
+            "(manifest -> 'subject' ->> 'principal_id' = principal_id::text) IS TRUE",
+            name="chk_context_receipts_subject_principal",
+        ),
+        CheckConstraint(
+            "(manifest -> 'packet' ->> 'hash' = packet_hash) IS TRUE",
+            name="chk_context_receipts_packet_agreement",
+        ),
+        CheckConstraint(
+            "NOT (manifest ? 'manifest_hash')",
+            name="chk_context_receipts_no_manifest_hash_field",
+        ),
+        CheckConstraint(
+            "retention_expires_at IS NULL OR retention_expires_at >= created_at",
+            name="chk_context_receipts_retention",
         ),
         # Principal timeline (newest first).
         Index(

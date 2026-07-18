@@ -106,44 +106,53 @@ CREATE TABLE IF NOT EXISTS context_receipts (
     ),
 
     -- The manifest JSONB is an object with the required top-level sections.
+    -- JSON accessors (->) return NULL when a key is absent, and a CHECK passes
+    -- when its expression is TRUE OR NULL. The JSONB-typed checks therefore
+    -- wrap each comparison in ``IS TRUE`` so an absent section rejects the row
+    -- instead of silently passing as NULL.
     CONSTRAINT chk_context_receipts_manifest_is_object CHECK (
         jsonb_typeof(manifest) = 'object'
     ),
     CONSTRAINT chk_context_receipts_manifest_sections CHECK (
-        jsonb_typeof(manifest -> 'subject') = 'object'
-        AND jsonb_typeof(manifest -> 'request') = 'object'
-        AND jsonb_typeof(manifest -> 'versions') = 'object'
-        AND jsonb_typeof(manifest -> 'result') = 'object'
-        AND jsonb_typeof(manifest -> 'packet') = 'object'
-        AND jsonb_typeof(manifest -> 'items') = 'array'
+        (jsonb_typeof(manifest -> 'subject') = 'object') IS TRUE
+        AND (jsonb_typeof(manifest -> 'request') = 'object') IS TRUE
+        AND (jsonb_typeof(manifest -> 'versions') = 'object') IS TRUE
+        AND (jsonb_typeof(manifest -> 'result') = 'object') IS TRUE
+        AND (jsonb_typeof(manifest -> 'packet') = 'object') IS TRUE
+        AND (jsonb_typeof(manifest -> 'items') = 'array') IS TRUE
     ),
 
     -- Envelope/column agreement: the mirrored protocol markers inside the
-    -- JSONB manifest must equal the envelope columns.
+    -- JSONB manifest must equal the envelope columns. ``->>`` returns NULL
+    -- when the key is absent, so each equality is wrapped in ``IS TRUE`` to
+    -- reject a missing marker rather than treating it as a NULL-pass.
     CONSTRAINT chk_context_receipts_schema_agreement CHECK (
-        manifest ->> 'schema' = manifest_schema
-        AND manifest ->> 'schema_version' = manifest_schema_version
-        AND manifest ->> 'canonicalization' = canonicalization
-        AND manifest ->> 'mode' = mode
+        (manifest ->> 'schema' = manifest_schema) IS TRUE
+        AND (manifest ->> 'schema_version' = manifest_schema_version) IS TRUE
+        AND (manifest ->> 'canonicalization' = canonicalization) IS TRUE
+        AND (manifest ->> 'mode' = mode) IS TRUE
     ),
 
     -- Ownership agreement: the manifest subject must describe the same
-    -- tenant/principal as the envelope columns.
+    -- tenant/principal as the envelope columns. Wrapped in ``IS TRUE`` so a
+    -- missing subject.tenant_id / subject.principal_id rejects the row.
     CONSTRAINT chk_context_receipts_subject_tenant CHECK (
-        manifest -> 'subject' ->> 'tenant_id' = tenant_id::text
+        (manifest -> 'subject' ->> 'tenant_id' = tenant_id::text) IS TRUE
     ),
     CONSTRAINT chk_context_receipts_subject_principal CHECK (
-        manifest -> 'subject' ->> 'principal_id' = principal_id::text
+        (manifest -> 'subject' ->> 'principal_id' = principal_id::text) IS TRUE
     ),
 
     -- Packet-hash agreement: manifest.packet.hash must equal the envelope
-    -- packet_hash column.
+    -- packet_hash column. Wrapped in ``IS TRUE`` so a missing packet.hash
+    -- rejects the row.
     CONSTRAINT chk_context_receipts_packet_agreement CHECK (
-        manifest -> 'packet' ->> 'hash' = packet_hash
+        (manifest -> 'packet' ->> 'hash' = packet_hash) IS TRUE
     ),
 
     -- The manifest must NOT carry a top-level manifest_hash field (it is
-    -- computed OVER the manifest and lives outside it).
+    -- computed OVER the manifest and lives outside it). ``?`` returns a
+    -- real boolean, so no IS TRUE wrapper is needed here.
     CONSTRAINT chk_context_receipts_no_manifest_hash_field CHECK (
         NOT (manifest ? 'manifest_hash')
     ),
@@ -153,6 +162,90 @@ CREATE TABLE IF NOT EXISTS context_receipts (
         retention_expires_at IS NULL OR retention_expires_at >= created_at
     )
 );
+
+-- ============ 2b. CHECK constraint normalization (idempotent) ============
+-- A prior revision of this migration created the JSONB CHECK constraints
+-- without ``IS TRUE`` wrappers, so an absent JSON key passed as NULL. Re-create
+-- those constraints idempotently with the corrected Boolean semantics on
+-- databases where the older form is already present.
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'context_receipts'::regclass
+          AND conname = 'chk_context_receipts_manifest_sections'
+          AND pg_get_constraintdef(oid) NOT LIKE '%IS TRUE%'
+    ) THEN
+        ALTER TABLE context_receipts
+            DROP CONSTRAINT chk_context_receipts_manifest_sections;
+        ALTER TABLE context_receipts
+            ADD CONSTRAINT chk_context_receipts_manifest_sections CHECK (
+                (jsonb_typeof(manifest -> 'subject') = 'object') IS TRUE
+                AND (jsonb_typeof(manifest -> 'request') = 'object') IS TRUE
+                AND (jsonb_typeof(manifest -> 'versions') = 'object') IS TRUE
+                AND (jsonb_typeof(manifest -> 'result') = 'object') IS TRUE
+                AND (jsonb_typeof(manifest -> 'packet') = 'object') IS TRUE
+                AND (jsonb_typeof(manifest -> 'items') = 'array') IS TRUE
+            );
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'context_receipts'::regclass
+          AND conname = 'chk_context_receipts_schema_agreement'
+          AND pg_get_constraintdef(oid) NOT LIKE '%IS TRUE%'
+    ) THEN
+        ALTER TABLE context_receipts
+            DROP CONSTRAINT chk_context_receipts_schema_agreement;
+        ALTER TABLE context_receipts
+            ADD CONSTRAINT chk_context_receipts_schema_agreement CHECK (
+                (manifest ->> 'schema' = manifest_schema) IS TRUE
+                AND (manifest ->> 'schema_version' = manifest_schema_version) IS TRUE
+                AND (manifest ->> 'canonicalization' = canonicalization) IS TRUE
+                AND (manifest ->> 'mode' = mode) IS TRUE
+            );
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'context_receipts'::regclass
+          AND conname = 'chk_context_receipts_subject_tenant'
+          AND pg_get_constraintdef(oid) NOT LIKE '%IS TRUE%'
+    ) THEN
+        ALTER TABLE context_receipts
+            DROP CONSTRAINT chk_context_receipts_subject_tenant;
+        ALTER TABLE context_receipts
+            ADD CONSTRAINT chk_context_receipts_subject_tenant CHECK (
+                (manifest -> 'subject' ->> 'tenant_id' = tenant_id::text) IS TRUE
+            );
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'context_receipts'::regclass
+          AND conname = 'chk_context_receipts_subject_principal'
+          AND pg_get_constraintdef(oid) NOT LIKE '%IS TRUE%'
+    ) THEN
+        ALTER TABLE context_receipts
+            DROP CONSTRAINT chk_context_receipts_subject_principal;
+        ALTER TABLE context_receipts
+            ADD CONSTRAINT chk_context_receipts_subject_principal CHECK (
+                (manifest -> 'subject' ->> 'principal_id' = principal_id::text) IS TRUE
+            );
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'context_receipts'::regclass
+          AND conname = 'chk_context_receipts_packet_agreement'
+          AND pg_get_constraintdef(oid) NOT LIKE '%IS TRUE%'
+    ) THEN
+        ALTER TABLE context_receipts
+            DROP CONSTRAINT chk_context_receipts_packet_agreement;
+        ALTER TABLE context_receipts
+            ADD CONSTRAINT chk_context_receipts_packet_agreement CHECK (
+                (manifest -> 'packet' ->> 'hash' = packet_hash) IS TRUE
+            );
+    END IF;
+END
+$$;
 
 -- ============ 3. One-to-one recall-log relationship ============
 -- Composite foreign key (tenant_id, principal_id, recall_log_id) references

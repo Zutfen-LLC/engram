@@ -245,25 +245,27 @@ def _validate_recall_log_overlap(
             "recall log item_ids do not match the manifest's ordered item IDs"
         )
 
-    # Effective budgets. The recall log records the caller-supplied budgets; the
-    # manifest records the effective budgets. Startup v1 resolves byte_budget
-    # from settings when the caller supplied None, so a non-None effective
-    # byte_budget with a None recall-log byte_budget is the normal defaulting
-    # path and is NOT a mismatch. Compare only when the recall log attests a
-    # non-None budget — that attested value must equal the effective value.
-    if (
-        recall_log.byte_budget is not None
-        and recall_log.byte_budget != manifest.request.effective.byte_budget
-    ):
+    # Effective budgets. Startup recall resolves caller-supplied budgets
+    # against defaults FIRST, then writes the resolved values into the recall
+    # log (see engram.recall._resolve_recall_budgets and the RecallLog insert).
+    # The recall log therefore attests the effective budgets the manifest must
+    # match exactly — including the null state. A receipt that claims a
+    # decision input the parent recall did not use is an integrity conflict.
+    if recall_log.byte_budget != manifest.request.effective.byte_budget:
         raise ContextReceiptConflictError(
             "recall log byte_budget does not match manifest effective byte_budget"
         )
-    if (
-        recall_log.token_budget is not None
-        and recall_log.token_budget != manifest.request.effective.token_budget
-    ):
+    if recall_log.token_budget != manifest.request.effective.token_budget:
         raise ContextReceiptConflictError(
             "recall log token_budget does not match manifest effective token_budget"
+        )
+
+    # Startup query data must remain absent. A startup recall log with a
+    # non-null query cannot be the parent of a startup manifest (which has no
+    # query).
+    if recall_log.query is not None:
+        raise ContextReceiptConflictError(
+            "recall log query must be null for a startup receipt"
         )
 
     # Decision versions.

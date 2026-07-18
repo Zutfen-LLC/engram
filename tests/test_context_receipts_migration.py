@@ -86,7 +86,33 @@ def test_manifest_jsonb_shape_checks() -> None:
     assert "jsonb_typeof(manifest -> 'items') = 'array'" in SQL
 
 
+def test_manifest_jsonb_shape_checks_use_is_true() -> None:
+    # JSON accessors return NULL for absent keys, and a CHECK passes when its
+    # expression is TRUE OR NULL. Each nullable JSON comparison must be wrapped
+    # in IS TRUE so an absent contract field rejects the row.
+    for section in ("subject", "request", "versions", "result", "packet", "items"):
+        assert (
+            f"(jsonb_typeof(manifest -> '{section}') = 'object') IS TRUE"
+            in SQL
+            or f"(jsonb_typeof(manifest -> '{section}') = 'array') IS TRUE" in SQL
+        ), f"missing IS TRUE wrapper for section: {section}"
+
+
+def test_envelope_manifest_agreement_checks_use_is_true() -> None:
+    assert "(manifest ->> 'schema' = manifest_schema) IS TRUE" in SQL
+    assert "(manifest ->> 'schema_version' = manifest_schema_version) IS TRUE" in SQL
+    assert "(manifest ->> 'canonicalization' = canonicalization) IS TRUE" in SQL
+    assert "(manifest ->> 'mode' = mode) IS TRUE" in SQL
+    assert "(manifest -> 'subject' ->> 'tenant_id' = tenant_id::text) IS TRUE" in SQL
+    assert (
+        "(manifest -> 'subject' ->> 'principal_id' = principal_id::text) IS TRUE"
+        in SQL
+    )
+    assert "(manifest -> 'packet' ->> 'hash' = packet_hash) IS TRUE" in SQL
+
+
 def test_envelope_manifest_agreement_checks() -> None:
+    # The underlying equality expressions are still present (inside IS TRUE).
     assert "manifest ->> 'schema' = manifest_schema" in SQL
     assert "manifest ->> 'schema_version' = manifest_schema_version" in SQL
     assert "manifest ->> 'canonicalization' = canonicalization" in SQL
@@ -94,6 +120,18 @@ def test_envelope_manifest_agreement_checks() -> None:
     assert "manifest -> 'subject' ->> 'tenant_id' = tenant_id::text" in SQL
     assert "manifest -> 'subject' ->> 'principal_id' = principal_id::text" in SQL
     assert "manifest -> 'packet' ->> 'hash' = packet_hash" in SQL
+
+
+def test_check_constraint_normalization_is_idempotent() -> None:
+    # A prior revision created the JSONB CHECKs without IS TRUE wrappers. The
+    # migration must re-create those constraints idempotently when the older
+    # form is present (guarded by pg_get_constraintdef NOT LIKE '%IS TRUE%').
+    assert "DROP CONSTRAINT chk_context_receipts_manifest_sections" in SQL
+    assert "DROP CONSTRAINT chk_context_receipts_schema_agreement" in SQL
+    assert "DROP CONSTRAINT chk_context_receipts_subject_tenant" in SQL
+    assert "DROP CONSTRAINT chk_context_receipts_subject_principal" in SQL
+    assert "DROP CONSTRAINT chk_context_receipts_packet_agreement" in SQL
+    assert "pg_get_constraintdef(oid) NOT LIKE '%IS TRUE%'" in SQL
 
 
 def test_no_manifest_hash_field_inside_manifest() -> None:
@@ -190,6 +228,54 @@ def test_migration_order_note() -> None:
 
 def test_principals_tenant_identity_reasserted() -> None:
     assert "idx_principals_tenant_identity" in SQL
+
+
+def test_orm_metadata_aligned_with_migration_constraints() -> None:
+    """The ORM declares the composite-FK parent unique identity and the receipt
+    CHECK constraints, so SQLAlchemy metadata does not disagree with the
+    migration schema (ENG-CONTEXT-002A requirement: migration/ORM constraint
+    alignment).
+    """
+    from engram.models import ContextReceipt, RecallLog
+
+    recall_log_constraint_names = {
+        c.name for c in RecallLog.__table_args__ if hasattr(c, "name") and c.name
+    }
+    assert "uq_recall_logs_tenant_principal_id" in recall_log_constraint_names
+
+    receipt_constraint_names = {
+        c.name for c in ContextReceipt.__table_args__ if hasattr(c, "name") and c.name
+    }
+    for name in (
+        "fk_context_receipts_recall_log",
+        "fk_context_receipts_tenant",
+        "fk_context_receipts_principal",
+        "idx_context_receipts_recall_log",
+        "chk_context_receipts_schema",
+        "chk_context_receipts_schema_version",
+        "chk_context_receipts_canonicalization",
+        "chk_context_receipts_mode",
+        "chk_context_receipts_manifest_hash",
+        "chk_context_receipts_packet_hash",
+        "chk_context_receipts_manifest_is_object",
+        "chk_context_receipts_manifest_sections",
+        "chk_context_receipts_schema_agreement",
+        "chk_context_receipts_subject_tenant",
+        "chk_context_receipts_subject_principal",
+        "chk_context_receipts_packet_agreement",
+        "chk_context_receipts_no_manifest_hash_field",
+        "chk_context_receipts_retention",
+    ):
+        assert name in receipt_constraint_names, (
+            f"ORM ContextReceipt missing constraint: {name}"
+        )
+
+    # The ORM CHECK constraints use the same IS TRUE semantics as the migration.
+    sections_check = next(
+        c for c in ContextReceipt.__table_args__
+        if getattr(c, "name", None) == "chk_context_receipts_manifest_sections"
+    )
+    assert "IS TRUE" in str(sections_check.sqltext)
 
 
 if __name__ == "__main__":
