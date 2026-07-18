@@ -154,3 +154,110 @@ def test_number_boundary_vector_has_no_negative_zero_in_canonical() -> None:
     # contain '"score":0' for that item and never '"score":-0'.
     assert '"score":0,' in canon or '"score":0}' in canon
     assert '"score":-0' not in canon
+
+
+# Frozen expected (manifest_hash, packet_hash) per vector at the ENG-CONTEXT-001
+# final-correction-start head (c9e5918), keyed by the stable numeric prefix
+# (rename-invariant). The final conformance correction must NOT change any valid
+# manifest preimage: vector 010 was renamed (lf-crlf-trailing-newline →
+# embedded-newline-content) with name/description only, and its expected hashes
+# are unchanged. This map is the programmatic proof of that guarantee.
+_CORRECTION_START_HASHES: dict[str, tuple[str, str]] = {
+    "001": (
+        "sha256:07def9ea36cb165c5a22e5ded1d389e7d167fae67db2790cea01ab661e60bbc4",
+        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    ),
+    "002": (
+        "sha256:d59169b4312ad3499f196049a1661b12b7ad9c5165a1cdf5ce85f7622b2155d1",
+        "sha256:8b921c077d6fa6867673d6e29ce64f416b7a94eb25d387359b841fab64741aa1",
+    ),
+    "003": (
+        "sha256:2daab65cb44b622dc437993b25452c77f90c35115bbfe18c79e3997ef8a51784",
+        "sha256:e924d31b36e7dafc9faa5a77cd395c82bea05d48e293cb6f819b9c8cdb8bc1b5",
+    ),
+    "004": (
+        "sha256:d11e6405ecbc6f5c6a5e1e03e4b7b07a0829f03fbc86cad6de0237f978db4aaa",
+        "sha256:43be6c94e282a27fa0e07d9d60608b4bac41c53950f821c26977f37103dbc14e",
+    ),
+    "005": (
+        "sha256:d365150a559fdf93bb8027f90346d3cbaa598e5bf9195d1bad10f02edbcfe77c",
+        "sha256:8a1f73ffc44a49bbd5957ccd0f449b5b7eef298894e3886c8f076666e7c9fb99",
+    ),
+    "006": (
+        "sha256:fa2d348298dc068396fb27332a58ee4facfb639f0a047dcc68c701f00c0a1018",
+        "sha256:b23c14edc584a215e611066d0a2b24b9b88bac53acac2c6f150ccf91c708728b",
+    ),
+    "007": (
+        "sha256:d68536139f07124443f3a6025ab7ca52e3ebecb17b84455a1db91361d4766c81",
+        "sha256:2f82eaf9055b2a11e3fda8b06e209869d539fee33938c5eebdef4397abd7eb53",
+    ),
+    "008": (
+        "sha256:0625a7d45ededdadbe29ca0934378deb275a662f660048550538464945940e29",
+        "sha256:4735b44bb748ef41c0ecb7c22a19beba259854e53563dcd39dddb33f32413222",
+    ),
+    "009": (
+        "sha256:50f1075140d96c41bd19e59fb56fcc65ecbdb08f690cd775db285cad4a3c6033",
+        "sha256:e00b0203b8c661f2820054ce7d930b6ef35394feac2e1f34231e4cbba0b64bb6",
+    ),
+    "010": (
+        "sha256:172e07c939267dfcd76c09b28ec5852f0a9cc4421b29d32e2e1a6c7a13b71157",
+        "sha256:7d7b8647c58e15b246fab6bd1eb6bf3d0bbd77f881fd89af2a8dcd29c670cd14",
+    ),
+}
+
+
+def test_valid_expected_hashes_unchanged_from_correction_start() -> None:
+    """Every valid vector's expected (manifest_hash, packet_hash) must equal the
+    frozen correction-start values. The vector-010 rename changed only its
+    filename/name/description — no valid manifest preimage may change."""
+    import re
+
+    seen_prefixes: set[str] = set()
+    for fname, raw in _VECTORS:
+        match = re.match(r"(\d+)-", fname)
+        assert match is not None, f"vector filename {fname!r} lacks a numeric prefix"
+        prefix = match.group(1)
+        seen_prefixes.add(prefix)
+        expected_hashes = _CORRECTION_START_HASHES.get(prefix)
+        assert expected_hashes is not None, f"unknown vector prefix {prefix!r}"
+        expected_mh, expected_ph = expected_hashes
+        actual_mh = raw["expected"]["manifest_hash"]
+        actual_ph = raw["expected"]["packet_hash"]
+        assert actual_mh == expected_mh, (
+            f"{fname}: manifest_hash changed from correction-start value "
+            f"({expected_mh} → {actual_mh}). A valid manifest preimage changed; "
+            f"this correction must not alter any frozen expected hash."
+        )
+        assert actual_ph == expected_ph, (
+            f"{fname}: packet_hash changed from correction-start value "
+            f"({expected_ph} → {actual_ph})."
+        )
+    # Every documented correction-start vector must still be present.
+    assert seen_prefixes == set(_CORRECTION_START_HASHES), (
+        f"vector set drifted: missing={set(_CORRECTION_START_HASHES) - seen_prefixes}, "
+        f"extra={seen_prefixes - set(_CORRECTION_START_HASHES)}"
+    )
+
+
+def test_vector_010_renamed_to_embedded_newline_content() -> None:
+    """Vector 010 must be the renamed embedded-newline vector, not the stale
+    trailing-newline name. Its content demonstrates LF inside an item's content
+    in a coherent working-set-v1 packet (no trailing packet newline)."""
+    filenames = {fname for fname, _ in _VECTORS}
+    assert "010-embedded-newline-content.json" in filenames
+    assert "010-lf-crlf-trailing-newline.json" not in filenames
+    raw = next(v for n, v in _VECTORS if n == "010-embedded-newline-content.json")
+    assert raw["name"] == "010-embedded-newline-content"
+    # The name and description must describe embedded-newline behavior, not a
+    # trailing-newline packet. The description MAY reference that a trailing
+    # packet newline is a rejected negative case — it must not claim the packet
+    # HAS one.
+    assert "embedded" in raw["description"].lower()
+    assert "trailing newline" not in raw["description"].lower() or "reject" in raw[
+        "description"
+    ].lower()
+    # The packet is coherent: working_set is the working-set-v1 render of items
+    # with an embedded LF in the first item's content, and NO trailing newline.
+    working_set = raw["input"]["response"]["working_set"]
+    assert not working_set.endswith("\n"), "vector 010 packet must not end with a newline"
+    assert "\n" in working_set, "vector 010 must contain an embedded newline"

@@ -1634,8 +1634,14 @@ constants. The builder verifies finalized-response coherence (item count, byte
 count, and the `working-set-v1` render of items — `packet_hash` is still
 hashed directly from the served `working_set`, never from the reconstruction),
 startup subject/request invariants (`query_digest` null, workspace agreement,
-no effective item budget), and strict field types (no silent coercion). The
-checked-in JSON Schema is generated from the strict model so it cannot drift.
+no effective item budget), and strict field types (no silent coercion). Profile
+identity (`memory_profile_id` / `memory_profile_revision_id` /
+`memory_profile_version`) is all-or-none: all null together or all non-null and
+valid together, enforced by both the Python `model_validator` and a `oneOf` the
+normative JSON Schema encodes deterministically. The checked-in JSON Schema is
+generated from the strict model so it cannot drift; a shared negative-fixture
+set proves both the Python and JavaScript verifiers reject malformed UUIDs,
+hashes, visibility, counts, budgets, and partial profiles.
 
 The manifest proves what was served and which policy admitted it. It does
 **not** prove that a memory was factually true or that an agent relied on it.

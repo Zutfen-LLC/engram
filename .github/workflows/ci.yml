@@ -256,3 +256,33 @@ jobs:
 
       - name: Verify vectors (JavaScript, independent RFC 8785 + SHA-256)
         run: node conformance/context-manifest-v1/verify.mjs
+
+      - name: Verify negative conformance fixtures (Python)
+        run: python scripts/verify_context_manifest_negatives.py
+
+      - name: Verify negative conformance fixtures (JavaScript)
+        run: node conformance/context-manifest-v1/verify_negatives.mjs
+
+      - name: Verify vectors cross-language (Python runner drives JS negatives)
+        run: python conformance/context-manifest-v1/run_cross_language.py
+
+  # Lightweight lock-consistency gate. Fails if uv.lock has drifted from
+  # pyproject.toml. Kept off the Compose real-DB critical path (runs in this
+  # parallel job) and does not rewrite the lockfile.
+  lock-drift:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.29"
+          enable-cache: false
+
+      - name: Verify uv.lock matches pyproject.toml (no rewrite)
+        run: uv lock --check

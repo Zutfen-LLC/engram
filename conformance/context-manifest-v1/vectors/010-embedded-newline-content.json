@@ -1,6 +1,6 @@
 {
-  "name": "010-lf-crlf-trailing-newline",
-  "description": "LF vs trailing-newline packet: working_set ends with a trailing newline. packet_hash is exact-byte (trailing newline preserved).",
+  "name": "010-embedded-newline-content",
+  "description": "Embedded-newline content: an item's content contains an LF, which the working-set-v1 render preserves verbatim between the [kind] lines. The packet is COHERENT (no trailing packet newline; LF separates rendered items). Proves embedded LF is preserved exactly in served_content_hash and packet_hash. Trailing-packet-newline and CRLF-separator variants are rejected by the builder — they are negative cases, not valid vectors.",
   "schema": "engram.context-manifest-vector",
   "schema_version": "1.0",
   "input": {

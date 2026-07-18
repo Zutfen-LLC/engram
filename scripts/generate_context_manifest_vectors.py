@@ -463,10 +463,15 @@ def _build_vector_raw(
     manifest_obj = manifest.model_dump(mode="json", exclude_none=False, by_alias=True)
     canonical = canonical_json_bytes(manifest_obj).decode("utf-8")
     return {
-        "name": "010-lf-crlf-trailing-newline",
+        "name": "010-embedded-newline-content",
         "description": (
-            "LF vs trailing-newline packet: working_set ends with a trailing "
-            "newline. packet_hash is exact-byte (trailing newline preserved)."
+            "Embedded-newline content: an item's content contains an LF, which "
+            "the working-set-v1 render preserves verbatim between the [kind] "
+            "lines. The packet is COHERENT (no trailing packet newline; LF "
+            "separates rendered items). Proves embedded LF is preserved exactly "
+            "in served_content_hash and packet_hash. Trailing-packet-newline "
+            "and CRLF-separator variants are rejected by the builder — they are "
+            "negative cases, not valid vectors."
         ),
         "schema": "engram.context-manifest-vector",
         "schema_version": "1.0",

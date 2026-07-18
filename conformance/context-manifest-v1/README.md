@@ -37,7 +37,28 @@ contract is language-neutral.
 | 7 | `007-key-order-equivalence.json` | Key insertion order does not change canonical bytes. |
 | 8 | `008-item-order-change.json` | Item-order change → distinct `manifest_hash` and `packet_hash`. |
 | 9 | `009-whitespace-case-content.json` | Whitespace/case content: exact-byte `served_content_hash` (no normalization). |
-| 10 | `010-lf-crlf-trailing-newline.json` | Exact-byte multi-line packet (LF join + embedded newline); exact-byte `packet_hash`. (Incoherent CRLF/trailing-newline variants are rejected by the builder — see the coherence negative tests.) |
+| 10 | `010-embedded-newline-content.json` | Embedded LF inside an item's content is preserved verbatim in a coherent `working-set-v1` packet (no trailing packet newline; LF separates rendered items). Proves embedded LF is preserved exactly in `served_content_hash` and `packet_hash`. Trailing-packet-newline and CRLF-separator variants are rejected by the builder — they are negative cases, not valid vectors. |
+
+## Negative fixtures
+
+`negative/*.json` is a **language-neutral rejection set**. Each fixture carries
+a valid base `input` with exactly one field mutated to violate the v1 contract
+(canonical UUID, SHA-256, visibility vocabulary, nonnegative count/budget,
+profile all-or-none coherence, strict scalar types, startup invariants). Both
+verifiers must reject every fixture — agreement is the cross-language rejection
+proof. Negative fixtures carry NO expected valid hashes.
+
+| Fixture | Rejected invariant |
+|---|---|
+| `malformed-tenant-uuid` / `uppercase-tenant-uuid` | canonical UUID (subject) |
+| `malformed-item-uuid` | canonical UUID (item) |
+| `invalid-visibility` | visibility vocabulary |
+| `negative-response-item-count` / `negative-response-byte-count` / `negative-omission-count` | nonnegative counts |
+| `negative-requested-budget` / `negative-effective-budget` | nonnegative budgets |
+| `non-null-effective-startup-item-budget` | startup v1 effective `item_budget` is null |
+| `profile-*-only` / `profile-*-no-*` (six variants) | profile all-or-none coherence |
+| `malformed-sha256` / `uppercase-sha256` | canonical SHA-256 |
+| `string-boolean` / `mixed-type-reasons` | strict scalar typing |
 
 ## Running the verifiers
 
@@ -55,12 +76,20 @@ python scripts/verify_context_manifest_vectors.py
 #             (Node stdlib only, no npm install)
 node conformance/context-manifest-v1/verify.mjs
 
+# Negative fixtures (rejection proofs): Python and JavaScript must both reject
+python scripts/verify_context_manifest_negatives.py
+node conformance/context-manifest-v1/verify_negatives.mjs
+
+# Cross-language agreement driver (runs both negative runners and checks exit 0)
+python conformance/context-manifest-v1/run_cross_language.py
+
 # Normative JSON Schema drift guard
 python scripts/generate_context_manifest_schema.py --check
 ```
 
-All must exit 0. The hosted CI `conformance-vectors` job runs all three
-against the same checked-in artifacts on every change.
+All must exit 0. The hosted CI `conformance-vectors` job runs all of the above
+against the same checked-in artifacts on every change; the parallel `lock-drift`
+job verifies `uv.lock` matches `pyproject.toml`.
 
 ## Regenerating the schema
 

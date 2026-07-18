@@ -248,11 +248,15 @@ The **empty packet** hashes as the SHA-256 of zero bytes
 
 - All string hashing is over **exact UTF-8 bytes** — no normalization.
 - `working_set` rendering is `[kind] content` lines joined with `LF` (`\n`),
-  with **no trailing newline**. The manifest hashes whatever the response
-  actually returned: if a response's `working_set` ends with a trailing
-  newline, the packet hash reflects it (see vector 010).
-- LF vs CRLF differences and trailing-newline presence/absence all change
-  `packet_hash` (and therefore `manifest_hash`).
+  with **no trailing newline**. `working-set-v1` adds no final newline.
+- `LF` **separates** rendered items; an `LF` **inside** an item's `content` is
+  valid and preserved exactly in `served_content_hash`, the rendered packet, and
+  therefore `packet_hash` (see vector 010).
+- A trailing newline introduced **outside** an item's content, or a `CRLF`
+  separator between items, makes the finalized response **incoherent** with
+  `working-set-v1`: the builder rejects it before manifest construction. They
+  are negative cases, not valid vectors. (Packet hashing still uses the exact
+  finalized response bytes after coherence succeeds.)
 
 ## 9. Field-level privacy decisions
 
@@ -384,13 +388,30 @@ the strict wire model (`scripts/generate_context_manifest_schema.py`), not
 hand-edited, so it cannot drift. A drift test and a `--check` mode fail CI if
 the checked-in schema differs from the model. The schema enforces the required
 `Literal` constants, canonical UUID/hash patterns, the `visibility` enum,
-nonnegative counts, and rejects unknown fields. Schema validation alone does
+nonnegative counts, **profile all-or-none coherence** (see above), and rejects
+unknown fields. `Draft202012Validator.check_schema` proves the generated schema
+is itself valid Draft 2020-12 JSON Schema. Schema validation alone does
 **not** verify packet or item hash preimages — the semantic verifier (Python
-and JavaScript) performs those checks.
+and JavaScript) performs those checks, and both reject the same shared negative
+fixtures (canonical UUID/hash/visibility/count/budget/profile/typing violations).
 
 > Note on golden vectors: vectors 001–009 kept their frozen expected hashes
-> unchanged through this correction. Vector 010 was repurposed: its original
-> packet had a trailing newline that did not match the `working-set-v1` render
-> of its items, which the coherence check now (correctly) rejects. It is now a
-> coherent multi-line packet proving exact-byte hashing; its preimage changed
-> by necessity, and that is the only frozen-value change.
+> unchanged through the final conformance correction. Vector 010 was renamed
+> from `010-lf-crlf-trailing-newline` to `010-embedded-newline-content`
+> (filename, `name`, and `description` only); it always was a coherent
+> multi-line packet proving exact-byte hashing of embedded-LF content, and its
+> frozen expected hashes are unchanged. A programmatic golden-preservation test
+> in `tests/test_context_manifest_golden.py` asserts every valid vector's
+> `(manifest_hash, packet_hash)` equals the correction-start values.
+
+### Profile all-or-none coherence (schema-encoded)
+
+`memory_profile_id`, `memory_profile_revision_id`, and `memory_profile_version`
+must be **all null** (unprofiled context) **or all non-null and valid**
+(profiled context). The Python model enforces this with a `model_validator`;
+the normative JSON Schema encodes it deterministically with a `oneOf` on the
+`ContextManifestSubjectV1` definition (augmented after `model_json_schema`,
+which cannot emit the semantic validator). Both the strict parser and the
+normative schema therefore reject every partial-profile combination; the
+Python and JavaScript conformance verifiers reject the same combinations
+through the shared negative-fixture set.

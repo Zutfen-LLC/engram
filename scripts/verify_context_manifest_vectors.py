@@ -59,6 +59,36 @@ except ImportError as exc:  # pragma: no cover - environment guard
 
 VECTORS_DIR = ROOT / "conformance" / "context-manifest-v1" / "vectors"
 
+# Exact top-level input keys a context-manifest-v1 vector may carry. Extra
+# additive fields on individual response item dicts are allowed (served recall
+# items are loose dict[str, Any]); the top-level envelope and its named
+# sub-objects are fixed by the vector contract.
+_INPUT_TOP_KEYS = frozenset(
+    {"response", "subject_context", "request_context", "decision_versions", "reorder_inputs"}
+)
+_RESPONSE_KEYS = frozenset(
+    {
+        "working_set",
+        "item_count",
+        "byte_count",
+        "pinned_omitted_count",
+        "omitted_count",
+        "message",
+        "items",
+    }
+)
+_SUBJECT_KEYS = frozenset(
+    {
+        "tenant_id",
+        "principal_id",
+        "workspace_id",
+        "memory_context_version",
+        "memory_profile_id",
+        "memory_profile_revision_id",
+        "memory_profile_version",
+    }
+)
+
 
 class _Response:
     def __init__(self, **kwargs: Any) -> None:
@@ -79,7 +109,18 @@ def _fail(name: str, what: str, expected: Any, got: Any) -> None:
 
 
 def _check_response_coherence(name: str, response: _Response) -> None:
-    """Stage 8: response coherence the builder itself enforces."""
+    """Stage 8: response coherence the builder itself enforces.
+
+    Also asserts the declared counts are nonnegative integers — a valid golden
+    vector must never carry a negative declared count or budget (those are
+    negative-fixture territory, not valid vectors).
+    """
+    for field in ("item_count", "byte_count", "pinned_omitted_count", "omitted_count"):
+        value = getattr(response, field)
+        if isinstance(value, bool) or not isinstance(value, int):
+            _fail(name, f"coherence {field} type", "int (not bool)", type(value).__name__)
+        if value < 0:
+            _fail(name, f"coherence {field} nonnegative", ">= 0", value)
     if response.item_count != len(response.items):
         _fail(name, "coherence item_count", len(response.items), response.item_count)
     derived_bytes = sum(len(i["content"].encode("utf-8")) for i in response.items)
@@ -96,6 +137,40 @@ def _verify_vector(path: Path, schema_validator: Draft202012Validator) -> None:
     inp = vector["input"]
     exp = vector["expected"]
 
+    # Stage 0: filename/name consistency. The checked-in filename (minus .json)
+    # must equal the vector's declared "name", so the two cannot drift.
+    if path.stem != name:
+        _fail(
+            name,
+            "filename/name consistency",
+            f"filename stem {path.stem!r}",
+            f"name {name!r}",
+        )
+
+    # Stage 0b: input envelope carries no unknown top-level keys, and the named
+    # sub-objects carry no unknown keys where the vector contract forbids them.
+    # (Individual response item dicts MAY carry additive served-decision fields;
+    # only the manifest's selected fields are validated, so items are unchecked.)
+    input_extra = set(inp) - _INPUT_TOP_KEYS
+    if input_extra:
+        _fail(name, "input unknown top-level keys", sorted(_INPUT_TOP_KEYS), sorted(input_extra))
+    response_extra = set(inp["response"]) - _RESPONSE_KEYS
+    if response_extra:
+        _fail(
+            name,
+            "input.response unknown keys",
+            sorted(_RESPONSE_KEYS),
+            sorted(response_extra),
+        )
+    subject_extra = set(inp["subject_context"]) - _SUBJECT_KEYS
+    if subject_extra:
+        _fail(
+            name,
+            "input.subject_context unknown keys",
+            sorted(_SUBJECT_KEYS),
+            sorted(subject_extra),
+        )
+
     subject = ContextManifestSubjectV1(**inp["subject_context"])
     request = ContextManifestRequestInputV1(
         requested=ContextManifestRequestedV1(**inp["request_context"]["requested"]),
@@ -105,7 +180,8 @@ def _verify_vector(path: Path, schema_validator: Draft202012Validator) -> None:
     versions = ContextManifestVersionsV1(**inp["decision_versions"])
     response = _Response(**inp["response"])
 
-    # Stage 8: response coherence (before building).
+    # Stage 8: response coherence (before building). Also asserts the declared
+    # counts (item_count, byte_count, omission counts) are nonnegative integers.
     _check_response_coherence(name, response)
 
     # Stages 1-2: build from inputs; rebuilt manifest object equals frozen.
@@ -198,11 +274,34 @@ def _verify_vector(path: Path, schema_validator: Draft202012Validator) -> None:
     print(f"  OK  {path.name}: manifest_hash={exp['manifest_hash'][:24]}...")
 
 
+def _check_schema_validity() -> None:
+    """Stage -1: the generated normative schema is itself valid Draft 2020-12."""
+    schema = normative_manifest_schema_dict()
+    Draft202012Validator.check_schema(schema)
+    # The profile all-or-none coherence oneOf must be present on the subject
+    # definition (augmented after model_json_schema, which cannot emit the
+    # semantic model_validator).
+    subject_def = schema["$defs"]["ContextManifestSubjectV1"]
+    if "oneOf" not in subject_def:
+        raise SystemExit(
+            "DRIFT: normative schema is missing the ContextManifestSubjectV1 "
+            "profile-coherence oneOf augmentation."
+        )
+    branches = subject_def["oneOf"]
+    if len(branches) != 2:
+        raise SystemExit(
+            f"DRIFT: profile-coherence oneOf has {len(branches)} branches (expected 2)."
+        )
+
+
 def main() -> int:
     vectors = sorted(VECTORS_DIR.glob("*.json"))
     if not vectors:
         print(f"no vectors found in {VECTORS_DIR}", file=sys.stderr)
         return 1
+    # Stage -1: the generated schema is valid Draft 2020-12 and carries the
+    # profile-coherence oneOf augmentation.
+    _check_schema_validity()
     print(f"Verifying {len(vectors)} context-manifest-v1 vectors (Python)...")
     schema_validator = Draft202012Validator(normative_manifest_schema_dict())
     for path in vectors:

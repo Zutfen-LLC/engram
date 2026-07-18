@@ -195,3 +195,129 @@ def test_omitted_required_null_valued_field_rejected() -> None:
     m = _valid_manifest()
     del m["result"]["message"]
     _assert_rejected(m, label="omitted required null field")
+
+
+# ─── Schema is itself valid Draft 2020-12 ──────────────────────────────
+
+
+def test_generated_schema_passes_draft2020_check_schema() -> None:
+    """The generated normative schema must be a valid Draft 2020-12 schema."""
+    Draft202012Validator.check_schema(_load_schema())
+
+
+# ─── Profile all-or-none coherence (schema-encoded) ────────────────────
+
+# Canonical UUIDs / version used to build a profiled subject.
+_PROFILE_ID = "00000000-0000-0000-0000-00000000009a"
+_PROFILE_REV = "00000000-0000-0000-0000-00000000009b"
+_PROFILE_VERSION = 3
+
+# Every partial-profile combination: set some of the three profile fields, leave
+# the others null. All six must be rejected by both Pydantic and the schema.
+_PARTIAL_PROFILE_COMBOS: list[tuple[str, dict[str, Any]]] = [
+    (
+        "id-only",
+        {"memory_profile_id": _PROFILE_ID},
+    ),
+    (
+        "revision-only",
+        {"memory_profile_revision_id": _PROFILE_REV},
+    ),
+    (
+        "version-only",
+        {"memory_profile_version": _PROFILE_VERSION},
+    ),
+    (
+        "id+revision",
+        {"memory_profile_id": _PROFILE_ID, "memory_profile_revision_id": _PROFILE_REV},
+    ),
+    (
+        "id+version",
+        {"memory_profile_id": _PROFILE_ID, "memory_profile_version": _PROFILE_VERSION},
+    ),
+    (
+        "revision+version",
+        {"memory_profile_revision_id": _PROFILE_REV, "memory_profile_version": _PROFILE_VERSION},
+    ),
+]
+
+
+def _subject_with_profile(
+    base_vector: str = "003-profile-bound-workspace.json",
+) -> dict[str, Any]:
+    """A fully-profiled (all three set) subject from a golden vector."""
+    raw = next(v for n_, v in _VECTORS if n_ == base_vector)
+    return copy.deepcopy(raw["expected"]["manifest"]["subject"])
+
+
+@pytest.mark.parametrize("label,overrides", _PARTIAL_PROFILE_COMBOS)
+def test_schema_rejects_partial_profile(label: str, overrides: dict[str, Any]) -> None:
+    """The normative schema rejects every partial-profile combination."""
+    # Start from an unprofiled subject and apply only the override fields.
+    m = _valid_manifest()
+    for key, value in overrides.items():
+        m["subject"][key] = value
+    _assert_rejected(m, label=f"partial profile: {label}")
+
+
+def test_schema_accepts_all_null_profile() -> None:
+    """The normative schema accepts an unprofiled (all-null) subject."""
+    m = _valid_manifest()
+    # _valid_manifest() is already unprofiled; assert it validates cleanly.
+    schema = _load_schema()
+    Draft202012Validator(schema).validate(m)
+
+
+def test_schema_accepts_all_valid_profile() -> None:
+    """The normative schema accepts a fully-profiled subject."""
+    m = _valid_manifest()
+    m["subject"] = _subject_with_profile()
+    schema = _load_schema()
+    Draft202012Validator(schema).validate(m)
+
+
+@pytest.mark.parametrize("label,overrides", _PARTIAL_PROFILE_COMBOS)
+def test_pydantic_model_rejects_partial_profile(label: str, overrides: dict[str, Any]) -> None:
+    """The strict wire model rejects every partial-profile combination."""
+    from engram.context_manifest import ContextManifestSubjectV1
+
+    fields = {
+        "tenant_id": "00000000-0000-0000-0000-000000000001",
+        "principal_id": "00000000-0000-0000-0000-000000000002",
+        "workspace_id": None,
+        "memory_context_version": "memory-context-v2",
+        "memory_profile_id": None,
+        "memory_profile_revision_id": None,
+        "memory_profile_version": None,
+    }
+    fields.update(overrides)
+    with pytest.raises(Exception):  # noqa: B017
+        ContextManifestSubjectV1(**fields)
+
+
+def test_pydantic_model_accepts_all_null_profile() -> None:
+    from engram.context_manifest import ContextManifestSubjectV1
+
+    ContextManifestSubjectV1(
+        tenant_id="00000000-0000-0000-0000-000000000001",
+        principal_id="00000000-0000-0000-0000-000000000002",
+        workspace_id=None,
+        memory_context_version="memory-context-v2",
+        memory_profile_id=None,
+        memory_profile_revision_id=None,
+        memory_profile_version=None,
+    )
+
+
+def test_pydantic_model_accepts_all_valid_profile() -> None:
+    from engram.context_manifest import ContextManifestSubjectV1
+
+    ContextManifestSubjectV1(
+        tenant_id="00000000-0000-0000-0000-000000000001",
+        principal_id="00000000-0000-0000-0000-000000000002",
+        workspace_id=None,
+        memory_context_version="memory-context-v2",
+        memory_profile_id=_PROFILE_ID,
+        memory_profile_revision_id=_PROFILE_REV,
+        memory_profile_version=_PROFILE_VERSION,
+    )

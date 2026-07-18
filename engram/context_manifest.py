@@ -475,6 +475,61 @@ class ContextManifestV1(_StrictModel):
         return self
 
 
+# Canonical lowercase UUID pattern (8-4-4-4-12 hex). Mirrors CanonicalUuidV1;
+# duplicated here as a plain string so the JSON Schema augmentation below does
+# not depend on introspecting Pydantic's generated schema.
+_CANONICAL_UUID_PATTERN = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+
+
+def _augment_profile_coherence(schema: dict[str, Any]) -> None:
+    """Encode profile all-or-none coherence in the normative schema.
+
+    Pydantic's ``model_json_schema`` does not emit the ``model_validator`` that
+    enforces ``memory_profile_id`` / ``memory_profile_revision_id`` /
+    ``memory_profile_version`` being all-null or all-non-null-and-valid together
+    (the Python semantic invariant on ``ContextManifestSubjectV1``). This
+    augments the generated ``ContextManifestSubjectV1`` definition with an
+    explicit ``oneOf`` so the checked-in normative schema rejects half-profile
+    manifests structurally, without relying on the Python validator.
+
+    The two branches are mutually exclusive (all-null vs all-set), so exactly
+    one matches a coherent subject and none matches a partial profile. The
+    branch ``properties`` conjoin with the generated per-field ``anyOf``
+    definitions (string-with-pattern | null), narrowing each field to the
+    branch's required type. The three profile fields remain ``required`` from
+    the generated schema, so explicit ``null`` is still mandatory for the
+    unprofiled branch.
+    """
+    subject_def = schema["$defs"]["ContextManifestSubjectV1"]
+    subject_def["oneOf"] = [
+        {
+            "description": "Unprofiled: all three profile fields are null.",
+            "properties": {
+                "memory_profile_id": {"type": "null"},
+                "memory_profile_revision_id": {"type": "null"},
+                "memory_profile_version": {"type": "null"},
+            },
+        },
+        {
+            "description": "Profiled: all three profile fields are non-null and valid.",
+            "properties": {
+                "memory_profile_id": {
+                    "type": "string",
+                    "pattern": _CANONICAL_UUID_PATTERN,
+                },
+                "memory_profile_revision_id": {
+                    "type": "string",
+                    "pattern": _CANONICAL_UUID_PATTERN,
+                },
+                "memory_profile_version": {
+                    "type": "integer",
+                    "minimum": 0,
+                },
+            },
+        },
+    ]
+
+
 def normative_manifest_schema_dict() -> dict[str, Any]:
     """Return the normative JSON Schema (draft 2020-12) for ``ContextManifestV1``.
 
@@ -483,6 +538,11 @@ def normative_manifest_schema_dict() -> dict[str, Any]:
     ``scripts/generate_context_manifest_schema.py``). Built from the strict wire
     model with ``by_alias=True`` so the property key is the normative
     ``"schema"`` rather than the internal ``schema_name``.
+
+    The profile all-or-none coherence invariant (a Python ``model_validator``
+    that ``model_json_schema`` cannot emit) is augmented deterministically onto
+    the ``ContextManifestSubjectV1`` definition after generation, so the
+    normative schema enforces it structurally.
     """
     schema = ContextManifestV1.model_json_schema(by_alias=True)
     schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
@@ -493,6 +553,7 @@ def normative_manifest_schema_dict() -> dict[str, Any]:
         "bytes and is NOT a field in this object. The normative wire parser "
         "requires canonical UUID/hash representations."
     )
+    _augment_profile_coherence(schema)
     return schema
 
 

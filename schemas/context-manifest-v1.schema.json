@@ -447,7 +447,40 @@
         "memory_profile_version"
       ],
       "title": "ContextManifestSubjectV1",
-      "type": "object"
+      "type": "object",
+      "oneOf": [
+        {
+          "description": "Unprofiled: all three profile fields are null.",
+          "properties": {
+            "memory_profile_id": {
+              "type": "null"
+            },
+            "memory_profile_revision_id": {
+              "type": "null"
+            },
+            "memory_profile_version": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "description": "Profiled: all three profile fields are non-null and valid.",
+          "properties": {
+            "memory_profile_id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            "memory_profile_revision_id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            "memory_profile_version": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      ]
     },
     "ContextManifestVersionsV1": {
       "additionalProperties": false,
