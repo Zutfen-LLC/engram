@@ -212,12 +212,14 @@ def _validate_recall_log_overlap(
     """Validate every trustworthy overlap between the recall log and the manifest.
 
     Raises :class:`ContextReceiptConflictError` when a valid manifest is attached
-    to a nonmatching recall log. Startup query data remains absent and is not
-    compared (the manifest has no query and the recall log's query column is not
-    a trustworthy manifest overlap).
+    to a nonmatching recall log. Startup query data must remain absent on both
+    sides: the manifest has no query, and the recall log's ``query`` column must
+    be NULL for a startup receipt (a startup recall log that leaked a query
+    cannot be the parent of a startup manifest).
 
     Compared fields: tenant ID, principal ID, mode, ordered item IDs, effective
-    byte budget, effective token budget, scoring version, config version,
+    byte budget, effective token budget (both including null state), startup
+    query absence (recall_log.query IS NULL), scoring version, config version,
     memory-context version, memory-profile ID, memory-profile revision ID.
     """
     if recall_log.tenant_id != _to_uuid(manifest.subject.tenant_id):
