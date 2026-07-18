@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -35,6 +36,7 @@ from engram.context_manifest import (
     ContextManifestRequestedV1,
     ContextManifestRequestInputV1,
     ContextManifestSubjectV1,
+    ContextManifestV1,
     ContextManifestVersionsV1,
     build_startup_context_manifest_v1,
     canonical_json_bytes,
@@ -96,17 +98,27 @@ class _Response:
     def __init__(
         self,
         *,
-        working_set: str,
         items: list[dict[str, Any]],
+        working_set: str | None = None,
         pinned_omitted_count: int = 0,
         omitted_count: int = 0,
         message: str | None = None,
     ) -> None:
-        self.working_set = working_set
         self.items = items
+        # working_set defaults to the coherent working-set-v1 render of items
+        # so a response is internally consistent unless a test deliberately
+        # overrides it (and updates items to match).
+        if working_set is None:
+            working_set = "\n".join(f"[{i['kind']}] {i['content']}" for i in items)
+        self.working_set = working_set
         self.pinned_omitted_count = pinned_omitted_count
         self.omitted_count = omitted_count
         self.message = message
+        # Declared counts are derived here so positive test responses are
+        # coherent by default; the builder verifies them against len(items)/
+        # sum(content bytes) before trusting them.
+        self.item_count = len(items)
+        self.byte_count = sum(len(i["content"].encode("utf-8")) for i in items)
 
 
 def _subject(
@@ -347,8 +359,11 @@ class TestHashSensitivity:
 
         resp = _build_two_item_response()
         # Whitespace-only content change (the dedup hash would NOT catch this).
+        # Keep the response coherent: content, working_set render, and declared
+        # byte_count must all reflect the mutated content.
         resp.items[0]["content"] = "alpha "  # trailing space
         resp.working_set = "[fact] alpha \n[preference] beta"
+        resp.byte_count = sum(len(i["content"].encode("utf-8")) for i in resp.items)
         m = _build(response=resp)
 
         assert compute_manifest_hash(m) != base_manifest
@@ -592,3 +607,317 @@ class TestProtocolMarkers:
             query_digest=req.query_digest,
         )
         assert _compute_request_digest(req2) == d1
+
+
+# ─── Blocker 1: normative wire round-trip ─────────────────────────────
+
+
+class TestWireRoundTrip:
+    """The emitted normative wire shape must parse back unchanged."""
+
+    def test_schema_name_not_emitted_on_wire(self) -> None:
+        dumped = _build().model_dump(mode="json", exclude_none=False, by_alias=True)
+        assert "schema_name" not in dumped
+        assert dumped["schema"] == "engram.context-manifest"
+
+    def test_wire_dict_round_trips_through_model_validate(self) -> None:
+        m = _build()
+        dumped = m.model_dump(mode="json", exclude_none=False, by_alias=True)
+        rebuilt = ContextManifestV1.model_validate(dumped)
+        assert compute_manifest_hash(rebuilt) == compute_manifest_hash(m)
+
+    def test_canonical_json_round_trips_through_model_validate_json(self) -> None:
+        m = _build()
+        dumped = m.model_dump(mode="json", exclude_none=False, by_alias=True)
+        canon = canonical_json_bytes(dumped).decode("utf-8")
+        rebuilt = ContextManifestV1.model_validate_json(canon)
+        # Reserialize both parsed representations -> byte-identical canonical.
+        reserialize = canonical_json_bytes(
+            rebuilt.model_dump(mode="json", exclude_none=False, by_alias=True)
+        ).decode("utf-8")
+        assert reserialize == canon
+        assert compute_manifest_hash(rebuilt) == compute_manifest_hash(m)
+
+    def test_missing_schema_rejected(self) -> None:
+        dumped = _build().model_dump(mode="json", exclude_none=False, by_alias=True)
+        del dumped["schema"]
+        with pytest.raises(Exception):  # noqa: B017
+            ContextManifestV1.model_validate(dumped)
+
+    def test_wrong_schema_rejected(self) -> None:
+        dumped = _build().model_dump(mode="json", exclude_none=False, by_alias=True)
+        dumped["schema"] = "not.engram"
+        with pytest.raises(Exception):  # noqa: B017
+            ContextManifestV1.model_validate(dumped)
+
+    def test_wrong_schema_version_rejected(self) -> None:
+        dumped = _build().model_dump(mode="json", exclude_none=False, by_alias=True)
+        dumped["schema_version"] = "2.0"
+        with pytest.raises(Exception):  # noqa: B017
+            ContextManifestV1.model_validate(dumped)
+
+    def test_wrong_canonicalization_rejected(self) -> None:
+        dumped = _build().model_dump(mode="json", exclude_none=False, by_alias=True)
+        dumped["canonicalization"] = "json-sort-keys"
+        with pytest.raises(Exception):  # noqa: B017
+            ContextManifestV1.model_validate(dumped)
+
+    def test_semantic_mode_in_v1_rejected(self) -> None:
+        dumped = _build().model_dump(mode="json", exclude_none=False, by_alias=True)
+        dumped["mode"] = "semantic"
+        with pytest.raises(Exception):  # noqa: B017
+            ContextManifestV1.model_validate(dumped)
+
+    def test_unknown_top_level_field_still_rejected_after_alias_fix(self) -> None:
+        dumped = _build().model_dump(mode="json", exclude_none=False, by_alias=True)
+        dumped["evil"] = "inject"
+        with pytest.raises(Exception):  # noqa: B017
+            ContextManifestV1.model_validate(dumped)
+
+    def test_protocol_markers_are_required_not_defaulted(self) -> None:
+        # Omitting each marker must fail (they are required Literal constants).
+        dumped = _build().model_dump(mode="json", exclude_none=False, by_alias=True)
+        for marker in ("schema", "schema_version", "canonicalization", "mode"):
+            copy = dict(dumped)
+            del copy[marker]
+            with pytest.raises(Exception):  # noqa: B017
+                ContextManifestV1.model_validate(copy)
+
+
+# ─── Blocker 2: finalized-response coherence ──────────────────────────
+
+
+class TestResponseCoherence:
+    """The builder rejects incoherent finalized responses."""
+
+    def test_declared_item_count_too_high_rejected(self) -> None:
+        resp = _build_two_item_response()
+        resp.item_count = 3  # but len(items) == 2
+        with pytest.raises(ValueError, match="item_count"):
+            _build(response=resp)
+
+    def test_declared_item_count_too_low_rejected(self) -> None:
+        resp = _build_two_item_response()
+        resp.item_count = 1  # but len(items) == 2
+        with pytest.raises(ValueError, match="item_count"):
+            _build(response=resp)
+
+    def test_declared_byte_count_mismatch_rejected(self) -> None:
+        resp = _build_two_item_response()
+        resp.byte_count = 999
+        with pytest.raises(ValueError, match="byte_count"):
+            _build(response=resp)
+
+    def test_packet_content_mismatch_rejected(self) -> None:
+        # working_set content does not match the items' content.
+        resp = _Response(
+            items=[_item(id_=ITEM_A, content="alpha"), _item(id_=ITEM_B, content="beta")],
+            working_set="[fact] WRONG\n[preference] beta",
+        )
+        with pytest.raises(ValueError, match="working_set"):
+            _build(response=resp)
+
+    def test_packet_kind_mismatch_rejected(self) -> None:
+        resp = _Response(
+            items=[_item(id_=ITEM_A, content="alpha", kind="fact")],
+            working_set="[preference] alpha",  # wrong kind
+        )
+        with pytest.raises(ValueError, match="working_set"):
+            _build(response=resp)
+
+    def test_packet_item_order_mismatch_rejected(self) -> None:
+        items = [_item(id_=ITEM_A, content="alpha"), _item(id_=ITEM_B, content="beta")]
+        resp = _Response(
+            items=items,
+            working_set="[fact] beta\n[fact] alpha",  # reversed
+        )
+        with pytest.raises(ValueError, match="working_set"):
+            _build(response=resp)
+
+    def test_trailing_newline_mismatch_rejected(self) -> None:
+        items = [_item(id_=ITEM_A, content="alpha")]
+        resp = _Response(
+            items=items,
+            working_set="[fact] alpha\n",  # trailing newline not in render
+        )
+        with pytest.raises(ValueError, match="working_set"):
+            _build(response=resp)
+
+    def test_crlf_mismatch_rejected(self) -> None:
+        items = [_item(id_=ITEM_A, content="alpha"), _item(id_=ITEM_B, content="beta")]
+        resp = _Response(
+            items=items,
+            working_set="[fact] alpha\r\n[fact] beta",  # CRLF not LF
+        )
+        with pytest.raises(ValueError, match="working_set"):
+            _build(response=resp)
+
+    def test_coherent_embedded_newline_content_accepted(self) -> None:
+        # Content with an embedded newline is fine as long as working_set
+        # matches the render (which preserves embedded newlines verbatim).
+        items = [_item(id_=ITEM_A, content="line one\nline two")]
+        resp = _Response(items=items)  # working_set auto-derived & coherent
+        m = _build(response=resp)
+        assert m.result.item_count == 1
+        assert "\n" in resp.working_set  # embedded newline preserved in packet
+        assert m.packet.hash == sha256_digest(resp.working_set.encode("utf-8"))
+
+
+class TestStartupContextCoherence:
+    """Startup v1 subject/request invariants."""
+
+    def test_query_digest_present_for_startup_rejected(self) -> None:
+        req = _request()
+        req.query_digest = "sha256:" + "a" * 64
+        with pytest.raises(ValueError, match="query_digest"):
+            _build(request_context=req)
+
+    def test_subject_effective_workspace_mismatch_rejected(self) -> None:
+        ws = WORKSPACE
+        # subject has no workspace, but effective claims one.
+        req = ContextManifestRequestInputV1(
+            requested=ContextManifestRequestedV1(
+                workspace_supplied=True, byte_budget=None, token_budget=None, item_budget=None
+            ),
+            effective=ContextManifestEffectiveV1(
+                workspace_id=ws, byte_budget=4096, token_budget=None, item_budget=None
+            ),
+            query_digest=None,
+        )
+        with pytest.raises(ValueError, match="workspace_id"):
+            _build(
+                subject_context=_subject(workspace_id=None),
+                request_context=req,
+            )
+
+    def test_non_null_effective_startup_item_budget_rejected(self) -> None:
+        # The shared request model lets a caller ASK for an item_budget, but
+        # startup v1 must not falsely attest one. effective.item_budget is
+        # typed None, so construction itself rejects a non-null value.
+        with pytest.raises(Exception):  # noqa: B017
+            ContextManifestEffectiveV1(
+                workspace_id=None, byte_budget=4096, token_budget=None, item_budget=5
+            )
+
+    def test_requested_item_budget_may_be_non_null(self) -> None:
+        # A caller may request an item_budget (the shared request model exposes
+        # it); the manifest records it under requested but effective stays null.
+        req = ContextManifestRequestInputV1(
+            requested=ContextManifestRequestedV1(
+                workspace_supplied=False, byte_budget=None, token_budget=None, item_budget=5
+            ),
+            effective=ContextManifestEffectiveV1(
+                workspace_id=None, byte_budget=4096, token_budget=None, item_budget=None
+            ),
+            query_digest=None,
+        )
+        m = _build(request_context=req)
+        assert m.request.requested.item_budget == 5
+        assert m.request.effective.item_budget is None
+
+
+# ─── Blocker 2: strict input typing (no silent coercion) ──────────────
+
+
+class TestStrictItemTypes:
+    """Malformed response item values are rejected, not coerced."""
+
+    def test_string_false_for_pinned_rejected(self) -> None:
+        resp = _build_two_item_response()
+        resp.items[0]["pinned"] = "false"  # would be coerced to True
+        with pytest.raises(Exception):  # noqa: B017
+            _build(response=resp)
+
+    def test_integer_one_for_pinned_rejected(self) -> None:
+        resp = _build_two_item_response()
+        resp.items[0]["pinned"] = 1  # would be coerced to True
+        with pytest.raises(Exception):  # noqa: B017
+            _build(response=resp)
+
+    def test_integer_one_for_human_verified_rejected(self) -> None:
+        resp = _build_two_item_response()
+        resp.items[0]["human_verified"] = 1
+        with pytest.raises(Exception):  # noqa: B017
+            _build(response=resp)
+
+    def test_boolean_for_authority_rejected(self) -> None:
+        resp = _build_two_item_response()
+        resp.items[0]["authority"] = True  # bool is not a valid int here
+        with pytest.raises(Exception):  # noqa: B017
+            _build(response=resp)
+
+    def test_boolean_for_score_rejected(self) -> None:
+        resp = _build_two_item_response()
+        resp.items[0]["score"] = True
+        with pytest.raises(Exception):  # noqa: B017
+            _build(response=resp)
+
+    def test_string_reason_instead_of_list_rejected(self) -> None:
+        resp = _build_two_item_response()
+        resp.items[0]["reasons"] = "single reason"  # would iterate to chars
+        with pytest.raises(Exception):  # noqa: B017
+            _build(response=resp)
+
+    def test_mixed_type_reason_list_rejected(self) -> None:
+        resp = _build_two_item_response()
+        resp.items[0]["reasons"] = ["ok", 123]
+        with pytest.raises(Exception):  # noqa: B017
+            _build(response=resp)
+
+    def test_invalid_visibility_value_rejected(self) -> None:
+        resp = _build_two_item_response()
+        resp.items[0]["visibility"] = "secret"
+        with pytest.raises(Exception):  # noqa: B017
+            _build(response=resp)
+
+    def test_malformed_item_id_rejected(self) -> None:
+        resp = _build_two_item_response()
+        resp.items[0]["id"] = "not-a-uuid"
+        with pytest.raises(Exception):  # noqa: B017
+            _build(response=resp)
+
+    def test_malformed_item_kind_rejected(self) -> None:
+        resp = _build_two_item_response()
+        resp.items[0]["kind"] = 123  # not a str
+        with pytest.raises(Exception):  # noqa: B017
+            _build(response=resp)
+
+
+# ─── Blocker 1: frozen-vector round-trip over all golden manifests ─────
+
+
+def _vector_dir() -> Path:
+    return (
+        Path(__file__).resolve().parent.parent
+        / "conformance"
+        / "context-manifest-v1"
+        / "vectors"
+    )
+
+
+class TestGoldenRoundTrip:
+    """Every checked-in golden manifest round-trips through the wire parser."""
+
+    @pytest.mark.parametrize(
+        "vector_name",
+        sorted(p.name for p in _vector_dir().glob("*.json")) if _vector_dir().exists() else [],
+    )
+    def test_golden_manifest_round_trips(self, vector_name: str) -> None:
+        import json
+
+        data = json.loads((_vector_dir() / vector_name).read_text())
+        expected = data["expected"]
+        # Parse the frozen wire dict and the canonical JSON; both must yield
+        # byte-identical canonical bytes and the frozen manifest_hash.
+        m_dict = ContextManifestV1.model_validate(expected["manifest"])
+        m_json = ContextManifestV1.model_validate_json(expected["canonical_json"])
+        canon_from_dict = canonical_json_bytes(
+            m_dict.model_dump(mode="json", exclude_none=False, by_alias=True)
+        ).decode("utf-8")
+        canon_from_json = canonical_json_bytes(
+            m_json.model_dump(mode="json", exclude_none=False, by_alias=True)
+        ).decode("utf-8")
+        assert canon_from_dict == expected["canonical_json"]
+        assert canon_from_json == expected["canonical_json"]
+        assert compute_manifest_hash(m_dict) == expected["manifest_hash"]
+        assert compute_manifest_hash(m_json) == expected["manifest_hash"]

@@ -7,6 +7,7 @@
     "response": {
       "working_set": "[fact] nums\n[fact] nums2",
       "item_count": 2,
+      "byte_count": 9,
       "pinned_omitted_count": 0,
       "omitted_count": 0,
       "message": null,

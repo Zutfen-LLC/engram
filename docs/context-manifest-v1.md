@@ -162,6 +162,33 @@ significant (never alphabetized). Full memory `content`, `conflicts_with_item_id
 review notes, source URIs, provenance payloads, secrets, and embeddings are
 absent — only `served_content_hash` represents content.
 
+### Normative wire round-trip
+
+The model emits the normative wire shape and parses that exact shape back.
+`ContextManifestV1.model_validate` and `model_validate_json` accept the emitted
+wire object (including the top-level `"schema"` key) without renaming. The
+`"schema"` key is a bidirectional alias of the internal `schema_name` field
+(it collides with `BaseModel.schema`); `populate_by_name=True` also permits
+Python construction by field name.
+
+All stable protocol markers are **required `Literal` constants** on the wire:
+`schema` (`"engram.context-manifest"`), `schema_version` (`"1.0"`),
+`canonicalization` (`"rfc8785"`), `mode` (`"startup"`),
+`subject.memory_context_version` (`"memory-context-v2"`),
+`versions.manifest_contract_version` (`"context-manifest-v1"`),
+`versions.packet_render_version` and `packet.render_version`
+(`"working-set-v1"`), and `packet.media_type`
+(`"text/plain; charset=utf-8"`). They are required (not defaulted) so the JSON
+Schema and a parsed wire manifest enforce them.
+
+The strict wire parser requires **canonical UUID/hash representations** — it
+does not normalize a noncanonical (e.g. uppercase) UUID or hash into a
+different canonical object. UUIDs match `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`;
+hashes match `^sha256:[0-9a-f]{64}$`. `visibility` is constrained to the
+storage CHECK vocabulary (`private`, `workspace`, `tenant`, `public`).
+Counts, ordinals, byte sizes, and budgets are nonnegative. `authority` is
+intentionally NOT range-constrained (storage has no CHECK range on it).
+
 ## 6. Canonicalization algorithm
 
 Canonical JSON bytes are produced with **RFC 8785 (JSON Canonicalization
@@ -306,3 +333,64 @@ it in a volatile envelope without redesigning the hash contract.
 ENG-CONTEXT-003 will add receipt inspect, verify, diff, and drift endpoints
 plus SDK/MCP surfaces. The manifest contract defined here is what those
 endpoints will return and verify against.
+
+## 16. Contract integrity (ENG-CONTEXT-001 correction)
+
+Three invariants harden the contract so it cannot silently describe an
+incoherent or wrongly typed response:
+
+### Finalized-response coherence
+
+Before constructing a manifest, the builder proves the finalized response is
+internally consistent:
+
+- `response.item_count == len(response.items)`;
+- `response.byte_count == sum(len(content.encode("utf-8")) for each item)`;
+- `response.working_set ==` the `working-set-v1` render of `response.items`
+  (exact item order, kind, content, LF separators, no trailing newline,
+  embedded newlines in content preserved, exact Unicode and whitespace).
+
+The render comparison is an **integrity check** for `working-set-v1`. The
+actual `packet.hash` is still computed directly over
+`response.working_set.encode("utf-8")` — the reconstructed string is never
+substituted as the hash preimage. A contradictory response (count, byte, or
+packet mismatch; trailing newline; LF-vs-CRLF) is rejected before the manifest
+is built.
+
+### Startup subject/request coherence
+
+- Startup `request.query_digest` must be `null`.
+- `subject.workspace_id` must equal `request.effective.workspace_id`.
+- `request.effective.item_budget` must be `null` for startup v1. A caller may
+  *request* an item budget (the shared request model exposes it), but startup
+  v1 does not enforce one, so the manifest must not falsely attest one.
+
+### Strict typing (no silent coercion)
+
+The builder validates the selected manifest fields exactly: `id`, `kind`,
+`content`, `review_status`, and `visibility` must be strings; `authority` an
+integer (not a Boolean); `pinned`/`human_verified` actual Booleans;
+`reasons`/`warnings` lists of only strings; optional workspace/conflict fields
+strings or null; score/trust fields finite numbers (not Booleans). Malformed
+values are rejected — `"false"` is not coerced to `True`, `1` is not coerced to
+a Boolean, a string is not iterated into a list of characters. Extra additive
+fields on the loose recall item dictionary are ignored; only the selected
+manifest fields are validated.
+
+### Normative JSON Schema (source of truth)
+
+The checked-in `schemas/context-manifest-v1.schema.json` is **generated** from
+the strict wire model (`scripts/generate_context_manifest_schema.py`), not
+hand-edited, so it cannot drift. A drift test and a `--check` mode fail CI if
+the checked-in schema differs from the model. The schema enforces the required
+`Literal` constants, canonical UUID/hash patterns, the `visibility` enum,
+nonnegative counts, and rejects unknown fields. Schema validation alone does
+**not** verify packet or item hash preimages — the semantic verifier (Python
+and JavaScript) performs those checks.
+
+> Note on golden vectors: vectors 001–009 kept their frozen expected hashes
+> unchanged through this correction. Vector 010 was repurposed: its original
+> packet had a trailing newline that did not match the `working-set-v1` render
+> of its items, which the coherence check now (correctly) rejects. It is now a
+> coherent multi-line packet proving exact-byte hashing; its preimage changed
+> by necessity, and that is the only frozen-value change.

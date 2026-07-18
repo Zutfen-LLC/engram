@@ -3,13 +3,20 @@
 // Uses ONLY the Node standard library (no `npm install`). It independently:
 //   - implements RFC 8785 JSON Canonicalization Scheme (JCS) canonicalization;
 //   - computes SHA-256 over UTF-8 bytes via node:crypto;
-//   - re-derives manifest_hash, packet_hash, request_digest, and per-item
-//     served_content_hash from each vector's inputs;
-//   - verifies every checked-in golden vector.
+//   - validates response coherence (item count, byte count, working-set-v1
+//     render) and rejects incoherent input BEFORE reconstruction;
+//   - reconstructs the COMPLETE manifest object from `input` using the v1
+//     contract (subject, request + digest, versions, result counts, packet
+//     descriptor, ordered item snapshots, per-item content hashes);
+//   - compares the reconstructed canonical object against expected.manifest,
+//     expected.canonical_json, and expected.manifest_hash;
+//   - independently re-derives packet_hash, request_digest, and per-item
+//     served_content_hash from the frozen inputs.
 //
-// It NEVER invokes the Python implementation. The Python verifier
-// (scripts/verify_context_manifest_vectors.py) and this one must agree on
-// every frozen expected value.
+// It NEVER invokes the Python implementation and does not merely hash
+// expected.manifest — it rebuilds the manifest from the inputs. The Python
+// verifier (scripts/verify_context_manifest_vectors.py) and this one must
+// agree on every frozen expected value.
 //
 // Usage:  node conformance/context-manifest-v1/verify.mjs
 
@@ -21,33 +28,27 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const VECTORS_DIR = path.join(__dirname, "vectors");
 
+// ─── Stable contract constants (must match the Python model exactly) ───
+const SCHEMA = "engram.context-manifest";
+const SCHEMA_VERSION = "1.0";
+const CANONICALIZATION = "rfc8785";
+const MODE = "startup";
+const MEMORY_CONTEXT_VERSION = "memory-context-v2";
+const MANIFEST_CONTRACT_VERSION = "context-manifest-v1";
+const PACKET_RENDER_VERSION = "working-set-v1";
+const PACKET_MEDIA_TYPE = "text/plain; charset=utf-8";
+const VISIBILITY_VALUES = new Set(["private", "workspace", "tenant", "public"]);
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const SHA256_RE = /^sha256:[0-9a-f]{64}$/;
+
 // ─── SHA-256 helper ────────────────────────────────────────────────────
-// Returns "sha256:<64 lowercase hex>" for the exact UTF-8 bytes of `s`.
-// No normalization is applied — exact bytes only. The empty string hashes
-// to the SHA-256 of zero bytes (e3b0c442...).
 function sha256Hex(s) {
   return "sha256:" + createHash("sha256").update(s, "utf8").digest("hex");
 }
 
 // ─── RFC 8785 (JCS) canonicalization ───────────────────────────────────
-// Independent implementation. Semantics per RFC 8785:
-//   - UTF-8 encoded, no BOM, no insignificant whitespace.
-//   - Object members ordered by UTF-16 code unit of the member name.
-//   - Arrays preserve order.
-//   - JSON string escaping: ECMAScript-compatible. Non-ASCII (>= U+0080)
-//     characters are NOT escaped (preserved as their exact Unicode scalars).
-//   - Number serialization: ECMAScript Number.prototype.toString(), with the
-//     additional JCS rule that -0 is serialized as "0". NaN and +Infinity
-//     / -Infinity are rejected (they are not valid JSON).
-//
-// JavaScript's default string `<` comparison orders by UTF-16 code unit, and
-// `JSON.stringify(string)` produces ECMAScript-compatible escaping without
-// escaping non-ASCII — both of which match JCS. This is why JCS is natural to
-// implement in JS and why `json.dumps(sort_keys=True)` in Python (Unicode
-// code-point ordering, no JCS number format) is NOT equivalent.
-
 function canonicalize(value) {
-  // Returns a string (the canonical JSON text).
   if (value === null) return "null";
   if (typeof value === "boolean") return value ? "true" : "false";
   if (typeof value === "string") return canonicalString(value);
@@ -56,8 +57,7 @@ function canonicalize(value) {
     return "[" + value.map(canonicalize).join(",") + "]";
   }
   if (typeof value === "object") {
-    // Order keys by UTF-16 code unit (JS default string comparison).
-    const keys = Object.keys(value).sort();
+    const keys = Object.keys(value).sort(); // UTF-16 code unit order (JCS)
     const members = keys.map((k) => canonicalString(k) + ":" + canonicalize(value[k]));
     return "{" + members.join(",") + "}";
   }
@@ -65,24 +65,216 @@ function canonicalize(value) {
 }
 
 function canonicalString(s) {
-  // JSON.stringify on a single string yields the ECMAScript-compatible quoted
-  // form (escapes control chars, ", \; does NOT escape non-ASCII). JCS wants
-  // exactly this. (For U+2028/U+2029 JSON.stringify does not escape them,
-  // which is also what JCS requires.)
   return JSON.stringify(s);
 }
 
 function canonicalNumber(n) {
-  if (Number.isNaN(n)) {
-    throw new Error("JCS: NaN is not valid JSON and must be rejected");
-  }
-  if (!Number.isFinite(n)) {
-    throw new Error("JCS: Infinity/-Infinity is not valid JSON and must be rejected");
-  }
-  // JCS §3.2.2.3: -0 is serialized as "0". Number.prototype.toString(-0)
-  // yields "0" already, but be explicit and defensive.
+  if (Number.isNaN(n)) throw new Error("JCS: NaN is not valid JSON");
+  if (!Number.isFinite(n)) throw new Error("JCS: Infinity/-Infinity is not valid JSON");
   if (Object.is(n, -0)) return "0";
   return n.toString();
+}
+
+// ─── Strict input validation helpers (mirror the Python builder) ───────
+function isStrictBool(v) {
+  return typeof v === "boolean";
+}
+function isStrictInt(v) {
+  return typeof v === "number" && Number.isInteger(v) && !Object.is(v, -0) === true && !isStrictBool(v) && Number.isFinite(v);
+}
+function isStrictStr(v) {
+  return typeof v === "string";
+}
+function isFiniteNumber(v) {
+  return (
+    (typeof v === "number") && Number.isFinite(v) && !isStrictBool(v)
+  );
+}
+
+function requireStr(v, where) {
+  if (!isStrictStr(v)) throw new Error(`${where} must be a string, got ${typeof v}`);
+  return v;
+}
+function requireInt(v, where) {
+  if (isStrictBool(v) || typeof v !== "number" || !Number.isInteger(v)) {
+    throw new Error(`${where} must be an integer (not bool), got ${typeof v}`);
+  }
+  return v;
+}
+function requireBool(v, where) {
+  if (!isStrictBool(v)) throw new Error(`${where} must be a boolean, got ${typeof v}`);
+  return v;
+}
+function requireFiniteFloat(v, where) {
+  if (isStrictBool(v) || typeof v !== "number" || !Number.isFinite(v)) {
+    throw new Error(`${where} must be a finite number, got ${typeof v}`);
+  }
+  return v;
+}
+function requireStrList(v, where) {
+  if (!Array.isArray(v)) throw new Error(`${where} must be a list`);
+  for (const el of v) {
+    if (!isStrictStr(el)) throw new Error(`${where} must contain only strings`);
+  }
+  return v;
+}
+
+// ─── Response coherence (reject incoherent input before reconstruction) ─
+function reconstructWorkingSetV1(items) {
+  return items.map((i) => `[${i.kind}] ${i.content}`).join("\n");
+}
+
+function assertResponseCoherence(name, response) {
+  if (!Array.isArray(response.items)) {
+    throw new Error(`${name}: response.items must be an array`);
+  }
+  const itemCount = requireInt(response.item_count, `${name}: response.item_count`);
+  if (itemCount !== response.items.length) {
+    throw new Error(
+      `${name}: response.item_count (${itemCount}) != len(items) (${response.items.length})`
+    );
+  }
+  const byteCount = requireInt(response.byte_count, `${name}: response.byte_count`);
+  let derived = 0;
+  for (const it of response.items) {
+    if (!isStrictStr(it.content)) {
+      throw new Error(`${name}: response item content must be a string`);
+    }
+    derived += Buffer.byteLength(it.content, "utf8");
+  }
+  if (byteCount !== derived) {
+    throw new Error(
+      `${name}: response.byte_count (${byteCount}) != derived (${derived})`
+    );
+  }
+  if (!isStrictStr(response.working_set)) {
+    throw new Error(`${name}: response.working_set must be a string`);
+  }
+  const reconstructed = reconstructWorkingSetV1(response.items);
+  if (response.working_set !== reconstructed) {
+    throw new Error(
+      `${name}: response.working_set does not match the working-set-v1 render of items`
+    );
+  }
+}
+
+// ─── Full manifest reconstruction from input ───────────────────────────
+function buildManifestFromInput(name, inp) {
+  const subject = inp.subject_context;
+  const request = inp.request_context;
+  const versions = inp.decision_versions;
+  const response = inp.response;
+
+  // Validate stable markers on input (the reconstruction trusts the frozen
+  // inputs, but these must match the v1 contract).
+  if (subject.memory_context_version !== MEMORY_CONTEXT_VERSION) {
+    throw new Error(`${name}: subject.memory_context_version mismatch`);
+  }
+  if (versions.manifest_contract_version !== MANIFEST_CONTRACT_VERSION) {
+    throw new Error(`${name}: versions.manifest_contract_version mismatch`);
+  }
+  if (versions.packet_render_version !== PACKET_RENDER_VERSION) {
+    throw new Error(`${name}: versions.packet_render_version mismatch`);
+  }
+
+  // Startup-context coherence.
+  if (request.query_digest !== null) {
+    throw new Error(`${name}: startup query_digest must be null`);
+  }
+  if (subject.workspace_id !== request.effective.workspace_id) {
+    throw new Error(`${name}: subject/effective workspace_id mismatch`);
+  }
+
+  // Coherence first (reject incoherent input).
+  assertResponseCoherence(name, response);
+
+  // Packet hash over exact working_set bytes.
+  const packetBytes = response.working_set;
+  const packetHash = sha256Hex(packetBytes);
+
+  // Ordered item snapshots.
+  let servedContentByteCount = 0;
+  const items = [];
+  for (let ordinal = 0; ordinal < response.items.length; ordinal++) {
+    const raw = response.items[ordinal];
+    const content = requireStr(raw.content, `${name}: item content`);
+    servedContentByteCount += Buffer.byteLength(content, "utf8");
+    items.push({
+      ordinal,
+      item_id: requireStr(raw.id, `${name}: item id`),
+      kind: requireStr(raw.kind, `${name}: item kind`),
+      served_content_hash: sha256Hex(content),
+      review_status: requireStr(raw.review_status, `${name}: item review_status`),
+      authority: requireInt(raw.authority, `${name}: item authority`),
+      visibility: requireStr(raw.visibility, `${name}: item visibility`),
+      workspace_id: raw.workspace_id === null ? null : requireStr(raw.workspace_id, `${name}: item workspace_id`),
+      score: raw.score === null ? null : requireFiniteFloat(raw.score, `${name}: item score`),
+      reasons: requireStrList(raw.reasons, `${name}: item reasons`),
+      warnings: requireStrList(raw.warnings, `${name}: item warnings`),
+      pinned: requireBool(raw.pinned, `${name}: item pinned`),
+      importance: requireFiniteFloat(raw.importance, `${name}: item importance`),
+      source_trust: requireFiniteFloat(raw.source_trust, `${name}: item source_trust`),
+      memory_confidence: requireFiniteFloat(raw.memory_confidence, `${name}: item memory_confidence`),
+      human_verified: requireBool(raw.human_verified, `${name}: item human_verified`),
+      conflict_type: raw.conflict_type === null ? null : requireStr(raw.conflict_type, `${name}: item conflict_type`),
+      conflict_resolution_status:
+        raw.conflict_resolution_status === null
+          ? null
+          : requireStr(raw.conflict_resolution_status, `${name}: item conflict_resolution_status`),
+    });
+  }
+
+  // request_digest: SHA-256 of canonical request descriptor (without digest).
+  const requestDescriptor = {
+    requested: request.requested,
+    effective: request.effective,
+    query_digest: request.query_digest,
+  };
+  const requestDigest = sha256Hex(canonicalize(requestDescriptor));
+
+  const manifest = {
+    schema: SCHEMA,
+    schema_version: SCHEMA_VERSION,
+    canonicalization: CANONICALIZATION,
+    mode: MODE,
+    subject: {
+      tenant_id: subject.tenant_id,
+      principal_id: subject.principal_id,
+      workspace_id: subject.workspace_id,
+      memory_context_version: subject.memory_context_version,
+      memory_profile_id: subject.memory_profile_id,
+      memory_profile_revision_id: subject.memory_profile_revision_id,
+      memory_profile_version: subject.memory_profile_version,
+    },
+    request: {
+      requested: request.requested,
+      effective: request.effective,
+      query_digest: request.query_digest,
+      request_digest: requestDigest,
+    },
+    versions: {
+      scoring_version: versions.scoring_version,
+      config_version: versions.config_version,
+      candidate_strategy_version: versions.candidate_strategy_version,
+      manifest_contract_version: versions.manifest_contract_version,
+      packet_render_version: versions.packet_render_version,
+    },
+    result: {
+      item_count: response.items.length,
+      served_content_byte_count: servedContentByteCount,
+      rendered_packet_byte_count: Buffer.byteLength(response.working_set, "utf8"),
+      pinned_omitted_count: response.pinned_omitted_count,
+      omitted_count: response.omitted_count,
+      message: response.message === undefined ? null : response.message,
+    },
+    packet: {
+      media_type: PACKET_MEDIA_TYPE,
+      render_version: PACKET_RENDER_VERSION,
+      hash: packetHash,
+    },
+    items,
+  };
+  return manifest;
 }
 
 // ─── Vector verification ───────────────────────────────────────────────
@@ -97,8 +289,14 @@ function fail(name, what, expected, got) {
 }
 
 function assertEqual(name, what, expected, got) {
-  if (expected !== got) {
-    fail(name, what, expected, got);
+  if (expected !== got) fail(name, what, expected, got);
+}
+
+function assertDeepEqual(name, what, expected, got) {
+  const e = canonicalize(expected);
+  const g = canonicalize(got);
+  if (e !== g) {
+    fail(name, what + " (canonical)", e, g);
   }
 }
 
@@ -109,34 +307,67 @@ async function verifyVector(file) {
   const inp = vector.input;
   const exp = vector.expected;
 
-  // 1. manifest_hash: independently canonicalize the frozen expected.manifest
-  //    object and SHA-256 it. This proves the frozen manifest object hashes
-  //    to the frozen manifest_hash without touching Python.
-  const manifestCanon = canonicalize(exp.manifest);
-  const recomputedManifestHash = sha256Hex(manifestCanon);
-  assertEqual(name, "manifest_hash", exp.manifest_hash, recomputedManifestHash);
+  // A) Reconstruct the COMPLETE manifest from input independently, then
+  //    compare to expected.manifest. This is the core reconstruction check.
+  let reconstructed;
+  try {
+    reconstructed = buildManifestFromInput(name, inp);
+  } catch (e) {
+    fail(name, "reconstruction", "(should succeed)", e.message);
+    return;
+  }
+  assertDeepEqual(name, "reconstructed manifest", exp.manifest, reconstructed);
 
-  // 2. The frozen canonical_json must equal our independent canonicalization.
-  if (manifestCanon !== exp.canonical_json) {
-    fail(name, "canonical_json bytes", exp.canonical_json, manifestCanon);
+  // B) Reconstructed manifest canonicalizes to expected.canonical_json.
+  const reconCanon = canonicalize(reconstructed);
+  if (reconCanon !== exp.canonical_json) {
+    fail(name, "reconstructed canonical_json", exp.canonical_json, reconCanon);
   }
 
-  // 3. The SHA-256 of the frozen canonical_json bytes (as UTF-8) must equal
-  //    the frozen manifest_hash. (Independent re-derivation from bytes.)
+  // C) Reconstructed manifest hashes to expected.manifest_hash.
   assertEqual(
     name,
-    "canonical_json byte hash",
+    "reconstructed manifest_hash",
+    exp.manifest_hash,
+    sha256Hex(reconCanon)
+  );
+
+  // D) The frozen expected.manifest also canonicalizes to expected.canonical_json.
+  const frozenCanon = canonicalize(exp.manifest);
+  if (frozenCanon !== exp.canonical_json) {
+    fail(name, "frozen canonical_json", exp.canonical_json, frozenCanon);
+  }
+
+  // E) SHA-256 of the frozen canonical_json bytes equals expected.manifest_hash.
+  assertEqual(
+    name,
+    "frozen canonical_json byte hash",
     exp.manifest_hash,
     sha256Hex(exp.canonical_json)
   );
 
-  // 4. packet_hash: independently hash the exact UTF-8 bytes of
-  //    response.working_set.
-  const packetHash = sha256Hex(inp.response.working_set);
-  assertEqual(name, "packet_hash", exp.packet_hash, packetHash);
+  // F) packet_hash: independently hash exact UTF-8 bytes of working_set.
+  assertEqual(
+    name,
+    "packet_hash",
+    exp.packet_hash,
+    sha256Hex(inp.response.working_set)
+  );
 
-  // 5. per-item served_content_hash: independently hash each served content's
-  //    exact UTF-8 bytes.
+  // G) request_digest: independently recompute over the canonical descriptor.
+  const reqDescriptor = {
+    requested: inp.request_context.requested,
+    effective: inp.request_context.effective,
+    query_digest: inp.request_context.query_digest,
+  };
+  assertEqual(
+    name,
+    "request_digest",
+    exp.request_digest,
+    sha256Hex(canonicalize(reqDescriptor))
+  );
+
+  // H) per-item served_content_hash from served content bytes.
   const items = inp.response.items;
   if (exp.served_content_hashes.length !== items.length) {
     fail(
@@ -147,32 +378,21 @@ async function verifyVector(file) {
     );
   }
   for (let i = 0; i < items.length; i++) {
-    const h = sha256Hex(items[i].content);
-    assertEqual(name, `served_content_hash[${i}]`, exp.served_content_hashes[i], h);
+    assertEqual(
+      name,
+      `served_content_hash[${i}]`,
+      exp.served_content_hashes[i],
+      sha256Hex(items[i].content)
+    );
   }
 
-  // 6. request_digest: independently canonicalize the request descriptor
-  //    (without request_digest) and hash it. We reconstruct the pre-digest
-  //    descriptor from the frozen request_context input.
-  const reqDescriptor = {
-    requested: inp.request_context.requested,
-    effective: inp.request_context.effective,
-    query_digest: inp.request_context.query_digest,
-  };
-  const requestDigest = sha256Hex(canonicalize(reqDescriptor));
-  assertEqual(name, "request_digest", exp.request_digest, requestDigest);
-
-  // 7. Key-order independence: re-canonicalize the manifest with its top-level
-  //    keys in a different insertion order — bytes must be identical (proves
-  //    member-ordering is canonical, not insertion-order, for vector 007 and
-  //    as a general invariant).
+  // I) Key-order independence: re-canonicalize with reversed top-level keys.
   const reordered = {};
   for (const k of Object.keys(exp.manifest).reverse()) {
     reordered[k] = exp.manifest[k];
   }
-  const reorderedCanon = canonicalize(reordered);
-  if (reorderedCanon !== manifestCanon) {
-    fail(name, "key-order independence", manifestCanon, reorderedCanon);
+  if (canonicalize(reordered) !== frozenCanon) {
+    fail(name, "key-order independence", frozenCanon, canonicalize(reordered));
   }
 
   if (failures === 0) {

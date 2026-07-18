@@ -66,13 +66,25 @@ def _item(content: str = "safe content", **extra: Any) -> dict[str, Any]:
     return base
 
 
+def _render(items: list[dict[str, Any]]) -> str:
+    """Reconstruct the working-set-v1 packet from items (kept coherent)."""
+    return "\n".join(f"[{i['kind']}] {i['content']}" for i in items)
+
+
 class _Response:
     def __init__(self, **kwargs: Any) -> None:
-        self.working_set = kwargs.get("working_set", "[fact] safe content")
         self.items = kwargs.get("items", [_item()])
+        # working_set defaults to the coherent working-set-v1 render of items
+        # so a response is internally consistent unless a test deliberately
+        # overrides it (and updates items to match).
+        self.working_set = kwargs.get("working_set", _render(self.items))
         self.pinned_omitted_count = kwargs.get("pinned_omitted_count", 0)
         self.omitted_count = kwargs.get("omitted_count", 0)
         self.message = kwargs.get("message")
+        # Declared counts derived here so the default response is coherent;
+        # the builder verifies them against len(items)/sum(content bytes).
+        self.item_count = len(self.items)
+        self.byte_count = sum(len(i["content"].encode("utf-8")) for i in self.items)
 
 
 def _subject() -> ContextManifestSubjectV1:

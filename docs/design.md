@@ -1628,6 +1628,15 @@ does not reuse the dedup `content_hash`, which normalizes whitespace/case).
 Receipt IDs, timestamps, and trace IDs are excluded from the deterministic
 manifest — they belong in the future receipt envelope (ENG-CONTEXT-002).
 
+The wire model round-trips: it emits the normative `"schema"` wire key and
+parses that exact shape back. Stable protocol markers are required `Literal`
+constants. The builder verifies finalized-response coherence (item count, byte
+count, and the `working-set-v1` render of items — `packet_hash` is still
+hashed directly from the served `working_set`, never from the reconstruction),
+startup subject/request invariants (`query_digest` null, workspace agreement,
+no effective item budget), and strict field types (no silent coercion). The
+checked-in JSON Schema is generated from the strict model so it cannot drift.
+
 The manifest proves what was served and which policy admitted it. It does
 **not** prove that a memory was factually true or that an agent relied on it.
 Full normative detail, the deterministic/volatile boundary, and the hash

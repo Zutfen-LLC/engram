@@ -162,10 +162,14 @@ PROFILE_EXECUTION_PROOFS = (
 # The real-PostgreSQL route-parity proof: exercises the live startup recall
 # route and proves the manifest built from the served response matches the
 # HTTP response exactly (ordered IDs, scores, reasons, warnings, counts,
-# packet bytes) and contains no raw content. Pure-Python determinism /
-# privacy / golden-vector coverage runs in the root suite.
+# packet bytes) and contains no raw content. The schema contract-integrity
+# proof (drift + positive/negative JSON Schema validation) is DB-free but
+# is gated here so compose-trust-proof enforces it with no skips.
+# Pure-Python determinism / privacy / golden-vector coverage runs in the
+# root suite.
 CONTEXT_MANIFEST_PROOFS = (
     "tests/test_context_manifest_route.py",
+    "tests/test_context_manifest_schema.py",
 )
 
 # ── Canonical aggregate ─────────────────────────────────────────────

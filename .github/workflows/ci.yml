@@ -241,10 +241,10 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install engram (editable, no optional extras)
+      - name: Install engram with dev extras (jsonschema for the verifier)
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e .
+          python -m pip install -e ".[dev]"
 
       - name: Set up Node
         uses: actions/setup-node@v5

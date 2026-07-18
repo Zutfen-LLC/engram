@@ -37,20 +37,40 @@ contract is language-neutral.
 | 7 | `007-key-order-equivalence.json` | Key insertion order does not change canonical bytes. |
 | 8 | `008-item-order-change.json` | Item-order change → distinct `manifest_hash` and `packet_hash`. |
 | 9 | `009-whitespace-case-content.json` | Whitespace/case content: exact-byte `served_content_hash` (no normalization). |
-| 10 | `010-lf-crlf-trailing-newline.json` | Trailing-newline packet: exact-byte `packet_hash`. |
+| 10 | `010-lf-crlf-trailing-newline.json` | Exact-byte multi-line packet (LF join + embedded newline); exact-byte `packet_hash`. (Incoherent CRLF/trailing-newline variants are rejected by the builder — see the coherence negative tests.) |
 
 ## Running the verifiers
 
+Both verifiers independently reconstruct the manifest from each vector's
+inputs, validate response coherence (item count, byte count, working-set-v1
+render), and re-derive every hash. The Python verifier additionally validates
+each frozen manifest against the normative JSON Schema and round-trips it
+through `model_validate`/`model_validate_json`.
+
 ```bash
-# Python (reference builder + independent re-hash)
+# Python: build + schema-validate + wire round-trip + all hash re-derivation
 python scripts/verify_context_manifest_vectors.py
 
-# JavaScript (fully independent RFC 8785 + SHA-256, Node stdlib only)
+# JavaScript: full independent reconstruction + coherence + RFC 8785 + SHA-256
+#             (Node stdlib only, no npm install)
 node conformance/context-manifest-v1/verify.mjs
+
+# Normative JSON Schema drift guard
+python scripts/generate_context_manifest_schema.py --check
 ```
 
-Both must exit 0. The hosted CI `conformance-vectors` job runs both against
-the same checked-in vectors on every change.
+All must exit 0. The hosted CI `conformance-vectors` job runs all three
+against the same checked-in artifacts on every change.
+
+## Regenerating the schema
+
+The checked-in `schemas/context-manifest-v1.schema.json` is **generated** from
+the strict wire model — never hand-edited — so it cannot drift:
+
+```bash
+python scripts/generate_context_manifest_schema.py            # regenerate
+python scripts/generate_context_manifest_schema.py --check     # drift guard
+```
 
 ## Regenerating vectors
 

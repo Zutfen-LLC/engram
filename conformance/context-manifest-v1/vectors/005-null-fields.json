@@ -7,6 +7,7 @@
     "response": {
       "working_set": "[fact] only",
       "item_count": 1,
+      "byte_count": 4,
       "pinned_omitted_count": 0,
       "omitted_count": 0,
       "message": null,

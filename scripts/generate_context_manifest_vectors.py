@@ -180,6 +180,7 @@ def _build_vector(
             "response": {
                 "working_set": working_set,
                 "item_count": len(items),
+                "byte_count": sum(len(i["content"].encode("utf-8")) for i in items),
                 "pinned_omitted_count": pinned_omitted_count,
                 "omitted_count": omitted_count,
                 "message": message,
@@ -213,6 +214,14 @@ class _Response:
         self.pinned_omitted_count = kwargs.get("pinned_omitted_count", 0)
         self.omitted_count = kwargs.get("omitted_count", 0)
         self.message = kwargs.get("message")
+        # Declared counts are derived here (the builder verifies they match
+        # len(items)/sum(content bytes) before trusting them). Carried in the
+        # vector input so the verifiers exercise the coherence checks.
+        self.item_count = kwargs.get("item_count", len(self.items))
+        self.byte_count = kwargs.get(
+            "byte_count",
+            sum(len(i["content"].encode("utf-8")) for i in self.items),
+        )
 
 
 def _build_all() -> list[dict[str, Any]]:
@@ -399,13 +408,19 @@ def _build_all() -> list[dict[str, Any]]:
         )
     )
 
-    # 10. LF versus CRLF and trailing-newline packet differences.
-    #     The working_set is authored directly (NOT via _render) to embed a
-    #     trailing newline and demonstrate that packet_hash is exact-byte.
-    items_lf = [_item(id_=ITEM_1, content="line one")]
-    ws_with_trailing_newline = "[fact] line one\n"
+    # 10. Exact-byte LF-joined multi-line packet (working-set-v1 render).
+    #     The packet is COHERENT: its working_set equals the working-set-v1
+    #     render of its items (multi-line content + LF join, no trailing
+    #     newline). It proves exact-byte packet hashing: the LF separators
+    #     and an embedded newline in content are preserved verbatim. The
+    #     incoherent variants (CRLF, trailing newline) are negative fixtures
+    #     the builder rejects — see test_context_manifest_unit coherence tests.
+    items_lf = [
+        _item(id_=ITEM_1, content="line one\nwith embedded newline"),
+        _item(id_=ITEM_2, content="line two", kind="preference"),
+    ]
     manifest_obj = _build_vector_raw(
-        items=items_lf, working_set=ws_with_trailing_newline
+        items=items_lf, working_set=_render(items_lf)
     )
     vectors.append(manifest_obj)
 
@@ -459,6 +474,7 @@ def _build_vector_raw(
             "response": {
                 "working_set": working_set,
                 "item_count": len(items),
+                "byte_count": sum(len(i["content"].encode("utf-8")) for i in items),
                 "pinned_omitted_count": 0,
                 "omitted_count": 0,
                 "message": None,

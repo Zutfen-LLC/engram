@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """Verify the ENG-CONTEXT-001 golden conformance vectors.
 
-Rebuilds each manifest from the vector's finalized-response + context inputs
-using the reference Python builder, then asserts:
+Each vector passes through every stage:
 
-- the rebuilt manifest object equals the frozen ``expected.manifest``;
-- ``manifest_hash`` (recomputed) equals the frozen value;
-- ``packet_hash`` (recomputed from ``response.working_set`` bytes) equals frozen;
-- ``request_digest`` (recomputed) equals frozen;
-- each per-item ``served_content_hash`` (recomputed from served ``content``
-  bytes) equals frozen;
-- the canonical RFC 8785 bytes of the frozen manifest hash to the frozen
-  ``manifest_hash``.
+  1. Build the manifest from the frozen finalized-response inputs.
+  2. Compare it to ``expected.manifest``.
+  3. Validate ``expected.manifest`` against the normative JSON Schema.
+  4. Parse ``expected.manifest`` through ``ContextManifestV1.model_validate``.
+  5. Parse ``expected.canonical_json`` through ``model_validate_json``.
+  6. Reserialize both parsed representations.
+  7. Prove canonical bytes and manifest hashes are unchanged.
+  8. Verify response coherence (item count, byte count, working-set-v1 render).
+  9. Verify packet, request, and item hashes.
 
 Independent of the JavaScript verifier (``conformance/context-manifest-v1/
 verify.mjs``); the two must agree on every frozen value.
@@ -36,12 +36,26 @@ from engram.context_manifest import (  # noqa: E402
     ContextManifestRequestedV1,
     ContextManifestRequestInputV1,
     ContextManifestSubjectV1,
+    ContextManifestV1,
     ContextManifestVersionsV1,
     build_startup_context_manifest_v1,
     canonical_json_bytes,
     compute_manifest_hash,
+    normative_manifest_schema_dict,
+    reconstruct_working_set_v1,
     sha256_digest,
 )
+
+# jsonschema is a dev dependency; the verifier requires it for stage 3.
+try:
+    from jsonschema import Draft202012Validator
+except ImportError as exc:  # pragma: no cover - environment guard
+    print(
+        "jsonschema is required to run the conformance verifier. "
+        "Install dev dependencies: pip install -e '.[dev]'",
+        file=sys.stderr,
+    )
+    raise SystemExit(2) from exc
 
 VECTORS_DIR = ROOT / "conformance" / "context-manifest-v1" / "vectors"
 
@@ -53,9 +67,30 @@ class _Response:
         self.pinned_omitted_count = kwargs.get("pinned_omitted_count", 0)
         self.omitted_count = kwargs.get("omitted_count", 0)
         self.message = kwargs.get("message")
+        self.item_count = kwargs["item_count"]
+        self.byte_count = kwargs["byte_count"]
 
 
-def _verify_vector(path: Path) -> None:
+def _fail(name: str, what: str, expected: Any, got: Any) -> None:
+    print(f"FAIL {name}: {what}", file=sys.stderr)
+    print(f"  expected: {expected}", file=sys.stderr)
+    print(f"  got:      {got}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def _check_response_coherence(name: str, response: _Response) -> None:
+    """Stage 8: response coherence the builder itself enforces."""
+    if response.item_count != len(response.items):
+        _fail(name, "coherence item_count", len(response.items), response.item_count)
+    derived_bytes = sum(len(i["content"].encode("utf-8")) for i in response.items)
+    if response.byte_count != derived_bytes:
+        _fail(name, "coherence byte_count", derived_bytes, response.byte_count)
+    reconstructed = reconstruct_working_set_v1(response.items)
+    if response.working_set != reconstructed:
+        _fail(name, "coherence working_set render", reconstructed, response.working_set)
+
+
+def _verify_vector(path: Path, schema_validator: Draft202012Validator) -> None:
     vector = json.loads(path.read_text())
     name = vector["name"]
     inp = vector["input"]
@@ -70,6 +105,10 @@ def _verify_vector(path: Path) -> None:
     versions = ContextManifestVersionsV1(**inp["decision_versions"])
     response = _Response(**inp["response"])
 
+    # Stage 8: response coherence (before building).
+    _check_response_coherence(name, response)
+
+    # Stages 1-2: build from inputs; rebuilt manifest object equals frozen.
     manifest = build_startup_context_manifest_v1(
         response=response,
         subject_context=subject,
@@ -77,66 +116,86 @@ def _verify_vector(path: Path) -> None:
         decision_versions=versions,
     )
     rebuilt = manifest.model_dump(mode="json", exclude_none=False, by_alias=True)
-
-    # 1. Rebuilt manifest object equals frozen manifest.
     if rebuilt != exp["manifest"]:
         _fail(name, "manifest object mismatch", exp["manifest"], rebuilt)
 
-    # 2. manifest_hash recomputed over the rebuilt manifest.
-    recomputed_hash = compute_manifest_hash(manifest)
-    if recomputed_hash != exp["manifest_hash"]:
-        _fail(name, "manifest_hash", exp["manifest_hash"], recomputed_hash)
+    # Stage 3: validate frozen manifest against the normative JSON Schema.
+    schema_validator.validate(exp["manifest"])
 
-    # 3. manifest_hash is also the hash of the frozen canonical bytes.
-    frozen_canon_hash = sha256_digest(exp["canonical_json"].encode("utf-8"))
-    if frozen_canon_hash != exp["manifest_hash"]:
-        _fail(name, "canonical_json hash", exp["manifest_hash"], frozen_canon_hash)
+    # Stage 4: parse frozen wire dict through the strict model.
+    m_from_dict = ContextManifestV1.model_validate(exp["manifest"])
 
-    # 4. packet_hash recomputed from response.working_set bytes.
+    # Stage 5: parse frozen canonical JSON through model_validate_json.
+    m_from_json = ContextManifestV1.model_validate_json(exp["canonical_json"])
+
+    # Stages 6-7: reserialize both parsed representations; bytes + hash unchanged.
+    canon_from_dict = canonical_json_bytes(
+        m_from_dict.model_dump(mode="json", exclude_none=False, by_alias=True)
+    ).decode("utf-8")
+    canon_from_json = canonical_json_bytes(
+        m_from_json.model_dump(mode="json", exclude_none=False, by_alias=True)
+    ).decode("utf-8")
+    if canon_from_dict != exp["canonical_json"]:
+        _fail(name, "model_validate round-trip canonical", exp["canonical_json"], canon_from_dict)
+    if canon_from_json != exp["canonical_json"]:
+        _fail(
+            name,
+            "model_validate_json round-trip canonical",
+            exp["canonical_json"],
+            canon_from_json,
+        )
+    if compute_manifest_hash(m_from_dict) != exp["manifest_hash"]:
+        _fail(
+            name,
+            "model_validate manifest_hash",
+            exp["manifest_hash"],
+            compute_manifest_hash(m_from_dict),
+        )
+    if compute_manifest_hash(m_from_json) != exp["manifest_hash"]:
+        _fail(
+            name,
+            "model_validate_json manifest_hash",
+            exp["manifest_hash"],
+            compute_manifest_hash(m_from_json),
+        )
+
+    # manifest_hash recomputed over the rebuilt manifest.
+    if compute_manifest_hash(manifest) != exp["manifest_hash"]:
+        _fail(name, "manifest_hash", exp["manifest_hash"], compute_manifest_hash(manifest))
+
+    # The frozen canonical bytes must hash to the frozen manifest_hash.
+    if sha256_digest(exp["canonical_json"].encode("utf-8")) != exp["manifest_hash"]:
+        _fail(
+            name,
+            "canonical_json byte hash",
+            exp["manifest_hash"],
+            sha256_digest(exp["canonical_json"].encode("utf-8")),
+        )
+
+    # Stage 9: packet_hash recomputed from response.working_set bytes.
     packet_hash = sha256_digest(inp["response"]["working_set"].encode("utf-8"))
     if packet_hash != exp["packet_hash"]:
         _fail(name, "packet_hash", exp["packet_hash"], packet_hash)
 
-    # 5. request_digest recomputed.
+    # request_digest recomputed.
     if manifest.request.request_digest != exp["request_digest"]:
-        _fail(
-            name,
-            "request_digest",
-            exp["request_digest"],
-            manifest.request.request_digest,
-        )
+        _fail(name, "request_digest", exp["request_digest"], manifest.request.request_digest)
 
-    # 6. per-item served_content_hash recomputed from served content bytes.
-    if len(exp["served_content_hashes"]) != len(inp["response"]["items"]):
+    # per-item served_content_hash recomputed from served content bytes.
+    items = inp["response"]["items"]
+    if len(exp["served_content_hashes"]) != len(items):
         _fail(
             name,
             "served_content_hashes length",
             str(len(exp["served_content_hashes"])),
-            str(len(inp["response"]["items"])),
+            str(len(items)),
         )
-    for i, raw_item in enumerate(inp["response"]["items"]):
+    for i, raw_item in enumerate(items):
         content_hash = sha256_digest(raw_item["content"].encode("utf-8"))
         if content_hash != exp["served_content_hashes"][i]:
-            _fail(
-                name,
-                f"served_content_hash[{i}]",
-                exp["served_content_hashes"][i],
-                content_hash,
-            )
-
-    # 7. canonical bytes of the rebuilt manifest equal the frozen canonical.
-    rebuilt_canon = canonical_json_bytes(rebuilt).decode("utf-8")
-    if rebuilt_canon != exp["canonical_json"]:
-        _fail(name, "canonical_json bytes", exp["canonical_json"], rebuilt_canon)
+            _fail(name, f"served_content_hash[{i}]", exp["served_content_hashes"][i], content_hash)
 
     print(f"  OK  {path.name}: manifest_hash={exp['manifest_hash'][:24]}...")
-
-
-def _fail(name: str, what: str, expected: Any, got: Any) -> None:
-    print(f"FAIL {name}: {what}", file=sys.stderr)
-    print(f"  expected: {expected}", file=sys.stderr)
-    print(f"  got:      {got}", file=sys.stderr)
-    raise SystemExit(1)
 
 
 def main() -> int:
@@ -145,8 +204,9 @@ def main() -> int:
         print(f"no vectors found in {VECTORS_DIR}", file=sys.stderr)
         return 1
     print(f"Verifying {len(vectors)} context-manifest-v1 vectors (Python)...")
+    schema_validator = Draft202012Validator(normative_manifest_schema_dict())
     for path in vectors:
-        _verify_vector(path)
+        _verify_vector(path, schema_validator)
     print(f"All {len(vectors)} vectors verified.")
     return 0
 

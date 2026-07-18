@@ -2,11 +2,12 @@
   "$defs": {
     "ContextManifestEffectiveV1": {
       "additionalProperties": false,
-      "description": "What the server actually used after applying defaults and resolution.\n\n``workspace_id`` is the resolved authorized workspace reference (null when\nrecall is principal-scoped).",
+      "description": "What the server actually used after applying defaults and resolution.\n\n``workspace_id`` is the resolved authorized workspace reference (null when\nrecall is principal-scoped). Startup v1 does not enforce an item budget, so\n``item_budget`` is always null here (the builder verifies this).",
       "properties": {
         "workspace_id": {
           "anyOf": [
             {
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
               "type": "string"
             },
             {
@@ -18,6 +19,7 @@
         "byte_budget": {
           "anyOf": [
             {
+              "minimum": 0,
               "type": "integer"
             },
             {
@@ -29,6 +31,7 @@
         "token_budget": {
           "anyOf": [
             {
+              "minimum": 0,
               "type": "integer"
             },
             {
@@ -38,15 +41,8 @@
           "title": "Token Budget"
         },
         "item_budget": {
-          "anyOf": [
-            {
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Item Budget"
+          "title": "Item Budget",
+          "type": "null"
         }
       },
       "required": [
@@ -63,10 +59,12 @@
       "description": "One served item's stable ordinal and mutable decision fields.\n\nItem array order is the exact response order; ``ordinal`` must equal the\narray position. ``score`` may be null for pinned items. Reason and warning\narray order is significant (never alphabetized). Full memory content is\nabsent — only ``served_content_hash`` (exact UTF-8 SHA-256 of the served\ncontent) is stored. ``conflicts_with_item_id`` is excluded: a counterpart\nmay not be independently eligible.",
       "properties": {
         "ordinal": {
+          "minimum": 0,
           "title": "Ordinal",
           "type": "integer"
         },
         "item_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
           "title": "Item Id",
           "type": "string"
         },
@@ -75,6 +73,7 @@
           "type": "string"
         },
         "served_content_hash": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
           "title": "Served Content Hash",
           "type": "string"
         },
@@ -87,12 +86,19 @@
           "type": "integer"
         },
         "visibility": {
+          "enum": [
+            "private",
+            "workspace",
+            "tenant",
+            "public"
+          ],
           "title": "Visibility",
           "type": "string"
         },
         "workspace_id": {
           "anyOf": [
             {
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
               "type": "string"
             },
             {
@@ -197,14 +203,17 @@
       "description": "The rendered packet served to the caller (``working_set``).\n\nThe current packet is the exact ``working_set`` string:\n\n    [kind] content\n    [kind] content\n\nIts hash preserves item order, exact content, exact kind, LF separators,\nand the presence/absence of a trailing newline. It is computed over\n``response.working_set`` directly — never reconstructed from item rows.",
       "properties": {
         "media_type": {
+          "const": "text/plain; charset=utf-8",
           "title": "Media Type",
           "type": "string"
         },
         "render_version": {
+          "const": "working-set-v1",
           "title": "Render Version",
           "type": "string"
         },
         "hash": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
           "title": "Hash",
           "type": "string"
         }
@@ -230,6 +239,7 @@
         "query_digest": {
           "anyOf": [
             {
+              "pattern": "^sha256:[0-9a-f]{64}$",
               "type": "string"
             },
             {
@@ -239,6 +249,7 @@
           "title": "Query Digest"
         },
         "request_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
           "title": "Request Digest",
           "type": "string"
         }
@@ -263,6 +274,7 @@
         "byte_budget": {
           "anyOf": [
             {
+              "minimum": 0,
               "type": "integer"
             },
             {
@@ -274,6 +286,7 @@
         "token_budget": {
           "anyOf": [
             {
+              "minimum": 0,
               "type": "integer"
             },
             {
@@ -285,6 +298,7 @@
         "item_budget": {
           "anyOf": [
             {
+              "minimum": 0,
               "type": "integer"
             },
             {
@@ -308,22 +322,27 @@
       "description": "Bounded aggregate counts over the served response.\n\n``served_content_byte_count`` corresponds to the recall ``byte_count``\nsemantics (sum of served item content byte sizes). ``rendered_packet_byte_\ncount`` is the exact UTF-8 size of ``working_set``. The two are not\ninterchangeable (the packet adds ``[kind] `` prefixes and LF separators).\nOnly bounded aggregate omission counts are stored — never a list of\nrejected or unauthorized candidates.",
       "properties": {
         "item_count": {
+          "minimum": 0,
           "title": "Item Count",
           "type": "integer"
         },
         "served_content_byte_count": {
+          "minimum": 0,
           "title": "Served Content Byte Count",
           "type": "integer"
         },
         "rendered_packet_byte_count": {
+          "minimum": 0,
           "title": "Rendered Packet Byte Count",
           "type": "integer"
         },
         "pinned_omitted_count": {
+          "minimum": 0,
           "title": "Pinned Omitted Count",
           "type": "integer"
         },
         "omitted_count": {
+          "minimum": 0,
           "title": "Omitted Count",
           "type": "integer"
         },
@@ -355,16 +374,19 @@
       "description": "The resolved identity and profile that admitted the served context.\n\n``workspace_id`` is the *resolved authorized* workspace reference, not an\nunresolved caller slug. An unprofiled context uses null profile fields.\nProfile and revision identity must be coherent (see validator).",
       "properties": {
         "tenant_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
           "title": "Tenant Id",
           "type": "string"
         },
         "principal_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
           "title": "Principal Id",
           "type": "string"
         },
         "workspace_id": {
           "anyOf": [
             {
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
               "type": "string"
             },
             {
@@ -374,12 +396,14 @@
           "title": "Workspace Id"
         },
         "memory_context_version": {
+          "const": "memory-context-v2",
           "title": "Memory Context Version",
           "type": "string"
         },
         "memory_profile_id": {
           "anyOf": [
             {
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
               "type": "string"
             },
             {
@@ -391,6 +415,7 @@
         "memory_profile_revision_id": {
           "anyOf": [
             {
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
               "type": "string"
             },
             {
@@ -402,6 +427,7 @@
         "memory_profile_version": {
           "anyOf": [
             {
+              "minimum": 0,
               "type": "integer"
             },
             {
@@ -440,10 +466,12 @@
           "type": "string"
         },
         "manifest_contract_version": {
+          "const": "context-manifest-v1",
           "title": "Manifest Contract Version",
           "type": "string"
         },
         "packet_render_version": {
+          "const": "working-set-v1",
           "title": "Packet Render Version",
           "type": "string"
         }
@@ -460,20 +488,25 @@
     }
   },
   "additionalProperties": false,
-  "description": "Canonical, deterministic served-context manifest (ENG-CONTEXT-001). Canonical JSON is RFC 8785; manifest_hash is SHA-256 of the canonical bytes and is NOT a field in this object.",
+  "description": "Canonical, deterministic served-context manifest (ENG-CONTEXT-001). Canonical JSON is RFC 8785; manifest_hash is SHA-256 of the canonical bytes and is NOT a field in this object. The normative wire parser requires canonical UUID/hash representations.",
   "properties": {
+    "schema": {
+      "const": "engram.context-manifest",
+      "title": "Schema",
+      "type": "string"
+    },
     "schema_version": {
-      "default": "1.0",
+      "const": "1.0",
       "title": "Schema Version",
       "type": "string"
     },
     "canonicalization": {
-      "default": "rfc8785",
+      "const": "rfc8785",
       "title": "Canonicalization",
       "type": "string"
     },
     "mode": {
-      "default": "startup",
+      "const": "startup",
       "title": "Mode",
       "type": "string"
     },
@@ -498,14 +531,13 @@
       },
       "title": "Items",
       "type": "array"
-    },
-    "schema": {
-      "default": "engram.context-manifest",
-      "title": "Schema Name",
-      "type": "string"
     }
   },
   "required": [
+    "schema",
+    "schema_version",
+    "canonicalization",
+    "mode",
     "subject",
     "request",
     "versions",

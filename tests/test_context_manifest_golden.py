@@ -47,6 +47,10 @@ class _Response:
         self.pinned_omitted_count = kwargs.get("pinned_omitted_count", 0)
         self.omitted_count = kwargs.get("omitted_count", 0)
         self.message = kwargs.get("message")
+        # Declared counts from the vector input (the builder verifies them
+        # against len(items)/sum(content bytes)).
+        self.item_count = kwargs["item_count"]
+        self.byte_count = kwargs["byte_count"]
 
 
 def _load_vectors() -> list[tuple[str, dict[str, Any]]]:
