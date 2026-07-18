@@ -172,6 +172,20 @@ CONTEXT_MANIFEST_PROOFS = (
     "tests/test_context_manifest_schema.py",
 )
 
+# ── Context receipt storage substrate (ENG-CONTEXT-002A) ─────────────
+# Real-PostgreSQL migration/RLS/privilege/relational proof, the repository
+# store/concurrency/transaction-ownership proof, the static migration
+# contract proof, and the pure-Python stored-manifest integrity proof.
+# Together they prove migration application, RLS ownership isolation,
+# app-role immutability, relational tenant/principal safety, idempotent
+# storage, concurrent insertion, and stored-manifest integrity verification.
+CONTEXT_RECEIPT_PROOFS = (
+    "tests/test_context_receipts_migration.py",
+    "tests/test_context_receipts_postgres.py",
+    "tests/test_context_receipt_store_postgres.py",
+    "tests/test_context_receipt_integrity.py",
+)
+
 # ── Canonical aggregate ─────────────────────────────────────────────
 TRUST_PROOF_FILES: tuple[str, ...] = (
     SCOPE_PROOFS
@@ -190,6 +204,7 @@ TRUST_PROOF_FILES: tuple[str, ...] = (
     + SESSION_END_PROOFS
     + PROFILE_EXECUTION_PROOFS
     + CONTEXT_MANIFEST_PROOFS
+    + CONTEXT_RECEIPT_PROOFS
 )
 
 

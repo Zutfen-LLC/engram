@@ -1606,13 +1606,19 @@ Auditability is part of the trust model, not a compliance afterthought.
 
 ### Context manifest contract
 
-> **Implementation status (ENG-CONTEXT-001):** The canonical, versioned
-> `ContextManifestV1` and its deterministic hash contract are **defined and
-> proven** (`engram/context_manifest.py`). Cross-language golden vectors and
-> independent Python + JavaScript verifiers are checked in. **Durable receipt
-> persistence** (`context_receipts` table, migration, RLS, retention) is
-> **designed but deferred** to ENG-CONTEXT-002; an **inspect/verify API** is
-> deferred to ENG-CONTEXT-003. Only `mode="startup"` is supported.
+> **Implementation status (ENG-CONTEXT-001 / ENG-CONTEXT-002A):** The
+> canonical, versioned `ContextManifestV1` and its deterministic hash contract
+> are **defined and proven** (`engram/context_manifest.py`). Cross-language
+> golden vectors and independent Python + JavaScript verifiers are checked in.
+> The **durable receipt storage substrate** (`context_receipts` table,
+> migration 026, ORM model, repository, RLS, retention metadata) is
+> **implemented as a storage-only foundation** (`engram/context_receipts.py`,
+> `engram.models.ContextReceipt`) — one-to-one with `recall_logs`, FORCE RLS
+> requiring both tenant and principal, app-role SELECT/INSERT only, immutable
+> rows, idempotent insertion, stored-manifest integrity verification. **No
+> production recall path writes receipts yet** (dark writes land in
+> ENG-CONTEXT-002B); an **inspect/verify API** is deferred to ENG-CONTEXT-003.
+> Only `mode="startup"` is supported.
 
 The context manifest is the deterministic, content-addressed artifact that
 lets Engram prove **what context it served and which policy/version admitted
@@ -1647,6 +1653,20 @@ The manifest proves what was served and which policy admitted it. It does
 **not** prove that a memory was factually true or that an agent relied on it.
 Full normative detail, the deterministic/volatile boundary, and the hash
 preimages are in [`docs/context-manifest-v1.md`](context-manifest-v1.md).
+
+The durable receipt envelope (`context_receipts`, ENG-CONTEXT-002A) wraps the
+manifest in an immutable, tenant/principal-isolated database row: receipt ID,
+recall-log identity, creation time, retention metadata, the stored JSONB
+manifest, `manifest_hash`, and `packet_hash`. It is one-to-one with
+`recall_logs` (composite foreign key, `ON DELETE RESTRICT`), FORCE RLS-protected
+(both tenant and principal required), and append-only from the application
+(app role SELECT/INSERT only). Receipt ID, creation time, recall-log ID, and
+retention metadata are outside the manifest hash; no raw memory content or
+`working_set` is duplicated. Verification recanonicalizes the stored JSONB
+through `ContextManifestV1` and compares the recomputed hash to the stored
+`manifest_hash`. ENG-CONTEXT-002A is storage-only — no production recall path
+writes receipts yet (dark writes land in ENG-CONTEXT-002B; retrieval and
+authorized rehydration land in ENG-CONTEXT-003).
 
 ---
 

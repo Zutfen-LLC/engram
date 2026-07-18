@@ -1,7 +1,11 @@
 # Context Manifest v1 — Canonical Served-Context Contract
 
 > **Status (ENG-CONTEXT-001):** This slice *defines and proves* the contract.
-> Durable persistence lands in ENG-CONTEXT-002; an inspect/verify API lands in
+> **Status (ENG-CONTEXT-002A):** The durable receipt *storage substrate*
+> (`context_receipts` table, migration 026, ORM model, repository, RLS,
+> retention metadata, real-PostgreSQL proofs) is implemented as a
+> storage-only foundation. **No production recall path writes receipts yet**
+> (dark writes land in ENG-CONTEXT-002B); an inspect/verify API lands in
 > ENG-CONTEXT-003. Only `mode="startup"` is supported here.
 
 The Context Manifest is the deterministic, versioned artifact beneath the
@@ -324,19 +328,58 @@ without discarding this contract. Semantic recall item dictionaries are kept
 field-aligned with startup so the future semantic manifest can reuse the same
 field vocabulary.
 
-## 14. Planned persistence in ENG-CONTEXT-002
+## 14. Durable receipt storage (ENG-CONTEXT-002A)
 
-ENG-CONTEXT-002 will introduce durable **receipts**: a `context_receipts`
-table (and migration) storing the manifest, `manifest_hash`, `packet_hash`,
-receipt ID, timestamps, and recall-log reference, with RLS and retention. The
-deterministic manifest defined here is the foundation — ENG-CONTEXT-002 wraps
-it in a volatile envelope without redesigning the hash contract.
+ENG-CONTEXT-002A introduces the durable **receipt storage substrate**. The
+deterministic manifest defined here is the hashed artifact; the receipt is its
+volatile persistence envelope:
+
+```
+ContextManifestV1        ← deterministic, RFC 8785-canonicalized,
+                           content-addressed by manifest_hash
+ContextReceipt           ← receipt_id, recall_log identity, tenant/principal
+                           ownership, created_at, retention_expires_at,
+                           manifest (JSONB), manifest_hash, packet_hash
+```
+
+The receipt row lives in the `context_receipts` table (migration 026), is
+one-to-one with `recall_logs` via a composite foreign key
+`(tenant_id, principal_id, recall_log_id) → recall_logs(tenant_id,
+principal_id, id)` with `ON DELETE RESTRICT`, is FORCE RLS-protected (both
+tenant and principal required), and is append-only from the application's
+perspective (app role SELECT/INSERT only; UPDATE/DELETE revoked). Receipt ID,
+creation time, recall-log ID, and retention metadata are deliberately **outside**
+the manifest hash. No raw memory content, raw `working_set`, or raw query text
+is stored — only the manifest JSONB. Verification parses the stored JSONB back
+through `ContextManifestV1`, recanonicalizes under RFC 8785, and compares the
+recomputed hash to `receipt.manifest_hash` (see
+`engram.context_receipts.verify_context_receipt_record`).
+
+**ENG-CONTEXT-002A is storage-only.** It does not create receipts during a
+production recall; receipt creation (dark writes) begins in ENG-CONTEXT-002B,
+and retrieval / authorized rehydration begins in ENG-CONTEXT-003.
+
+### Retention metadata (002A)
+
+`retention_expires_at` is metadata only in this slice: `NULL` means no expiry
+has been assigned; a non-NULL value is the earliest time at which a *future*
+retention process MAY evaluate the receipt for deletion. This slice does not
+delete expired rows and does not change retention after insert. No tenant
+retention configuration is introduced here.
+
+### Migration safety
+
+Migration 026 is additive and safe to re-apply (`CREATE TABLE IF NOT EXISTS`,
+guarded constraints, guarded policy recreation). Rolling application code back
+leaves an unused additive table; do not drop the table if receipts have been
+inserted. This slice itself creates no production receipts.
 
 ## 15. Planned inspect/verify API in ENG-CONTEXT-003
 
 ENG-CONTEXT-003 will add receipt inspect, verify, diff, and drift endpoints
 plus SDK/MCP surfaces. The manifest contract defined here is what those
-endpoints will return and verify against.
+endpoints will return and verify against. Retrieval and authorized rehydration
+begin only in ENG-CONTEXT-003.
 
 ## 16. Contract integrity (ENG-CONTEXT-001 correction)
 
