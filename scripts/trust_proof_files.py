@@ -186,6 +186,18 @@ CONTEXT_RECEIPT_PROOFS = (
     "tests/test_context_receipt_integrity.py",
 )
 
+# ── Context receipt startup dark writes (ENG-CONTEXT-002B) ───────────
+# Real-PostgreSQL dark-write proof: default-off, enabled startup
+# persistence, empty startup persistence, semantic exclusion, the
+# finalized-response snapshot boundary (later memory mutations cannot
+# alter the stored served snapshot), dedicated-session isolation,
+# verification-before-commit, fail-open insertion/verification/timeout,
+# recall-log survival, no response-shape change, no raw content/query
+# leakage, and idempotent retry.
+CONTEXT_RECEIPT_DARK_WRITE_PROOFS = (
+    "tests/test_context_receipt_dark_write_postgres.py",
+)
+
 # ── Canonical aggregate ─────────────────────────────────────────────
 TRUST_PROOF_FILES: tuple[str, ...] = (
     SCOPE_PROOFS
@@ -205,6 +217,7 @@ TRUST_PROOF_FILES: tuple[str, ...] = (
     + PROFILE_EXECUTION_PROOFS
     + CONTEXT_MANIFEST_PROOFS
     + CONTEXT_RECEIPT_PROOFS
+    + CONTEXT_RECEIPT_DARK_WRITE_PROOFS
 )
 
 

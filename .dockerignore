@@ -8,3 +8,7 @@ __pycache__
 .codex
 .env
 .env.*
+# .env.example is a committed template (no real secrets — only commented-out
+# defaults) and MUST ship in the CI image so the ci-contract test that asserts
+# the dark-write settings are documented can read it.
+!.env.example

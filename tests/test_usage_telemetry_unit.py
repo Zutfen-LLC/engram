@@ -21,6 +21,7 @@ from engram.usage import (
     extract_openai_compatible_usage,
     record_candidate_once,
     record_candidate_outcome,
+    record_context_receipt_dark_write,
     record_provider_call,
     record_retrieval_request,
     record_usage_event_best_effort,
@@ -115,6 +116,76 @@ async def test_retrieval_metadata_carries_only_bounded_memory_context_provenance
     assert "query" not in str(metadata).lower()
     assert "content" not in str(metadata).lower()
     assert "workspace_ids" not in str(metadata).lower()
+
+
+async def test_context_receipt_dark_write_records_bounded_aggregate_metadata(monkeypatch):
+    """The context_receipt.dark_write usage event carries only bounded
+    aggregate metadata: mode, status, item/byte counts from the finalized
+    response, latency, and bounded failure diagnostics (failure stage +
+    exception type, never raw content/working_set/manifest JSON/query text).
+    """
+    captured: dict[str, object] = {}
+
+    async def capture(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("engram.usage.record_usage_event_best_effort", capture)
+    tenant_id = uuid4()
+    principal_id = uuid4()
+    await record_context_receipt_dark_write(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        status="created",
+        item_count=3,
+        byte_count=128,
+        latency_ms=42,
+        verification_status="passed",
+    )
+    assert captured["event_type"] == "context_receipt.dark_write"
+    assert captured["operation"] == "startup_context_receipt"
+    assert captured["status"] == "created"
+    assert captured["usage_class"] == "request"
+    assert captured["input_count"] == 3
+    assert captured["input_bytes"] == 128
+    assert captured["latency_ms"] == 42
+    metadata = captured["metadata"]
+    assert metadata == {"mode": "startup", "verification_status": "passed"}
+    rendered = str(metadata)
+    assert "content" not in rendered.lower()
+    assert "working_set" not in rendered.lower()
+    assert "manifest" not in rendered.lower()
+    assert "query" not in rendered.lower()
+
+
+async def test_context_receipt_dark_write_failure_metadata_is_bounded(monkeypatch):
+    captured: dict[str, object] = {}
+
+    async def capture(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("engram.usage.record_usage_event_best_effort", capture)
+    await record_context_receipt_dark_write(
+        tenant_id=uuid4(),
+        principal_id=None,
+        status="failed",
+        item_count=0,
+        byte_count=0,
+        latency_ms=5,
+        failure_stage="store",
+        exception_type="IntegrityError",
+        verification_status="failed",
+    )
+    metadata = captured["metadata"]
+    assert metadata == {
+        "mode": "startup",
+        "failure_stage": "store",
+        "exception_type": "IntegrityError",
+        "verification_status": "failed",
+    }
+    # An exception containing a secret sentinel must NOT place that sentinel
+    # in usage metadata — only the exception *type* is recorded.
+    assert "secret" not in str(metadata).lower()
+    assert "password" not in str(metadata).lower()
 
 
 def test_utf8_byte_len_counts_bytes_not_characters():

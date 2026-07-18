@@ -589,6 +589,56 @@ async def record_client_lifecycle_summary(
     )
 
 
+async def record_context_receipt_dark_write(
+    *,
+    tenant_id: UUID | str,
+    principal_id: UUID | str | None,
+    status: str,
+    item_count: int,
+    byte_count: int,
+    latency_ms: int,
+    mode: str = "startup",
+    failure_stage: str | None = None,
+    exception_type: str | None = None,
+    verification_status: str | None = None,
+) -> UUID | None:
+    """Record one ``context_receipt.dark_write`` event (ENG-CONTEXT-002B).
+
+    Narrow, privacy-preserving observability for the startup receipt dark
+    write. Stores only bounded aggregate metadata: mode, status, item/byte
+    counts from the finalized response, latency, and bounded failure
+    diagnostics (failure stage + exception *type*, never exception messages,
+    raw content, working_set, manifest JSON, or query text).
+
+    Respects the global ``usage_telemetry_enabled`` flag (no-op when off).
+    A telemetry failure must never alter the dark-write result or the recall
+    response — this helper swallows its own failures and returns ``None``.
+    """
+    meta: dict[str, Any] = {
+        k: v
+        for k, v in {
+            "mode": mode,
+            "failure_stage": failure_stage,
+            "exception_type": exception_type,
+            "verification_status": verification_status,
+        }.items()
+        if v is not None
+    }
+    return await record_usage_event_best_effort(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        workspace_id=None,
+        event_type="context_receipt.dark_write",
+        operation="startup_context_receipt",
+        status=status,
+        usage_class="request",
+        input_count=max(0, item_count),
+        input_bytes=max(0, byte_count),
+        latency_ms=latency_ms,
+        metadata=meta,
+    )
+
+
 @dataclass(frozen=True)
 class ProviderUsage:
     """Defensively-parsed provider usage/cost, all fields nullable.
@@ -705,6 +755,7 @@ __all__ = [
     "record_candidate_once",
     "record_candidate_outcome",
     "record_client_lifecycle_summary",
+    "record_context_receipt_dark_write",
     "record_provider_call",
     "record_retrieval_request",
     "record_usage_event_best_effort",

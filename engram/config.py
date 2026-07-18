@@ -115,6 +115,22 @@ class Settings(BaseSettings):
     # open a database session.
     usage_telemetry_enabled: bool = False
 
+    # Context-receipt startup dark writes (ENG-CONTEXT-002B). API-only,
+    # default-off, fail-open. When disabled, the recall route performs no
+    # receipt work at all (no manifest, no receipt DB session, no telemetry).
+    # When enabled, a successful startup recall additionally builds a
+    # ContextManifestV1 from the finalized RecallResponse, persists one
+    # immutable context_receipts row on a dedicated app-role session, reloads
+    # and verifies the stored JSONB, and commits only after verification
+    # succeeds. Any receipt failure is swallowed and the recall response is
+    # returned unchanged. The timeout bounds the whole enabled attempt. Not
+    # propagated to the worker (API-only).
+    context_receipt_dark_write_enabled: bool = False
+    # Strictly positive; invalid (<=0) configuration fails settings
+    # validation with no silent negative-to-positive coercion. Covers manifest
+    # construction, persistence, reload, verification, and commit.
+    context_receipt_dark_write_timeout_seconds: float = 1.0
+
     # Background worker / job queue (ENG-AUD-008). The service still works
     # without a worker running; pending jobs simply queue and semantic recall /
     # LLM refinement lag until processed.
@@ -194,6 +210,32 @@ class Settings(BaseSettings):
         limit = min(limit, self.startup_recall_candidate_limit_max)
         limit = max(limit, self.recall_item_budget)
         self.startup_recall_candidate_limit = limit
+        return self
+
+    @model_validator(mode="after")
+    def _validate_context_receipt_dark_write_timeout(self) -> Settings:
+        """Require a finite, strictly positive context-receipt dark-write timeout.
+
+        A non-positive timeout is invalid configuration, not a request to
+        disable the feature (the dedicated ``context_receipt_dark_write_
+        enabled`` flag owns that). There is no silent negative-to-positive
+        coercion: a misconfigured value surfaces at settings load rather than
+        silently bounding every enabled attempt to zero.
+
+        NaN and ±Infinity are also rejected: NaN compares unequal to every
+        value (so ``NaN <= 0`` is ``False`` and would slip through a naive
+        ``<= 0`` check), and an unbounded timeout defeats the fail-open
+        guarantee. ``math.isfinite`` rejects both in one check.
+        """
+        import math
+
+        timeout = self.context_receipt_dark_write_timeout_seconds
+        if not math.isfinite(timeout) or timeout <= 0.0:
+            raise ValueError(
+                "context_receipt_dark_write_timeout_seconds must be a finite, "
+                "strictly positive number (got "
+                f"{timeout!r})"
+            )
         return self
 
 

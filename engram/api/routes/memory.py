@@ -5,8 +5,10 @@ This is a skeleton — implementation in Phase 1 PR 4-5.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import logging
 import uuid
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -36,6 +38,9 @@ from engram.classification import ClassificationResult, classify_rules_only
 from engram.classification_evidence import bind_run, lock_run
 from engram.classification_trust import narrow_visibility
 from engram.config import settings
+from engram.context_receipt_dark_write import (
+    write_startup_context_receipt_best_effort,
+)
 from engram.db import get_session
 from engram.embeddings import create_embedding_placeholder, generate_embedding
 from engram.feedback import (
@@ -85,6 +90,8 @@ _SOURCE_TRUST_KEYS = trust_policy._SOURCE_TRUST_KEYS
 _TRUST_FALLBACKS = trust_policy._TRUST_FALLBACKS
 
 router = APIRouter()
+
+logger = logging.getLogger("engram.api.routes.memory")
 
 # source_type values that default to review_status='active'.
 _ACTIVE_SOURCES = {"manual", "import", "migration"}
@@ -1290,6 +1297,66 @@ async def recall(
     resolved_embedding_outcome: EmbeddingOutcome = result.get(
         "embedding_outcome", "not_required" if mode != "semantic" else "unknown"
     )
+
+    # Finalize ONE RecallResponse object before any dark-write work. The same
+    # object is passed to the Context Manifest builder (when enabled) and
+    # returned by the route. No database mutation after this point may affect
+    # the manifest — this is the served snapshot boundary (ENG-CONTEXT-002B).
+    response = RecallResponse(
+        working_set=result["working_set"],
+        item_count=result["item_count"],
+        byte_count=result["byte_count"],
+        pinned_omitted_count=result["pinned_omitted_count"],
+        omitted_count=result["omitted_count"],
+        items=result["items"],
+        scoring_version=result.get("scoring_version", "v1"),
+        config_version=result.get("config_version", "v1"),
+        recall_log_id=result.get("recall_log_id"),
+        message=result.get("message"),
+    )
+
+    # Startup-only dark write (ENG-CONTEXT-002B). Runs BEFORE the retrieval
+    # telemetry record so the retrieval latency metric includes the enabled
+    # dark-write time (the client waits for the attempt before receiving the
+    # response). The dedicated receipt event records the dark-write latency
+    # separately. Semantic recall never invokes the dark write. A receipt
+    # failure must never fail recall or modify the response.
+    #
+    # The OUTER guard checks the feature flag before ANY receipt-specific
+    # work: no manifest work, no decision-context parsing, no receipt DB
+    # session, no receipt telemetry, no receipt-related warning logs run
+    # while the feature is disabled. The helper's own disabled check is
+    # retained as defense in depth. The route supplies the finalized
+    # RecallResponse, the raw executed engine result, and the caller's
+    # original request values; the helper owns executed-result validation,
+    # manifest construction, persistence, reload, verification, commit,
+    # bounded telemetry, and the standardized structured log. The route does
+    # NOT duplicate evidence parsing — public RecallResponse defaults must
+    # never feed the receipt manifest.
+    if settings.context_receipt_dark_write_enabled and mode == "startup":
+        try:
+            await write_startup_context_receipt_best_effort(
+                response=response,
+                raw_result=result,
+                memory_context=memory_context,
+                requested_workspace_supplied=req.workspace is not None,
+                requested_byte_budget=req.byte_budget,
+                requested_token_budget=req.token_budget,
+                requested_item_budget=req.item_budget,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — defense-in-depth no-raise guard
+            # The helper is contracted to never raise an ordinary dark-write
+            # failure. If it ever does, the route still returns the
+            # successful recall response and logs only the exception type
+            # (never the message — it may include bound values).
+            logger.warning(
+                "context_receipt_dark_write helper raised unexpectedly "
+                "mode=startup exc_type=%s",
+                type(exc).__name__,
+            )
+
     await record_retrieval_request(
         tenant_id=tenant_id,
         principal_id=principal_id,
@@ -1310,18 +1377,7 @@ async def recall(
         memory_profile_version=memory_context.memory_profile_version,
     )
 
-    return RecallResponse(
-        working_set=result["working_set"],
-        item_count=result["item_count"],
-        byte_count=result["byte_count"],
-        pinned_omitted_count=result["pinned_omitted_count"],
-        omitted_count=result["omitted_count"],
-        items=result["items"],
-        scoring_version=result.get("scoring_version", "v1"),
-        config_version=result.get("config_version", "v1"),
-        recall_log_id=result.get("recall_log_id"),
-        message=result.get("message"),
-    )
+    return response
 
 
 @router.post("/search", response_model=SearchResponse, dependencies=[Depends(READ_SCOPE)])
