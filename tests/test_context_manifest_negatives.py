@@ -289,3 +289,228 @@ def test_javascript_verifier_validates_expected_manifest(tmp_path: Path) -> None
             f"{result.stderr}"
         )
         assert "OK" in result.stdout
+
+
+# ─── authority is a signed, unconstrained integer (cross-language contract) ─
+#
+# `authority` mirrors the storage column `authority` (a SmallInteger with NO
+# CHECK range) and the Python contract field `authority: int`. The normative
+# JSON Schema types it `{"type": "integer"}` with NO minimum. So a manifest
+# with `"authority": -1` is valid according to Python, the schema, and the
+# documentation. The JavaScript verifier MUST agree — it must use a signed
+# integer validator for authority, not a nonnegative one (which would make a
+# negative authority valid in one language and invalid in another).
+#
+# Counts, budgets, ordinals, and the profile version stay nonnegative; only
+# authority is signed.
+
+_AUTHORITY_DRIVER_TEMPLATE = """
+import {{ buildManifestFromInput, validateExpectedManifest }} from {libPathModule};
+import {{ readFile, writeFile }} from 'node:fs/promises';
+const [inPath, outPath, authorityLiteral] = process.argv.slice(2);
+const vector = JSON.parse(await readFile(inPath, 'utf8'));
+// Mutate authority on item 0 of the input, then reconstruct + validate the
+// resulting expected manifest. Both must succeed for a signed integer.
+vector.input.response.items[0].authority = JSON.parse(authorityLiteral);
+let manifest;
+try {{
+  manifest = buildManifestFromInput(vector.name, vector.input);
+  validateExpectedManifest(vector.name, manifest);
+}} catch (e) {{
+  console.error('REJECT ' + e.message);
+  process.exit(1);
+}}
+await writeFile(outPath, JSON.stringify(manifest.items[0].authority));
+console.log('ACCEPT');
+"""
+
+
+def _golden_vector_input() -> dict[str, Any]:
+    """A coherent base input (vector 002) for authority mutation tests."""
+    vector_path = (
+        REPOSITORY_ROOT
+        / "conformance"
+        / "context-manifest-v1"
+        / "vectors"
+        / "002-mixed-pinned-scored.json"
+    )
+    return json.loads(vector_path.read_text())
+
+
+def _run_authority_driver(authority_json: str, tmp_path: Path) -> subprocess.CompletedProcess:
+    """Run the JS authority driver; authority is passed as a JSON literal arg."""
+    vector_path = (
+        REPOSITORY_ROOT
+        / "conformance"
+        / "context-manifest-v1"
+        / "vectors"
+        / "002-mixed-pinned-scored.json"
+    )
+    driver = _js_driver(tmp_path, body=_AUTHORITY_DRIVER_TEMPLATE)
+    out_path = tmp_path / "authority.json"
+    return subprocess.run(
+        ["node", str(driver), str(vector_path), str(out_path), authority_json],
+        capture_output=True,
+        text=True,
+        cwd=REPOSITORY_ROOT,
+    )
+
+
+@pytest.mark.parametrize("authority", [-1, -2147483648, 0, 1, 999999])
+def test_authority_signed_integer_accepted_by_python_model(authority: int) -> None:
+    """The Pydantic contract field accepts any signed integer for authority."""
+    from engram.context_manifest import ContextManifestItemV1
+
+    item = ContextManifestItemV1(
+        ordinal=0,
+        item_id="00000000-0000-0000-0000-0000000000a1",
+        kind="fact",
+        served_content_hash="sha256:" + "a" * 64,
+        review_status="active",
+        authority=authority,
+        visibility="private",
+        workspace_id=None,
+        score=0.5,
+        importance=0.5,
+        source_trust=0.5,
+        memory_confidence=0.5,
+        reasons=[],
+        warnings=[],
+        pinned=False,
+        human_verified=True,
+        conflict_type=None,
+        conflict_resolution_status=None,
+    )
+    assert item.authority == authority
+
+
+@pytest.mark.parametrize("authority", [-1, -2147483648, 0, 1, 999999])
+def test_authority_signed_integer_accepted_by_normative_schema(authority: int) -> None:
+    """The checked-in normative JSON Schema has no minimum on authority."""
+    import copy
+
+    from jsonschema import Draft202012Validator
+
+    from engram.context_manifest import normative_manifest_schema_dict
+
+    vector = _golden_vector_input()
+    manifest = copy.deepcopy(vector["expected"]["manifest"])
+    manifest["items"][0]["authority"] = authority
+    validator = Draft202012Validator(normative_manifest_schema_dict())
+    assert not list(validator.iter_errors(manifest)), (
+        f"authority={authority} should be schema-valid"
+    )
+
+
+@pytest.mark.parametrize("authority", [-1, -2147483648, 0, 1, 999999])
+def test_authority_signed_integer_accepted_by_python_builder(authority: int) -> None:
+    """The Python manifest builder accepts a negative authority without coercion."""
+    import copy
+
+    from engram.context_manifest import (
+        ContextManifestEffectiveV1,
+        ContextManifestRequestedV1,
+        ContextManifestRequestInputV1,
+        ContextManifestSubjectV1,
+        ContextManifestVersionsV1,
+        build_startup_context_manifest_v1,
+    )
+
+    vector = _golden_vector_input()
+    inp = copy.deepcopy(vector["input"])
+    inp["response"]["items"][0]["authority"] = authority
+
+    class _Response:
+        def __init__(self, **kwargs: Any) -> None:
+            self.working_set = kwargs["working_set"]
+            self.items = kwargs["items"]
+            self.pinned_omitted_count = kwargs.get("pinned_omitted_count", 0)
+            self.omitted_count = kwargs.get("omitted_count", 0)
+            self.message = kwargs.get("message")
+            self.item_count = kwargs["item_count"]
+            self.byte_count = kwargs["byte_count"]
+
+    manifest = build_startup_context_manifest_v1(
+        response=_Response(**inp["response"]),
+        subject_context=ContextManifestSubjectV1(**inp["subject_context"]),
+        request_context=ContextManifestRequestInputV1(
+            requested=ContextManifestRequestedV1(**inp["request_context"]["requested"]),
+            effective=ContextManifestEffectiveV1(**inp["request_context"]["effective"]),
+            query_digest=inp["request_context"]["query_digest"],
+        ),
+        decision_versions=ContextManifestVersionsV1(**inp["decision_versions"]),
+    )
+    # The authority is preserved verbatim, not clamped or rejected.
+    assert manifest.items[0].authority == authority
+
+
+@pytest.mark.skipif(not _HAS_NODE, reason="node not installed")
+@pytest.mark.parametrize("authority", [-1, -2147483648, 0, 1, 999999])
+def test_authority_signed_integer_accepted_by_javascript(
+    authority: int, tmp_path: Path
+) -> None:
+    """The JavaScript verifier accepts any signed integer for authority.
+
+    This is the cross-language half: a negative authority must be valid in JS
+    exactly as it is in Python and the schema. The driver reconstructs the
+    manifest from the mutated input AND runs the independent expected-manifest
+    validation on the result, then reports the reconstructed authority.
+    """
+    out_path = tmp_path / "authority.json"
+    result = _run_authority_driver(json.dumps(authority), tmp_path)
+    assert result.returncode == 0, (
+        f"authority={authority}: JavaScript rejected a valid signed integer. "
+        f"stderr: {result.stderr.strip()}"
+    )
+    assert "ACCEPT" in result.stdout
+    # The reconstructed authority is preserved verbatim.
+    assert json.loads(out_path.read_text()) == authority
+
+
+@pytest.mark.parametrize(
+    "bad_authority", [1.5, True, "10", None]
+)
+def test_authority_non_integer_rejected_by_python_model(bad_authority: Any) -> None:
+    """A non-integer authority is rejected by the Pydantic contract."""
+    from engram.context_manifest import ContextManifestItemV1
+
+    with pytest.raises(Exception):  # noqa: B017
+        ContextManifestItemV1(
+            ordinal=0,
+            item_id="00000000-0000-0000-0000-0000000000a1",
+            kind="fact",
+            served_content_hash="sha256:" + "a" * 64,
+            review_status="active",
+            authority=bad_authority,  # type: ignore[arg-type]
+            visibility="private",
+            workspace_id=None,
+            score=0.5,
+            importance=0.5,
+            source_trust=0.5,
+            memory_confidence=0.5,
+            reasons=[],
+            warnings=[],
+            pinned=False,
+            human_verified=True,
+            conflict_type=None,
+            conflict_resolution_status=None,
+        )
+
+
+@pytest.mark.skipif(not _HAS_NODE, reason="node not installed")
+@pytest.mark.parametrize("bad_authority", ["1.5", "true", '"10"', "null"])
+def test_authority_non_integer_rejected_by_javascript(
+    bad_authority: str, tmp_path: Path
+) -> None:
+    """A non-integer authority is rejected by the JavaScript verifier.
+
+    The JS signed-integer validator still rejects floats, booleans, strings,
+    and null — only the range was relaxed, not the type. `bad_authority` is a
+    JSON literal the driver parses before validation.
+    """
+    result = _run_authority_driver(bad_authority, tmp_path)
+    assert result.returncode != 0, (
+        f"bad_authority={bad_authority}: JavaScript accepted a non-integer authority"
+    )
+    assert "REJECT" in result.stderr
+    assert "authority" in result.stderr

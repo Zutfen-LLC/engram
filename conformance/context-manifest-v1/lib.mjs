@@ -189,6 +189,26 @@ export function requireNonNegativeInt(value, where) {
   return value;
 }
 
+export function requireInt(value, where) {
+  // Signed integer validator. Mirrors the Python contract field `authority: int`,
+  // which is INTENTIONALLY NOT range-constrained (the storage column has no
+  // CHECK range on it — see engram/context_manifest.py and docs/context-manifest-v1.md).
+  // Only authority uses this: counts, budgets, ordinals, and the profile version
+  // remain nonnegative. Rejects Boolean and non-integer numbers; accepts any
+  // finite integer sign/magnitude so Python, the normative JSON Schema, and the
+  // JS verifier agree on a negative authority value.
+  if (isStrictBool(value)) {
+    throw new Error(`${where} must be an integer (not bool), got boolean`);
+  }
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    throw new Error(`${where} must be an integer, got ${typeof value}`);
+  }
+  if (!Number.isFinite(value)) {
+    throw new Error(`${where} must be an integer (not NaN/Infinity)`);
+  }
+  return value;
+}
+
 export function requireOptionalNonNegativeInt(value, where) {
   if (value === null) return null;
   if (value === undefined) {
@@ -458,7 +478,7 @@ export function buildManifestFromInput(name, inp) {
       kind: requireStr(raw.kind, `${name}: item kind`),
       served_content_hash: sha256Hex(content),
       review_status: requireStr(raw.review_status, `${name}: item review_status`),
-      authority: requireNonNegativeInt(raw.authority, `${name}: item authority`),
+      authority: requireInt(raw.authority, `${name}: item authority`),
       visibility: requireVisibility(raw.visibility, `${name}: item visibility`),
       workspace_id:
         raw.workspace_id === null
@@ -669,7 +689,7 @@ export function validateExpectedManifest(name, manifest) {
       `${name}: manifest.items[${i}].served_content_hash`
     );
     requireStr(it.review_status, `${name}: manifest.items[${i}].review_status`);
-    requireNonNegativeInt(it.authority, `${name}: manifest.items[${i}].authority`);
+    requireInt(it.authority, `${name}: manifest.items[${i}].authority`);
     requireVisibility(it.visibility, `${name}: manifest.items[${i}].visibility`);
     requireOptionalCanonicalUuid(
       it.workspace_id,
