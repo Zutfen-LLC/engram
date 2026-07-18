@@ -10,10 +10,12 @@ from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
     ForeignKeyConstraint,
+    Index,
     Integer,
     Numeric,
     SmallInteger,
@@ -746,6 +748,16 @@ class RecallLog(Base):
 
     __tablename__ = "recall_logs"
     __table_args__ = (
+        # Composite unique identity backing the context_receipts composite FK
+        # (migration 026). A receipt's (tenant_id, principal_id, recall_log_id)
+        # pins all three columns to one parent row, so the parent must expose a
+        # unique key over exactly those columns.
+        UniqueConstraint(
+            "tenant_id",
+            "principal_id",
+            "id",
+            name="uq_recall_logs_tenant_principal_id",
+        ),
         ForeignKeyConstraint(
             ["memory_profile_revision_id", "memory_profile_id", "tenant_id"],
             [
@@ -800,6 +812,14 @@ class RecallLog(Base):
     # queue redelivery) that finds it already set is a safe no-op.
     telemetry_applied_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+
+    # One-to-one with context_receipts (ENG-CONTEXT-002A). The receipt is the
+    # immutable persistence envelope for a ContextManifestV1. uselist=False makes
+    # this a scalar; no cascade-delete — the database's ON DELETE RESTRICT is
+    # authoritative, so a recall log cannot be erased while its receipt remains.
+    context_receipt: Mapped[ContextReceipt | None] = relationship(
+        back_populates="recall_log", uselist=False
     )
 
 
@@ -1123,4 +1143,168 @@ class UsageEvent(Base):
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class ContextReceipt(Base):
+    """Immutable persistence envelope for a ``ContextManifestV1`` (ENG-CONTEXT-002A).
+
+    The manifest (``ContextManifestV1`` from :mod:`engram.context_manifest`) is
+    the deterministic, RFC 8785-canonicalized, content-addressed artifact; this
+    row is its volatile database envelope — receipt ID, recall-log identity,
+    tenant/principal ownership, creation time, retention metadata, the stored
+    JSONB manifest, ``manifest_hash`` (SHA-256 of the canonical manifest bytes),
+    and ``packet_hash`` (from ``manifest.packet.hash``).
+
+    Receipt ID, creation time, recall-log ID, and retention metadata are
+    deliberately OUTSIDE the manifest hash. No raw memory content, raw
+    ``working_set``, or raw query text is stored — only the manifest JSONB.
+
+    One-to-one with ``recall_logs`` via a composite foreign key
+    ``(tenant_id, principal_id, recall_log_id) -> recall_logs(tenant_id,
+    principal_id, id)`` with ``ON DELETE RESTRICT`` so a recall log cannot be
+    erased while its receipt remains. App-role rows are SELECT/INSERT only
+    (UPDATE/DELETE revoked); the receipt is immutable from the application's
+    perspective. FORCE RLS requires both tenant and principal.
+    """
+
+    __tablename__ = "context_receipts"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "principal_id", "recall_log_id"],
+            ["recall_logs.tenant_id", "recall_logs.principal_id", "recall_logs.id"],
+            name="fk_context_receipts_recall_log",
+            ondelete="RESTRICT",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id"],
+            ["tenants.id"],
+            name="fk_context_receipts_tenant",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "principal_id"],
+            ["principals.tenant_id", "principals.id"],
+            name="fk_context_receipts_principal",
+            ondelete="RESTRICT",
+        ),
+        # Unique one-to-one: one receipt per recall log.
+        UniqueConstraint(
+            "recall_log_id",
+            name="idx_context_receipts_recall_log",
+        ),
+        # ── CHECK constraints mirroring migration 026 ──────────────────
+        # JSON accessors return NULL for absent keys, and a CHECK passes when
+        # its expression is TRUE OR NULL, so each nullable JSON comparison is
+        # wrapped in ``IS TRUE`` to reject an absent contract field. These
+        # keep SQLAlchemy metadata aligned with the migration schema.
+        CheckConstraint(
+            "manifest_schema = 'engram.context-manifest'",
+            name="chk_context_receipts_schema",
+        ),
+        CheckConstraint(
+            "manifest_schema_version = '1.0'",
+            name="chk_context_receipts_schema_version",
+        ),
+        CheckConstraint(
+            "canonicalization = 'rfc8785'",
+            name="chk_context_receipts_canonicalization",
+        ),
+        CheckConstraint("mode = 'startup'", name="chk_context_receipts_mode"),
+        CheckConstraint(
+            "manifest_hash ~ '^sha256:[0-9a-f]{64}$'",
+            name="chk_context_receipts_manifest_hash",
+        ),
+        CheckConstraint(
+            "packet_hash ~ '^sha256:[0-9a-f]{64}$'",
+            name="chk_context_receipts_packet_hash",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(manifest) = 'object'",
+            name="chk_context_receipts_manifest_is_object",
+        ),
+        CheckConstraint(
+            "(jsonb_typeof(manifest -> 'subject') = 'object') IS TRUE "
+            "AND (jsonb_typeof(manifest -> 'request') = 'object') IS TRUE "
+            "AND (jsonb_typeof(manifest -> 'versions') = 'object') IS TRUE "
+            "AND (jsonb_typeof(manifest -> 'result') = 'object') IS TRUE "
+            "AND (jsonb_typeof(manifest -> 'packet') = 'object') IS TRUE "
+            "AND (jsonb_typeof(manifest -> 'items') = 'array') IS TRUE",
+            name="chk_context_receipts_manifest_sections",
+        ),
+        CheckConstraint(
+            "(manifest ->> 'schema' = manifest_schema) IS TRUE "
+            "AND (manifest ->> 'schema_version' = manifest_schema_version) IS TRUE "
+            "AND (manifest ->> 'canonicalization' = canonicalization) IS TRUE "
+            "AND (manifest ->> 'mode' = mode) IS TRUE",
+            name="chk_context_receipts_schema_agreement",
+        ),
+        CheckConstraint(
+            "(manifest -> 'subject' ->> 'tenant_id' = tenant_id::text) IS TRUE",
+            name="chk_context_receipts_subject_tenant",
+        ),
+        CheckConstraint(
+            "(manifest -> 'subject' ->> 'principal_id' = principal_id::text) IS TRUE",
+            name="chk_context_receipts_subject_principal",
+        ),
+        CheckConstraint(
+            "(manifest -> 'packet' ->> 'hash' = packet_hash) IS TRUE",
+            name="chk_context_receipts_packet_agreement",
+        ),
+        CheckConstraint(
+            "NOT (manifest ? 'manifest_hash')",
+            name="chk_context_receipts_no_manifest_hash_field",
+        ),
+        CheckConstraint(
+            "retention_expires_at IS NULL OR retention_expires_at >= created_at",
+            name="chk_context_receipts_retention",
+        ),
+        # Principal timeline (newest first).
+        Index(
+            "idx_context_receipts_principal_timeline",
+            "tenant_id",
+            "principal_id",
+            text("created_at DESC"),
+        ),
+        # Manifest-hash lookup (tenant-scoped).
+        Index(
+            "idx_context_receipts_tenant_manifest_hash",
+            "tenant_id",
+            "manifest_hash",
+        ),
+        # Retention sweep (only rows with an assigned expiry).
+        Index(
+            "idx_context_receipts_retention_sweep",
+            "retention_expires_at",
+            postgresql_where=text("retention_expires_at IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    principal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    recall_log_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+
+    manifest_schema: Mapped[str] = mapped_column(Text, nullable=False)
+    manifest_schema_version: Mapped[str] = mapped_column(Text, nullable=False)
+    canonicalization: Mapped[str] = mapped_column(Text, nullable=False)
+    mode: Mapped[str] = mapped_column(Text, nullable=False)
+
+    manifest: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    manifest_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    packet_hash: Mapped[str] = mapped_column(Text, nullable=False)
+
+    retention_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+    recall_log: Mapped[RecallLog] = relationship(
+        back_populates="context_receipt", uselist=False
     )

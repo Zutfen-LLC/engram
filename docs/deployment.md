@@ -708,6 +708,103 @@ already-applied migrations via the `schema_migrations` table.
 
 ---
 
+## 10a. Migration 026 — durable context receipt storage substrate (ENG-CONTEXT-002A)
+
+Migration `026_context_receipts.sql` is an **additive, storage-only** slice that
+introduces the `context_receipts` table: the immutable, tenant/principal-
+isolated persistence envelope for the deterministic `ContextManifestV1`
+(ENG-CONTEXT-001). It is the foundation for the Engram Context Ledger.
+
+### What it adds
+
+- `context_receipts` table — receipt ID, `recall_log_id` (one-to-one with
+  `recall_logs`), tenant/principal ownership, envelope protocol markers, the
+  stored manifest JSONB, `manifest_hash`, `packet_hash`, `retention_expires_at`,
+  and `created_at`.
+- A composite unique identity on `recall_logs (tenant_id, principal_id, id)` and
+  a composite foreign key
+  `context_receipts(tenant_id, principal_id, recall_log_id) →
+  recall_logs(tenant_id, principal_id, id)` with `ON DELETE RESTRICT
+  DEFERRABLE INITIALLY DEFERRED`.
+- Protocol CHECK constraints (schema/mode/hash-format/JSON-shape/envelope-
+  agreement/ownership/packet/no-`manifest_hash`-field/retention).
+- FORCE RLS requiring **both** tenant and principal GUCs.
+- App-role `SELECT`/`INSERT` only; `UPDATE`/`DELETE` explicitly revoked
+  (migration 003's default privileges would otherwise grant them).
+- Indexes: unique `recall_log_id`, principal timeline, tenant manifest-hash
+  lookup, and a partial retention-sweep index.
+
+### What it does NOT add
+
+This slice is storage-only. It does **not**:
+
+- create receipts during a production recall (dark writes land in
+  ENG-CONTEXT-002B);
+- add receipt IDs or hashes to any API response;
+- add inspect/verify/diff/drift/exposure/impact endpoints (ENG-CONTEXT-003);
+- add SDK, MCP, or Hermes receipt surfaces;
+- delete expired rows or run a retention worker;
+- introduce tenant retention configuration;
+- store raw memory content, raw `working_set`, raw query text, or a second copy
+  of the canonical JSON.
+
+### Migration order
+
+```
+001 → ... → 025 → 026
+```
+
+### Deployment order for this slice
+
+```
+migration 026
+  → verify constraints / RLS / privileges
+  → deploy model / repository code
+  → no behavioral change expected
+```
+
+No behavioral change is expected because no production path writes receipts yet.
+The new table is additive and the repository module has no FastAPI dependencies
+and is not wired into any route.
+
+### Rollback guidance
+
+- Application code may be rolled back while leaving migration 026 in place.
+- Do **not** drop the table if receipts have been inserted — receipts are
+  immutable retention evidence. (This slice itself creates no production
+  receipts, so on a pre-002B deployment the table is empty and the rollback is
+  trivially safe.)
+- Rolling back does not require rolling back migration 026.
+
+### Idempotency
+
+Migration 026 is safe to re-apply: `CREATE TABLE IF NOT EXISTS`,
+`CREATE [UNIQUE] INDEX IF NOT EXISTS`, guarded constraint creation through
+`pg_constraint`, guarded policy recreation through `pg_policies`, safe
+two-argument `current_setting(..., true)`, explicit FORCE RLS, and explicit
+grants/revocations. Reapplying does not duplicate constraints/policies, rewrite
+rows, weaken privileges, or lose FORCE RLS.
+
+### Verification
+
+After applying migration 026, verify (as the owner):
+
+- `context_receipts` exists with FORCE RLS active;
+- the app role (`engram_app`) has `SELECT`/`INSERT` but **not** `UPDATE`/`DELETE`;
+- the composite recall-log FK and the `uq_recall_logs_tenant_principal_id`
+  unique identity exist;
+- a row whose manifest subject tenant/principal disagrees with the envelope
+  columns is rejected;
+- a second receipt for one recall log is rejected;
+- recall-log deletion is restricted while its receipt remains.
+
+The real-PostgreSQL proof suite
+(`tests/test_context_receipts_postgres.py`,
+`tests/test_context_receipt_store_postgres.py`) covers all of the above against
+the non-owner app role.
+
+---
+
 ## 11. Memory profiles (control plane)
 
 Memory profiles are reusable, tenant-scoped policy identities. They are created and revised by an
