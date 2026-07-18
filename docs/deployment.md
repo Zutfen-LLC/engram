@@ -805,6 +805,89 @@ the non-owner app role.
 
 ---
 
+## 10b. Startup context-receipt dark writes (ENG-CONTEXT-002B)
+
+ENG-CONTEXT-002B wires the canonical `ContextManifestV1` (ENG-CONTEXT-001) and
+the durable `context_receipts` storage substrate (ENG-CONTEXT-002A) into the
+production startup-recall path as a **default-off, fail-open** dark write. No
+migration is added by this slice — it uses the migration 026 table.
+
+### Configuration (API-only)
+
+| Setting | Env var | Default |
+| --- | --- | --- |
+| `context_receipt_dark_write_enabled` | `ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_ENABLED` | `false` |
+| `context_receipt_dark_write_timeout_seconds` | `ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_TIMEOUT_SECONDS` | `1.0` |
+
+These are API-only settings — they are **not** propagated to the worker. The
+timeout must be strictly positive; an invalid (`<=0`) value fails settings
+load with no silent negative-to-positive coercion.
+
+### Disabled behavior (default)
+
+When `ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_ENABLED=false`:
+
+- no manifest is built;
+- no context-receipt database session is opened;
+- no receipt query is executed;
+- no dark-write telemetry event is emitted;
+- startup and semantic recall behavior is **unchanged**.
+
+The disabled branch is a cheap Boolean check.
+
+### Enabled behavior (startup only)
+
+When enabled, a successful `POST /v1/recall` with `mode=startup` additionally:
+
+1. executes startup recall normally and finalizes one `RecallResponse` object;
+2. builds `ContextManifestV1` from that finalized response and the actual
+   resolved execution context (no re-reads of mutable memory rows);
+3. opens a dedicated, short-lived, non-owner app-role session
+   (`engram.db.async_session_factory`) with tenant/principal RLS applied;
+4. persists one immutable `context_receipts` row linked to the committed
+   recall log (idempotent on retry);
+5. forces a database reload of the stored JSONB through PostgreSQL;
+6. recanonicalizes and verifies the reloaded manifest and hashes;
+7. commits the receipt **only after** verification succeeds;
+8. records a bounded `context_receipt.dark_write` usage event (when usage
+   telemetry is enabled);
+9. returns the **original** `RecallResponse` unchanged.
+
+Semantic recall (`mode=semantic`) **never** invokes the dark write. No
+semantic Context Manifest support is implemented in this slice.
+
+### Fail-open contract
+
+All ordinary manifest, database, integrity, telemetry, and timeout failures
+are fail-open:
+
+- the route still returns the exact successful startup `RecallResponse`;
+- a receipt failure never fails the recall request, modifies the response,
+  deletes or rolls back the already-committed recall log, poisons the
+  caller's request session, or suppresses retrieval-success telemetry;
+- asyncio cancellation is **not** swallowed — it propagates normally;
+- no raw content, `working_set`, query text, manifest JSON, canonical JSON,
+  or exception messages are logged or stored in usage metadata — only
+  bounded aggregate metadata and the exception *type*.
+
+### Dogfood rollout
+
+See [`docs/ops/context-receipt-dark-writes.md`](ops/context-receipt-dark-writes.md)
+for the staged rollout (deploy disabled → enable on dogfood → verify →
+disable safely), owner-role diagnostic queries, and p50/p95 measurement
+steps. Receipt failures are expected to be visible but fail-open during the
+dark-write phase.
+
+### Compose propagation
+
+`docker-compose.yml` explicitly passes both
+`ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_ENABLED` and
+`ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_TIMEOUT_SECONDS` to `engram-service` only
+(API-only). They are not added to the shared `x-env` anchor, so the worker
+container never sees them.
+
+---
+
 ## 11. Memory profiles (control plane)
 
 Memory profiles are reusable, tenant-scoped policy identities. They are created and revised by an

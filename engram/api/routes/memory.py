@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import uuid
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -36,6 +37,10 @@ from engram.classification import ClassificationResult, classify_rules_only
 from engram.classification_evidence import bind_run, lock_run
 from engram.classification_trust import narrow_visibility
 from engram.config import settings
+from engram.context_receipt_dark_write import (
+    build_startup_decision_context_from_result,
+    write_startup_context_receipt_best_effort,
+)
 from engram.db import get_session
 from engram.embeddings import create_embedding_placeholder, generate_embedding
 from engram.feedback import (
@@ -85,6 +90,8 @@ _SOURCE_TRUST_KEYS = trust_policy._SOURCE_TRUST_KEYS
 _TRUST_FALLBACKS = trust_policy._TRUST_FALLBACKS
 
 router = APIRouter()
+
+logger = logging.getLogger("engram.api.routes.memory")
 
 # source_type values that default to review_status='active'.
 _ACTIVE_SOURCES = {"manual", "import", "migration"}
@@ -1290,6 +1297,82 @@ async def recall(
     resolved_embedding_outcome: EmbeddingOutcome = result.get(
         "embedding_outcome", "not_required" if mode != "semantic" else "unknown"
     )
+
+    # Finalize ONE RecallResponse object before any dark-write work. The same
+    # object is passed to the Context Manifest builder (when enabled) and
+    # returned by the route. No database mutation after this point may affect
+    # the manifest — this is the served snapshot boundary (ENG-CONTEXT-002B).
+    response = RecallResponse(
+        working_set=result["working_set"],
+        item_count=result["item_count"],
+        byte_count=result["byte_count"],
+        pinned_omitted_count=result["pinned_omitted_count"],
+        omitted_count=result["omitted_count"],
+        items=result["items"],
+        scoring_version=result.get("scoring_version", "v1"),
+        config_version=result.get("config_version", "v1"),
+        recall_log_id=result.get("recall_log_id"),
+        message=result.get("message"),
+    )
+
+    # Startup-only dark write (ENG-CONTEXT-002B). Runs BEFORE the retrieval
+    # telemetry record so the retrieval latency metric includes the enabled
+    # dark-write time (the client waits for the attempt before receiving the
+    # response). The dedicated receipt event records the dark-write latency
+    # separately. Semantic recall never invokes the dark write. A receipt
+    # failure must never fail recall or modify the response; the helper itself
+    # is contracted to be no-raise, but a route-level defense-in-depth guard
+    # still returns the successful response if it ever violates that contract.
+    if mode == "startup" and result.get("recall_log_id"):
+        recall_log_id_str = result.get("recall_log_id")
+        assert recall_log_id_str is not None
+        try:
+            recall_log_uuid = UUID(str(recall_log_id_str))
+        except (ValueError, AttributeError, TypeError):
+            recall_log_uuid = None
+        if recall_log_uuid is not None:
+            # Build the decision context from the EXACT executed engine values
+            # — no defaults. A missing/malformed internal key raises
+            # StartupDecisionContextError, which the guard below catches and
+            # logs as a bounded failure. Evidence code must never infer an
+            # executed value from a missing key.
+            try:
+                decision_context = build_startup_decision_context_from_result(
+                    req_workspace_supplied=req.workspace is not None,
+                    req_byte_budget=req.byte_budget,
+                    req_token_budget=req.token_budget,
+                    req_item_budget=req.item_budget,
+                    result=result,
+                    scoring_version=response.scoring_version,
+                    config_version=response.config_version,
+                )
+            except Exception as exc:  # noqa: BLE001 — bounded failure, no receipt
+                logger.warning(
+                    "context_receipt_dark_write decision context invalid "
+                    "mode=startup failure_stage=build_decision_context "
+                    "exc_type=%s",
+                    type(exc).__name__,
+                )
+            else:
+                try:
+                    await write_startup_context_receipt_best_effort(
+                        response=response,
+                        recall_log_id=recall_log_uuid,
+                        memory_context=memory_context,
+                        decision_context=decision_context,
+                    )
+                except Exception as exc:  # noqa: BLE001 — defense-in-depth no-raise guard
+                    # The helper is contracted to never raise an ordinary
+                    # dark-write failure. If it ever does, the route still
+                    # returns the successful recall response and logs only the
+                    # exception type (never the message — it may include bound
+                    # values).
+                    logger.warning(
+                        "context_receipt_dark_write helper raised unexpectedly "
+                        "mode=startup exc_type=%s",
+                        type(exc).__name__,
+                    )
+
     await record_retrieval_request(
         tenant_id=tenant_id,
         principal_id=principal_id,
@@ -1310,18 +1393,7 @@ async def recall(
         memory_profile_version=memory_context.memory_profile_version,
     )
 
-    return RecallResponse(
-        working_set=result["working_set"],
-        item_count=result["item_count"],
-        byte_count=result["byte_count"],
-        pinned_omitted_count=result["pinned_omitted_count"],
-        omitted_count=result["omitted_count"],
-        items=result["items"],
-        scoring_version=result.get("scoring_version", "v1"),
-        config_version=result.get("config_version", "v1"),
-        recall_log_id=result.get("recall_log_id"),
-        message=result.get("message"),
-    )
+    return response
 
 
 @router.post("/search", response_model=SearchResponse, dependencies=[Depends(READ_SCOPE)])

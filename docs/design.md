@@ -1606,19 +1606,28 @@ Auditability is part of the trust model, not a compliance afterthought.
 
 ### Context manifest contract
 
-> **Implementation status (ENG-CONTEXT-001 / ENG-CONTEXT-002A):** The
-> canonical, versioned `ContextManifestV1` and its deterministic hash contract
-> are **defined and proven** (`engram/context_manifest.py`). Cross-language
-> golden vectors and independent Python + JavaScript verifiers are checked in.
-> The **durable receipt storage substrate** (`context_receipts` table,
-> migration 026, ORM model, repository, RLS, retention metadata) is
-> **implemented as a storage-only foundation** (`engram/context_receipts.py`,
-> `engram.models.ContextReceipt`) — one-to-one with `recall_logs`, FORCE RLS
-> requiring both tenant and principal, app-role SELECT/INSERT only, immutable
-> rows, idempotent insertion, stored-manifest integrity verification. **No
-> production recall path writes receipts yet** (dark writes land in
-> ENG-CONTEXT-002B); an **inspect/verify API** is deferred to ENG-CONTEXT-003.
-> Only `mode="startup"` is supported.
+> **Implementation status (ENG-CONTEXT-001 / ENG-CONTEXT-002A / ENG-CONTEXT-002B):**
+> The canonical, versioned `ContextManifestV1` and its deterministic hash
+> contract are **defined and proven** (`engram/context_manifest.py`).
+> Cross-language golden vectors and independent Python + JavaScript verifiers
+> are checked in. The **durable receipt storage substrate**
+> (`context_receipts` table, migration 026, ORM model, repository, RLS,
+> retention metadata) is **implemented as a storage-only foundation**
+> (`engram/context_receipts.py`, `engram.models.ContextReceipt`) — one-to-one
+> with `recall_logs`, FORCE RLS requiring both tenant and principal, app-role
+> SELECT/INSERT only, immutable rows, idempotent insertion, stored-manifest
+> integrity verification. The storage substrate is **wired into the
+> production startup-recall path as a default-off, fail-open dark write**
+> (`engram/context_receipt_dark_write.py`, ENG-CONTEXT-002B): when
+> `ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_ENABLED=true`, a successful
+> `mode=startup` recall builds a manifest from the finalized `RecallResponse`
+> and persists one immutable receipt on a dedicated app-role session; the row
+> is reloaded and verified before commit, and any receipt failure is
+> swallowed (the recall response is returned unchanged). Receipt IDs/hashes
+> remain **invisible to clients** (exposure lands in ENG-CONTEXT-002C); an
+> **inspect/verify API** is deferred to ENG-CONTEXT-003. Only
+> `mode="startup"` is supported; semantic recall creates no receipt while
+> the feature is enabled.
 
 The context manifest is the deterministic, content-addressed artifact that
 lets Engram prove **what context it served and which policy/version admitted
@@ -1664,9 +1673,12 @@ manifest, `manifest_hash`, and `packet_hash`. It is one-to-one with
 retention metadata are outside the manifest hash; no raw memory content or
 `working_set` is duplicated. Verification recanonicalizes the stored JSONB
 through `ContextManifestV1` and compares the recomputed hash to the stored
-`manifest_hash`. ENG-CONTEXT-002A is storage-only — no production recall path
-writes receipts yet (dark writes land in ENG-CONTEXT-002B; retrieval and
-authorized rehydration land in ENG-CONTEXT-003).
+`manifest_hash`. ENG-CONTEXT-002A is storage-only; ENG-CONTEXT-002B wires it
+into the production startup-recall path as a default-off, fail-open dark write
+(the route finalizes one `RecallResponse`, builds the manifest from it,
+persists on a dedicated app-role session, reloads and verifies before
+commit, and returns the response unchanged on any receipt failure).
+Retrieval and authorized rehydration land in ENG-CONTEXT-003.
 
 ---
 

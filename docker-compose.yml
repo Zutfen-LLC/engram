@@ -151,6 +151,10 @@ services:
       ENGRAM_STARTUP_RECALL_CANDIDATE_LIMIT_MAX: ${ENGRAM_STARTUP_RECALL_CANDIDATE_LIMIT_MAX:-5000}
       # Lazy promotion is initiated only by startup recall on the API path.
       ENGRAM_STARTUP_PROMOTION_LIMIT: ${ENGRAM_STARTUP_PROMOTION_LIMIT:-20}
+      # Context-receipt startup dark writes (ENG-CONTEXT-002B) — API-only,
+      # default-off, fail-open. Not propagated to the worker.
+      ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_ENABLED: ${ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_ENABLED:-false}
+      ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_TIMEOUT_SECONDS: ${ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_TIMEOUT_SECONDS:-1.0}
     depends_on:
       postgres:
         condition: service_healthy

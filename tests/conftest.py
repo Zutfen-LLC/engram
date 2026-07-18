@@ -48,6 +48,22 @@ def _restore_usage_telemetry_enabled_default():
 
 
 @pytest.fixture(autouse=True)
+def _restore_context_receipt_dark_write_defaults():
+    """Guard against global context-receipt dark-write settings leakage
+    (ENG-CONTEXT-002B). Tests flip these singletons to exercise the enabled
+    path; restore the pre-test values after every test so a default-off
+    deployment invariant is never leaked into unrelated tests.
+    """
+    from engram.config import settings
+
+    original_enabled = settings.context_receipt_dark_write_enabled
+    original_timeout = settings.context_receipt_dark_write_timeout_seconds
+    yield
+    settings.context_receipt_dark_write_enabled = original_enabled
+    settings.context_receipt_dark_write_timeout_seconds = original_timeout
+
+
+@pytest.fixture(autouse=True)
 async def _dispose_db_engines_after_test():
     """Dispose the real module-level SQLAlchemy engines after every test.
 

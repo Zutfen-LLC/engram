@@ -4,9 +4,17 @@
 > **Status (ENG-CONTEXT-002A):** The durable receipt *storage substrate*
 > (`context_receipts` table, migration 026, ORM model, repository, RLS,
 > retention metadata, real-PostgreSQL proofs) is implemented as a
-> storage-only foundation. **No production recall path writes receipts yet**
-> (dark writes land in ENG-CONTEXT-002B); an inspect/verify API lands in
-> ENG-CONTEXT-003. Only `mode="startup"` is supported here.
+> storage-only foundation.
+> **Status (ENG-CONTEXT-002B):** The storage substrate is wired into the
+> production startup-recall path as a **default-off, fail-open dark write**.
+> When enabled, a successful `mode=startup` recall builds a manifest from the
+> *finalized* `RecallResponse` and persists one immutable receipt on a
+> dedicated app-role session; the row is reloaded and verified before commit,
+> and any receipt failure is swallowed (the recall response is returned
+> unchanged). Receipt IDs/hashes remain **invisible to clients** (exposure is
+> decided in ENG-CONTEXT-002C); an inspect/verify API lands in
+> ENG-CONTEXT-003. Only `mode=startup` is supported. Semantic recall creates
+> no receipt while the feature is enabled.
 
 The Context Manifest is the deterministic, versioned artifact beneath the
 **Engram Context Ledger**. It lets Engram answer one question with proof:
@@ -373,6 +381,86 @@ Migration 026 is additive and safe to re-apply (`CREATE TABLE IF NOT EXISTS`,
 guarded constraints, guarded policy recreation). Rolling application code back
 leaves an unused additive table; do not drop the table if receipts have been
 inserted. This slice itself creates no production receipts.
+
+## 14a. Startup dark writes (ENG-CONTEXT-002B)
+
+ENG-CONTEXT-002B wires the storage substrate into the production
+startup-recall path as a **default-off, fail-open** dark write. No migration
+is added — it reuses the migration 026 table.
+
+### Finalized-response snapshot boundary
+
+The route finalizes **one** `RecallResponse` object before any dark-write
+work. That same object is passed to `build_startup_context_manifest_v1` and
+returned to the caller. The manifest is built **only** from the finalized
+response — never from ORM `MemoryItem` rows, a fresh memory query,
+`recall_logs.item_ids` alone, reconstructed content, or a second
+independently assembled response dictionary. No database mutation after
+response construction may affect the manifest: a later memory mutation
+cannot alter the stored served snapshot.
+
+### Effective vs requested decision context
+
+The manifest's request descriptor carries two views of the recall decision:
+
+- **requested** — the caller's exact request (before server defaults):
+  `workspace_supplied`, `byte_budget`, `token_budget`, `item_budget`;
+- **effective** — what startup actually used (after applying defaults and
+  workspace resolution): `workspace_id`, `byte_budget`, `token_budget`,
+  `item_budget` (always `null` for startup v1).
+
+The startup engine exposes `effective_byte_budget`, `effective_token_budget`,
+and `effective_item_budget` (always `null`) as internal-only result values
+that are the exact values used by budget enforcement and written to
+`RecallLog`. They are **not** added to `RecallResponse`. The route does not
+recompute default budgets — the engine is authoritative for the values it
+actually used.
+
+### Dedicated transaction isolation
+
+Dark-write persistence uses a fresh, short-lived, non-owner app-role session
+(`engram.db.async_session_factory`), not the caller's request session. RLS
+is applied with `apply_rls_context(tenant_id, principal_id)`. Rationale: the
+recall log is already committed; a receipt database error must not poison
+the request session; rollback must affect only the optional receipt attempt.
+
+### Verification before commit
+
+Inside the dedicated session the orchestrator: applies RLS, calls
+`store_context_receipt`, flushes, forces a database reload
+(`session.refresh(receipt)`), verifies the reloaded record, compares the
+verified reloaded manifest's canonical JSON bytes to the original built
+manifest's canonical JSON bytes, and commits **only after** verification
+succeeds. On any mismatch it raises `ContextReceiptIntegrityError`
+internally, rolls back the dedicated transaction, emits failure
+observability, and returns the original `RecallResponse`. A newly inserted
+row does not commit if immediate verification fails.
+
+### Fail-open + no public exposure
+
+All ordinary manifest, database, integrity, telemetry, and timeout failures
+are fail-open: the route returns the exact successful startup
+`RecallResponse`. asyncio cancellation is **not** swallowed (it propagates
+normally); only ordinary `Exception` subclasses are fail-open. No
+`receipt_id`, `manifest_hash`, `packet_hash`, `receipt_status`,
+`receipt_error`, or `verification_status` is added to `RecallResponse` (or
+the SDK/MCP/Hermes contracts). Exposure is decided in ENG-CONTEXT-002C.
+
+### Semantic exclusion
+
+Semantic recall (`mode=semantic`) never invokes the dark write, never creates
+a `context_receipts` row, and never emits a startup-receipt event, regardless
+of whether the feature is enabled. No semantic Context Manifest is
+implemented in this slice.
+
+### Observability
+
+One bounded structured log per enabled attempt (success carries
+`verification=passed`; failure carries only `failure_stage` and exception
+*type* — never the message). A bounded `context_receipt.dark_write` usage
+event is recorded when `ENGRAM_USAGE_TELEMETRY_ENABLED=true`. Neither carries
+raw content, `working_set`, query text, manifest JSON, canonical JSON, or
+exception messages.
 
 ## 15. Planned inspect/verify API in ENG-CONTEXT-003
 

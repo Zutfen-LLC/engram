@@ -859,6 +859,16 @@ async def execute_startup_recall(
         # never calls an embedding provider, so embedding_outcome is not_required.
         "workspace_id": str(workspace_id) if workspace_id else None,
         "embedding_outcome": "not_required",
+        # Internal-only effective decision context (ENG-CONTEXT-002B). These are
+        # the exact resolved values used by budget enforcement and written to
+        # RecallLog (``byte_budget``/``token_budget`` columns), exposed so the
+        # startup receipt can build the effective descriptor without recomputing
+        # defaults in the route. Startup v1 never enforces an item budget, so
+        # ``effective_item_budget`` is always null. These MUST NOT enter
+        # RecallResponse (they are not part of the public contract).
+        "effective_byte_budget": byte_budget,
+        "effective_token_budget": token_budget,
+        "effective_item_budget": None,
     }
 
 

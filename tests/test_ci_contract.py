@@ -121,6 +121,37 @@ def test_compose_supports_prebuilt_hosted_and_local_build_modes() -> None:
     )
 
 
+def test_compose_propagates_context_receipt_dark_write_settings() -> None:
+    """The API-only context-receipt dark-write settings must be explicitly
+    passed to the API service in docker-compose.yml so future settings cannot
+    silently disappear from the deployable configuration (ENG-CONTEXT-002B).
+
+    These are API-only: they must NOT be in the shared ``x-env`` anchor (the
+    worker never sees them).
+    """
+    compose = (REPOSITORY_ROOT / "docker-compose.yml").read_text()
+    assert "ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_ENABLED" in compose
+    assert "ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_TIMEOUT_SECONDS" in compose
+    # API service carries the settings.
+    api_section = compose.split("engram-service:", 1)[1].split("engram-worker:", 1)[0]
+    assert "ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_ENABLED" in api_section
+    assert "ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_TIMEOUT_SECONDS" in api_section
+    # Worker section must NOT carry them (API-only).
+    worker_section = compose.split("engram-worker:", 1)[1]
+    assert "ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_ENABLED" not in worker_section
+    # The shared anchor must NOT carry them (API-only).
+    anchor = compose.split("x-env:", 1)[1].split("services:", 1)[0]
+    assert "ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_ENABLED" not in anchor
+
+
+def test_env_example_documents_context_receipt_dark_write_settings() -> None:
+    """The example env file must document the new settings so operators can
+    discover and configure them (ENG-CONTEXT-002B)."""
+    env = (REPOSITORY_ROOT / ".env.example").read_text()
+    assert "ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_ENABLED=false" in env
+    assert "ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_TIMEOUT_SECONDS=1.0" in env
+
+
 def test_ci_dockerfile_separates_dependencies_from_source_binding() -> None:
     dockerfile = (REPOSITORY_ROOT / "Dockerfile").read_text()
 
