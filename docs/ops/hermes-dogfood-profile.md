@@ -1,8 +1,10 @@
 # Stock-Hermes Engram dogfood profile
 
-**Status:** the dual-face plugin is unit-tested without Hermes or a live Engram
-service. The independent write-interception, fresh-session recall, and Track A
-manual dogfood gates below have not yet been run.
+**Status:** the dual-face plugin is unit-tested, and the independent
+write-interception and fresh-session recall gates were run against stock Hermes
+on 2026-07-19. The Track A read-safety gate has not yet been run. The recall
+gate used a pre-existing active imported item because no reviewer-scoped
+credential was available; its exact limitation is recorded with the result.
 
 Compatibility contract: `NousResearch/hermes-agent` at
 `36f2a966c7f9f69987494b867c3dcf96b69a5766`. Do not patch that repository. The
@@ -13,7 +15,7 @@ models the stock configuration.
 
 | Surface | Activation | Responsibility |
 | --- | --- | --- |
-| General plugin | `plugins.enabled` contains `engram_memory` | Automatic reads through synchronous `pre_llm_call`; session start/reset/finalize read-state lifecycle. |
+| General plugin | `plugins.enabled` contains `engram_memory` | Automatic reads through synchronous `pre_llm_call`; fail-closed write backstop through `pre_tool_call`; session start/reset/finalize read-state lifecycle. |
 | MemoryProvider | `memory.provider: engram_memory` | Governed writes, pre-compression/session-end capture, setup/status, and the static evidence policy. `prefetch()` and `queue_prefetch()` are permanently inert. |
 | MCP | `mcp_servers.engram` | Explicit recall/search/explain and other tool-selected operations. |
 
@@ -23,8 +25,11 @@ discovery/status do not call `engram_hooks.install()`, patch Hermes, restore a
 Hermes function, or access the network. Interception activates only when stock
 Hermes initializes the selected provider for an agent session.
 
-`HERMES_SAFE_MODE=1` disables general-plugin discovery, which disables automatic
-Engram reads even if the provider and MCP server remain configured.
+`HERMES_SAFE_MODE=1` disables general-plugin discovery. This removes both
+automatic Engram reads and the independent fail-closed `pre_tool_call` write
+backstop, even if the provider and MCP server remain configured. Required
+automatic capture must not be claimed under safe mode unless another
+fail-closed write boundary is independently active and verified.
 
 ## Same-turn read safety
 
@@ -92,10 +97,14 @@ submitted to Engram and returns replacement JSON without touching `MEMORY.md` or
 `USER.md`; a rejected add is blocked before either store. Any batch containing an
 `add` is rejected atomically until replace/remove reconciliation is supported.
 
-The supported `pre_tool_call` hook was evaluated but cannot replace this boundary:
-it can inspect arguments and veto execution, but Hermes renders its result as a
-blocked error and offers no successful replacement result. Native
-`prepare_memory_write` remains preferred if a future Hermes revision supplies it.
+The supported `pre_tool_call` hook cannot replace this boundary: it can inspect
+arguments and veto execution, but Hermes renders its result as a blocked error
+and offers no successful replacement result. The general plugin nevertheless
+uses it as an independent fail-closed backstop: when required capture status is
+absent, `recall_only`, or `incompatible`, it blocks memory/user adds before the
+native writer. Once the wrapper is active it allows the call so the wrapper can
+return Engram's acknowledged replacement result. Native `prepare_memory_write`
+remains preferred if a future Hermes revision supplies it.
 Startup logs report `read_hook=pre_llm_call`, whether reads are enabled,
 `provider_prefetch=inert`, and one of `native_prepare`, `stock_compat`,
 `recall_only`, or `incompatible`. Required capture makes the last two fail visibly.
@@ -219,9 +228,19 @@ interception. The marker must be submitted by Hermes' actual memory tool. A
 
 #### Write-interception recorded result
 
-- [ ] Not yet run. Record the Engram commit, pinned Hermes commit, restarted
-      process activation line, Hermes tool transcript, item ID/source/review
-      status, and native-file non-persistence result.
+- [x] Run 2026-07-19 against Engram
+      `ca2f7a2499d99fcb946e8f918a731dca036387f7` and stock Hermes
+      `36f2a966c7f9f69987494b867c3dcf96b69a5766` in a newly started CLI process
+      (session `20260719_110337_e81fb7`). Startup logged
+      `engram-hooks stock-Hermes interception active: tools.memory_tool.memory_tool`.
+      Hermes' actual memory tool submitted marker
+      `HERMES-ENGRAM-SMOKE-20260719-CA2F7A2`; Engram acknowledged item
+      `baa9c4a6-8aab-4fd0-9dab-19bc2516fd00` with
+      `source_type=sync_turn` and `review_status=proposed` before the replacement
+      result reported `success=true`, `provider=engram`, and
+      `native_write=false`. The marker was absent from both profile-scoped
+      native memory files. The stock-Hermes checkout stayed at the pinned SHA
+      with no Engram-caused source changes.
 
 ### Fresh-session active-item recall gate
 
@@ -267,9 +286,24 @@ diagnosable and does not depend on the write-interception marker being promoted.
 
 #### Fresh-session recall recorded result
 
-- [ ] Not yet run. Record the Engram commit, pinned Hermes commit, active item
-      ID, review event, fresh-session transcript, attribution/labels, and
-      recall-log IDs.
+- [x] Run 2026-07-19 against Engram
+      `ca2f7a2499d99fcb946e8f918a731dca036387f7` and stock Hermes
+      `36f2a966c7f9f69987494b867c3dcf96b69a5766` in a separate newly started CLI
+      process (session `20260719_110751_bb295d`). Engram supplied active item
+      `817227dd-f34c-4055-a3a6-b8b0158a88e1`; Hermes attributed the FastAPI-over-
+      Flask decision to Engram and preserved `review_status=active`,
+      `epistemic_status=asserted_unverified`, and `human_verified=false`.
+      Attached recall-log IDs were
+      `dd369987-0bf4-4a0a-9e2d-4c77e7916890` and
+      `2e628cd7-937c-4ff6-adb8-9255490ab14c`.
+
+      Exact caveat: no reviewer-scoped credential was available in the smoke
+      environment, so this run used a pre-existing active `source_type=import`
+      item rather than creating and reviewing a new
+      `HERMES-ENGRAM-ACTIVE-*` marker. The Hermes credential remained the
+      read/write-only agent key. This proves fresh-process active-item recall,
+      safe attribution, labels, and recall provenance; it does not provide a
+      new marker-creation or review-event proof.
 
 ## Track A read-safety gate
 
