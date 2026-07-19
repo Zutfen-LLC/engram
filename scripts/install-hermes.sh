@@ -337,10 +337,16 @@ CLIENT_REF="engram-client @ git+$REPOSITORY_URL@$RESOLVED_COMMIT#subdirectory=sd
 HOOKS_REF="engram-hooks @ git+$REPOSITORY_URL@$RESOLVED_COMMIT#subdirectory=adapters/engram-hooks"
 printf '[4/8] Installing Engram packages into the live Hermes environment...\n'
 if "$HERMES_PYTHON" -m pip --version >/dev/null 2>&1; then
-    "$HERMES_PYTHON" -m pip install --upgrade "$CLIENT_REF" "$HOOKS_REF" \
+    "$HERMES_PYTHON" -m pip install "$CLIENT_REF" "$HOOKS_REF" \
+        || die "Python package install" "pip could not resolve Engram dependencies"
+    "$HERMES_PYTHON" -m pip install --force-reinstall --no-deps "$CLIENT_REF" "$HOOKS_REF" \
         || die "Python package install" "pip could not install Engram into the Hermes environment"
 elif command -v uv >/dev/null 2>&1; then
-    uv pip install --python "$HERMES_PYTHON" --upgrade "$CLIENT_REF" "$HOOKS_REF" \
+    uv pip install --python "$HERMES_PYTHON" "$CLIENT_REF" "$HOOKS_REF" \
+        || die "Python package install" "uv could not resolve Engram dependencies"
+    uv pip install --python "$HERMES_PYTHON" --no-deps \
+        --reinstall-package engram-client --reinstall-package engram-hooks \
+        "$CLIENT_REF" "$HOOKS_REF" \
         || die "Python package install" "uv could not install Engram into the Hermes environment"
 else
     die "Python package install" "the Hermes environment lacks pip and uv is unavailable"

@@ -322,7 +322,8 @@ def test_symbolic_ref_is_resolved_once_and_used_for_all_artifacts(harness: Harne
     assert harness.key not in output
     assert harness.key not in log
     assert "hermes:--profile work config path" in log
-    assert "python:-m pip install --upgrade" in log
+    assert "python:-m pip install engram-client" in log
+    assert "python:-m pip install --force-reinstall --no-deps" in log
     assert f"engram.git@{harness.resolved_sha}#subdirectory=sdk/engram-client" in log
     assert f"engram.git@{harness.resolved_sha}#subdirectory=adapters/engram-hooks" in log
     assert log.count("fetch --depth 1") == 1
@@ -345,7 +346,7 @@ def test_branch_advancing_after_resolution_cannot_mix_artifacts(harness: Harness
     assert result.returncode == 0, _combined(result)
     log = harness.log.read_text()
     assert log.count("moving-branch") == 1
-    assert log.count(f"engram.git@{harness.resolved_sha}#subdirectory=") == 2
+    assert log.count(f"engram.git@{harness.resolved_sha}#subdirectory=") == 4
     assert f"checkout --quiet --detach {harness.resolved_sha}" in log
     assert harness.advanced_sha not in log
 
@@ -422,6 +423,7 @@ def test_pip_falls_back_to_uv_for_the_same_interpreter(harness: Harness) -> None
     log = harness.log.read_text()
     assert "uv:pip install --python" in log
     assert str(harness.root / "hermes-live" / "bin" / "python3") in log
+    assert "--no-deps --reinstall-package engram-client --reinstall-package engram-hooks" in log
 
 
 def test_doctor_warnings_are_nonfatal(harness: Harness) -> None:

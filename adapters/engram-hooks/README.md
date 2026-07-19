@@ -3,7 +3,7 @@
 Companion library and one installable plugin directory that wire stock
 [Hermes](https://github.com/NousResearch/hermes-agent) into
 [Engram](../../..). Compatibility is pinned to stock Hermes commit
-`f8ddf4fd866d4e581a5353f728117faf2736ad4c`; no Hermes source patch or fork is
+`36f2a966c7f9f69987494b867c3dcf96b69a5766`; no Hermes source patch or fork is
 required.
 
 The installed `~/.hermes/plugins/engram_memory/` directory has two independently
@@ -122,7 +122,7 @@ The installer discovers the active profile and live Hermes Python environment
 through the Hermes CLI. Key entry is masked and read from `/dev/tty`, so it
 does not enter shell history; non-interactive automation can set
 `ENGRAM_API_KEY` in the process environment. The default service is
-`https://engram.zutfen.com`.
+`https://api.engram.zutfen.com`.
 
 Options can be passed to the piped script with `bash -s --`:
 
@@ -179,8 +179,9 @@ to install the sibling SDK into the same environment first via
 package dependency name (`engram-client>=0.1.0`) instead of a relative `file:`
 URL so editable installs do not fail during wheel metadata generation.
 
-Hermes itself is **not** a dependency — the plugin loads on stock Hermes (or
-with no Hermes installed at all, for testing).
+Hermes itself is **not** a package dependency. The plugin can load without
+Hermes for testing; stock-Hermes interception is verified only at the pinned
+commit above.
 
 ## Configuration
 
@@ -312,14 +313,19 @@ stock Hermes as of 2026-07-06. `install()` detects whether it exists on the
 `MemoryProvider` ABC at load time:
 
 - **Hook present** (PR merged) → registered natively, no patching.
-- **Hook missing** → a ~20-line runtime monkey-patch wraps the `memory()`
-  dispatch in `hermes_agent.tools.tool_executor` and
-  `hermes_agent.runtime.agent_runtime_helpers` so the write-boundary guard runs
-  before every native write. A clear warning is logged with the PR link.
+- **Hook missing at the pinned stock revision** → the compatibility shim wraps
+  the shared `tools.memory_tool.memory_tool` function that both stock execution
+  paths late-import. The write-boundary guard can then return a successful
+  replacement result before native persistence. A clear warning identifies the
+  exact inspected contract and links to the upstream PR.
 - **Hermes not installed** → the shim is inactive; the lifecycle hooks still
   work standalone.
 
-This makes Engram work with any Hermes version — no fork, no source editing.
+Compatibility is proven only for stock Hermes commit
+`36f2a966c7f9f69987494b867c3dcf96b69a5766`. A different Hermes revision must
+be inspected and pinned before claiming compatibility; API-shape drift fails
+required automatic-capture activation loudly. No fork or source editing is
+required for the pinned revision.
 
 ```python
 from engram_hooks import detect_prepare_memory_write
