@@ -6,13 +6,41 @@ from pathlib import Path
 import yaml
 
 HERMES_REFERENCE_REPOSITORY = "NousResearch/hermes-agent"
-HERMES_REFERENCE_SHA = "75467998f90ba87adf66e1254a4d163345f23a5f"
+HERMES_REFERENCE_SHA = "36f2a966c7f9f69987494b867c3dcf96b69a5766"
 _MANIFEST = (
     Path(__file__).resolve().parents[1]
     / "hermes_plugin"
     / "engram_memory"
     / "plugin.yaml"
 )
+_PROVENANCE = (
+    Path(__file__).parent
+    / "fixtures"
+    / "hermes_stock_36f2a966"
+    / "PROVENANCE.md"
+)
+
+
+def test_stock_write_fixture_records_exact_source_provenance() -> None:
+    provenance = _PROVENANCE.read_text()
+    assert f"Revision: `{HERMES_REFERENCE_SHA}`" in provenance
+    assert "Engram work-start revision: `906fc1d30128f49d4653c94688f08bde5b0c65b0`" in provenance
+    assert (
+        "Discovery correction work-start revision: "
+        "`85d3b67e61511b0c181f8e8c21704d36c333fa1a`"
+    ) in provenance
+    for source_path in (
+        "agent/tool_executor.py",
+        "agent/agent_runtime_helpers.py",
+        "agent/agent_init.py",
+        "tools/memory_tool.py",
+        "agent/memory_manager.py",
+        "agent/memory_provider.py",
+        "plugins/memory/__init__.py",
+        "hermes_cli/memory_setup.py",
+        "hermes_cli/plugins.py",
+    ):
+        assert source_path in provenance
 
 
 def test_manifest_matches_pinned_stock_general_plugin_contract() -> None:
@@ -28,6 +56,7 @@ def test_manifest_matches_pinned_stock_general_plugin_contract() -> None:
         ),
         "kind": "standalone",
         "provides_hooks": [
+            "pre_tool_call",
             "pre_llm_call",
             "on_session_start",
             "on_session_reset",

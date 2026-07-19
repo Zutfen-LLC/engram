@@ -3,13 +3,14 @@
 Companion library and one installable plugin directory that wire stock
 [Hermes](https://github.com/NousResearch/hermes-agent) into
 [Engram](../../..). Compatibility is pinned to stock Hermes commit
-`f8ddf4fd866d4e581a5353f728117faf2736ad4c`; no Hermes source patch or fork is
+`36f2a966c7f9f69987494b867c3dcf96b69a5766`; no Hermes source patch or fork is
 required.
 
 The installed `~/.hermes/plugins/engram_memory/` directory has two independently
 loaded faces:
 
-- The **general plugin** owns reads. Its synchronous `pre_llm_call` callback
+- The **general plugin** owns reads and the fail-closed activation backstop. Its
+  synchronous `pre_llm_call` callback
   performs bounded current-query semantic recall, first-turn startup recall,
   safe evidence rendering, per-session circuit breaking, and compact follow-up
   provenance. Stock Hermes appends this context directly to the current user
@@ -33,8 +34,13 @@ The split (per [design.md](../../../docs/design.md) §2, principle 8):
 
 ### Same-turn read path
 
-The general plugin registers exactly `pre_llm_call`, `on_session_start`,
-`on_session_reset`, and `on_session_finalize`. On each non-empty current query,
+The general plugin registers exactly `pre_tool_call`, `pre_llm_call`,
+`on_session_start`, `on_session_reset`, and `on_session_finalize`. The
+`pre_tool_call` callback dynamically checks shared engram-hooks activation
+status and blocks native memory/user adds whenever required automatic capture
+is absent, recall-only, or incompatible. Once the wrapper is active it allows
+the call so the wrapper can return Engram's replacement result. On each
+non-empty current query,
 it calls `POST /v1/recall` in semantic mode. The first turn (or a session whose
 startup recall has not successfully completed) also starts startup recall;
 both requests run concurrently under one aggregate deadline. Results are
@@ -88,7 +94,9 @@ Every candidate — and every direct `memory()` add when the compat shim is
 active — passes through `prepare_memory_write_guard`. Direct rejected adds
 return a stock-Hermes-safe JSON error and never reach the native writer.
 Accepted adds invoke the active provider's governed callback exactly once and
-return replacement JSON with `provider: "engram"` and `native_write: false`.
+return replacement JSON with `provider: "engram"` and `native_write: false`
+only after Engram acknowledges the durable write. API errors return failure and
+still block native persistence; there is no fire-and-forget success response.
 Any batch containing an add is rejected atomically; replace/remove-only calls
 retain stock behavior for this focused compatibility slice.
 
@@ -122,7 +130,7 @@ The installer discovers the active profile and live Hermes Python environment
 through the Hermes CLI. Key entry is masked and read from `/dev/tty`, so it
 does not enter shell history; non-interactive automation can set
 `ENGRAM_API_KEY` in the process environment. The default service is
-`https://engram.zutfen.com`.
+`https://api.engram.zutfen.com`.
 
 Options can be passed to the piped script with `bash -s --`:
 
@@ -179,8 +187,9 @@ to install the sibling SDK into the same environment first via
 package dependency name (`engram-client>=0.1.0`) instead of a relative `file:`
 URL so editable installs do not fail during wheel metadata generation.
 
-Hermes itself is **not** a dependency — the plugin loads on stock Hermes (or
-with no Hermes installed at all, for testing).
+Hermes itself is **not** a package dependency. The plugin can load without
+Hermes for testing; stock-Hermes interception is verified only at the pinned
+commit above.
 
 ## Configuration
 
@@ -261,7 +270,15 @@ result = await hooks.sync_turn(payload)
 
 `install()` is idempotent: calling it again (e.g. a Hermes plugin-reload path)
 re-detects and recognizes an already-patched dispatch site instead of
-wrapping it a second time — see `_SHIM_MARKER` in `hooks.py`.
+wrapping it a second time. The active provider callback is owned by the
+surviving wrapper, so even a full `engram_hooks.hooks` module replacement uses
+the newest provider instance. Disabling compatibility, or reinstalling without
+a provider callback, restores the native boundary rather than retaining a
+stale provider — see `_SHIM_MARKER` in `hooks.py`.
+
+`EngramMemoryProvider` does not call `install()` during construction,
+discovery, or `hermes memory status`. Stock Hermes activates interception only
+when it calls the selected provider's `initialize()` for an agent session.
 
 Set `ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE=true` to make `install()` raise
 `AutomaticCaptureUnavailable` instead of returning when neither the native
@@ -304,18 +321,23 @@ assert not is_allowed(verdict)
 
 The upstream `prepare_memory_write` hook ([PR
 #59898](https://github.com/NousResearch/hermes-agent/pull/59898)) is **not** in
-stock Hermes as of 2026-07-06. `install()` detects whether it exists on the
-`MemoryProvider` ABC at load time:
+stock Hermes as of 2026-07-06. During selected-provider initialization,
+`install()` detects whether it exists on the `MemoryProvider` ABC:
 
 - **Hook present** (PR merged) → registered natively, no patching.
-- **Hook missing** → a ~20-line runtime monkey-patch wraps the `memory()`
-  dispatch in `hermes_agent.tools.tool_executor` and
-  `hermes_agent.runtime.agent_runtime_helpers` so the write-boundary guard runs
-  before every native write. A clear warning is logged with the PR link.
+- **Hook missing at the pinned stock revision** → the compatibility shim wraps
+  the shared `tools.memory_tool.memory_tool` function that both stock execution
+  paths late-import. The write-boundary guard can then return a successful
+  replacement result before native persistence. A clear warning identifies the
+  exact inspected contract and links to the upstream PR.
 - **Hermes not installed** → the shim is inactive; the lifecycle hooks still
   work standalone.
 
-This makes Engram work with any Hermes version — no fork, no source editing.
+Compatibility is proven only for stock Hermes commit
+`36f2a966c7f9f69987494b867c3dcf96b69a5766`. A different Hermes revision must
+be inspected and pinned before claiming compatibility; API-shape drift fails
+required automatic-capture activation loudly. No fork or source editing is
+required for the pinned revision.
 
 ```python
 from engram_hooks import detect_prepare_memory_write

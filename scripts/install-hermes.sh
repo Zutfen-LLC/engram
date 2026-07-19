@@ -8,6 +8,7 @@ readonly DEFAULT_BASE_URL="https://api.engram.zutfen.com"
 readonly DEFAULT_REF="main"
 readonly REPOSITORY_URL="https://github.com/Zutfen-LLC/engram.git"
 readonly PLUGIN_SUBDIR="adapters/engram-hooks/hermes_plugin/engram_memory"
+readonly HERMES_REFERENCE="NousResearch/hermes-agent@36f2a966c7f9f69987494b867c3dcf96b69a5766"
 
 BASE_URL="$DEFAULT_BASE_URL"
 PROFILE=""
@@ -22,6 +23,7 @@ ENV_FILE=""
 CONFIG_FILE=""
 CHECKOUT=""
 RESOLVED_COMMIT=""
+PLUGIN_DIR=""
 
 usage() {
     cat <<'EOF'
@@ -45,6 +47,12 @@ EOF
 die() {
     printf 'ERROR [%s]: %s\n' "$1" "$2" >&2
     exit 1
+}
+
+provider_verification_die() {
+    local category=$1 detail=$2
+    die "$category" \
+        "$detail; configured provider: engram_memory; plugin directory: ${PLUGIN_DIR:-unresolved}; live Hermes interpreter: ${HERMES_PYTHON:-unresolved}; pinned Hermes contract: $HERMES_REFERENCE; resolved Engram commit: ${RESOLVED_COMMIT:-unresolved}"
 }
 
 restore_profile_files() {
@@ -134,6 +142,7 @@ if $DRY_RUN; then
     printf '  Plan: install Engram packages and nested engram_memory plugin\n'
     printf '  Plan: require governed automatic capture in the profile environment\n'
     printf '  Plan: atomically update profile environment and configuration\n'
+    printf '  Plan: verify provider discovery and local availability through memory status\n'
     printf '  No commands, prompts, network requests, installs, or writes were performed.\n'
     exit 0
 fi
@@ -198,6 +207,7 @@ ENV_FILE=$("${HERMES[@]}" config env-path) \
 [[ -f "$CONFIG_FILE" ]] || die "Hermes discovery" "Hermes config does not exist: $CONFIG_FILE"
 [[ "$(dirname "$CONFIG_FILE")" == "$(dirname "$ENV_FILE")" ]] \
     || die "Hermes discovery" "Hermes config and environment paths resolve to different profiles"
+PLUGIN_DIR="$(dirname "$CONFIG_FILE")/plugins/engram_memory"
 printf '  Profile: %s\n' "${PROFILE:-active/default}"
 printf '  Python: %s\n' "$HERMES_PYTHON"
 
@@ -336,10 +346,16 @@ CLIENT_REF="engram-client @ git+$REPOSITORY_URL@$RESOLVED_COMMIT#subdirectory=sd
 HOOKS_REF="engram-hooks @ git+$REPOSITORY_URL@$RESOLVED_COMMIT#subdirectory=adapters/engram-hooks"
 printf '[4/8] Installing Engram packages into the live Hermes environment...\n'
 if "$HERMES_PYTHON" -m pip --version >/dev/null 2>&1; then
-    "$HERMES_PYTHON" -m pip install --upgrade "$CLIENT_REF" "$HOOKS_REF" \
+    "$HERMES_PYTHON" -m pip install "$CLIENT_REF" "$HOOKS_REF" \
+        || die "Python package install" "pip could not resolve Engram dependencies"
+    "$HERMES_PYTHON" -m pip install --force-reinstall --no-deps "$CLIENT_REF" "$HOOKS_REF" \
         || die "Python package install" "pip could not install Engram into the Hermes environment"
 elif command -v uv >/dev/null 2>&1; then
-    uv pip install --python "$HERMES_PYTHON" --upgrade "$CLIENT_REF" "$HOOKS_REF" \
+    uv pip install --python "$HERMES_PYTHON" "$CLIENT_REF" "$HOOKS_REF" \
+        || die "Python package install" "uv could not resolve Engram dependencies"
+    uv pip install --python "$HERMES_PYTHON" --no-deps \
+        --reinstall-package engram-client --reinstall-package engram-hooks \
+        "$CLIENT_REF" "$HOOKS_REF" \
         || die "Python package install" "uv could not install Engram into the Hermes environment"
 else
     die "Python package install" "the Hermes environment lacks pip and uv is unavailable"
@@ -460,7 +476,7 @@ from agent.memory_provider import MemoryProvider
 from tools.memory_tool import memory_tool
 assert isinstance(MemoryProvider, type) and callable(memory_tool)
 ' || die "Hermes compatibility verification" \
-    "required target tools.memory_tool.memory_tool is unavailable in the live Hermes runtime"
+    "required target tools.memory_tool.memory_tool is unavailable in the live Hermes runtime; inspected contract: $HERMES_REFERENCE; reinstall a compatible Engram plugin or use deliberate recall-only mode"
 "$HERMES_PYTHON" - verify-direct-url "$RESOLVED_COMMIT" <<'PY' \
     || die "Python revision verification" "installed Engram packages do not match the resolved commit"
 import importlib.metadata
@@ -494,6 +510,31 @@ if tuple(map(int, match.groups())) < (0, 2, 0):
     || die "configuration verification" "Hermes memory is not enabled"
 [[ "$("${HERMES[@]}" config get memory.provider)" == "engram_memory" ]] \
     || die "configuration verification" "the active memory provider is not engram_memory"
+if ! MEMORY_STATUS=$("${HERMES[@]}" memory status 2>&1); then
+    provider_verification_die "provider status command failure" \
+        "Hermes could not run the active profile's memory status path"
+fi
+if ! printf '%s\n' "$MEMORY_STATUS" \
+    | grep -Eq '^[[:space:]]*Provider:[[:space:]]+engram_memory[[:space:]]*$'; then
+    provider_verification_die "provider configuration mismatch" \
+        "memory status did not identify Provider: engram_memory"
+fi
+if printf '%s\n' "$MEMORY_STATUS" \
+    | grep -Eq '^[[:space:]]*Plugin:[[:space:]]+NOT installed'; then
+    provider_verification_die "provider discovery/construction failure" \
+        "Hermes discovered no loadable engram_memory provider after plugin installation"
+fi
+if ! printf '%s\n' "$MEMORY_STATUS" \
+    | grep -Eq '^[[:space:]]*Plugin:[[:space:]]+installed'; then
+    provider_verification_die "provider loading verification" \
+        "memory status did not confirm Plugin: installed"
+fi
+if ! printf '%s\n' "$MEMORY_STATUS" \
+    | grep -Eq '^[[:space:]]*Status:[[:space:]]+available'; then
+    provider_verification_die "provider local-availability verification" \
+        "the installed provider did not pass its local configuration check"
+fi
+printf '  Provider loading: engram_memory installed and locally available (interception not initialized).\n'
 request "/whoami" true || die "final authentication" "final credential validation failed"
 parse_whoami >/dev/null || die "final authentication" "final identity response was invalid"
 
@@ -511,7 +552,7 @@ else
     printf '  Hermes diagnostics completed.\n'
 fi
 
-printf '\nEngram package, profile, and stock-Hermes API-shape checks are verified.\n'
+printf '\nEngram package, profile, provider loading, and stock-Hermes API-shape checks are verified.\n'
 printf 'Automatic write interception activates inside Hermes after restart and is configured fail-loud.\n'
 printf 'Installed revision: %s -> %s\n' "$REF" "$RESOLVED_COMMIT"
 printf 'Interactive CLI: fully exit and relaunch Hermes.\n'

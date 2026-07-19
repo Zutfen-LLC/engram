@@ -149,6 +149,17 @@ case "${{args[*]:-}}" in
   *'plugins enable '*'--no-allow-tool-override'*) exit 0 ;;
   'plugins list --plain --no-bundled')
     printf 'engram_memory  0.2.0  enabled\\ncalculator  1.0.0  enabled\\n' ;;
+  'memory status')
+    [[ "${{INSTALLER_TEST_MEMORY_STATUS_COMMAND_FAIL:-0}}" != 1 ]] || exit 71
+    printf '\\nMemory status\\n----------------------------------------\\n'
+    printf '  Built-in:  always active\\n  Provider:  engram_memory\\n'
+    if [[ "${{INSTALLER_TEST_PROVIDER_LOAD_FAIL:-0}}" == 1 ]]; then
+      printf '\\n  Plugin:    NOT installed x\\n'
+    elif [[ "${{INSTALLER_TEST_PROVIDER_UNAVAILABLE:-0}}" == 1 ]]; then
+      printf '\\n  Plugin:    installed ok\\n  Status:    not available x\\n'
+    else
+      printf '\\n  Plugin:    installed ok\\n  Status:    available ok\\n'
+    fi ;;
   'doctor')
     printf 'pre-existing provider warning\\n'
     exit "${{INSTALLER_TEST_DOCTOR_STATUS:-0}}" ;;
@@ -322,7 +333,8 @@ def test_symbolic_ref_is_resolved_once_and_used_for_all_artifacts(harness: Harne
     assert harness.key not in output
     assert harness.key not in log
     assert "hermes:--profile work config path" in log
-    assert "python:-m pip install --upgrade" in log
+    assert "python:-m pip install engram-client" in log
+    assert "python:-m pip install --force-reinstall --no-deps" in log
     assert f"engram.git@{harness.resolved_sha}#subdirectory=sdk/engram-client" in log
     assert f"engram.git@{harness.resolved_sha}#subdirectory=adapters/engram-hooks" in log
     assert log.count("fetch --depth 1") == 1
@@ -333,10 +345,12 @@ def test_symbolic_ref_is_resolved_once_and_used_for_all_artifacts(harness: Harne
     assert "plugins install --force --enable file://" in log
     assert "plugins enable" in log
     assert "--no-allow-tool-override" in log
+    assert "hermes:--profile work memory status" in log
     assert log.count("curl:") == 3
     assert "Requested ref: release/0.2" in output
     assert f"Resolved commit: {harness.resolved_sha}" in output
     assert "restart" in output.lower()
+    assert "interception not initialized" in output
 
 
 def test_branch_advancing_after_resolution_cannot_mix_artifacts(harness: Harness) -> None:
@@ -345,7 +359,7 @@ def test_branch_advancing_after_resolution_cannot_mix_artifacts(harness: Harness
     assert result.returncode == 0, _combined(result)
     log = harness.log.read_text()
     assert log.count("moving-branch") == 1
-    assert log.count(f"engram.git@{harness.resolved_sha}#subdirectory=") == 2
+    assert log.count(f"engram.git@{harness.resolved_sha}#subdirectory=") == 4
     assert f"checkout --quiet --detach {harness.resolved_sha}" in log
     assert harness.advanced_sha not in log
 
@@ -409,9 +423,34 @@ def test_hermes_api_drift_rolls_back_profile_and_fails_loudly(harness: Harness) 
 
     assert result.returncode != 0
     assert "tools.memory_tool.memory_tool" in _combined(result)
+    assert "36f2a966c7f9f69987494b867c3dcf96b69a5766" in _combined(result)
     assert config.read_bytes() == config_before
     assert env_file.read_bytes() == env_before
     assert harness.key not in _combined(result)
+
+
+def test_provider_load_failure_rolls_back_with_actionable_runtime_context(
+    harness: Harness,
+) -> None:
+    config = harness.profile / "config.yaml"
+    env_file = harness.profile / ".env"
+    config_before = config.read_bytes()
+    env_before = env_file.read_bytes()
+    harness.env["INSTALLER_TEST_PROVIDER_LOAD_FAIL"] = "1"
+
+    result = harness.run("--profile", "work")
+
+    assert result.returncode != 0
+    output = _combined(result)
+    assert "provider discovery/construction failure" in output
+    assert "configured provider: engram_memory" in output
+    assert f"plugin directory: {harness.profile / 'plugins' / 'engram_memory'}" in output
+    assert f"live Hermes interpreter: {harness.root / 'hermes-live' / 'bin' / 'python3'}" in output
+    assert "NousResearch/hermes-agent@36f2a966c7f9f69987494b867c3dcf96b69a5766" in output
+    assert f"resolved Engram commit: {harness.resolved_sha}" in output
+    assert config.read_bytes() == config_before
+    assert env_file.read_bytes() == env_before
+    assert harness.key not in output
 
 
 def test_pip_falls_back_to_uv_for_the_same_interpreter(harness: Harness) -> None:
@@ -421,6 +460,7 @@ def test_pip_falls_back_to_uv_for_the_same_interpreter(harness: Harness) -> None
     log = harness.log.read_text()
     assert "uv:pip install --python" in log
     assert str(harness.root / "hermes-live" / "bin" / "python3") in log
+    assert "--no-deps --reinstall-package engram-client --reinstall-package engram-hooks" in log
 
 
 def test_doctor_warnings_are_nonfatal(harness: Harness) -> None:
