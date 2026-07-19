@@ -707,9 +707,19 @@ def _replacement_result(result: dict[str, Any] | None) -> str:
     if isinstance(replacement, dict):
         payload = dict(replacement)
     elif isinstance(replacement, str):
-        payload = {"success": True, "message": replacement}
+        payload = {
+            "success": False,
+            "error": (
+                "Engram write interceptor returned an unverified string result; "
+                "durable acknowledgement required"
+            ),
+            "detail": replacement,
+        }
     else:
-        payload = {"success": True, "message": "Handled by Engram"}
+        payload = {
+            "success": False,
+            "error": "Engram write interceptor returned no durable acknowledgement",
+        }
     payload.setdefault("provider", "engram")
     payload.setdefault("native_write", False)
     return json.dumps(payload, ensure_ascii=False)
@@ -1002,6 +1012,11 @@ def install(
     capture the pre-install value.
     """
     global ACTIVE_HOOKS, ACTIVE_STATUS, ACTIVE_WRITE_INTERCEPTOR
+    # Clear any prior process/session claim before doing work that can raise.
+    # If construction or detection fails unexpectedly, the independent
+    # pre-tool hook sees status=absent and blocks required native adds instead
+    # of trusting a stale successful status from an older provider instance.
+    ACTIVE_STATUS = None
     hooks = LifecycleHooks(config)
     ACTIVE_HOOKS = hooks
     ACTIVE_WRITE_INTERCEPTOR = write_interceptor

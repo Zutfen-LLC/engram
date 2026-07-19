@@ -9,7 +9,8 @@ required.
 The installed `~/.hermes/plugins/engram_memory/` directory has two independently
 loaded faces:
 
-- The **general plugin** owns reads. Its synchronous `pre_llm_call` callback
+- The **general plugin** owns reads and the fail-closed activation backstop. Its
+  synchronous `pre_llm_call` callback
   performs bounded current-query semantic recall, first-turn startup recall,
   safe evidence rendering, per-session circuit breaking, and compact follow-up
   provenance. Stock Hermes appends this context directly to the current user
@@ -33,8 +34,13 @@ The split (per [design.md](../../../docs/design.md) §2, principle 8):
 
 ### Same-turn read path
 
-The general plugin registers exactly `pre_llm_call`, `on_session_start`,
-`on_session_reset`, and `on_session_finalize`. On each non-empty current query,
+The general plugin registers exactly `pre_tool_call`, `pre_llm_call`,
+`on_session_start`, `on_session_reset`, and `on_session_finalize`. The
+`pre_tool_call` callback dynamically checks shared engram-hooks activation
+status and blocks native memory/user adds whenever required automatic capture
+is absent, recall-only, or incompatible. Once the wrapper is active it allows
+the call so the wrapper can return Engram's replacement result. On each
+non-empty current query,
 it calls `POST /v1/recall` in semantic mode. The first turn (or a session whose
 startup recall has not successfully completed) also starts startup recall;
 both requests run concurrently under one aggregate deadline. Results are
@@ -88,7 +94,9 @@ Every candidate — and every direct `memory()` add when the compat shim is
 active — passes through `prepare_memory_write_guard`. Direct rejected adds
 return a stock-Hermes-safe JSON error and never reach the native writer.
 Accepted adds invoke the active provider's governed callback exactly once and
-return replacement JSON with `provider: "engram"` and `native_write: false`.
+return replacement JSON with `provider: "engram"` and `native_write: false`
+only after Engram acknowledges the durable write. API errors return failure and
+still block native persistence; there is no fire-and-forget success response.
 Any batch containing an add is rejected atomically; replace/remove-only calls
 retain stock behavior for this focused compatibility slice.
 

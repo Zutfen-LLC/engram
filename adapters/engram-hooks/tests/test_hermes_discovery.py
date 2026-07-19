@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -30,8 +32,12 @@ class _Manager:
 
 class _Agent:
     def __init__(self, store: Any) -> None:
+        self.session_id = "fixture-session"
         self._memory_store = store
         self._memory_manager = _Manager()
+
+    def _build_memory_write_metadata(self, **kwargs: Any) -> dict[str, Any]:
+        return kwargs
 
 
 @pytest.fixture
@@ -54,11 +60,28 @@ def pinned_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str,
     config.CONFIG = {"memory": {"provider": "engram_memory"}}
     memory_tool = importlib.import_module("tools.memory_tool")
     executor = importlib.import_module("agent.tool_executor")
+    runtime_helpers = importlib.import_module("agent.agent_runtime_helpers")
+    agent_init = importlib.import_module("agent.agent_init")
+    plugin_hooks = importlib.import_module("hermes_cli.plugins")
+
+    spec = importlib.util.spec_from_file_location(
+        "engram_memory",
+        _PLUGIN_DIR / "__init__.py",
+        submodule_search_locations=[str(_PLUGIN_DIR)],
+    )
+    assert spec is not None and spec.loader is not None
+    general_plugin = importlib.util.module_from_spec(spec)
+    sys.modules["engram_memory"] = general_plugin
+    spec.loader.exec_module(general_plugin)
+    general_plugin.register(plugin_hooks.PluginContext())
     return {
         "plugins": memory_plugins,
         "status": memory_status,
         "memory_tool": memory_tool,
         "executor": executor,
+        "runtime_helpers": runtime_helpers,
+        "agent_init": agent_init,
+        "general_plugin": general_plugin,
     }
 
 
@@ -109,9 +132,10 @@ async def test_real_initialize_intercepts_once_and_refreshes_callback_ownership(
     assert first_provider is not None
     first_submissions: list[str] = []
 
-    async def first_remember(content: str, metadata: dict[str, Any] | None = None) -> None:
+    async def first_remember(content: str, metadata: dict[str, Any] | None = None) -> Any:
         del metadata
         first_submissions.append(content)
+        return SimpleNamespace(id="fixture-item-one", review_status="proposed")
 
     first_provider._async_remember = first_remember
     with patch("engram_hooks.install", wraps=engram_hooks.install) as install_spy:
@@ -154,9 +178,10 @@ async def test_real_initialize_intercepts_once_and_refreshes_callback_ownership(
 
         async def second_remember(
             content: str, metadata: dict[str, Any] | None = None
-        ) -> None:
+        ) -> Any:
             del metadata
             second_submissions.append(content)
+            return SimpleNamespace(id="fixture-item-two", review_status="proposed")
 
         second_provider._async_remember = second_remember
         second_provider.initialize("session-two", agent_context="primary")
@@ -208,3 +233,45 @@ def test_required_activation_failure_is_deferred_until_initialize(
     assert "tools.memory_tool.memory_tool" in str(excinfo.value)
     assert provider._activation_mode == "incompatible"
     assert provider._initialized is False
+
+
+@pytest.mark.parametrize("executor_name", ["executor", "runtime_helpers"])
+def test_pinned_startup_swallow_cannot_fall_through_to_native_mutation(
+    pinned_runtime: dict[str, Any], executor_name: str
+) -> None:
+    """Exercise agent_init -> initialize_all -> swallowed provider failure."""
+    from engram_hooks import get_install_status
+
+    memory_tool = pinned_runtime["memory_tool"]
+    store = memory_tool.MemoryStore()
+    agent = _Agent(store)
+    del memory_tool.memory_tool
+
+    # Stock agent_init returns normally because MemoryManager.initialize_all
+    # catches AutomaticCaptureUnavailable from the selected provider.
+    pinned_runtime["agent_init"].initialize_memory_provider(
+        agent, "engram_memory", platform="cli"
+    )
+
+    assert agent._memory_manager is not None
+    assert len(agent._memory_manager.providers) == 1
+    provider = agent._memory_manager.providers[0]
+    assert provider._initialized is False
+    assert provider._activation_mode == "incompatible"
+    status = get_install_status()
+    assert status is not None
+    assert status.activation_mode == "incompatible"
+    result = json.loads(
+        pinned_runtime[executor_name].execute_memory(
+            agent,
+            {
+                "action": "add",
+                "target": "memory",
+                "content": "The native store must remain unchanged after activation failure.",
+            },
+        )
+    )
+
+    assert "Engram automatic capture is required but inactive" in result["error"]
+    assert "activation_status=incompatible" in result["error"]
+    assert store.entries == {"memory": [], "user": []}

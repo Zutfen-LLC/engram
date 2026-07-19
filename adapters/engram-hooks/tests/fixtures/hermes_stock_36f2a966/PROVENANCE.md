@@ -19,18 +19,21 @@
   - `hermes_cli/plugins.py` (`resolve_pre_tool_block`, lines 2228–2280)
 
 The executable fixture preserves the compatibility-relevant shape: both agent
-paths define nested execution closures, import `tools.memory_tool.memory_tool`
-inside those closures at call time, pass the six stock arguments, and notify
-the memory manager only after the tool returns, including the lazy provenance
-metadata callback used by this revision. The store is intentionally minimal;
-it records native mutations so tests can prove interception happens before
-native persistence. The general `pre_tool_call` hook was rejected as the
-implementation path because stock Hermes can only turn its directive into a
-blocked/error result, not a successful replacement tool result.
+paths resolve the general `pre_tool_call` block before execution, then define
+nested execution closures, import `tools.memory_tool.memory_tool` inside those
+closures at call time, pass the six stock arguments, and notify the memory
+manager only after the tool returns, including the lazy provenance metadata
+callback used by this revision. The store is intentionally minimal; it records
+native mutations so tests can prove interception happens before native
+persistence. The general hook is the fail-closed backstop when required capture
+is inactive; once the wrapper is active it allows execution because stock
+Hermes can only turn the directive into a blocked/error result, not Engram's
+successful replacement result.
 
 The discovery/status fixture is a faithful extraction of the pinned loader and
 CLI paths. It preserves the two constructor calls (discovery and explicit
 load), swallowed constructor failures, filtering in `_get_available_providers`,
-and the resulting `Plugin: NOT installed` status branch. The production startup
-path is recorded above: `agent_init.py` loads and registers the selected
-provider, then `MemoryManager.initialize_all()` calls `provider.initialize()`.
+and the resulting `Plugin: NOT installed` status branch. The executable startup
+fixture also follows `agent_init.py`: load and register the selected provider,
+then call `MemoryManager.initialize_all()`, whose per-provider `try/except`
+swallows `provider.initialize()` failure exactly where stock Hermes does.

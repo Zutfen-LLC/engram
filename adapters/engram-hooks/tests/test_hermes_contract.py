@@ -56,6 +56,7 @@ def test_manifest_matches_pinned_stock_general_plugin_contract() -> None:
         ),
         "kind": "standalone",
         "provides_hooks": [
+            "pre_tool_call",
             "pre_llm_call",
             "on_session_start",
             "on_session_reset",

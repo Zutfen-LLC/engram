@@ -3,7 +3,7 @@
 Tests verify:
 1. ABC conformance — all abstract methods implemented, instantiation succeeds.
 2. prepare_memory_write routing — allows durable content, rejects ephemeral.
-3. _async_remember — SDK attribute access (Pydantic), not dict access.
+3. write acknowledgement — success is impossible before Engram accepts the item.
 4. discovery-safe lifecycle — construction is inert and initialize activates.
 
 These tests do NOT require a live Engram instance or a real Hermes installation.
@@ -12,10 +12,13 @@ A stub ABC mirroring Hermes' MemoryProvider is installed per-test.
 from __future__ import annotations
 
 import abc
+import asyncio
+import concurrent.futures
 import importlib
 import importlib.util
 import os
 import sys
+import threading
 import types
 from pathlib import Path
 from typing import Any
@@ -251,6 +254,7 @@ def test_general_register_exact_hooks_without_provider_or_install(monkeypatch):
         module.register(ctx)
 
     assert [name for name, _ in registrations] == [
+        "pre_tool_call",
         "pre_llm_call",
         "on_session_start",
         "on_session_reset",
@@ -259,7 +263,7 @@ def test_general_register_exact_hooks_without_provider_or_install(monkeypatch):
     install_mock.assert_not_called()
     assert module._READ_BRIDGE is not None
     assert all(callable(callback) for _, callback in registrations)
-    assert registrations[0][1](
+    assert registrations[1][1](
         user_message="q", session_id="s", unknown_future_kwarg=True
     ) is None
 
@@ -293,7 +297,78 @@ def test_dual_loader_keeps_general_and_provider_module_state_separate(monkeypatc
     assert provider_module._READ_BRIDGE is None
     provider = provider_module.EngramMemoryProvider()
     assert provider.prefetch("q", session_id="s") == ""
-    assert ctx.register_hook.call_count == 4
+    assert ctx.register_hook.call_count == 5
+
+
+@pytest.mark.parametrize("activation_mode", ["recall_only", "incompatible"])
+def test_general_pre_tool_hook_blocks_required_add_when_capture_inactive(
+    monkeypatch: pytest.MonkeyPatch, activation_mode: str
+) -> None:
+    import engram_hooks.hooks as hooks_module
+
+    _install_agent_stub()
+    for name in tuple(sys.modules):
+        if name == "engram_memory" or name.startswith("engram_memory."):
+            sys.modules.pop(name, None)
+    monkeypatch.setenv("ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE", "true")
+    module = importlib.import_module("engram_memory")
+    hooks_module.ACTIVE_STATUS = hooks_module.InstallStatus(
+        native_hook_available=False,
+        compat_shim_installed=False,
+        activation_mode=activation_mode,
+        failure_reason="fixture activation failure",
+    )
+
+    directive = module._pre_tool_call_fail_closed(
+        tool_name="memory",
+        args={"action": "add", "target": "user", "content": "durable fact"},
+    )
+
+    assert directive is not None
+    assert directive["action"] == "block"
+    assert f"activation_status={activation_mode}" in directive["message"]
+
+
+def test_general_pre_tool_hook_blocks_required_add_when_status_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_agent_stub()
+    for name in tuple(sys.modules):
+        if name == "engram_memory" or name.startswith("engram_memory."):
+            sys.modules.pop(name, None)
+    monkeypatch.setenv("ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE", "true")
+    module = importlib.import_module("engram_memory")
+
+    directive = module._pre_tool_call_fail_closed(
+        tool_name="memory",
+        args={"target": "memory", "operations": [{"action": "add"}]},
+    )
+
+    assert directive is not None
+    assert "activation_status=absent" in directive["message"]
+
+
+def test_general_pre_tool_hook_allows_active_wrapper_to_return_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import engram_hooks.hooks as hooks_module
+
+    _install_agent_stub()
+    for name in tuple(sys.modules):
+        if name == "engram_memory" or name.startswith("engram_memory."):
+            sys.modules.pop(name, None)
+    monkeypatch.setenv("ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE", "true")
+    module = importlib.import_module("engram_memory")
+    hooks_module.ACTIVE_STATUS = hooks_module.InstallStatus(
+        native_hook_available=False,
+        compat_shim_installed=True,
+        activation_mode="stock_compat",
+    )
+
+    assert module._pre_tool_call_fail_closed(
+        tool_name="memory",
+        args={"action": "add", "target": "memory", "content": "durable fact"},
+    ) is None
 
 
 def test_required_capture_activation_failure_occurs_only_during_initialize(monkeypatch):
@@ -338,6 +413,8 @@ class TestPrepareMemoryWrite:
 
     def test_durable_content_is_handled(self, provider):
         """Substantial durable content should be routed to Engram."""
+        acknowledgement = MagicMock(id="item_123", review_status="proposed")
+        provider._async_remember = AsyncMock(return_value=acknowledgement)
         result = provider.prepare_memory_write(
             action="add",
             target="memory",
@@ -346,8 +423,57 @@ class TestPrepareMemoryWrite:
         assert result is not None
         assert result["handled"] is True
         assert result["result"]["success"] is True
-        assert "Submitted to Engram" in result["result"]["message"]
+        assert "Stored in Engram" in result["result"]["message"]
+        assert result["result"]["item_id"] == "item_123"
         assert result["result"]["native_write"] is False
+
+    def test_engram_failure_is_reported_without_false_success(self, provider):
+        provider._async_remember = AsyncMock(side_effect=RuntimeError("network down"))
+
+        result = provider.prepare_memory_write(
+            action="add",
+            target="memory",
+            content="The production database always uses PostgreSQL 16.",
+        )
+
+        assert result is not None
+        assert result["handled"] is True
+        assert result["result"] == {
+            "success": False,
+            "error": "Engram did not acknowledge the write: network down",
+            "provider": "engram",
+            "native_write": False,
+        }
+
+    def test_success_waits_for_durable_acknowledgement(self, provider):
+        started = threading.Event()
+        release = threading.Event()
+        acknowledgement = MagicMock(id="item_delayed", review_status="proposed")
+
+        async def delayed_remember(
+            content: str, metadata: dict[str, Any] | None = None
+        ) -> Any:
+            del content, metadata
+            started.set()
+            await asyncio.to_thread(release.wait)
+            return acknowledgement
+
+        provider._async_remember = delayed_remember
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                provider.prepare_memory_write,
+                action="add",
+                target="memory",
+                content="The durable deployment region is us-east-1.",
+            )
+            assert started.wait(timeout=1)
+            assert future.done() is False
+            release.set()
+            result = future.result(timeout=1)
+
+        assert result is not None
+        assert result["result"]["success"] is True
+        assert result["result"]["item_id"] == "item_delayed"
 
     def test_short_content_is_rejected(self, provider):
         """Content below the minimum length threshold should be rejected."""
@@ -407,7 +533,7 @@ class TestPrepareMemoryWrite:
 
 
 class TestAsyncRemember:
-    """Verify _async_remember uses attribute access (Pydantic), not dict access."""
+    """Verify the one-shot SDK request propagates acknowledgement and failure."""
 
     @pytest.mark.asyncio
     async def test_successful_remember_uses_attribute_access(self, provider):
@@ -418,27 +544,37 @@ class TestAsyncRemember:
         mock_result.review_status = "proposed"
         mock_client.remember = AsyncMock(return_value=mock_result)
 
-        provider._hooks._get_client.return_value = mock_client
+        client_context = MagicMock()
+        client_context.__aenter__ = AsyncMock(return_value=mock_client)
+        client_context.__aexit__ = AsyncMock(return_value=None)
 
-        # Should not raise — uses getattr(), not dict access
-        await provider._async_remember("test content")
+        with patch("engram_client.EngramClient", return_value=client_context):
+            result = await provider._async_remember("test content")
 
         mock_client.remember.assert_called_once_with(
             content="test content",
             source_type="sync_turn",
+            source_session=None,
+            metadata=None,
         )
+        assert result is mock_result
 
     @pytest.mark.asyncio
-    async def test_remember_client_none_is_safe(self, provider):
-        """When Engram client is unavailable, should log warning and return."""
-        provider._hooks._get_client.return_value = None
-        await provider._async_remember("test content")  # should not raise
+    async def test_missing_base_url_is_a_write_failure(self, provider):
+        provider._config.base_url = ""
+        with pytest.raises(RuntimeError, match="ENGRAM_BASE_URL is unset"):
+            await provider._async_remember("test content")
 
     @pytest.mark.asyncio
-    async def test_remember_exception_is_caught(self, provider):
-        """SDK exceptions should be caught and logged, not propagated."""
+    async def test_remember_exception_propagates_to_tool_result(self, provider):
         mock_client = AsyncMock()
         mock_client.remember = AsyncMock(side_effect=Exception("Network error"))
-        provider._hooks._get_client.return_value = mock_client
+        client_context = MagicMock()
+        client_context.__aenter__ = AsyncMock(return_value=mock_client)
+        client_context.__aexit__ = AsyncMock(return_value=None)
 
-        await provider._async_remember("test content")  # should not raise
+        with (
+            patch("engram_client.EngramClient", return_value=client_context),
+            pytest.raises(Exception, match="Network error"),
+        ):
+            await provider._async_remember("test content")

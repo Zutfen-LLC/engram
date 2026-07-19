@@ -11,6 +11,7 @@ to ``~/.hermes/plugins/engram_memory/`` and setting
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -20,6 +21,83 @@ logger = logging.getLogger(__name__)
 
 _READ_BRIDGE: Any | None = None
 _REGISTERED = False
+
+
+def _contains_governed_add(args: Any) -> bool:
+    """Return true when a stock memory-tool call could persist a durable add."""
+    if not isinstance(args, dict):
+        return False
+    target = args.get("target") or "memory"
+    if target not in {"memory", "user"}:
+        return False
+    if args.get("action") == "add":
+        return True
+    operations = args.get("operations")
+    return isinstance(operations, list) and any(
+        isinstance(operation, dict) and operation.get("action") == "add"
+        for operation in operations
+    )
+
+
+def _pre_tool_call_fail_closed(
+    *, tool_name: str = "", args: Any = None, **kwargs: Any
+) -> dict[str, str] | None:
+    """Block native durable adds while required Engram capture is inactive.
+
+    This general-plugin hook lives outside MemoryProvider initialization. Stock
+    Hermes swallows provider initialization exceptions, so the shared
+    ``engram_hooks`` activation status must be checked again at the last common
+    boundary before either memory executor reaches the native writer.
+    """
+    del kwargs
+    if tool_name != "memory" or not _contains_governed_add(args):
+        return None
+
+    import os
+
+    env_requires_capture = os.environ.get(
+        "ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE", "false"
+    ).lower() in {"1", "true", "yes", "on"}
+    try:
+        from engram_hooks import get_active_hooks, get_install_status
+
+        active_hooks = get_active_hooks()
+        requires_capture = (
+            active_hooks.config.require_automatic_capture
+            if active_hooks is not None
+            else env_requires_capture
+        )
+        status = get_install_status()
+    except Exception as exc:
+        if not env_requires_capture:
+            return None
+        message = (
+            "Engram automatic capture is required but activation status could not be read; "
+            "native memory/user add blocked"
+        )
+        logger.critical("%s: %s", message, exc)
+        return {"action": "block", "message": message}
+
+    if not requires_capture:
+        return None
+
+    if status is not None and status.automatic_capture_active:
+        # The stock wrapper must execute so it can return Engram's successful
+        # replacement result instead of Hermes' pre-tool blocked/error shape.
+        return None
+
+    activation_mode = status.activation_mode if status is not None else "absent"
+    reason = (
+        status.failure_reason
+        if status is not None
+        else "provider initialization did not run"
+    )
+    message = (
+        "Engram automatic capture is required but inactive "
+        f"(activation_status={activation_mode}); native memory/user add blocked"
+    )
+    logger.critical("%s: %s", message, reason)
+    return {"action": "block", "message": message}
 
 
 def register(ctx: Any) -> None:
@@ -33,6 +111,7 @@ def register(ctx: Any) -> None:
     from .recall_bridge import RecallBridge
 
     bridge = RecallBridge(HooksConfig())
+    ctx.register_hook("pre_tool_call", _pre_tool_call_fail_closed)
     ctx.register_hook("pre_llm_call", bridge.pre_llm_call)
     ctx.register_hook("on_session_start", bridge.on_session_start)
     ctx.register_hook("on_session_reset", bridge.on_session_reset)
@@ -224,8 +303,6 @@ claim true. Attribute relied-on claims to Engram and surface contradictions."""
         intercept the native write. Returns ``None`` for rejected content or
         non-add/non-memory actions so native storage proceeds normally.
         """
-        import asyncio
-
         from engram_hooks import is_allowed, prepare_memory_write_guard
 
         # Only intercept add operations on memory/user targets.
@@ -251,68 +328,109 @@ claim true. Attribute relied-on claims to Engram and surface contradictions."""
             }
 
         # Content passed the guard — route to Engram instead of native store.
-        # Always fire-and-forget: the tool return value is already set below.
+        # Hermes' tool call is synchronous, so bridge the async SDK call and do
+        # not acknowledge success until Engram has returned a durable item.
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.ensure_future(self._async_remember(content, metadata))
-            else:
-                # No running loop — run in a daemon thread, don't block.
-                import threading
+            acknowledged = self._wait_for_remember(content, metadata)
+        except Exception as exc:
+            logger.error("Engram remember failed; native add remains blocked: %s", exc)
+            return {
+                "handled": True,
+                "result": {
+                    "success": False,
+                    "error": f"Engram did not acknowledge the write: {exc}",
+                    "provider": "engram",
+                    "native_write": False,
+                },
+            }
 
-                def _bg_remember() -> None:
-                    try:
-                        asyncio.run(self._async_remember(content, metadata))
-                    except Exception as e:
-                        logger.debug("engram remember failed (background): %s", e)
-
-                threading.Thread(target=_bg_remember, daemon=True).start()
-        except RuntimeError:
-            import threading
-
-            def _bg_remember_re() -> None:
-                try:
-                    asyncio.run(self._async_remember(content, metadata))
-                except Exception as e:
-                    logger.debug("engram remember failed (background): %s", e)
-
-            threading.Thread(target=_bg_remember_re, daemon=True).start()
+        item_id = getattr(acknowledged, "id", None)
+        if not item_id:
+            return {
+                "handled": True,
+                "result": {
+                    "success": False,
+                    "error": "Engram response contained no durable item acknowledgement",
+                    "provider": "engram",
+                    "native_write": False,
+                },
+            }
+        review_status = getattr(acknowledged, "review_status", "?")
 
         return {
             "handled": True,
             "result": {
                 "success": True,
                 "message": (
-                    f"Submitted to Engram: {content[:80]}"
-                    f"{'...' if len(content) > 80 else ''}"
+                    f"Stored in Engram: id={item_id} review_status={review_status}"
                 ),
                 "provider": "engram",
                 "native_write": False,
+                "item_id": str(item_id),
+                "review_status": str(review_status),
             },
         }
 
+    def _wait_for_remember(
+        self, content: str, metadata: dict[str, Any] | None = None
+    ) -> Any:
+        """Synchronously wait for the async Engram acknowledgement.
+
+        Stock Hermes may call the synchronous memory tool from a thread that
+        already owns a running asyncio loop. ``asyncio.run`` cannot nest in
+        that case, so execute the one-shot request in a helper thread and join
+        it before returning the tool result.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self._async_remember(content, metadata))
+
+        import threading
+
+        result: list[Any] = []
+        errors: list[BaseException] = []
+
+        def _run() -> None:
+            try:
+                result.append(asyncio.run(self._async_remember(content, metadata)))
+            except BaseException as exc:  # propagate the exact failure to Hermes
+                errors.append(exc)
+
+        thread = threading.Thread(target=_run, name="engram-write-ack", daemon=True)
+        thread.start()
+        thread.join()
+        if errors:
+            raise errors[0]
+        if not result:
+            raise RuntimeError("Engram write acknowledgement worker returned no result")
+        return result[0]
+
     async def _async_remember(
         self, content: str, metadata: dict[str, Any] | None = None
-    ) -> None:
-        """Write a memory item to Engram via the SDK."""
-        client = self._hooks._get_client()
-        if client is None:
-            logger.warning("Engram client unavailable — memory not stored")
-            return
+    ) -> Any:
+        """Write one item and return only after the Engram API acknowledges it."""
+        if not self._config.base_url:
+            raise RuntimeError("ENGRAM_BASE_URL is unset")
 
-        try:
+        import engram_client
+
+        async with engram_client.EngramClient(
+            self._config.base_url,
+            self._config.api_key,
+            timeout=self._config.timeout,
+        ) as client:
             result = await client.remember(
                 content=content,
                 source_type="sync_turn",
+                source_session=self._session_id or None,
+                metadata=metadata,
             )
-            # SDK returns Pydantic models — use attribute access
-            item_id = getattr(result, "id", None) or "?"
-            review_status = getattr(result, "review_status", "?")
-            logger.info(
-                "Engram remember OK: id=%s review_status=%s", item_id, review_status
-            )
-        except Exception as e:
-            logger.error("Engram remember failed: %s", e)
+        # SDK returns Pydantic models — use attribute access.
+        item_id = getattr(result, "id", None) or "?"
+        review_status = getattr(result, "review_status", "?")
+        logger.info("Engram remember OK: id=%s review_status=%s", item_id, review_status)
+        return result
 
     # ---- Lifecycle hooks ----
 
