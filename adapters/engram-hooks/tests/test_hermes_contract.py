@@ -25,12 +25,19 @@ def test_stock_write_fixture_records_exact_source_provenance() -> None:
     provenance = _PROVENANCE.read_text()
     assert f"Revision: `{HERMES_REFERENCE_SHA}`" in provenance
     assert "Engram work-start revision: `906fc1d30128f49d4653c94688f08bde5b0c65b0`" in provenance
+    assert (
+        "Discovery correction work-start revision: "
+        "`85d3b67e61511b0c181f8e8c21704d36c333fa1a`"
+    ) in provenance
     for source_path in (
         "agent/tool_executor.py",
         "agent/agent_runtime_helpers.py",
+        "agent/agent_init.py",
         "tools/memory_tool.py",
         "agent/memory_manager.py",
         "agent/memory_provider.py",
+        "plugins/memory/__init__.py",
+        "hermes_cli/memory_setup.py",
         "hermes_cli/plugins.py",
     ):
         assert source_path in provenance

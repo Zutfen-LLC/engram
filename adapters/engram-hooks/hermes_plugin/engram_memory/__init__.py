@@ -62,49 +62,16 @@ class EngramMemoryProvider(MemoryProvider):
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        from engram_hooks import (
-            AutomaticCaptureUnavailable,
-            HooksConfig,
-            LifecycleHooks,
-            install,
-        )
+        from engram_hooks import HooksConfig, LifecycleHooks
 
         self._config = HooksConfig()
         self._hooks = LifecycleHooks(self._config)
         self._session_id: str = ""
-
-        # Install the compat shim / native hook detection.
-        try:
-            self._install_result = install(
-                config=self._config,
-                write_interceptor=self.prepare_memory_write,
-            )
-            status = self._install_result.get("status")
-            self._native_hook = status.native_hook_available if status else False
-            self._compat_shim = status.compat_shim_installed if status else False
-            self._activation_mode = status.activation_mode if status else "incompatible"
-        except AutomaticCaptureUnavailable:
-            logger.critical(
-                "Engram automatic writes are required but interception could not activate",
-                exc_info=True,
-            )
-            raise
-        except Exception as e:
-            logger.error("engram-hooks install() failed: %s", e)
-            self._install_result = None
-            self._native_hook = False
-            self._compat_shim = False
-            self._activation_mode = "incompatible"
-            if self._config.require_automatic_capture:
-                raise
-
-        logger.info(
-            "Engram Hermes integration: read_hook=pre_llm_call read_enabled=%s "
-            "provider_prefetch=inert write_interception=%s base_url=%s",
-            self._config.recall_enabled,
-            self._activation_mode,
-            getattr(self._config, "base_url", None) or "(unset)",
-        )
+        self._install_result: dict[str, Any] | None = None
+        self._native_hook = False
+        self._compat_shim = False
+        self._activation_mode = "uninitialized"
+        self._initialized = False
 
     # ---- ABC required methods ----
 
@@ -131,16 +98,66 @@ class EngramMemoryProvider(MemoryProvider):
     def initialize(self, session_id: str, **kwargs: Any) -> None:
         """Initialize for a session.
 
-        Called once at agent startup. Stores the session ID and logs the
-        activation path.
+        Stock Hermes calls this only after discovery has loaded and selected
+        the configured provider for an agent session. Runtime interception is
+        therefore activated here, never during provider discovery or status.
         """
+        from engram_hooks import AutomaticCaptureUnavailable, install
+        from engram_hooks.hooks import (
+            HERMES_REFERENCE_REPOSITORY,
+            HERMES_REFERENCE_SHA,
+        )
+
         self._hooks.reset_session_context()
+        self._initialized = False
+        try:
+            install_result = install(
+                config=self._config,
+                write_interceptor=self.prepare_memory_write,
+            )
+            status = install_result.get("status")
+            self._install_result = install_result
+            installed_hooks = install_result.get("hooks")
+            if installed_hooks is not None:
+                self._hooks = installed_hooks
+            self._native_hook = status.native_hook_available if status else False
+            self._compat_shim = status.compat_shim_installed if status else False
+            self._activation_mode = status.activation_mode if status else "incompatible"
+        except AutomaticCaptureUnavailable as exc:
+            self._install_result = None
+            self._native_hook = exc.status.native_hook_available
+            self._compat_shim = exc.status.compat_shim_installed
+            self._activation_mode = exc.status.activation_mode
+            logger.critical(
+                "Engram automatic writes are required but interception could not activate",
+                exc_info=True,
+            )
+            raise
+        except Exception as exc:
+            self._install_result = None
+            self._native_hook = False
+            self._compat_shim = False
+            self._activation_mode = "incompatible"
+            logger.error("engram-hooks install() failed: %s", exc)
+            if self._config.require_automatic_capture:
+                raise
+
         self._session_id = session_id
-        agent_context = kwargs.get("agent_context", "primary")
+        self._initialized = True
         logger.info(
-            "EngramMemoryProvider.initialize: session=%s context=%s",
+            "Engram Hermes integration initialized: session=%s context=%s "
+            "read_hook=pre_llm_call read_enabled=%s provider_prefetch=inert "
+            "write_interception=%s native_hook=%s compat_shim=%s "
+            "contract=%s@%s base_url=%s",
             session_id,
-            agent_context,
+            kwargs.get("agent_context", "primary"),
+            self._config.recall_enabled,
+            self._activation_mode,
+            self._native_hook,
+            self._compat_shim,
+            HERMES_REFERENCE_REPOSITORY,
+            HERMES_REFERENCE_SHA,
+            getattr(self._config, "base_url", None) or "(unset)",
         )
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:

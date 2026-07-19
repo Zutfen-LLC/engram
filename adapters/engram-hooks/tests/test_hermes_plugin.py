@@ -4,7 +4,7 @@ Tests verify:
 1. ABC conformance — all abstract methods implemented, instantiation succeeds.
 2. prepare_memory_write routing — allows durable content, rejects ephemeral.
 3. _async_remember — SDK attribute access (Pydantic), not dict access.
-4. is_available — checks env/config without network calls.
+4. discovery-safe lifecycle — construction is inert and initialize activates.
 
 These tests do NOT require a live Engram instance or a real Hermes installation.
 A stub ABC mirroring Hermes' MemoryProvider is installed per-test.
@@ -126,6 +126,7 @@ def provider():
     status = MagicMock()
     status.native_hook_available = True
     status.compat_shim_installed = False
+    status.activation_mode = "native_prepare"
     mock_pkg.install.return_value = {
         "hooks": hooks_instance,
         "status": status,
@@ -169,6 +170,13 @@ class TestABCConformance:
 
     def test_instantiation_succeeds(self, provider):
         assert provider is not None
+        assert provider._install_result is None
+        assert provider._activation_mode == "uninitialized"
+        assert provider._initialized is False
+
+        from engram_hooks import install
+
+        install.assert_not_called()
 
     def test_name_property(self, provider):
         assert provider.name == "engram_memory"
@@ -179,6 +187,7 @@ class TestABCConformance:
     def test_initialize_stores_session_id(self, provider):
         provider.initialize("test-session-123", agent_context="primary")
         assert provider._session_id == "test-session-123"
+        assert provider._initialized is True
         provider._hooks.reset_session_context.assert_called_once_with()
 
     def test_get_tool_schemas_returns_empty(self, provider):
@@ -186,12 +195,15 @@ class TestABCConformance:
 
     def test_install_result_parsed_correctly(self, provider):
         """install() returns a dict — the old code accessed .native_hook_available on it."""
+        provider.initialize("test-session")
         assert provider._native_hook is True
         assert provider._compat_shim is False
+        assert provider._activation_mode == "native_prepare"
 
     def test_provider_registers_its_governed_write_callback(self, provider):
         from engram_hooks import install
 
+        provider.initialize("test-session")
         assert install.call_args.kwargs["write_interceptor"].__self__ is provider
 
     def test_static_system_prompt_treats_evidence_as_quoted_data(self, provider):
@@ -284,7 +296,7 @@ def test_dual_loader_keeps_general_and_provider_module_state_separate(monkeypatc
     assert ctx.register_hook.call_count == 4
 
 
-def test_required_capture_activation_failure_is_not_swallowed(monkeypatch):
+def test_required_capture_activation_failure_occurs_only_during_initialize(monkeypatch):
     class StockMemoryProvider:
         def __init__(self, **kwargs: Any) -> None:
             del kwargs
@@ -304,10 +316,16 @@ def test_required_capture_activation_failure_is_not_swallowed(monkeypatch):
 
     from engram_hooks import AutomaticCaptureUnavailable
 
+    provider = EngramMemoryProvider()
+    assert provider._activation_mode == "uninitialized"
+    assert provider._initialized is False
+
     with pytest.raises(AutomaticCaptureUnavailable) as excinfo:
-        EngramMemoryProvider()
+        provider.initialize("required-capture-session")
 
     assert "tools.memory_tool.memory_tool" in str(excinfo.value)
+    assert provider._activation_mode == "incompatible"
+    assert provider._initialized is False
 
 
 # ---------------------------------------------------------------------------

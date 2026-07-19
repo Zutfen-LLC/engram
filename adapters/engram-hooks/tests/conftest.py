@@ -41,6 +41,17 @@ _FAKE_MODULE_NAMES = (
     "agent.agent_runtime_helpers",
     "tools",
     "tools.memory_tool",
+    "plugins",
+    "plugins.memory",
+    "hermes_cli",
+    "hermes_cli.config",
+    "hermes_cli.memory_setup",
+    "hermes_constants",
+    "_hermes_user_memory",
+    "_hermes_user_memory.engram_memory",
+    "_hermes_user_memory.engram_memory.recall_bridge",
+    "engram_memory",
+    "engram_memory.recall_bridge",
 )
 
 

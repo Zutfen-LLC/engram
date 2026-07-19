@@ -968,11 +968,11 @@ def install(
     *,
     write_interceptor: WriteInterceptor | None = None,
 ) -> dict[str, Any]:
-    """Plugin load entry point: build hooks, apply shim, return state.
+    """Runtime activation entry point: build hooks, apply shim, return state.
 
-    Call this once per process at plugin load (Hermes' plugin discovery
-    invokes it, or a human calls it from their Hermes profile/config — see
-    ``docs/ops/hermes-dogfood-profile.md``). It constructs the
+    Call this when Hermes initializes the selected memory provider for an
+    agent session, not while discovery/status merely instantiates candidate
+    providers. It constructs the
     :class:`LifecycleHooks` engine, detects/patches ``prepare_memory_write``
     if the profile has the compat shim enabled, and returns a dict the caller
     can log or inspect: ``{"hooks": LifecycleHooks, "status": InstallStatus}``.

@@ -268,6 +268,10 @@ the newest provider instance. Disabling compatibility, or reinstalling without
 a provider callback, restores the native boundary rather than retaining a
 stale provider — see `_SHIM_MARKER` in `hooks.py`.
 
+`EngramMemoryProvider` does not call `install()` during construction,
+discovery, or `hermes memory status`. Stock Hermes activates interception only
+when it calls the selected provider's `initialize()` for an agent session.
+
 Set `ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE=true` to make `install()` raise
 `AutomaticCaptureUnavailable` instead of returning when neither the native
 hook nor the compat shim ends up active — for profiles where "engram-hooks is
@@ -309,8 +313,8 @@ assert not is_allowed(verdict)
 
 The upstream `prepare_memory_write` hook ([PR
 #59898](https://github.com/NousResearch/hermes-agent/pull/59898)) is **not** in
-stock Hermes as of 2026-07-06. `install()` detects whether it exists on the
-`MemoryProvider` ABC at load time:
+stock Hermes as of 2026-07-06. During selected-provider initialization,
+`install()` detects whether it exists on the `MemoryProvider` ABC:
 
 - **Hook present** (PR merged) → registered natively, no patching.
 - **Hook missing at the pinned stock revision** → the compatibility shim wraps
