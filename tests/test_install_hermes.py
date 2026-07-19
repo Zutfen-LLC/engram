@@ -409,6 +409,7 @@ def test_hermes_api_drift_rolls_back_profile_and_fails_loudly(harness: Harness) 
 
     assert result.returncode != 0
     assert "tools.memory_tool.memory_tool" in _combined(result)
+    assert "36f2a966c7f9f69987494b867c3dcf96b69a5766" in _combined(result)
     assert config.read_bytes() == config_before
     assert env_file.read_bytes() == env_before
     assert harness.key not in _combined(result)

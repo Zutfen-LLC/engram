@@ -4,7 +4,7 @@
 service. The Track A manual dogfood gate below has not yet been run.
 
 Compatibility contract: `NousResearch/hermes-agent` at
-`75467998f90ba87adf66e1254a4d163345f23a5f`. Do not patch that repository. The
+`36f2a966c7f9f69987494b867c3dcf96b69a5766`. Do not patch that repository. The
 checked-in [`profiles/hermes-engram-dogfood.yaml`](../../profiles/hermes-engram-dogfood.yaml)
 models the stock configuration.
 
@@ -96,6 +96,9 @@ blocked error and offers no successful replacement result. Native
 Startup logs report `read_hook=pre_llm_call`, whether reads are enabled,
 `provider_prefetch=inert`, and one of `native_prepare`, `stock_compat`,
 `recall_only`, or `incompatible`. Required capture makes the last two fail visibly.
+Repeated installs update the callback owned by the surviving wrapper, including
+after a full plugin module replacement; disabling the shim or reinstalling
+without a provider callback restores the native boundary.
 
 ## Installation
 

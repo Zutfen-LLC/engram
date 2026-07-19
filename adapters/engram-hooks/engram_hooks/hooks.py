@@ -127,7 +127,7 @@ _UPSTREAM_PR_URL = "https://github.com/NousResearch/hermes-agent/pull/59898"
 # call, but can only produce a blocked/error result, so it cannot replace a
 # successful accepted write.
 HERMES_REFERENCE_REPOSITORY = "NousResearch/hermes-agent"
-HERMES_REFERENCE_SHA = "75467998f90ba87adf66e1254a4d163345f23a5f"
+HERMES_REFERENCE_SHA = "36f2a966c7f9f69987494b867c3dcf96b69a5766"
 _HERMES_MEMORY_TOOL_MODULE = "tools.memory_tool"
 _HERMES_MEMORY_TOOL_ATTR = "memory_tool"
 
@@ -683,6 +683,7 @@ def _find_memory_provider() -> type:
 # restore the exact pre-shim function.
 _SHIM_MARKER = "__engram_hooks_shim__"
 _SHIM_ORIGINAL = "__engram_hooks_original__"
+_SHIM_INTERCEPTOR = "__engram_hooks_interceptor__"
 
 
 def _replacement_result(result: dict[str, Any] | None) -> str:
@@ -722,15 +723,31 @@ def _batch_contains_add(operations: Any) -> bool:
     )
 
 
-def _patch_memory_tool(mod: Any) -> bool:
-    """Wrap stock Hermes' shared memory-tool write boundary."""
+def _patch_memory_tool(mod: Any, write_interceptor: WriteInterceptor) -> bool:
+    """Wrap stock Hermes' shared memory-tool write boundary.
+
+    The active callback lives on the wrapper rather than only in this module's
+    globals. Hermes can retain the patched ``tools.memory_tool`` module while a
+    plugin reload replaces ``engram_hooks.hooks`` with a new module object. In
+    that case the surviving wrapper still resolves the newly installed
+    provider, and does not retain or call the provider from the old module.
+    """
     import json
 
     original = getattr(mod, _HERMES_MEMORY_TOOL_ATTR, None)
     if not callable(original):
         return False
     if getattr(original, _SHIM_MARKER, False):
-        return True
+        wrapped = original
+        original = getattr(wrapped, _SHIM_ORIGINAL, None)
+        if not callable(original):
+            return False
+        if hasattr(wrapped, _SHIM_INTERCEPTOR):
+            setattr(wrapped, _SHIM_INTERCEPTOR, write_interceptor)
+            return True
+        # Upgrade a wrapper installed by Engram <=0.2.0. That implementation
+        # resolved only its defining module's global callback, which becomes
+        # stale after a full module replacement.
 
     def wrapper(
         action: str | None = None,
@@ -760,7 +777,7 @@ def _patch_memory_tool(mod: Any) -> bool:
 
         effective_target = target or "memory"
         if action == "add" and effective_target in {"memory", "user"}:
-            interceptor = get_active_write_interceptor()
+            interceptor = getattr(wrapper, _SHIM_INTERCEPTOR, None)
             if interceptor is None:
                 logger.error(
                     "engram-hooks wrapper is active without a write interceptor; "
@@ -802,6 +819,7 @@ def _patch_memory_tool(mod: Any) -> bool:
 
     setattr(wrapper, _SHIM_MARKER, True)
     setattr(wrapper, _SHIM_ORIGINAL, original)
+    setattr(wrapper, _SHIM_INTERCEPTOR, write_interceptor)
     setattr(mod, _HERMES_MEMORY_TOOL_ATTR, wrapper)
     logger.info(
         "engram-hooks stock-Hermes interception active: %s.%s (reference %s@%s)",
@@ -823,6 +841,8 @@ def _restore_memory_tool() -> bool:
     original = getattr(current, _SHIM_ORIGINAL, None)
     if not getattr(current, _SHIM_MARKER, False) or not callable(original):
         return False
+    if hasattr(current, _SHIM_INTERCEPTOR):
+        delattr(current, _SHIM_INTERCEPTOR)
     setattr(mod, _HERMES_MEMORY_TOOL_ATTR, original)
     logger.info("engram-hooks restored native %s.memory_tool", _HERMES_MEMORY_TOOL_MODULE)
     return True
@@ -850,6 +870,7 @@ def install_compat_shim(
     detection = detect_prepare_memory_write()
 
     if write_interceptor is None:
+        _restore_memory_tool()
         reason = (
             "no Engram provider write interceptor was registered; refusing to claim "
             "automatic capture"
@@ -857,7 +878,7 @@ def install_compat_shim(
         return InstallStatus(
             native_hook_available=False,
             compat_shim_installed=False,
-            activation_mode="incompatible",
+            activation_mode="recall_only",
             failure_reason=reason,
             detection=detection,
         )
@@ -908,7 +929,7 @@ def install_compat_shim(
     else:
         target_error = "attribute missing or non-callable"
 
-    if mod is None or not _patch_memory_tool(mod):
+    if mod is None or not _patch_memory_tool(mod, write_interceptor):
         # Hermes is installed but every known dispatch site is gone or
         # renamed — API drift. Fail loudly with actionable diagnostics rather
         # than a debug-level "no patch applied" that an operator would miss.

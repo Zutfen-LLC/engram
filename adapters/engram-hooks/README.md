@@ -261,7 +261,11 @@ result = await hooks.sync_turn(payload)
 
 `install()` is idempotent: calling it again (e.g. a Hermes plugin-reload path)
 re-detects and recognizes an already-patched dispatch site instead of
-wrapping it a second time — see `_SHIM_MARKER` in `hooks.py`.
+wrapping it a second time. The active provider callback is owned by the
+surviving wrapper, so even a full `engram_hooks.hooks` module replacement uses
+the newest provider instance. Disabling compatibility, or reinstalling without
+a provider callback, restores the native boundary rather than retaining a
+stale provider — see `_SHIM_MARKER` in `hooks.py`.
 
 Set `ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE=true` to make `install()` raise
 `AutomaticCaptureUnavailable` instead of returning when neither the native

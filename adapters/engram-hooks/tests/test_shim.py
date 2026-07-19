@@ -19,7 +19,7 @@ from engram_hooks.hooks import (
     install,
 )
 
-_CONTRACT_ROOT = Path(__file__).parent / "fixtures" / "hermes_stock_75467998"
+_CONTRACT_ROOT = Path(__file__).parent / "fixtures" / "hermes_stock_36f2a966"
 
 
 def _config(tmp_path: Path, **overrides: Any) -> HooksConfig:
@@ -34,7 +34,14 @@ class _Manager:
     def __init__(self) -> None:
         self.notifications: list[tuple[Any, dict[str, Any]]] = []
 
-    def notify_memory_tool_write(self, result: Any, args: dict[str, Any]) -> None:
+    def notify_memory_tool_write(
+        self,
+        result: Any,
+        args: dict[str, Any],
+        *,
+        build_metadata: Any = None,
+    ) -> None:
+        del build_metadata
         self.notifications.append((result, args))
 
 
@@ -168,7 +175,7 @@ def test_contract_has_nested_lazy_import_shape_not_module_memory_attributes(
     assert not hasattr(stock_contract["runtime_helpers"], "memory")
     assert getattr(stock_contract["memory_tool"].memory_tool, _SHIM_MARKER) is True
     assert HERMES_REFERENCE_REPOSITORY == "NousResearch/hermes-agent"
-    assert HERMES_REFERENCE_SHA == "75467998f90ba87adf66e1254a4d163345f23a5f"
+    assert HERMES_REFERENCE_SHA == "36f2a966c7f9f69987494b867c3dcf96b69a5766"
 
 
 def test_native_prepare_status_restores_and_skips_compat_wrapper(
@@ -213,6 +220,76 @@ def test_reinstall_updates_provider_without_double_wrap_or_duplicate_submission(
     assert store.entries["memory"] == []
 
 
+def test_full_hooks_module_replacement_updates_surviving_wrapper_provider(
+    stock_contract: dict[str, Any], tmp_path: Path
+) -> None:
+    """A Hermes plugin reload can retain tools.memory_tool but replace hooks.py."""
+    import engram_hooks
+    import engram_hooks.hooks as old_hooks_module
+
+    first_writer = _GovernedWriter()
+    old_hooks_module.install(_config(tmp_path), write_interceptor=first_writer)
+    surviving_wrapper = stock_contract["memory_tool"].memory_tool
+
+    sys.modules.pop("engram_hooks.hooks", None)
+    if hasattr(engram_hooks, "hooks"):
+        delattr(engram_hooks, "hooks")
+    new_hooks_module = importlib.import_module("engram_hooks.hooks")
+    second_writer = _GovernedWriter()
+    new_hooks_module.install(_config(tmp_path), write_interceptor=second_writer)
+    store = stock_contract["memory_tool"].MemoryStore()
+
+    stock_contract["runtime_helpers"].execute_memory(
+        _Agent(store),
+        {
+            "action": "add",
+            "target": "memory",
+            "content": "The durable reload policy uses the newest provider instance.",
+        },
+    )
+
+    assert stock_contract["memory_tool"].memory_tool is surviving_wrapper
+    assert first_writer.calls == []
+    assert len(second_writer.calls) == 1
+    assert store.entries["memory"] == []
+    sys.modules["engram_hooks.hooks"] = old_hooks_module
+    engram_hooks.hooks = old_hooks_module
+
+
+def test_install_upgrades_legacy_global_callback_wrapper(
+    stock_contract: dict[str, Any], tmp_path: Path
+) -> None:
+    memory_tool_module = stock_contract["memory_tool"]
+    native_writer = memory_tool_module.memory_tool
+
+    def legacy_wrapper(**kwargs: Any) -> str:
+        return native_writer(**kwargs)
+
+    setattr(legacy_wrapper, _SHIM_MARKER, True)
+    legacy_wrapper.__engram_hooks_original__ = native_writer  # type: ignore[attr-defined]
+    memory_tool_module.memory_tool = legacy_wrapper
+    writer = _GovernedWriter()
+
+    status = install(_config(tmp_path), write_interceptor=writer)["status"]
+    store = memory_tool_module.MemoryStore()
+    result = json.loads(
+        stock_contract["tool_executor"].execute_memory(
+            _Agent(store),
+            {
+                "action": "add",
+                "target": "memory",
+                "content": "An upgraded plugin uses its newly registered Engram provider.",
+            },
+        )
+    )
+
+    assert status.activation_mode == "stock_compat"
+    assert memory_tool_module.memory_tool is not legacy_wrapper
+    assert len(writer.calls) == 1
+    assert result["provider"] == "engram"
+    assert store.entries["memory"] == []
+
+
 def test_disabling_compatibility_restores_native_behavior(
     stock_contract: dict[str, Any], tmp_path: Path
 ) -> None:
@@ -239,6 +316,34 @@ def test_disabling_compatibility_restores_native_behavior(
     assert result["success"] is True
     assert store.entries["memory"] == [
         "This deliberate recall-only call uses native storage."
+    ]
+    assert writer.calls == []
+
+
+def test_reinstall_without_provider_restores_native_boundary(
+    stock_contract: dict[str, Any], tmp_path: Path
+) -> None:
+    writer = _GovernedWriter()
+    install(_config(tmp_path), write_interceptor=writer)
+
+    status = install(_config(tmp_path))["status"]
+    store = stock_contract["memory_tool"].MemoryStore()
+    result = json.loads(
+        stock_contract["tool_executor"].execute_memory(
+            _Agent(store),
+            {
+                "action": "add",
+                "target": "memory",
+                "content": "Recall-only mode deliberately restores stock persistence.",
+            },
+        )
+    )
+
+    assert status.activation_mode == "recall_only"
+    assert status.automatic_capture_active is False
+    assert result["success"] is True
+    assert store.entries["memory"] == [
+        "Recall-only mode deliberately restores stock persistence."
     ]
     assert writer.calls == []
 

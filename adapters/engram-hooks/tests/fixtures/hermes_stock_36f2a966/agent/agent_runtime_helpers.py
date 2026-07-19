@@ -1,4 +1,4 @@
-"""Pinned nested/lazy-import shape from stock agent/tool_executor.py."""
+"""Pinned nested/lazy-import shape from stock agent/agent_runtime_helpers.py."""
 from __future__ import annotations
 
 from typing import Any
@@ -19,7 +19,14 @@ def execute_memory(agent: Any, function_args: dict[str, Any]) -> str:
             store=agent._memory_store,
         )
         if agent._memory_manager:
-            agent._memory_manager.notify_memory_tool_write(result, next_args)
+            agent._memory_manager.notify_memory_tool_write(
+                result,
+                next_args,
+                build_metadata=lambda: agent._build_memory_write_metadata(
+                    task_id="fixture-task",
+                    tool_call_id="fixture-tool-call",
+                ),
+            )
         return result
 
     return _execute(function_args)

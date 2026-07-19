@@ -8,6 +8,7 @@ readonly DEFAULT_BASE_URL="https://api.engram.zutfen.com"
 readonly DEFAULT_REF="main"
 readonly REPOSITORY_URL="https://github.com/Zutfen-LLC/engram.git"
 readonly PLUGIN_SUBDIR="adapters/engram-hooks/hermes_plugin/engram_memory"
+readonly HERMES_REFERENCE="NousResearch/hermes-agent@36f2a966c7f9f69987494b867c3dcf96b69a5766"
 
 BASE_URL="$DEFAULT_BASE_URL"
 PROFILE=""
@@ -460,7 +461,7 @@ from agent.memory_provider import MemoryProvider
 from tools.memory_tool import memory_tool
 assert isinstance(MemoryProvider, type) and callable(memory_tool)
 ' || die "Hermes compatibility verification" \
-    "required target tools.memory_tool.memory_tool is unavailable in the live Hermes runtime"
+    "required target tools.memory_tool.memory_tool is unavailable in the live Hermes runtime; inspected contract: $HERMES_REFERENCE; reinstall a compatible Engram plugin or use deliberate recall-only mode"
 "$HERMES_PYTHON" - verify-direct-url "$RESOLVED_COMMIT" <<'PY' \
     || die "Python revision verification" "installed Engram packages do not match the resolved commit"
 import importlib.metadata
