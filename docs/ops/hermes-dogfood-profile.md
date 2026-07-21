@@ -324,3 +324,8 @@ that may have influenced the prior answer without claiming causal reliance.
 - [ ] Not yet run. Record the Engram commit, Hermes commit, sanitized startup
       status line, item ID, recall-log IDs, first/follow-up responses, observed
       latency, and confirmation that stock Hermes (not a fork) was used.
+
+> The deterministic memory E2E audit harness (`scripts/run_memory_e2e_audit.py`)
+> automates the write-interception, recall, and epistemic-safety gates above
+> with independent fixtures and a sanitized report. See
+> [`memory-e2e-audit.md`](memory-e2e-audit.md) for the full operator runbook.
