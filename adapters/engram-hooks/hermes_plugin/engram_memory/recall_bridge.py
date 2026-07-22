@@ -521,6 +521,8 @@ class RecallBridge:
             # Audit trace: emit one sanitized record when the env var is set.
             # Import is deferred so test contexts that don't have the full
             # plugin package initialized can still exercise recall_bridge.
+            # Pass the actual query/session/turn so the trace binds to this
+            # exact audit action.
             try:
                 from .audit_trace import emit_audit_trace
 
@@ -540,6 +542,9 @@ class RecallBridge:
                     "error_code": (
                         outcome.disposition.value if not outcome.semantic_completed else None
                     ),
+                    "query": query,
+                    "session_id": session_id,
+                    "turn_index": turn_index,
                 })
             except Exception:  # noqa: BLE001 — trace is best-effort, never breaks recall
                 pass

@@ -33,6 +33,7 @@ import os
 import re
 import sys
 import traceback
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -76,6 +77,29 @@ RECALL_FIXTURE_REASON = "Controlled Engram memory E2E audit fixture"
 EPISTEMIC_FIXTURE_REASON = "Controlled Engram epistemic-safety audit fixture"
 
 EPISTEMIC_TEST_QUERY = "What color is the sky on February 30th?"
+
+# Canonical prompts for audit trace binding.
+RECALL_CANONICAL_PROMPT = "What is the controlled Engram recall marker?"
+EPISTEMIC_CANONICAL_PROMPT = "What color is the sky on February 30th?"
+
+
+def _audit_prompt_sha256(prompt: str) -> str:
+    """Canonical SHA-256 hash of a prompt (shared by runbook, harness, plugin).
+
+    Normalization:
+    1. convert CRLF/CR to LF;
+    2. remove no content;
+    3. add no implicit trailing newline.
+    """
+    normalized = prompt.replace("\r\n", "\n").replace("\r", "\n")
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+# Precomputed canonical prompt hashes (computed at import time so the
+# harness and tests share the exact same values).
+RECALL_PROMPT_SHA256 = _audit_prompt_sha256(RECALL_CANONICAL_PROMPT)
+EPISTEMIC_PROMPT_SHA256 = _audit_prompt_sha256(EPISTEMIC_CANONICAL_PROMPT)
+
 # Bounded item budget for deterministic audit recall preflight. Does NOT
 # change global recall defaults — only the audit harness preflight call.
 AUDIT_RECALL_ITEM_BUDGET = 20
@@ -423,36 +447,72 @@ async def stage_0_identity_preflight(state: RunState, cfg: AuditConfig) -> None:
             denied_checks["authenticated"] = False
             denied_checks["error"] = "NEGATIVE_CONTROL_CREDENTIAL_INVALID"
         else:
+            same_tenant = denied_id.get("tenant_id") == agent_id.get("tenant_id")
+            distinct_key = (
+                denied_id.get("api_key_id") != agent_id.get("api_key_id")
+            )
+            # Parse the nested memory_profile object from the real /whoami shape.
+            try:
+                denied_profile = _whoami_profile(denied_id)
+            except ValueError:
+                denied_profile = None
+                denied_checks["profile_error"] = "malformed_nested_profile"
             denied_checks.update({
                 "authenticated": True,
-                "same_tenant": denied_id.get("tenant_id") == agent_id.get("tenant_id"),
-                "distinct_key_id": denied_id.get("api_key_id") != agent_id.get("api_key_id"),
-                "has_profile": denied_id.get("memory_profile_id") is not None,
-                "profile_id": denied_id.get("memory_profile_id"),
-                "profile_revision_id": denied_id.get("memory_profile_revision_id"),
-                "profile_version": denied_id.get("memory_profile_version"),
+                "same_tenant": same_tenant,
+                "distinct_key_id": distinct_key,
+                "has_profile": denied_profile is not None,
             })
-            # If owner diagnostics available, check include_tenant on the
-            # profile revision. include_tenant=true means the profile is not
-            # restrictive — the negative control would see other tenants' data.
-            if cfg.owner_db_url and denied_id.get("memory_profile_revision_id"):
-                try:
-                    profile_diag = await _owner_profile_diagnostic(
-                        cfg.owner_db_url, denied_id["memory_profile_revision_id"]
-                    )
-                    denied_checks["profile_diagnostic"] = profile_diag
-                    if profile_diag.get("available") and profile_diag.get("include_tenant"):
-                        # Fail-early condition: the denied key is not restrictive.
-                        denied_checks["restrictive"] = False
-                        denied_checks["error"] = "NEGATIVE_PROFILE_NOT_RESTRICTIVE"
-                    else:
-                        denied_checks["restrictive"] = True
-                except Exception:
+            if denied_profile is not None:
+                denied_checks["profile"] = {
+                    "id": denied_profile.profile_id,
+                    "slug": denied_profile.slug,
+                    "active_revision_id": denied_profile.active_revision_id,
+                    "version": denied_profile.version,
+                }
+            # Stable failure-reason diagnostics (not stage gates).
+            if not same_tenant:
+                denied_checks["restrictive"] = False
+                denied_checks["error"] = "NEGATIVE_CONTROL_TENANT_MISMATCH"
+            elif not distinct_key:
+                denied_checks["restrictive"] = False
+                denied_checks["error"] = "NEGATIVE_CONTROL_KEY_COLLISION"
+            elif denied_profile is None:
+                denied_checks["restrictive"] = False
+                denied_checks["error"] = "NEGATIVE_PROFILE_NOT_BOUND"
+            else:
+                # Profile is present and same-tenant. Now check the policy:
+                # include_tenant must be false for the profile to be restrictive.
+                if cfg.owner_db_url and denied_profile.active_revision_id:
+                    try:
+                        profile_diag = await _owner_profile_diagnostic(
+                            cfg.owner_db_url,
+                            denied_profile.active_revision_id,
+                        )
+                        denied_checks["profile_diagnostic"] = profile_diag
+                        if not profile_diag.get("available"):
+                            denied_checks["restrictive"] = None
+                            denied_checks["error"] = (
+                                "NEGATIVE_PROFILE_POLICY_UNPROVEN"
+                            )
+                        elif profile_diag.get("include_tenant"):
+                            denied_checks["restrictive"] = False
+                            denied_checks["error"] = (
+                                "NEGATIVE_PROFILE_NOT_RESTRICTIVE"
+                            )
+                        else:
+                            denied_checks["policy_proven"] = True
+                            denied_checks["include_tenant"] = False
+                            denied_checks["restrictive"] = True
+                            denied_checks["ready_for_stage_7"] = True
+                    except Exception:
+                        denied_checks["restrictive"] = None
+                        denied_checks["error"] = (
+                            "NEGATIVE_PROFILE_POLICY_UNPROVEN"
+                        )
+                else:
                     denied_checks["restrictive"] = None
                     denied_checks["error"] = "NEGATIVE_PROFILE_POLICY_UNPROVEN"
-            else:
-                denied_checks["restrictive"] = None
-                denied_checks["error"] = "NEGATIVE_PROFILE_POLICY_UNPROVEN"
         checks["denied_profile"] = denied_checks
 
     _stage_done(
@@ -464,19 +524,77 @@ async def stage_0_identity_preflight(state: RunState, cfg: AuditConfig) -> None:
     )
 
 
-def _safe_identity(who: dict[str, Any]) -> dict[str, Any]:
-    """Keep only sanitized identity fields supported by the current /whoami."""
-    allowed = (
-        "tenant_id",
-        "principal_id",
-        "principal_type",
-        "api_key_id",
-        "memory_profile_id",
-        "memory_profile_revision_id",
-        "memory_profile_version",
-        "scopes",
+@dataclass(frozen=True)
+class WhoAmIProfile:
+    """Typed nested ``/whoami.memory_profile`` object (the real public contract)."""
+
+    profile_id: str
+    slug: str
+    active_revision_id: str
+    version: int
+
+
+def _whoami_profile(identity: dict[str, Any]) -> WhoAmIProfile | None:
+    """Parse the nested ``memory_profile`` object from a real ``/whoami`` response.
+
+    Reads only the nested ``memory_profile`` dict — never infers a profile from
+    scopes, and never reads legacy flattened top-level test-only fields.
+
+    Returns ``None`` when the nested object is absent. Raises ``ValueError``
+    for partial/malformed profile objects that are present but incomplete.
+    """
+    raw = identity.get("memory_profile")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("memory_profile is not an object")
+    pid = raw.get("id")
+    slug = raw.get("slug")
+    revision_id = raw.get("active_revision_id")
+    version = raw.get("version")
+    if pid is None or slug is None or revision_id is None or version is None:
+        raise ValueError("memory_profile is missing required fields")
+    return WhoAmIProfile(
+        profile_id=str(pid),
+        slug=str(slug),
+        active_revision_id=str(revision_id),
+        version=int(version),
     )
-    return {k: who.get(k) for k in allowed if k in who}
+
+
+def _safe_identity(who: dict[str, Any]) -> dict[str, Any]:
+    """Keep only sanitized identity fields from the real ``/whoami`` contract.
+
+    The profile identity is retained from the nested ``memory_profile`` object,
+    normalized into a flat safe representation. No credentials are retained.
+    """
+    base = {
+        k: who.get(k)
+        for k in (
+            "tenant_id",
+            "principal_id",
+            "principal_type",
+            "api_key_id",
+            "scopes",
+        )
+        if k in who
+    }
+    # Parse the nested profile object; if it is absent, profile fields are
+    # simply omitted from the sanitized identity. If it is malformed, we
+    # record the malformed diagnosis so the caller can distinguish.
+    try:
+        profile = _whoami_profile(who)
+    except ValueError:
+        base["memory_profile_error"] = "malformed_nested_profile"
+        return base
+    if profile is not None:
+        base["memory_profile"] = {
+            "id": profile.profile_id,
+            "slug": profile.slug,
+            "active_revision_id": profile.active_revision_id,
+            "version": profile.version,
+        }
+    return base
 
 
 # ── Stage 1 — Hermes write interception (operator-submitted) ─────────────────
@@ -1399,7 +1517,7 @@ def cmd_prepare_hermes_recall(state: RunState, cfg: AuditConfig) -> None:
 # ── Hook trace validation ────────────────────────────────────────────────────
 
 HOOK_TRACE_SCHEMA = "engram.hermes-hook-audit-trace"
-HOOK_TRACE_SCHEMA_VERSION = "1.0"
+HOOK_TRACE_SCHEMA_VERSION = "2.0"
 
 
 def _validate_hook_trace(
@@ -1407,11 +1525,24 @@ def _validate_hook_trace(
     *,
     expected_item_id: str,
     expected_fixture: str,  # "recall" or "epistemic"
+    expected_run_id: str | None = None,
 ) -> tuple[str | None, dict[str, Any]]:
     """Validate a Hermes hook audit trace file.
 
     Returns ``(reason_code_or_None, trace_evidence)``. When
     ``reason_code`` is not None the trace failed validation.
+
+    Binding validation (Blocker B):
+    * ``audit_run_id`` must match ``expected_run_id`` (if both are present)
+    * ``audit_fixture`` must match ``expected_fixture``
+    * ``prompt_sha256`` must match the canonical hash for the fixture
+    * ``session_id_digest`` must be present
+    * ``turn_index`` must be a non-negative integer
+    * ``expected_prompt_sha256_match`` must be true (if the field exists)
+
+    Trace selection: select the record matching schema, schema version,
+    run ID, fixture, prompt hash, AND expected item ID — not just the last
+    structurally valid line.
     """
     if not trace_file.is_file():
         return "HERMES_HOOK_TRACE_MISSING", {}
@@ -1421,9 +1552,15 @@ def _validate_hook_trace(
     except OSError:
         return "HERMES_HOOK_TRACE_INVALID", {"error": "unreadable"}
 
-    # Find the last trace record matching the expected fixture context.
-    # Each line is one JSON object; take the last valid one.
-    best_record: dict[str, Any] | None = None
+    # Compute the expected prompt hash for this fixture.
+    if expected_fixture == "recall":
+        expected_prompt_hash = RECALL_PROMPT_SHA256
+    else:
+        expected_prompt_hash = EPISTEMIC_PROMPT_SHA256
+
+    # Parse all lines, tracking both matching and malformed records.
+    valid_records: list[dict[str, Any]] = []
+    malformed_count = 0
     for line in lines:
         line = line.strip()
         if not line:
@@ -1431,50 +1568,149 @@ def _validate_hook_trace(
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
+            malformed_count += 1
             continue
         if (
             record.get("schema") == HOOK_TRACE_SCHEMA
             and record.get("hook") == "pre_llm_call"
         ):
-            best_record = record
+            valid_records.append(record)
 
-    if best_record is None:
+    if not valid_records:
         return "HERMES_HOOK_TRACE_INVALID", {"error": "no_valid_pre_llm_call_record"}
 
-    # Schema version check.
-    if best_record.get("schema_version") != HOOK_TRACE_SCHEMA_VERSION:
+    # Select the best matching record: must match schema_version, fixture,
+    # prompt hash, AND contain the expected item ID.
+    best_match: dict[str, Any] | None = None
+    # Also track the last valid record as fallback for schema checks.
+    last_valid: dict[str, Any] | None = None
+
+    for record in valid_records:
+        if record.get("schema_version") != HOOK_TRACE_SCHEMA_VERSION:
+            continue
+        last_valid = record
+
+        # Check if this record matches all binding criteria.
+        record_fixture = record.get("audit_fixture")
+        record_prompt_hash = record.get("prompt_sha256")
+        record_run_id = record.get("audit_run_id")
+        retrieved_ids = record.get("retrieved_item_ids") or []
+        injected_ids = record.get("injected_item_ids") or []
+
+        fixture_match = record_fixture == expected_fixture
+        prompt_match = record_prompt_hash == expected_prompt_hash
+        run_match = (
+            expected_run_id is None
+            or record_run_id is None
+            or record_run_id == expected_run_id
+        )
+        item_retrieved = expected_item_id in retrieved_ids
+        item_injected = expected_item_id in injected_ids
+
+        if fixture_match and prompt_match and run_match and item_retrieved and item_injected:
+            best_match = record
+            break  # Take the first fully matching record.
+
+    # If no fully matching record, use the last valid one for error reporting.
+    report_record = best_match or last_valid
+    if report_record is None:
         return "HERMES_HOOK_TRACE_INVALID", {
             "error": "schema_version_mismatch",
-            "found": best_record.get("schema_version"),
+            "expected": HOOK_TRACE_SCHEMA_VERSION,
+            "malformed_line_count": malformed_count,
+        }
+
+    # Schema version check.
+    if report_record.get("schema_version") != HOOK_TRACE_SCHEMA_VERSION:
+        return "HERMES_HOOK_TRACE_INVALID", {
+            "error": "schema_version_mismatch",
+            "found": report_record.get("schema_version"),
+            "malformed_line_count": malformed_count,
         }
 
     # Provider check.
-    if best_record.get("provider") != "engram":
+    if report_record.get("provider") != "engram":
         return "HERMES_HOOK_TRACE_INVALID", {
             "error": "wrong_provider",
-            "found": best_record.get("provider"),
+            "found": report_record.get("provider"),
+            "malformed_line_count": malformed_count,
         }
 
     # Recall must have succeeded.
-    if not best_record.get("recall_succeeded"):
+    if not report_record.get("recall_succeeded"):
         return "HERMES_HOOK_TRACE_INVALID", {
             "error": "recall_did_not_succeed",
-            "error_code": best_record.get("error_code"),
+            "error_code": report_record.get("error_code"),
+            "malformed_line_count": malformed_count,
         }
 
     # Recall log ID must be present.
-    trace_log_id = best_record.get("recall_log_id")
+    trace_log_id = report_record.get("recall_log_id")
     if not trace_log_id:
-        return "HERMES_TRACE_PROVENANCE_MISMATCH", {"error": "trace_recall_log_id_null"}
+        return "HERMES_TRACE_PROVENANCE_MISMATCH", {
+            "error": "trace_recall_log_id_null",
+            "malformed_line_count": malformed_count,
+        }
 
-    retrieved_ids = best_record.get("retrieved_item_ids") or []
-    injected_ids = best_record.get("injected_item_ids") or []
+    # ── Binding validation ──────────────────────────────────────────────
+    # Only enforce binding checks when a best_match was found (i.e. when
+    # the trace actually contains a record that matches all binding
+    # criteria). If no best_match, fall through to individual checks below
+    # for precise error reporting.
+
+    if best_match is None:
+        # Determine which specific binding check failed.
+        for record in valid_records:
+            if record.get("schema_version") != HOOK_TRACE_SCHEMA_VERSION:
+                continue
+            record_fixture = record.get("audit_fixture")
+            record_run_id = record.get("audit_run_id")
+            record_prompt_hash = record.get("prompt_sha256")
+            session_digest = record.get("session_id_digest")
+            turn_raw = record.get("turn_index")
+
+            if expected_run_id and record_run_id and record_run_id != expected_run_id:
+                return "HERMES_TRACE_RUN_MISMATCH", {
+                    "expected_run_id": expected_run_id,
+                    "found_run_id": record_run_id,
+                    "malformed_line_count": malformed_count,
+                }
+            if record_fixture and record_fixture != expected_fixture:
+                return "HERMES_TRACE_FIXTURE_MISMATCH", {
+                    "expected_fixture": expected_fixture,
+                    "found_fixture": record_fixture,
+                    "malformed_line_count": malformed_count,
+                }
+            if (
+                record_prompt_hash
+                and record_prompt_hash != expected_prompt_hash
+            ):
+                return "HERMES_TRACE_PROMPT_MISMATCH", {
+                    "expected_prompt_sha256": expected_prompt_hash,
+                    "found_prompt_sha256": record_prompt_hash,
+                    "malformed_line_count": malformed_count,
+                }
+            if not session_digest:
+                return "HERMES_TRACE_SESSION_UNPROVEN", {
+                    "error": "session_id_digest_missing",
+                    "malformed_line_count": malformed_count,
+                }
+            if not isinstance(turn_raw, int) or turn_raw < 0:
+                return "HERMES_TRACE_TURN_INVALID", {
+                    "error": "turn_index_invalid",
+                    "found": turn_raw,
+                    "malformed_line_count": malformed_count,
+                }
+
+    retrieved_ids = report_record.get("retrieved_item_ids") or []
+    injected_ids = report_record.get("injected_item_ids") or []
 
     # Expected item must appear in retrieved_item_ids.
     if expected_item_id not in retrieved_ids:
         return "HERMES_EXPECTED_ITEM_NOT_RETRIEVED", {
             "expected_item_id": expected_item_id,
             "retrieved_item_ids": retrieved_ids,
+            "malformed_line_count": malformed_count,
         }
 
     # Expected item must appear in injected_item_ids (proves injection).
@@ -1483,6 +1719,7 @@ def _validate_hook_trace(
             "expected_item_id": expected_item_id,
             "retrieved_item_ids": retrieved_ids,
             "injected_item_ids": injected_ids,
+            "malformed_line_count": malformed_count,
         }
 
     # Compute trace file hash (we store the hash, not the raw content).
@@ -1494,8 +1731,19 @@ def _validate_hook_trace(
         "hook_trace_recall_log_id": trace_log_id,
         "retrieved_item_ids_match": expected_item_id in retrieved_ids,
         "injected_item_ids_match": expected_item_id in injected_ids,
-        "retrieved_item_count": best_record.get("retrieved_item_count"),
-        "injected_item_count": best_record.get("injected_item_count"),
+        "retrieved_item_count": report_record.get("retrieved_item_count"),
+        "injected_item_count": report_record.get("injected_item_count"),
+        "audit_run_id": report_record.get("audit_run_id"),
+        "audit_fixture": report_record.get("audit_fixture"),
+        "prompt_sha256": report_record.get("prompt_sha256"),
+        "expected_prompt_sha256_match": report_record.get(
+            "expected_prompt_sha256_match"
+        ),
+        "session_id_digest_present": bool(
+            report_record.get("session_id_digest")
+        ),
+        "turn_index": report_record.get("turn_index"),
+        "malformed_line_count": malformed_count,
     }
 
 
@@ -1547,6 +1795,7 @@ def cmd_record_hermes_recall(
             hook_trace_file,
             expected_item_id=fr.item_id,
             expected_fixture="recall",
+            expected_run_id=state.run_id,
         )
         evidence["hook_trace"] = trace_evidence
         if trace_reason is not None:
@@ -1802,6 +2051,7 @@ def cmd_record_epistemic_result(
             hook_trace_file,
             expected_item_id=fe.item_id,
             expected_fixture="epistemic",
+            expected_run_id=state.run_id,
         )
         evidence["hook_trace"] = trace_evidence
         if trace_reason is not None:
@@ -1955,62 +2205,133 @@ async def stage_7_negative_controls(state: RunState, cfg: AuditConfig) -> None:
         _stage_start(state, "negative_r_denied_profile", bucket="negative")
         denied = EngramAPI(cfg.base_url, cfg.denied_key)
         fr = state.fixture("recall")
-        try:
-            denied_identity = await denied.whoami()
-            state.negative("negative_r_denied_profile").evidence["credential_identity"] = (
-                _safe_identity(denied_identity)
-            )
-        except APIError:
+
+        # ── Stage 0 preflight gate ──────────────────────────────────────
+        # Before accepting any behavioral result from the denied key, verify
+        # the Stage 0 preflight proved this is a restrictive same-tenant key.
+        # A cross-tenant key returning 404, or an unprofiled key, must NEVER
+        # be presented as proof that a restrictive profile worked.
+        s0_checks = (
+            state.stage("stage_0_identity_preflight")
+            .evidence.get("checks", {})
+            .get("denied_profile", {})
+        )
+        stage7_eligible = (
+            s0_checks.get("authenticated") is True
+            and s0_checks.get("same_tenant") is True
+            and s0_checks.get("distinct_key_id") is True
+            and s0_checks.get("has_profile") is True
+            and s0_checks.get("restrictive") is True
+            and s0_checks.get("ready_for_stage_7") is True
+        )
+        if not s0_checks:
+            # Stage 0 denied-profile preflight was never run (no denied_key
+            # was configured at init time). Report as blocked.
             _stage_done(
                 state,
                 "negative_r_denied_profile",
                 bucket="negative",
-                status="failed",
-                reason_code="NEGATIVE_CONTROL_CREDENTIAL_INVALID",
-                evidence={"item_id": fr.item_id, "required": False},
+                status="blocked",
+                reason_code="NEGATIVE_PROFILE_POLICY_UNPROVEN",
+                evidence={
+                    "item_id": fr.item_id,
+                    "required": False,
+                    "preflight": "not_run",
+                },
+            )
+        elif not stage7_eligible:
+            # Determine the exact failure reason from the preflight.
+            if not s0_checks.get("authenticated"):
+                reason = "NEGATIVE_CONTROL_CREDENTIAL_INVALID"
+            elif not s0_checks.get("same_tenant"):
+                reason = "NEGATIVE_CONTROL_TENANT_MISMATCH"
+            elif not s0_checks.get("distinct_key_id"):
+                reason = "NEGATIVE_CONTROL_KEY_COLLISION"
+            elif not s0_checks.get("has_profile"):
+                reason = "NEGATIVE_PROFILE_NOT_BOUND"
+            elif s0_checks.get("restrictive") is False:
+                reason = "NEGATIVE_PROFILE_NOT_RESTRICTIVE"
+            else:
+                reason = "NEGATIVE_PROFILE_POLICY_UNPROVEN"
+            _stage_done(
+                state,
+                "negative_r_denied_profile",
+                bucket="negative",
+                status="blocked",
+                reason_code=reason,
+                evidence={
+                    "item_id": fr.item_id,
+                    "required": False,
+                    "preflight": s0_checks,
+                },
             )
         else:
-            direct_denied = False
+            # ── Preflight passed — now do the behavioral test ─────────
             try:
-                await denied.get_item(fr.item_id or "")
-            except APIError as exc:
-                direct_denied = _is_denied(exc)
+                denied_identity = await denied.whoami()
+                state.negative(
+                    "negative_r_denied_profile"
+                ).evidence["credential_identity"] = _safe_identity(
+                    denied_identity
+                )
+            except APIError:
+                _stage_done(
+                    state,
+                    "negative_r_denied_profile",
+                    bucket="negative",
+                    status="failed",
+                    reason_code="NEGATIVE_CONTROL_CREDENTIAL_INVALID",
+                    evidence={"item_id": fr.item_id, "required": False},
+                )
+            else:
+                direct_denied = False
+                try:
+                    await denied.get_item(fr.item_id or "")
+                except APIError as exc:
+                    direct_denied = _is_denied(exc)
+                    if not direct_denied:
+                        _stage_done(
+                            state,
+                            "negative_r_denied_profile",
+                            bucket="negative",
+                            status="failed",
+                            reason_code="NEGATIVE_CONTROL_CREDENTIAL_INVALID"
+                            if exc.status_code == 401
+                            else "NEGATIVE_CONTROL_RECALL_NOT_PROVEN",
+                            evidence={"item_id": fr.item_id, "required": False},
+                        )
                 if not direct_denied:
                     _stage_done(
                         state,
                         "negative_r_denied_profile",
                         bucket="negative",
                         status="failed",
-                        reason_code="NEGATIVE_CONTROL_CREDENTIAL_INVALID"
-                        if exc.status_code == 401
-                        else "NEGATIVE_CONTROL_RECALL_NOT_PROVEN",
+                        reason_code="PASS_EXPECTED_DENIAL",
+                        limitations=[
+                            "denied key unexpectedly read tenant Fixture R"
+                        ],
+                    )
+                else:
+                    try:
+                        rec = await denied.recall(
+                            fr.marker or "", mode="semantic"
+                        )
+                        leaked = any(
+                            item.get("id") == fr.item_id
+                            for item in (rec.get("items") or [])
+                        )
+                    except APIError:
+                        leaked = True
+                    _stage_done(
+                        state,
+                        "negative_r_denied_profile",
+                        bucket="negative",
+                        status="failed" if leaked else "pass_expected_denial",
+                        reason_code="NEGATIVE_CONTROL_RECALL_NOT_PROVEN"
+                        if leaked
+                        else "PASS_EXPECTED_DENIAL",
                         evidence={"item_id": fr.item_id, "required": False},
                     )
-            if not direct_denied:
-                _stage_done(
-                    state,
-                    "negative_r_denied_profile",
-                    bucket="negative",
-                    status="failed",
-                    reason_code="PASS_EXPECTED_DENIAL",
-                    limitations=["denied key unexpectedly read tenant Fixture R"],
-                )
-            else:
-                try:
-                    rec = await denied.recall(fr.marker or "", mode="semantic")
-                    leaked = any(item.get("id") == fr.item_id for item in (rec.get("items") or []))
-                except APIError:
-                    leaked = True
-                _stage_done(
-                    state,
-                    "negative_r_denied_profile",
-                    bucket="negative",
-                    status="failed" if leaked else "pass_expected_denial",
-                    reason_code="NEGATIVE_CONTROL_RECALL_NOT_PROVEN"
-                    if leaked
-                    else "PASS_EXPECTED_DENIAL",
-                    evidence={"item_id": fr.item_id, "required": False},
-                )
 
     # Positive control: agent key against Fixture R.
     _stage_start(state, "negative_r_agent_positive", bucket="negative")

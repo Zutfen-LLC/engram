@@ -89,7 +89,7 @@ def test_trace_writes_valid_jsonl(
     assert len(records) == 1
     rec = records[0]
     assert rec["schema"] == "engram.hermes-hook-audit-trace"
-    assert rec["schema_version"] == "1.0"
+    assert rec["schema_version"] == "2.0"
     assert rec["hook"] == "pre_llm_call"
     assert rec["provider"] == "engram"
     assert rec["recall_enabled"] is True

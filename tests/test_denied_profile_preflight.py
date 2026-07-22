@@ -1,12 +1,32 @@
-"""Unit tests for the denied-profile preflight (Correction E) in stage_0.
+"""Unit tests for the denied-profile preflight (Blocker A) in stage_0.
 
 These tests exercise the diagnostic preflight logic WITHOUT a live service or
 database. They use httpx.MockTransport for the EngramAPI /whoami calls and
 monkeypatch the _owner_profile_diagnostic helper to avoid needing PostgreSQL.
 
+The tests use the REAL nested ``/whoami.memory_profile`` contract:
+
+    {
+        "principal_id": "...",
+        "principal_type": "agent",
+        "tenant_id": "...",
+        "scopes": ["read"],
+        "api_key_id": "...",
+        "memory_profile": {
+            "id": "...",
+            "slug": "restricted-audit",
+            "active_revision_id": "...",
+            "version": 1
+        }
+    }
+
+NOT the legacy flattened fields (memory_profile_id, etc.) that the FIX3 code
+incorrectly relied on.
+
 The preflight is a diagnostic, not a stage gate: it records checks under
 ``evidence.checks.denied_profile`` but never changes stage_0's pass status.
-Stage 7 remains the authoritative behavioral proof.
+Stage 7 remains the authoritative behavioral proof, and its enforcement of
+the preflight is tested separately in test_memory_e2e_audit.py.
 """
 
 from __future__ import annotations
@@ -73,19 +93,43 @@ def _install_mock_transport(
     monkeypatch.setattr(cli.EngramAPI, "__init__", patched_init)
 
 
+def _nested_profile(
+    *,
+    profile_id: str | None = None,
+    slug: str = "audit-denied",
+    revision_id: str | None = None,
+    version: int = 1,
+) -> dict[str, Any] | None:
+    """Build the real nested ``memory_profile`` object from /whoami."""
+    if profile_id is None or revision_id is None:
+        return {
+            "id": str(uuid.uuid4()),
+            "slug": slug,
+            "active_revision_id": str(uuid.uuid4()),
+            "version": version,
+        }
+    return {
+        "id": profile_id,
+        "slug": slug,
+        "active_revision_id": revision_id,
+        "version": version,
+    }
+
+
 def _make_handler(
     *,
     tenant_id: str,
     agent_pid: str,
     reviewer_pid: str,
-    denied_response: dict[str, Any] | None = None,
+    denied_tenant_id: str | None = None,
+    denied_api_key_id: str = "key-denied-001",
+    denied_profile: dict[str, Any] | None = None,
     denied_status: int = 200,
-    denied_profile_fields: dict[str, Any] | None = None,
 ) -> Any:
-    """Build a MockTransport handler for the three keys.
+    """Build a MockTransport handler using the REAL nested /whoami shape.
 
-    ``denied_profile_fields`` is merged into the denied whoami payload to set
-    memory_profile_id / memory_profile_revision_id / memory_profile_version.
+    ``denied_profile`` is the nested ``memory_profile`` dict (or None).
+    ``denied_tenant_id`` defaults to ``tenant_id`` (same tenant).
     """
     agent_payload: dict[str, Any] = {
         "tenant_id": tenant_id,
@@ -101,6 +145,7 @@ def _make_handler(
         "api_key_id": "key-reviewer-001",
         "scopes": ["read", "write", "review"],
     }
+    actual_denied_tenant = denied_tenant_id or tenant_id
 
     def handler(request: httpx.Request) -> httpx.Response:
         auth = request.headers.get("authorization", "")
@@ -111,15 +156,15 @@ def _make_handler(
         if auth == "Bearer denied":
             if denied_status >= 400:
                 return httpx.Response(denied_status, json={"detail": "unauthorized"})
-            payload = denied_response or {
-                "tenant_id": tenant_id,
+            payload: dict[str, Any] = {
+                "tenant_id": actual_denied_tenant,
                 "principal_id": str(uuid.uuid4()),
                 "principal_type": "agent",
-                "api_key_id": "key-denied-001",
+                "api_key_id": denied_api_key_id,
                 "scopes": ["read"],
             }
-            if denied_profile_fields:
-                payload = {**payload, **denied_profile_fields}
+            if denied_profile is not None:
+                payload["memory_profile"] = denied_profile
             return httpx.Response(200, json=payload)
         return httpx.Response(404, json={"detail": "no mock"})
 
@@ -133,26 +178,97 @@ def _denied_checks(state: RunState) -> dict[str, Any]:
     return checks.get("denied_profile", {})
 
 
-# ── tests ─────────────────────────────────────────────────────────────────────
+# ── 1. Nested profile parser tests ───────────────────────────────────────────
 
 
-async def test_ordinary_same_tenant_key_diagnosed_as_not_restrictive(
+def test_nested_profile_parses_correctly() -> None:
+    """Nested ``/whoami.memory_profile`` parses to a WhoAmIProfile."""
+    profile_id = str(uuid.uuid4())
+    rev_id = str(uuid.uuid4())
+    identity = {
+        "tenant_id": "t1",
+        "principal_id": "p1",
+        "principal_type": "agent",
+        "api_key_id": "k1",
+        "scopes": ["read"],
+        "memory_profile": {
+            "id": profile_id,
+            "slug": "restricted-audit",
+            "active_revision_id": rev_id,
+            "version": 2,
+        },
+    }
+    result = cli._whoami_profile(identity)
+    assert result is not None
+    assert result.profile_id == profile_id
+    assert result.slug == "restricted-audit"
+    assert result.active_revision_id == rev_id
+    assert result.version == 2
+
+
+def test_missing_profile_returns_none() -> None:
+    """When ``memory_profile`` is absent, parser returns None."""
+    identity = {
+        "tenant_id": "t1",
+        "principal_id": "p1",
+        "api_key_id": "k1",
+        "scopes": ["read"],
+    }
+    assert cli._whoami_profile(identity) is None
+
+
+def test_partial_nested_profile_rejected() -> None:
+    """A partial nested profile object raises ValueError."""
+    identity = {
+        "tenant_id": "t1",
+        "memory_profile": {
+            "id": str(uuid.uuid4()),
+            "slug": "partial",
+            # active_revision_id missing
+            "version": 1,
+        },
+    }
+    with pytest.raises(ValueError, match="missing required fields"):
+        cli._whoami_profile(identity)
+
+
+def test_nested_profile_not_dict_rejected() -> None:
+    """When ``memory_profile`` is not a dict, raises ValueError."""
+    identity = {
+        "tenant_id": "t1",
+        "memory_profile": "not-a-dict",
+    }
+    with pytest.raises(ValueError, match="not an object"):
+        cli._whoami_profile(identity)
+
+
+def test_parser_does_not_read_flattened_fields() -> None:
+    """Parser must NOT read legacy flattened fields even if present."""
+    identity = {
+        "tenant_id": "t1",
+        "memory_profile_id": str(uuid.uuid4()),
+        "memory_profile_revision_id": str(uuid.uuid4()),
+        "memory_profile_version": 3,
+    }
+    # Must return None — the flattened fields are not the real contract.
+    assert cli._whoami_profile(identity) is None
+
+
+# ── 2-7. Denied-profile preflight behavioral tests ──────────────────────────
+
+
+async def test_include_tenant_true_rejected_as_not_restrictive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A denied profile with include_tenant=true is not restrictive."""
     s = _mkstate()
     tid = str(uuid.uuid4())
-    profile_rev = str(uuid.uuid4())
 
     handler = _make_handler(
         tenant_id=tid,
         agent_pid=str(uuid.uuid4()),
         reviewer_pid=str(uuid.uuid4()),
-        denied_profile_fields={
-            "memory_profile_id": str(uuid.uuid4()),
-            "memory_profile_revision_id": profile_rev,
-            "memory_profile_version": 3,
-        },
+        denied_profile=_nested_profile(),
     )
     _install_mock_transport(monkeypatch, httpx.MockTransport(handler))
 
@@ -170,7 +286,6 @@ async def test_ordinary_same_tenant_key_diagnosed_as_not_restrictive(
 
     await cli.stage_0_identity_preflight(s, cfg)
 
-    # Stage 0 still passes — preflight is diagnostic only.
     assert s.stage("stage_0_identity_preflight").status == "pass"
     dc = _denied_checks(s)
     assert dc["authenticated"] is True
@@ -179,23 +294,18 @@ async def test_ordinary_same_tenant_key_diagnosed_as_not_restrictive(
     assert dc["profile_diagnostic"]["include_tenant"] is True
 
 
-async def test_bound_include_tenant_false_passes_preflight(
+async def test_include_tenant_false_ready_for_stage_7(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A denied profile with include_tenant=false is restrictive."""
+    """A denied profile with include_tenant=false is restrictive and ready."""
     s = _mkstate()
     tid = str(uuid.uuid4())
-    profile_rev = str(uuid.uuid4())
 
     handler = _make_handler(
         tenant_id=tid,
         agent_pid=str(uuid.uuid4()),
         reviewer_pid=str(uuid.uuid4()),
-        denied_profile_fields={
-            "memory_profile_id": str(uuid.uuid4()),
-            "memory_profile_revision_id": profile_rev,
-            "memory_profile_version": 1,
-        },
+        denied_profile=_nested_profile(),
     )
     _install_mock_transport(monkeypatch, httpx.MockTransport(handler))
 
@@ -216,56 +326,100 @@ async def test_bound_include_tenant_false_passes_preflight(
     assert s.stage("stage_0_identity_preflight").status == "pass"
     dc = _denied_checks(s)
     assert dc["authenticated"] is True
-    assert dc["restrictive"] is True
+    assert dc["same_tenant"] is True
+    assert dc["distinct_key_id"] is True
     assert dc["has_profile"] is True
-    assert dc["profile_id"] is not None
-    assert dc["profile_diagnostic"]["include_tenant"] is False
+    assert dc["restrictive"] is True
+    assert dc["ready_for_stage_7"] is True
+    assert dc["policy_proven"] is True
+    assert dc["include_tenant"] is False
+    assert dc["profile"]["id"] is not None
+    assert dc["profile"]["slug"] == "audit-denied"
+    assert dc["profile"]["active_revision_id"] is not None
+    assert dc["profile"]["version"] == 1
 
 
-async def test_different_profile_id_with_include_tenant_true_rejected(
+async def test_cross_tenant_key_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A denied key with a different profile ID but include_tenant=true is rejected."""
+    """A cross-tenant key is rejected with TENANT_MISMATCH."""
     s = _mkstate()
     tid = str(uuid.uuid4())
-    profile_rev = str(uuid.uuid4())
 
     handler = _make_handler(
         tenant_id=tid,
         agent_pid=str(uuid.uuid4()),
         reviewer_pid=str(uuid.uuid4()),
-        denied_profile_fields={
-            "memory_profile_id": str(uuid.uuid4()),  # different profile
-            "memory_profile_revision_id": profile_rev,
-            "memory_profile_version": 5,
-        },
+        denied_tenant_id=str(uuid.uuid4()),  # different tenant
+        denied_profile=_nested_profile(),
     )
     _install_mock_transport(monkeypatch, httpx.MockTransport(handler))
-
-    async def fake_diag(owner_url: str, profile_revision_id: str) -> dict[str, Any]:
-        return {
-            "available": True,
-            "read_only": True,
-            "include_tenant": True,
-            "include_private": False,
-            "include_public": False,
-        }
-
-    monkeypatch.setattr(cli, "_owner_profile_diagnostic", fake_diag)
     cfg = _base_cfg()
 
     await cli.stage_0_identity_preflight(s, cfg)
 
     assert s.stage("stage_0_identity_preflight").status == "pass"
     dc = _denied_checks(s)
+    assert dc["same_tenant"] is False
     assert dc["restrictive"] is False
-    assert dc["error"] == "NEGATIVE_PROFILE_NOT_RESTRICTIVE"
+    assert dc["error"] == "NEGATIVE_CONTROL_TENANT_MISMATCH"
 
 
-async def test_invalid_denied_credential_distinct_from_restrictive_denial(
+async def test_same_key_id_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A 401 auth failure on the denied key records a credential error, not a profile error."""
+    """A denied key with the same api_key_id as the agent is rejected."""
+    s = _mkstate()
+    tid = str(uuid.uuid4())
+
+    handler = _make_handler(
+        tenant_id=tid,
+        agent_pid=str(uuid.uuid4()),
+        reviewer_pid=str(uuid.uuid4()),
+        denied_api_key_id="key-agent-001",  # same as agent
+        denied_profile=_nested_profile(),
+    )
+    _install_mock_transport(monkeypatch, httpx.MockTransport(handler))
+    cfg = _base_cfg()
+
+    await cli.stage_0_identity_preflight(s, cfg)
+
+    assert s.stage("stage_0_identity_preflight").status == "pass"
+    dc = _denied_checks(s)
+    assert dc["distinct_key_id"] is False
+    assert dc["restrictive"] is False
+    assert dc["error"] == "NEGATIVE_CONTROL_KEY_COLLISION"
+
+
+async def test_unprofiled_key_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A key with no memory_profile bound is rejected as NOT_BOUND."""
+    s = _mkstate()
+    tid = str(uuid.uuid4())
+
+    handler = _make_handler(
+        tenant_id=tid,
+        agent_pid=str(uuid.uuid4()),
+        reviewer_pid=str(uuid.uuid4()),
+        denied_profile=None,  # no nested memory_profile
+    )
+    _install_mock_transport(monkeypatch, httpx.MockTransport(handler))
+    cfg = _base_cfg()
+
+    await cli.stage_0_identity_preflight(s, cfg)
+
+    assert s.stage("stage_0_identity_preflight").status == "pass"
+    dc = _denied_checks(s)
+    assert dc["has_profile"] is False
+    assert dc["restrictive"] is False
+    assert dc["error"] == "NEGATIVE_PROFILE_NOT_BOUND"
+
+
+async def test_invalid_credential_diagnosed_separately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 401 auth failure on the denied key records a credential error."""
     s = _mkstate()
     tid = str(uuid.uuid4())
 
@@ -281,17 +435,16 @@ async def test_invalid_denied_credential_distinct_from_restrictive_denial(
 
     await cli.stage_0_identity_preflight(s, cfg)
 
-    # Stage 0 still passes — the agent/reviewer identity is valid.
     assert s.stage("stage_0_identity_preflight").status == "pass"
     dc = _denied_checks(s)
     assert dc["authenticated"] is False
     assert dc["error"] == "NEGATIVE_CONTROL_CREDENTIAL_INVALID"
-    # Must NOT be the profile-restrictive error.
-    assert dc.get("restrictive") is None or "restrictive" not in dc
 
 
-async def test_no_owner_diagnostics_records_unproven(monkeypatch: pytest.MonkeyPatch) -> None:
-    """When owner_db_url is unset, the restrictive policy is recorded as unproven."""
+async def test_owner_diagnostics_absent_records_unproven(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When owner_db_url is unset, restrictive policy is unproven."""
     s = _mkstate()
     tid = str(uuid.uuid4())
 
@@ -299,21 +452,85 @@ async def test_no_owner_diagnostics_records_unproven(monkeypatch: pytest.MonkeyP
         tenant_id=tid,
         agent_pid=str(uuid.uuid4()),
         reviewer_pid=str(uuid.uuid4()),
-        denied_profile_fields={
-            "memory_profile_id": str(uuid.uuid4()),
-            "memory_profile_revision_id": str(uuid.uuid4()),
-            "memory_profile_version": 2,
-        },
+        denied_profile=_nested_profile(),
     )
     _install_mock_transport(monkeypatch, httpx.MockTransport(handler))
 
-    cfg = _base_cfg(owner_db_url="")  # no owner diagnostics
+    cfg = _base_cfg(owner_db_url="")
 
     await cli.stage_0_identity_preflight(s, cfg)
 
     assert s.stage("stage_0_identity_preflight").status == "pass"
     dc = _denied_checks(s)
     assert dc["authenticated"] is True
+    assert dc["has_profile"] is True
     assert dc["restrictive"] is None
     assert dc["error"] == "NEGATIVE_PROFILE_POLICY_UNPROVEN"
     assert "profile_diagnostic" not in dc
+    assert "ready_for_stage_7" not in dc
+
+
+async def test_stage_0_passes_without_denied_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stage 0 passes when denied key is absent (optional lane)."""
+    s = _mkstate()
+    tid = str(uuid.uuid4())
+
+    handler = _make_handler(
+        tenant_id=tid,
+        agent_pid=str(uuid.uuid4()),
+        reviewer_pid=str(uuid.uuid4()),
+    )
+    _install_mock_transport(monkeypatch, httpx.MockTransport(handler))
+    cfg = _base_cfg()
+    cfg.denied_key = ""
+
+    await cli.stage_0_identity_preflight(s, cfg)
+
+    assert s.stage("stage_0_identity_preflight").status == "pass"
+    # denied_profile checks should not be present at all.
+    dc = _denied_checks(s)
+    assert dc == {}
+
+
+# ── 8. Safe identity uses nested profile ─────────────────────────────────────
+
+
+def test_safe_identity_retains_nested_profile() -> None:
+    """_safe_identity preserves the nested profile identity."""
+    profile_id = str(uuid.uuid4())
+    rev_id = str(uuid.uuid4())
+    who = {
+        "tenant_id": "t1",
+        "principal_id": "p1",
+        "principal_type": "agent",
+        "api_key_id": "k1",
+        "scopes": ["read"],
+        "memory_profile": {
+            "id": profile_id,
+            "slug": "test-profile",
+            "active_revision_id": rev_id,
+            "version": 1,
+        },
+    }
+    safe = cli._safe_identity(who)
+    assert "memory_profile" in safe
+    assert safe["memory_profile"]["id"] == profile_id
+    assert safe["memory_profile"]["slug"] == "test-profile"
+    assert safe["memory_profile"]["active_revision_id"] == rev_id
+    assert safe["memory_profile"]["version"] == 1
+    # No credentials retained.
+    assert "api_key" not in safe
+    assert "authorization" not in safe
+
+
+def test_safe_identity_no_profile_when_absent() -> None:
+    """_safe_identity omits profile fields when absent."""
+    who = {
+        "tenant_id": "t1",
+        "principal_id": "p1",
+        "api_key_id": "k1",
+        "scopes": ["read"],
+    }
+    safe = cli._safe_identity(who)
+    assert "memory_profile" not in safe
+    assert "memory_profile_error" not in safe
