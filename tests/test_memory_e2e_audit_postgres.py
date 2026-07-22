@@ -202,7 +202,9 @@ async def _insert_item(
     principal_id: str,
     content: str,
     review_status: str = "proposed",
-    memory_confidence: float = 0.9,
+    # Evidence-lane fixtures must not accidentally qualify via the legacy
+    # confidence lane; individual legacy tests set their own value explicitly.
+    memory_confidence: float = 0.35,
     created_at: datetime | None = None,
     visibility: str = "private",
     kind: str = "fact",
@@ -335,41 +337,18 @@ async def _enable_evidence_lane(tenant_id: str) -> None:
 
 async def _assess(item_id: str, *, now: datetime) -> Any:
     """Load support + assess a single item using real production policy."""
+    from sqlalchemy import select
+
     from engram.models import MemoryItem
 
     async with _test_session_factory() as session:
         item = (
-            (
-                await session.execute(
-                    text("SELECT * FROM memory_items WHERE id = :id"), {"id": item_id}
-                )
-            )
-            .mappings()
-            .one()
-        )
-        mi = MemoryItem(
-            id=item["id"],
-            tenant_id=item["tenant_id"],
-            principal_id=item["principal_id"],
-            content_hash=item["content_hash"],
-            kind=item["kind"],
-            review_status=item["review_status"],
-            memory_confidence=item["memory_confidence"],
-            source_trust=item["source_trust"],
-            source_confidence_prior=item["source_confidence_prior"],
-            retention_confidence=item["retention_confidence"],
-            retention_disposition=item["retention_disposition"],
-            retention_evidence_at=item["retention_evidence_at"],
-            authority=item["authority"],
-            visibility=item["visibility"],
-            source_type=item["source_type"],
-            conflict_resolution_status=item["conflict_resolution_status"],
-            created_at=item["created_at"],
-        )
-        support_map = await load_promotion_support(session, [mi])
-        support = support_map[mi.id]
+            await session.execute(select(MemoryItem).where(MemoryItem.id == item_id))
+        ).scalar_one()
+        support_map = await load_promotion_support(session, [item])
+        support = support_map[item.id]
     return assess_promotion_candidate(
-        mi,
+        item,
         support,
         confidence_threshold=0.7,
         min_age_hours=72,
