@@ -518,6 +518,36 @@ class RecallBridge:
                 traces,
                 self.config.recall_max_context_bytes,
             )
+            # Audit trace: emit one sanitized record when the env var is set.
+            # Import is deferred so test contexts that don't have the full
+            # plugin package initialized can still exercise recall_bridge.
+            # Pass the actual query/session/turn so the trace binds to this
+            # exact audit action.
+            try:
+                from .audit_trace import emit_audit_trace
+
+                emit_audit_trace({
+                    "recall_succeeded": outcome.semantic_completed,
+                    "recall_log_id": (
+                        outcome.semantic.recall_log_id
+                        if outcome.semantic.completed
+                        else None
+                    ),
+                    "retrieved_item_ids": (
+                        [item.id for item in outcome.semantic.evidence]
+                        if outcome.semantic.completed
+                        else []
+                    ),
+                    "injected_item_ids": [item.id for item in evidence] if evidence else [],
+                    "error_code": (
+                        outcome.disposition.value if not outcome.semantic_completed else None
+                    ),
+                    "query": query,
+                    "session_id": session_id,
+                    "turn_index": turn_index,
+                })
+            except Exception:  # noqa: BLE001 — trace is best-effort, never breaks recall
+                pass
             if context and evidence and self.config.recall_followup_turns:
                 trace = self._trace(turn_index, query_digest, evidence, log_ids)
                 previous = state.recent_traces[-1] if state.recent_traces else None

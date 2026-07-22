@@ -10,6 +10,7 @@ import base64
 import json
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
 from uuid import UUID
@@ -1750,14 +1751,81 @@ def _encode_cursor(item: dict[str, Any]) -> str:
 
 
 def _decode_cursor(cursor: str) -> tuple[str, str]:
+    """Decode a base64 cursor payload into validated (created_at, item_id).
+
+    The timestamp remains a validated ISO string so it can be passed to
+    asyncpg; conversion to a typed datetime is done by
+    :func:`decode_items_cursor` before the SQL boundary.
+
+    Raises ``ValueError`` for any malformed payload (not a valid cursor).
+    """
     padding = "=" * (-len(cursor) % 4)
-    data = base64.urlsafe_b64decode((cursor + padding).encode()).decode()
-    payload = json.loads(data)
+    try:
+        data = base64.urlsafe_b64decode((cursor + padding).encode()).decode()
+    except Exception as exc:
+        raise ValueError("invalid cursor encoding") from exc
+    try:
+        payload = json.loads(data)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError("invalid cursor payload") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("invalid cursor")
     created_at = payload.get("created_at")
     item_id = payload.get("id")
     if not isinstance(created_at, str) or not isinstance(item_id, str):
         raise ValueError("invalid cursor")
     return created_at, item_id
+
+
+@dataclass(frozen=True)
+class ItemsCursor:
+    """Typed cursor decoded into timezone-aware datetime + validated UUID.
+
+    This is the typed boundary object that prevents raw timestamp strings
+    from reaching asyncpg. The ``created_at`` is always timezone-aware
+    (UTC); the ``item_id`` is a validated UUID.
+    """
+
+    created_at: datetime
+    item_id: UUID
+
+
+class InvalidCursorError(ValueError):
+    """Raised for a malformed client cursor — maps to HTTP 400, never 500."""
+
+
+def decode_items_cursor(cursor: str) -> ItemsCursor:
+    """Decode and validate a pagination cursor into typed values.
+
+    Converts the ISO timestamp to a timezone-aware ``datetime`` (UTC),
+    validates the item ID as a UUID, and rejects malformed payloads with
+    a deterministic :class:`InvalidCursorError`.
+
+    Handles:
+    * trailing ``Z`` suffix (produced by some encoders);
+    * naive timestamps (normalized to UTC);
+    * malformed timestamps / UUIDs (rejected, not passed to asyncpg).
+    """
+    created_at_str, item_id_str = _decode_cursor(cursor)
+
+    # Normalize trailing Z → +00:00 for fromisoformat compatibility.
+    ts = created_at_str.strip()
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(ts)
+    except ValueError as exc:
+        raise InvalidCursorError("cursor timestamp is not a valid ISO datetime") from exc
+    # Normalize naive timestamps to UTC.
+    parsed = parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+    # Validate item_id as a UUID.
+    try:
+        item_uuid = UUID(item_id_str)
+    except ValueError as exc:
+        raise InvalidCursorError("cursor item_id is not a valid UUID") from exc
+
+    return ItemsCursor(created_at=parsed, item_id=item_uuid)
 
 
 async def _fetch_profile_readable_item(
@@ -1987,15 +2055,15 @@ async def list_items(
         clauses.append("review_status = 'active' AND valid_to IS NULL AND superseded_by IS NULL")
     if cursor is not None:
         try:
-            created_at, item_id = _decode_cursor(cursor)
-        except ValueError as exc:
+            decoded = decode_items_cursor(cursor)
+        except (InvalidCursorError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="Invalid cursor") from exc
         clauses.append(
             "(created_at < :cursor_created_at OR "
             "(created_at = :cursor_created_at AND id < :cursor_id))"
         )
-        params["cursor_created_at"] = created_at
-        params["cursor_id"] = item_id
+        params["cursor_created_at"] = decoded.created_at
+        params["cursor_id"] = decoded.item_id
     sql = "SELECT * FROM memory_items"
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)

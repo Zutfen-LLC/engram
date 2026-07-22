@@ -93,6 +93,61 @@ def _prepare_stage_6(s: RunState) -> None:
     }
 
 
+def _make_hook_trace(
+    tmp_path: Path,
+    item_id: str,
+    *,
+    fixture: str = "recall",
+    run_id: str | None = None,
+) -> Path:
+    """Write a valid hook audit trace JSONL file for a given fixture item ID.
+
+    Produces a schema 2.0 record with audit binding fields (prompt hash,
+    session digest, turn index, run ID, fixture lane) matching what the
+    actual recall_bridge + audit_trace pipeline would emit.
+    """
+    import hashlib
+
+    # Canonical prompts must match run_memory_e2e_audit.py.
+    recall_prompt = "What is the controlled Engram recall marker?"
+    epistemic_prompt = "What color is the sky on February 30th?"
+    prompt = recall_prompt if fixture == "recall" else epistemic_prompt
+
+    def _sha(prompt: str) -> str:
+        norm = prompt.replace("\r\n", "\n").replace("\r", "\n")
+        return hashlib.sha256(norm.encode("utf-8")).hexdigest()
+
+    trace = tmp_path / f"trace-{item_id[:8]}.jsonl"
+    record = {
+        "schema": "engram.hermes-hook-audit-trace",
+        "schema_version": "2.0",
+        "timestamp": datetime.now(UTC).isoformat(),
+        "hook": "pre_llm_call",
+        "provider": "engram",
+        "profile": "test-profile",
+        "recall_enabled": True,
+        "recall_succeeded": True,
+        "recall_log_id": str(uuid.uuid4()),
+        "retrieved_item_ids": [item_id],
+        "injected_item_ids": [item_id],
+        "retrieved_item_count": 1,
+        "injected_item_count": 1,
+        "native_memory_used": False,
+        "error_code": None,
+        # Audit binding fields (Blocker B).
+        "prompt_sha256": _sha(prompt),
+        "query_digest": hashlib.sha256(prompt.encode()).hexdigest()[:12],
+        "session_id_digest": hashlib.sha256(b"test-session").hexdigest()[:12],
+        "turn_index": 1,
+        "expected_prompt_sha256_match": True,
+    }
+    if run_id is not None:
+        record["audit_run_id"] = run_id
+    record["audit_fixture"] = fixture
+    trace.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    return trace
+
+
 def _dict_handler(routes: dict[str, Any]) -> Any:
     """Build a MockTransport handler from {method path: (status, payload)}."""
 
@@ -1067,8 +1122,11 @@ def test_record_hermes_recall_pass(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     _prepare_stage_5(s)
     resp = tmp_path / "resp.txt"
     resp.write_text(f"The controlled Engram recall marker is {marker}. (sourced from Engram)")
+    trace = _make_hook_trace(
+        tmp_path, s.fixture("recall").item_id, fixture="recall", run_id=s.run_id
+    )
     cfg = cli.AuditConfig()
-    cli.cmd_record_hermes_recall(s, cfg, resp)
+    cli.cmd_record_hermes_recall(s, cfg, resp, hook_trace_file=trace)
     ev = s.stage("stage_5_hermes_recall")
     assert ev.status == "pass"
     assert ev.evidence["exact_marker_returned"] is True
@@ -1080,8 +1138,11 @@ def test_record_hermes_recall_omitted_marker(tmp_path: Path) -> None:
     _prepare_stage_5(s)
     resp = tmp_path / "resp.txt"
     resp.write_text("I don't know the marker.")
+    trace = _make_hook_trace(
+        tmp_path, s.fixture("recall").item_id, fixture="recall", run_id=s.run_id
+    )
     cfg = cli.AuditConfig()
-    cli.cmd_record_hermes_recall(s, cfg, resp)
+    cli.cmd_record_hermes_recall(s, cfg, resp, hook_trace_file=trace)
     ev = s.stage("stage_5_hermes_recall")
     assert ev.status == "failed"
     assert ev.reason_code == "MODEL_OMITTED_MARKER"
@@ -1095,8 +1156,11 @@ def test_record_hermes_recall_attribution_failure(tmp_path: Path) -> None:
     resp = tmp_path / "resp.txt"
     # marker present but no Engram attribution
     resp.write_text(f"The marker is {marker}.")
+    trace = _make_hook_trace(
+        tmp_path, s.fixture("recall").item_id, fixture="recall", run_id=s.run_id
+    )
     cfg = cli.AuditConfig()
-    cli.cmd_record_hermes_recall(s, cfg, resp)
+    cli.cmd_record_hermes_recall(s, cfg, resp, hook_trace_file=trace)
     ev = s.stage("stage_5_hermes_recall")
     assert ev.status == "failed"
     assert ev.reason_code == "MODEL_ATTRIBUTION_FAILURE"
@@ -1214,7 +1278,10 @@ def test_record_epistemic_pass(tmp_path: Path) -> None:
         )
     )
     cli.cmd_record_epistemic_result(
-        s, cfg, resp, provenance_file=provenance, assertions_file=assertions
+        s, cfg, resp, provenance_file=provenance, assertions_file=assertions,
+        hook_trace_file=_make_hook_trace(
+            tmp_path, s.fixture("epistemic").item_id, fixture="epistemic", run_id=s.run_id
+        ),
     )
     assert s.stage("stage_6_epistemic_safety").status == "pass"
 
