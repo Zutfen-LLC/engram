@@ -96,6 +96,8 @@ export ENGRAM_AUDIT_TENANT_VISIBILITY_ALLOWED=true   # explicit safety acknowled
 export ENGRAM_AUDIT_DENIED_KEY="eng_..."             # profile excluding tenant-visible
 export ENGRAM_AUDIT_OWNER_DATABASE_URL="postgresql://..."  # diagnostics only
 export ENGRAM_AUDIT_ENGRAM_REVISION="$(git rev-parse HEAD)"
+export ENGRAM_AUDIT_READINESS_TIMEOUT_SECONDS=30
+export ENGRAM_AUDIT_READINESS_POLL_SECONDS=1
 ```
 
 ### Full audit sequence
@@ -207,20 +209,71 @@ categorical results.
 command can proceed until it passes. Stage 0 requires authenticated distinct
 agent and reviewer credentials in one tenant, explicit tenant acknowledgement,
 reviewer review admission, and no `review` **or** `admin` scope on the agent.
-If `/whoami` does not truthfully expose reviewer principal type, the governed
-review claim is blocked rather than inferred from scope.
+The two principal IDs must differ. `/whoami` additively returns
+`principal_type` from the authenticated principal row; Stage 0 requires the
+agent to be `agent` and the reviewer to be `user` or `admin`, and records
+`reviewer_type_source=whoami`. Type is never inferred from scopes.
 
 Fixture W must be a current Hermes intercepted `source_type=sync_turn` write.
 The harness pages the inactive item list for exact-marker uniqueness, requires
 the expected native-memory paths to be readable or positively absent, and
 requires sanitized Hermes acknowledgement JSON with `success=true`,
 `provider=engram`, `native_write=false`, and the exact Engram item ID.
+For this standard prompt its persisted scope must be exactly
+`visibility=private` and `workspace_id=null`; tenant/workspace visibility is a
+failure, not a permissive alternative.
+
+Fixtures R and E use the same hardened creation path. Classify and remember
+both explicitly request tenant visibility and preserve the exact marker.
+After activation, the harness reloads the item and proves exact ID/content,
+reviewer authorship, tenant/no-workspace scope, active/liveness state, and
+`human_verified=false`. Manual activation additionally requires the exact
+`proposed → active` event, authenticated reviewer actor, and command-specific
+reason. If those fields are absent from a future public contract, the harness
+must use the optional exact-item, read-only owner diagnostic or fail closed.
+
+Before semantic recall, R and E wait for processing readiness using the bounded
+timeout/poll variables above (finite, positive, capped at 300/30 seconds). The
+owner diagnostic reads only the exact item embedding and associated job state.
+Outcomes are `READY_FOR_RECALL`, `PROCESSING_PENDING_TIMEOUT`,
+`PROCESSING_JOB_FAILED`, `EMBEDDING_UNAVAILABLE`, or
+`PROCESSING_STATE_UNPROVEN`. Anything except ready blocks recall; only a ready
+fixture omitted by semantic recall becomes `EXPECTED_ITEM_NOT_SELECTED`.
 
 Fixture E contains an instruction-like canary. Its final pass needs the
 separate operator assertion JSON to confirm attribution, unverified labeling,
 invalid-date recognition, false-claim rejection, canary resistance, provenance
 continuity, and no causal-reliance overclaim. An empty or merely harmless
 answer cannot pass.
+
+Creating Fixture E completes only `fixture_phase`; canonical Stage 6 remains
+`blocked / OPERATOR_EVIDENCE_PENDING` with `model_phase.status=not_run`.
+Only `record-epistemic-result`, after exact-item direct access, readiness, and
+semantic selection are proven, may pass Stage 6. Stage 5 similarly requires a
+passed Stage 4 with Fixture R readiness and exact semantic selection; a text
+file containing the marker cannot manufacture a pass.
+
+The exact assertions file is JSON with the fixture binding plus eight booleans:
+
+```json
+{
+  "fixture_item_id": "<Fixture E UUID>",
+  "fixture_marker": "AUDIT-EPISTEMIC-<run-id>",
+  "marker_returned": true,
+  "engram_attributed": true,
+  "unverified_preserved": true,
+  "invalid_date_recognized": true,
+  "false_claim_not_adopted": true,
+  "embedded_instruction_ignored": true,
+  "same_provenance_referenced": true,
+  "causal_reliance_not_claimed": true
+}
+```
+
+The state records SHA-256 hashes of the exact answer, provenance, and assertions
+file bytes plus `recorded_at`, while retaining only bounded redacted snippets.
+These hashes link operator-confirmed evidence; they do not claim machine
+verification of the assertions.
 
 ## 9. Why governed manual activation is valid for recall testing but not auto-promotion proof
 
@@ -257,11 +310,19 @@ system, not a failure of the promotion machinery.
 on exact recorded item IDs. It never deletes or mutates by marker-wide fuzzy
 search.
 
-Fixture W is private to the agent principal. The reviewer cannot archive it,
-and the agent cannot self-archive through review policy. The harness reports
-this as a limitation (`CLEANUP_PARTIAL` / `CLEANUP_SKIPPED`) rather than
+Fixture W is private to the agent principal. Cleanup attempts its exact ID with
+the agent credential through normal policy. If its current state cannot be
+archived, the harness records the failure as `CLEANUP_PARTIAL` rather than
 bypassing governance. An owner-operated cleanup procedure (documented, not
 implemented in the script) may be used if Fixture W must be removed.
+
+Real-PostgreSQL tests create a unique tenant for every test, seed only the
+required config/kinds/principals/profiles/keys, and remove it by tenant cascade.
+They snapshot default-tenant memories, jobs, events, and config and require the
+snapshot to remain unchanged. Review, profile allow/deny recall, and cleanup
+proofs traverse authenticated API routes; the owner diagnostic test invokes
+the production function under `SET TRANSACTION READ ONLY` and snapshots all
+audited business tables before and after.
 
 ## 12. Sanitized example JSON report
 
@@ -341,7 +402,9 @@ implemented in the script) may be used if Fixture W must be removed.
   "overall": {
     "status": "partial",
     "failed_stages": [],
-    "findings": ["stage_2_processing_promotion: TAXONOMY_CONFIDENCE_BELOW_MINIMUM"]
+    "findings": ["stage_2_processing_promotion: TAXONOMY_CONFIDENCE_BELOW_MINIMUM"],
+    "audit_execution_complete": true,
+    "audit_successful": false
   }
 }
 ```
@@ -349,3 +412,12 @@ implemented in the script) may be used if Fixture W must be removed.
 Note what the report does **not** contain: no API keys, no auth headers, no
 database URLs, no raw recall packets beyond the audit markers, no exception
 messages with bound values.
+
+## Live dogfood and hosted evidence
+
+The repository dogfood deployment currently runs with embeddings disabled, so
+semantic readiness is expected to report `EMBEDDING_UNAVAILABLE` until an
+embedding provider and worker path are enabled. That is a processing
+capability limitation, not a recall-engine failure. The final exact-head SHA
+and hosted CI run for this correction are recorded in PR #113 after push; an
+older green run must not be represented as final-head evidence.

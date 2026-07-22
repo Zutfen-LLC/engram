@@ -44,6 +44,7 @@ __all__ = [
     "SCHEMA_NAME",
     "SCHEMA_VERSION",
     "ReasonCode",
+    "REASON_CODES",
     "StageStatus",
     "STAGE_ORDER",
     "StageEvidence",
@@ -90,6 +91,94 @@ STAGE_LABELS: dict[str, str] = {
 # stable categorical reason so an ambiguous "the agent did not recall the
 # memory" can never collapse distinct outcomes.
 ReasonCode = str
+
+# Authoritative implementation vocabulary. The JSON Schema carries the same
+# closed set and a completeness test prevents either side drifting.
+REASON_CODES = frozenset(
+    {
+        "IDENTITY_CONFIGURATION_MISSING",
+        "IDENTITY_AUTH_FAILED",
+        "IDENTITY_TENANT_MISMATCH",
+        "IDENTITY_PRINCIPAL_COLLISION",
+        "IDENTITY_AGENT_REVIEW_SCOPE_FORBIDDEN",
+        "IDENTITY_AGENT_TYPE_INVALID",
+        "IDENTITY_REVIEWER_TYPE_INVALID",
+        "IDENTITY_REVIEWER_MISSING_REVIEW_SCOPE",
+        "IDENTITY_PROFILE_CAPABILITY_MISMATCH",
+        "IDENTITY_TENANT_NOT_ACKNOWLEDGED",
+        "IDENTITY_CAPABILITY_PREFLIGHT_FAILED",
+        "IDENTITY_PRINCIPAL_TYPE_UNPROVEN",
+        "HERMES_WRITE_NOT_SUBMITTED",
+        "ENGRAM_ITEM_NOT_FOUND",
+        "ENGRAM_DUPLICATE_ITEMS",
+        "ENGRAM_ACKNOWLEDGEMENT_UNPROVEN",
+        "ENGRAM_ACKNOWLEDGEMENT_MISMATCH",
+        "NATIVE_HERMES_WRITE_DETECTED",
+        "NATIVE_MEMORY_PROOF_UNAVAILABLE",
+        "WRONG_SOURCE_TYPE",
+        "UNEXPECTED_WRITE_VISIBILITY",
+        "PROCESSING_COMPLETE",
+        "PROCESSING_FIELDS_OBSERVED",
+        "PROCESSING_INCOMPLETE",
+        "PROCESSING_EVIDENCE_UNAVAILABLE",
+        "PROCESSING_PENDING",
+        "PROCESSING_PENDING_TIMEOUT",
+        "PROCESSING_JOB_FAILED",
+        "PROCESSING_STATE_UNPROVEN",
+        "EMBEDDING_UNAVAILABLE",
+        "READY_FOR_RECALL",
+        "CLASSIFICATION_RUN_MISSING",
+        "RETENTION_EVIDENCE_MISSING",
+        "RETENTION_DISPOSITION_NOT_RETAIN",
+        "TAXONOMY_CONFIDENCE_BELOW_MINIMUM",
+        "EVIDENCE_PROMOTION_DISABLED",
+        "EVIDENCE_SCORE_BELOW_THRESHOLD",
+        "PROMOTION_COOLING_PERIOD",
+        "KIND_AUTO_PROMOTION_DISABLED",
+        "PROMOTION_CONFLICT_BLOCKED",
+        "PROMOTION_REVIEW_POLICY_BLOCKED",
+        "FIXTURE_PERSISTED_STATE_INVALID",
+        "FIXTURE_AUTHOR_UNPROVEN",
+        "FIXTURE_ACTIVATION_EVENT_MISSING",
+        "FIXTURE_ACTIVATION_ACTOR_UNPROVEN",
+        "FIXTURE_ACTIVATION_REASON_MISMATCH",
+        "FIXTURE_ALREADY_EXISTS",
+        "FIXTURE_REPLACEMENT_FAILED",
+        "AGENT_ITEM_ACCESS_DENIED",
+        "RECALL_REQUEST_FAILED",
+        "EXPECTED_ITEM_NOT_SELECTED",
+        "RECALL_LABEL_MISMATCH",
+        "RECALL_PROVENANCE_MISSING",
+        "HERMES_RECALL_FIXTURE_NOT_READY",
+        "HERMES_READ_HOOK_NOT_ACTIVE",
+        "HERMES_EXPECTED_ITEM_NOT_INJECTED",
+        "HERMES_CONTEXT_PACKING_FAILURE",
+        "MODEL_OMITTED_MARKER",
+        "MODEL_ATTRIBUTION_FAILURE",
+        "MODEL_LABEL_MISREPRESENTATION",
+        "EPISTEMIC_FIXTURE_NOT_READY",
+        "EPISTEMIC_FIXTURE_NOT_ACCESSIBLE",
+        "EPISTEMIC_FIXTURE_NOT_RECALLED",
+        "MODEL_ACCEPTED_FALSE_CLAIM",
+        "MODEL_IGNORED_INVALID_DATE",
+        "MODEL_TREATED_ACTIVE_AS_VERIFIED",
+        "MODEL_TREATED_CONFIDENCE_AS_TRUTH",
+        "MODEL_FOLLOWED_MEMORY_INSTRUCTION",
+        "MODEL_FALSELY_CLAIMED_CAUSAL_RELIANCE",
+        "EPISTEMIC_POSITIVE_EVIDENCE_MISSING",
+        "TRACE_PROVENANCE_MISMATCH",
+        "PASS_EXPECTED_DENIAL",
+        "NEGATIVE_CONTROL_CREDENTIAL_INVALID",
+        "NEGATIVE_CONTROL_RECALL_NOT_PROVEN",
+        "OPERATOR_EVIDENCE_PENDING",
+        "OPERATOR_EVIDENCE_RECORDED",
+        "CLEANUP_SKIPPED",
+        "CLEANUP_PARTIAL",
+        "CLEANUP_COMPLETE",
+        "OWNER_DIAGNOSTICS_UNAVAILABLE",
+        "UNKNOWN_ERROR",
+    }
+)
 
 StageStatus = str  # one of the literal statuses below
 
@@ -392,6 +481,8 @@ class AuditReport:
     negative_controls: dict[str, StageEvidence]
 
     def to_dict(self) -> dict[str, Any]:
+        overall = _overall(self.stages, self.negative_controls)
+        execution_complete = self.completed_at is not None
         return {
             "schema": SCHEMA_NAME,
             "schema_version": SCHEMA_VERSION,
@@ -407,7 +498,11 @@ class AuditReport:
             "fixtures": {k: v.to_dict() for k, v in self.fixtures.items()},
             "stages": {k: v.to_dict() for k, v in self.stages.items()},
             "negative_controls": {k: v.to_dict() for k, v in self.negative_controls.items()},
-            "overall": _overall(self.stages, self.negative_controls),
+            "overall": {
+                **overall,
+                "audit_execution_complete": execution_complete,
+                "audit_successful": execution_complete and overall["status"] == "pass",
+            },
         }
 
 

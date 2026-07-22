@@ -210,6 +210,7 @@ async def test_profile_binding_forwarding_and_whoami_variants() -> None:
         recorder = Recorder(
             {
                 "principal_id": PRINCIPAL_ID,
+                "principal_type": "agent",
                 "tenant_id": TENANT_ID,
                 "scopes": ["read"],
                 "api_key_id": REVISION_ID,

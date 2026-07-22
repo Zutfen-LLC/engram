@@ -39,10 +39,20 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from engram.api.app import create_app
+from engram.auth import (
+    DIGEST_ALGORITHM,
+    digest_api_key_secret,
+    generate_api_key,
+    parse_api_key,
+    reset_principal_cache,
+)
 from engram.config import settings
 from engram.promotion import (
     BLOCK_CONFLICT,
@@ -62,6 +72,8 @@ _test_engine = create_async_engine(settings.database_url, poolclass=NullPool)
 _test_session_factory: async_sessionmaker[AsyncSession] = async_sessionmaker(
     _test_engine, class_=AsyncSession, expire_on_commit=False
 )
+_isolated_tenant_id: str | None = None
+_isolated_admin_id: str | None = None
 
 
 @pytest.fixture(autouse=True)
@@ -109,64 +121,81 @@ def _db_ok_sync() -> bool:
 
 
 @pytest.fixture(autouse=True)
-async def _clean_db() -> None:
+async def _isolated_test_tenant(_fresh_engine: Any) -> Any:
+    """Create one tenant per test and remove it by tenant cascade only."""
+    global _isolated_tenant_id, _isolated_admin_id
     if not await _db_ok():
+        yield
         return
-    async with _test_engine.begin() as conn:
-        await conn.execute(text("DELETE FROM jobs"))
-        await conn.execute(text("DELETE FROM feedback_events"))
-        await conn.execute(text("DELETE FROM item_events"))
-        await conn.execute(text("DELETE FROM classification_runs"))
-        await conn.execute(text("DELETE FROM memory_items"))
-        await conn.execute(
-            text(
-                "DELETE FROM memory_kinds WHERE tenant_id != "
-                "(SELECT id FROM tenants WHERE slug = 'default')"
+    tenant_id = str(uuid.uuid4())
+    admin_id = str(uuid.uuid4())
+    slug = f"memory-audit-{uuid.uuid4().hex}"
+    async with _test_engine.connect() as conn:
+        default_before = (
+            await conn.execute(
+                text(
+                    "SELECT "
+                    "(SELECT count(*) FROM memory_items WHERE tenant_id=t.id), "
+                    "(SELECT count(*) FROM jobs WHERE tenant_id=t.id), "
+                    "(SELECT count(*) FROM item_events e JOIN memory_items m ON m.id=e.item_id "
+                    " WHERE m.tenant_id=t.id), "
+                    "(SELECT row_to_json(c)::text FROM tenant_config c "
+                    " WHERE c.tenant_id=t.id AND c.active=true) "
+                    "FROM tenants t WHERE t.slug='default'"
+                )
             )
-        )
-        await conn.execute(text("DELETE FROM tenants WHERE slug != 'default'"))
-    # Reset default tenant config to migration defaults.
-    async with _test_engine.begin() as conn:
-        await conn.execute(
-            text(
-                "UPDATE tenant_config SET "
-                "auto_promote_enabled = TRUE, "
-                "auto_promote_confidence_threshold = 0.7, "
-                "auto_promote_min_age_hours = 72, "
-                "auto_promote_evidence_enabled = FALSE, "
-                "auto_promote_evidence_threshold = 0.7 "
-                "WHERE tenant_id = (SELECT id FROM tenants WHERE slug = 'default')"
-            )
-        )
-    # Ensure the default 'fact' kind has auto_promote_from_inferred enabled for
-    # these tests (the seeded default may or may not depending on tenant config).
+        ).one()
     async with _test_engine.begin() as conn:
         await conn.execute(
-            text(
-                "UPDATE memory_kinds SET auto_promote_from_inferred = TRUE, enabled = TRUE "
-                "WHERE name = 'fact' AND tenant_id = "
-                "(SELECT id FROM tenants WHERE slug = 'default')"
-            )
+            text("INSERT INTO tenants (id, name, slug) VALUES (:id, :name, :slug)"),
+            {"id": tenant_id, "name": slug, "slug": slug},
         )
+        await conn.execute(
+            text(
+                "INSERT INTO principals (id, tenant_id, name, type) "
+                "VALUES (:id, :tenant_id, 'admin', 'admin')"
+            ),
+            {"id": admin_id, "tenant_id": tenant_id},
+        )
+        await conn.execute(
+            text("INSERT INTO tenant_config (tenant_id) VALUES (:id)"), {"id": tenant_id}
+        )
+        await conn.execute(
+            text(
+                "UPDATE memory_kinds SET auto_promote_from_inferred=TRUE, enabled=TRUE "
+                "WHERE tenant_id=:tenant_id AND name='fact'"
+            ),
+            {"tenant_id": tenant_id},
+        )
+    _isolated_tenant_id, _isolated_admin_id = tenant_id, admin_id
+    try:
+        yield
+    finally:
+        async with _test_engine.begin() as conn:
+            await conn.execute(text("DELETE FROM tenants WHERE id=:id"), {"id": tenant_id})
+        async with _test_engine.connect() as conn:
+            default_after = (
+                await conn.execute(
+                    text(
+                        "SELECT "
+                        "(SELECT count(*) FROM memory_items WHERE tenant_id=t.id), "
+                        "(SELECT count(*) FROM jobs WHERE tenant_id=t.id), "
+                        "(SELECT count(*) FROM item_events e JOIN memory_items m ON m.id=e.item_id "
+                        " WHERE m.tenant_id=t.id), "
+                        "(SELECT row_to_json(c)::text FROM tenant_config c "
+                        " WHERE c.tenant_id=t.id AND c.active=true) "
+                        "FROM tenants t WHERE t.slug='default'"
+                    )
+                )
+            ).one()
+        assert default_after == default_before
+        _isolated_tenant_id = _isolated_admin_id = None
 
 
 async def _default_tenant_principal() -> tuple[str, str]:
-    async with _test_session_factory() as session:
-        row = (
-            (
-                await session.execute(
-                    text(
-                        "SELECT t.id::text AS tenant_id, p.id::text AS principal_id "
-                        "FROM tenants t "
-                        "JOIN principals p ON p.tenant_id = t.id AND p.name = 'admin' "
-                        "WHERE t.slug = 'default'"
-                    )
-                )
-            )
-            .mappings()
-            .one()
-        )
-    return str(row["tenant_id"]), str(row["principal_id"])
+    assert _isolated_tenant_id is not None
+    assert _isolated_admin_id is not None
+    return _isolated_tenant_id, _isolated_admin_id
 
 
 async def _second_principal(tenant_id: str, name: str = "audit-agent") -> str:
@@ -190,6 +219,134 @@ async def _second_principal(tenant_id: str, name: str = "audit-agent") -> str:
         )
         await session.commit()
     return pid
+
+
+async def _issue_key(
+    tenant_id: str,
+    principal_id: str,
+    scopes: list[str],
+    *,
+    profile_id: str | None = None,
+) -> str:
+    plaintext = generate_api_key()
+    parsed = parse_api_key(plaintext)
+    assert parsed.key_id is not None
+    async with _test_session_factory() as session:
+        await session.execute(
+            text(
+                "INSERT INTO api_keys (id, tenant_id, principal_id, key_hash, key_id, "
+                "secret_digest, digest_algorithm, scopes, label, memory_profile_id) "
+                "VALUES (:id, :tenant_id, :principal_id, NULL, :key_id, :digest, "
+                ":algorithm, :scopes, :label, :profile_id)"
+            ),
+            {
+                "id": str(uuid.uuid4()),
+                "tenant_id": tenant_id,
+                "principal_id": principal_id,
+                "key_id": parsed.key_id,
+                "digest": digest_api_key_secret(parsed.secret),
+                "algorithm": DIGEST_ALGORITHM,
+                "scopes": scopes,
+                "label": f"memory-audit-{uuid.uuid4()}",
+                "profile_id": profile_id,
+            },
+        )
+        await session.commit()
+    return plaintext
+
+
+async def _api_client(monkeypatch: pytest.MonkeyPatch) -> AsyncClient:
+    settings.auth_enabled = True
+    reset_principal_cache()
+    import engram.db as db_module
+
+    monkeypatch.setattr(db_module, "async_session_factory", _test_session_factory)
+    monkeypatch.setattr(db_module, "owner_session_factory", _test_session_factory)
+    monkeypatch.setattr(db_module, "read_session_factory", _test_session_factory)
+    return AsyncClient(transport=ASGITransport(app=create_app()), base_url="http://test")
+
+
+def _auth(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def _create_profile(
+    tenant_id: str, creator_id: str, *, include_tenant: bool, slug: str
+) -> str:
+    profile_id = str(uuid.uuid4())
+    revision_id = str(uuid.uuid4())
+    async with _test_session_factory() as session:
+        await session.execute(
+            text(
+                "INSERT INTO memory_profiles "
+                "(id, tenant_id, name, slug, created_by_principal_id) "
+                "VALUES (:id, :tenant_id, :name, :slug, :creator)"
+            ),
+            {
+                "id": profile_id,
+                "tenant_id": tenant_id,
+                "name": slug,
+                "slug": slug,
+                "creator": creator_id,
+            },
+        )
+        await session.execute(
+            text(
+                "INSERT INTO memory_profile_revisions "
+                "(id, tenant_id, profile_id, version, include_private, include_tenant, "
+                "include_public, allow_tenant_write, allow_public_write, "
+                "default_write_visibility, created_by_principal_id, reason) "
+                "VALUES (:id, :tenant_id, :profile_id, 1, true, :include_tenant, false, "
+                "false, false, 'private', :creator, 'audit profile')"
+            ),
+            {
+                "id": revision_id,
+                "tenant_id": tenant_id,
+                "profile_id": profile_id,
+                "include_tenant": include_tenant,
+                "creator": creator_id,
+            },
+        )
+        await session.execute(
+            text("UPDATE memory_profiles SET active_revision_id=:revision WHERE id=:id"),
+            {"revision": revision_id, "id": profile_id},
+        )
+        await session.commit()
+    return profile_id
+
+
+async def _insert_ready_embedding(item_id: str, tenant_id: str) -> list[float]:
+    async with _test_session_factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT id::text, model, dimensions FROM embedding_profiles "
+                    "WHERE state='active' LIMIT 1"
+                )
+            )
+        ).one()
+        vector = [1.0] + [0.0] * (int(row[2]) - 1)
+        rendered = "[" + ",".join(str(value) for value in vector) + "]"
+        await session.execute(
+            text(
+                "INSERT INTO memory_embeddings "
+                "(id, memory_item_id, tenant_id, profile_id, embedding_model, "
+                "embedding_dim, embedding, embedding_status) "
+                "VALUES (:id, :item_id, :tenant_id, :profile_id, :model, "
+                ":dimensions, CAST(:embedding AS vector), 'ready')"
+            ),
+            {
+                "id": str(uuid.uuid4()),
+                "item_id": item_id,
+                "tenant_id": tenant_id,
+                "profile_id": row[0],
+                "model": row[1],
+                "dimensions": row[2],
+                "embedding": rendered,
+            },
+        )
+        await session.commit()
+    return vector
 
 
 def _now() -> datetime:
@@ -619,7 +776,35 @@ async def test_blocker_conflict_unresolved() -> None:
 # ── governed review transition (Fixture R model) ─────────────────────────────
 
 
-async def test_reviewer_created_tenant_item_becomes_active_through_review() -> None:
+async def test_whoami_reports_every_authenticated_principal_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not await _db_ok():
+        pytest.skip(_DB_SKIP_REASON)
+    tenant_id, admin_id = await _default_tenant_principal()
+    identities = [(admin_id, "admin")]
+    for principal_type in ("agent", "user", "system"):
+        identities.append(
+            (await _second_principal(tenant_id, f"audit-{principal_type}"), principal_type)
+        )
+        async with _test_session_factory() as session:
+            await session.execute(
+                text("UPDATE principals SET type=:type WHERE id=:id"),
+                {"type": principal_type, "id": identities[-1][0]},
+            )
+            await session.commit()
+    client = await _api_client(monkeypatch)
+    async with client:
+        for principal_id, principal_type in identities:
+            token = await _issue_key(tenant_id, principal_id, ["read"])
+            response = await client.get("/whoami", headers=_auth(token))
+            assert response.status_code == 200
+            assert response.json()["principal_type"] == principal_type
+
+
+async def test_reviewer_created_tenant_item_becomes_active_through_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A reviewer-created tenant-visible proposed item can be activated through
     the normal governed review endpoint (no direct DB mutation)."""
     if not await _db_ok():
@@ -632,52 +817,57 @@ async def test_reviewer_created_tenant_item_becomes_active_through_review() -> N
         visibility="tenant",
         review_status="proposed",
     )
-
-    # Activate through a direct governed review transition (the endpoint logic
-    # is pure-policy: evaluate_transition). The reviewer authored the item and
-    # is an admin principal, so proposed→active is ALLOWED.
-    from engram.review_policy import TransitionOutcome, evaluate_transition
-
-    decision = evaluate_transition(
-        principal_id=uuid.UUID(reviewer_id),
-        principal_type="admin",
-        item_author_principal_id=uuid.UUID(reviewer_id),
-        current_status="proposed",
-        requested_status="active",
-    )
-    assert decision.outcome is TransitionOutcome.ALLOWED
-    # Perform the transition in-DB (mirrors what the review endpoint does).
-    async with _test_session_factory() as session:
-        await session.execute(
-            text(
-                "INSERT INTO item_events (item_id, event_type, field_name, "
-                "old_value, new_value, actor_principal_id, reason) "
-                "VALUES (:id, 'review_change', 'review_status', 'proposed', "
-                "'active', :actor, 'Controlled Engram audit fixture')"
-            ),
-            {"id": item_id, "actor": reviewer_id},
+    agent_id = await _second_principal(tenant_id)
+    reviewer_key = await _issue_key(tenant_id, reviewer_id, ["read", "write", "review"])
+    agent_key = await _issue_key(tenant_id, agent_id, ["read", "write"])
+    client = await _api_client(monkeypatch)
+    reason = "Controlled Engram memory E2E audit fixture"
+    async with client:
+        identity = await client.get("/whoami", headers=_auth(reviewer_key))
+        assert identity.status_code == 200
+        assert identity.json()["principal_type"] == "admin"
+        denied = await client.post(
+            f"/v1/items/{item_id}/review",
+            json={"review_status": "active", "reason": reason},
+            headers=_auth(agent_key),
         )
-        await session.execute(
-            text("UPDATE memory_items SET review_status = 'active' WHERE id = :id"),
-            {"id": item_id},
+        assert denied.status_code == 403
+        hidden = await client.post(
+            f"/v1/items/{uuid.uuid4()}/review",
+            json={"review_status": "active", "reason": reason},
+            headers=_auth(reviewer_key),
         )
-        await session.commit()
+        assert hidden.status_code == 404
+        activated = await client.post(
+            f"/v1/items/{item_id}/review",
+            json={"review_status": "active", "reason": reason},
+            headers=_auth(reviewer_key),
+        )
+        assert activated.status_code == 200, activated.text
 
     async with _test_session_factory() as session:
-        status = (
+        row = (
             await session.execute(
-                text("SELECT review_status FROM memory_items WHERE id = :id"),
+                text(
+                    "SELECT m.review_status, e.actor_principal_id::text, e.reason "
+                    "FROM memory_items m JOIN item_events e ON e.item_id=m.id "
+                    "WHERE m.id=:id AND e.old_value='proposed' AND e.new_value='active'"
+                ),
                 {"id": item_id},
             )
-        ).scalar_one()
-    assert status == "active"
+        ).one()
+    assert row[0] == "active"
+    assert row[1] == reviewer_id
+    assert row[2] == reason
 
 
 # ── visibility / access boundaries ───────────────────────────────────────────
 
 
-async def test_agent_can_read_tenant_visible_fixture() -> None:
-    """A tenant-visible item is readable by a different same-tenant principal."""
+async def test_profile_bound_allow_and_deny_direct_read_and_semantic_recall(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bound profile revisions govern real API reads and semantic recall."""
     if not await _db_ok():
         pytest.skip(_DB_SKIP_REASON)
     tenant_id, reviewer_id = await _default_tenant_principal()
@@ -690,23 +880,44 @@ async def test_agent_can_read_tenant_visible_fixture() -> None:
         visibility="tenant",
         review_status="active",
     )
-    from sqlalchemy import select
+    vector = await _insert_ready_embedding(item_id, tenant_id)
+    allowed_profile = await _create_profile(
+        tenant_id, reviewer_id, include_tenant=True, slug=f"allowed-{uuid.uuid4().hex}"
+    )
+    denied_profile = await _create_profile(
+        tenant_id, reviewer_id, include_tenant=False, slug=f"denied-{uuid.uuid4().hex}"
+    )
+    allowed_key = await _issue_key(
+        tenant_id, agent_id, ["read"], profile_id=allowed_profile
+    )
+    denied_key = await _issue_key(tenant_id, agent_id, ["read"], profile_id=denied_profile)
 
-    from engram.memory_access import eligibility_expression
-    from engram.models import MemoryItem
+    async def fixed_embedding(*args: Any, **kwargs: Any) -> list[float]:
+        return vector
 
-    async with _test_session_factory() as session:
-        visible = (
-            await session.execute(
-                select(MemoryItem).where(
-                    MemoryItem.id == uuid.UUID(item_id),
-                    MemoryItem.tenant_id == tenant_id,
-                    eligibility_expression(agent_id),
-                )
-            )
-        ).scalar_one_or_none()
-    assert visible is not None
-    assert str(visible.id) == item_id
+    import engram.recall as recall_module
+
+    monkeypatch.setattr(recall_module, "generate_embedding", fixed_embedding)
+    client = await _api_client(monkeypatch)
+    async with client:
+        allowed_read = await client.get(f"/v1/items/{item_id}", headers=_auth(allowed_key))
+        denied_read = await client.get(f"/v1/items/{item_id}", headers=_auth(denied_key))
+        assert allowed_read.status_code == 200
+        assert denied_read.status_code == 404
+        allowed_recall = await client.post(
+            "/v1/recall",
+            json={"mode": "semantic", "query": marker},
+            headers=_auth(allowed_key),
+        )
+        denied_recall = await client.post(
+            "/v1/recall",
+            json={"mode": "semantic", "query": marker},
+            headers=_auth(denied_key),
+        )
+        assert allowed_recall.status_code == 200, allowed_recall.text
+        assert denied_recall.status_code == 200, denied_recall.text
+        assert item_id in {str(item["id"]) for item in allowed_recall.json()["items"]}
+        assert item_id not in {str(item["id"]) for item in denied_recall.json()["items"]}
 
 
 async def test_reviewer_cannot_read_private_fixture_w() -> None:
@@ -788,36 +999,58 @@ async def test_owner_diagnostic_mode_performs_no_mutations() -> None:
     if not await _db_ok():
         pytest.skip(_DB_SKIP_REASON)
     tenant_id, principal_id = await _default_tenant_principal()
-    await _insert_item(
+    item_id = await _insert_item(
         tenant_id=tenant_id,
         principal_id=principal_id,
         content="owner diagnostic read-only probe",
         review_status="proposed",
     )
-    async with _test_session_factory() as session:
-        before = (await session.execute(text("SELECT COUNT(*) FROM memory_items"))).scalar_one()
+    tables = (
+        "memory_items",
+        "classification_runs",
+        "item_events",
+        "jobs",
+        "feedback_events",
+        "usage_events",
+    )
 
-    # Simulated owner-diagnostic: read-only transaction, parameterized query,
-    # immediate rollback.
-    async with _test_session_factory() as session, session.begin():  # transaction
-        await session.execute(
-            text(
-                "SELECT id, review_status, retention_disposition "
-                "FROM memory_items WHERE content LIKE :pat"
-            ),
-            {"pat": "%owner diagnostic%"},
-        )
+    async def snapshot() -> dict[str, list[tuple[Any, ...]]]:
+        async with _test_session_factory() as session:
+            return {
+                table: list(
+                    (
+                        await session.execute(
+                            text(f"SELECT * FROM {table} WHERE tenant_id=:tenant_id ORDER BY id"),
+                            {"tenant_id": tenant_id},
+                        )
+                    ).tuples()
+                )
+                for table in tables
+            }
+
+    before = await snapshot()
+    from scripts.run_memory_e2e_audit import _owner_promotion_diagnostic
+
+    owner_url = settings.owner_database_url or settings.database_url
+    diagnostic = await _owner_promotion_diagnostic(owner_url, item_id)
+    assert diagnostic["read_only"] is True
+    assert await snapshot() == before
+
+    async with _test_session_factory() as session:
+        await session.execute(text("SET TRANSACTION READ ONLY"))
+        with pytest.raises(DBAPIError):
+            await session.execute(
+                text("UPDATE memory_items SET importance=0.1 WHERE id=:id"), {"id": item_id}
+            )
         await session.rollback()
-
-    async with _test_session_factory() as session:
-        after = (await session.execute(text("SELECT COUNT(*) FROM memory_items"))).scalar_one()
-    assert after == before
 
 
 # ── audit cleanup changes only exact recorded fixture ids ────────────────────
 
 
-async def test_cleanup_changes_only_exact_recorded_ids() -> None:
+async def test_cleanup_changes_only_exact_recorded_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The harness cleanup archives ONLY exact recorded item ids, never a
     marker-wide fuzzy search. A decoy item with a similar marker is untouched."""
     if not await _db_ok():
@@ -839,20 +1072,60 @@ async def test_cleanup_changes_only_exact_recorded_ids() -> None:
         visibility="tenant",
         review_status="active",
     )
-    # Cleanup: archive only the exact target id.
-    async with _test_session_factory() as session:
-        await session.execute(
-            text("UPDATE memory_items SET review_status = 'archived' WHERE id = :id"),
-            {"id": target_id},
+    epistemic_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=reviewer_id,
+        content=f"epistemic {uuid.uuid4()}",
+        visibility="tenant",
+        review_status="active",
+    )
+    agent_id = await _second_principal(tenant_id)
+    write_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=agent_id,
+        content=f"private write {uuid.uuid4()}",
+        visibility="private",
+        review_status="active",
+    )
+    reviewer_key = await _issue_key(tenant_id, reviewer_id, ["read", "write", "review"])
+    agent_key = await _issue_key(tenant_id, agent_id, ["read", "write"])
+    settings.auth_enabled = True
+    reset_principal_cache()
+    import engram.db as db_module
+
+    monkeypatch.setattr(db_module, "async_session_factory", _test_session_factory)
+    monkeypatch.setattr(db_module, "owner_session_factory", _test_session_factory)
+    monkeypatch.setattr(db_module, "read_session_factory", _test_session_factory)
+    app = create_app()
+    import scripts.run_memory_e2e_audit as audit_cli
+    from engram.memory_audit import RunState
+
+    def asgi_client(api: Any) -> AsyncClient:
+        return AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            headers={"authorization": f"Bearer {api._key}", "accept": "application/json"},
         )
-        await session.commit()
+    monkeypatch.setattr(audit_cli.EngramAPI, "_client", asgi_client)
+    cfg = audit_cli.AuditConfig()
+    cfg.base_url, cfg.reviewer_key, cfg.agent_key = "http://test", reviewer_key, agent_key
+    state = RunState(
+        run_id=str(uuid.uuid4()), started_at=datetime.now(UTC), target_host="test"
+    )
+    state.fixture("recall").item_id = target_id
+    state.fixture("epistemic").item_id = epistemic_id
+    state.fixture("write").item_id = write_id
+    await audit_cli.cmd_cleanup(state, cfg)
 
     async with _test_session_factory() as session:
         rows = (
             (
                 await session.execute(
-                    text("SELECT id::text, review_status FROM memory_items WHERE id IN (:a, :b)"),
-                    {"a": target_id, "b": decoy_id},
+                    text(
+                        "SELECT id::text, review_status FROM memory_items "
+                        "WHERE id IN (:a, :b, :e, :w)"
+                    ),
+                    {"a": target_id, "b": decoy_id, "e": epistemic_id, "w": write_id},
                 )
             )
             .mappings()
@@ -860,4 +1133,7 @@ async def test_cleanup_changes_only_exact_recorded_ids() -> None:
         )
     by_id = {r["id"]: r["review_status"] for r in rows}
     assert by_id[target_id] == "archived"
+    assert by_id[epistemic_id] == "archived"
     assert by_id[decoy_id] == "active", "decoy must not be archived by fuzzy cleanup"
+    assert by_id[write_id] == "active"
+    assert write_id in state.stage("cleanup").evidence["skipped_ids"]
