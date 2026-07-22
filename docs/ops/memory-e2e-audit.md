@@ -421,3 +421,186 @@ embedding provider and worker path are enabled. That is a processing
 capability limitation, not a recall-engine failure. The final exact-head SHA
 and hosted CI run for this correction are recorded in PR #113 after push; an
 older green run must not be represented as final-head evidence.
+
+## Child-session isolation (ENG-AUDIT-001-FIX3 Correction D)
+
+Each Hermes child process used for the audit must have an **isolated session
+store** with no prior transcripts, no operator conversation history, and no
+access to the operator's session database.
+
+### Supported mechanism: HERMES_HOME override
+
+Stock Hermes at `5c172b25c3fb722b32ab264a4e24ae91523f857e` supports
+isolating all session/history/state by pointing `HERMES_HOME` at a fresh
+temporary directory. Each profile is a fully independent `HERMES_HOME` with
+its own `state.db` (the SQLite session store), `config.yaml`, `.env`, and
+`sessions/`.
+
+This is the mechanism used for the audit. It does **not** modify stock Hermes
+core.
+
+### Isolated child launch procedure
+
+Create a fresh temporary HERMES_HOME that contains only the Engram plugin
+configuration and agent key, then launch a child process from it:
+
+```bash
+# 1. Create an empty isolated state root.
+ISOLATED_HOME=$(mktemp -d /tmp/engram-audit-child-XXXXXX)
+
+# 2. Copy only the necessary configuration (no prior sessions, no transcripts).
+#    The plugin and provider config come from the dogfood profile config.yaml.
+cp ~/.hermes/profiles/<profile>/config.yaml "$ISOLATED_HOME/config.yaml"
+
+# 3. Create a minimal .env with only the Engram agent key and recall settings.
+cat > "$ISOLATED_HOME/.env" <<'EOF'
+ENGRAM_BASE_URL=https://api.engram.zutfen.com
+ENGRAM_API_KEY=<agent-key>
+ENGRAM_HOOKS_RECALL_ENABLED=true
+ENGRAM_HOOKS_RECALL_TIMEOUT=5.0
+ENGRAM_HOOKS_AUDIT_TRACE_FILE=<unique-trace-path.jsonl>
+EOF
+chmod 600 "$ISOLATED_HOME/.env"
+
+# 4. Verify the child's session store begins empty.
+test ! -f "$ISOLATED_HOME/state.db" && echo "session store begins empty ✓"
+
+# 5. Launch the child process with the isolated HERMES_HOME.
+HERMES_HOME="$ISOLATED_HOME" hermes chat -q 'What is the controlled Engram recall marker?'
+# or for epistemic: HERMES_HOME="$ISOLATED_HOME" hermes chat -q 'What color is the sky on February 30th?'
+```
+
+### Separate isolated children for each fixture
+
+Use a **separate** `ISOLATED_HOME` for each fixture lane:
+
+| Fixture | Isolated home | Query |
+|---------|---------------|-------|
+| Fixture W (write) | `/tmp/engram-audit-child-write-XXXX` | `Remember this durable fact...` |
+| Fixture R (recall) | `/tmp/engram-audit-child-recall-XXXX` | `What is the controlled Engram recall marker?` |
+| Fixture E (epistemic) | `/tmp/engram-audit-child-epistemic-XXXX` | `What color is the sky on February 30th?` |
+
+### Verification command
+
+After creating each isolated home but before launching Hermes, verify:
+
+```bash
+test ! -f "$ISOLATED_HOME/state.db" && echo "OK: empty session store" \
+  || { echo "FAIL: session store already exists"; exit 1; }
+```
+
+After the child process exits, verify no operator sessions were accessed:
+
+```bash
+# The isolated home's state.db should now exist but contain only this run's session.
+sqlite3 "$ISOLATED_HOME/state.db" "SELECT COUNT(*) FROM sessions;"
+# Expected: a small number (the child's own sessions), NOT the operator's history.
+```
+
+Clean up after the audit:
+
+```bash
+rm -rf "$ISOLATED_HOME"
+```
+
+### Plugin installation for isolated homes
+
+The Engram Hermes plugin must be importable. If the plugin is installed in the
+global site-packages (via the installer), the isolated HERMES_HOME inherits it
+automatically. If the plugin lives in `~/.hermes/plugins/`, copy it into the
+isolated home:
+
+```bash
+mkdir -p "$ISOLATED_HOME/plugins"
+cp -r ~/.hermes/plugins/engram_memory "$ISOLATED_HOME/plugins/"
+```
+
+## Denied-profile provisioning (ENG-AUDIT-001-FIX3 Correction E)
+
+The negative-control "denied" key must use a memory profile that genuinely
+excludes tenant-visible items. A different key ID does **not** imply
+restriction — an ordinary same-tenant read key is not a valid denied key.
+
+### Creating a restrictive memory profile
+
+Create a profile equivalent to:
+
+```
+include_private=true
+include_tenant=false
+include_public=false
+allow_tenant_write=false
+allow_public_write=false
+default_write_visibility=private
+```
+
+Using the owner/admin API:
+
+```bash
+# Create the restrictive profile revision
+curl -fsS -X POST \
+  -H "Authorization: Bearer $ENGRAM_OWNER_KEY" \
+  -H 'Content-Type: application/json' \
+  https://api.engram.zutfen.com/v1/memory-profiles \
+  -d '{
+    "slug": "audit-denied-restrictive",
+    "include_private": true,
+    "include_tenant": false,
+    "include_public": false,
+    "allow_tenant_write": false,
+    "allow_public_write": false,
+    "default_write_visibility": "private"
+  }'
+```
+
+### Binding the denied test key
+
+Create or update an agent API key and bind it to this profile:
+
+```bash
+# Create a new agent key bound to the restrictive profile
+curl -fsS -X POST \
+  -H "Authorization: Bearer $ENGRAM_OWNER_KEY" \
+  -H 'Content-Type: application/json' \
+  https://api.engram.zutfen.com/v1/agents \
+  -d '{
+    "name": "audit-denied-key",
+    "memory_profile_id": "<restrictive-profile-id>"
+  }'
+```
+
+### Verification
+
+Before running the audit, verify the denied key is correctly restrictive:
+
+```bash
+export ENGRAM_AUDIT_DENIED_KEY='<denied-key>'
+
+# 1. /whoami shows the bound profile
+curl -fsS -H "Authorization: Bearer $ENGRAM_AUDIT_DENIED_KEY" \
+  https://api.engram.zutfen.com/whoami | jq '.memory_profile_id'
+# Must match the restrictive profile ID, not null.
+
+# 2. GET tenant Fixture R returns 404
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -H "Authorization: Bearer $ENGRAM_AUDIT_DENIED_KEY" \
+  https://api.engram.zutfen.com/v1/items/<fixture-r-item-id>
+# Must be 404.
+
+# 3. Semantic recall returns 200 but omits Fixture R
+curl -fsS -X POST \
+  -H "Authorization: Bearer $ENGRAM_AUDIT_DENIED_KEY" \
+  -H 'Content-Type: application/json' \
+  https://api.engram.zutfen.com/v1/recall \
+  -d '{"mode":"semantic","query":"controlled Engram recall marker"}' \
+  | jq '[.items[].id] | index("<fixture-r-item-id>")'
+# Must be null (not found in results).
+```
+
+### What NOT to do
+
+- Do not use an ordinary same-tenant agent key as the denied key — it can read
+  tenant-visible items by design.
+- Do not infer restriction solely because the profile ID differs.
+- Do not auto-create or mutate profiles from the audit harness.
+

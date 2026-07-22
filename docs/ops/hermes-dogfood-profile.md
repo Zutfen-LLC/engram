@@ -305,6 +305,47 @@ diagnosable and does not depend on the write-interception marker being promoted.
       safe attribution, labels, and recall provenance; it does not provide a
       new marker-creation or review-event proof.
 
+## Persistent recall configuration (dogfood)
+
+The live dogfood audit requires `ENGRAM_HOOKS_RECALL_ENABLED=true` and
+`ENGRAM_HOOKS_RECALL_TIMEOUT=5.0`. These are **dogfood profile settings** —
+they do not change the library default (`recall_enabled=false`,
+`recall_timeout=1.5`). Set them in the profile `.env` file, not as one-shot
+exports:
+
+```bash
+# In the dogfood profile .env (mode 0600):
+echo 'ENGRAM_HOOKS_RECALL_ENABLED=true' >> ~/.hermes/profiles/<profile>/.env
+echo 'ENGRAM_HOOKS_RECALL_TIMEOUT=5.0' >> ~/.hermes/profiles/<profile>/.env
+chmod 600 ~/.hermes/profiles/<profile>/.env
+hermes gateway restart   # gateway; for CLI, fully exit and relaunch
+```
+
+After restart, confirm the sanitized startup status:
+
+- `read_hook=pre_llm_call`
+- `read_enabled=True`
+- recall timeout resolved to `5.00s` in the bridge log line:
+  `Engram recall config: enabled=True timeout=5.00s ...`
+- no fallback to native memory (startup log must NOT contain
+  `falling back to native memory` or `engram_memory` provider being skipped)
+
+### Hermes audit trace (dogfood only)
+
+For the structured E2E audit, set `ENGRAM_HOOKS_AUDIT_TRACE_FILE` to a unique
+path per test run. This writes one sanitized JSON Lines record per
+`pre_llm_call` hook execution. The trace is disabled when the variable is
+unset and never changes recall behavior.
+
+```bash
+export ENGRAM_HOOKS_AUDIT_TRACE_FILE=/tmp/engram-audit-trace-$(date +%s).jsonl
+```
+
+Each trace record contains only: schema, schema_version, timestamp, hook,
+provider, profile (sanitized), recall_enabled, recall_succeeded,
+recall_log_id, retrieved_item_ids, injected_item_ids, counts,
+native_memory_used, error_code. No API keys, no content, no secrets.
+
 ## Track A read-safety gate
 
 Store `The sky is purple on February 30th.` with `human_verified=false`, then
