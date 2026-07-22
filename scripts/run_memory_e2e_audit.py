@@ -33,6 +33,7 @@ import os
 import re
 import sys
 import traceback
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -505,6 +506,11 @@ async def stage_0_identity_preflight(state: RunState, cfg: AuditConfig) -> None:
                             denied_checks["include_tenant"] = False
                             denied_checks["restrictive"] = True
                             denied_checks["ready_for_stage_7"] = True
+                            # Persist the exact sanitized identity proven at
+                            # preflight time so Stage 7 can verify continuity.
+                            denied_checks["proven_identity"] = (
+                                _denied_identity_record(denied_id)
+                            )
                     except Exception:
                         denied_checks["restrictive"] = None
                         denied_checks["error"] = (
@@ -595,6 +601,75 @@ def _safe_identity(who: dict[str, Any]) -> dict[str, Any]:
             "version": profile.version,
         }
     return base
+
+
+def _denied_identity_record(whoami: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract a normalized identity record from a denied-key ``/whoami`` response.
+
+    Used by Stage 0 to persist the exact sanitized identity proven at preflight
+    time, and by Stage 7 to compare the current identity against the stored one.
+
+    Returns ``None`` when the nested ``memory_profile`` is absent or malformed.
+    Never stores the raw API key.
+    """
+    try:
+        profile = _whoami_profile(whoami)
+    except ValueError:
+        return None
+    if profile is None:
+        return None
+    return {
+        "tenant_id": whoami.get("tenant_id"),
+        "principal_id": whoami.get("principal_id"),
+        "api_key_id": whoami.get("api_key_id"),
+        "profile_id": profile.profile_id,
+        "profile_slug": profile.slug,
+        "profile_revision_id": profile.active_revision_id,
+        "profile_version": profile.version,
+    }
+
+
+def _identity_continuity(
+    expected: dict[str, Any] | None,
+    actual: dict[str, Any] | None,
+) -> tuple[bool, dict[str, Any]]:
+    """Compare two denied-key identity records for exact equality.
+
+    Returns ``(ok, summary)`` where ``ok`` is True only when all seven
+    continuity fields match exactly:
+    - tenant_id
+    - principal_id
+    - api_key_id
+    - profile_id
+    - profile_slug
+    - profile_revision_id (active revision ID)
+    - profile_version
+    """
+    if expected is None or actual is None:
+        return False, {
+            "expected_present": expected is not None,
+            "actual_present": actual is not None,
+        }
+
+    fields = (
+        "tenant_id",
+        "principal_id",
+        "api_key_id",
+        "profile_id",
+        "profile_slug",
+        "profile_revision_id",
+        "profile_version",
+    )
+    diffs: dict[str, dict[str, Any]] = {}
+    for f in fields:
+        exp_v = expected.get(f)
+        act_v = actual.get(f)
+        if exp_v != act_v:
+            diffs[f] = {"expected": exp_v, "actual": act_v}
+
+    if diffs:
+        return False, {"differences": diffs}
+    return True, {"matched": list(fields)}
 
 
 # ── Stage 1 — Hermes write interception (operator-submitted) ─────────────────
@@ -1520,6 +1595,158 @@ HOOK_TRACE_SCHEMA = "engram.hermes-hook-audit-trace"
 HOOK_TRACE_SCHEMA_VERSION = "2.0"
 
 
+@dataclass(frozen=True)
+class ValidatedHookTrace:
+    """Strictly parsed hook-trace record. Every field is guaranteed present
+    and well-typed. Missing/malformed fields cause parsing to fail closed."""
+
+    audit_run_id: str
+    audit_fixture: str
+    prompt_sha256: str
+    query_digest: str
+    session_id_digest: str
+    turn_index: int
+    recall_log_id: str
+    retrieved_item_ids: tuple[str, ...]
+    injected_item_ids: tuple[str, ...]
+    retrieved_item_count: int
+    injected_item_count: int
+    expected_prompt_sha256_match: bool
+    recall_succeeded: bool
+    error_code: str | None
+
+
+def _parse_hook_trace_record(
+    record: dict[str, Any],
+) -> tuple[ValidatedHookTrace | None, str | None]:
+    """Strictly parse a single hook-trace record.
+
+    Returns ``(ValidatedHookTrace | None, reason_code | None)``.
+    When parsing succeeds the first element is set; otherwise the second
+    carries a stable reason code explaining the failure.
+
+    The parser fails closed on every missing or malformed required field.
+    It never coerces None, empty strings, missing keys, ``False``, or
+    wrong types into success.
+    """
+    # ── Schema identity ─────────────────────────────────────────────────
+    if record.get("schema") != HOOK_TRACE_SCHEMA:
+        return None, "HERMES_HOOK_TRACE_INVALID"
+    if record.get("schema_version") != HOOK_TRACE_SCHEMA_VERSION:
+        return None, "HERMES_HOOK_TRACE_INVALID"
+    if record.get("hook") != "pre_llm_call":
+        return None, "HERMES_HOOK_TRACE_INVALID"
+    if record.get("provider") != "engram":
+        return None, "HERMES_HOOK_TRACE_INVALID"
+
+    # ── Boolean gates ───────────────────────────────────────────────────
+    if record.get("recall_enabled") is not True:
+        return None, "HERMES_HOOK_TRACE_INVALID"
+    if record.get("recall_succeeded") is not True:
+        return None, "HERMES_HOOK_TRACE_INVALID"
+    if record.get("native_memory_used") is not False:
+        return None, "HERMES_HOOK_TRACE_INVALID"
+
+    # ── error_code must be exactly null ────────────────────────────────
+    if record.get("error_code") is not None:
+        return None, "HERMES_TRACE_ERROR_PRESENT"
+
+    # ── audit_run_id: valid UUID ───────────────────────────────────────
+    audit_run_id = record.get("audit_run_id")
+    if not isinstance(audit_run_id, str) or not audit_run_id:
+        return None, "HERMES_HOOK_TRACE_MISSING"
+    try:
+        uuid.UUID(audit_run_id)
+    except (ValueError, AttributeError):
+        return None, "HERMES_HOOK_TRACE_INVALID"
+
+    # ── audit_fixture: "recall" or "epistemic" ─────────────────────────
+    audit_fixture = record.get("audit_fixture")
+    if audit_fixture not in ("recall", "epistemic"):
+        return None, "HERMES_HOOK_TRACE_INVALID"
+
+    # ── prompt_sha256: 64 lowercase hex ────────────────────────────────
+    prompt_sha256 = record.get("prompt_sha256")
+    if (
+        not isinstance(prompt_sha256, str)
+        or len(prompt_sha256) != 64
+        or not all(c in "0123456789abcdef" for c in prompt_sha256)
+    ):
+        return None, "HERMES_HOOK_TRACE_INVALID"
+
+    # ── expected_prompt_sha256_match must be exactly true ──────────────
+    if record.get("expected_prompt_sha256_match") is not True:
+        return None, "HERMES_TRACE_EXPECTED_PROMPT_UNPROVEN"
+
+    # ── query_digest: present non-empty string ─────────────────────────
+    query_digest = record.get("query_digest")
+    if not isinstance(query_digest, str) or not query_digest:
+        return None, "HERMES_TRACE_QUERY_UNPROVEN"
+
+    # ── session_id_digest: present non-empty string ────────────────────
+    session_id_digest = record.get("session_id_digest")
+    if not isinstance(session_id_digest, str) or not session_id_digest:
+        return None, "HERMES_TRACE_SESSION_UNPROVEN"
+
+    # ── turn_index: integer >= 1 ───────────────────────────────────────
+    turn_raw = record.get("turn_index")
+    if not isinstance(turn_raw, int) or isinstance(turn_raw, bool):
+        return None, "HERMES_TRACE_TURN_INVALID"
+    if turn_raw < 1:
+        return None, "HERMES_TRACE_TURN_INVALID"
+
+    # ── recall_log_id: non-empty string ────────────────────────────────
+    recall_log_id = record.get("recall_log_id")
+    if not isinstance(recall_log_id, str) or not recall_log_id:
+        return None, "HERMES_TRACE_PROVENANCE_MISMATCH"
+
+    # ── retrieved_item_ids: list of strings ────────────────────────────
+    retrieved_raw = record.get("retrieved_item_ids")
+    if not isinstance(retrieved_raw, list):
+        return None, "HERMES_HOOK_TRACE_INVALID"
+    if not all(isinstance(x, str) and x for x in retrieved_raw):
+        return None, "HERMES_HOOK_TRACE_INVALID"
+    retrieved_item_ids = tuple(retrieved_raw)
+
+    # ── injected_item_ids: list of strings ─────────────────────────────
+    injected_raw = record.get("injected_item_ids")
+    if not isinstance(injected_raw, list):
+        return None, "HERMES_HOOK_TRACE_INVALID"
+    if not all(isinstance(x, str) and x for x in injected_raw):
+        return None, "HERMES_HOOK_TRACE_INVALID"
+    injected_item_ids = tuple(injected_raw)
+
+    # ── count/list consistency ─────────────────────────────────────────
+    retrieved_count = record.get("retrieved_item_count")
+    if not isinstance(retrieved_count, int) or isinstance(retrieved_count, bool):
+        return None, "HERMES_HOOK_TRACE_INVALID"
+    if retrieved_count != len(retrieved_item_ids):
+        return None, "HERMES_HOOK_TRACE_INVALID"
+
+    injected_count = record.get("injected_item_count")
+    if not isinstance(injected_count, int) or isinstance(injected_count, bool):
+        return None, "HERMES_HOOK_TRACE_INVALID"
+    if injected_count != len(injected_item_ids):
+        return None, "HERMES_HOOK_TRACE_INVALID"
+
+    return ValidatedHookTrace(
+        audit_run_id=audit_run_id,
+        audit_fixture=audit_fixture,
+        prompt_sha256=prompt_sha256,
+        query_digest=query_digest,
+        session_id_digest=session_id_digest,
+        turn_index=turn_raw,
+        recall_log_id=recall_log_id,
+        retrieved_item_ids=retrieved_item_ids,
+        injected_item_ids=injected_item_ids,
+        retrieved_item_count=retrieved_count,
+        injected_item_count=injected_count,
+        expected_prompt_sha256_match=True,
+        recall_succeeded=True,
+        error_code=None,
+    ), None
+
+
 def _validate_hook_trace(
     trace_file: Path,
     *,
@@ -1527,222 +1754,148 @@ def _validate_hook_trace(
     expected_fixture: str,  # "recall" or "epistemic"
     expected_run_id: str | None = None,
 ) -> tuple[str | None, dict[str, Any]]:
-    """Validate a Hermes hook audit trace file.
+    """Validate a Hermes hook audit trace file using strict typed parsing.
 
     Returns ``(reason_code_or_None, trace_evidence)``. When
     ``reason_code`` is not None the trace failed validation.
 
-    Binding validation (Blocker B):
-    * ``audit_run_id`` must match ``expected_run_id`` (if both are present)
-    * ``audit_fixture`` must match ``expected_fixture``
-    * ``prompt_sha256`` must match the canonical hash for the fixture
-    * ``session_id_digest`` must be present
-    * ``turn_index`` must be a non-negative integer
-    * ``expected_prompt_sha256_match`` must be true (if the field exists)
-
-    Trace selection: select the record matching schema, schema version,
-    run ID, fixture, prompt hash, AND expected item ID — not just the last
-    structurally valid line.
+    Missing binding evidence fails exactly like mismatched binding evidence.
+    Fallback records can never produce success — they are used only to
+    produce a more precise error diagnosis.
     """
     if not trace_file.is_file():
         return "HERMES_HOOK_TRACE_MISSING", {}
 
     try:
-        lines = trace_file.read_text(encoding="utf-8").strip().splitlines()
+        raw_text = trace_file.read_text(encoding="utf-8")
     except OSError:
         return "HERMES_HOOK_TRACE_INVALID", {"error": "unreadable"}
 
     # Compute the expected prompt hash for this fixture.
-    if expected_fixture == "recall":
-        expected_prompt_hash = RECALL_PROMPT_SHA256
-    else:
-        expected_prompt_hash = EPISTEMIC_PROMPT_SHA256
+    expected_prompt_hash = (
+        RECALL_PROMPT_SHA256
+        if expected_fixture == "recall"
+        else EPISTEMIC_PROMPT_SHA256
+    )
 
-    # Parse all lines, tracking both matching and malformed records.
-    valid_records: list[dict[str, Any]] = []
+    # ── Parse all lines ────────────────────────────────────────────────
     malformed_count = 0
-    for line in lines:
+    parsed_records: list[ValidatedHookTrace] = []
+    parse_failures: list[tuple[str | None, dict[str, Any]]] = []
+
+    for line in raw_text.strip().splitlines():
         line = line.strip()
         if not line:
             continue
         try:
-            record = json.loads(line)
+            raw_record = json.loads(line)
         except json.JSONDecodeError:
             malformed_count += 1
             continue
-        if (
-            record.get("schema") == HOOK_TRACE_SCHEMA
-            and record.get("hook") == "pre_llm_call"
-        ):
-            valid_records.append(record)
+        parsed, fail_reason = _parse_hook_trace_record(raw_record)
+        if parsed is not None:
+            parsed_records.append(parsed)
+        elif fail_reason:
+            parse_failures.append(
+                (fail_reason, {"malformed_line_count": malformed_count})
+            )
 
-    if not valid_records:
-        return "HERMES_HOOK_TRACE_INVALID", {"error": "no_valid_pre_llm_call_record"}
+    if not parsed_records:
+        if parse_failures:
+            # Return the most precise parse failure.
+            return parse_failures[0]
+        return "HERMES_HOOK_TRACE_INVALID", {
+            "error": "no_valid_pre_llm_call_record",
+            "malformed_line_count": malformed_count,
+        }
 
-    # Select the best matching record: must match schema_version, fixture,
-    # prompt hash, AND contain the expected item ID.
-    best_match: dict[str, Any] | None = None
-    # Also track the last valid record as fallback for schema checks.
-    last_valid: dict[str, Any] | None = None
-
-    for record in valid_records:
-        if record.get("schema_version") != HOOK_TRACE_SCHEMA_VERSION:
+    # ── Filter candidates by binding criteria ──────────────────────────
+    # A candidate must match: expected run, expected fixture, expected
+    # prompt hash, expected item in retrieved_item_ids, and expected item
+    # in injected_item_ids.
+    candidates: list[ValidatedHookTrace] = []
+    for rec in parsed_records:
+        if rec.audit_run_id != expected_run_id:
             continue
-        last_valid = record
+        if rec.audit_fixture != expected_fixture:
+            continue
+        if rec.prompt_sha256 != expected_prompt_hash:
+            continue
+        if expected_item_id not in rec.retrieved_item_ids:
+            continue
+        if expected_item_id not in rec.injected_item_ids:
+            continue
+        candidates.append(rec)
 
-        # Check if this record matches all binding criteria.
-        record_fixture = record.get("audit_fixture")
-        record_prompt_hash = record.get("prompt_sha256")
-        record_run_id = record.get("audit_run_id")
-        retrieved_ids = record.get("retrieved_item_ids") or []
-        injected_ids = record.get("injected_item_ids") or []
-
-        fixture_match = record_fixture == expected_fixture
-        prompt_match = record_prompt_hash == expected_prompt_hash
-        run_match = (
-            expected_run_id is None
-            or record_run_id is None
-            or record_run_id == expected_run_id
-        )
-        item_retrieved = expected_item_id in retrieved_ids
-        item_injected = expected_item_id in injected_ids
-
-        if fixture_match and prompt_match and run_match and item_retrieved and item_injected:
-            best_match = record
-            break  # Take the first fully matching record.
-
-    # If no fully matching record, use the last valid one for error reporting.
-    report_record = best_match or last_valid
-    if report_record is None:
-        return "HERMES_HOOK_TRACE_INVALID", {
-            "error": "schema_version_mismatch",
-            "expected": HOOK_TRACE_SCHEMA_VERSION,
-            "malformed_line_count": malformed_count,
-        }
-
-    # Schema version check.
-    if report_record.get("schema_version") != HOOK_TRACE_SCHEMA_VERSION:
-        return "HERMES_HOOK_TRACE_INVALID", {
-            "error": "schema_version_mismatch",
-            "found": report_record.get("schema_version"),
-            "malformed_line_count": malformed_count,
-        }
-
-    # Provider check.
-    if report_record.get("provider") != "engram":
-        return "HERMES_HOOK_TRACE_INVALID", {
-            "error": "wrong_provider",
-            "found": report_record.get("provider"),
-            "malformed_line_count": malformed_count,
-        }
-
-    # Recall must have succeeded.
-    if not report_record.get("recall_succeeded"):
-        return "HERMES_HOOK_TRACE_INVALID", {
-            "error": "recall_did_not_succeed",
-            "error_code": report_record.get("error_code"),
-            "malformed_line_count": malformed_count,
-        }
-
-    # Recall log ID must be present.
-    trace_log_id = report_record.get("recall_log_id")
-    if not trace_log_id:
-        return "HERMES_TRACE_PROVENANCE_MISMATCH", {
-            "error": "trace_recall_log_id_null",
-            "malformed_line_count": malformed_count,
-        }
-
-    # ── Binding validation ──────────────────────────────────────────────
-    # Only enforce binding checks when a best_match was found (i.e. when
-    # the trace actually contains a record that matches all binding
-    # criteria). If no best_match, fall through to individual checks below
-    # for precise error reporting.
-
-    if best_match is None:
-        # Determine which specific binding check failed.
-        for record in valid_records:
-            if record.get("schema_version") != HOOK_TRACE_SCHEMA_VERSION:
-                continue
-            record_fixture = record.get("audit_fixture")
-            record_run_id = record.get("audit_run_id")
-            record_prompt_hash = record.get("prompt_sha256")
-            session_digest = record.get("session_id_digest")
-            turn_raw = record.get("turn_index")
-
-            if expected_run_id and record_run_id and record_run_id != expected_run_id:
+    # ── 0 candidates → most precise binding failure ────────────────────
+    if not candidates:
+        # Try to determine the most precise failure reason from all
+        # parsed records (regardless of item binding).
+        for rec in parsed_records:
+            if expected_run_id and rec.audit_run_id != expected_run_id:
                 return "HERMES_TRACE_RUN_MISMATCH", {
                     "expected_run_id": expected_run_id,
-                    "found_run_id": record_run_id,
+                    "found_run_id": rec.audit_run_id,
                     "malformed_line_count": malformed_count,
                 }
-            if record_fixture and record_fixture != expected_fixture:
+        for rec in parsed_records:
+            if rec.audit_fixture != expected_fixture:
                 return "HERMES_TRACE_FIXTURE_MISMATCH", {
                     "expected_fixture": expected_fixture,
-                    "found_fixture": record_fixture,
+                    "found_fixture": rec.audit_fixture,
                     "malformed_line_count": malformed_count,
                 }
-            if (
-                record_prompt_hash
-                and record_prompt_hash != expected_prompt_hash
-            ):
+        for rec in parsed_records:
+            if rec.prompt_sha256 != expected_prompt_hash:
                 return "HERMES_TRACE_PROMPT_MISMATCH", {
                     "expected_prompt_sha256": expected_prompt_hash,
-                    "found_prompt_sha256": record_prompt_hash,
+                    "found_prompt_sha256": rec.prompt_sha256,
                     "malformed_line_count": malformed_count,
                 }
-            if not session_digest:
-                return "HERMES_TRACE_SESSION_UNPROVEN", {
-                    "error": "session_id_digest_missing",
+        for rec in parsed_records:
+            if expected_item_id not in rec.retrieved_item_ids:
+                return "HERMES_EXPECTED_ITEM_NOT_RETRIEVED", {
+                    "expected_item_id": expected_item_id,
                     "malformed_line_count": malformed_count,
                 }
-            if not isinstance(turn_raw, int) or turn_raw < 0:
-                return "HERMES_TRACE_TURN_INVALID", {
-                    "error": "turn_index_invalid",
-                    "found": turn_raw,
+        for rec in parsed_records:
+            if expected_item_id not in rec.injected_item_ids:
+                return "HERMES_EXPECTED_ITEM_NOT_INJECTED", {
+                    "expected_item_id": expected_item_id,
                     "malformed_line_count": malformed_count,
                 }
-
-    retrieved_ids = report_record.get("retrieved_item_ids") or []
-    injected_ids = report_record.get("injected_item_ids") or []
-
-    # Expected item must appear in retrieved_item_ids.
-    if expected_item_id not in retrieved_ids:
-        return "HERMES_EXPECTED_ITEM_NOT_RETRIEVED", {
-            "expected_item_id": expected_item_id,
-            "retrieved_item_ids": retrieved_ids,
+        # Generic fallback: no records matched any criteria.
+        return "HERMES_HOOK_TRACE_INVALID", {
+            "error": "no_matching_candidate",
             "malformed_line_count": malformed_count,
         }
 
-    # Expected item must appear in injected_item_ids (proves injection).
-    if expected_item_id not in injected_ids:
-        return "HERMES_EXPECTED_ITEM_NOT_INJECTED", {
-            "expected_item_id": expected_item_id,
-            "retrieved_item_ids": retrieved_ids,
-            "injected_item_ids": injected_ids,
+    # ── >1 candidates → ambiguous ──────────────────────────────────────
+    if len(candidates) > 1:
+        return "HERMES_TRACE_AMBIGUOUS", {
+            "matching_candidate_count": len(candidates),
             "malformed_line_count": malformed_count,
         }
 
-    # Compute trace file hash (we store the hash, not the raw content).
+    # ── Exactly one candidate → success ────────────────────────────────
+    trace = candidates[0]
+
     trace_bytes = trace_file.read_bytes()
     trace_hash = hashlib.sha256(trace_bytes).hexdigest()
 
     return None, {
         "hook_trace_file_hash": trace_hash,
-        "hook_trace_recall_log_id": trace_log_id,
-        "retrieved_item_ids_match": expected_item_id in retrieved_ids,
-        "injected_item_ids_match": expected_item_id in injected_ids,
-        "retrieved_item_count": report_record.get("retrieved_item_count"),
-        "injected_item_count": report_record.get("injected_item_count"),
-        "audit_run_id": report_record.get("audit_run_id"),
-        "audit_fixture": report_record.get("audit_fixture"),
-        "prompt_sha256": report_record.get("prompt_sha256"),
-        "expected_prompt_sha256_match": report_record.get(
-            "expected_prompt_sha256_match"
-        ),
-        "session_id_digest_present": bool(
-            report_record.get("session_id_digest")
-        ),
-        "turn_index": report_record.get("turn_index"),
+        "hook_trace_recall_log_id": trace.recall_log_id,
+        "retrieved_item_ids_match": expected_item_id in trace.retrieved_item_ids,
+        "injected_item_ids_match": expected_item_id in trace.injected_item_ids,
+        "retrieved_item_count": trace.retrieved_item_count,
+        "injected_item_count": trace.injected_item_count,
+        "audit_run_id": trace.audit_run_id,
+        "audit_fixture": trace.audit_fixture,
+        "prompt_sha256": trace.prompt_sha256,
+        "expected_prompt_sha256_match": trace.expected_prompt_sha256_match,
+        "session_id_digest_present": bool(trace.session_id_digest),
+        "turn_index": trace.turn_index,
         "malformed_line_count": malformed_count,
     }
 
@@ -2284,54 +2437,80 @@ async def stage_7_negative_controls(state: RunState, cfg: AuditConfig) -> None:
                     evidence={"item_id": fr.item_id, "required": False},
                 )
             else:
-                direct_denied = False
-                try:
-                    await denied.get_item(fr.item_id or "")
-                except APIError as exc:
-                    direct_denied = _is_denied(exc)
+                # ── Identity continuity check (FIX5 Part B) ──────────────
+                # Compare the current denied-key identity with the one
+                # proven at Stage 0. If any field differs (different API
+                # key, tenant, principal, profile, revision, or version),
+                # block the denied-profile lane immediately. Do NOT run
+                # any behavioral proof after drift is detected.
+                stored_identity = s0_checks.get("proven_identity")
+                current_identity = _denied_identity_record(denied_identity)
+                continuity_ok, continuity_summary = _identity_continuity(
+                    stored_identity, current_identity
+                )
+                if not continuity_ok:
+                    _stage_done(
+                        state,
+                        "negative_r_denied_profile",
+                        bucket="negative",
+                        status="blocked",
+                        reason_code="NEGATIVE_CONTROL_IDENTITY_DRIFT",
+                        evidence={
+                            "item_id": fr.item_id,
+                            "required": False,
+                            "identity_continuity": continuity_summary,
+                            "behavioral_calls_made": False,
+                        },
+                    )
+                else:
+                    direct_denied = False
+                    try:
+                        await denied.get_item(fr.item_id or "")
+                    except APIError as exc:
+                        direct_denied = _is_denied(exc)
+                        if not direct_denied:
+                            _stage_done(
+                                state,
+                                "negative_r_denied_profile",
+                                bucket="negative",
+                                status="failed",
+                                reason_code="NEGATIVE_CONTROL_CREDENTIAL_INVALID"
+                                if exc.status_code == 401
+                                else "NEGATIVE_CONTROL_RECALL_NOT_PROVEN",
+                                evidence={"item_id": fr.item_id, "required": False},
+                            )
                     if not direct_denied:
                         _stage_done(
                             state,
                             "negative_r_denied_profile",
                             bucket="negative",
                             status="failed",
-                            reason_code="NEGATIVE_CONTROL_CREDENTIAL_INVALID"
-                            if exc.status_code == 401
-                            else "NEGATIVE_CONTROL_RECALL_NOT_PROVEN",
+                            reason_code="PASS_EXPECTED_DENIAL",
+                            limitations=[
+                                "denied key unexpectedly read tenant Fixture R"
+                            ],
+                        )
+                    else:
+                        try:
+                            rec = await denied.recall(
+                                fr.marker or "", mode="semantic"
+                            )
+                            leaked = any(
+                                item.get("id") == fr.item_id
+                                for item in (rec.get("items") or [])
+                            )
+                        except APIError:
+                            leaked = True
+                        _stage_done(
+                            state,
+                            "negative_r_denied_profile",
+                            bucket="negative",
+                            status="failed" if leaked else "pass_expected_denial",
+                            reason_code="NEGATIVE_CONTROL_RECALL_NOT_PROVEN"
+                            if leaked
+                            else "PASS_EXPECTED_DENIAL",
                             evidence={"item_id": fr.item_id, "required": False},
                         )
-                if not direct_denied:
-                    _stage_done(
-                        state,
-                        "negative_r_denied_profile",
-                        bucket="negative",
-                        status="failed",
-                        reason_code="PASS_EXPECTED_DENIAL",
-                        limitations=[
-                            "denied key unexpectedly read tenant Fixture R"
-                        ],
-                    )
-                else:
-                    try:
-                        rec = await denied.recall(
-                            fr.marker or "", mode="semantic"
-                        )
-                        leaked = any(
-                            item.get("id") == fr.item_id
-                            for item in (rec.get("items") or [])
-                        )
-                    except APIError:
-                        leaked = True
-                    _stage_done(
-                        state,
-                        "negative_r_denied_profile",
-                        bucket="negative",
-                        status="failed" if leaked else "pass_expected_denial",
-                        reason_code="NEGATIVE_CONTROL_RECALL_NOT_PROVEN"
-                        if leaked
-                        else "PASS_EXPECTED_DENIAL",
-                        evidence={"item_id": fr.item_id, "required": False},
-                    )
 
     # Positive control: agent key against Fixture R.
     _stage_start(state, "negative_r_agent_positive", bucket="negative")
