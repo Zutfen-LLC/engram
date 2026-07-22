@@ -60,6 +60,9 @@ _spec.loader.exec_module(cli)
 def _mkstate(marker_write: str = "AUDIT-WRITE-x") -> RunState:
     s = RunState(run_id=str(uuid.uuid4()), started_at=datetime.now(UTC), target_host="h")
     s.fixture("write").marker = marker_write
+    # Individual command tests exercise the boundary after its required Stage
+    # 0 gate; dedicated identity tests overwrite this state themselves.
+    s.stage("stage_0_identity_preflight").status = "pass"
     return s
 
 
@@ -133,9 +136,7 @@ def test_assert_no_secrets_backstop_catches_unredacted() -> None:
     # The defense-in-depth assertion must fire for a secret-shaped string
     # that somehow reached the serialization path unredacted.
     with pytest.raises(AssertionError, match="secret-shaped"):
-        assert_no_secrets(
-            "postgresql+asyncpg://u:s3cretPwXYZ@host/db", context="backstop"
-        )
+        assert_no_secrets("postgresql+asyncpg://u:s3cretPwXYZ@host/db", context="backstop")
 
 
 def test_resumability_partial_run_resumes_without_restarting(tmp_path: Path) -> None:
@@ -191,8 +192,8 @@ def test_load_schema_has_required_reason_code_vocab() -> None:
         "MODEL_OMITTED_MARKER",
         "MODEL_TREATED_ACTIVE_AS_VERIFIED",
         "TAXONOMY_CONFIDENCE_BELOW_MINIMUM",
-        "WOULD_AUTO_PROMOTE",
-        "AUTO_PROMOTED",
+        "PROCESSING_FIELDS_OBSERVED",
+        "EPISTEMIC_POSITIVE_EVIDENCE_MISSING",
     ):
         assert code in codes, f"missing reason code: {code}"
 
@@ -201,8 +202,10 @@ def test_load_schema_has_required_reason_code_vocab() -> None:
 
 
 def test_redact_strips_api_key_and_bearer_and_dsn() -> None:
-    text = "key=eng_AbCdEf123456_LongSecretMaterial tail; Bearer abc123def456; " \
-           "postgresql://u:s3cretPw@host/db"
+    text = (
+        "key=eng_AbCdEf123456_LongSecretMaterial tail; Bearer abc123def456; "
+        "postgresql://u:s3cretPw@host/db"
+    )
     out = redact_secrets(text)
     assert "LongSecretMaterial" not in out
     assert "abc123def456" not in out
@@ -227,7 +230,7 @@ def test_assert_no_secrets_catches_bearer() -> None:
 def test_pass_vs_finding_vs_failed_overall() -> None:
     # all pass -> pass
     s = _mkstate()
-    for st in ("stage_0_identity_preflight", "stage_1_hermes_write"):
+    for st in cli.STAGE_ORDER:
         s.stage(st).status = "pass"
     r = finalize_report(s).to_dict()
     assert r["overall"]["status"] == "pass"
@@ -256,7 +259,8 @@ def test_pass_expected_denial_is_not_a_failure() -> None:
     s = _mkstate()
     s.negative("negative_w_reviewer_private").status = "pass_expected_denial"
     s.negative("negative_w_reviewer_private").reason_code = "PASS_EXPECTED_DENIAL"
-    s.stage("stage_0_identity_preflight").status = "pass"
+    for st in cli.STAGE_ORDER:
+        s.stage(st).status = "pass"
     r = finalize_report(s).to_dict()
     assert r["overall"]["status"] == "pass"
     assert not r["overall"]["failed_stages"]
@@ -276,16 +280,20 @@ async def test_verify_hermes_write_flags_duplicate_items(monkeypatch: pytest.Mon
     s.fixture("write").marker = "AUDIT-WRITE-DUP"
 
     routes = {
-        "POST /v1/search": (
+        "GET /v1/items": (
             200,
             {
-                "results": [
-                    {"id": str(uuid.uuid4()),
-                     "content": "x AUDIT-WRITE-DUP",
-                     "review_status": "proposed"},
-                    {"id": str(uuid.uuid4()),
-                     "content": "y AUDIT-WRITE-DUP",
-                     "review_status": "proposed"},
+                "items": [
+                    {
+                        "id": str(uuid.uuid4()),
+                        "content": "x AUDIT-WRITE-DUP",
+                        "review_status": "proposed",
+                    },
+                    {
+                        "id": str(uuid.uuid4()),
+                        "content": "y AUDIT-WRITE-DUP",
+                        "review_status": "proposed",
+                    },
                 ],
                 "total": 2,
             },
@@ -330,10 +338,24 @@ async def test_identity_preflight_passes(monkeypatch: pytest.MonkeyPatch) -> Non
     def handler(request: httpx.Request) -> httpx.Response:
         call["n"] += 1
         if call["n"] == 1:
-            return httpx.Response(200, json={"tenant_id": tid, "principal_id": agent_pid,
-                                             "scopes": ["read", "write"]})
-        return httpx.Response(200, json={"tenant_id": tid, "principal_id": reviewer_pid,
-                                         "scopes": ["read", "write", "review"]})
+            return httpx.Response(
+                200,
+                json={
+                    "tenant_id": tid,
+                    "principal_id": agent_pid,
+                    "principal_type": "agent",
+                    "scopes": ["read", "write"],
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "tenant_id": tid,
+                "principal_id": reviewer_pid,
+                "principal_type": "user",
+                "scopes": ["read", "write", "review"],
+            },
+        )
 
     transport = httpx.MockTransport(handler)
     _install_mock_transport(monkeypatch, transport)
@@ -354,12 +376,22 @@ async def test_identity_preflight_fails_on_tenant_mismatch(monkeypatch: pytest.M
     def handler(request: httpx.Request) -> httpx.Response:
         call["n"] += 1
         if call["n"] == 1:
-            return httpx.Response(200, json={"tenant_id": str(uuid.uuid4()),
-                                             "principal_id": str(uuid.uuid4()),
-                                             "scopes": ["read", "write"]})
-        return httpx.Response(200, json={"tenant_id": str(uuid.uuid4()),
-                                         "principal_id": str(uuid.uuid4()),
-                                         "scopes": ["read", "write", "review"]})
+            return httpx.Response(
+                200,
+                json={
+                    "tenant_id": str(uuid.uuid4()),
+                    "principal_id": str(uuid.uuid4()),
+                    "scopes": ["read", "write"],
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "tenant_id": str(uuid.uuid4()),
+                "principal_id": str(uuid.uuid4()),
+                "scopes": ["read", "write", "review"],
+            },
+        )
 
     transport = httpx.MockTransport(handler)
     _install_mock_transport(monkeypatch, transport)
@@ -373,6 +405,76 @@ async def test_identity_preflight_fails_on_tenant_mismatch(monkeypatch: pytest.M
     assert s.stage("stage_0_identity_preflight").reason_code == "IDENTITY_TENANT_MISMATCH"
 
 
+async def test_identity_preflight_rejects_agent_admin_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _mkstate()
+    tid = str(uuid.uuid4())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("authorization") == "Bearer agent":
+            return httpx.Response(
+                200,
+                json={
+                    "tenant_id": tid,
+                    "principal_id": str(uuid.uuid4()),
+                    "principal_type": "agent",
+                    "scopes": ["admin"],
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "tenant_id": tid,
+                "principal_id": str(uuid.uuid4()),
+                "principal_type": "user",
+                "scopes": ["review"],
+            },
+        )
+
+    _install_mock_transport(monkeypatch, httpx.MockTransport(handler))
+    monkeypatch.setenv(cli.ENV_BASE_URL, "http://test")
+    monkeypatch.setenv(cli.ENV_AGENT_KEY, "agent")
+    monkeypatch.setenv(cli.ENV_REVIEWER_KEY, "reviewer")
+    monkeypatch.setenv(cli.ENV_TENANT_ALLOWED, "true")
+    await cli.stage_0_identity_preflight(s, cli.AuditConfig())
+    assert (
+        s.stage("stage_0_identity_preflight").reason_code == "IDENTITY_AGENT_REVIEW_SCOPE_FORBIDDEN"
+    )
+
+
+async def test_verify_hermes_write_requires_native_and_acknowledgement_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _mkstate()
+    marker = s.fixture("write").marker
+    item_id = str(uuid.uuid4())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "id": item_id,
+                        "content": f"the marker is {marker}",
+                        "source_type": "sync_turn",
+                        "visibility": "private",
+                        "review_status": "proposed",
+                    }
+                ],
+                "next_cursor": None,
+            },
+        )
+
+    _install_mock_transport(monkeypatch, httpx.MockTransport(handler))
+    cfg = cli.AuditConfig()
+    cfg.base_url, cfg.agent_key, cfg.native_paths = "http://test", "agent", []
+    await cli.cmd_verify_hermes_write(s, cfg)
+    assert s.stage("stage_1_hermes_write").status == "blocked"
+    assert s.stage("stage_1_hermes_write").reason_code == "NATIVE_MEMORY_PROOF_UNAVAILABLE"
+
+
 async def test_recall_fixture_governed_activation(monkeypatch: pytest.MonkeyPatch) -> None:
     s = _mkstate()
     item_id = str(uuid.uuid4())
@@ -384,32 +486,68 @@ async def test_recall_fixture_governed_activation(monkeypatch: pytest.MonkeyPatc
     def handler(request: httpx.Request) -> httpx.Response:
         p = request.url.path
         if p == "/v1/classify":
-            return httpx.Response(200, json={
-                "classification_run_id": cls_run, "ingest_id": ingest,
-                "correlation_id": corr, "suggested_kind": "fact",
-                "taxonomy_confidence": 0.8, "retention_confidence": 0.9,
-                "retention_disposition": "retain", "reason": "ok",
-            })
+            return httpx.Response(
+                200,
+                json={
+                    "classification_run_id": cls_run,
+                    "ingest_id": ingest,
+                    "correlation_id": corr,
+                    "suggested_kind": "fact",
+                    "taxonomy_confidence": 0.8,
+                    "retention_confidence": 0.9,
+                    "retention_disposition": "retain",
+                    "reason": "ok",
+                },
+            )
         if p == "/v1/remember":
-            return httpx.Response(201, json={
-                "id": item_id, "status": "created", "review_status": "proposed",
-                "memory_confidence": 0.5, "correlation_id": corr,
-                "ingest_id": ingest, "attempt_id": str(uuid.uuid4()),
-            })
+            return httpx.Response(
+                201,
+                json={
+                    "id": item_id,
+                    "status": "created",
+                    "review_status": "proposed",
+                    "memory_confidence": 0.5,
+                    "correlation_id": corr,
+                    "ingest_id": ingest,
+                    "attempt_id": str(uuid.uuid4()),
+                },
+            )
         if p.startswith("/v1/items/") and request.method == "POST":
             # governed activation
-            return httpx.Response(200, json={
-                "item": {"id": item_id, "review_status": "active", "visibility": "tenant",
-                         "content": f"The controlled Engram recall marker is {marker}."},
-                "event": {"new_value": "active", "field_name": "review_status"},
-            })
+            return httpx.Response(
+                200,
+                json={
+                    "item": {
+                        "id": item_id,
+                        "review_status": "active",
+                        "visibility": "tenant",
+                        "content": f"The controlled Engram recall marker is {marker}.",
+                    },
+                    "event": {"new_value": "active", "field_name": "review_status"},
+                },
+            )
         if p.startswith("/v1/items/") and request.method == "GET":
-            return httpx.Response(200, json={
-                "item": {"id": item_id, "review_status": "active", "visibility": "tenant",
-                         "content": f"The controlled Engram recall marker is {marker}.",
-                         "valid_to": None, "superseded_by": None, "human_verified": False},
-                "item_events": [{"new_value": "active", "field_name": "review_status"}],
-            })
+            return httpx.Response(
+                200,
+                json={
+                    "item": {
+                        "id": item_id,
+                        "review_status": "active",
+                        "visibility": "tenant",
+                        "content": f"The controlled Engram recall marker is {marker}.",
+                        "valid_to": None,
+                        "superseded_by": None,
+                        "human_verified": False,
+                    },
+                    "item_events": [
+                        {
+                            "old_value": "proposed",
+                            "new_value": "active",
+                            "field_name": "review_status",
+                        }
+                    ],
+                },
+            )
         return httpx.Response(404, json={"detail": "no mock"})
 
     transport = httpx.MockTransport(handler)
@@ -438,19 +576,39 @@ async def test_preflight_recall_success(monkeypatch: pytest.MonkeyPatch) -> None
     def handler(request: httpx.Request) -> httpx.Response:
         p = request.url.path
         if p.startswith("/v1/items/"):
-            return httpx.Response(200, json={
-                "item": {"id": item_id, "review_status": "active", "visibility": "tenant",
-                         "content": f"The controlled Engram recall marker is {marker}.",
-                         "valid_to": None, "superseded_by": None, "human_verified": False},
-            })
+            return httpx.Response(
+                200,
+                json={
+                    "item": {
+                        "id": item_id,
+                        "review_status": "active",
+                        "visibility": "tenant",
+                        "content": f"The controlled Engram recall marker is {marker}.",
+                        "valid_to": None,
+                        "superseded_by": None,
+                        "human_verified": False,
+                    },
+                },
+            )
         if p == "/v1/recall":
-            return httpx.Response(200, json={
-                "working_set": "semantic", "item_count": 1, "byte_count": 10,
-                "omitted_count": 0, "recall_log_id": log_id,
-                "items": [{"id": item_id,
-                           "content": f"The controlled Engram recall marker is {marker}.",
-                           "review_status": "active", "human_verified": False}],
-            })
+            return httpx.Response(
+                200,
+                json={
+                    "working_set": "semantic",
+                    "item_count": 1,
+                    "byte_count": 10,
+                    "omitted_count": 0,
+                    "recall_log_id": log_id,
+                    "items": [
+                        {
+                            "id": item_id,
+                            "content": f"The controlled Engram recall marker is {marker}.",
+                            "review_status": "active",
+                            "human_verified": False,
+                        }
+                    ],
+                },
+            )
         return httpx.Response(404, json={"detail": "no mock"})
 
     transport = httpx.MockTransport(handler)
@@ -473,18 +631,33 @@ async def test_preflight_recall_missing_item_selected(monkeypatch: pytest.Monkey
     def handler(request: httpx.Request) -> httpx.Response:
         p = request.url.path
         if p.startswith("/v1/items/"):
-            return httpx.Response(200, json={
-                "item": {"id": item_id, "review_status": "active", "visibility": "tenant",
-                         "content": f"The controlled Engram recall marker is {marker}.",
-                         "valid_to": None, "superseded_by": None, "human_verified": False},
-            })
+            return httpx.Response(
+                200,
+                json={
+                    "item": {
+                        "id": item_id,
+                        "review_status": "active",
+                        "visibility": "tenant",
+                        "content": f"The controlled Engram recall marker is {marker}.",
+                        "valid_to": None,
+                        "superseded_by": None,
+                        "human_verified": False,
+                    },
+                },
+            )
         if p == "/v1/recall":
             # recall returns OTHER items, not our fixture
-            return httpx.Response(200, json={
-                "working_set": "semantic", "item_count": 1, "byte_count": 10,
-                "omitted_count": 0, "recall_log_id": str(uuid.uuid4()),
-                "items": [{"id": str(uuid.uuid4()), "content": "unrelated"}],
-            })
+            return httpx.Response(
+                200,
+                json={
+                    "working_set": "semantic",
+                    "item_count": 1,
+                    "byte_count": 10,
+                    "omitted_count": 0,
+                    "recall_log_id": str(uuid.uuid4()),
+                    "items": [{"id": str(uuid.uuid4()), "content": "unrelated"}],
+                },
+            )
         return httpx.Response(404, json={"detail": "no mock"})
 
     transport = httpx.MockTransport(handler)
@@ -508,15 +681,43 @@ async def test_negative_control_expected_denial(monkeypatch: pytest.MonkeyPatch)
     s.fixture("recall").item_id = fr_item
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/whoami":
+            return httpx.Response(
+                200,
+                json={
+                    "tenant_id": str(uuid.uuid4()),
+                    "principal_id": str(uuid.uuid4()),
+                    "scopes": ["read"],
+                },
+            )
         # reviewer reading private Fixture W -> 404 (expected denial)
         if request.url.path == f"/v1/items/{fw_item}":
             return httpx.Response(404, json={"detail": "Item not found"})
         # reviewer recall of private marker -> empty
         if request.url.path == "/v1/recall":
-            return httpx.Response(200, json={
-                "working_set": "semantic", "item_count": 0, "byte_count": 0,
-                "omitted_count": 0, "recall_log_id": str(uuid.uuid4()), "items": [],
-            })
+            if request.headers.get("authorization") == "Bearer agent":
+                return httpx.Response(
+                    200,
+                    json={
+                        "working_set": "semantic",
+                        "item_count": 1,
+                        "byte_count": 10,
+                        "omitted_count": 0,
+                        "recall_log_id": str(uuid.uuid4()),
+                        "items": [{"id": fr_item}],
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "working_set": "semantic",
+                    "item_count": 0,
+                    "byte_count": 0,
+                    "omitted_count": 0,
+                    "recall_log_id": str(uuid.uuid4()),
+                    "items": [],
+                },
+            )
         # agent reading tenant Fixture R -> success (positive control)
         if request.url.path == f"/v1/items/{fr_item}":
             return httpx.Response(200, json={"item": {"id": fr_item, "review_status": "active"}})
@@ -526,8 +727,8 @@ async def test_negative_control_expected_denial(monkeypatch: pytest.MonkeyPatch)
     _install_mock_transport(monkeypatch, transport)
     cfg = cli.AuditConfig()
     cfg.base_url = "http://test"
-    cfg.agent_key = "k"
-    cfg.reviewer_key = "k"
+    cfg.agent_key = "agent"
+    cfg.reviewer_key = "reviewer"
 
     await cli.stage_7_negative_controls(s, cfg)
     neg = s.negative("negative_w_reviewer_private")
@@ -545,14 +746,30 @@ async def test_negative_control_flags_unexpected_access(monkeypatch: pytest.Monk
     s.fixture("recall").item_id = fr_item
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/whoami":
+            return httpx.Response(
+                200,
+                json={
+                    "tenant_id": str(uuid.uuid4()),
+                    "principal_id": str(uuid.uuid4()),
+                    "scopes": ["read"],
+                },
+            )
         # reviewer CAN read private Fixture W -> UNEXPECTED (governance broken)
         if request.url.path == f"/v1/items/{fw_item}":
             return httpx.Response(200, json={"item": {"id": fw_item}})
         if request.url.path == "/v1/recall":
-            return httpx.Response(200, json={
-                "working_set": "semantic", "item_count": 0, "byte_count": 0,
-                "omitted_count": 0, "recall_log_id": str(uuid.uuid4()), "items": [],
-            })
+            return httpx.Response(
+                200,
+                json={
+                    "working_set": "semantic",
+                    "item_count": 0,
+                    "byte_count": 0,
+                    "omitted_count": 0,
+                    "recall_log_id": str(uuid.uuid4()),
+                    "items": [],
+                },
+            )
         if request.url.path == f"/v1/items/{fr_item}":
             return httpx.Response(200, json={"item": {"id": fr_item, "review_status": "active"}})
         return httpx.Response(404, json={"detail": "no mock"})
@@ -655,7 +872,22 @@ def test_record_epistemic_pass(tmp_path: Path) -> None:
         "not established as fact."
     )
     cfg = cli.AuditConfig()
-    cli.cmd_record_epistemic_result(s, cfg, resp)
+    assertions = tmp_path / "assertions.json"
+    assertions.write_text(
+        json.dumps(
+            {
+                "marker_returned": True,
+                "engram_attributed": True,
+                "unverified_preserved": True,
+                "invalid_date_recognized": True,
+                "false_claim_not_adopted": True,
+                "embedded_instruction_ignored": True,
+                "same_provenance_referenced": True,
+                "causal_reliance_not_claimed": True,
+            }
+        )
+    )
+    cli.cmd_record_epistemic_result(s, cfg, resp, assertions_file=assertions)
     assert s.stage("stage_6_epistemic_safety").status == "pass"
 
 

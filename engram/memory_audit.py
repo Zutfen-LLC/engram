@@ -33,6 +33,7 @@ import contextlib
 import json
 import os
 import re
+import tempfile
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -141,7 +142,7 @@ def redact_secrets(text: str) -> str:
     out = _API_KEY_RE.sub("eng_***REDACTED***", text)
     out = _BEARER_RE.sub("Bearer ***REDACTED***", out)
     out = _PG_DSN_RE.sub(
-        lambda m: m.string[m.start():m.start(1)] + "***REDACTED***" + "@",
+        lambda m: m.string[m.start() : m.start(1)] + "***REDACTED***" + "@",
         out,
     )
     out = _KV_SECRET_RE.sub(r"\1=***REDACTED***", out)
@@ -268,19 +269,27 @@ class RunState:
     stages: dict[str, StageEvidence] = field(default_factory=dict)
     negative_controls: dict[str, StageEvidence] = field(default_factory=dict)
     fixtures: dict[str, FixtureEvidence] = field(
-        default_factory=lambda: {"write": FixtureEvidence(), "recall": FixtureEvidence(),
-                                  "epistemic": FixtureEvidence()}
+        default_factory=lambda: {
+            "write": FixtureEvidence(),
+            "recall": FixtureEvidence(),
+            "epistemic": FixtureEvidence(),
+        }
     )
     operator_evidence: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def new(cls, *, base_url: str, out_dir: Path) -> RunState:
         run_id = str(uuid.uuid4())
-        return cls(
+        state = cls(
             run_id=run_id,
             started_at=datetime.now(UTC),
             target_host=sanitize_host(base_url),
         )
+        # A report is never sparse: every canonical boundary is represented
+        # from the first state write onward.
+        for stage in STAGE_ORDER:
+            state.stage(stage)
+        return state
 
     def fixture(self, key: str) -> FixtureEvidence:
         return self.fixtures.setdefault(key, FixtureEvidence())
@@ -318,12 +327,10 @@ class RunState:
             identity=dict(d.get("identity") or {}),
             stages={k: StageEvidence.from_dict(v) for k, v in (d.get("stages") or {}).items()},
             negative_controls={
-                k: StageEvidence.from_dict(v)
-                for k, v in (d.get("negative_controls") or {}).items()
+                k: StageEvidence.from_dict(v) for k, v in (d.get("negative_controls") or {}).items()
             },
             fixtures={
-                k: FixtureEvidence.from_dict(v)
-                for k, v in (d.get("fixtures") or {}).items()
+                k: FixtureEvidence.from_dict(v) for k, v in (d.get("fixtures") or {}).items()
             },
             operator_evidence=dict(d.get("operator_evidence") or {}),
         )
@@ -340,14 +347,24 @@ class RunState:
 
 
 def save_state(state: RunState, out_dir: Path) -> Path:
-    """Persist run state to ``<out_dir>/<run_id>/state.json``."""
+    """Atomically persist secret-free state to ``<out_dir>/<run_id>/state.json``."""
     run_dir = out_dir / state.run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     state_path = run_dir / "state.json"
-    state_path.write_text(state.to_json(), encoding="utf-8")
-    # best-effort restrictive perms
-    with contextlib.suppress(OSError):
-        os.chmod(state_path, 0o600)
+    rendered = state.to_json()
+    fd, temporary = tempfile.mkstemp(prefix=".state-", suffix=".json", dir=run_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            with contextlib.suppress(OSError):
+                os.fchmod(fh.fileno(), 0o600)
+            fh.write(rendered)
+            fh.flush()
+            with contextlib.suppress(OSError):
+                os.fsync(fh.fileno())
+        os.replace(temporary, state_path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
     return state_path
 
 
@@ -396,16 +413,19 @@ class AuditReport:
 
 def finalize_report(state: RunState) -> AuditReport:
     """Assemble the final report from run state."""
+    stages = {name: state.stage(name) for name in STAGE_ORDER}
+    # An incomplete report is an observation, not a completed audit.
+    complete = all(ev.status != "not_run" and ev.completed_at is not None for ev in stages.values())
     return AuditReport(
         run_id=state.run_id,
         started_at=state.started_at,
-        completed_at=datetime.now(UTC),
+        completed_at=datetime.now(UTC) if complete else None,
         target_host=state.target_host,
         engram_revision=state.engram_revision,
         hermes_revision=state.hermes_revision,
         identity_preflight=state.stage("stage_0_identity_preflight"),
         fixtures=dict(state.fixtures),
-        stages=dict(state.stages),
+        stages=stages,
         negative_controls=dict(state.negative_controls),
     )
 
@@ -420,12 +440,12 @@ def _overall(
     -> pass. ``finding`` statuses are collected into findings[], never failed.
     An empty run (no stages recorded) is ``partial`` — nothing was proven.
     """
-    all_stages = {**stages, **negative}
+    canonical = {name: stages.get(name, StageEvidence()) for name in STAGE_ORDER}
     failed: list[str] = []
     findings: list[str] = []
     any_finding = False
     any_incomplete = False
-    for name, ev in all_stages.items():
+    for name, ev in canonical.items():
         if ev.status in _FAILURE_STATUSES:
             failed.append(name)
         elif ev.status == "finding":
@@ -434,8 +454,12 @@ def _overall(
             findings.append(f"{name}: {rc}")
         elif ev.status in {"blocked", "not_run"}:
             any_incomplete = True
-    if not all_stages:
-        any_incomplete = True
+    # Negative controls are separately reported. A required control is marked
+    # by the harness, while absent optional controls do not fabricate a pass.
+    for name, ev in negative.items():
+        if ev.evidence.get("required") and ev.status not in _PASSING_STATUSES:
+            any_incomplete = True
+            findings.append(f"{name}: required control not proven")
     status = "failed" if failed else ("partial" if (any_finding or any_incomplete) else "pass")
     return {"status": status, "failed_stages": failed, "findings": findings}
 
@@ -449,9 +473,7 @@ def load_schema(schema_path: str | Path | None = None) -> dict[str, Any]:
     """Load the JSON Schema for the report. Bundled schema is the default."""
     if schema_path is None:
         schema_path = (
-            Path(__file__).resolve().parent.parent
-            / "schemas"
-            / "memory-e2e-audit-v1.schema.json"
+            Path(__file__).resolve().parent.parent / "schemas" / "memory-e2e-audit-v1.schema.json"
         )
     key = str(schema_path)
     if key not in _SCHEMA_CACHE:
@@ -472,9 +494,8 @@ def validate_report(report: dict[str, Any], schema_path: str | Path | None = Non
     schema = load_schema(schema_path)
     try:
         import jsonschema  # type: ignore[import-untyped]
-    except ImportError:
-        _validate_report_fallback(report)
-        return
+    except ImportError as exc:
+        raise RuntimeError("jsonschema is required to validate audit reports") from exc
     jsonschema.validate(instance=report, schema=schema)
 
 
@@ -483,8 +504,16 @@ def _validate_report_fallback(report: dict[str, Any]) -> None:
         raise ValueError(f"report.schema must be {SCHEMA_NAME!r}")
     if report.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(f"report.schema_version must be {SCHEMA_VERSION!r}")
-    for req in ("run_id", "started_at", "target", "identity_preflight", "fixtures",
-                "stages", "negative_controls", "overall"):
+    for req in (
+        "run_id",
+        "started_at",
+        "target",
+        "identity_preflight",
+        "fixtures",
+        "stages",
+        "negative_controls",
+        "overall",
+    ):
         if req not in report:
             raise ValueError(f"report missing required field: {req}")
     for fk in ("write", "recall", "epistemic"):

@@ -118,8 +118,12 @@ async def _clean_db() -> None:
         await conn.execute(text("DELETE FROM item_events"))
         await conn.execute(text("DELETE FROM classification_runs"))
         await conn.execute(text("DELETE FROM memory_items"))
-        await conn.execute(text("DELETE FROM memory_kinds WHERE tenant_id != "
-                                "(SELECT id FROM tenants WHERE slug = 'default')"))
+        await conn.execute(
+            text(
+                "DELETE FROM memory_kinds WHERE tenant_id != "
+                "(SELECT id FROM tenants WHERE slug = 'default')"
+            )
+        )
         await conn.execute(text("DELETE FROM tenants WHERE slug != 'default'"))
     # Reset default tenant config to migration defaults.
     async with _test_engine.begin() as conn:
@@ -171,10 +175,7 @@ async def _second_principal(tenant_id: str, name: str = "audit-agent") -> str:
     async with _test_session_factory() as session:
         existing = (
             await session.execute(
-                text(
-                    "SELECT id::text FROM principals "
-                    "WHERE tenant_id = :tid AND name = :name"
-                ),
+                text("SELECT id::text FROM principals WHERE tenant_id = :tid AND name = :name"),
                 {"tid": tenant_id, "name": name},
             )
         ).scalar_one_or_none()
@@ -203,7 +204,7 @@ async def _insert_item(
     review_status: str = "proposed",
     memory_confidence: float = 0.9,
     created_at: datetime | None = None,
-    visibility: str = "workspace",
+    visibility: str = "private",
     kind: str = "fact",
     source_type: str = "manual",
     source_trust: float = 0.5,
@@ -338,10 +339,14 @@ async def _assess(item_id: str, *, now: datetime) -> Any:
 
     async with _test_session_factory() as session:
         item = (
-            await session.execute(
-                text("SELECT * FROM memory_items WHERE id = :id"), {"id": item_id}
+            (
+                await session.execute(
+                    text("SELECT * FROM memory_items WHERE id = :id"), {"id": item_id}
+                )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
         mi = MemoryItem(
             id=item["id"],
             tenant_id=item["tenant_id"],
@@ -403,7 +408,10 @@ async def test_deterministic_promotion_positive_path() -> None:
         authority=10,
     )
     await _insert_bound_evidence(
-        item_id, tenant_id=tenant_id, principal_id=principal_id, created_at=evidence_at,
+        item_id,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        created_at=evidence_at,
         taxonomy_confidence=EVIDENCE_TAXONOMY_MINIMUM,
     )
     await _enable_evidence_lane(tenant_id)
@@ -424,11 +432,13 @@ async def test_blocker_missing_evidence() -> None:
     tenant_id, principal_id = await _default_tenant_principal()
     now = _now()
     item_id = await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
         content="audit blocker missing evidence",
         created_at=now - timedelta(hours=100),
         source_confidence_prior=0.35,
-        retention_confidence=0.90, retention_disposition="retain",
+        retention_confidence=0.90,
+        retention_disposition="retain",
         retention_evidence_at=now - timedelta(hours=80),
     )
     await _enable_evidence_lane(tenant_id)
@@ -445,16 +455,21 @@ async def test_blocker_taxonomy_below_minimum() -> None:
     now = _now()
     evidence_at = now - timedelta(hours=80)
     item_id = await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
         content="audit blocker taxonomy low",
         created_at=now - timedelta(hours=100),
         source_confidence_prior=0.35,
-        retention_confidence=0.90, retention_disposition="retain",
+        retention_confidence=0.90,
+        retention_disposition="retain",
         retention_evidence_at=evidence_at,
     )
     await _insert_bound_evidence(
-        item_id, tenant_id=tenant_id, principal_id=principal_id,
-        created_at=evidence_at, taxonomy_confidence=0.60,
+        item_id,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        created_at=evidence_at,
+        taxonomy_confidence=0.60,
     )
     await _enable_evidence_lane(tenant_id)
     candidate = await _assess(item_id, now=now)
@@ -470,15 +485,20 @@ async def test_blocker_disposition_not_retain() -> None:
     now = _now()
     evidence_at = now - timedelta(hours=80)
     item_id = await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
         content="audit blocker transient disposition",
         created_at=now - timedelta(hours=100),
         source_confidence_prior=0.35,
-        retention_confidence=0.90, retention_disposition="transient",
+        retention_confidence=0.90,
+        retention_disposition="transient",
         retention_evidence_at=evidence_at,
     )
     await _insert_bound_evidence(
-        item_id, tenant_id=tenant_id, principal_id=principal_id, created_at=evidence_at,
+        item_id,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        created_at=evidence_at,
     )
     await _enable_evidence_lane(tenant_id)
     candidate = await _assess(item_id, now=now)
@@ -496,15 +516,20 @@ async def test_blocker_evidence_score_below_threshold() -> None:
     # score = 0.20*prior + 0.80*retention; pick values that stay below 0.70
     # 0.20*0.30 + 0.80*0.60 = 0.06 + 0.48 = 0.54 < 0.70
     item_id = await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
         content="audit blocker score low",
         created_at=now - timedelta(hours=100),
         source_confidence_prior=0.30,
-        retention_confidence=0.60, retention_disposition="retain",
+        retention_confidence=0.60,
+        retention_disposition="retain",
         retention_evidence_at=evidence_at,
     )
     await _insert_bound_evidence(
-        item_id, tenant_id=tenant_id, principal_id=principal_id, created_at=evidence_at,
+        item_id,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        created_at=evidence_at,
     )
     await _enable_evidence_lane(tenant_id)
     candidate = await _assess(item_id, now=now)
@@ -521,15 +546,20 @@ async def test_blocker_cooling_period() -> None:
     # Evidence only 10 hours old; needs 72h cooling.
     evidence_at = now - timedelta(hours=10)
     item_id = await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
         content="audit blocker cooling period",
         created_at=now - timedelta(hours=100),
         source_confidence_prior=0.35,
-        retention_confidence=0.90, retention_disposition="retain",
+        retention_confidence=0.90,
+        retention_disposition="retain",
         retention_evidence_at=evidence_at,
     )
     await _insert_bound_evidence(
-        item_id, tenant_id=tenant_id, principal_id=principal_id, created_at=evidence_at,
+        item_id,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        created_at=evidence_at,
     )
     await _enable_evidence_lane(tenant_id)
     candidate = await _assess(item_id, now=now)
@@ -554,15 +584,20 @@ async def test_blocker_kind_disabled() -> None:
             {"tid": tenant_id},
         )
     item_id = await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
         content="audit blocker kind disabled",
         created_at=now - timedelta(hours=100),
         source_confidence_prior=0.35,
-        retention_confidence=0.90, retention_disposition="retain",
+        retention_confidence=0.90,
+        retention_disposition="retain",
         retention_evidence_at=evidence_at,
     )
     await _insert_bound_evidence(
-        item_id, tenant_id=tenant_id, principal_id=principal_id, created_at=evidence_at,
+        item_id,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        created_at=evidence_at,
     )
     await _enable_evidence_lane(tenant_id)
     candidate = await _assess(item_id, now=now)
@@ -578,16 +613,21 @@ async def test_blocker_conflict_unresolved() -> None:
     now = _now()
     evidence_at = now - timedelta(hours=80)
     item_id = await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
         content="audit blocker conflict",
         created_at=now - timedelta(hours=100),
         source_confidence_prior=0.35,
-        retention_confidence=0.90, retention_disposition="retain",
+        retention_confidence=0.90,
+        retention_disposition="retain",
         retention_evidence_at=evidence_at,
         conflict_resolution_status="unresolved",
     )
     await _insert_bound_evidence(
-        item_id, tenant_id=tenant_id, principal_id=principal_id, created_at=evidence_at,
+        item_id,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        created_at=evidence_at,
     )
     await _enable_evidence_lane(tenant_id)
     candidate = await _assess(item_id, now=now)
@@ -605,9 +645,11 @@ async def test_reviewer_created_tenant_item_becomes_active_through_review() -> N
         pytest.skip(_DB_SKIP_REASON)
     tenant_id, reviewer_id = await _default_tenant_principal()
     item_id = await _insert_item(
-        tenant_id=tenant_id, principal_id=reviewer_id,
+        tenant_id=tenant_id,
+        principal_id=reviewer_id,
         content="audit controlled recall fixture via review",
-        visibility="tenant", review_status="proposed",
+        visibility="tenant",
+        review_status="proposed",
     )
 
     # Activate through a direct governed review transition (the endpoint logic
@@ -661,9 +703,11 @@ async def test_agent_can_read_tenant_visible_fixture() -> None:
     agent_id = await _second_principal(tenant_id)
     marker = f"AUDIT-RECALL-{uuid.uuid4()}"
     item_id = await _insert_item(
-        tenant_id=tenant_id, principal_id=reviewer_id,
+        tenant_id=tenant_id,
+        principal_id=reviewer_id,
         content=f"The controlled Engram recall marker is {marker}.",
-        visibility="tenant", review_status="active",
+        visibility="tenant",
+        review_status="active",
     )
     from sqlalchemy import select
 
@@ -694,9 +738,11 @@ async def test_reviewer_cannot_read_private_fixture_w() -> None:
     agent_id = await _second_principal(tenant_id)
     marker = f"AUDIT-WRITE-{uuid.uuid4()}"
     item_id = await _insert_item(
-        tenant_id=tenant_id, principal_id=agent_id,
+        tenant_id=tenant_id,
+        principal_id=agent_id,
         content=f"the Engram write-audit marker is {marker}",
-        visibility="private", review_status="proposed",
+        visibility="private",
+        review_status="proposed",
     )
     from sqlalchemy import select
 
@@ -724,9 +770,11 @@ async def test_agent_can_read_own_private_fixture_w() -> None:
     agent_id = await _second_principal(tenant_id)
     marker = f"AUDIT-WRITE-{uuid.uuid4()}"
     item_id = await _insert_item(
-        tenant_id=tenant_id, principal_id=agent_id,
+        tenant_id=tenant_id,
+        principal_id=agent_id,
         content=f"the Engram write-audit marker is {marker}",
-        visibility="private", review_status="proposed",
+        visibility="private",
+        review_status="proposed",
     )
     from sqlalchemy import select
 
@@ -760,14 +808,13 @@ async def test_owner_diagnostic_mode_performs_no_mutations() -> None:
         pytest.skip(_DB_SKIP_REASON)
     tenant_id, principal_id = await _default_tenant_principal()
     await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
         content="owner diagnostic read-only probe",
         review_status="proposed",
     )
     async with _test_session_factory() as session:
-        before = (
-            await session.execute(text("SELECT COUNT(*) FROM memory_items"))
-        ).scalar_one()
+        before = (await session.execute(text("SELECT COUNT(*) FROM memory_items"))).scalar_one()
 
     # Simulated owner-diagnostic: read-only transaction, parameterized query,
     # immediate rollback.
@@ -782,9 +829,7 @@ async def test_owner_diagnostic_mode_performs_no_mutations() -> None:
         await session.rollback()
 
     async with _test_session_factory() as session:
-        after = (
-            await session.execute(text("SELECT COUNT(*) FROM memory_items"))
-        ).scalar_one()
+        after = (await session.execute(text("SELECT COUNT(*) FROM memory_items"))).scalar_one()
     assert after == before
 
 
@@ -799,37 +844,39 @@ async def test_cleanup_changes_only_exact_recorded_ids() -> None:
     tenant_id, reviewer_id = await _default_tenant_principal()
     marker = f"AUDIT-RECALL-{uuid.uuid4()}"
     target_id = await _insert_item(
-        tenant_id=tenant_id, principal_id=reviewer_id,
+        tenant_id=tenant_id,
+        principal_id=reviewer_id,
         content=f"The controlled Engram recall marker is {marker}.",
-        visibility="tenant", review_status="active",
+        visibility="tenant",
+        review_status="active",
     )
     # Decoy: same marker fragment, different item, must NOT be archived.
     decoy_id = await _insert_item(
-        tenant_id=tenant_id, principal_id=reviewer_id,
+        tenant_id=tenant_id,
+        principal_id=reviewer_id,
         content=f"unrelated but mentions {marker}",
-        visibility="tenant", review_status="active",
+        visibility="tenant",
+        review_status="active",
     )
     # Cleanup: archive only the exact target id.
     async with _test_session_factory() as session:
         await session.execute(
-            text(
-                "UPDATE memory_items SET review_status = 'archived' "
-                "WHERE id = :id"
-            ),
+            text("UPDATE memory_items SET review_status = 'archived' WHERE id = :id"),
             {"id": target_id},
         )
         await session.commit()
 
     async with _test_session_factory() as session:
         rows = (
-            await session.execute(
-                text(
-                    "SELECT id::text, review_status FROM memory_items "
-                    "WHERE id IN (:a, :b)"
-                ),
-                {"a": target_id, "b": decoy_id},
+            (
+                await session.execute(
+                    text("SELECT id::text, review_status FROM memory_items WHERE id IN (:a, :b)"),
+                    {"a": target_id, "b": decoy_id},
+                )
             )
-        ).mappings().all()
+            .mappings()
+            .all()
+        )
     by_id = {r["id"]: r["review_status"] for r in rows}
     assert by_id[target_id] == "archived"
     assert by_id[decoy_id] == "active", "decoy must not be archived by fuzzy cleanup"

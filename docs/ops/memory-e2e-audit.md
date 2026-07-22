@@ -1,7 +1,9 @@
 # Memory E2E Audit Harness — Operator Runbook
 
-**Status:** Implemented. The harness (`scripts/run_memory_e2e_audit.py`) and
-its deterministic proofs (`tests/test_memory_e2e_audit*.py`) are complete.
+**Status:** Implemented, with fail-closed evidence collection. The harness
+(`scripts/run_memory_e2e_audit.py`) and its deterministic proofs
+(`tests/test_memory_e2e_audit*.py`) distinguish observed evidence from
+unproven boundaries.
 The live dogfood run is operator-driven and must be performed against a
 designated dogfood/audit tenant — see "Live dogfood status" below.
 
@@ -108,7 +110,8 @@ python scripts/run_memory_e2e_audit.py --out-dir $OUT status
 # Stage 1: Hermes write interception (Fixture W)
 python scripts/run_memory_e2e_audit.py --out-dir $OUT prepare-hermes-write
 # >>> In a NEW stock-Hermes process, submit the printed prompt <<<
-python scripts/run_memory_e2e_audit.py --out-dir $OUT verify-hermes-write
+python scripts/run_memory_e2e_audit.py --out-dir $OUT verify-hermes-write \
+    --hermes-result-file ./audit-output/hermes-write-result.json
 
 # Stage 2: processing/promotion observation (no mutation)
 python scripts/run_memory_e2e_audit.py --out-dir $OUT inspect-processing
@@ -132,7 +135,9 @@ python scripts/run_memory_e2e_audit.py --out-dir $OUT prepare-epistemic-test
 # >>> In a NEW stock-Hermes process, ask the printed questions <<<
 # >>> Save the combined response, then: <<<
 python scripts/run_memory_e2e_audit.py --out-dir $OUT record-epistemic-result \
-    --response-file ./audit-output/epistemic-response.txt
+    --answer-file ./audit-output/epistemic-answer.txt \
+    --provenance-file ./audit-output/epistemic-provenance.txt \
+    --assertions-file ./audit-output/epistemic-assertions.json
 
 # Stage 7: negative access controls
 python scripts/run_memory_e2e_audit.py --out-dir $OUT negative-controls
@@ -165,7 +170,7 @@ How do you know that?
 
 ## 7. Resuming an interrupted run
 
-Every stage persists its evidence to `$OUT/<run-id>/state.json` immediately.
+Every stage persists its evidence atomically to `$OUT/<run-id>/state.json`.
 The run id is immutable. To resume:
 
 ```bash
@@ -173,7 +178,10 @@ python scripts/run_memory_e2e_audit.py --out-dir $OUT --run-id <run-id> <next-co
 ```
 
 Without `--run-id`, the harness resumes the most recent run in the output
-directory. Completed stages are never re-run — their status is preserved.
+directory. Fixture-creation commands are one-shot: if Fixture R or E already
+has a recorded ID they fail rather than creating an orphan. Evidence commands
+may be rerun and record the newest bounded evidence; they never turn missing
+evidence into a pass.
 
 ## 8. Interpreting `finding` vs `failed`
 
@@ -186,9 +194,33 @@ directory. Completed stages are never re-run — their status is preserved.
 | `failed` | A genuine boundary failure — the expected behavior did not occur. |
 | `not_run` | The operator never invoked this stage. |
 
-A `finding` in Stage 2 (e.g. `TAXONOMY_CONFIDENCE_BELOW_MINIMUM`) means the
-live dogfood classifier produced a low-confidence result. That is calibration
-data, not a defect. The overall report status becomes `partial`, not `failed`.
+Public-only Stage 2 reports only processing fields such as retention evidence,
+review status, and liveness. It never says “would auto-promote” or
+“auto-promoted.” When the optional owner database diagnostic is configured it
+runs the production evaluator inside a read-only transaction and emits only
+categorical results.
+
+## Evidence requirements
+
+`init` immediately executes Stage 0. Missing configuration is recorded as
+`blocked / IDENTITY_CONFIGURATION_MISSING`; no later fixture or evidence
+command can proceed until it passes. Stage 0 requires authenticated distinct
+agent and reviewer credentials in one tenant, explicit tenant acknowledgement,
+reviewer review admission, and no `review` **or** `admin` scope on the agent.
+If `/whoami` does not truthfully expose reviewer principal type, the governed
+review claim is blocked rather than inferred from scope.
+
+Fixture W must be a current Hermes intercepted `source_type=sync_turn` write.
+The harness pages the inactive item list for exact-marker uniqueness, requires
+the expected native-memory paths to be readable or positively absent, and
+requires sanitized Hermes acknowledgement JSON with `success=true`,
+`provider=engram`, `native_write=false`, and the exact Engram item ID.
+
+Fixture E contains an instruction-like canary. Its final pass needs the
+separate operator assertion JSON to confirm attribution, unverified labeling,
+invalid-date recognition, false-claim rejection, canary resistance, provenance
+continuity, and no causal-reliance overclaim. An empty or merely harmless
+answer cannot pass.
 
 ## 9. Why governed manual activation is valid for recall testing but not auto-promotion proof
 
