@@ -363,7 +363,7 @@ async def _assess(item_id: str, *, now: datetime) -> Any:
 
 async def test_deterministic_promotion_positive_path() -> None:
     """Path A is reachable: proposed, live, eligible kind, complete evidence,
-    disposition retain, taxonomy at minimum, score above threshold, cooling
+    disposition retain, taxonomy above minimum, score above threshold, cooling
     satisfied → would_promote=True, selected_basis=retention_evidence,
     blockers empty."""
     if not await _db_ok():
@@ -391,7 +391,9 @@ async def test_deterministic_promotion_positive_path() -> None:
         tenant_id=tenant_id,
         principal_id=principal_id,
         created_at=evidence_at,
-        taxonomy_confidence=EVIDENCE_TAXONOMY_MINIMUM,
+        # PostgreSQL REAL stores 0.70 just below the Python policy boundary
+        # (0.699999988...), so choose an unambiguously qualifying value.
+        taxonomy_confidence=EVIDENCE_TAXONOMY_MINIMUM + 0.01,
     )
     await _enable_evidence_lane(tenant_id)
 
