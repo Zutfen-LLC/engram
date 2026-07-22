@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import re
+from uuid import UUID
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.auth import (
@@ -17,6 +18,7 @@ from engram.auth import (
     get_current_principal,
 )
 from engram.db import get_session
+from engram.models import Principal as PrincipalModel
 
 router = APIRouter()
 
@@ -114,12 +116,27 @@ async def readiness(
 @router.get("/whoami", response_model=None, dependencies=[Depends(READ_SCOPE)])
 async def whoami(
     principal: Principal = Depends(get_current_principal),  # noqa: B008
-) -> dict[str, object]:
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> dict[str, object] | JSONResponse:
     """Return the caller's resolved principal and tenant.
 
     Lets API clients discover their own tenant_id from their API key,
     without needing to pass it as a query parameter or know it out of band.
     """
+    principal_type = await session.scalar(
+        select(PrincipalModel.type).where(
+            PrincipalModel.id == UUID(principal.principal_id),
+            PrincipalModel.tenant_id == UUID(principal.tenant_id),
+        )
+    )
+    if principal_type is None:
+        # Authentication already resolved this principal. Missing backing state
+        # is therefore an integrity failure, never a caller-selectable fallback.
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "authenticated principal record unavailable"},
+        )
+
     memory_profile: dict[str, object] | None = None
     if principal.memory_profile_id is not None:
         memory_profile = {
@@ -130,6 +147,7 @@ async def whoami(
         }
     return {
         "principal_id": principal.principal_id,
+        "principal_type": principal_type,
         "tenant_id": principal.tenant_id,
         "scopes": list(principal.scopes),
         "api_key_id": principal.api_key_id,

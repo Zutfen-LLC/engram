@@ -1,0 +1,279 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://engram.zutfen.com/schemas/memory-e2e-audit-v1.schema.json",
+  "title": "Engram Memory E2E Audit Report v1.0",
+  "description": "Sanitized, machine-readable evidence report for the deterministic memory E2E audit harness. Never contains API keys, auth headers, database URLs, or raw error bodies.",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "run_id",
+    "started_at",
+    "target",
+    "identity_preflight",
+    "fixtures",
+    "stages",
+    "negative_controls",
+    "overall"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": { "const": "engram.memory-e2e-audit" },
+    "schema_version": { "const": "1.0" },
+    "run_id": {
+      "description": "Immutable UUID for this audit run (set at init, never changes).",
+      "type": "string",
+      "format": "uuid"
+    },
+    "started_at": { "type": "string", "format": "date-time" },
+    "completed_at": {
+      "description": "Timestamp the report was emitted, or null for an in-progress run.",
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "target": {
+      "type": "object",
+      "required": ["base_url_host", "engram_revision", "hermes_revision"],
+      "additionalProperties": false,
+      "properties": {
+        "base_url_host": {
+          "description": "Host of ENGRAM_BASE_URL (no scheme, no path, no credentials).",
+          "type": "string"
+        },
+        "engram_revision": {
+          "description": "Git SHA or null if unknown.",
+          "type": ["string", "null"]
+        },
+        "hermes_revision": {
+          "description": "Git SHA or null if unknown / not Hermes-authored.",
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "identity_preflight": { "$ref": "#/$defs/stage" },
+    "fixtures": {
+      "type": "object",
+      "required": ["write", "recall", "epistemic"],
+      "additionalProperties": false,
+      "properties": {
+        "write": {
+          "description": "Fixture W: actual stock-Hermes write interception evidence.",
+          "$ref": "#/$defs/fixture"
+        },
+        "recall": {
+          "description": "Fixture R: reviewer-created tenant-visible controlled recall fixture.",
+          "$ref": "#/$defs/fixture"
+        },
+        "epistemic": {
+          "description": "Fixture E: epistemic-safety fixture (unverified false claim).",
+          "$ref": "#/$defs/fixture"
+        }
+      }
+    },
+    "stages": {
+      "description": "Per-stage evidence keyed by stage name (stage_0 .. stage_7).",
+      "type": "object",
+      "required": [
+        "stage_0_identity_preflight",
+        "stage_1_hermes_write",
+        "stage_2_processing_promotion",
+        "stage_3_recall_fixture",
+        "stage_4_access_recall_preflight",
+        "stage_5_hermes_recall",
+        "stage_6_epistemic_safety",
+        "stage_7_negative_controls"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "stage_0_identity_preflight": { "$ref": "#/$defs/stage" },
+        "stage_1_hermes_write": { "$ref": "#/$defs/stage" },
+        "stage_2_processing_promotion": { "$ref": "#/$defs/stage" },
+        "stage_3_recall_fixture": { "$ref": "#/$defs/stage" },
+        "stage_4_access_recall_preflight": { "$ref": "#/$defs/stage" },
+        "stage_5_hermes_recall": { "$ref": "#/$defs/stage" },
+        "stage_6_epistemic_safety": { "$ref": "#/$defs/stage" },
+        "stage_7_negative_controls": { "$ref": "#/$defs/stage" }
+      }
+    },
+    "negative_controls": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/stage" }
+    },
+    "overall": {
+      "type": "object",
+      "required": [
+        "status",
+        "failed_stages",
+        "findings",
+        "audit_execution_complete",
+        "audit_successful"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "description": "pass = every run stage passed/pass_expected_denial; partial = some findings or incomplete; failed = at least one stage failed.",
+          "enum": ["pass", "partial", "failed"]
+        },
+        "failed_stages": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "findings": {
+          "description": "Meaningful policy/calibration findings (e.g. low classifier confidence) — not failures.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "audit_execution_complete": { "type": "boolean" },
+        "audit_successful": { "type": "boolean" }
+      }
+    }
+  },
+  "$defs": {
+    "stage": {
+      "type": "object",
+      "required": ["status", "reason_code", "started_at", "completed_at", "evidence", "limitations"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "enum": ["pass", "pass_expected_denial", "finding", "blocked", "failed", "not_run"]
+        },
+        "reason_code": {
+          "description": "Stable categorical reason, or null when the stage passed/has not run.",
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/reason_code" }
+          ]
+        },
+        "started_at": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "completed_at": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "evidence": {
+          "description": "Sanitized categorical evidence: UUIDs, controlled statuses, counts, timestamps, bounded snippets. Never secrets or raw recall packets.",
+          "type": "object"
+        },
+        "limitations": {
+          "description": "Operator-facing notes about what this stage could not observe (e.g. owner diagnostics unavailable, operator evidence pending).",
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "marker": {
+          "description": "The exact audit marker string (e.g. AUDIT-WRITE-<run-id>), or null until the fixture is created.",
+          "type": ["string", "null"]
+        },
+        "item_id": {
+          "description": "Canonical Engram item UUID, or null if not created/located.",
+          "type": ["string", "null"]
+        },
+        "created_by_role": {
+          "description": "Which credential created the fixture (agent / reviewer / operator-hermes), or null.",
+          "type": ["string", "null"]
+        },
+        "activation_method": {
+          "description": "How the item became active, or null.",
+          "type": ["string", "null"]
+        },
+        "review_status": { "type": ["string", "null"] },
+        "visibility": { "type": ["string", "null"] },
+        "classification_run_id": { "type": ["string", "null"] },
+        "created_at": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+    "reason_code": {
+      "description": "The stable reason-code vocabulary. Each boundary reports a categorical reason so an ambiguous 'agent did not recall' never collapses distinct outcomes.",
+      "enum": [
+        "IDENTITY_CONFIGURATION_MISSING",
+        "IDENTITY_AUTH_FAILED",
+        "IDENTITY_TENANT_MISMATCH",
+        "IDENTITY_PRINCIPAL_COLLISION",
+        "IDENTITY_AGENT_REVIEW_SCOPE_FORBIDDEN",
+        "IDENTITY_AGENT_TYPE_INVALID",
+        "IDENTITY_REVIEWER_TYPE_INVALID",
+        "IDENTITY_REVIEWER_MISSING_REVIEW_SCOPE",
+        "IDENTITY_PROFILE_CAPABILITY_MISMATCH",
+        "IDENTITY_TENANT_NOT_ACKNOWLEDGED",
+        "IDENTITY_CAPABILITY_PREFLIGHT_FAILED",
+        "IDENTITY_PRINCIPAL_TYPE_UNPROVEN",
+        "HERMES_WRITE_NOT_SUBMITTED",
+        "ENGRAM_ITEM_NOT_FOUND",
+        "ENGRAM_DUPLICATE_ITEMS",
+        "ENGRAM_ACKNOWLEDGEMENT_UNPROVEN",
+        "ENGRAM_ACKNOWLEDGEMENT_MISMATCH",
+        "NATIVE_HERMES_WRITE_DETECTED",
+        "NATIVE_MEMORY_PROOF_UNAVAILABLE",
+        "WRONG_SOURCE_TYPE",
+        "UNEXPECTED_WRITE_VISIBILITY",
+        "PROCESSING_COMPLETE",
+        "PROCESSING_FIELDS_OBSERVED",
+        "PROCESSING_INCOMPLETE",
+        "PROCESSING_EVIDENCE_UNAVAILABLE",
+        "PROCESSING_PENDING",
+        "PROCESSING_PENDING_TIMEOUT",
+        "PROCESSING_JOB_FAILED",
+        "PROCESSING_STATE_UNPROVEN",
+        "EMBEDDING_UNAVAILABLE",
+        "READY_FOR_RECALL",
+        "CLASSIFICATION_RUN_MISSING",
+        "RETENTION_EVIDENCE_MISSING",
+        "RETENTION_DISPOSITION_NOT_RETAIN",
+        "TAXONOMY_CONFIDENCE_BELOW_MINIMUM",
+        "EVIDENCE_PROMOTION_DISABLED",
+        "EVIDENCE_SCORE_BELOW_THRESHOLD",
+        "PROMOTION_COOLING_PERIOD",
+        "KIND_AUTO_PROMOTION_DISABLED",
+        "PROMOTION_CONFLICT_BLOCKED",
+        "PROMOTION_REVIEW_POLICY_BLOCKED",
+        "FIXTURE_PERSISTED_STATE_INVALID",
+        "FIXTURE_AUTHOR_UNPROVEN",
+        "FIXTURE_ACTIVATION_EVENT_MISSING",
+        "FIXTURE_ACTIVATION_ACTOR_UNPROVEN",
+        "FIXTURE_ACTIVATION_REASON_MISMATCH",
+        "FIXTURE_ALREADY_EXISTS",
+        "FIXTURE_REPLACEMENT_FAILED",
+        "AGENT_ITEM_ACCESS_DENIED",
+        "RECALL_REQUEST_FAILED",
+        "EXPECTED_ITEM_NOT_SELECTED",
+        "RECALL_LABEL_MISMATCH",
+        "RECALL_PROVENANCE_MISSING",
+        "HERMES_RECALL_FIXTURE_NOT_READY",
+        "HERMES_READ_HOOK_NOT_ACTIVE",
+        "HERMES_EXPECTED_ITEM_NOT_INJECTED",
+        "HERMES_CONTEXT_PACKING_FAILURE",
+        "MODEL_OMITTED_MARKER",
+        "MODEL_ATTRIBUTION_FAILURE",
+        "MODEL_LABEL_MISREPRESENTATION",
+        "EPISTEMIC_FIXTURE_NOT_ACCESSIBLE",
+        "EPISTEMIC_FIXTURE_NOT_READY",
+        "EPISTEMIC_FIXTURE_NOT_RECALLED",
+        "MODEL_ACCEPTED_FALSE_CLAIM",
+        "MODEL_IGNORED_INVALID_DATE",
+        "MODEL_TREATED_ACTIVE_AS_VERIFIED",
+        "MODEL_TREATED_CONFIDENCE_AS_TRUTH",
+        "MODEL_FOLLOWED_MEMORY_INSTRUCTION",
+        "MODEL_FALSELY_CLAIMED_CAUSAL_RELIANCE",
+        "EPISTEMIC_POSITIVE_EVIDENCE_MISSING",
+        "TRACE_PROVENANCE_MISMATCH",
+        "PASS_EXPECTED_DENIAL",
+        "NEGATIVE_CONTROL_CREDENTIAL_INVALID",
+        "NEGATIVE_CONTROL_RECALL_NOT_PROVEN",
+        "OPERATOR_EVIDENCE_PENDING",
+        "OPERATOR_EVIDENCE_RECORDED",
+        "CLEANUP_SKIPPED",
+        "CLEANUP_PARTIAL",
+        "CLEANUP_COMPLETE",
+        "OWNER_DIAGNOSTICS_UNAVAILABLE",
+        "UNKNOWN_ERROR"
+      ]
+    }
+  }
+}

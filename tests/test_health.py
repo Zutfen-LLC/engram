@@ -8,11 +8,15 @@ it locally with ``docker compose up``.
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 
 from engram.api.app import create_app
+from engram.api.routes.health import whoami
+from engram.auth import Principal
 from engram.db import engine
 
 
@@ -42,6 +46,21 @@ async def test_health(client):
     response = await client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+@pytest.mark.parametrize("principal_type", ["agent", "user", "admin", "system"])
+async def test_whoami_truthfully_exposes_principal_type(principal_type: str) -> None:
+    session = AsyncMock()
+    session.scalar.return_value = principal_type
+    principal = Principal(
+        tenant_id="11111111-1111-1111-1111-111111111111",
+        principal_id="22222222-2222-2222-2222-222222222222",
+        scopes=("read",),
+    )
+    response = await whoami(principal=principal, session=session)
+    assert isinstance(response, dict)
+    assert response["principal_type"] == principal_type
+    session.scalar.assert_awaited_once()
 
 
 async def test_ready_requires_db(client):

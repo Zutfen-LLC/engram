@@ -157,6 +157,7 @@ class WhoAmIMemoryProfile(BaseModel):
 
 class WhoAmIResponse(BaseModel):
     principal_id: UUID
+    principal_type: Literal["agent", "user", "admin", "system"]
     tenant_id: UUID
     scopes: list[str]
     api_key_id: UUID | None
@@ -255,6 +256,7 @@ class ClassifyRequest(BaseModel):
     content: str
     context: str | None = None
     workspace: str | None = None
+    visibility: str | None = None
     source_type: SourceKind = "manual"
     # Optional correlation id shared with a subsequent remember() call for the
     # same candidate. When omitted the server generates one (see
