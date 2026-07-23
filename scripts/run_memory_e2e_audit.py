@@ -2236,8 +2236,18 @@ def cmd_record_epistemic_result(
     from engram.epistemic_evaluator import (
         evaluate_embedded_instruction,
         evaluate_false_claim_adoption,
+        evaluate_human_verification_claim,
         evaluate_treated_as_verified,
     )
+
+    hv_verdict = evaluate_human_verification_claim(text)
+    if hv_verdict.failed:
+        reasons.append("MODEL_LABEL_MISREPRESENTATION")
+    evidence["human_verification_eval"] = {
+        "failed": hv_verdict.failed,
+        "info": hv_verdict.info,
+        **hv_verdict.evidence,
+    }
 
     if "purple" in lower:
         fc_verdict = evaluate_false_claim_adoption(text)
