@@ -913,6 +913,12 @@ ClassificationJobState = Literal[
     "dead",
     "cancelled",
 ]
+RefreshAvailability = Literal[
+    "available",
+    "api_failed",
+    "malformed",
+    "identity_mismatch",
+]
 
 
 @dataclass(frozen=True)
@@ -946,6 +952,84 @@ class ClassificationJobDiagnostic:
         if self.diagnostic_error is not None:
             evidence["diagnostic_error"] = self.diagnostic_error
         return evidence
+
+
+@dataclass(frozen=True)
+class PostSuccessRefresh:
+    """Sanitized result of the one exact-item read after a succeeded job."""
+
+    availability: RefreshAvailability
+    item: dict[str, Any] | None = None
+    diagnostic_error: str | None = None
+
+    def to_evidence(self) -> dict[str, Any]:
+        if self.availability == "available":
+            return {
+                "availability": "available",
+                "item_id_match": True,
+                "processing_fields_present": True,
+            }
+        evidence = {"availability": self.availability}
+        if self.diagnostic_error is not None:
+            evidence["diagnostic_error"] = self.diagnostic_error
+        return evidence
+
+
+async def _refresh_processing_item_after_succeeded_job(
+    agent: EngramAPI,
+    expected_item_id: str,
+) -> PostSuccessRefresh:
+    """Refresh and validate the public exact-item processing contract once."""
+    try:
+        detail = await agent.get_item(expected_item_id)
+    except APIError as exc:
+        if "(non-json)" in exc.detail:
+            return PostSuccessRefresh(
+                availability="malformed",
+                diagnostic_error="item_refresh_malformed",
+            )
+        return PostSuccessRefresh(
+            availability="api_failed",
+            diagnostic_error="item_refresh_failed",
+        )
+    except httpx.HTTPError:
+        return PostSuccessRefresh(
+            availability="api_failed",
+            diagnostic_error="item_refresh_failed",
+        )
+    except (AssertionError, TypeError, ValueError):
+        return PostSuccessRefresh(
+            availability="malformed",
+            diagnostic_error="item_refresh_malformed",
+        )
+
+    if not isinstance(detail, dict):
+        return PostSuccessRefresh(
+            availability="malformed",
+            diagnostic_error="item_refresh_malformed",
+        )
+    item = detail.get("item", detail)
+    if not isinstance(item, dict) or not item.get("id"):
+        return PostSuccessRefresh(
+            availability="malformed",
+            diagnostic_error="item_refresh_malformed",
+        )
+    if str(item["id"]) != expected_item_id:
+        return PostSuccessRefresh(
+            availability="identity_mismatch",
+            diagnostic_error="refreshed_item_id_mismatch",
+        )
+    required_processing_fields = {
+        "review_status",
+        "retention_disposition",
+        "retention_evidence_at",
+    }
+    if not required_processing_fields.issubset(item):
+        return PostSuccessRefresh(
+            availability="malformed",
+            diagnostic_error="item_refresh_malformed",
+        )
+    return PostSuccessRefresh(availability="available", item=item)
 
 
 def _classification_job_reason(
@@ -1005,6 +1089,7 @@ async def stage_2_processing_promotion(state: RunState, cfg: AuditConfig) -> Non
     reason = "PROCESSING_FIELDS_OBSERVED"
     status = "pass"
     diagnostic: ClassificationJobDiagnostic | None = None
+    post_success_refresh_unavailable = False
     if item.get("review_status") == "proposed" and item.get("retention_disposition") is None:
         diagnostic = await _classification_refine_job_diagnostic(cfg, fw.item_id)
         evidence["classification_refine_diagnostic"] = diagnostic.to_evidence()
@@ -1017,18 +1102,20 @@ async def stage_2_processing_promotion(state: RunState, cfg: AuditConfig) -> Non
         # the job crossed that boundary after the first API read, refresh the
         # item once before diagnosing a completed-without-persistence defect.
         if diagnostic.availability == "available" and diagnostic.state == "succeeded":
-            try:
-                refreshed_detail = await agent.get_item(fw.item_id)
-                refreshed_item = refreshed_detail.get("item") or refreshed_detail
-                if refreshed_item.get("retention_disposition") is not None:
-                    item = refreshed_item
-                    fw.review_status = item.get("review_status")
-                    fw.visibility = item.get("visibility")
-                    evidence.update(_capture_processing_fields(item))
-            except APIError:
-                pass
+            refresh = await _refresh_processing_item_after_succeeded_job(agent, fw.item_id)
+            evidence["post_success_refresh"] = refresh.to_evidence()
+            if refresh.availability == "available":
+                assert refresh.item is not None
+                item = refresh.item
+                fw.review_status = item.get("review_status")
+                fw.visibility = item.get("visibility")
+                evidence.update(_capture_processing_fields(item))
+            else:
+                post_success_refresh_unavailable = True
 
-    if item.get("review_status") == "proposed" and item.get("retention_disposition") is None:
+    if post_success_refresh_unavailable:
+        reason, status = "PROCESSING_STATE_UNPROVEN", "finding"
+    elif item.get("review_status") == "proposed" and item.get("retention_disposition") is None:
         assert diagnostic is not None
         reason, status = _classification_job_reason(diagnostic)
     elif item.get("retention_disposition") not in {None, "retain"}:
@@ -1152,17 +1239,30 @@ async def _classification_refine_job_diagnostic(
                 "cancelled",
             }
             raw_state = str(row["status"])
+            matching_count = min(max(0, int(row["matching_job_count"])), 1000)
+            attempts = min(max(0, int(row["attempts"])), 999)
             if raw_state in canonical_states:
-                matching_count = int(row["matching_job_count"])
                 diagnostic = ClassificationJobDiagnostic(
                     availability="available",
                     state=cast(ClassificationJobState, raw_state),
                     job_id=str(row["id"]),
-                    attempts=int(row["attempts"]),
+                    attempts=attempts,
                     created_at=row["created_at"],
                     completed_at=row["completed_at"],
                     matching_job_count=matching_count,
                     duplicate_count=min(max(0, matching_count - 1), 999),
+                )
+            else:
+                diagnostic = ClassificationJobDiagnostic(
+                    availability="available",
+                    state=None,
+                    job_id=str(row["id"]),
+                    attempts=attempts,
+                    created_at=row["created_at"],
+                    completed_at=row["completed_at"],
+                    matching_job_count=matching_count,
+                    duplicate_count=min(max(0, matching_count - 1), 999),
+                    diagnostic_error="unknown_job_status",
                 )
     except Exception:
         diagnostic = ClassificationJobDiagnostic(

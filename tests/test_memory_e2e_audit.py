@@ -1549,6 +1549,13 @@ def test_classification_job_reason_requires_proven_absence_for_incomplete() -> N
     assert cli._classification_job_reason(diagnostic) == ("PROCESSING_INCOMPLETE", "finding")
 
 
+def test_only_not_found_diagnostic_state_maps_to_processing_incomplete() -> None:
+    states = [None, "pending", "running", "succeeded", "failed", "dead", "cancelled"]
+    for state in states:
+        diagnostic = cli.ClassificationJobDiagnostic(availability="available", state=state)
+        assert cli._classification_job_reason(diagnostic)[0] != "PROCESSING_INCOMPLETE"
+
+
 @pytest.mark.parametrize("availability", ["not_configured", "connection_failed", "query_failed"])
 def test_classification_job_reason_fails_closed_when_diagnostic_unavailable(
     availability: str,
@@ -1665,6 +1672,41 @@ async def test_classification_job_diagnostic_proves_not_found_only_after_success
     assert diagnostic.availability == "available"
     assert diagnostic.state == "not_found"
     assert diagnostic.matching_job_count == 0
+
+
+async def test_classification_job_diagnostic_reports_unknown_status_as_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = {
+        "id": "job-unknown",
+        "status": "mystery_state",
+        "attempts": 2,
+        "created_at": "2026-07-23T12:00:00+00:00",
+        "completed_at": None,
+        "matching_job_count": 1,
+    }
+    connection = _DiagnosticConnection(row)
+    engine = _DiagnosticEngine(connection)
+    monkeypatch.setattr("sqlalchemy.ext.asyncio.create_async_engine", lambda *_a, **_k: engine)
+    cfg = cli.AuditConfig()
+    cfg.owner_db_url = "postgresql+asyncpg://owner:secret@db/test"
+
+    diagnostic = await cli._classification_refine_job_diagnostic(cfg, "item-1")
+    evidence = diagnostic.to_evidence()
+
+    assert diagnostic.availability == "available"
+    assert diagnostic.state is None
+    assert diagnostic.job_id == "job-unknown"
+    assert diagnostic.attempts == 2
+    assert diagnostic.matching_job_count == 1
+    assert diagnostic.diagnostic_error == "unknown_job_status"
+    assert cli._classification_job_reason(diagnostic) == (
+        "PROCESSING_STATE_UNPROVEN",
+        "finding",
+    )
+    assert evidence["diagnostic_error"] == "unknown_job_status"
+    assert "mystery_state" not in json.dumps(evidence)
+    assert "owner_db_query_failed" not in json.dumps(evidence)
 
 
 @pytest.mark.parametrize(
@@ -1803,6 +1845,200 @@ async def test_stage2_refreshes_item_before_completed_without_persistence_findin
     assert event.status == "pass"
     assert event.evidence["retention_disposition"] == "retain"
     assert event.evidence["retention_evidence_at"] == "2026-07-23T12:00:00+00:00"
+    assert event.evidence["post_success_refresh"] == {
+        "availability": "available",
+        "item_id_match": True,
+        "processing_fields_present": True,
+    }
+
+
+async def _run_stage2_succeeded_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+    second_response_factory: Any,
+) -> Any:
+    state = _mkstate()
+    item_id = str(uuid.uuid4())
+    state.fixture("write").item_id = item_id
+    state.stage("stage_0_identity_preflight").status = "pass"
+    state.stage("stage_0_identity_preflight").completed_at = datetime.now(UTC)
+    cfg = cli.AuditConfig()
+    cfg.agent_key = "agent"
+    cfg.base_url = "http://test"
+    cfg.owner_db_url = "postgresql+asyncpg://owner:secret@db/test"
+    reads = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal reads
+        assert request.url.path == "/v1/items/" + item_id
+        reads += 1
+        if reads == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "item": {
+                        "id": item_id,
+                        "review_status": "proposed",
+                        "retention_disposition": None,
+                        "retention_evidence_at": None,
+                    }
+                },
+            )
+        return second_response_factory(item_id)
+
+    async def completed_diagnostic(_cfg: Any, _item_id: str) -> Any:
+        assert _item_id == item_id
+        return cli.ClassificationJobDiagnostic(
+            availability="available",
+            state="succeeded",
+            job_id="completed-job",
+            attempts=1,
+            matching_job_count=1,
+        )
+
+    async def mock_promotion(_url: str, _item_id: str) -> dict[str, Any]:
+        return {"available": True, "would_promote": False, "blockers": ["no_evidence"]}
+
+    _install_mock_transport(monkeypatch, httpx.MockTransport(handler))
+    monkeypatch.setattr(cli, "_classification_refine_job_diagnostic", completed_diagnostic)
+    monkeypatch.setattr(cli, "_owner_promotion_diagnostic", mock_promotion)
+    await cli.stage_2_processing_promotion(state, cfg)
+    assert reads == 2
+    return state.stage("stage_2_processing_promotion")
+
+
+@pytest.mark.parametrize("wrapped", [True, False])
+async def test_stage2_completed_without_persistence_requires_exact_successful_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+    wrapped: bool,
+) -> None:
+    def response(item_id: str) -> httpx.Response:
+        item = {
+            "id": item_id,
+            "review_status": "proposed",
+            "retention_disposition": None,
+            "retention_evidence_at": None,
+        }
+        return httpx.Response(200, json={"item": item} if wrapped else item)
+
+    event = await _run_stage2_succeeded_refresh(monkeypatch, response)
+
+    assert event.reason_code == "JOB_COMPLETED_WITHOUT_PERSISTENCE"
+    assert event.status == "finding"
+    assert event.evidence["post_success_refresh"] == {
+        "availability": "available",
+        "item_id_match": True,
+        "processing_fields_present": True,
+    }
+
+
+@pytest.mark.parametrize("status_code", [401, 403, 404, 500])
+async def test_stage2_refresh_api_failure_is_unproven_and_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+) -> None:
+    event = await _run_stage2_succeeded_refresh(
+        monkeypatch,
+        lambda _item_id: httpx.Response(
+            status_code, json={"secret_body": "Bearer should-not-persist"}
+        ),
+    )
+
+    assert event.reason_code == "PROCESSING_STATE_UNPROVEN"
+    assert event.reason_code != "JOB_COMPLETED_WITHOUT_PERSISTENCE"
+    assert event.evidence["post_success_refresh"] == {
+        "availability": "api_failed",
+        "diagnostic_error": "item_refresh_failed",
+    }
+    rendered = json.dumps(event.evidence)
+    assert "secret_body" not in rendered
+    assert "should-not-persist" not in rendered
+
+
+@pytest.mark.parametrize(
+    "payload_factory",
+    [
+        lambda _item_id: {},
+        lambda _item_id: {"item": None},
+        lambda _item_id: {"unexpected": "shape"},
+        lambda _item_id: {"item": []},
+        lambda item_id: {
+            "item": {
+                "id": item_id,
+                "review_status": "proposed",
+                "retention_evidence_at": None,
+            }
+        },
+        lambda item_id: {
+            "item": {
+                "id": item_id,
+                "review_status": "proposed",
+                "retention_disposition": None,
+            }
+        },
+    ],
+)
+async def test_stage2_malformed_refresh_is_unproven(
+    monkeypatch: pytest.MonkeyPatch,
+    payload_factory: Any,
+) -> None:
+    event = await _run_stage2_succeeded_refresh(
+        monkeypatch,
+        lambda item_id: httpx.Response(200, json=payload_factory(item_id)),
+    )
+
+    assert event.reason_code == "PROCESSING_STATE_UNPROVEN"
+    assert event.evidence["post_success_refresh"] == {
+        "availability": "malformed",
+        "diagnostic_error": "item_refresh_malformed",
+    }
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(200, text="not-json"),
+        httpx.Response(200, json="scalar-json"),
+    ],
+)
+async def test_stage2_non_mapping_or_non_json_refresh_is_malformed(
+    monkeypatch: pytest.MonkeyPatch,
+    response: httpx.Response,
+) -> None:
+    event = await _run_stage2_succeeded_refresh(
+        monkeypatch,
+        lambda _item_id: response,
+    )
+
+    assert event.reason_code == "PROCESSING_STATE_UNPROVEN"
+    assert event.evidence["post_success_refresh"] == {
+        "availability": "malformed",
+        "diagnostic_error": "item_refresh_malformed",
+    }
+
+
+async def test_stage2_wrong_refresh_identity_is_unproven(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event = await _run_stage2_succeeded_refresh(
+        monkeypatch,
+        lambda _item_id: httpx.Response(
+            200,
+            json={
+                "item": {
+                    "id": str(uuid.uuid4()),
+                    "review_status": "proposed",
+                    "retention_disposition": None,
+                    "retention_evidence_at": None,
+                }
+            },
+        ),
+    )
+
+    assert event.reason_code == "PROCESSING_STATE_UNPROVEN"
+    assert event.evidence["post_success_refresh"] == {
+        "availability": "identity_mismatch",
+        "diagnostic_error": "refreshed_item_id_mismatch",
+    }
 
 
 async def test_missing_owner_url_is_unproven_not_incomplete(
