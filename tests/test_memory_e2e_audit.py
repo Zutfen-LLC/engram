@@ -1522,64 +1522,185 @@ def test_sanitize_host_strips_scheme_path_and_creds() -> None:
 # ── ENG-AUDIT-002A: Stage 2 reason-code accuracy ─────────────────────────────
 
 
-async def test_stage2_processing_pending_vs_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stage 2 must distinguish PROCESSING_PENDING from PROCESSING_INCOMPLETE.
+@pytest.mark.parametrize("state", ["pending", "running"])
+def test_classification_job_reason_maps_active_states_to_pending(state: str) -> None:
+    diagnostic = cli.ClassificationJobDiagnostic(availability="available", state=state)
+    assert cli._classification_job_reason(diagnostic) == ("PROCESSING_PENDING", "finding")
 
-    When a classification.refine job is still pending, the finding should be
-    PROCESSING_PENDING (calibration evidence). When no job exists, it should
-    be PROCESSING_INCOMPLETE (possible pipeline defect).
-    """
-    s = _mkstate()
-    fw_item = str(uuid.uuid4())
-    s.fixture("write").item_id = fw_item
-    s.stage("stage_0_identity_preflight").status = "pass"
-    s.stage("stage_0_identity_preflight").completed_at = datetime.now(UTC)
 
+@pytest.mark.parametrize("state", ["failed", "dead", "cancelled"])
+def test_classification_job_reason_maps_unsuccessful_terminal_states_to_failed(
+    state: str,
+) -> None:
+    diagnostic = cli.ClassificationJobDiagnostic(availability="available", state=state)
+    assert cli._classification_job_reason(diagnostic) == ("PROCESSING_JOB_FAILED", "finding")
+
+
+def test_classification_job_reason_maps_success_without_evidence_to_contract_failure() -> None:
+    diagnostic = cli.ClassificationJobDiagnostic(availability="available", state="succeeded")
+    assert cli._classification_job_reason(diagnostic) == (
+        "JOB_COMPLETED_WITHOUT_PERSISTENCE",
+        "finding",
+    )
+
+
+def test_classification_job_reason_requires_proven_absence_for_incomplete() -> None:
+    diagnostic = cli.ClassificationJobDiagnostic(availability="available", state="not_found")
+    assert cli._classification_job_reason(diagnostic) == ("PROCESSING_INCOMPLETE", "finding")
+
+
+@pytest.mark.parametrize("availability", ["not_configured", "connection_failed", "query_failed"])
+def test_classification_job_reason_fails_closed_when_diagnostic_unavailable(
+    availability: str,
+) -> None:
+    diagnostic = cli.ClassificationJobDiagnostic(
+        availability=availability,
+        state=None,
+        diagnostic_error=f"owner_db_{availability}",
+    )
+    reason, status = cli._classification_job_reason(diagnostic)
+    assert (reason, status) == ("PROCESSING_STATE_UNPROVEN", "finding")
+    assert reason != "PROCESSING_INCOMPLETE"
+
+
+class _DiagnosticResult:
+    def __init__(self, row: dict[str, Any] | None) -> None:
+        self._row = row
+
+    def mappings(self) -> _DiagnosticResult:
+        return self
+
+    def first(self) -> dict[str, Any] | None:
+        return self._row
+
+
+class _DiagnosticTransaction:
+    is_active = True
+
+    async def rollback(self) -> None:
+        self.is_active = False
+
+
+class _DiagnosticConnection:
+    def __init__(self, row: dict[str, Any] | None, *, fail_query: bool = False) -> None:
+        self.row = row
+        self.fail_query = fail_query
+        self.statements: list[str] = []
+        self.closed = False
+
+    async def begin(self) -> _DiagnosticTransaction:
+        return _DiagnosticTransaction()
+
+    async def execute(self, statement: Any, _params: Any = None) -> _DiagnosticResult:
+        sql = str(statement)
+        self.statements.append(sql)
+        if self.fail_query:
+            raise RuntimeError("postgresql://owner:raw-secret@db/internal failure")
+        return _DiagnosticResult(self.row if sql.lstrip().startswith("SELECT") else None)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _DiagnosticEngine:
+    def __init__(self, connection: _DiagnosticConnection | None) -> None:
+        self.connection = connection
+        self.disposed = False
+
+    async def connect(self) -> _DiagnosticConnection:
+        if self.connection is None:
+            raise RuntimeError("postgresql://owner:raw-secret@db/connect failure")
+        return self.connection
+
+    async def dispose(self) -> None:
+        self.disposed = True
+
+
+@pytest.mark.parametrize(
+    "state", ["pending", "running", "succeeded", "failed", "dead", "cancelled"]
+)
+async def test_classification_job_diagnostic_queries_all_canonical_states_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    row = {
+        "id": "job-2",
+        "status": state,
+        "attempts": 3,
+        "created_at": "2026-07-23T12:00:00+00:00",
+        "completed_at": "2026-07-23T12:02:00+00:00",
+        "matching_job_count": 2,
+    }
+    connection = _DiagnosticConnection(row)
+    engine = _DiagnosticEngine(connection)
+    monkeypatch.setattr("sqlalchemy.ext.asyncio.create_async_engine", lambda *_a, **_k: engine)
     cfg = cli.AuditConfig()
-    cfg.agent_key = "agent"
-    cfg.base_url = "http://test"
+    cfg.owner_db_url = "postgresql+asyncpg://owner:secret@db/test"
 
-    # Mock the agent API to return a proposed item with no retention evidence.
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/items/" + fw_item:
-            return httpx.Response(
-                200,
-                json={
-                    "item": {
-                        "id": fw_item,
-                        "review_status": "proposed",
-                        "retention_disposition": None,
-                        "retention_evidence_at": None,
-                        "kind": "fact",
-                        "memory_confidence": 0.4,
-                        "source_trust": 0.4,
-                        "source_confidence_prior": 0.4,
-                        "visibility": "private",
-                        "human_verified": False,
-                    }
-                },
-            )
-        return httpx.Response(404)
+    diagnostic = await cli._classification_refine_job_diagnostic(cfg, "item-1")
 
-    transport = httpx.MockTransport(handler)
-    _install_mock_transport(monkeypatch, transport)
-
-    # Case 1: no owner_db_url → cannot check for pending jobs → PROCESSING_INCOMPLETE
-    cfg.owner_db_url = ""
-    await cli.stage_2_processing_promotion(s, cfg)
-    ev = s.stage("stage_2_processing_promotion")
-    assert ev.status == "finding"
-    assert ev.reason_code == "PROCESSING_INCOMPLETE"
+    assert diagnostic.state == state
+    assert diagnostic.matching_job_count == 2
+    assert diagnostic.duplicate_count == 1
+    assert diagnostic.job_id == "job-2"
+    assert "SET TRANSACTION READ ONLY" in connection.statements
+    assert any("statement_timeout" in sql for sql in connection.statements)
+    select_sql = next(sql for sql in connection.statements if sql.lstrip().startswith("SELECT"))
+    assert "status IN" not in select_sql
+    assert "ORDER BY created_at DESC, id DESC" in select_sql
+    assert all(sql.lstrip().startswith(("SET", "SELECT")) for sql in connection.statements)
+    assert connection.closed is True
+    assert engine.disposed is True
 
 
-async def test_stage2_processing_pending_with_job(monkeypatch: pytest.MonkeyPatch) -> None:
-    """When a classification.refine job exists, Stage 2 reports PROCESSING_PENDING."""
+async def test_classification_job_diagnostic_proves_not_found_only_after_successful_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _DiagnosticConnection(None)
+    engine = _DiagnosticEngine(connection)
+    monkeypatch.setattr("sqlalchemy.ext.asyncio.create_async_engine", lambda *_a, **_k: engine)
+    cfg = cli.AuditConfig()
+    cfg.owner_db_url = "postgresql+asyncpg://owner:secret@db/test"
+    diagnostic = await cli._classification_refine_job_diagnostic(cfg, "item-1")
+    assert diagnostic.availability == "available"
+    assert diagnostic.state == "not_found"
+    assert diagnostic.matching_job_count == 0
+
+
+@pytest.mark.parametrize(
+    ("connection", "availability", "error"),
+    [
+        (None, "connection_failed", "owner_db_connection_failed"),
+        (_DiagnosticConnection(None, fail_query=True), "query_failed", "owner_db_query_failed"),
+    ],
+)
+async def test_classification_job_diagnostic_sanitizes_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    connection: _DiagnosticConnection | None,
+    availability: str,
+    error: str,
+) -> None:
+    engine = _DiagnosticEngine(connection)
+    monkeypatch.setattr("sqlalchemy.ext.asyncio.create_async_engine", lambda *_a, **_k: engine)
+    cfg = cli.AuditConfig()
+    cfg.owner_db_url = "postgresql+asyncpg://owner:secret@db/test"
+    diagnostic = await cli._classification_refine_job_diagnostic(cfg, "item-1")
+    evidence = diagnostic.to_evidence()
+    assert diagnostic.availability == availability
+    assert diagnostic.state is None
+    assert diagnostic.diagnostic_error == error
+    assert "secret" not in json.dumps(evidence)
+    assert engine.disposed is True
+
+
+async def test_stage2_records_sanitized_structured_job_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     s = _mkstate()
     fw_item = str(uuid.uuid4())
     s.fixture("write").item_id = fw_item
     s.stage("stage_0_identity_preflight").status = "pass"
     s.stage("stage_0_identity_preflight").completed_at = datetime.now(UTC)
-
     cfg = cli.AuditConfig()
     cfg.agent_key = "agent"
     cfg.base_url = "http://test"
@@ -1595,37 +1716,128 @@ async def test_stage2_processing_pending_with_job(monkeypatch: pytest.MonkeyPatc
                         "review_status": "proposed",
                         "retention_disposition": None,
                         "retention_evidence_at": None,
-                        "kind": "fact",
-                        "memory_confidence": 0.4,
-                        "source_trust": 0.4,
-                        "source_confidence_prior": 0.4,
-                        "visibility": "private",
-                        "human_verified": False,
                     }
                 },
             )
         return httpx.Response(404)
 
-    transport = httpx.MockTransport(handler)
-    _install_mock_transport(monkeypatch, transport)
+    _install_mock_transport(monkeypatch, httpx.MockTransport(handler))
 
-    # Mock the pending job check to return a pending job
-    async def mock_check(cfg: Any, item_id: str) -> dict[str, Any] | None:
-        return {"job_id": "test-job", "job_type": "classification.refine", "status": "pending"}
+    async def mock_diagnostic(_cfg: Any, item_id: str) -> Any:
+        assert item_id == fw_item
+        return cli.ClassificationJobDiagnostic(
+            availability="available",
+            state="pending",
+            job_id="test-job",
+            attempts=0,
+            matching_job_count=2,
+            duplicate_count=1,
+        )
 
-    monkeypatch.setattr(cli, "_check_pending_classification_job", mock_check)
+    async def mock_promotion(_url: str, _item_id: str) -> dict[str, Any]:
+        return {"available": True, "would_promote": False, "blockers": ["no_evidence"]}
 
-    # Mock the owner promotion diagnostic
-    async def mock_diag(url: str, item_id: str) -> dict[str, Any]:
-        return {"available": True, "would_promote": False, "blockers": ["no_retention_evidence"]}
+    monkeypatch.setattr(cli, "_classification_refine_job_diagnostic", mock_diagnostic)
+    monkeypatch.setattr(cli, "_owner_promotion_diagnostic", mock_promotion)
+    await cli.stage_2_processing_promotion(s, cfg)
+    event = s.stage("stage_2_processing_promotion")
+    assert event.reason_code == "PROCESSING_PENDING"
+    assert event.evidence["classification_refine_diagnostic"]["duplicate_count"] == 1
+    assert "secret" not in json.dumps(event.evidence)
 
-    monkeypatch.setattr(cli, "_owner_promotion_diagnostic", mock_diag)
+
+async def test_stage2_refreshes_item_before_completed_without_persistence_finding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _mkstate()
+    item_id = str(uuid.uuid4())
+    s.fixture("write").item_id = item_id
+    s.stage("stage_0_identity_preflight").status = "pass"
+    s.stage("stage_0_identity_preflight").completed_at = datetime.now(UTC)
+    cfg = cli.AuditConfig()
+    cfg.agent_key = "agent"
+    cfg.base_url = "http://test"
+    cfg.owner_db_url = "postgresql+asyncpg://owner:secret@db/test"
+    reads = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal reads
+        if request.url.path == "/v1/items/" + item_id:
+            reads += 1
+            item = {
+                "id": item_id,
+                "review_status": "proposed",
+                "retention_disposition": None,
+                "retention_evidence_at": None,
+            }
+            if reads == 2:
+                item.update(
+                    retention_disposition="retain",
+                    retention_confidence=0.9,
+                    retention_evidence_at="2026-07-23T12:00:00+00:00",
+                )
+            return httpx.Response(200, json={"item": item})
+        return httpx.Response(404)
+
+    async def completed_diagnostic(_cfg: Any, _item_id: str) -> Any:
+        return cli.ClassificationJobDiagnostic(
+            availability="available",
+            state="succeeded",
+            job_id="completed-job",
+            attempts=1,
+            matching_job_count=1,
+        )
+
+    async def mock_promotion(_url: str, _item_id: str) -> dict[str, Any]:
+        return {"available": True, "would_promote": True, "blockers": []}
+
+    _install_mock_transport(monkeypatch, httpx.MockTransport(handler))
+    monkeypatch.setattr(cli, "_classification_refine_job_diagnostic", completed_diagnostic)
+    monkeypatch.setattr(cli, "_owner_promotion_diagnostic", mock_promotion)
 
     await cli.stage_2_processing_promotion(s, cfg)
-    ev = s.stage("stage_2_processing_promotion")
-    assert ev.status == "finding"
-    assert ev.reason_code == "PROCESSING_PENDING"
-    assert ev.evidence.get("classification_refine_job", {}).get("status") == "pending"
+
+    event = s.stage("stage_2_processing_promotion")
+    assert reads == 2
+    assert event.reason_code == "PROCESSING_FIELDS_OBSERVED"
+    assert event.status == "pass"
+    assert event.evidence["retention_disposition"] == "retain"
+    assert event.evidence["retention_evidence_at"] == "2026-07-23T12:00:00+00:00"
+
+
+async def test_missing_owner_url_is_unproven_not_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _mkstate()
+    fw_item = str(uuid.uuid4())
+    s.fixture("write").item_id = fw_item
+    s.stage("stage_0_identity_preflight").status = "pass"
+    s.stage("stage_0_identity_preflight").completed_at = datetime.now(UTC)
+    cfg = cli.AuditConfig()
+    cfg.agent_key = "agent"
+    cfg.base_url = "http://test"
+    cfg.owner_db_url = ""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/items/" + fw_item:
+            return httpx.Response(
+                200,
+                json={
+                    "item": {
+                        "id": fw_item,
+                        "review_status": "proposed",
+                        "retention_disposition": None,
+                        "retention_evidence_at": None,
+                    }
+                },
+            )
+        return httpx.Response(404)
+
+    _install_mock_transport(monkeypatch, httpx.MockTransport(handler))
+    await cli.stage_2_processing_promotion(s, cfg)
+    event = s.stage("stage_2_processing_promotion")
+    assert event.reason_code == "PROCESSING_STATE_UNPROVEN"
+    assert event.evidence["classification_refine_diagnostic"]["availability"] == "not_configured"
 
 
 # ── no API keys persisted (end-to-end on the report) ──────────────────────────
