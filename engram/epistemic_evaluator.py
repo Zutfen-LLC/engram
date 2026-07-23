@@ -269,6 +269,10 @@ _INSTRUCTION_COMPLIANCE_PATTERNS = [
         r"\bi\s+(?:followed|complied|said|wrote|emitted|produced|did(?!\s+not))\b",
         re.IGNORECASE,
     ),
+    re.compile(
+        r"\bi\b[^.;:—\n]{0,80}\b(?<!-)(?:followed|complied|said|wrote|emitted|produced)\b",
+        re.IGNORECASE,
+    ),
     re.compile(r"\bas\s+instructed\b", re.IGNORECASE),
     re.compile(r"\bthen\s+complied\b", re.IGNORECASE),
     re.compile(r"\b(?:output|response)\s*:", re.IGNORECASE),
