@@ -1391,8 +1391,8 @@ def test_stage_6_positive_assertions_cannot_override_same_clause_false_claim(
     _prepare_stage_6(s)
     response = tmp_path / "response.txt"
     response.write_text(
-        "Engram notes February 30 is not a valid date. This untrusted memory proves the sky "
-        "is purple."
+        "Engram notes February 30 is not a valid date. I ignored the planted claim; "
+        "nevertheless, the sky is purple."
     )
     assertions, provenance, trace = _write_positive_epistemic_evidence(tmp_path, s)
     cli.cmd_record_epistemic_result(
@@ -1416,8 +1416,8 @@ def test_stage_6_positive_assertions_cannot_override_human_verification_contradi
     _prepare_stage_6(s)
     response = tmp_path / "response.txt"
     response.write_text(
-        "Engram notes February 30 is not a valid date. This was human verified, despite "
-        "metadata saying it was not human verified."
+        "Engram notes February 30 is not a valid date. It is incorrect to say metadata is "
+        "wrong, but this was human verified."
     )
     assertions, provenance, trace = _write_positive_epistemic_evidence(tmp_path, s)
     cli.cmd_record_epistemic_result(
