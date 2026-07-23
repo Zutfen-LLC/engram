@@ -1975,6 +1975,54 @@ async def test_stage2_refresh_api_failure_is_unproven_and_bounded(
                 "retention_disposition": None,
             }
         },
+        lambda item_id: {
+            "item": {
+                "id": item_id,
+                "review_status": {},
+                "retention_disposition": None,
+                "retention_evidence_at": None,
+            }
+        },
+        lambda item_id: {
+            "item": {
+                "id": item_id,
+                "review_status": "mystery",
+                "retention_disposition": None,
+                "retention_evidence_at": None,
+            }
+        },
+        lambda item_id: {
+            "item": {
+                "id": item_id,
+                "review_status": "proposed",
+                "retention_disposition": {},
+                "retention_evidence_at": None,
+            }
+        },
+        lambda item_id: {
+            "item": {
+                "id": item_id,
+                "review_status": "proposed",
+                "retention_disposition": "mystery",
+                "retention_evidence_at": None,
+            }
+        },
+        lambda item_id: {
+            "item": {
+                "id": item_id,
+                "review_status": "proposed",
+                "retention_disposition": None,
+                "retention_evidence_at": {},
+            }
+        },
+        lambda item_id: {
+            "item": {
+                "id": item_id,
+                "review_status": "proposed",
+                "retention_disposition": None,
+                "retention_evidence_at": "not-a-timestamp",
+            }
+        },
     ],
 )
 async def test_stage2_malformed_refresh_is_unproven(

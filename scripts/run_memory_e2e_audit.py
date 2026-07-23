@@ -969,7 +969,7 @@ class PostSuccessRefresh:
                 "item_id_match": True,
                 "processing_fields_present": True,
             }
-        evidence = {"availability": self.availability}
+        evidence: dict[str, Any] = {"availability": self.availability}
         if self.diagnostic_error is not None:
             evidence["diagnostic_error"] = self.diagnostic_error
         return evidence
@@ -1025,6 +1025,39 @@ async def _refresh_processing_item_after_succeeded_job(
         "retention_evidence_at",
     }
     if not required_processing_fields.issubset(item):
+        return PostSuccessRefresh(
+            availability="malformed",
+            diagnostic_error="item_refresh_malformed",
+        )
+    review_status = item["review_status"]
+    if not (
+        isinstance(review_status, str)
+        and review_status in {"proposed", "active", "disputed", "rejected", "archived"}
+    ):
+        return PostSuccessRefresh(
+            availability="malformed",
+            diagnostic_error="item_refresh_malformed",
+        )
+    retention_disposition = item["retention_disposition"]
+    if not (
+        retention_disposition is None
+        or (
+            isinstance(retention_disposition, str)
+            and retention_disposition in {"retain", "transient", "noise", "uncertain"}
+        )
+    ):
+        return PostSuccessRefresh(
+            availability="malformed",
+            diagnostic_error="item_refresh_malformed",
+        )
+    retention_evidence_at = item["retention_evidence_at"]
+    if not (
+        retention_evidence_at is None
+        or (
+            isinstance(retention_evidence_at, str)
+            and _parse_dt(retention_evidence_at) is not None
+        )
+    ):
         return PostSuccessRefresh(
             availability="malformed",
             diagnostic_error="item_refresh_malformed",
