@@ -1519,6 +1519,115 @@ def test_sanitize_host_strips_scheme_path_and_creds() -> None:
     assert sanitize_host("https://engram.zutfen.com") == "engram.zutfen.com"
 
 
+# ── ENG-AUDIT-002A: Stage 2 reason-code accuracy ─────────────────────────────
+
+
+async def test_stage2_processing_pending_vs_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stage 2 must distinguish PROCESSING_PENDING from PROCESSING_INCOMPLETE.
+
+    When a classification.refine job is still pending, the finding should be
+    PROCESSING_PENDING (calibration evidence). When no job exists, it should
+    be PROCESSING_INCOMPLETE (possible pipeline defect).
+    """
+    s = _mkstate()
+    fw_item = str(uuid.uuid4())
+    s.fixture("write").item_id = fw_item
+    s.stage("stage_0_identity_preflight").status = "pass"
+    s.stage("stage_0_identity_preflight").completed_at = datetime.now(UTC)
+
+    cfg = cli.AuditConfig()
+    cfg.agent_key = "agent"
+    cfg.base_url = "http://test"
+
+    # Mock the agent API to return a proposed item with no retention evidence.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/items/" + fw_item:
+            return httpx.Response(
+                200,
+                json={
+                    "item": {
+                        "id": fw_item,
+                        "review_status": "proposed",
+                        "retention_disposition": None,
+                        "retention_evidence_at": None,
+                        "kind": "fact",
+                        "memory_confidence": 0.4,
+                        "source_trust": 0.4,
+                        "source_confidence_prior": 0.4,
+                        "visibility": "private",
+                        "human_verified": False,
+                    }
+                },
+            )
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    _install_mock_transport(monkeypatch, transport)
+
+    # Case 1: no owner_db_url → cannot check for pending jobs → PROCESSING_INCOMPLETE
+    cfg.owner_db_url = ""
+    await cli.stage_2_processing_promotion(s, cfg)
+    ev = s.stage("stage_2_processing_promotion")
+    assert ev.status == "finding"
+    assert ev.reason_code == "PROCESSING_INCOMPLETE"
+
+
+async def test_stage2_processing_pending_with_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When a classification.refine job exists, Stage 2 reports PROCESSING_PENDING."""
+    s = _mkstate()
+    fw_item = str(uuid.uuid4())
+    s.fixture("write").item_id = fw_item
+    s.stage("stage_0_identity_preflight").status = "pass"
+    s.stage("stage_0_identity_preflight").completed_at = datetime.now(UTC)
+
+    cfg = cli.AuditConfig()
+    cfg.agent_key = "agent"
+    cfg.base_url = "http://test"
+    cfg.owner_db_url = "postgresql+asyncpg://owner:secret@db/test"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/items/" + fw_item:
+            return httpx.Response(
+                200,
+                json={
+                    "item": {
+                        "id": fw_item,
+                        "review_status": "proposed",
+                        "retention_disposition": None,
+                        "retention_evidence_at": None,
+                        "kind": "fact",
+                        "memory_confidence": 0.4,
+                        "source_trust": 0.4,
+                        "source_confidence_prior": 0.4,
+                        "visibility": "private",
+                        "human_verified": False,
+                    }
+                },
+            )
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    _install_mock_transport(monkeypatch, transport)
+
+    # Mock the pending job check to return a pending job
+    async def mock_check(cfg: Any, item_id: str) -> dict[str, Any] | None:
+        return {"job_id": "test-job", "job_type": "classification.refine", "status": "pending"}
+
+    monkeypatch.setattr(cli, "_check_pending_classification_job", mock_check)
+
+    # Mock the owner promotion diagnostic
+    async def mock_diag(url: str, item_id: str) -> dict[str, Any]:
+        return {"available": True, "would_promote": False, "blockers": ["no_retention_evidence"]}
+
+    monkeypatch.setattr(cli, "_owner_promotion_diagnostic", mock_diag)
+
+    await cli.stage_2_processing_promotion(s, cfg)
+    ev = s.stage("stage_2_processing_promotion")
+    assert ev.status == "finding"
+    assert ev.reason_code == "PROCESSING_PENDING"
+    assert ev.evidence.get("classification_refine_job", {}).get("status") == "pending"
+
+
 # ── no API keys persisted (end-to-end on the report) ──────────────────────────
 
 

@@ -937,7 +937,17 @@ async def stage_2_processing_promotion(state: RunState, cfg: AuditConfig) -> Non
     reason = "PROCESSING_FIELDS_OBSERVED"
     status = "pass"
     if item.get("review_status") == "proposed" and item.get("retention_disposition") is None:
-        reason, status = "PROCESSING_INCOMPLETE", "finding"
+        # Distinguish pending (classification.refine job still queued/running)
+        # from permanently incomplete. A sync_turn item written via the
+        # rule-only path enqueues classification.refine asynchronously; the
+        # retention evidence appears once that job completes. If the job is
+        # pending, this is calibration evidence, not a pipeline defect.
+        pending_job = await _check_pending_classification_job(cfg, fw.item_id)
+        if pending_job:
+            reason, status = "PROCESSING_PENDING", "finding"
+            evidence["classification_refine_job"] = pending_job
+        else:
+            reason, status = "PROCESSING_INCOMPLETE", "finding"
     elif item.get("retention_disposition") not in {None, "retain"}:
         reason, status = "RETENTION_DISPOSITION_NOT_RETAIN", "finding"
     elif item.get("retention_disposition") == "retain" and not item.get("retention_evidence_at"):
@@ -989,6 +999,54 @@ def _capture_processing_fields(item: dict[str, Any]) -> dict[str, Any]:
             else:
                 out[f] = v
     return out
+
+
+async def _check_pending_classification_job(
+    cfg: AuditConfig, item_id: str
+) -> dict[str, Any] | None:
+    """Check whether a classification.refine job is still pending for an item.
+
+    Returns job status dict if a pending/running job exists, None otherwise.
+    Uses the owner DB URL for a read-only query against the jobs table.
+    """
+    if not cfg.owner_db_url:
+        return None
+    from sqlalchemy import text as sql_text
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    engine = create_async_engine(cfg.owner_db_url, pool_pre_ping=True)
+    try:
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with sessions() as session:
+            await session.execute(sql_text("SET TRANSACTION READ ONLY"))
+            await session.execute(sql_text("SET LOCAL statement_timeout = '5s'"))
+            row = (
+                await session.execute(
+                    sql_text(
+                        "SELECT id::text, job_type, status, attempts, created_at::text "
+                        "FROM jobs "
+                        "WHERE job_type = 'classification.refine' "
+                        "AND payload->>'memory_item_id' = :item_id "
+                        "AND status IN ('pending', 'running') "
+                        "ORDER BY created_at DESC LIMIT 1"
+                    ),
+                    {"item_id": item_id},
+                )
+            ).mappings().first()
+            await session.rollback()
+            if row is None:
+                return None
+            return {
+                "job_id": row["id"],
+                "job_type": row["job_type"],
+                "status": row["status"],
+                "attempts": row["attempts"],
+                "created_at": row["created_at"],
+            }
+    except Exception:
+        return None
+    finally:
+        await engine.dispose()
 
 
 async def _owner_promotion_diagnostic(owner_url: str, item_id: str) -> dict[str, Any]:

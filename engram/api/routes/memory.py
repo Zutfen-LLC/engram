@@ -1171,6 +1171,23 @@ async def _remember_impl(
         from engram.promotion import schedule_evidence_promotion_if_qualified
 
         await schedule_evidence_promotion_if_qualified(session, item, receipt)
+    elif classification_result is not None and settings.classification_provider != "none":
+        # Rule-only path: the synchronous classify_rules_only set the kind,
+        # but LLM refinement (retention evidence, taxonomy confidence, kind
+        # improvement) was deferred to an async classification.refine job.
+        # Enqueue that job so retention evidence is eventually produced and
+        # the item can qualify for evidence-lane promotion (ENG-AUD-002A).
+        await enqueue_job(
+            session,
+            tenant_id=tenant_id,
+            job_type="classification.refine",
+            payload={
+                "memory_item_id": str(item.id),
+                "correlation_id": str(correlation_id),
+                "ingest_id": str(ingest.id),
+            },
+            dedupe_key=f"classification.refine:{item.id}",
+        )
 
     # 9. Embeddings are generated OFF the request path (ENG-AUD-008 / F20).
     # Create the pending placeholder synchronously so the row exists, then
