@@ -577,25 +577,112 @@ Before running the audit, verify the denied key is correctly restrictive:
 export ENGRAM_AUDIT_DENIED_KEY='<denied-key>'
 
 # 1. /whoami shows the bound profile
-curl -fsS -H "Authorization: Bearer $ENGRAM_AUDIT_DENIED_KEY" \
+curl -fsS -H "Authorization: Bearer $ENGRA..._KEY" \
   https://api.engram.zutfen.com/whoami | jq '.memory_profile_id'
 # Must match the restrictive profile ID, not null.
 
 # 2. GET tenant Fixture R returns 404
 curl -sS -o /dev/null -w '%{http_code}\n' \
-  -H "Authorization: Bearer $ENGRAM_AUDIT_DENIED_KEY" \
+  -H "Authorization: Bearer $ENGRA..._KEY" \
   https://api.engram.zutfen.com/v1/items/<fixture-r-item-id>
 # Must be 404.
 
 # 3. Semantic recall returns 200 but omits Fixture R
 curl -fsS -X POST \
-  -H "Authorization: Bearer $ENGRAM_AUDIT_DENIED_KEY" \
+  -H "Authorization: Bearer $ENGRA..._KEY" \
   -H 'Content-Type: application/json' \
   https://api.engram.zutfen.com/v1/recall \
   -d '{"mode":"semantic","query":"controlled Engram recall marker"}' \
   | jq '[.items[].id] | index("<fixture-r-item-id>")'
 # Must be null (not found in results).
 ```
+
+## ENG-AUDIT-003A — Epistemic injection-window preflight
+
+### Why this matters
+
+The audit API preflight uses `item_budget=20` but the stock-Hermes child
+process defaults to `ENGRAM_HOOKS_RECALL_ITEM_BUDGET=5`. Fixture E can rank
+below position 5, causing the child to retrieve only 5 items and exclude
+Fixture E. The preflight would pass while the child never sees the fixture.
+
+### What changed
+
+Stage 6 now requires **both**:
+
+1. A pre-model **injection-window gate** that proves `rank < budget` before
+   the model test may run.
+2. A post-model **trace gate** that proves Fixture E survived final rendering
+   into the actual model context.
+
+### Budget contract
+
+| Setting | Value | Scope |
+|---------|-------|-------|
+| API audit preflight budget | 20 | Audit harness only |
+| Hermes ordinary default | 5 | Production (unchanged) |
+| Stage 6 child override | 20 | Audit child `.env` only |
+
+The override is audit-only. Do NOT modify the permanent Hermes profile's
+ordinary budget.
+
+### Required child environment
+
+The Stage 6 epistemic child must explicitly set these non-secret variables:
+
+```
+ENGRAM_HOOKS_RECALL_ITEM_BUDGET=20
+ENGRAM_HOOKS_AUDIT_RUN_ID=<current audit run UUID>
+ENGRAM_HOOKS_AUDIT_FIXTURE=epistemic
+ENGRAM_HOOKS_AUDIT_EXPECTED_PROMPT_SHA256=<canonical epistemic prompt hash>
+ENGRAM_HOOKS_AUDIT_TRACE_FILE=<unique trace path for this run>
+```
+
+The `prepare-epistemic-test` command emits these values and writes a
+mode-0600 `epistemic-child-config.json` manifest after the gate passes.
+
+### Zero-based rank boundary rule
+
+Rank is zero-based. The required pre-model condition is:
+
+```
+exact_rank_zero_based < effective_hermes_item_budget
+```
+
+Examples:
+- rank 10, budget 20 → inside (pass)
+- rank 19, budget 20 → inside (pass)
+- rank 20, budget 20 → outside (blocked)
+- rank 10, budget 5 → budget mismatch (blocked)
+
+### Trace schema 2.1
+
+Schema version 2.1 adds `configured_item_budget` — the actual integer the
+child used, clamped to [1, 20]. Stage 6 requires this to equal 20. Stage 5
+remains compatible with schema 2.0 traces (backward compatibility).
+
+### Truthful post-render provenance
+
+`injected_item_ids` in the audit trace now means only items that **survived
+final rendering** into the model context — not the pre-render admitted list.
+An item admitted by item count but dropped during context-byte fitting is
+NOT reported as injected.
+
+If Fixture E was admitted by item count but removed by context-byte rendering,
+the final evaluation returns `HERMES_EXPECTED_ITEM_NOT_INJECTED`. This is an
+audit configuration/context-capacity problem, not a model epistemic failure.
+
+### Immutable failed runs
+
+A failed or blocked run must remain immutable. Do not edit, regenerate, or
+reclassify a failed run's report. The next certification attempt uses a new
+run ID.
+
+### `marker_returned=false` is not a model failure
+
+When injection was unproven (budget gate, window gate, or render gate failed),
+`marker_returned=false` is not a model epistemic failure — it means the model
+never saw the evidence in the first place.
 
 ### What NOT to do
 

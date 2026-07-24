@@ -318,11 +318,14 @@ def test_bridge_integration_emits_fully_bound_trace(
 
     # Trace schema.
     assert rec["schema"] == "engram.hermes-hook-audit-trace"
-    assert rec["schema_version"] == "2.0"
+    assert rec["schema_version"] == "2.1"
 
     # Retrieved/injected item IDs reflect the rendered evidence path.
     assert item_id in rec["retrieved_item_ids"]
     assert item_id in rec["injected_item_ids"]
+
+    # Schema 2.1: configured_item_budget is attested.
+    assert rec["configured_item_budget"] == 5  # _Config default
 
     # Prompt hash matches the actual prompt.
     assert rec["prompt_sha256"] == RECALL_PROMPT_SHA256

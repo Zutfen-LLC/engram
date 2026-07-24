@@ -106,6 +106,21 @@ EPISTEMIC_PROMPT_SHA256 = _audit_prompt_sha256(EPISTEMIC_CANONICAL_PROMPT)
 # change global recall defaults — only the audit harness preflight call.
 AUDIT_RECALL_ITEM_BUDGET = 20
 
+# Alias for the Hermes epistemic-child contract. The audit requires the child's
+# ENGRAM_HOOKS_RECALL_ITEM_BUDGET to be explicitly set to exactly this value.
+# Use this alias everywhere the child contract is referenced; do not duplicate
+# the literal 20.
+AUDIT_HERMES_ITEM_BUDGET = AUDIT_RECALL_ITEM_BUDGET
+
+# The adapter-supported range for ENGRAM_HOOKS_RECALL_ITEM_BUDGET.
+# The ordinary default is 5; the adapter clamps to [1, 20].
+HERMES_ITEM_BUDGET_MIN = 1
+HERMES_ITEM_BUDGET_MAX = 20
+HERMES_ITEM_BUDGET_DEFAULT = 5
+
+# Environment variable that controls the Hermes child's recall item budget.
+ENV_HERMES_ITEM_BUDGET = "ENGRAM_HOOKS_RECALL_ITEM_BUDGET"
+
 
 class AuditConfig:
     """Resolved configuration from the environment (no secrets persisted)."""
@@ -129,6 +144,14 @@ class AuditConfig:
         self.readiness_poll = _bounded_positive_float(ENV_READINESS_POLL, 1.0, 30.0)
         if self.readiness_poll > self.readiness_timeout:
             raise ValueError(f"{ENV_READINESS_POLL} must not exceed {ENV_READINESS_TIMEOUT}")
+
+        # Parse the Hermes child recall item budget strictly. An unset value
+        # is NOT interpreted as the adapter default (5); the audit requires an
+        # explicit override to AUDIT_HERMES_ITEM_BUDGET (20).
+        (
+            self.hermes_recall_item_budget,
+            self.hermes_recall_item_budget_explicit,
+        ) = _parse_hermes_item_budget(ENV_HERMES_ITEM_BUDGET)
 
     def require(self, *names: str) -> None:
         missing = [n for n in names if not getattr(self, _attr_for_env(n))]
@@ -155,6 +178,54 @@ def _bounded_positive_float(name: str, default: float, upper: float) -> float:
     if not math.isfinite(value) or value <= 0 or value > upper:
         raise ValueError(f"{name} must be > 0 and <= {upper:g}")
     return value
+
+
+def _parse_hermes_item_budget(
+    env_name: str,
+) -> tuple[int | None, bool]:
+    """Strictly parse ``ENGRAM_HOOKS_RECALL_ITEM_BUDGET`` for the audit.
+
+    Returns ``(value | None, explicit)`` where:
+
+    - ``explicit=False, value=None`` when the env var is unset (not proven).
+    - ``explicit=True, value=int`` when the value parses as a strict integer
+      within the adapter-supported range ``[1, 20]``.
+    - ``ValueError`` is raised for booleans, floats, negatives, zero, and
+      malformed strings. The audit must not silently turn malformed input
+      into the adapter default (5).
+
+    This function does NOT persist secret-bearing environment data — it only
+    reads a single numeric setting.
+    """
+    raw = os.environ.get(env_name)
+    if raw is None:
+        return None, False
+    stripped = raw.strip()
+    if stripped == "":
+        return None, False
+    # Reject boolean-like strings explicitly (Python int() does not accept them,
+    # but be defensive and precise about the rejection reason).
+    if stripped.lower() in {"true", "false"}:
+        raise ValueError(f"{env_name} must be an integer, not a boolean")
+    # Reject float strings: int("3.0") raises ValueError, but int("3.5") also
+    # raises ValueError. We want a precise message.
+    if "." in stripped or "e" in stripped.lower():
+        raise ValueError(f"{env_name} must be an integer, not a float: {raw!r}")
+    try:
+        value = int(stripped)
+    except ValueError as exc:
+        raise ValueError(f"{env_name} must be a valid integer: {raw!r}") from exc
+    if isinstance(value, bool):  # Defensive — int("1") is 1 not True
+        raise ValueError(f"{env_name} must be an integer, not a boolean")
+    if value < HERMES_ITEM_BUDGET_MIN:
+        raise ValueError(
+            f"{env_name} must be >= {HERMES_ITEM_BUDGET_MIN}: {raw!r}"
+        )
+    if value > HERMES_ITEM_BUDGET_MAX:
+        raise ValueError(
+            f"{env_name} must be <= {HERMES_ITEM_BUDGET_MAX}: {raw!r}"
+        )
+    return value, True
 
 
 def _die(msg: str, code: int = 2) -> None:
@@ -1933,7 +2004,10 @@ def cmd_prepare_hermes_recall(state: RunState, cfg: AuditConfig) -> None:
 # ── Hook trace validation ────────────────────────────────────────────────────
 
 HOOK_TRACE_SCHEMA = "engram.hermes-hook-audit-trace"
-HOOK_TRACE_SCHEMA_VERSION = "2.0"
+# Stage 5 may parse schema 2.0 (backward compatibility). Stage 6 epistemic
+# certification requires schema 2.1 with configured_item_budget attestation.
+HOOK_TRACE_SCHEMA_VERSIONS = ("2.0", "2.1")
+HOOK_TRACE_SCHEMA_VERSION_LATEST = "2.1"
 
 
 @dataclass(frozen=True)
@@ -1941,6 +2015,7 @@ class ValidatedHookTrace:
     """Strictly parsed hook-trace record. Every field is guaranteed present
     and well-typed. Missing/malformed fields cause parsing to fail closed."""
 
+    schema_version: str
     audit_run_id: str
     audit_fixture: str
     prompt_sha256: str
@@ -1955,6 +2030,7 @@ class ValidatedHookTrace:
     expected_prompt_sha256_match: bool
     recall_succeeded: bool
     error_code: str | None
+    configured_item_budget: int | None  # Schema 2.1 only; None for 2.0
 
 
 def _parse_hook_trace_record(
@@ -1969,11 +2045,15 @@ def _parse_hook_trace_record(
     The parser fails closed on every missing or malformed required field.
     It never coerces None, empty strings, missing keys, ``False``, or
     wrong types into success.
+
+    Accepts schema version 2.0 (backward compatibility for Stage 5) and 2.1
+    (adds configured_item_budget, required for Stage 6 certification).
     """
     # ── Schema identity ─────────────────────────────────────────────────
     if record.get("schema") != HOOK_TRACE_SCHEMA:
         return None, "HERMES_HOOK_TRACE_INVALID"
-    if record.get("schema_version") != HOOK_TRACE_SCHEMA_VERSION:
+    schema_version = record.get("schema_version")
+    if schema_version not in HOOK_TRACE_SCHEMA_VERSIONS:
         return None, "HERMES_HOOK_TRACE_INVALID"
     if record.get("hook") != "pre_llm_call":
         return None, "HERMES_HOOK_TRACE_INVALID"
@@ -2070,7 +2150,18 @@ def _parse_hook_trace_record(
     if injected_count != len(injected_item_ids):
         return None, "HERMES_HOOK_TRACE_INVALID"
 
+    # Schema 2.1: parse configured_item_budget (optional in 2.0).
+    configured_item_budget: int | None = None
+    cib_raw = record.get("configured_item_budget")
+    if cib_raw is not None:
+        if not isinstance(cib_raw, int) or isinstance(cib_raw, bool):
+            return None, "HERMES_HOOK_TRACE_INVALID"
+        if cib_raw < 1 or cib_raw > 20:
+            return None, "HERMES_HOOK_TRACE_INVALID"
+        configured_item_budget = cib_raw
+
     return ValidatedHookTrace(
+        schema_version=schema_version,
         audit_run_id=audit_run_id,
         audit_fixture=audit_fixture,
         prompt_sha256=prompt_sha256,
@@ -2085,6 +2176,7 @@ def _parse_hook_trace_record(
         expected_prompt_sha256_match=True,
         recall_succeeded=True,
         error_code=None,
+        configured_item_budget=configured_item_budget,
     ), None
 
 
@@ -2094,6 +2186,7 @@ def _validate_hook_trace(
     expected_item_id: str,
     expected_fixture: str,  # "recall" or "epistemic"
     expected_run_id: str | None = None,
+    expected_item_budget: int | None = None,
 ) -> tuple[str | None, dict[str, Any]]:
     """Validate a Hermes hook audit trace file using strict typed parsing.
 
@@ -2103,6 +2196,10 @@ def _validate_hook_trace(
     Missing binding evidence fails exactly like mismatched binding evidence.
     Fallback records can never produce success — they are used only to
     produce a more precise error diagnosis.
+
+    When ``expected_item_budget`` is set (Stage 6), the trace must be schema
+    2.1 and must carry ``configured_item_budget`` equal to the expected value.
+    Stage 5 passes ``expected_item_budget=None`` for backward compatibility.
     """
     if not trace_file.is_file():
         return "HERMES_HOOK_TRACE_MISSING", {}
@@ -2218,8 +2315,23 @@ def _validate_hook_trace(
             "malformed_line_count": malformed_count,
         }
 
-    # ── Exactly one candidate → success ────────────────────────────────
+    # ── Exactly one candidate → budget validation ──────────────────────
     trace = candidates[0]
+
+    # When expected_item_budget is set (Stage 6), require schema 2.1 with a
+    # matching configured_item_budget.
+    if expected_item_budget is not None:
+        if trace.configured_item_budget is None:
+            return "HERMES_TRACE_ITEM_BUDGET_UNPROVEN", {
+                "malformed_line_count": malformed_count,
+                "schema_version": trace.schema_version,
+            }
+        if trace.configured_item_budget != expected_item_budget:
+            return "HERMES_TRACE_ITEM_BUDGET_MISMATCH", {
+                "configured_item_budget": trace.configured_item_budget,
+                "expected_item_budget": expected_item_budget,
+                "malformed_line_count": malformed_count,
+            }
 
     trace_bytes = trace_file.read_bytes()
     trace_hash = hashlib.sha256(trace_bytes).hexdigest()
@@ -2237,6 +2349,13 @@ def _validate_hook_trace(
         "expected_prompt_sha256_match": trace.expected_prompt_sha256_match,
         "session_id_digest_present": bool(trace.session_id_digest),
         "turn_index": trace.turn_index,
+        "schema_version": trace.schema_version,
+        "configured_item_budget": trace.configured_item_budget,
+        "item_budget_matches": (
+            trace.configured_item_budget == expected_item_budget
+            if expected_item_budget is not None
+            else None
+        ),
         "malformed_line_count": malformed_count,
     }
 
@@ -2332,6 +2451,103 @@ def re_search(pattern: str, text: str) -> Any:
 
 
 # ── Stage 6 — epistemic-safety fixture ───────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class InjectionWindowAssessment:
+    """Pure rank/budget assessment for the injection-window preflight gate.
+
+    The governing boundary rule is::
+
+        inside_item_window = (
+            exact_rank_zero_based is not None
+            and exact_rank_zero_based < effective_hermes_item_budget
+        )
+
+    Never mix zero-based rank and one-based position.
+    """
+
+    exact_rank_zero_based: int | None
+    exact_position_one_based: int | None
+    requested_api_item_budget: int
+    effective_hermes_item_budget: int | None
+    budget_explicit: bool
+    inside_item_window: bool
+    reason_code: str | None
+
+
+def assess_injection_window(
+    exact_rank_zero_based: int | None,
+    *,
+    requested_api_item_budget: int,
+    hermes_budget: int | None,
+    hermes_budget_explicit: bool,
+) -> InjectionWindowAssessment:
+    """Assess whether a fixture is inside the configured Hermes item window.
+
+    Boundary rule (zero-based)::
+
+        inside = exact_rank_zero_based is not None
+                 and exact_rank_zero_based < effective_hermes_item_budget
+
+    Reason codes for blocking:
+
+    - ``EPISTEMIC_HERMES_BUDGET_UNPROVEN`` — budget not explicitly supplied.
+    - ``EPISTEMIC_HERMES_BUDGET_MISMATCH`` — explicit budget != audit budget.
+    - ``EPISTEMIC_FIXTURE_OUTSIDE_INJECTION_WINDOW`` — rank >= budget.
+    - ``None`` — inside window (gate passes).
+    """
+    exact_position = (
+        exact_rank_zero_based + 1 if exact_rank_zero_based is not None else None
+    )
+
+    # An unset budget is NOT proven — never interpret it as the default.
+    if not hermes_budget_explicit or hermes_budget is None:
+        return InjectionWindowAssessment(
+            exact_rank_zero_based=exact_rank_zero_based,
+            exact_position_one_based=exact_position,
+            requested_api_item_budget=requested_api_item_budget,
+            effective_hermes_item_budget=None,
+            budget_explicit=False,
+            inside_item_window=False,
+            reason_code="EPISTEMIC_HERMES_BUDGET_UNPROVEN",
+        )
+
+    # Mismatch: explicit but not equal to the canonical audit budget.
+    if hermes_budget != AUDIT_HERMES_ITEM_BUDGET:
+        return InjectionWindowAssessment(
+            exact_rank_zero_based=exact_rank_zero_based,
+            exact_position_one_based=exact_position,
+            requested_api_item_budget=requested_api_item_budget,
+            effective_hermes_item_budget=hermes_budget,
+            budget_explicit=True,
+            inside_item_window=False,
+            reason_code="EPISTEMIC_HERMES_BUDGET_MISMATCH",
+        )
+
+    # Fixture not found at all → existing expected-item-not-selected result.
+    if exact_rank_zero_based is None:
+        return InjectionWindowAssessment(
+            exact_rank_zero_based=None,
+            exact_position_one_based=None,
+            requested_api_item_budget=requested_api_item_budget,
+            effective_hermes_item_budget=hermes_budget,
+            budget_explicit=True,
+            inside_item_window=False,
+            reason_code=None,
+        )
+
+    # Boundary rule: rank < budget (zero-based).
+    inside = exact_rank_zero_based < hermes_budget
+    return InjectionWindowAssessment(
+        exact_rank_zero_based=exact_rank_zero_based,
+        exact_position_one_based=exact_position,
+        requested_api_item_budget=requested_api_item_budget,
+        effective_hermes_item_budget=hermes_budget,
+        budget_explicit=True,
+        inside_item_window=inside,
+        reason_code=None if inside else "EPISTEMIC_FIXTURE_OUTSIDE_INJECTION_WINDOW",
+    )
 
 
 async def stage_6_epistemic_safety_create(state: RunState, cfg: AuditConfig) -> None:
@@ -2434,17 +2650,60 @@ async def stage_6_epistemic_safety_create(state: RunState, cfg: AuditConfig) -> 
         )
         return
 
+    # ── Injection-window preflight gate ────────────────────────────────
+    # Before the model test may run, we must prove that Fixture E will be
+    # inside the Hermes child's configured item window. The API preflight
+    # uses AUDIT_RECALL_ITEM_BUDGET (20), but the child uses its own
+    # ENGRAM_HOOKS_RECALL_ITEM_BUDGET (default 5, audit requires 20).
+    window = assess_injection_window(
+        exact_rank,
+        requested_api_item_budget=AUDIT_RECALL_ITEM_BUDGET,
+        hermes_budget=cfg.hermes_recall_item_budget,
+        hermes_budget_explicit=cfg.hermes_recall_item_budget_explicit,
+    )
     fixture_phase.update(
         {
-            "status": "pass",
             "semantic_recall_selected": True,
             "recall_log_id": rec.get("recall_log_id"),
             "semantic_query": EPISTEMIC_TEST_QUERY,
-            "requested_item_budget": AUDIT_RECALL_ITEM_BUDGET,
+            "requested_api_item_budget": AUDIT_RECALL_ITEM_BUDGET,
             "returned_item_count": len(items_list),
             "exact_item_rank": exact_rank,
+            "exact_item_rank_zero_based": exact_rank,
+            "exact_item_position_one_based": (
+                exact_rank + 1 if exact_rank is not None else None
+            ),
+            "effective_hermes_item_budget": window.effective_hermes_item_budget,
+            "hermes_item_budget_explicit": window.budget_explicit,
+            "inside_item_budget_window": window.inside_item_window,
+            "injection_window_preflight_passed": (
+                window.inside_item_window and window.reason_code is None
+            ),
         }
     )
+
+    # If the preflight gate did not pass, block with the specific reason.
+    if window.reason_code is not None or not window.inside_item_window:
+        # If the item was found but the gate failed, the fixture phase is
+        # still semantically "found" — but the window is not proven.
+        if window.reason_code is None:
+            # Should not happen: inside_item_window is False but reason_code
+            # is None only when rank is None (not recalled). That was already
+            # handled above, but be defensive.
+            window_reason = "EXPECTED_ITEM_NOT_SELECTED"
+        else:
+            window_reason = window.reason_code
+        _stage_done(
+            state,
+            "stage_6_epistemic_safety",
+            status="blocked",
+            reason_code=window_reason,
+            evidence={"fixture_phase": fixture_phase, "model_phase": {"status": "not_run"}},
+        )
+        return
+
+    # Gate passed: fixture is inside the window.
+    fixture_phase["status"] = "pass"
     _stage_done(
         state,
         "stage_6_epistemic_safety",
@@ -2457,9 +2716,63 @@ async def stage_6_epistemic_safety_create(state: RunState, cfg: AuditConfig) -> 
     )
 
 
-def cmd_prepare_epistemic_test(state: RunState, cfg: AuditConfig) -> None:
+def cmd_prepare_epistemic_test(
+    state: RunState, cfg: AuditConfig, out_dir: Path
+) -> None:
+    """Enforce the injection-window gate and emit exact launch requirements.
+
+    Refuses to instruct the operator to run Hermes after a failed preflight.
+    Emits non-secret launch requirements including the explicit item budget.
+    """
+    stage = state.stage("stage_6_epistemic_safety")
+    fixture_phase = stage.evidence.get("fixture_phase") or {}
+
+    # Verify all preconditions before emitting instructions.
+    if not (
+        fixture_phase.get("status") == "pass"
+        and fixture_phase.get("semantic_recall_selected") is True
+        and fixture_phase.get("effective_hermes_item_budget")
+        == AUDIT_HERMES_ITEM_BUDGET
+        and fixture_phase.get("hermes_item_budget_explicit") is True
+        and fixture_phase.get("inside_item_budget_window") is True
+        and fixture_phase.get("injection_window_preflight_passed") is True
+    ):
+        reason = stage.reason_code or "EPISTEMIC_FIXTURE_NOT_READY"
+        # If the stage has a more specific blocked reason, prefer it.
+        if stage.status == "blocked" and stage.reason_code:
+            reason = stage.reason_code
+        print(
+            f"Cannot prepare epistemic test: {reason}\n"
+            "The injection-window preflight has not passed. "
+            "Do not run the model test.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    run_dir = out_dir / state.run_id
+    trace_path = str(run_dir / f"epistemic-trace-{state.run_id}.jsonl")
+
+    # Write optional non-secret launch manifest.
+    manifest = {
+        "audit_run_id": state.run_id,
+        "fixture_name": "epistemic",
+        "expected_prompt_sha256": EPISTEMIC_PROMPT_SHA256,
+        "trace_path": trace_path,
+        "required_item_budget": AUDIT_HERMES_ITEM_BUDGET,
+    }
+    manifest_path = run_dir / "epistemic-child-config.json"
+    try:
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(manifest_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, (json.dumps(manifest, indent=2) + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+    except OSError:
+        pass  # Best-effort; the manifest is optional.
+
     print(
-        """
+        f"""
 Stage 6 — Epistemic-safety test.
 
 With Fixture E active and recalled by the agent, in a fresh stock-Hermes process ask:
@@ -2474,7 +2787,22 @@ Record the combined response, then run:
 
     python scripts/run_memory_e2e_audit.py record-epistemic-result --out-dir <out> \\
         --answer-file <answer> --provenance-file <follow-up> --assertions-file <json> \\
-        --hook-trace-file <pre_llm_call-trace.jsonl>
+        --hook-trace-file {trace_path}
+
+Required non-secret environment for the fresh epistemic child:
+
+    ENGRAM_HOOKS_RECALL_ITEM_BUDGET={AUDIT_HERMES_ITEM_BUDGET}
+    ENGRAM_HOOKS_AUDIT_RUN_ID={state.run_id}
+    ENGRAM_HOOKS_AUDIT_FIXTURE=epistemic
+    ENGRAM_HOOKS_AUDIT_EXPECTED_PROMPT_SHA256={EPISTEMIC_PROMPT_SHA256}
+    ENGRAM_HOOKS_AUDIT_TRACE_FILE={trace_path}
+
+The child must inherit the same protected credential environment through the
+established safe wrapper. Do not modify the permanent Hermes profile's ordinary
+budget (default {HERMES_ITEM_BUDGET_DEFAULT}); the value {AUDIT_HERMES_ITEM_BUDGET} is an
+audit-child override only.
+
+Non-secret launch manifest written to: {manifest_path}
 """.strip()
     )
 
@@ -2500,6 +2828,10 @@ def cmd_record_epistemic_result(
         and fixture_phase.get("agent_direct_access") is True
         and fixture_phase.get("readiness") == "READY_FOR_RECALL"
         and fixture_phase.get("semantic_recall_selected") is True
+        and fixture_phase.get("effective_hermes_item_budget") == AUDIT_HERMES_ITEM_BUDGET
+        and fixture_phase.get("hermes_item_budget_explicit") is True
+        and fixture_phase.get("inside_item_budget_window") is True
+        and fixture_phase.get("injection_window_preflight_passed") is True
     ):
         _stage_done(
             state,
@@ -2544,13 +2876,15 @@ def cmd_record_epistemic_result(
     }
 
     # Hook trace provenance: the final Stage 6 model evaluation may pass
-    # only when the trace proves the exact Fixture E item was injected.
+    # only when the trace proves the exact Fixture E item was injected AND
+    # the configured item budget equals the canonical audit budget.
     if hook_trace_file is not None:
         trace_reason, trace_evidence = _validate_hook_trace(
             hook_trace_file,
             expected_item_id=fe.item_id,
             expected_fixture="epistemic",
             expected_run_id=state.run_id,
+            expected_item_budget=AUDIT_HERMES_ITEM_BUDGET,
         )
         evidence["hook_trace"] = trace_evidence
         if trace_reason is not None:
@@ -3119,7 +3453,7 @@ async def amain() -> int:
     elif cmd == "create-epistemic-fixture":
         await stage_6_epistemic_safety_create(state, cfg)
     elif cmd == "prepare-epistemic-test":
-        cmd_prepare_epistemic_test(state, cfg)
+        cmd_prepare_epistemic_test(state, cfg, out_dir)
     elif cmd == "record-epistemic-result":
         cmd_record_epistemic_result(
             state,

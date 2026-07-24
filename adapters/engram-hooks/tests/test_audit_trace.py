@@ -49,6 +49,7 @@ def _basic_outcome(
     injected: list[str] | None = None,
     recall_succeeded: bool = True,
     error_code: str | None = None,
+    configured_item_budget: int = 20,
 ) -> dict[str, object]:
     if retrieved is None:
         retrieved = ["item-semantic-1"]
@@ -60,6 +61,7 @@ def _basic_outcome(
         "retrieved_item_ids": retrieved,
         "injected_item_ids": injected,
         "error_code": error_code,
+        "configured_item_budget": configured_item_budget,
     }
 
 
@@ -89,7 +91,7 @@ def test_trace_writes_valid_jsonl(
     assert len(records) == 1
     rec = records[0]
     assert rec["schema"] == "engram.hermes-hook-audit-trace"
-    assert rec["schema_version"] == "2.0"
+    assert rec["schema_version"] == "2.1"
     assert rec["hook"] == "pre_llm_call"
     assert rec["provider"] == "engram"
     assert rec["recall_enabled"] is True
@@ -101,6 +103,7 @@ def test_trace_writes_valid_jsonl(
     assert rec["injected_item_count"] == 1
     assert rec["native_memory_used"] is False
     assert rec["error_code"] is None
+    assert rec["configured_item_budget"] == 20
     assert isinstance(rec["timestamp"], str)
     assert rec["timestamp"].endswith("+00:00")
 
