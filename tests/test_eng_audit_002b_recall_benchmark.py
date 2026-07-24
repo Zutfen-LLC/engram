@@ -673,9 +673,13 @@ async def test_item_budget_exclusion_unconditional(audit_tenant: Any) -> None:
     packing and exactly item_budget_excluded afterward.
 
     F12 fix: uses a deterministic corpus where the target is GUARANTEED to be
-    excluded by item budget. The target has LOW trust (score ~0.475) while
-    2 high-trust near-target items (score ~0.83) outrank it. With item_budget=2,
-    the two high-trust items fill the budget and the target is excluded.
+    excluded by item budget with disposition exactly ITEM_BUDGET_EXCLUDED
+    (not trust_demoted). To avoid the trust_demoted classification
+    (which fires when raw_rank < item_budget && trust_rank >= item_budget),
+    the target is placed at raw_rank >= item_budget by putting 2 nearer items
+    between the query and the target. With item_budget=2, the target has
+    raw_rank=2 which is >= item_budget, so the disposition is exactly
+    item_budget_excluded.
 
     Asserts UNCONDITIONALLY:
     - final_served_rank is None (target not in final set)
@@ -690,17 +694,28 @@ async def test_item_budget_exclusion_unconditional(audit_tenant: Any) -> None:
 
     dims = await _get_dimensions()
 
-    # Build a corpus where target is GUARANTEED excluded by budget.
+    # Build a corpus where target has raw_rank >= item_budget.
     query_vec = [0.0] * dims
     query_vec[0] = 1.0
 
-    # Target: shares query vector (distance=0, similarity=1.0) but LOW trust.
-    # trust_score = compute_semantic_trust_score(0.50, 0.50, 0.50, False, "active")
-    #              ≈ 0.475
-    # score = 1.0 * 0.475 = 0.475
-    target_vec = list(query_vec)
+    # Two NEAR items that are closer to the query than the target.
+    # They share the query axis but with slightly off-axis components.
+    # Item 1: mostly position 0 with small position 1 → distance ~0.05
+    near1_vec = [0.0] * dims
+    near1_vec[0] = 0.99
+    near1_vec[1] = 0.14  # small off-axis → norm ≈ 1.0
+
+    # Item 2: mostly position 0 with small position 2 → distance ~0.05
+    near2_vec = [0.0] * dims
+    near2_vec[0] = 0.99
+    near2_vec[2] = 0.14
+
+    # Target: shares position 0 but with larger off-axis → distance ~0.29
+    # This places the target at raw_rank=2 (after the two nearer items).
+    target_vec = _near_unit_vec(dims, 0, 3)
+
     target_item = CorpusItem(
-        content="f12 target: low-truth exact match",
+        content="f12 target: present but beyond item budget",
         source_trust=0.50,
         memory_confidence=0.50,
         importance=0.50,
@@ -709,38 +724,30 @@ async def test_item_budget_exclusion_unconditional(audit_tenant: Any) -> None:
         embedding_vector=target_vec,
         label="target",
     )
-
-    # Two high-trust near-target items: slightly off-axis (similarity ~0.91)
-    # but HIGH trust → score ≈ 0.91 * 0.915 ≈ 0.833
-    # These will outrank the target by trust-weighted score.
-    high1_vec = _near_unit_vec(dims, 0, 1)
-    high2_vec = _near_unit_vec(dims, 0, 2)
-    high1 = CorpusItem(
-        content="f12 high-trust near target 1",
-        source_trust=0.90,
-        memory_confidence=0.90,
-        importance=0.90,
-        human_verified=True,
+    near1 = CorpusItem(
+        content="f12 near item 1",
+        source_trust=0.50,
+        memory_confidence=0.50,
+        importance=0.50,
         review_status="active",
-        embedding_vector=high1_vec,
-        label="high1",
+        embedding_vector=near1_vec,
+        label="near1",
     )
-    high2 = CorpusItem(
-        content="f12 high-trust near target 2",
-        source_trust=0.90,
-        memory_confidence=0.90,
-        importance=0.90,
-        human_verified=True,
+    near2 = CorpusItem(
+        content="f12 near item 2",
+        source_trust=0.50,
+        memory_confidence=0.50,
+        importance=0.50,
         review_status="active",
-        embedding_vector=high2_vec,
-        label="high2",
+        embedding_vector=near2_vec,
+        label="near2",
     )
 
     profile = CorpusProfile(
         name="f12_item_budget",
-        description="Target guaranteed excluded by item budget",
+        description="Target excluded by item budget (not trust demoted)",
         mode="controlled",
-        items=(target_item, high1, high2),
+        items=(target_item, near1, near2),
         query_vector=list(query_vec),
         query_text="f12 item budget query",
     )
@@ -758,20 +765,18 @@ async def test_item_budget_exclusion_unconditional(audit_tenant: Any) -> None:
             query=profile.query_text,
             query_vector=profile.query_vector,
             expected_item_id=target_id,
-            item_budget=2,  # Only 2 items served — the 2 high-trust items
+            item_budget=2,  # Only 2 items served
         )
 
         assert result.stages is not None
         stages = result.stages
 
-        # Target IS in the production candidate window (distance=0, raw_rank=0)
-        assert stages.raw_similarity_rank == 0, (
-            f"Expected raw_rank=0 (target shares query vec), got "
-            f"{stages.raw_similarity_rank}"
+        # Target IS in the production candidate window.
+        assert stages.raw_similarity_rank is not None, (
+            "Target should be in the production candidate window"
         )
 
         # UNCONDITIONAL: target survives through post-relationship stage.
-        # (No relationship edges in this corpus, so expansion keeps all items.)
         assert stages.post_relationship_rank is not None, (
             "Target should be present through post-relationship stage"
         )
@@ -2017,11 +2022,11 @@ async def test_embedding_dimension_mismatch_fails_closed(audit_tenant: Any) -> N
 
     # The mismatch should cause a PipelineError when semantic.search validates
     # the vector dimensions.
-    with pytest.raises((PipelineError, EmbeddingFailure, Exception)):  # noqa: B017, PT011
+    with pytest.raises(PipelineError):  # noqa: PT011
         await suite.run_single_query(
             tenant_id=tenant_id, principal_id=admin_id,
             query="mismatch test", query_vector=None,
-            expected_item_id="some-id", item_budget=10,
+            expected_item_id=str(uuid.uuid4()), item_budget=10,
             query_embedding_fn=wrong_dim_fn,
         )
 
