@@ -36,7 +36,7 @@ F11 fix: all behavioral assertions are UNCONDITIONAL — they do not use
 from __future__ import annotations
 
 import uuid
-from datetime import UTC
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -1201,6 +1201,9 @@ async def test_tie_break_distance_equal_created_at_differs(audit_tenant: Any) ->
     F10: when two items have the same cosine distance, the one with the
     newer created_at must rank first (matching production ORDER BY
     distance ASC, created_at DESC).
+
+    Uses direct SQL insertion with explicit timestamps so the tie-break
+    is deterministic (ControlledCorpus.setup uses datetime.now for all items).
     """
     if not await _db_ok():
         pytest.skip("requires PostgreSQL with pgvector")
@@ -1208,44 +1211,92 @@ async def test_tie_break_distance_equal_created_at_differs(audit_tenant: Any) ->
     assert tenant_id is not None
 
     dims = await _get_dimensions()
-    # Create a custom corpus with two items at the same distance but different
-    # created_at. Both share the same vector position (position 1) so they
-    # have the same distance from the query vector (position 0).
+    import uuid as uuid_mod
+    from datetime import timedelta
+
+    # Both items at position 1 → same distance from query at position 0.
     query_vec = [0.0] * dims
     query_vec[0] = 1.0
 
-    # Both items at position 1 → same distance from query.
     both_vec = [0.0] * dims
     both_vec[1] = 1.0
+    rendered_both = "[" + ",".join(str(v) for v in both_vec) + "]"
 
-    item_newer = CorpusItem(
-        content="tie-break newer item",
-        embedding_vector=list(both_vec),
-        label="newer",
-    )
-    item_older = CorpusItem(
-        content="tie-break older item",
-        embedding_vector=list(both_vec),
-        label="older",
-    )
-    # Add a distractor to ensure both items are in the candidate window.
-    distractor = CorpusItem(
-        content="tie-break distractor",
-        embedding_vector=_unit_vec_at(dims, 2),
-        label="distractor",
-    )
+    distractor_vec = _unit_vec_at(dims, 2)
+    rendered_distractor = "[" + ",".join(str(v) for v in distractor_vec) + "]"
 
-    profile = CorpusProfile(
-        name="tie_break_test",
-        description="Two items at equal distance, different created_at",
-        mode="controlled",
-        items=(item_newer, item_older, distractor),
-        query_vector=list(query_vec),
-        query_text="tie-break query",
-    )
+    # Resolve embedding profile for the embeddings.
+    async with _test_session_factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT id::text, model, dimensions FROM embedding_profiles "
+                    "WHERE state='active' LIMIT 1"
+                )
+            )
+        ).one()
+        profile_id = str(row[0])
+        model = str(row[1])
+        dimensions = int(row[2])
 
-    corpus = ControlledCorpus(tenant_id, admin_id, profile)
-    label_map = await corpus.setup(_test_session_factory)
+    # Insert items with explicitly different created_at timestamps.
+    newer_id = str(uuid_mod.uuid4())
+    older_id = str(uuid_mod.uuid4())
+    distractor_id = str(uuid_mod.uuid4())
+
+    base_time = datetime.now(UTC) - timedelta(hours=2)
+    newer_time = base_time + timedelta(hours=1, minutes=5)
+    older_time = base_time + timedelta(minutes=5)
+
+    item_ids = [newer_id, older_id, distractor_id]
+
+    for item_id, content, created, emb_vec in [
+        (newer_id, "tie-break newer item", newer_time, rendered_both),
+        (older_id, "tie-break older item", older_time, rendered_both),
+        (distractor_id, "tie-break distractor", base_time, rendered_distractor),
+    ]:
+        async with _test_session_factory() as session:
+            await session.execute(
+                text(
+                    "INSERT INTO memory_items ("
+                    "id, tenant_id, principal_id, content, content_hash, kind, "
+                    "visibility, review_status, memory_confidence, source_trust, "
+                    "importance, human_verified, source_type, authority, "
+                    "created_at, valid_from"
+                    ") VALUES ("
+                    ":id, :tenant_id, :principal_id, :content, :content_hash, 'fact', "
+                    "'tenant', 'active', 0.50, 0.50, 0.50, false, 'manual', 10, "
+                    ":created, :created"
+                    ")"
+                ),
+                {
+                    "id": item_id,
+                    "tenant_id": tenant_id,
+                    "principal_id": admin_id,
+                    "content": content,
+                    "content_hash": f"sha256:{uuid_mod.uuid4().hex}",
+                    "created": created,
+                },
+            )
+            await session.execute(
+                text(
+                    "INSERT INTO memory_embeddings "
+                    "(id, memory_item_id, tenant_id, profile_id, embedding_model, "
+                    "embedding_dim, embedding, embedding_status) "
+                    "VALUES (:eid, :item_id, :tenant_id, :profile_id, :model, "
+                    ":dimensions, CAST(:embedding AS vector), 'ready')"
+                ),
+                {
+                    "eid": str(uuid_mod.uuid4()),
+                    "item_id": item_id,
+                    "tenant_id": tenant_id,
+                    "profile_id": profile_id,
+                    "model": model,
+                    "dimensions": dimensions,
+                    "embedding": emb_vec,
+                },
+            )
+            await session.commit()
 
     try:
         suite = ServiceBenchmarkSuite(_test_session_factory)
@@ -1253,15 +1304,15 @@ async def test_tie_break_distance_equal_created_at_differs(audit_tenant: Any) ->
         # Query for the newer item
         result_newer = await suite.run_single_query(
             tenant_id=tenant_id, principal_id=admin_id,
-            query=profile.query_text, query_vector=profile.query_vector,
-            expected_item_id=label_map["newer"], item_budget=10,
+            query="tie-break query", query_vector=query_vec,
+            expected_item_id=newer_id, item_budget=10,
         )
 
         # Query for the older item
         result_older = await suite.run_single_query(
             tenant_id=tenant_id, principal_id=admin_id,
-            query=profile.query_text, query_vector=profile.query_vector,
-            expected_item_id=label_map["older"], item_budget=10,
+            query="tie-break query", query_vector=query_vec,
+            expected_item_id=older_id, item_budget=10,
         )
 
         assert result_newer.stages is not None
@@ -1279,7 +1330,16 @@ async def test_tie_break_distance_equal_created_at_differs(audit_tenant: Any) ->
             f"older item raw_rank ({result_older.stages.raw_similarity_rank})"
         )
     finally:
-        await corpus.teardown(_test_session_factory)
+        async with _test_session_factory() as session:
+            await session.execute(
+                text("DELETE FROM memory_embeddings WHERE memory_item_id = ANY(:ids)"),
+                {"ids": item_ids},
+            )
+            await session.execute(
+                text("DELETE FROM memory_items WHERE id = ANY(:ids)"),
+                {"ids": item_ids},
+            )
+            await session.commit()
 
 
 async def test_existing_corpus_with_explicit_query_vector(audit_tenant: Any) -> None:
