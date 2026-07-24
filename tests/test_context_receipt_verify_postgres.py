@@ -1567,26 +1567,51 @@ async def test_manifest_parse_failure_truthful_recall_log_exists() -> None:
 
 
 async def test_manifest_parse_failure_no_parent_recall_log_not_found() -> None:
-    """Parse failure without a parent recall log: recall_log_exists=False and
-    recall_log_binding=False. All 12 checks present (F7)."""
+    """Parse failure where the recall log is not visible to the caller:
+    recall_log_exists=False and recall_log_binding=False.
+
+    The context_receipts FK prevents a genuinely-missing recall log from
+    being stored. Instead we simulate the RLS-invisible case: the receipt
+    is seeded under tenant A / principal A, but the verify call uses a
+    different (correctly-seeded) tenant B / principal B. The recall log
+    exists in the database but is invisible under the caller's ownership
+    predicates, so ``recall_log_exists`` is truthfully false.
+    """
     owner = await _owner_connect()
     engine = _app_engine()
     factory = _app_factory(engine)
-    tenant_id = uuid.uuid4()
-    principal_id = uuid.uuid4()
-    # Deliberately do NOT seed a recall log — the receipt references a
-    # nonexistent parent.
+    tenant_id_a = uuid.uuid4()
+    principal_id_a = uuid.uuid4()
+    tenant_id_b = uuid.uuid4()
+    principal_id_b = uuid.uuid4()
     rl = uuid.uuid4()
     rid = uuid.uuid4()
     item_ids = [uuid.uuid4()]
     try:
         await _seed_tenant_principal(
-            owner, tenant_id=tenant_id, principal_id=principal_id, label="mpnp"
+            owner,
+            tenant_id=tenant_id_a,
+            principal_id=principal_id_a,
+            label="mpnp_a",
+        )
+        await _seed_tenant_principal(
+            owner,
+            tenant_id=tenant_id_b,
+            principal_id=principal_id_b,
+            label="mpnp_b",
+        )
+        await _insert_recall_log(
+            owner,
+            tenant_id=tenant_id_a,
+            principal_id=principal_id_a,
+            recall_log_id=rl,
+            item_ids=item_ids,
+            byte_budget=8192,
         )
         await _owner_insert_receipt(
             owner,
-            tenant_id=tenant_id,
-            principal_id=principal_id,
+            tenant_id=tenant_id_a,
+            principal_id=principal_id_a,
             recall_log_id=rl,
             receipt_id=rid,
             item_ids=item_ids,
@@ -1600,8 +1625,8 @@ async def test_manifest_parse_failure_no_parent_recall_log_not_found() -> None:
             "canonicalization": "rfc8785",
             "mode": "startup",
             "subject": {
-                "tenant_id": str(tenant_id),
-                "principal_id": str(principal_id),
+                "tenant_id": str(tenant_id_a),
+                "principal_id": str(principal_id_a),
             },
             "request": {"invalid": True},
             "versions": {"invalid": True},
@@ -1617,24 +1642,33 @@ async def test_manifest_parse_failure_no_parent_recall_log_not_found() -> None:
             rid,
         )
 
+        # The verify function receives the receipt object directly and
+        # queries the recall log under explicit tenant/principal predicates.
+        # We load the receipt under A's RLS, then verify under B's ownership
+        # — the recall log belongs to A, so it's invisible under B's
+        # predicates, making recall_log_exists truthfully false.
         async with factory() as session:
             await _apply_rls(
-                session, tenant_id=tenant_id, principal_id=principal_id
+                session,
+                tenant_id=tenant_id_a,
+                principal_id=principal_id_a,
             )
             from engram.context_receipts import get_context_receipt
 
             receipt = await get_context_receipt(
                 session,
-                tenant_id=tenant_id,
-                principal_id=principal_id,
+                tenant_id=tenant_id_a,
+                principal_id=principal_id_a,
                 receipt_id=rid,
             )
             assert receipt is not None
+            # Verify under B's ownership — recall log belongs to A,
+            # so recall_log_exists will be false.
             result = await verify_context_receipt_with_recall_log(
                 session,
                 receipt,
-                tenant_id=tenant_id,
-                principal_id=principal_id,
+                tenant_id=tenant_id_b,
+                principal_id=principal_id_b,
             )
         assert result.status == "invalid"
 
@@ -1649,7 +1683,8 @@ async def test_manifest_parse_failure_no_parent_recall_log_not_found() -> None:
         assert check_map["recall_log_exists"] is False
         assert check_map["recall_log_binding"] is False
     finally:
-        await _cleanup(owner, tenant_id)
+        await _cleanup(owner, tenant_id_a)
+        await _cleanup(owner, tenant_id_b)
         await engine.dispose()
         await owner.close()
 
@@ -1768,7 +1803,7 @@ async def test_embedded_manifest_hash_forbidden_returns_all_12_checks() -> None:
         row = await owner.fetchrow(
             "SELECT manifest FROM context_receipts WHERE id = $1", rid
         )
-        tampered = dict(row["manifest"])
+        tampered = json.loads(row["manifest"])
         tampered["manifest_hash"] = "sha256:" + "a" * 64
         await owner.execute(
             "UPDATE context_receipts SET manifest = $1::jsonb WHERE id = $2",
