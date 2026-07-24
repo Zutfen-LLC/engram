@@ -1841,46 +1841,56 @@ class ServiceBenchmarkSuite:
         The fingerprint and eligible count MUST equal semantic.candidate_count
         under the same resolved context and workspace.
         """
-        from sqlalchemy import text
+        from sqlalchemy import cast, func, select
+        from sqlalchemy.types import Text
 
         from engram.db import apply_rls_context
-
-        # Build the SQL with read_eligibility_expression injected as raw SQL
-        # (matching semantic.candidate_count exactly).
         from engram.memory_access import read_eligibility_expression
+        from engram.models import MemoryEmbedding, MemoryItem
 
-        eligibility_sql = str(
-            read_eligibility_expression(memory_context).compile(
-                compile_kwargs={"literal_binds": True}
+        # Build the query using the SAME ORM approach as candidate_count so
+        # that read_eligibility_expression(memory_context) column references
+        # resolve against the MemoryItem entity exactly as in production.
+        # Use pgcrypto's digest() for SHA-256 vector hashing (pgcrypto is
+        # installed via CREATE EXTENSION in migration 001_init.sql).
+        embedding_hash_expr = func.encode(
+            func.digest(cast(MemoryEmbedding.embedding, Text), "sha256"),
+            "hex",
+        ).label("embedding_hash")
+
+        stmt = (
+            select(
+                MemoryItem.id,
+                MemoryItem.review_status,
+                MemoryItem.source_trust,
+                MemoryItem.memory_confidence,
+                MemoryItem.importance,
+                MemoryItem.human_verified,
+                MemoryItem.conflict_type,
+                MemoryItem.conflict_resolution_status,
+                MemoryItem.created_at,
+                MemoryItem.content_hash,
+                embedding_hash_expr,
             )
+            .select_from(MemoryEmbedding)
+            .join(
+                MemoryItem,
+                (MemoryItem.id == MemoryEmbedding.memory_item_id)
+                & (MemoryItem.tenant_id == MemoryEmbedding.tenant_id),
+            )
+            .where(
+                MemoryEmbedding.profile_id == embedding_profile_id,
+                MemoryEmbedding.embedding_dim == embedding_dimensions,
+                MemoryEmbedding.embedding_status == "ready",
+                MemoryEmbedding.embedding.is_not(None),
+                MemoryItem.review_status.in_(("active", "proposed")),
+                MemoryItem.valid_to.is_(None),
+                read_eligibility_expression(memory_context),
+            )
+            .order_by(MemoryItem.id)
         )
-
-        query = (
-            "SELECT mi.id::text, mi.review_status, mi.source_trust, "
-            "mi.memory_confidence, mi.importance, mi.human_verified, "
-            "mi.conflict_type, mi.conflict_resolution_status, "
-            "mi.created_at, mi.content_hash, "
-            "encode(digest(CAST(me.embedding AS TEXT), 'sha256'), 'hex') AS embedding_hash "
-            "FROM memory_items mi "
-            "JOIN memory_embeddings me "
-            "ON me.memory_item_id = mi.id "
-            "AND me.tenant_id = mi.tenant_id "
-            "WHERE me.profile_id = :profile_id "
-            "AND me.embedding_dim = :dimensions "
-            "AND me.embedding_status = 'ready' "
-            "AND me.embedding IS NOT NULL "
-            "AND mi.review_status IN ('active', 'proposed') "
-            "AND mi.valid_to IS NULL "
-            f"AND {eligibility_sql}"
-        )
-        params: dict[str, Any] = {
-            "profile_id": embedding_profile_id,
-            "dimensions": embedding_dimensions,
-        }
         if workspace_id is not None:
-            query += " AND mi.workspace_id = :workspace_id"
-            params["workspace_id"] = workspace_id
-        query += " ORDER BY mi.id::text"
+            stmt = stmt.where(MemoryItem.workspace_id == workspace_id)
 
         h = hashlib.sha256()
         h.update(b"eligible-corpus-v2")
@@ -1894,22 +1904,20 @@ class ServiceBenchmarkSuite:
             await apply_rls_context(
                 session, tenant_id=tenant_id, principal_id=principal_id
             )
-            rows = (
-                await session.execute(text(query), params)
-            ).mappings().all()
+            rows = (await session.execute(stmt)).all()
 
         for row in rows:
-            h.update(str(row["id"]).encode())
-            h.update(str(row["review_status"]).encode())
-            h.update(str(round(float(row["source_trust"] or 0), 6)).encode())
-            h.update(str(round(float(row["memory_confidence"] or 0), 6)).encode())
-            h.update(str(round(float(row["importance"] or 0), 6)).encode())
-            h.update(str(bool(row["human_verified"])).encode())
-            h.update(str(row["conflict_type"]).encode())
-            h.update(str(row["conflict_resolution_status"]).encode())
-            h.update(str(row["created_at"]).encode())
-            h.update(str(row["content_hash"]).encode())
-            h.update(str(row["embedding_hash"]).encode())
+            h.update(str(row.id).encode())
+            h.update(str(row.review_status).encode())
+            h.update(str(round(float(row.source_trust or 0), 6)).encode())
+            h.update(str(round(float(row.memory_confidence or 0), 6)).encode())
+            h.update(str(round(float(row.importance or 0), 6)).encode())
+            h.update(str(bool(row.human_verified)).encode())
+            h.update(str(row.conflict_type).encode())
+            h.update(str(row.conflict_resolution_status).encode())
+            h.update(str(row.created_at).encode())
+            h.update(str(row.content_hash).encode())
+            h.update(str(row.embedding_hash).encode())
 
         return h.hexdigest()[:16], len(rows)
 
