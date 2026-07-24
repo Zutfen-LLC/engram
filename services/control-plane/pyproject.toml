@@ -1,0 +1,77 @@
+[project]
+name = "engram-control-plane"
+version = "0.1.0"
+description = "Engram Control Plane — hosted SaaS identity, organization, business, entitlement, and orchestration boundary"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+keywords = ["ai", "agents", "memory", "engram", "control-plane", "saas"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+# The Control Plane is a hard service boundary (ENG-PORTAL-001A). It MUST NOT
+# import the `engram` Core package. There is no dependency on Core, and no
+# shared ORM/session code — any future Core interaction is HTTP-only.
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.29",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "httpx>=0.27",
+    # Alembic is a runtime dependency: the migrate/check-migrations commands run
+    # in the same image as the server (owner-only execution). Not dev-only.
+    "alembic>=1.13",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "aiosqlite>=0.20",
+]
+
+[project.scripts]
+engram-control-plane = "engram_control_plane.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Zutfen-LLC/engram"
+Repository = "https://github.com/Zutfen-LLC/engram"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["engram_control_plane*"]
+
+[tool.setuptools.package-data]
+engram_control_plane = ["py.typed"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+
+# asyncpg ships no type stubs / py.typed marker.
+[[tool.mypy.overrides]]
+module = "asyncpg"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

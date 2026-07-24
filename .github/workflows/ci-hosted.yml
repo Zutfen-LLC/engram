@@ -1,0 +1,225 @@
+name: CI (hosted)
+
+# Parallel hosted-platform jobs (ENG-PORTAL-001A). These are independent of the
+# Core ci.yml jobs and never enter the Core real-DB critical path.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # ---- Control Plane Python quality + OpenAPI contract ----
+  control-plane-quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.29"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Sync control-plane workspace member (dev extras)
+        run: uv sync --package engram-control-plane --extra dev --frozen
+
+      - name: Ruff
+        run: uv run --package engram-control-plane ruff check services/control-plane
+
+      - name: Strict mypy
+        run: uv run --package engram-control-plane mypy services/control-plane/engram_control_plane
+
+      - name: Unit tests
+        run: uv run --package engram-control-plane pytest services/control-plane/tests -q
+
+      - name: Regenerate OpenAPI (DB-free)
+        run: |
+          uv run --package engram-control-plane engram-control-plane export-openapi \
+            -o packages/portal-sdk/openapi.json
+
+      - name: OpenAPI drift check (repo must be clean)
+        run: |
+          if ! git diff --exit-code -- packages/portal-sdk/openapi.json; then
+            echo "::error::OpenAPI drift detected. Run 'engram-control-plane export-openapi -o packages/portal-sdk/openapi.json' and commit." >&2
+            exit 1
+          fi
+
+      - name: Lock consistency
+        run: uv lock --check
+
+  # ---- Portal + portal-sdk + ui TypeScript quality ----
+  portal-quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      - name: Provision pinned pnpm (do not assume corepack)
+        run: npm install -g pnpm@9.12.3
+
+      - name: Install workspace (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Strict TypeScript checking
+        run: pnpm typecheck
+
+      - name: Unit/component tests
+        run: pnpm test
+
+      - name: Build (portal-sdk, ui, Portal)
+        run: pnpm build
+
+      - name: Regenerate contracts and fail on drift
+        run: |
+          pnpm --filter engram-portal-sdk contracts:generate
+          if ! git diff --exit-code -- packages/portal-sdk/src/generated; then
+            echo "::error::Generated TS types drifted. Run 'pnpm --filter engram-portal-sdk contracts:generate' and commit." >&2
+            exit 1
+          fi
+
+  # ---- Hosted Compose static validation ----
+  hosted-compose-validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Validate base + overlay compose
+        run: |
+          docker compose -f docker-compose.yml config -q
+          docker compose -f docker-compose.yml -f docker-compose.hosted.yml config -q
+
+      - name: Assert hosted compose contract
+        run: python3 scripts/validate_hosted_compose.py
+
+  # ---- Hosted Compose smoke + database boundary proofs ----
+  hosted-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 22 (Playwright from runner, not prod image)
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      - name: Provision pinned pnpm
+        run: npm install -g pnpm@9.12.3
+
+      - name: Boot hosted overlay
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.hosted.yml up -d --build
+          # Wait for control-plane health.
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8100/health >/dev/null; then break; fi
+            sleep 2
+          done
+          curl -sf http://localhost:8100/health
+
+      - name: Verify Control Plane /ready at head
+        run: |
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /tmp/ready.json -w "%{http_code}" http://localhost:8100/ready || true)
+            if [ "$code" = "200" ]; then break; fi
+            sleep 2
+          done
+          test "$code" = "200"
+
+      - name: Verify Portal health + ready
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:3000/api/health >/dev/null; then break; fi
+            sleep 2
+          done
+          curl -sf http://localhost:3000/api/health
+
+      - name: Prove engram_control_app CANNOT connect to the Core database
+        run: |
+          set +e
+          docker compose -f docker-compose.yml -f docker-compose.hosted.yml exec -T \
+            control-plane python -c "
+          import asyncio, asyncpg
+          async def main():
+              try:
+                  conn = await asyncpg.connect('postgresql://engram_control_app:change-me-in-production@postgres:5432/engram')
+                  await conn.close()
+                  print('UNEXPECTED: connected to Core DB')
+                  return 1
+              except Exception:
+                  print('OK: control role cannot connect to Core DB')
+                  return 0
+          raise SystemExit(asyncio.run(main()))
+          "
+          rc=$?
+          if [ "$rc" != "0" ]; then echo "::error::Control Plane role could connect to the Core DB"; exit 1; fi
+
+      - name: Prove engram_app CANNOT connect to the Control Plane database
+        run: |
+          set +e
+          docker compose -f docker-compose.yml -f docker-compose.hosted.yml exec -T \
+            engram-service python -c "
+          import asyncio, asyncpg
+          async def main():
+              try:
+                  conn = await asyncpg.connect('postgresql://engram_app:engram_app@postgres:5432/engram_control')
+                  await conn.close()
+                  print('UNEXPECTED: connected to Control DB')
+                  return 1
+              except Exception:
+                  print('OK: core role cannot connect to Control DB')
+                  return 0
+          raise SystemExit(asyncio.run(main()))
+          "
+          rc=$?
+          if [ "$rc" != "0" ]; then echo "::error::Core role could connect to the Control Plane DB"; exit 1; fi
+
+      - name: Same-volume regression — Core API and worker still start after bootstrap
+        run: |
+          # The Core services are part of the same overlay; assert they are healthy.
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8000/health >/dev/null; then break; fi
+            sleep 2
+          done
+          curl -sf http://localhost:8000/health
+          docker compose -f docker-compose.yml -f docker-compose.hosted.yml ps engram-worker | grep -q "engram-worker"
+
+      - name: Browser smoke (Playwright from the runner)
+        run: |
+          pnpm --filter engram-portal install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium
+          pnpm --filter engram-portal exec playwright test
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.yml -f docker-compose.hosted.yml logs --no-color
+
+      - name: Shut down and remove volumes
+        if: always()
+        run: docker compose -f docker-compose.yml -f docker-compose.hosted.yml down -v --remove-orphans

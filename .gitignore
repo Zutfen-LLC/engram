@@ -55,3 +55,25 @@ htmlcov/
 # Databases (local dev)
 *.sqlite
 *.db
+
+# Node / pnpm / Next.js (ENG-PORTAL-001A)
+node_modules/
+.next/
+out/
+.vercel/
+*.tsbuildinfo
+.npm
+.pnpm-store/
+.pnpm-debug.log*
+
+# TS test / coverage
+coverage/
+.vitest-cache/
+
+# Playwright (ENG-PORTAL-001A) — run from CI runner, not committed artifacts
+test-results/
+playwright-report/
+playwright/.cache/
+
+# Alembic (Control Plane) — local binary blobs only; versions/*.py are committed
+services/control-plane/__pycache__/

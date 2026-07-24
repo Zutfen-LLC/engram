@@ -60,6 +60,15 @@ engram = "engram.cli:main"
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
+# Hosted Control Plane is a uv workspace member (ENG-PORTAL-001A). It is an
+# independent package with NO dependency on Core (it never imports `engram`),
+# so no [tool.uv.sources] mapping is declared. Core itself remains a plain
+# setuptools project; only the control-plane member is resolved through the
+# workspace. Use `uv sync --package engram-control-plane` /
+# `uv run --package engram-control-plane` for member-specific operations.
+[tool.uv.workspace]
+members = ["services/control-plane"]
+
 [tool.setuptools.packages.find]
 include = ["engram*"]
 

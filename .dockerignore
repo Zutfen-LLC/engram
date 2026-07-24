@@ -12,3 +12,13 @@ __pycache__
 # defaults) and MUST ship in the CI image so the ci-contract test that asserts
 # the dark-write settings are documented can read it.
 !.env.example
+
+# Hosted-platform Node build artifacts (not the manifests — those are needed by
+# the Portal/Control-Plane Dockerfiles which share this repo-root context).
+node_modules
+.next
+apps/portal/.next
+packages/*/dist
+test-results
+playwright-report
+.pnpm-store

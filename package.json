@@ -1,0 +1,17 @@
+{
+  "name": "engram-workspace",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Engram monorepo workspace root. Hosted-platform TypeScript packages live under apps/ and packages/; the Core memory service remains a Python project.",
+  "packageManager": "pnpm@9.12.3",
+  "engines": {
+    "node": ">=22.0.0 <23.0.0"
+  },
+  "scripts": {
+    "lint": "pnpm -r run lint",
+    "typecheck": "pnpm -r run typecheck",
+    "test": "pnpm -r run test",
+    "build": "pnpm -r run build",
+    "contracts:check": "pnpm -r run contracts:check"
+  }
+}

@@ -1,0 +1,5 @@
+packages:
+  # Hosted Portal application (ENG-PORTAL-001A).
+  - "apps/portal"
+  # Shared TypeScript packages consumed by the Portal.
+  - "packages/*"

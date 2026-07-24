@@ -1,0 +1,187 @@
+{
+  "components": {
+    "schemas": {
+      "HealthResponse": {
+        "description": "Database-free liveness response.",
+        "properties": {
+          "build_sha": {
+            "title": "Build Sha",
+            "type": "string"
+          },
+          "service": {
+            "title": "Service",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "service",
+          "version",
+          "build_sha"
+        ],
+        "title": "HealthResponse",
+        "type": "object"
+      },
+      "MetaResponse": {
+        "description": "Safe scaffold metadata + boundary contract.\n\nField values are fixed strings describing the CURRENT scaffold state, not\nfuture behavior. They are intentionally rigid so drift is visible.",
+        "properties": {
+          "api_version": {
+            "title": "Api Version",
+            "type": "string"
+          },
+          "billing_status": {
+            "title": "Billing Status",
+            "type": "string"
+          },
+          "build_sha": {
+            "title": "Build Sha",
+            "type": "string"
+          },
+          "core_access_mode": {
+            "title": "Core Access Mode",
+            "type": "string"
+          },
+          "database_boundary": {
+            "title": "Database Boundary",
+            "type": "string"
+          },
+          "delegation_status": {
+            "title": "Delegation Status",
+            "type": "string"
+          },
+          "environment": {
+            "title": "Environment",
+            "type": "string"
+          },
+          "identity_status": {
+            "title": "Identity Status",
+            "type": "string"
+          },
+          "service": {
+            "title": "Service",
+            "type": "string"
+          }
+        },
+        "required": [
+          "service",
+          "api_version",
+          "environment",
+          "build_sha",
+          "database_boundary",
+          "identity_status",
+          "delegation_status",
+          "billing_status",
+          "core_access_mode"
+        ],
+        "title": "MetaResponse",
+        "type": "object"
+      },
+      "ReadyResponse": {
+        "description": "Readiness response (200 path).",
+        "properties": {
+          "database": {
+            "title": "Database",
+            "type": "string"
+          },
+          "migration": {
+            "title": "Migration",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "database",
+          "migration"
+        ],
+        "title": "ReadyResponse",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Hosted SaaS control-plane boundary. This is scaffolding (ENG-PORTAL-001A): no production identity, billing, delegation, organization, or management behavior is implemented.",
+    "title": "Engram Control Plane",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/control/v1/meta": {
+      "get": {
+        "description": "Safe scaffold metadata only.",
+        "operationId": "meta_control_v1_meta_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MetaResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Meta",
+        "tags": [
+          "meta"
+        ]
+      }
+    },
+    "/health": {
+      "get": {
+        "description": "Liveness probe — database-free.",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health",
+        "tags": [
+          "health"
+        ]
+      }
+    },
+    "/ready": {
+      "get": {
+        "description": "Readiness probe — dedicated DB reachable + Alembic at head.\n\nReturns 200 only when the Control Plane database is reachable and its\nAlembic revision is at head; otherwise a sanitized 503.",
+        "operationId": "ready_ready_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadyResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Ready",
+        "tags": [
+          "health"
+        ]
+      }
+    }
+  }
+}

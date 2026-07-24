@@ -1,0 +1,120 @@
+# Hosted-platform overlay (ENG-PORTAL-001A).
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.hosted.yml up --build
+#
+# This file is ADDITIVE: it defines only the new hosted services. It does not
+# modify the existing postgres / engram-service / engram-worker services, so
+# the standard self-hosted stack (`docker compose up`) is unchanged.
+#
+# Service boundaries:
+#   - control-db-bootstrap : one-shot; creates the dedicated engram_control DB
+#     and the least-privilege engram_control_app role, and enforces per-database
+#     CONNECT isolation (REVOKE FROM PUBLIC; per-role grants).
+#   - control-plane-migrate: one-shot; owner-only Alembic upgrade to head.
+#   - control-plane        : the Control Plane API (runs as engram_control_app).
+#   - portal               : the Next.js BFF (server-side Control Plane access).
+#
+# Dependency order: postgres (healthy) -> control-db-bootstrap ->
+#   control-plane-migrate -> control-plane (healthy) -> portal (healthy).
+
+# Shared build context for the control-plane image: the repository root (the
+# directory containing this compose file), so the uv workspace + root uv.lock
+# resolve (the control plane is a workspace member). Compose resolves ``context``
+# relative to THIS compose file's directory.
+x-cp-build: &cp-build
+  context: .
+  dockerfile: services/control-plane/Dockerfile
+
+services:
+  # One-shot: create the dedicated Control Plane database + role + isolation.
+  control-db-bootstrap:
+    image: postgres:16
+    restart: "no"
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_OWNER_USER:-${POSTGRES_USER:-engram}}
+      PGPASSWORD: ${POSTGRES_OWNER_PASSWORD:-${POSTGRES_PASSWORD:-engram}}
+      PGDATABASE: ${POSTGRES_DB:-engram}
+      POSTGRES_DB: ${POSTGRES_DB:-engram}
+      ENGRAM_CONTROL_DB: ${ENGRAM_CONTROL_DB:-engram_control}
+      ENGRAM_CONTROL_APP_USER: ${ENGRAM_CONTROL_APP_USER:-engram_control_app}
+      ENGRAM_CONTROL_APP_PASSWORD: ${ENGRAM_CONTROL_APP_PASSWORD:-change-me-in-production}
+      ENGRAM_APP_USER: ${POSTGRES_APP_USER:-engram_app}
+    entrypoint: ["bash", "/bootstrap/bootstrap-control-db.sh"]
+    volumes:
+      - ./services/control-plane/scripts:/bootstrap:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # One-shot: owner-only Alembic migration to head.
+  control-plane-migrate:
+    build: *cp-build
+    restart: "no"
+    environment:
+      ENGRAM_CONTROL_DATABASE_URL: postgresql+asyncpg://${POSTGRES_OWNER_USER:-${POSTGRES_USER:-engram}}:${POSTGRES_OWNER_PASSWORD:-${POSTGRES_PASSWORD:-engram}}@postgres:5432/${ENGRAM_CONTROL_DB:-engram_control}
+      ENGRAM_CONTROL_OWNER_DATABASE_URL: postgresql+asyncpg://${POSTGRES_OWNER_USER:-${POSTGRES_USER:-engram}}:${POSTGRES_OWNER_PASSWORD:-${POSTGRES_PASSWORD:-engram}}@postgres:5432/${ENGRAM_CONTROL_DB:-engram_control}
+      ENGRAM_CONTROL_ENVIRONMENT: development
+      ENGRAM_CONTROL_BUILD_SHA: ${ENGRAM_CONTROL_BUILD_SHA:-unknown}
+    entrypoint: ["engram-control-plane", "migrate"]
+    depends_on:
+      control-db-bootstrap:
+        condition: service_completed_successfully
+
+  # The Control Plane API server (runs as the non-owner engram_control_app role).
+  control-plane:
+    build: *cp-build
+    container_name: engram-control-plane
+    environment:
+      ENGRAM_CONTROL_HOST: 0.0.0.0
+      ENGRAM_CONTROL_PORT: "8100"
+      ENGRAM_CONTROL_DATABASE_URL: postgresql+asyncpg://${ENGRAM_CONTROL_APP_USER:-engram_control_app}:${ENGRAM_CONTROL_APP_PASSWORD:-change-me-in-production}@postgres:5432/${ENGRAM_CONTROL_DB:-engram_control}
+      ENGRAM_CONTROL_OWNER_DATABASE_URL: postgresql+asyncpg://${POSTGRES_OWNER_USER:-${POSTGRES_USER:-engram}}:${POSTGRES_OWNER_PASSWORD:-${POSTGRES_PASSWORD:-engram}}@postgres:5432/${ENGRAM_CONTROL_DB:-engram_control}
+      ENGRAM_CONTROL_ENVIRONMENT: development
+      ENGRAM_CONTROL_LOG_LEVEL: ${ENGRAM_CONTROL_LOG_LEVEL:-info}
+      ENGRAM_CONTROL_BUILD_SHA: ${ENGRAM_CONTROL_BUILD_SHA:-unknown}
+    ports:
+      - "8100:8100"
+    depends_on:
+      control-plane-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - >-
+          python -c "import sys,urllib.request as u;
+          sys.exit(0 if u.urlopen('http://localhost:8100/health',timeout=5).status==200 else 1)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  # The Portal BFF. Server-side Control Plane access only; no Core key/DB URL.
+  portal:
+    build:
+      context: .
+      dockerfile: apps/portal/Dockerfile
+    container_name: engram-portal
+    environment:
+      # Server-only. NEVER exposed via NEXT_PUBLIC_*: the internal URL never
+      # reaches the browser.
+      CONTROL_PLANE_URL: http://control-plane:8100
+      NODE_ENV: production
+    ports:
+      - "3000:3000"
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - >-
+          node -e "const u=require('node:http');u.get('http://localhost:3000/api/health',(r)=>{process.exit(r.statusCode===200?0:1)}).on('error',()=>process.exit(1));"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
