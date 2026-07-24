@@ -473,6 +473,15 @@ class BenchmarkReport:
     results: list[BenchmarkResult]
     summary: dict[str, Any]
     generated_at: str
+    # F13: fingerprint of the actual eligible corpus population.
+    eligible_corpus_fingerprint: str | None = None
+    eligible_corpus_fingerprint_schema: str = "eligible-corpus-v1"
+    eligible_item_count: int | None = None
+    # F15: resolved memory context provenance.
+    memory_context_version: str | None = None
+    memory_profile_slug: str | None = None
+    memory_profile_version: int | None = None
+    workspace_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -688,6 +697,11 @@ class ServiceBenchmarkSuite:
         token_budget: int | None = None,
         memory_context: ResolvedMemoryContext | None = None,
         query_embedding_fn: QueryEmbeddingFn | None = None,
+        workspace_id: str | None = None,
+        memory_profile_id: str | None = None,
+        memory_profile_revision_id: str | None = None,
+        memory_profile_slug: str | None = None,
+        memory_profile_version: int | None = None,
     ) -> BenchmarkResult:
         """Run one query at one budget and capture full stage decomposition.
 
@@ -722,6 +736,11 @@ class ServiceBenchmarkSuite:
                 byte_budget=byte_budget,
                 token_budget=token_budget,
                 memory_context_input=memory_context,
+                workspace_id=workspace_id,
+                memory_profile_id=memory_profile_id,
+                memory_profile_revision_id=memory_profile_revision_id,
+                memory_profile_slug=memory_profile_slug,
+                memory_profile_version=memory_profile_version,
             )
         except BenchmarkError:
             raise
@@ -759,23 +778,127 @@ class ServiceBenchmarkSuite:
         )
 
     async def _build_memory_context(
-        self, tenant_id: str, principal_id: str
+        self,
+        tenant_id: str,
+        principal_id: str,
+        *,
+        workspace_id: str | None = None,
+        memory_profile_id: str | None = None,
+        memory_profile_revision_id: str | None = None,
+        memory_profile_slug: str | None = None,
+        memory_profile_version: int | None = None,
     ) -> Any:
-        """Build an unrestricted ResolvedMemoryContext for the audit tenant."""
+        """Build a ResolvedMemoryContext matching the audited recall context.
+
+        F15: when a memory profile is specified, resolves the profile revision
+        and workspace grants from the database to reproduce the exact same
+        eligibility context as the audited live recall. When no profile is
+        specified, falls back to unrestricted (compatibility) context.
+
+        Raises PipelineError when the requested context cannot be proven to
+        match the original audit context (e.g., profile not found, disabled,
+        or revision mismatch).
+        """
+        from sqlalchemy import text
+
         from engram.auth import Principal
-        from engram.memory_context import unrestricted_memory_context
+        from engram.memory_context import (
+            MEMORY_CONTEXT_VERSION,
+            ResolvedMemoryContext,
+            unrestricted_memory_context,
+        )
 
         principal = Principal(
             tenant_id=tenant_id,
             principal_id=principal_id,
             api_key_id="",
-            scopes=("read", "write", "admin"),
-            memory_profile_id=None,
-            memory_profile_revision_id=None,
-            memory_profile_slug=None,
-            memory_profile_version=None,
+            scopes=(("read", "write", "admin") if workspace_id is None else ("read",)),
+            memory_profile_id=memory_profile_id,
+            memory_profile_revision_id=memory_profile_revision_id,
+            memory_profile_slug=memory_profile_slug,
+            memory_profile_version=memory_profile_version,
         )
-        return unrestricted_memory_context(principal)
+
+        if memory_profile_id is None:
+            return unrestricted_memory_context(principal)
+
+        # F15: resolve the profiled context from the database.
+        async with self.session_factory() as session:
+            row = (
+                await session.execute(
+                    text(
+                        "SELECT p.id AS profile_id, p.slug, p.disabled_at, "
+                        "r.id AS revision_id, r.version, r.include_private, "
+                        "r.include_tenant, r.include_public, r.allow_tenant_write, "
+                        "r.allow_public_write, r.default_write_visibility, "
+                        "r.default_write_workspace_id, "
+                        "COALESCE(array_agg(g.workspace_id) FILTER (WHERE g.can_read), "
+                        "ARRAY[]::uuid[]) AS readable_workspace_ids, "
+                        "COALESCE(array_agg(g.workspace_id) FILTER (WHERE g.can_write), "
+                        "ARRAY[]::uuid[]) AS writable_workspace_ids "
+                        "FROM memory_profiles p "
+                        "JOIN memory_profile_revisions r "
+                        "ON r.tenant_id = p.tenant_id AND r.profile_id = p.id "
+                        "AND r.id = :revision_id "
+                        "LEFT JOIN memory_profile_workspace_grants g "
+                        "ON g.tenant_id = r.tenant_id AND g.revision_id = r.id "
+                        "WHERE p.tenant_id = :tenant_id AND p.id = :profile_id "
+                        "GROUP BY p.id, p.slug, p.disabled_at, r.id, r.version, "
+                        "r.include_private, r.include_tenant, r.include_public, "
+                        "r.allow_tenant_write, r.allow_public_write, "
+                        "r.default_write_visibility, r.default_write_workspace_id"
+                    ),
+                    {
+                        "tenant_id": tenant_id,
+                        "profile_id": memory_profile_id,
+                        "revision_id": memory_profile_revision_id or "",
+                    },
+                )
+            ).mappings().first()
+
+        if row is None or row["disabled_at"] is not None:
+            raise PipelineError(
+                f"memory profile {memory_profile_id} not found or disabled — "
+                f"cannot reproduce audit context"
+            )
+
+        from typing import cast as t_cast
+        from uuid import UUID
+
+        from engram.memory_context import WriteVisibility
+
+        readable_workspace_ids = frozenset(
+            UUID(str(value)) for value in row["readable_workspace_ids"]
+        )
+        writable_workspace_ids = frozenset(
+            UUID(str(value)) for value in row["writable_workspace_ids"]
+        )
+        default_workspace_id = (
+            UUID(str(row["default_write_workspace_id"]))
+            if row["default_write_workspace_id"] is not None
+            else None
+        )
+
+        return ResolvedMemoryContext(
+            version=MEMORY_CONTEXT_VERSION,
+            tenant_id=UUID(tenant_id),
+            principal_id=UUID(principal_id),
+            api_key_id=None,
+            memory_profile_id=UUID(str(row["profile_id"])),
+            memory_profile_revision_id=UUID(str(row["revision_id"])),
+            memory_profile_slug=str(row["slug"]),
+            memory_profile_version=int(row["version"]),
+            include_private=bool(row["include_private"]),
+            include_tenant=bool(row["include_tenant"]),
+            include_public=bool(row["include_public"]),
+            readable_workspace_ids=readable_workspace_ids,
+            allow_tenant_write=bool(row["allow_tenant_write"]),
+            allow_public_write=bool(row["allow_public_write"]),
+            default_write_visibility=t_cast(WriteVisibility, str(row["default_write_visibility"])),
+            default_write_workspace_id=default_workspace_id,
+            writable_workspace_ids=writable_workspace_ids,
+            admin_workspace_bypass=False,
+        )
 
     async def _run_pipeline_stages(
         self,
@@ -788,6 +911,11 @@ class ServiceBenchmarkSuite:
         byte_budget: int | None,
         token_budget: int | None,
         memory_context_input: ResolvedMemoryContext | None,
+        workspace_id: str | None = None,
+        memory_profile_id: str | None = None,
+        memory_profile_revision_id: str | None = None,
+        memory_profile_slug: str | None = None,
+        memory_profile_version: int | None = None,
     ) -> tuple[StageRanks, list[dict[str, Any]]]:
         """Execute the production pipeline stage-by-stage, capturing exact ranks.
 
@@ -811,7 +939,15 @@ class ServiceBenchmarkSuite:
         _SEMANTIC_REVIEW_STATUSES = ("active", "proposed")
 
         if memory_context_input is None:
-            memory_context = await self._build_memory_context(tenant_id, principal_id)
+            memory_context = await self._build_memory_context(
+                tenant_id,
+                principal_id,
+                workspace_id=workspace_id,
+                memory_profile_id=memory_profile_id,
+                memory_profile_revision_id=memory_profile_revision_id,
+                memory_profile_slug=memory_profile_slug,
+                memory_profile_version=memory_profile_version,
+            )
         else:
             memory_context = memory_context_input
 
@@ -1390,6 +1526,12 @@ class ServiceBenchmarkSuite:
         embedding_dimensions: int,
         scoring_version: str,
         config_version: str,
+        eligible_corpus_fingerprint: str | None = None,
+        eligible_item_count: int | None = None,
+        memory_context_version: str | None = None,
+        memory_profile_slug: str | None = None,
+        memory_profile_version: int | None = None,
+        workspace_id: str | None = None,
     ) -> BenchmarkReport:
         """Produce a machine-readable benchmark report with full provenance."""
         summary = ServiceBenchmarkSuite.summarize(results)
@@ -1405,7 +1547,165 @@ class ServiceBenchmarkSuite:
             results=results,
             summary=summary,
             generated_at=datetime.now(UTC).isoformat(),
+            eligible_corpus_fingerprint=eligible_corpus_fingerprint,
+            eligible_item_count=eligible_item_count,
+            memory_context_version=memory_context_version,
+            memory_profile_slug=memory_profile_slug,
+            memory_profile_version=memory_profile_version,
+            workspace_id=workspace_id,
         )
+
+    @staticmethod
+    def generate_redacted_report(report: BenchmarkReport) -> dict[str, Any]:
+        """F15: produce a redacted report suitable for public PR attachment.
+
+        Omits raw query text, full tenant/principal IDs, and raw item IDs.
+        Retains stable digests and all ranking/relevance metadata.
+        """
+        import dataclasses
+
+        base = dataclasses.asdict(report)
+        redacted: dict[str, Any] = {
+            "repository_sha": base["repository_sha"],
+            "scoring_version": base["scoring_version"],
+            "config_version": base["config_version"],
+            "embedding_profile": base["embedding_profile"],
+            "embedding_model": base["embedding_model"],
+            "embedding_dimensions": base["embedding_dimensions"],
+            "corpus_profile_name": base["corpus_profile_name"],
+            "corpus_fingerprint": base["corpus_fingerprint"],
+            "eligible_corpus_fingerprint": base.get("eligible_corpus_fingerprint"),
+            "eligible_corpus_fingerprint_schema": base.get(
+                "eligible_corpus_fingerprint_schema", "eligible-corpus-v1"
+            ),
+            "eligible_item_count": base.get("eligible_item_count"),
+            "memory_context_version": base.get("memory_context_version"),
+            "memory_profile_slug": base.get("memory_profile_slug"),
+            "memory_profile_version": base.get("memory_profile_version"),
+            "workspace_id": (
+                base["workspace_id"][:8] + "***"
+                if base.get("workspace_id")
+                else None
+            ),
+            "generated_at": base["generated_at"],
+            "summary": base["summary"],
+            "results": [],
+        }
+        for r in base["results"]:
+            redacted_result: dict[str, Any] = {
+                "query_digest": r["query_digest"],
+                "expected_item_id": r["expected_item_id"][:8] + "***",
+                "item_budget": r["item_budget"],
+                "byte_budget": r["byte_budget"],
+                "token_budget": r["token_budget"],
+                "top_k_hit": r["top_k_hit"],
+                "latency_ms": r["latency_ms"],
+                "latency_type": r["latency_type"],
+                "returned_bytes": r["returned_bytes"],
+                "returned_count": r["returned_count"],
+                "error": r["error"],
+            }
+            if r["stages"] is not None:
+                s = r["stages"]
+                redacted_result["stages"] = {
+                    "eligible_candidate_count": s["eligible_candidate_count"],
+                    "candidate_window_size": s["candidate_window_size"],
+                    "raw_similarity_rank": s["raw_similarity_rank"],
+                    "raw_similarity_rank_1based": s["raw_similarity_rank_1based"],
+                    "raw_similarity_score": s["raw_similarity_score"],
+                    "raw_rank_exact": s["raw_rank_exact"],
+                    "corpus_raw_rank": s["corpus_raw_rank"],
+                    "corpus_raw_rank_1based": s["corpus_raw_rank_1based"],
+                    "corpus_raw_rank_exact": s["corpus_raw_rank_exact"],
+                    "trust_rank": s["trust_rank"],
+                    "trust_rank_1based": s["trust_rank_1based"],
+                    "trust_score": s["trust_score"],
+                    "post_relationship_rank": s["post_relationship_rank"],
+                    "post_relationship_rank_1based": s["post_relationship_rank_1based"],
+                    "final_served_rank": s["final_served_rank"],
+                    "final_served_rank_1based": s["final_served_rank_1based"],
+                    "final_score": s["final_score"],
+                    "candidate_origin": s["candidate_origin"],
+                    "exclusion_disposition": s["exclusion_disposition"],
+                    "item_budget": s["item_budget"],
+                    "byte_budget": s["byte_budget"],
+                    "token_budget": s["token_budget"],
+                }
+            redacted["results"].append(redacted_result)
+        return redacted
+
+    async def compute_eligible_corpus_fingerprint(
+        self,
+        *,
+        tenant_id: str,
+        memory_context: ResolvedMemoryContext,
+        embedding_profile_key: str,
+    ) -> tuple[str, int]:
+        """F13: compute a tenant-safe fingerprint of the exact eligible population.
+
+        Hashes a canonical sorted representation of every ranking-relevant
+        mutable field for each eligible item: review status, validity,
+        source trust, confidence, importance, verification, conflict status,
+        created_at, embedding profile, embedding status, and content/vector
+        hashes.
+
+        Does NOT include raw memory content. Returns (fingerprint, item_count).
+        """
+        from sqlalchemy import text
+
+        h = hashlib.sha256()
+        h.update(b"eligible-corpus-v1")
+        h.update(embedding_profile_key.encode())
+
+        async with self.session_factory() as session:
+            rows = (
+                await session.execute(
+                    text(
+                        "SELECT mi.id::text, mi.review_status, mi.valid_to, "
+                        "mi.source_trust, mi.memory_confidence, mi.importance, "
+                        "mi.human_verified, mi.conflict_type, "
+                        "mi.conflict_resolution_status, mi.created_at, "
+                        "mi.content_hash, "
+                        "me.embedding_status, me.profile_id::text, "
+                        "md5(me.embedding::text) AS embedding_hash "
+                        "FROM memory_items mi "
+                        "LEFT JOIN memory_embeddings me "
+                        "ON me.memory_item_id = mi.id "
+                        "AND me.tenant_id = mi.tenant_id "
+                        "WHERE mi.tenant_id = :tenant_id "
+                        "AND mi.valid_to IS NULL "
+                        "AND mi.review_status IN ('active', 'proposed') "
+                        "ORDER BY mi.id::text"
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+            ).mappings().all()
+
+        item_count = 0
+        for row in rows:
+            # Only include items with ready embeddings for the active profile.
+            if (
+                row["embedding_status"] != "ready"
+                or row["profile_id"] is None
+            ):
+                continue
+            item_count += 1
+            h.update(str(row["id"]).encode())
+            h.update(str(row["review_status"]).encode())
+            h.update(str(row["valid_to"]).encode())
+            h.update(str(round(float(row["source_trust"] or 0), 6)).encode())
+            h.update(str(round(float(row["memory_confidence"] or 0), 6)).encode())
+            h.update(str(round(float(row["importance"] or 0), 6)).encode())
+            h.update(str(bool(row["human_verified"])).encode())
+            h.update(str(row["conflict_type"]).encode())
+            h.update(str(row["conflict_resolution_status"]).encode())
+            h.update(str(row["created_at"]).encode())
+            h.update(str(row["content_hash"]).encode())
+            h.update(str(row["embedding_status"]).encode())
+            h.update(str(row["profile_id"]).encode())
+            h.update(str(row["embedding_hash"]).encode())
+
+        return h.hexdigest()[:16], item_count
 
 
 # ---------------------------------------------------------------------------

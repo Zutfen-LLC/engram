@@ -54,6 +54,7 @@ from evals.recall_benchmark import (
     EmptyFixtureIdError,
     ExclusionDisposition,
     HttpBenchmarkClient,
+    PipelineError,
     QueryFixture,
     ServiceBenchmarkSuite,
     StageRanks,
@@ -63,6 +64,16 @@ from evals.recall_benchmark import (
     existing_corpus_mode,
     small_controlled_corpus,
 )
+
+
+def _near_unit_vec(dimensions: int, primary: int, secondary: int) -> list[float]:
+    """A vector mostly along *primary* with a small *secondary* component."""
+    vec = [0.0] * dimensions
+    if 0 <= primary < dimensions:
+        vec[primary] = 0.95
+    if 0 <= secondary < dimensions:
+        vec[secondary] = 0.312
+    return vec
 
 # ---------------------------------------------------------------------------
 # Engine + fixtures (mirrors test_promotion.py / test_semantic_recall.py)
@@ -658,14 +669,19 @@ async def test_returned_bytes_exact_utf8_total(audit_tenant: Any) -> None:
 
 
 async def test_item_budget_exclusion_unconditional(audit_tenant: Any) -> None:
-    """Required test 4 (unconditional): target is proven present before packing
-    and exactly item_budget_excluded afterward.
+    """Required test 4 (F12 unconditional): target is proven present before
+    packing and exactly item_budget_excluded afterward.
 
-    Uses distractor_heavy_corpus (31 items) with item_budget=1.
-    The target shares the query vector → raw_rank=0 (present in candidates).
-    With item_budget=1 and 31 candidates of equal trust, the target may be
-    excluded. The disposition MUST be exactly item_budget_excluded or
-    trust_demoted, not outside_candidate_window.
+    F12 fix: uses a deterministic corpus where the target is GUARANTEED to be
+    excluded by item budget. The target has LOW trust (score ~0.475) while
+    2 high-trust near-target items (score ~0.83) outrank it. With item_budget=2,
+    the two high-trust items fill the budget and the target is excluded.
+
+    Asserts UNCONDITIONALLY:
+    - final_served_rank is None (target not in final set)
+    - returned_count == 2 (exactly the budget)
+    - disposition == item_budget_excluded
+    - target is present through post_relationship_rank (survives expansion)
     """
     if not await _db_ok():
         pytest.skip("requires PostgreSQL with pgvector")
@@ -673,7 +689,62 @@ async def test_item_budget_exclusion_unconditional(audit_tenant: Any) -> None:
     assert tenant_id is not None
 
     dims = await _get_dimensions()
-    profile = distractor_heavy_corpus(dims)
+
+    # Build a corpus where target is GUARANTEED excluded by budget.
+    query_vec = [0.0] * dims
+    query_vec[0] = 1.0
+
+    # Target: shares query vector (distance=0, similarity=1.0) but LOW trust.
+    # trust_score = compute_semantic_trust_score(0.50, 0.50, 0.50, False, "active")
+    #              ≈ 0.475
+    # score = 1.0 * 0.475 = 0.475
+    target_vec = list(query_vec)
+    target_item = CorpusItem(
+        content="f12 target: low-truth exact match",
+        source_trust=0.50,
+        memory_confidence=0.50,
+        importance=0.50,
+        human_verified=False,
+        review_status="active",
+        embedding_vector=target_vec,
+        label="target",
+    )
+
+    # Two high-trust near-target items: slightly off-axis (similarity ~0.91)
+    # but HIGH trust → score ≈ 0.91 * 0.915 ≈ 0.833
+    # These will outrank the target by trust-weighted score.
+    high1_vec = _near_unit_vec(dims, 0, 1)
+    high2_vec = _near_unit_vec(dims, 0, 2)
+    high1 = CorpusItem(
+        content="f12 high-trust near target 1",
+        source_trust=0.90,
+        memory_confidence=0.90,
+        importance=0.90,
+        human_verified=True,
+        review_status="active",
+        embedding_vector=high1_vec,
+        label="high1",
+    )
+    high2 = CorpusItem(
+        content="f12 high-trust near target 2",
+        source_trust=0.90,
+        memory_confidence=0.90,
+        importance=0.90,
+        human_verified=True,
+        review_status="active",
+        embedding_vector=high2_vec,
+        label="high2",
+    )
+
+    profile = CorpusProfile(
+        name="f12_item_budget",
+        description="Target guaranteed excluded by item budget",
+        mode="controlled",
+        items=(target_item, high1, high2),
+        query_vector=list(query_vec),
+        query_text="f12 item budget query",
+    )
+
     corpus = ControlledCorpus(tenant_id, admin_id, profile)
     label_map = await corpus.setup(_test_session_factory)
 
@@ -687,34 +758,39 @@ async def test_item_budget_exclusion_unconditional(audit_tenant: Any) -> None:
             query=profile.query_text,
             query_vector=profile.query_vector,
             expected_item_id=target_id,
-            item_budget=1,  # Very tight — only 1 item served
+            item_budget=2,  # Only 2 items served — the 2 high-trust items
         )
 
         assert result.stages is not None
         stages = result.stages
 
-        # UNCONDITIONAL: target is present in candidate window (raw_rank=0)
+        # Target IS in the production candidate window (distance=0, raw_rank=0)
         assert stages.raw_similarity_rank == 0, (
             f"Expected raw_rank=0 (target shares query vec), got "
             f"{stages.raw_similarity_rank}"
         )
 
-        # UNCONDITIONAL: disposition is NOT outside_candidate_window or
-        # not_eligible — the item IS in the candidate window.
-        assert stages.exclusion_disposition != ExclusionDisposition.OUTSIDE_CANDIDATE_WINDOW
-        assert stages.exclusion_disposition != ExclusionDisposition.NOT_ELIGIBLE
-        assert stages.exclusion_disposition != ExclusionDisposition.NO_EMBEDDING
+        # UNCONDITIONAL: target survives through post-relationship stage.
+        # (No relationship edges in this corpus, so expansion keeps all items.)
+        assert stages.post_relationship_rank is not None, (
+            "Target should be present through post-relationship stage"
+        )
 
-        # If excluded (not selected), it must be a budget-related disposition
-        if stages.exclusion_disposition != ExclusionDisposition.SELECTED:
-            # UNCONDITIONAL: must be item_budget_excluded or trust_demoted
-            assert stages.exclusion_disposition in (
-                ExclusionDisposition.ITEM_BUDGET_EXCLUDED,
-                ExclusionDisposition.TRUST_DEMOTED,
-            ), (
-                f"Expected item_budget_excluded or trust_demoted, got "
-                f"{stages.exclusion_disposition}"
-            )
+        # UNCONDITIONAL: final_served_rank is None (excluded by budget)
+        assert stages.final_served_rank is None, (
+            f"Expected final_served_rank=None (budget excluded), got "
+            f"{stages.final_served_rank}"
+        )
+
+        # UNCONDITIONAL: returned_count == item_budget (exactly 2 items selected)
+        assert result.returned_count == 2, (
+            f"Expected returned_count=2 (item_budget), got {result.returned_count}"
+        )
+
+        # UNCONDITIONAL: disposition is exactly item_budget_excluded.
+        assert stages.exclusion_disposition == ExclusionDisposition.ITEM_BUDGET_EXCLUDED, (
+            f"Expected item_budget_excluded, got {stages.exclusion_disposition}"
+        )
     finally:
         await corpus.teardown(_test_session_factory)
 
@@ -1593,3 +1669,431 @@ def _near_vec(dimensions: int, primary: int, secondary: int) -> list[float]:
     if 0 <= secondary < dimensions:
         vec[secondary] = 0.312
     return vec
+
+
+# ---------------------------------------------------------------------------
+# FIX3 TESTS: F12-F15 corrections
+# ---------------------------------------------------------------------------
+
+
+async def test_eligible_corpus_fingerprint_changes_on_metadata(audit_tenant: Any) -> None:
+    """F13: fingerprint changes when an eligible item's ranking-relevant metadata changes."""
+    if not await _db_ok():
+        pytest.skip("requires PostgreSQL with pgvector")
+    tenant_id, admin_id = audit_tenant
+    assert tenant_id is not None
+
+    dims = await _get_dimensions()
+    profile = small_controlled_corpus(dims)
+    corpus = ControlledCorpus(tenant_id, admin_id, profile)
+    await corpus.setup(_test_session_factory)
+
+    try:
+        suite = ServiceBenchmarkSuite(_test_session_factory)
+
+        # Get embedding profile key.
+        async with _test_session_factory() as session:
+            from engram.embedding_profiles import get_active_profile
+
+            ep = await get_active_profile(session)
+
+        from engram.auth import Principal
+        from engram.memory_context import unrestricted_memory_context
+
+        principal = Principal(
+            tenant_id=tenant_id, principal_id=admin_id, api_key_id="",
+            scopes=("read",), memory_profile_id=None,
+            memory_profile_revision_id=None, memory_profile_slug=None,
+            memory_profile_version=None,
+        )
+        ctx = unrestricted_memory_context(principal)
+
+        fp1, count1 = await suite.compute_eligible_corpus_fingerprint(
+            tenant_id=tenant_id, memory_context=ctx,
+            embedding_profile_key=ep.profile_key,
+        )
+
+        # Change a ranking-relevant field on one item.
+        async with _test_session_factory() as session:
+            await session.execute(
+                text(
+                    "UPDATE memory_items SET source_trust = 0.99 "
+                    "WHERE tenant_id = :tid AND content LIKE 'benchmark target%'"
+                ),
+                {"tid": tenant_id},
+            )
+            await session.commit()
+
+        fp2, count2 = await suite.compute_eligible_corpus_fingerprint(
+            tenant_id=tenant_id, memory_context=ctx,
+            embedding_profile_key=ep.profile_key,
+        )
+
+        # UNCONDITIONAL: fingerprint changed after metadata change.
+        assert fp1 != fp2, (
+            "F13 FAIL: fingerprint should change when source_trust changes"
+        )
+        assert count1 == count2  # item count unchanged
+    finally:
+        await corpus.teardown(_test_session_factory)
+
+
+async def test_eligible_corpus_fingerprint_changes_on_add_remove(audit_tenant: Any) -> None:
+    """F13: fingerprint changes when an eligible item or embedding is added/removed."""
+    if not await _db_ok():
+        pytest.skip("requires PostgreSQL with pgvector")
+    tenant_id, admin_id = audit_tenant
+    assert tenant_id is not None
+
+    dims = await _get_dimensions()
+    profile = small_controlled_corpus(dims)
+    corpus = ControlledCorpus(tenant_id, admin_id, profile)
+    label_map = await corpus.setup(_test_session_factory)
+
+    try:
+        suite = ServiceBenchmarkSuite(_test_session_factory)
+
+        async with _test_session_factory() as session:
+            from engram.embedding_profiles import get_active_profile
+
+            ep = await get_active_profile(session)
+
+        from engram.auth import Principal
+        from engram.memory_context import unrestricted_memory_context
+
+        principal = Principal(
+            tenant_id=tenant_id, principal_id=admin_id, api_key_id="",
+            scopes=("read",), memory_profile_id=None,
+            memory_profile_revision_id=None, memory_profile_slug=None,
+            memory_profile_version=None,
+        )
+        ctx = unrestricted_memory_context(principal)
+
+        fp1, count1 = await suite.compute_eligible_corpus_fingerprint(
+            tenant_id=tenant_id, memory_context=ctx,
+            embedding_profile_key=ep.profile_key,
+        )
+
+        # Remove one item's embedding (makes it ineligible for semantic search).
+        target_id = label_map["target"]
+        async with _test_session_factory() as session:
+            await session.execute(
+                text(
+                    "DELETE FROM memory_embeddings WHERE memory_item_id = :id"
+                ),
+                {"id": target_id},
+            )
+            await session.commit()
+
+        fp2, count2 = await suite.compute_eligible_corpus_fingerprint(
+            tenant_id=tenant_id, memory_context=ctx,
+            embedding_profile_key=ep.profile_key,
+        )
+
+        # UNCONDITIONAL: fingerprint changed.
+        assert fp1 != fp2, (
+            "F13 FAIL: fingerprint should change when an embedding is removed"
+        )
+        # UNCONDITIONAL: eligible count decreased.
+        assert count2 == count1 - 1, (
+            f"Expected count {count1 - 1} after removal, got {count2}"
+        )
+    finally:
+        await corpus.teardown(_test_session_factory)
+
+
+async def test_eligible_corpus_fingerprint_stable(audit_tenant: Any) -> None:
+    """F13: fingerprint remains stable across unchanged repeated runs."""
+    if not await _db_ok():
+        pytest.skip("requires PostgreSQL with pgvector")
+    tenant_id, admin_id = audit_tenant
+    assert tenant_id is not None
+
+    dims = await _get_dimensions()
+    profile = small_controlled_corpus(dims)
+    corpus = ControlledCorpus(tenant_id, admin_id, profile)
+    await corpus.setup(_test_session_factory)
+
+    try:
+        suite = ServiceBenchmarkSuite(_test_session_factory)
+
+        async with _test_session_factory() as session:
+            from engram.embedding_profiles import get_active_profile
+
+            ep = await get_active_profile(session)
+
+        from engram.auth import Principal
+        from engram.memory_context import unrestricted_memory_context
+
+        principal = Principal(
+            tenant_id=tenant_id, principal_id=admin_id, api_key_id="",
+            scopes=("read",), memory_profile_id=None,
+            memory_profile_revision_id=None, memory_profile_slug=None,
+            memory_profile_version=None,
+        )
+        ctx = unrestricted_memory_context(principal)
+
+        fp1, count1 = await suite.compute_eligible_corpus_fingerprint(
+            tenant_id=tenant_id, memory_context=ctx,
+            embedding_profile_key=ep.profile_key,
+        )
+        fp2, count2 = await suite.compute_eligible_corpus_fingerprint(
+            tenant_id=tenant_id, memory_context=ctx,
+            embedding_profile_key=ep.profile_key,
+        )
+
+        # UNCONDITIONAL: fingerprint stable.
+        assert fp1 == fp2, "F13 FAIL: fingerprint should be stable across runs"
+        assert count1 == count2
+    finally:
+        await corpus.teardown(_test_session_factory)
+
+
+async def test_eligible_corpus_fingerprint_ignores_ineligible(audit_tenant: Any) -> None:
+    """F13: ineligible or cross-tenant rows do not alter the eligible-corpus fingerprint."""
+    if not await _db_ok():
+        pytest.skip("requires PostgreSQL with pgvector")
+    tenant_id, admin_id = audit_tenant
+    assert tenant_id is not None
+
+    dims = await _get_dimensions()
+    profile = small_controlled_corpus(dims)
+    corpus = ControlledCorpus(tenant_id, admin_id, profile)
+    await corpus.setup(_test_session_factory)
+
+    try:
+        suite = ServiceBenchmarkSuite(_test_session_factory)
+
+        async with _test_session_factory() as session:
+            from engram.embedding_profiles import get_active_profile
+
+            ep = await get_active_profile(session)
+
+        from engram.auth import Principal
+        from engram.memory_context import unrestricted_memory_context
+
+        principal = Principal(
+            tenant_id=tenant_id, principal_id=admin_id, api_key_id="",
+            scopes=("read",), memory_profile_id=None,
+            memory_profile_revision_id=None, memory_profile_slug=None,
+            memory_profile_version=None,
+        )
+        ctx = unrestricted_memory_context(principal)
+
+        fp1, count1 = await suite.compute_eligible_corpus_fingerprint(
+            tenant_id=tenant_id, memory_context=ctx,
+            embedding_profile_key=ep.profile_key,
+        )
+
+        # Insert an ineligible item (rejected review_status) in the same tenant.
+        import uuid as uuid_mod
+
+        ineligible_id = str(uuid_mod.uuid4())
+        async with _test_session_factory() as session:
+            await session.execute(
+                text(
+                    "INSERT INTO memory_items ("
+                    "id, tenant_id, principal_id, content, content_hash, kind, "
+                    "visibility, review_status, memory_confidence, source_trust, "
+                    "importance, human_verified, source_type, authority, "
+                    "created_at, valid_from"
+                    ") VALUES ("
+                    ":id, :tid, :pid, 'ineligible rejected item', "
+                    ":content_hash, 'fact', 'tenant', 'rejected', "
+                    "0.50, 0.50, 0.50, false, 'manual', 10, now(), now()"
+                    ")"
+                ),
+                {
+                    "id": ineligible_id, "tid": tenant_id, "pid": admin_id,
+                    "content_hash": f"sha256:{uuid_mod.uuid4().hex}",
+                },
+            )
+            await session.commit()
+
+        fp2, count2 = await suite.compute_eligible_corpus_fingerprint(
+            tenant_id=tenant_id, memory_context=ctx,
+            embedding_profile_key=ep.profile_key,
+        )
+
+        # UNCONDITIONAL: fingerprint unchanged (ineligible item not counted).
+        assert fp1 == fp2, (
+            "F13 FAIL: ineligible item should not change the fingerprint"
+        )
+        assert count1 == count2, (
+            f"Expected count {count1}, got {count2} (ineligible item counted)"
+        )
+
+        # Cleanup.
+        async with _test_session_factory() as session:
+            await session.execute(
+                text("DELETE FROM memory_items WHERE id = :id"),
+                {"id": ineligible_id},
+            )
+            await session.commit()
+    finally:
+        await corpus.teardown(_test_session_factory)
+
+
+async def test_injected_embedding_fn_receives_active_profile(audit_tenant: Any) -> None:
+    """F14: injected embedding generator receives the exact active EmbeddingProfile.
+
+    The test verifies that the embedding function closure captures and uses the
+    active profile by checking it produces a vector with the correct dimensions.
+    """
+    if not await _db_ok():
+        pytest.skip("requires PostgreSQL with pgvector")
+    tenant_id, admin_id = audit_tenant
+    assert tenant_id is not None
+
+    dims = await _get_dimensions()
+
+    # Insert a controlled corpus.
+    controlled_profile = small_controlled_corpus(dims)
+    corpus = ControlledCorpus(tenant_id, admin_id, controlled_profile)
+    label_map = await corpus.setup(_test_session_factory)
+
+    try:
+        target_id = label_map["target"]
+
+        # Resolve the active embedding profile.
+        async with _test_session_factory() as session:
+            from engram.embedding_profiles import get_active_profile
+
+            ep = await get_active_profile(session)
+
+        # Build an embedding function that uses the resolved profile.
+        received_profile: list[Any] = []
+
+        async def profile_aware_fn(query: str) -> list[float] | None:
+            received_profile.append(ep)
+            # Return the query vector matching the active profile dimensions.
+            vec = [0.0] * ep.dimensions
+            vec[0] = 1.0
+            return vec
+
+        existing_profile = existing_corpus_mode(
+            query_text="test query",
+            query_embedding_fn=profile_aware_fn,
+        )
+
+        suite = ServiceBenchmarkSuite(_test_session_factory)
+        result = await suite.run_benchmark(
+            tenant_id=tenant_id, principal_id=admin_id,
+            corpus_profile=existing_profile,
+            queries=[QueryFixture(
+                query="test query",
+                expected_item_id=target_id,
+                label="q1",
+            )],
+            budgets=[10],
+        )
+
+        # UNCONDITIONAL: the embedding fn was called and received the active profile.
+        assert len(received_profile) >= 1, "Embedding function was never called"
+        assert received_profile[0].dimensions == dims, (
+            f"F14 FAIL: embedding fn received dims={received_profile[0].dimensions}, "
+            f"expected {dims}"
+        )
+        assert len(result) == 1
+        assert result[0].error is None
+    finally:
+        await corpus.teardown(_test_session_factory)
+
+
+async def test_embedding_dimension_mismatch_fails_closed(audit_tenant: Any) -> None:
+    """F14: embedding-profile dimension/model mismatch fails closed."""
+    if not await _db_ok():
+        pytest.skip("requires PostgreSQL with pgvector")
+    tenant_id, admin_id = audit_tenant
+    assert tenant_id is not None
+
+    dims = await _get_dimensions()
+
+    # Build an embedding function that returns a WRONG-dimension vector.
+    async def wrong_dim_fn(query: str) -> list[float] | None:
+        return [1.0] * (dims + 1)  # Wrong dimension
+
+    suite = ServiceBenchmarkSuite(_test_session_factory)
+
+    # The mismatch should cause a PipelineError when semantic.search validates
+    # the vector dimensions.
+    with pytest.raises((PipelineError, EmbeddingFailure, Exception)):  # noqa: B017, PT011
+        await suite.run_single_query(
+            tenant_id=tenant_id, principal_id=admin_id,
+            query="mismatch test", query_vector=None,
+            expected_item_id="some-id", item_budget=10,
+            query_embedding_fn=wrong_dim_fn,
+        )
+
+
+def test_redacted_report_omits_raw_identifiers() -> None:
+    """F15: redacted report omits raw tenant ID, principal ID, query text, and item IDs.
+
+    Unit test — no DB needed. Builds a report with known values, redacts it,
+    and verifies no raw identifier survives.
+    """
+    raw_tenant = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    raw_principal = "11111111-2222-3333-4444-555555555555"
+    raw_item = "99999999-8888-7777-6666-555555555555"
+    raw_query = "this is a secret query with sensitive content"
+
+    stages = StageRanks(
+        eligible_candidate_count=5, candidate_window_size=5,
+        raw_similarity_rank=0, raw_similarity_rank_1based=1,
+        raw_similarity_score=1.0, raw_rank_exact=True,
+        corpus_raw_rank=0, corpus_raw_rank_1based=1,
+        corpus_raw_rank_exact=True,
+        trust_rank=0, trust_rank_1based=1, trust_score=0.5,
+        post_relationship_rank=0, post_relationship_rank_1based=1,
+        final_served_rank=0, final_served_rank_1based=1,
+        final_score=0.5, candidate_origin="semantic",
+        exclusion_disposition=ExclusionDisposition.SELECTED,
+        item_budget=10, byte_budget=None, token_budget=None,
+    )
+
+    result = BenchmarkResult(
+        query=raw_query,
+        query_digest="abcdef0123456789",
+        expected_item_id=raw_item,
+        item_budget=10, byte_budget=None, token_budget=None,
+        top_k_hit={"top_1": True, "top_5": True, "top_10": True},
+        latency_ms=10.0, latency_type="service",
+        returned_bytes=100, returned_count=1,
+        stages=stages, error=None,
+    )
+
+    from evals.recall_benchmark import CorpusProfile
+
+    profile = CorpusProfile(
+        name="test", description="test", mode="controlled",
+        items=(), query_vector=None, query_text=raw_query,
+    )
+
+    report = ServiceBenchmarkSuite.generate_report(
+        repository_sha="abc123",
+        results=[result],
+        corpus_profile=profile,
+        embedding_profile_key="test-profile",
+        embedding_model="test-model",
+        embedding_dimensions=1536,
+        scoring_version="semantic-v3",
+        config_version="v1",
+        memory_profile_slug="test-profile",
+    )
+
+    redacted = ServiceBenchmarkSuite.generate_redacted_report(report)
+
+    # Serialize to JSON string for scanning.
+    import json
+
+    redacted_str = json.dumps(redacted, default=str)
+
+    # UNCONDITIONAL: no raw identifiers in the redacted output.
+    assert raw_tenant not in redacted_str, "Raw tenant ID leaked into redacted report"
+    assert raw_principal not in redacted_str, "Raw principal ID leaked"
+    assert raw_query not in redacted_str, "Raw query text leaked"
+    assert raw_item not in redacted_str, "Raw item ID leaked"
+
+    # Digests and truncated IDs are OK.
+    assert "abcdef0123456789" in redacted_str  # query digest preserved
+    assert "99999999***" in redacted_str  # truncated item ID

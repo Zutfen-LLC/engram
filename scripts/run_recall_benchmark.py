@@ -1,17 +1,7 @@
 #!/usr/bin/env python3
 """Operator-runnable benchmark for Fixture E ranking evidence (ENG-AUDIT-002B).
 
-Usage:
-
-    python scripts/run_recall_benchmark.py \\
-        --tenant-id <uuid> \\
-        --principal-id <uuid> \\
-        --query "the query text" \\
-        --expected-item-id <uuid> \\
-        --item-budget 10 \\
-        --output /tmp/fixture-e-report.json
-
-Or with an existing corpus (no controlled insertion):
+Usage (existing corpus with explicit query vector):
 
     python scripts/run_recall_benchmark.py \\
         --mode existing \\
@@ -23,22 +13,46 @@ Or with an existing corpus (no controlled insertion):
         --query-vector-file /tmp/query_vec.json \\
         --output /tmp/fixture-e-report.json
 
-The script emits a machine-readable JSON report with all ranking stages,
-corpus fingerprint, embedding profile, and production-window diagnostics.
+Existing corpus with injected embedding (resolves active EmbeddingProfile):
 
-Requires a live PostgreSQL with the v2 schema and pgvector, and the
-appropriate ENGRAM_DATABASE_URL / ENGRAM_OWNER_DATABASE_URL env vars.
+    python scripts/run_recall_benchmark.py \\
+        --mode existing \\
+        --tenant-id <uuid> \\
+        --principal-id <uuid> \\
+        --query "the query text" \\
+        --expected-item-id <uuid> \\
+        --item-budget 10 \\
+        --use-embedding-provider \\
+        --output /tmp/fixture-e-report.json
+
+With memory profile and workspace context (F15):
+
+    python scripts/run_recall_benchmark.py \\
+        --mode existing \\
+        --tenant-id <uuid> \\
+        --principal-id <uuid> \\
+        --memory-profile-id <uuid> \\
+        --memory-profile-revision-id <uuid> \\
+        --workspace-id <uuid> \\
+        --query "..." --expected-item-id <uuid> \\
+        --use-embedding-provider \\
+        --redacted \\
+        --output /tmp/fixture-e-redacted.json
+
+The script emits a machine-readable JSON report with all ranking stages,
+corpus fingerprint, embedding profile, resolved memory context, and
+production-window diagnostics.
+
+Requires a live PostgreSQL with the v2 schema and pgvector.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
 import subprocess
 import sys
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -56,36 +70,13 @@ def _get_repo_sha() -> str:
         return "unknown"
 
 
-async def _resolve_query_vector(
-    args: argparse.Namespace,
-) -> tuple[list[float] | None, Any]:
-    """Resolve query vector from explicit arg, file, or embedding fn."""
-    from engram.db import owner_session_factory  # noqa: F401 — ensure DB is ready
-
-    if args.query_vector_file:
-        with open(args.query_vector_file) as f:
-            vec = json.load(f)
-        return list(vec), None
-
-    if args.query_embedding_fn:
-        # Use the configured embedding provider to generate the vector.
-        from engram.embeddings import generate_embedding
-
-        async def embedding_fn(query: str) -> list[float] | None:
-            result = await generate_embedding(query)
-            return list(result) if result is not None else None
-
-        return None, embedding_fn
-
-    return None, None
-
-
 async def run(args: argparse.Namespace) -> int:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
     from sqlalchemy.pool import NullPool
 
     from engram.config import settings
     from engram.embedding_profiles import get_active_profile
+    from engram.relationship_recall import RECALL_SCORING_VERSION
     from evals.recall_benchmark import (
         ControlledCorpus,
         ServiceBenchmarkSuite,
@@ -99,34 +90,66 @@ async def run(args: argparse.Namespace) -> int:
     )
 
     try:
-        # Resolve query vector / embedding fn.
-        explicit_vector, embedding_fn = await _resolve_query_vector(args)
+        # --- Resolve active EmbeddingProfile (F14) ---
+        async with session_factory() as session:
+            ep = await get_active_profile(session)
 
-        # Build corpus profile.
+        # --- Resolve query vector ---
+        query_vector: list[float] | None = None
+        embedding_fn = None
+
+        if args.query_vector_file:
+            with open(args.query_vector_file) as f:
+                query_vector = list(json.load(f))
+            # F14: validate dimensions match the active profile.
+            if len(query_vector) != ep.dimensions:
+                print(
+                    f"ERROR: query vector dims ({len(query_vector)}) do not match "
+                    f"active profile ({ep.dimensions})",
+                    file=sys.stderr,
+                )
+                return 2
+
+        if query_vector is None and args.use_embedding_provider:
+            # F14: resolve the active EmbeddingProfile BEFORE generating the
+            # embedding, and pass it explicitly to generate_embedding.
+            from engram.embeddings import generate_embedding
+
+            async def profile_aware_embedding_fn(query: str) -> list[float] | None:
+                result = await generate_embedding(
+                    query,
+                    profile=ep,
+                    tenant_id=args.tenant_id,
+                    principal_id=args.principal_id,
+                    workspace_id=args.workspace_id,
+                    operation="embedding_query_recall",
+                    usage_class="diagnostic",
+                )
+                return list(result) if result is not None else None
+
+            embedding_fn = profile_aware_embedding_fn
+
+        # --- Build corpus profile ---
         corpus: ControlledCorpus | None = None
         if args.mode == "existing":
             profile = existing_corpus_mode(
-                query_vector=explicit_vector,
+                query_vector=query_vector,
                 query_text=args.query,
                 query_embedding_fn=embedding_fn,
             )
         else:
-            # Controlled mode — use small_controlled_corpus for reproducibility.
-            async with session_factory() as session:
-                ep = await get_active_profile(session)
+            # Controlled mode.
             dims = ep.dimensions
             profile = small_controlled_corpus(dims)
-            # If using controlled mode, we need to set up the corpus.
             corpus = ControlledCorpus(args.tenant_id, args.principal_id, profile)
             label_map = await corpus.setup(session_factory)
             if args.expected_item_id == "auto" and "target" in label_map:
                 args.expected_item_id = label_map["target"]
 
         try:
-            # Run the benchmark.
             suite = ServiceBenchmarkSuite(session_factory)
 
-            query_vector_for_run = explicit_vector if explicit_vector else profile.query_vector
+            query_vector_for_run = query_vector if query_vector else profile.query_vector
 
             result = await suite.run_single_query(
                 tenant_id=args.tenant_id,
@@ -138,81 +161,103 @@ async def run(args: argparse.Namespace) -> int:
                 byte_budget=args.byte_budget,
                 token_budget=args.token_budget,
                 query_embedding_fn=embedding_fn,
+                workspace_id=args.workspace_id,
+                memory_profile_id=args.memory_profile_id,
+                memory_profile_revision_id=args.memory_profile_revision_id,
+                memory_profile_slug=args.memory_profile_slug,
+                memory_profile_version=args.memory_profile_version,
             )
         finally:
             if corpus is not None:
                 await corpus.teardown(session_factory)
 
-        # Gather embedding profile info.
-        async with session_factory() as session:
-            ep = await get_active_profile(session)
+        # --- Compute eligible corpus fingerprint (F13) ---
+        from engram.auth import Principal
+        from engram.memory_context import unrestricted_memory_context
 
-        # Build the report.
+        principal = Principal(
+            tenant_id=args.tenant_id,
+            principal_id=args.principal_id,
+            api_key_id="",
+            scopes=("read",),
+            memory_profile_id=args.memory_profile_id,
+            memory_profile_revision_id=args.memory_profile_revision_id,
+            memory_profile_slug=args.memory_profile_slug,
+            memory_profile_version=args.memory_profile_version,
+        )
+        ctx = unrestricted_memory_context(principal)
+        eligible_fp, eligible_count = await suite.compute_eligible_corpus_fingerprint(
+            tenant_id=args.tenant_id,
+            memory_context=ctx,
+            embedding_profile_key=ep.profile_key,
+        )
+
+        # --- Build the report ---
         sha = _get_repo_sha()
-        query_digest = hashlib.sha256(args.query.encode()).hexdigest()[:16]
 
-        report: dict[str, Any] = {
-            "repository_sha": sha,
-            "generated_at": datetime.now(UTC).isoformat(),
-            "tenant_id_safe": args.tenant_id[:8] + "***",
-            "embedding_profile": ep.profile_key,
-            "embedding_model": ep.model,
-            "embedding_dimensions": ep.dimensions,
-            "corpus_profile_name": profile.name,
-            "corpus_fingerprint": profile.corpus_fingerprint(),
-            "query_digest": query_digest,
-            "query_text": args.query,
-            "expected_item_id": args.expected_item_id,
-            "item_budget": result.item_budget,
-            "byte_budget": result.byte_budget,
-            "token_budget": result.token_budget,
-            "result": {
-                "returned_count": result.returned_count,
-                "returned_bytes": result.returned_bytes,
-                "latency_ms": result.latency_ms,
-                "top_k_hit": result.top_k_hit,
-                "error": result.error,
-            },
-        }
+        from evals.recall_benchmark import BenchmarkResult
 
-        if result.stages:
-            s = result.stages
-            report["stages"] = {
-                "eligible_candidate_count": s.eligible_candidate_count,
-                "candidate_window_size": s.candidate_window_size,
-                "production_window_raw_rank": s.raw_similarity_rank,
-                "production_window_raw_rank_1based": s.raw_similarity_rank_1based,
-                "production_window_raw_score": s.raw_similarity_score,
-                "raw_rank_exact": s.raw_rank_exact,
-                "corpus_raw_rank": s.corpus_raw_rank,
-                "corpus_raw_rank_1based": s.corpus_raw_rank_1based,
-                "corpus_raw_rank_exact": s.corpus_raw_rank_exact,
-                "trust_rank": s.trust_rank,
-                "trust_rank_1based": s.trust_rank_1based,
-                "trust_score": s.trust_score,
-                "post_relationship_rank": s.post_relationship_rank,
-                "post_relationship_rank_1based": s.post_relationship_rank_1based,
-                "final_served_rank": s.final_served_rank,
-                "final_served_rank_1based": s.final_served_rank_1based,
-                "final_score": s.final_score,
-                "candidate_origin": s.candidate_origin,
-                "exclusion_disposition": s.exclusion_disposition,
-                "item_budget": s.item_budget,
-                "byte_budget": s.byte_budget,
-                "token_budget": s.token_budget,
-            }
+        all_results: list[BenchmarkResult] = [result]
 
-        # Write the report.
+        # Run comparison budgets if requested.
+        if args.comparison_budgets:
+            for budget in args.comparison_budgets:
+                comp_result = await suite.run_single_query(
+                    tenant_id=args.tenant_id,
+                    principal_id=args.principal_id,
+                    query=args.query,
+                    query_vector=query_vector_for_run,
+                    expected_item_id=args.expected_item_id,
+                    item_budget=budget,
+                    query_embedding_fn=embedding_fn,
+                    workspace_id=args.workspace_id,
+                    memory_profile_id=args.memory_profile_id,
+                    memory_profile_revision_id=args.memory_profile_revision_id,
+                    memory_profile_slug=args.memory_profile_slug,
+                    memory_profile_version=args.memory_profile_version,
+                )
+                all_results.append(comp_result)
+
+        report = ServiceBenchmarkSuite.generate_report(
+            repository_sha=sha,
+            results=all_results,
+            corpus_profile=profile,
+            embedding_profile_key=ep.profile_key,
+            embedding_model=ep.model,
+            embedding_dimensions=ep.dimensions,
+            scoring_version=RECALL_SCORING_VERSION,
+            config_version="v1",
+            eligible_corpus_fingerprint=eligible_fp,
+            eligible_item_count=eligible_count,
+            memory_context_version=ctx.version,
+            memory_profile_slug=args.memory_profile_slug,
+            memory_profile_version=args.memory_profile_version,
+            workspace_id=args.workspace_id,
+        )
+
+        # --- Output ---
+        import dataclasses
+
+        def _default(obj: Any) -> Any:
+            if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+                return dataclasses.asdict(obj)
+            raise TypeError(f"Not serializable: {type(obj)}")
+
+        if args.redacted:
+            output_data: Any = ServiceBenchmarkSuite.generate_redacted_report(report)
+        else:
+            output_data = dataclasses.asdict(report)
+
         if args.output:
             output_path = Path(args.output)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             with open(output_path, "w") as f:
-                json.dump(report, f, indent=2, default=str)
+                json.dump(output_data, f, indent=2, default=_default)
             print(f"Report written to {output_path}", file=sys.stderr)
         else:
-            print(json.dumps(report, indent=2, default=str))
+            print(json.dumps(output_data, indent=2, default=_default))
 
-        return 0 if result.error is None else 1
+        return 0 if all(r.error is None for r in all_results) else 1
 
     finally:
         await engine.dispose()
@@ -225,17 +270,39 @@ def main() -> int:
     parser.add_argument("--tenant-id", required=True, help="Tenant UUID")
     parser.add_argument("--principal-id", required=True, help="Principal UUID")
     parser.add_argument("--query", required=True, help="Query text")
-    parser.add_argument("--expected-item-id", required=True, help="Expected item UUID (or 'auto')")
+    parser.add_argument(
+        "--expected-item-id", required=True, help="Expected item UUID (or 'auto')"
+    )
     parser.add_argument("--item-budget", type=int, default=10)
     parser.add_argument("--byte-budget", type=int, default=None)
     parser.add_argument("--token-budget", type=int, default=None)
-    parser.add_argument("--mode", choices=["controlled", "existing"], default="existing")
+    parser.add_argument(
+        "--comparison-budgets",
+        type=int,
+        nargs="*",
+        default=None,
+        help="Additional budgets to run for comparison (e.g., 5 10 20)",
+    )
+    parser.add_argument(
+        "--mode", choices=["controlled", "existing"], default="existing"
+    )
     parser.add_argument("--query-vector-file", help="JSON file with explicit query vector")
     parser.add_argument(
-        "--query-embedding-fn",
+        "--use-embedding-provider",
         action="store_true",
-        help="Use the configured embedding provider to generate the query vector",
+        help="Resolve active EmbeddingProfile and use it to generate the query vector",
     )
+    # F15: memory profile and workspace context.
+    parser.add_argument("--memory-profile-id", default=None, help="Memory profile UUID")
+    parser.add_argument(
+        "--memory-profile-revision-id", default=None, help="Memory profile revision UUID"
+    )
+    parser.add_argument("--memory-profile-slug", default=None, help="Memory profile slug")
+    parser.add_argument(
+        "--memory-profile-version", type=int, default=None, help="Memory profile version"
+    )
+    parser.add_argument("--workspace-id", default=None, help="Workspace UUID")
+    parser.add_argument("--redacted", action="store_true", help="Emit redacted report")
     parser.add_argument("--output", help="Output path for machine-readable JSON report")
     args = parser.parse_args()
 
