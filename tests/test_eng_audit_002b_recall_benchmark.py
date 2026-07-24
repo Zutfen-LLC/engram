@@ -2014,21 +2014,30 @@ async def test_embedding_dimension_mismatch_fails_closed(audit_tenant: Any) -> N
 
     dims = await _get_dimensions()
 
-    # Build an embedding function that returns a WRONG-dimension vector.
-    async def wrong_dim_fn(query: str) -> list[float] | None:
-        return [1.0] * (dims + 1)  # Wrong dimension
+    # Insert a controlled corpus so the tenant has eligible items (ensuring
+    # the pipeline reaches semantic.search where dimension validation occurs).
+    controlled_profile = small_controlled_corpus(dims)
+    corpus = ControlledCorpus(tenant_id, admin_id, controlled_profile)
+    label_map = await corpus.setup(_test_session_factory)
 
-    suite = ServiceBenchmarkSuite(_test_session_factory)
+    try:
+        # Build an embedding function that returns a WRONG-dimension vector.
+        async def wrong_dim_fn(query: str) -> list[float] | None:
+            return [1.0] * (dims + 1)  # Wrong dimension
 
-    # The mismatch should cause a PipelineError when semantic.search validates
-    # the vector dimensions.
-    with pytest.raises(PipelineError):  # noqa: PT011
-        await suite.run_single_query(
-            tenant_id=tenant_id, principal_id=admin_id,
-            query="mismatch test", query_vector=None,
-            expected_item_id=str(uuid.uuid4()), item_budget=10,
-            query_embedding_fn=wrong_dim_fn,
-        )
+        suite = ServiceBenchmarkSuite(_test_session_factory)
+
+        # The mismatch should cause a PipelineError when semantic.search
+        # validates the vector dimensions against the active profile.
+        with pytest.raises(PipelineError):  # noqa: PT011
+            await suite.run_single_query(
+                tenant_id=tenant_id, principal_id=admin_id,
+                query="mismatch test", query_vector=None,
+                expected_item_id=label_map["target"], item_budget=10,
+                query_embedding_fn=wrong_dim_fn,
+            )
+    finally:
+        await corpus.teardown(_test_session_factory)
 
 
 def test_redacted_report_omits_raw_identifiers() -> None:
