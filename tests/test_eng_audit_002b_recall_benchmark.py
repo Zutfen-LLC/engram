@@ -2475,7 +2475,7 @@ async def test_fingerprint_excludes_non_active_profile_embeddings(audit_tenant: 
         )
 
         # Insert an embedding for one of the items under a DIFFERENT profile.
-        # Create a dummy inactive profile.
+        # Create a dummy retired profile (state values: candidate/active/retired).
         import uuid as uuid_mod
 
         dummy_profile_id = str(uuid_mod.uuid4())
@@ -2485,12 +2485,11 @@ async def test_fingerprint_excludes_non_active_profile_embeddings(audit_tenant: 
                 await session.execute(
                     text(
                         "INSERT INTO embedding_profiles "
-                        "(id, tenant_id, model, dimensions, state, profile_key) "
-                        "VALUES (:id, :tid, 'dummy-model', :dims, 'inactive', :key)"
+                        "(id, model, dimensions, state, profile_key, provider) "
+                        "VALUES (:id, 'dummy-model', :dims, 'retired', :key, 'dummy')"
                     ),
                     {
                         "id": dummy_profile_id,
-                        "tid": tenant_id,
                         "dims": dims,
                         "key": "dummy-profile",
                     },
