@@ -1496,11 +1496,16 @@ async def test_manifest_parse_failure_truthful_recall_log_exists() -> None:
         )
 
         # Corrupt the manifest JSON so it fails to parse as a
-        # ContextManifestV1 but still satisfies all structural check
-        # constraints (manifest sections are objects, subject tenant/
-        # principal match envelope, packet.hash matches envelope).
+        # ContextManifestV1 but still satisfies ALL structural check
+        # constraints: sections are objects, items is an array, schema/
+        # version/canonicalization/mode match envelope columns, subject
+        # tenant/principal match, and packet.hash matches packet_hash.
         corrupt_packet_hash = "sha256:" + "0" * 64
         broken_manifest = {
+            "schema": "engram.context-manifest",
+            "schema_version": "1.0",
+            "canonicalization": "rfc8785",
+            "mode": "startup",
             "subject": {
                 "tenant_id": str(tenant_id),
                 "principal_id": str(principal_id),
@@ -1509,6 +1514,7 @@ async def test_manifest_parse_failure_truthful_recall_log_exists() -> None:
             "versions": {"invalid": True},
             "result": {"invalid": True},
             "packet": {"hash": corrupt_packet_hash},
+            "items": [],
         }
         await owner.execute(
             "UPDATE context_receipts SET manifest = $1::jsonb, "

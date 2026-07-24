@@ -580,7 +580,7 @@ async def test_detail_readable_for_integrity_invalid_row():
     # The manifest JSON itself is still well-formed, so parse_status is "valid".
     # The point is that the row is still readable despite the hash mismatch.
     assert body["manifest_parse_status"] == "valid"
-    assert body["manifest_hash"] == "sha256:deadbeef"
+    assert body["manifest_hash"] == "sha256:" + "d" * 64
 
 
 async def test_detail_response_has_no_raw_content_or_working_set():
