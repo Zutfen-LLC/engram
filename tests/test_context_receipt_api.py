@@ -232,13 +232,17 @@ async def _seed_full_setup(
 
     receipt_ids: list[str] = []
     for i in range(num_receipts):
+        item_id = str(uuid.uuid4())
         rl_id = await _insert_recall_log(
-            tenant_id=tenant_id, principal_id=principal_id
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            item_ids=[item_id],
         )
         rid = await _store_receipt(
             tenant_id=tenant_id,
             principal_id=principal_id,
             recall_log_id=rl_id,
+            item_ids=[item_id],
             content=f"content-{i}",
         )
         receipt_ids.append(rid)
@@ -365,13 +369,28 @@ async def test_list_returns_only_owning_principal_receipts():
     pid_a = await _seed_principal(tenant_id, f"crtest-pa-{tenant_id[:8]}")
     pid_b = await _seed_principal(tenant_id, f"crtest-pb-{tenant_id[:8]}")
 
-    rl_a1 = await _insert_recall_log(tenant_id=tenant_id, principal_id=pid_a)
-    rl_a2 = await _insert_recall_log(tenant_id=tenant_id, principal_id=pid_a)
-    rl_b1 = await _insert_recall_log(tenant_id=tenant_id, principal_id=pid_b)
+    item_a1 = str(uuid.uuid4())
+    item_a2 = str(uuid.uuid4())
+    item_b1 = str(uuid.uuid4())
+    rl_a1 = await _insert_recall_log(
+        tenant_id=tenant_id, principal_id=pid_a, item_ids=[item_a1]
+    )
+    rl_a2 = await _insert_recall_log(
+        tenant_id=tenant_id, principal_id=pid_a, item_ids=[item_a2]
+    )
+    rl_b1 = await _insert_recall_log(
+        tenant_id=tenant_id, principal_id=pid_b, item_ids=[item_b1]
+    )
 
-    await _store_receipt(tenant_id=tenant_id, principal_id=pid_a, recall_log_id=rl_a1)
-    await _store_receipt(tenant_id=tenant_id, principal_id=pid_a, recall_log_id=rl_a2)
-    await _store_receipt(tenant_id=tenant_id, principal_id=pid_b, recall_log_id=rl_b1)
+    await _store_receipt(
+        tenant_id=tenant_id, principal_id=pid_a, recall_log_id=rl_a1, item_ids=[item_a1]
+    )
+    await _store_receipt(
+        tenant_id=tenant_id, principal_id=pid_a, recall_log_id=rl_a2, item_ids=[item_a2]
+    )
+    await _store_receipt(
+        tenant_id=tenant_id, principal_id=pid_b, recall_log_id=rl_b1, item_ids=[item_b1]
+    )
 
     client = await _make_client(tenant_id, pid_a)
     async with client:
@@ -484,9 +503,11 @@ async def test_detail_returns_exact_stored_manifest():
     await _check_table()
     tenant_id, _ = await _seed_tenant()
     principal_id = await _seed_principal(tenant_id, f"crtest-p-{tenant_id[:8]}")
-    rl_id = await _insert_recall_log(tenant_id=tenant_id, principal_id=principal_id)
-
     item_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+    rl_id = await _insert_recall_log(
+        tenant_id=tenant_id, principal_id=principal_id, item_ids=item_ids
+    )
+
     manifest = build_manifest(
         tenant_id=tenant_id,
         principal_id=principal_id,
@@ -686,9 +707,15 @@ async def test_cross_principal_receipt_returns_404():
     pid_owner = await _seed_principal(tenant_id, f"crtest-owner-{tenant_id[:8]}")
     pid_other = await _seed_principal(tenant_id, f"crtest-other-{tenant_id[:8]}")
 
-    rl_id = await _insert_recall_log(tenant_id=tenant_id, principal_id=pid_owner)
+    item_id = str(uuid.uuid4())
+    rl_id = await _insert_recall_log(
+        tenant_id=tenant_id, principal_id=pid_owner, item_ids=[item_id]
+    )
     receipt_id = await _store_receipt(
-        tenant_id=tenant_id, principal_id=pid_owner, recall_log_id=rl_id
+        tenant_id=tenant_id,
+        principal_id=pid_owner,
+        recall_log_id=rl_id,
+        item_ids=[item_id],
     )
 
     client = await _make_client(tenant_id, pid_other)

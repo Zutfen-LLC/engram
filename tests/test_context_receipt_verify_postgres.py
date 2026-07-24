@@ -112,6 +112,42 @@ async def _seed_tenant_principal(
     )
 
 
+async def _seed_memory_profile(
+    owner: Any,
+    *,
+    tenant_id: uuid.UUID,
+    profile_id: uuid.UUID,
+    revision_id: uuid.UUID,
+    principal_id: uuid.UUID,
+    version: int = 1,
+) -> None:
+    """Seed a memory_profiles + memory_profile_revisions row pair.
+
+    Required when inserting a recall_log that carries profile/revision IDs,
+    because ``recall_logs`` has a composite FK to ``memory_profile_revisions``.
+    """
+    await owner.execute(
+        "INSERT INTO memory_profiles (id, tenant_id, name, slug, "
+        "created_by_principal_id) VALUES ($1, $2, $3, $4, $5)",
+        profile_id,
+        tenant_id,
+        f"prof-{profile_id.hex[:8]}",
+        f"prof-{profile_id.hex[:8]}",
+        principal_id,
+    )
+    await owner.execute(
+        "INSERT INTO memory_profile_revisions "
+        "(id, tenant_id, profile_id, version, reason, created_by_principal_id) "
+        "VALUES ($1, $2, $3, $4, $5, $6)",
+        revision_id,
+        tenant_id,
+        profile_id,
+        version,
+        "test fixture",
+        principal_id,
+    )
+
+
 async def _insert_recall_log(
     owner: Any,
     *,
@@ -647,6 +683,22 @@ async def test_profile_bound_sees_only_matching_profile_receipts() -> None:
             principal_id=principal_id,
             label="prof",
         )
+        # Seed memory profile A + revision A.
+        await _seed_memory_profile(
+            owner,
+            tenant_id=tenant_id,
+            profile_id=profile_id,
+            revision_id=profile_rev,
+            principal_id=principal_id,
+        )
+        # Seed memory profile B + revision B.
+        await _seed_memory_profile(
+            owner,
+            tenant_id=tenant_id,
+            profile_id=other_profile_id,
+            revision_id=other_profile_rev,
+            principal_id=principal_id,
+        )
         # Recall log + receipt for profile A.
         rl_a = uuid.uuid4()
         receipt_a = uuid.uuid4()
@@ -793,6 +845,14 @@ async def test_unprofiled_context_sees_all_receipts() -> None:
             tenant_id=tenant_id,
             principal_id=principal_id,
             label="unp",
+        )
+        # Seed the memory profile + revision for the profiled receipt.
+        await _seed_memory_profile(
+            owner,
+            tenant_id=tenant_id,
+            profile_id=profile_id,
+            revision_id=profile_rev,
+            principal_id=principal_id,
         )
         # Profiled receipt.
         rl_p = uuid.uuid4()
@@ -966,11 +1026,25 @@ async def test_verify_detects_packet_hash_corruption() -> None:
             item_ids=item_ids,
         )
 
-        # Owner corrupts packet_hash.
+        # Owner corrupts the envelope packet_hash to differ from the
+        # manifest's embedded packet.hash. The
+        # chk_context_receipts_packet_agreement check constraint prevents
+        # storing a mismatched state, so we temporarily drop it, corrupt,
+        # and re-add it. This simulates a post-store DB-level corruption
+        # that bypasses application-layer integrity.
+        await owner.execute(
+            "ALTER TABLE context_receipts "
+            "DROP CONSTRAINT IF EXISTS chk_context_receipts_packet_agreement"
+        )
         await owner.execute(
             "UPDATE context_receipts SET packet_hash = $1 WHERE id = $2",
             "sha256:" + "0" * 64,
             rid,
+        )
+        await owner.execute(
+            "ALTER TABLE context_receipts "
+            "ADD CONSTRAINT chk_context_receipts_packet_agreement CHECK ("
+            "(manifest -> 'packet' ->> 'hash' = packet_hash) IS TRUE)"
         )
 
         async with factory() as session:
@@ -1155,6 +1229,361 @@ async def test_verify_performs_no_mutations() -> None:
 
         # The verification should be valid (no corruption).
         assert result.status == "valid"
+    finally:
+        await _cleanup(owner, tenant_id)
+        await engine.dispose()
+        await owner.close()
+
+
+# ─── 13. Profile-filtered pagination cannot produce a false terminal page ─
+
+
+async def test_profile_filtered_pagination_no_false_terminal() -> None:
+    """A profile-filtered first page with zero matches but a later matching
+    receipt returns a usable continuation (does NOT return next_cursor=None
+    when eligible rows still exist on later pages).
+
+    Seeds 5 unprofiled receipts (oldest) then 3 profiled receipts (newest).
+    With limit=2 and profile-bound query, the first page should return 2
+    profiled receipts and a continuation cursor.
+    """
+    owner = await _owner_connect()
+    engine = _app_engine()
+    factory = _app_factory(engine)
+    tenant_id = uuid.uuid4()
+    principal_id = uuid.uuid4()
+    profile_id = uuid.uuid4()
+    profile_rev = uuid.uuid4()
+    item_ids = [uuid.uuid4()]
+    try:
+        await _seed_tenant_principal(
+            owner, tenant_id=tenant_id, principal_id=principal_id, label="pfpage"
+        )
+        await _seed_memory_profile(
+            owner,
+            tenant_id=tenant_id,
+            profile_id=profile_id,
+            revision_id=profile_rev,
+            principal_id=principal_id,
+        )
+
+        base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+        # 5 unprofiled receipts (oldest).
+        for i in range(5):
+            rl = uuid.uuid4()
+            rid = uuid.uuid4()
+            ts = base + timedelta(seconds=i)
+            await _insert_recall_log(
+                owner,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                recall_log_id=rl,
+                item_ids=item_ids,
+                byte_budget=8192,
+                created_at=ts,
+            )
+            await _owner_insert_receipt(
+                owner,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                recall_log_id=rl,
+                receipt_id=rid,
+                item_ids=item_ids,
+                created_at=ts,
+            )
+
+        # 3 profiled receipts (newest).
+        profiled_receipt_ids: list[uuid.UUID] = []
+        for i in range(3):
+            rl = uuid.uuid4()
+            rid = uuid.uuid4()
+            profiled_receipt_ids.append(rid)
+            ts = base + timedelta(seconds=10 + i)
+            await _insert_recall_log(
+                owner,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                recall_log_id=rl,
+                item_ids=item_ids,
+                byte_budget=8192,
+                memory_profile_id=profile_id,
+                memory_profile_revision_id=profile_rev,
+                created_at=ts,
+            )
+            await _owner_insert_receipt(
+                owner,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                recall_log_id=rl,
+                receipt_id=rid,
+                item_ids=item_ids,
+                memory_profile_id=str(profile_id),
+                memory_profile_revision_id=str(profile_rev),
+                memory_profile_version=1,
+                created_at=ts,
+            )
+
+        # Profile-bound query: paginate through all profiled receipts.
+        seen_ids: set[uuid.UUID] = set()
+        cursor: str | None = None
+        for _page in range(5):
+            async with factory() as session:
+                await _apply_rls(
+                    session, tenant_id=tenant_id, principal_id=principal_id
+                )
+                result = await list_context_receipts(
+                    session,
+                    tenant_id=tenant_id,
+                    principal_id=principal_id,
+                    limit=2,
+                    cursor=cursor,
+                    memory_profile_id=profile_id,
+                    memory_profile_revision_id=profile_rev,
+                )
+            for item in result.items:
+                assert item.id not in seen_ids, f"duplicate receipt {item.id}"
+                seen_ids.add(item.id)
+            cursor = result.next_cursor
+            if cursor is None:
+                break
+
+        # Must have seen all 3 profiled receipts, no more, no less.
+        assert len(seen_ids) == 3
+        assert seen_ids == set(profiled_receipt_ids)
+    finally:
+        await _cleanup(owner, tenant_id)
+        await engine.dispose()
+        await owner.close()
+
+
+# ─── 14. Manifest-hash mismatch reports truthful independent recall-log checks ─
+
+
+async def test_manifest_hash_mismatch_truthful_recall_log_checks() -> None:
+    """When manifest_hash is corrupted but the recall log exists and is valid,
+    the verify result must report:
+    - manifest_hash check: False
+    - recall_log_exists: True
+    - recall_log_binding: True (the recall log still matches the manifest)
+    """
+    owner = await _owner_connect()
+    engine = _app_engine()
+    factory = _app_factory(engine)
+    tenant_id = uuid.uuid4()
+    principal_id = uuid.uuid4()
+    rl = uuid.uuid4()
+    rid = uuid.uuid4()
+    item_ids = [uuid.uuid4()]
+    try:
+        await _seed_tenant_principal(
+            owner, tenant_id=tenant_id, principal_id=principal_id, label="mhtruth"
+        )
+        await _insert_recall_log(
+            owner,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            recall_log_id=rl,
+            item_ids=item_ids,
+            byte_budget=8192,
+        )
+        await _owner_insert_receipt(
+            owner,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            recall_log_id=rl,
+            receipt_id=rid,
+            item_ids=item_ids,
+        )
+
+        # Corrupt manifest_hash.
+        await owner.execute(
+            "UPDATE context_receipts SET manifest_hash = $1 WHERE id = $2",
+            "sha256:" + "0" * 64,
+            rid,
+        )
+
+        async with factory() as session:
+            await _apply_rls(
+                session, tenant_id=tenant_id, principal_id=principal_id
+            )
+            from engram.context_receipts import get_context_receipt
+
+            receipt = await get_context_receipt(
+                session,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                receipt_id=rid,
+            )
+            assert receipt is not None
+            result = await verify_context_receipt_with_recall_log(
+                session,
+                receipt,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+            )
+        assert result.status == "invalid"
+        assert result.failure_code == VERIFICATION_FAILURE_MANIFEST_HASH_MISMATCH
+
+        # Check codes: all 12 must be present exactly once in canonical order.
+        codes = [c.code for c in result.checks]
+        assert len(codes) == 12
+        from engram.context_receipts import VERIFICATION_CHECK_CODES as _VCC
+
+        assert codes == list(_VCC)
+
+        # Find the specific checks.
+        check_map = {c.code: c.passed for c in result.checks}
+        assert check_map["manifest_hash"] is False
+        assert check_map["recall_log_exists"] is True
+        assert check_map["recall_log_binding"] is True
+    finally:
+        await _cleanup(owner, tenant_id)
+        await engine.dispose()
+        await owner.close()
+
+
+# ─── 15. Manifest parse failure reports truthful recall_log_exists ──────────
+
+
+async def test_manifest_parse_failure_truthful_recall_log_exists() -> None:
+    """When the manifest cannot be parsed but the recall log exists, the
+    verify result must report:
+    - manifest_parse: False
+    - recall_log_exists: True
+    - recall_log_binding: False (binding cannot be established without manifest)
+    """
+    owner = await _owner_connect()
+    engine = _app_engine()
+    factory = _app_factory(engine)
+    tenant_id = uuid.uuid4()
+    principal_id = uuid.uuid4()
+    rl = uuid.uuid4()
+    rid = uuid.uuid4()
+    item_ids = [uuid.uuid4()]
+    try:
+        await _seed_tenant_principal(
+            owner, tenant_id=tenant_id, principal_id=principal_id, label="mptruth"
+        )
+        await _insert_recall_log(
+            owner,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            recall_log_id=rl,
+            item_ids=item_ids,
+            byte_budget=8192,
+        )
+        await _owner_insert_receipt(
+            owner,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            recall_log_id=rl,
+            receipt_id=rid,
+            item_ids=item_ids,
+        )
+
+        # Corrupt the manifest JSON so it fails to parse. We must also
+        # satisfy chk_context_receipts_manifest_is_object (manifest IS a
+        # JSON object), so we replace with a valid JSON object that won't
+        # parse as a ContextManifestV1.
+        await owner.execute(
+            "UPDATE context_receipts SET manifest = $1::jsonb WHERE id = $2",
+            json.dumps({"broken": "manifest"}),
+            rid,
+        )
+
+        async with factory() as session:
+            await _apply_rls(
+                session, tenant_id=tenant_id, principal_id=principal_id
+            )
+            from engram.context_receipts import get_context_receipt
+
+            receipt = await get_context_receipt(
+                session,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                receipt_id=rid,
+            )
+            assert receipt is not None
+            result = await verify_context_receipt_with_recall_log(
+                session,
+                receipt,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+            )
+        assert result.status == "invalid"
+
+        check_map = {c.code: c.passed for c in result.checks}
+        assert check_map["manifest_parse"] is False
+        assert check_map["recall_log_exists"] is True
+        assert check_map["recall_log_binding"] is False
+    finally:
+        await _cleanup(owner, tenant_id)
+        await engine.dispose()
+        await owner.close()
+
+
+# ─── 16. Verification result always has all 12 check codes ──────────────
+
+
+async def test_verify_result_has_all_12_check_codes() -> None:
+    """A valid receipt's full verify result has all 12 checks in canonical order."""
+    owner = await _owner_connect()
+    engine = _app_engine()
+    factory = _app_factory(engine)
+    tenant_id = uuid.uuid4()
+    principal_id = uuid.uuid4()
+    rl = uuid.uuid4()
+    rid = uuid.uuid4()
+    item_ids = [uuid.uuid4()]
+    try:
+        await _seed_tenant_principal(
+            owner, tenant_id=tenant_id, principal_id=principal_id, label="all12"
+        )
+        await _insert_recall_log(
+            owner,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            recall_log_id=rl,
+            item_ids=item_ids,
+            byte_budget=8192,
+        )
+        await _owner_insert_receipt(
+            owner,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            recall_log_id=rl,
+            receipt_id=rid,
+            item_ids=item_ids,
+        )
+
+        async with factory() as session:
+            await _apply_rls(
+                session, tenant_id=tenant_id, principal_id=principal_id
+            )
+            from engram.context_receipts import get_context_receipt
+
+            receipt = await get_context_receipt(
+                session,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                receipt_id=rid,
+            )
+            assert receipt is not None
+            result = await verify_context_receipt_with_recall_log(
+                session,
+                receipt,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+            )
+        assert result.status == "valid"
+
+        codes = [c.code for c in result.checks]
+        assert len(codes) == 12
+        from engram.context_receipts import VERIFICATION_CHECK_CODES as _VCC
+
+        assert codes == list(_VCC)
+        assert all(c.passed for c in result.checks)
     finally:
         await _cleanup(owner, tenant_id)
         await engine.dispose()

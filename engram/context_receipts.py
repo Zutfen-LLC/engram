@@ -883,10 +883,16 @@ def decode_receipt_cursor(cursor: str) -> tuple[datetime, UUID]:
     if keys != _CURSOR_PAYLOAD_KEYS:
         raise InvalidCursorError("invalid cursor fields")
 
+    # Version: reject bool (bool is an int subclass in Python) and require
+    # exact integer equality.
     version = payload["v"]
-    if not isinstance(version, int) or version != _CURSOR_VERSION:
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise InvalidCursorError("unsupported cursor version")
+    if version != _CURSOR_VERSION:
         raise InvalidCursorError("unsupported cursor version")
 
+    # Timestamp: reject naive timestamps. Never assume UTC — a cursor with a
+    # naive timestamp is malformed because the encoder always produces tz-aware.
     created_at_str = payload["created_at"]
     if not isinstance(created_at_str, str):
         raise InvalidCursorError("invalid cursor created_at")
@@ -895,9 +901,9 @@ def decode_receipt_cursor(cursor: str) -> tuple[datetime, UUID]:
     except ValueError as exc:
         raise InvalidCursorError("invalid cursor timestamp") from exc
     if created_at.tzinfo is None:
-        # Accept a naive timestamp by assuming UTC (common in ISO round-trips).
-        created_at = created_at.replace(tzinfo=UTC)
+        raise InvalidCursorError("cursor timestamp must be timezone-aware")
 
+    # UUID: require canonical lowercase 8-4-4-4-12 form.
     id_str = payload["id"]
     if not isinstance(id_str, str):
         raise InvalidCursorError("invalid cursor id")
@@ -905,6 +911,8 @@ def decode_receipt_cursor(cursor: str) -> tuple[datetime, UUID]:
         receipt_id = UUID(id_str)
     except (ValueError, AttributeError) as exc:
         raise InvalidCursorError("invalid cursor uuid") from exc
+    if id_str != str(receipt_id):
+        raise InvalidCursorError("cursor uuid must be canonical lowercase form")
 
     return created_at, receipt_id
 
@@ -920,14 +928,31 @@ def profile_eligible(
 ) -> bool:
     """Check whether a receipt's manifest subject matches a profile context.
 
-    When the current credential is unprofiled (both IDs ``None``), any receipt
-    owned by the same tenant/principal is eligible.  When profile-bound, the
-    manifest's ``memory_profile_id`` and ``memory_profile_revision_id`` must
-    exactly equal the resolved profile and revision — including null state.
+    Unprofiled access (both current IDs ``None``): any receipt already proven to
+    belong to the tenant/principal is eligible, regardless of the receipt's
+    historical profile identity.  No manifest subject parsing is required.
+
+    Profile-bound access: the manifest's ``memory_profile_id`` and
+    ``memory_profile_revision_id`` must both be non-null and exactly equal the
+    resolved profile and revision.
+
+    Partially specified current profile context (one None, one non-None) fails
+    closed (returns False).
 
     Profile access is never inferred from slug, version, workspace, or
     principal identity alone.
     """
+    # Unprofiled credential: any receipt owned by the same tenant/principal is
+    # eligible.  No manifest parsing required — ownership was already proven
+    # by the explicit tenant/principal predicates in get/list.
+    if memory_profile_id is None and memory_profile_revision_id is None:
+        return True
+
+    # Partially specified current profile context: fail closed.
+    if memory_profile_id is None or memory_profile_revision_id is None:
+        return False
+
+    # Profile-bound: require exact manifest subject match.
     subject = receipt_manifest.get("subject")
     if not isinstance(subject, dict):
         return False
@@ -938,7 +963,7 @@ def profile_eligible(
     def _norm(v: object) -> str | None:
         return str(v) if v is not None else None
 
-    return _norm(m_pid) == _norm(memory_profile_id) and _norm(m_rid) == _norm(
+    return _norm(m_pid) == str(memory_profile_id) and _norm(m_rid) == str(
         memory_profile_revision_id
     )
 
@@ -971,11 +996,17 @@ async def list_context_receipts(
     pagination never duplicates or omits rows when timestamps are equal.
 
     Profile narrowing:
-      - When ``memory_profile_id`` is ``None`` (unprofiled credential), all
-        receipts owned by the tenant/principal are returned.
+      - When the current credential is unprofiled (``memory_profile_id`` is
+        ``None``), no profile filter is applied — all receipts owned by the
+        tenant/principal are eligible.
       - When profile-bound, only receipts whose manifest subject carries the
         exact same ``memory_profile_id`` AND ``memory_profile_revision_id``
-        are returned.
+        (as JSONB string values) are returned.
+
+    Profile filtering is applied as a SQL WHERE clause BEFORE ``LIMIT`` so
+    that an empty page means there are genuinely no more eligible rows, and
+    ``next_cursor`` is derived from the last eligible row under the filtered
+    query.
 
     Does not perform cryptographic verification for every row (that is the
     verify endpoint's job). A malformed manifest does not make the timeline
@@ -990,6 +1021,21 @@ async def list_context_receipts(
 
     if recall_log_id is not None:
         stmt = stmt.where(ContextReceipt.recall_log_id == recall_log_id)
+
+    # Apply profile narrowing as a SQL filter BEFORE pagination so that
+    # an empty page means there are genuinely no more eligible rows.
+    profile_bound = (
+        memory_profile_id is not None and memory_profile_revision_id is not None
+    )
+    if profile_bound:
+        pid_str = str(memory_profile_id)
+        rid_str = str(memory_profile_revision_id)
+        stmt = stmt.where(
+            ContextReceipt.manifest["subject"]["memory_profile_id"].as_string()
+            == pid_str,
+            ContextReceipt.manifest["subject"]["memory_profile_revision_id"].as_string()
+            == rid_str,
+        )
 
     # Cursor: return rows strictly before (created_at, id) in DESC order.
     # That means: created_at < cursor_created_at OR
@@ -1016,28 +1062,6 @@ async def list_context_receipts(
     if has_more:
         rows = rows[:limit]
 
-    # Apply profile narrowing in Python (the manifest subject is JSONB; a
-    # SQL expression filter would require JSON path operators that are not
-    # portable and the narrowing is per-row, not per-cursor).
-    if memory_profile_id is not None or memory_profile_revision_id is not None:
-        rows = [
-            r
-            for r in rows
-            if profile_eligible(
-                r.manifest,
-                memory_profile_id=memory_profile_id,
-                memory_profile_revision_id=memory_profile_revision_id,
-            )
-        ]
-        # After filtering, there may be fewer than `limit`. That is fine —
-        # we do not fetch a second page inside this call. The next_cursor
-        # is still derived from the actual last DB row before filtering so
-        # it remains a valid keyset continuation point.
-        # However, if filtering removed all rows and the DB had more, we
-        # should set next_cursor so the caller can page to find matching
-        # rows. If filtering removed some rows but we had `has_more`, the
-        # cursor points at the last fetched DB row (correct continuation).
-
     next_cursor = None
     if has_more and rows:
         last = rows[-1]
@@ -1049,6 +1073,18 @@ async def list_context_receipts(
 
 
 # ─── Full verification with recall-log binding (ENG-CONTEXT-003A) ──────
+
+
+def _manifest_failed_parse(result: ContextReceiptVerificationResult) -> bool:
+    """True when the stored-record verification failed at the parse step.
+
+    A parse failure means ``manifest`` is None because the JSON could not be
+    parsed, not because a downstream check (hash/envelope/ownership) failed.
+    """
+    return result.failure_code is not None and result.failure_code in (
+        VERIFICATION_FAILURE_MANIFEST_PARSE_FAILED,
+        VERIFICATION_FAILURE_EMBEDDED_MANIFEST_HASH_FORBIDDEN,
+    )
 
 
 async def verify_context_receipt_with_recall_log(
@@ -1078,33 +1114,28 @@ async def verify_context_receipt_with_recall_log(
     stored_result = _verify_stored_record(receipt)
     checks = list(stored_result.checks)
 
-    # If the stored record already failed at parse, we cannot compare the
-    # manifest to the recall log (there is no parsed manifest). Still report
-    # the recall-log checks as failed so the response is complete.
-    if stored_result.manifest is None:
-        checks.append(
-            ContextReceiptVerificationCheck(
-                VERIFICATION_CHECK_RECALL_LOG_EXISTS, False
-            )
-        )
-        checks.append(
-            ContextReceiptVerificationCheck(
-                VERIFICATION_CHECK_RECALL_LOG_BINDING, False
-            )
-        )
-        # Use the stored failure code as the overall code, or add
-        # RECALL_LOG_NOT_FOUND if the stored checks passed but recall-log
-        # failed.
-        return ContextReceiptVerificationResult(
-            status="invalid",
-            checks=checks,
-            failure_code=stored_result.failure_code,
-            manifest=None,
-            recomputed_manifest_hash=stored_result.recomputed_manifest_hash,
-            manifest_packet_hash=stored_result.manifest_packet_hash,
-        )
+    # When the manifest parsed successfully, we can still check recall-log
+    # existence and binding even if another stored-record integrity check
+    # already failed. The manifest is preserved by _verify_stored_record only
+    # on success; but a manifest that parsed can have failed hash/envelope/
+    # ownership checks — in that case the manifest is still usable for
+    # recall-log comparison.
+    #
+    # When the manifest failed to parse, recall_log_binding cannot be
+    # established (no manifest to compare), but recall_log_exists must still
+    # be checked truthfully.
 
-    # Load the parent recall log with explicit ownership predicates.
+    manifest: ContextManifestV1 | None = stored_result.manifest
+
+    # If _verify_stored_record set manifest=None due to a non-parse failure
+    # (hash/envelope/ownership), re-parse so we can attempt recall-log binding.
+    if manifest is None and not _manifest_failed_parse(stored_result):
+        try:
+            manifest = ContextManifestV1.model_validate(receipt.manifest)
+        except Exception:  # noqa: BLE001
+            manifest = None
+
+    # recall_log_exists: check independently of stored-record validity.
     recall_log = await session.scalar(
         select(RecallLog).where(
             RecallLog.id == receipt.recall_log_id,
@@ -1113,41 +1144,25 @@ async def verify_context_receipt_with_recall_log(
         )
     )
 
-    if recall_log is None:
-        checks.append(
-            ContextReceiptVerificationCheck(
-                VERIFICATION_CHECK_RECALL_LOG_EXISTS, False
-            )
-        )
-        checks.append(
-            ContextReceiptVerificationCheck(
-                VERIFICATION_CHECK_RECALL_LOG_BINDING, False
-            )
-        )
-        return ContextReceiptVerificationResult(
-            status="invalid",
-            checks=checks,
-            failure_code=VERIFICATION_FAILURE_RECALL_LOG_NOT_FOUND,
-            manifest=stored_result.manifest,
-            recomputed_manifest_hash=stored_result.recomputed_manifest_hash,
-            manifest_packet_hash=stored_result.manifest_packet_hash,
-        )
-
+    recall_log_exists = recall_log is not None
     checks.append(
         ContextReceiptVerificationCheck(
-            VERIFICATION_CHECK_RECALL_LOG_EXISTS, True
+            VERIFICATION_CHECK_RECALL_LOG_EXISTS, recall_log_exists
         )
     )
 
-    # Recall-log binding: reuse the exact same overlap contract from store
-    # time. If it raises, that is a binding mismatch.
-    binding_ok = True
-    try:
-        _validate_recall_log_overlap(
-            recall_log=recall_log, manifest=stored_result.manifest
-        )
-    except ContextReceiptConflictError:
-        binding_ok = False
+    # recall_log_binding: only evaluable when we have both a parsed manifest
+    # and the recall log exists. Otherwise it fails.
+    binding_ok = False
+    if manifest is not None and recall_log_exists:
+        assert recall_log is not None  # narrowed by recall_log_exists
+        binding_ok = True
+        try:
+            _validate_recall_log_overlap(
+                recall_log=recall_log, manifest=manifest
+            )
+        except ContextReceiptConflictError:
+            binding_ok = False
 
     checks.append(
         ContextReceiptVerificationCheck(
@@ -1155,8 +1170,16 @@ async def verify_context_receipt_with_recall_log(
         )
     )
 
+    # Determine the overall failure code by precedence:
+    # 1. The stored-record failure code (if any) takes precedence.
+    # 2. RECALL_LOG_NOT_FOUND if the stored checks passed but the recall log
+    #    does not exist.
+    # 3. RECALL_LOG_BINDING_MISMATCH if stored checks passed, recall log
+    #    exists, but binding failed.
     failure_code = stored_result.failure_code
-    if not binding_ok and failure_code is None:
+    if failure_code is None and not recall_log_exists:
+        failure_code = VERIFICATION_FAILURE_RECALL_LOG_NOT_FOUND
+    elif failure_code is None and not binding_ok:
         failure_code = VERIFICATION_FAILURE_RECALL_LOG_BINDING_MISMATCH
 
     status: Literal["valid", "invalid"] = (
@@ -1166,7 +1189,7 @@ async def verify_context_receipt_with_recall_log(
         status=status,
         checks=checks,
         failure_code=failure_code,
-        manifest=stored_result.manifest if status == "valid" else None,
+        manifest=manifest if status == "valid" else None,
         recomputed_manifest_hash=stored_result.recomputed_manifest_hash,
         manifest_packet_hash=stored_result.manifest_packet_hash,
     )
