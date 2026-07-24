@@ -373,3 +373,80 @@ class DiaryWriteResponse(BaseModel):
     attribution_status: Literal["recorded", "legacy_unknown"]
     authority: int
     authority_label: str
+
+
+# ---- /v1/context-receipts (ENG-CONTEXT-003A) ----
+
+
+class ContextReceiptListItem(BaseModel):
+    """Summary of one receipt for the timeline list."""
+
+    id: UUID
+    recall_log_id: UUID
+    created_at: datetime
+    retention_expires_at: datetime | None
+    manifest_schema: str
+    manifest_schema_version: str
+    canonicalization: str
+    mode: str
+    manifest_hash: str
+    packet_hash: str
+    manifest_parse_status: Literal["valid", "invalid"]
+    item_count: int | None = None
+    served_content_byte_count: int | None = None
+    rendered_packet_byte_count: int | None = None
+    workspace_id: UUID | None = None
+    memory_context_version: str | None = None
+    memory_profile_id: UUID | None = None
+    memory_profile_revision_id: UUID | None = None
+    memory_profile_version: int | None = None
+    scoring_version: str | None = None
+    config_version: str | None = None
+
+
+class ContextReceiptListResponse(BaseModel):
+    items: list[ContextReceiptListItem]
+    next_cursor: str | None = None
+
+
+class ContextReceiptDetailResponse(BaseModel):
+    """Full receipt envelope with the exact stored manifest JSON object."""
+
+    id: UUID
+    recall_log_id: UUID
+    created_at: datetime
+    retention_expires_at: datetime | None
+    manifest_schema: str
+    manifest_schema_version: str
+    canonicalization: str
+    mode: str
+    manifest_hash: str
+    packet_hash: str
+    manifest_parse_status: Literal["valid", "invalid"]
+    manifest: dict[str, Any] = Field(
+        description=(
+            "The exact stored JSON object; no normalization or rehydrated content."
+        )
+    )
+
+
+class ContextReceiptVerificationCheck(BaseModel):
+    code: str
+    passed: bool
+
+
+class ContextReceiptVerifyResponse(BaseModel):
+    receipt_id: UUID
+    status: Literal["valid", "invalid"]
+    verification_scope: Literal["stored_artifact_and_recall_log_binding"]
+    checks: list[ContextReceiptVerificationCheck]
+    failure_code: str | None = None
+    stored_manifest_hash: str
+    recomputed_manifest_hash: str | None = None
+    stored_packet_hash: str
+    manifest_packet_hash: str | None = None
+    manifest_schema: str | None = None
+    manifest_schema_version: str | None = None
+    canonicalization: str | None = None
+    mode: str | None = None
+    limitations: list[str] = Field(default_factory=list)

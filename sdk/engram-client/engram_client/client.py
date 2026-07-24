@@ -29,6 +29,9 @@ from .models import (
     ApiKeyCreateResponse,
     ClassifyRequest,
     ClassifyResponse,
+    ContextReceiptDetailResponse,
+    ContextReceiptListResponse,
+    ContextReceiptVerifyResponse,
     DiaryWrite,
     DiaryWriteResponse,
     KgAddRequest,
@@ -506,4 +509,49 @@ class EngramClient:
             "/v1/diary",
             DiaryWriteResponse,
             json_body=req.model_dump(mode="json", exclude_none=True),
+        )
+
+    # ---- /v1/context-receipts (ENG-CONTEXT-003A) ----
+
+    async def list_context_receipts(
+        self,
+        *,
+        limit: int = 50,
+        cursor: str | None = None,
+        recall_log_id: UUID | None = None,
+    ) -> ContextReceiptListResponse:
+        """List the authenticated principal's readable receipts newest-first."""
+        params: dict[str, Any] = {"limit": limit}
+        if cursor is not None:
+            params["cursor"] = cursor
+        if recall_log_id is not None:
+            params["recall_log_id"] = str(recall_log_id)
+        return await self._send(
+            "GET",
+            "/v1/context-receipts",
+            ContextReceiptListResponse,
+            params=params,
+        )
+
+    async def get_context_receipt(self, receipt_id: UUID) -> ContextReceiptDetailResponse:
+        """Inspect one receipt envelope and its exact stored manifest."""
+        return await self._send(
+            "GET",
+            f"/v1/context-receipts/{receipt_id}",
+            ContextReceiptDetailResponse,
+        )
+
+    async def verify_context_receipt(self, receipt_id: UUID) -> ContextReceiptVerifyResponse:
+        """Perform deterministic read-only verification of one stored receipt.
+
+        Returns a typed response with ``status="valid"`` or
+        ``status="invalid"``. An integrity failure (``status="invalid"``)
+        is NOT raised as an exception — it is a normal 200 response with a
+        ``failure_code``. Only inaccessible receipts raise (404
+        :class:`EngramNotFoundError`).
+        """
+        return await self._send(
+            "GET",
+            f"/v1/context-receipts/{receipt_id}/verify",
+            ContextReceiptVerifyResponse,
         )

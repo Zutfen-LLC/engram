@@ -24,6 +24,11 @@ from .models import (
     ApiKeyCreateResponse,
     ClassifyRequest,
     ClassifyResponse,
+    ContextReceiptDetailResponse,
+    ContextReceiptListItem,
+    ContextReceiptListResponse,
+    ContextReceiptVerificationCheck,
+    ContextReceiptVerifyResponse,
     DiaryWrite,
     DiaryWriteResponse,
     KgAddRequest,
@@ -93,4 +98,10 @@ __all__ = [
     "AgentCreateRequest",
     "AgentCreated",
     "WhoAmIResponse",
+    # context receipts (ENG-CONTEXT-003A)
+    "ContextReceiptListItem",
+    "ContextReceiptListResponse",
+    "ContextReceiptDetailResponse",
+    "ContextReceiptVerificationCheck",
+    "ContextReceiptVerifyResponse",
 ]

@@ -53,6 +53,12 @@ _EXPLICITLY_UNAFFECTED_GET_ROUTES = {
     ("GET", "/v1/tunnels"),
     ("GET", "/v1/admin/principals"),
     ("GET", "/v1/admin/memory-kinds"),
+    # ENG-CONTEXT-003A: receipt inspect/verify read receipts, not memory
+    # items. The memory-context dependency is used for profile narrowing
+    # (which receipts the caller may see), not for item-level read scoping.
+    ("GET", "/v1/context-receipts"),
+    ("GET", "/v1/context-receipts/{receipt_id}"),
+    ("GET", "/v1/context-receipts/{receipt_id}/verify"),
 }
 
 
