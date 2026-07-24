@@ -23,13 +23,17 @@ Lists the authenticated principal's readable receipts, newest-first.
 
 **Profile narrowing:**
 
-- An **unprofiled** credential may inspect any receipt owned by the same
+- An **unprofiled** credential (both `memory_profile_id` and
+  `memory_profile_revision_id` null) may inspect any receipt owned by the same
   tenant and principal.
-- A **profile-bound** credential may inspect only receipts whose manifest
-  subject carries the exact same `memory_profile_id` AND
+- A **profile-bound** credential (both non-null) may inspect only receipts
+  whose manifest subject carries the exact same `memory_profile_id` AND
   `memory_profile_revision_id` — including null state. A profiled credential
   cannot read unprofiled receipts, receipts from another profile, or receipts
   from an older/newer revision.
+- A **partially specified** context (exactly one null, one non-null) is an
+  invalid state. The API fails closed with a `401` response — it never
+  returns unrestricted receipts from a partial profile context.
 
 **Response:**
 
@@ -68,6 +72,11 @@ Lists the authenticated principal's readable receipts, newest-first.
 
 - The cursor is an opaque URL-safe base64 payload containing the sort key
   (`created_at`, `id`) of the last row returned.
+- Only cursors produced by this API's encoder are accepted. Timezone-aware
+  but noncanonical timestamp spellings (Z-form `...Z`, non-UTC offsets like
+  `+05:00`, trailing-zero fractional seconds like `.000000`) are rejected,
+  even when they represent the same instant. This prevents ambiguity in
+  keyset pagination.
 - Malformed or unsupported cursors return `422` and are never silently
   ignored.
 - Pagination is stable across equal timestamps (ordered by
@@ -185,6 +194,27 @@ parent recall-log binding.
 ```
 
 ## Verification checks
+
+Every verification result — valid or invalid — includes all 12 check codes
+exactly once in canonical order:
+
+1. `manifest_parse`
+2. `manifest_hash`
+3. `packet_hash_binding`
+4. `envelope_schema`
+5. `envelope_schema_version`
+6. `envelope_canonicalization`
+7. `envelope_mode`
+8. `subject_tenant`
+9. `subject_principal`
+10. `embedded_manifest_hash_absent`
+11. `recall_log_exists`
+12. `recall_log_binding`
+
+On a manifest parse failure, checks that require a parsed manifest are set
+to `false` (they cannot be established), while `embedded_manifest_hash_absent`
+is set truthfully from the raw stored JSON. This guarantees a complete matrix
+for every outcome — no abbreviated check lists.
 
 | Check code                    | Description                                    |
 |-------------------------------|------------------------------------------------|

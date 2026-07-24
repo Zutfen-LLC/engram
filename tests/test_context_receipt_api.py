@@ -47,6 +47,7 @@ from engram.api.app import create_app
 from engram.config import settings
 from engram.context_receipts import store_context_receipt
 from engram.db import get_session
+from engram.memory_context import MEMORY_CONTEXT_VERSION, ResolvedMemoryContext
 from tests.context_receipt_helpers import build_manifest
 
 # ─── Engine / session factory (owner privileges, no RLS) ───────────────
@@ -781,3 +782,100 @@ async def test_404_responses_are_identical_for_missing_and_cross_tenant():
     assert cross_resp.json() == missing_resp.json(), (
         "404 bodies must be identical for non-disclosure"
     )
+
+
+# ===========================================================================
+# F. Partial profile context fail-closed (F8)
+# ===========================================================================
+
+
+async def _make_partial_profile_client(
+    tenant_id: str,
+    principal_id: str,
+    *,
+    profile_id_only: bool = False,
+    revision_id_only: bool = False,
+) -> AsyncClient:
+    """ASGI client with a partially specified memory context.
+
+    Overrides ``resolve_memory_context`` to return a ResolvedMemoryContext
+    where exactly one of memory_profile_id / memory_profile_revision_id is set.
+    """
+    app = create_app()
+
+    async def _override_get_session():
+        async with _test_session_factory() as session:
+            await session.execute(
+                text("SELECT set_config('app.tenant_id', :tid, true)"),
+                {"tid": tenant_id},
+            )
+            await session.execute(
+                text("SELECT set_config('app.principal_id', :pid, true)"),
+                {"pid": principal_id},
+            )
+            yield session
+
+    pid = uuid.uuid4() if profile_id_only else None
+    rid = uuid.uuid4() if revision_id_only else None
+
+    async def _override_memory_context():
+        return ResolvedMemoryContext(
+            version=MEMORY_CONTEXT_VERSION,
+            tenant_id=uuid.UUID(tenant_id),
+            principal_id=uuid.UUID(principal_id),
+            api_key_id=None,
+            memory_profile_id=pid,
+            memory_profile_revision_id=rid,
+            memory_profile_slug="test-profile" if pid else None,
+            memory_profile_version=1 if pid else None,
+            include_private=True,
+            include_tenant=True,
+            include_public=True,
+            readable_workspace_ids=None,
+            allow_tenant_write=True,
+            allow_public_write=True,
+            default_write_visibility="private",
+            default_write_workspace_id=None,
+            writable_workspace_ids=None,
+        )
+
+    from engram.memory_context import resolve_memory_context
+
+    app.dependency_overrides[get_session] = _override_get_session
+    app.dependency_overrides[resolve_memory_context] = _override_memory_context
+    transport = ASGITransport(app=app)
+    return AsyncClient(transport=transport, base_url="http://test")
+
+
+async def test_list_with_partial_profile_id_only_returns_401():
+    """GET /v1/context-receipts with profile_id set and revision_id null
+    cannot expose unrestricted receipts — returns 401 (fail closed)."""
+    if not await _db_ok():
+        _require_db()
+    await _check_table()
+    setup = await _seed_full_setup(num_receipts=2)
+
+    client = await _make_partial_profile_client(
+        setup["tenant_id"], setup["principal_id"], profile_id_only=True
+    )
+    async with client:
+        resp = await client.get("/v1/context-receipts")
+    assert resp.status_code == 401
+    assert resp.json()["detail"] == "Invalid or revoked API key"
+
+
+async def test_list_with_partial_profile_revision_only_returns_401():
+    """GET /v1/context-receipts with revision_id set and profile_id null
+    cannot expose unrestricted receipts — returns 401 (fail closed)."""
+    if not await _db_ok():
+        _require_db()
+    await _check_table()
+    setup = await _seed_full_setup(num_receipts=2)
+
+    client = await _make_partial_profile_client(
+        setup["tenant_id"], setup["principal_id"], revision_id_only=True
+    )
+    async with client:
+        resp = await client.get("/v1/context-receipts")
+    assert resp.status_code == 401
+    assert resp.json()["detail"] == "Invalid or revoked API key"

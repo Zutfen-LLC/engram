@@ -32,6 +32,7 @@ from engram.auth import READ_SCOPE
 from engram.context_manifest import ContextManifestV1
 from engram.context_receipts import (
     InvalidCursorError,
+    PartialProfileContextError,
     get_context_receipt,
     list_context_receipts,
     profile_eligible,
@@ -268,6 +269,15 @@ async def list_receipts(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="invalid or malformed cursor",
+        ) from exc
+    except PartialProfileContextError as exc:
+        # A partially specified profile context is an invalid state — never
+        # leak profile details. Translate to the same generic invalid-
+        # credential behavior used for an incoherent ResolvedMemoryContext.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or revoked API key",
+            headers={"WWW-Authenticate": "Bearer"},
         ) from exc
 
     items = [_to_list_item(r) for r in result.items]

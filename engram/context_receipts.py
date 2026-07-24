@@ -58,6 +58,7 @@ __all__ = [
     "ContextReceiptVerificationCheck",
     "ContextReceiptVerificationResult",
     "InvalidCursorError",
+    "PartialProfileContextError",
     "VERIFICATION_CHECK_CODES",
     "VERIFICATION_FAILURE_CODES",
     "decode_receipt_cursor",
@@ -113,6 +114,18 @@ class ContextReceiptIntegrityError(ContextReceiptError):
     def __init__(self, message: str, *, code: str | None = None) -> None:
         super().__init__(message)
         self.code = code or VERIFICATION_FAILURE_UNKNOWN
+
+
+class PartialProfileContextError(ContextReceiptError):
+    """Exactly one of memory_profile_id and memory_profile_revision_id is null.
+
+    A partially specified profile context is an invalid state — it must not be
+    treated as unprofiled (which would return unrestricted receipts). The
+    repository raises this so callers can fail closed before executing the
+    list query. If this error reaches the REST route, it is translated to the
+    same generic invalid-credential behavior used for an incoherent
+    ResolvedMemoryContext, without leaking profile details.
+    """
 
 
 # ─── Stable verification check and failure codes ───────────────────────
@@ -422,6 +435,10 @@ def _verify_stored_record(receipt: ContextReceipt) -> ContextReceiptVerification
     On success ``status`` is ``"valid"`` and ``manifest`` is the parsed
     :class:`ContextManifestV1`.  On failure ``status`` is ``"invalid"`` and
     ``failure_code`` is the stable code of the first failing check.
+
+    Every result — including manifest parse failure and embedded-manifest-hash
+    failure — contains all 10 stored-record check codes exactly once in
+    ``VERIFICATION_CHECK_CODES`` order.
     """
     checks: list[ContextReceiptVerificationCheck] = []
     failure_code: str | None = None
@@ -443,6 +460,7 @@ def _verify_stored_record(receipt: ContextReceipt) -> ContextReceiptVerification
             )
         )
     except Exception:  # noqa: BLE001 — any parse failure is an integrity defect
+        # Parse failure: record manifest_parse=False and set failure code.
         checks.append(
             ContextReceiptVerificationCheck(
                 VERIFICATION_CHECK_MANIFEST_PARSE, False
@@ -452,21 +470,34 @@ def _verify_stored_record(receipt: ContextReceipt) -> ContextReceiptVerification
         # real defect (not a generic parse failure). The strict model rejects
         # extra fields, so this path is reachable when the field is smuggled.
         if embedded_hash_forbidden:
-            checks.append(
-                ContextReceiptVerificationCheck(
-                    VERIFICATION_CHECK_EMBEDDED_MANIFEST_HASH_ABSENT, False
-                )
-            )
             failure_code = VERIFICATION_FAILURE_EMBEDDED_MANIFEST_HASH_FORBIDDEN
         else:
-            # Record embedded check as passed (no smuggled field) so the
-            # check list is complete.
-            checks.append(
-                ContextReceiptVerificationCheck(
-                    VERIFICATION_CHECK_EMBEDDED_MANIFEST_HASH_ABSENT, True
-                )
-            )
             failure_code = VERIFICATION_FAILURE_MANIFEST_PARSE_FAILED
+
+        # On parse failure, the remaining checks cannot be established
+        # because there is no parsed manifest to compare against. Set them
+        # all to False in canonical order, EXCEPT embedded_manifest_hash_absent
+        # which is truthful from the raw stored JSON.
+        for code in (
+            VERIFICATION_CHECK_MANIFEST_HASH,
+            VERIFICATION_CHECK_PACKET_HASH_BINDING,
+            VERIFICATION_CHECK_ENVELOPE_SCHEMA,
+            VERIFICATION_CHECK_ENVELOPE_SCHEMA_VERSION,
+            VERIFICATION_CHECK_ENVELOPE_CANONICALIZATION,
+            VERIFICATION_CHECK_ENVELOPE_MODE,
+            VERIFICATION_CHECK_SUBJECT_TENANT,
+            VERIFICATION_CHECK_SUBJECT_PRINCIPAL,
+        ):
+            checks.append(ContextReceiptVerificationCheck(code, False))
+
+        # embedded_manifest_hash_absent — truthful from the raw stored JSON.
+        checks.append(
+            ContextReceiptVerificationCheck(
+                VERIFICATION_CHECK_EMBEDDED_MANIFEST_HASH_ABSENT,
+                not embedded_hash_forbidden,
+            )
+        )
+
         return ContextReceiptVerificationResult(
             status="invalid",
             checks=checks,
@@ -862,7 +893,15 @@ def decode_receipt_cursor(cursor: str) -> tuple[datetime, UUID]:
     Returns ``(created_at, receipt_id)`` with a timezone-aware datetime and a
     validated UUID. Raises :class:`InvalidCursorError` for any malformed
     payload: bad base64, bad JSON, missing/extra fields, unsupported version,
-    non-canonical UUID, or naive timestamp.
+    non-canonical UUID, naive timestamp, or non-canonical timestamp/UUID
+    spellings.
+
+    Canonical validation: after decoding and field validation, the entire
+    cursor is validated by re-encoding the decoded sort key and requiring
+    exact equality with the supplied unpadded cursor. This rejects
+    timezone-aware-but-noncanonical representations (Z-form timestamps,
+    non-UTC offsets, noncanonical fractional-second spellings) that would
+    re-encode differently from the canonical encoder output.
     """
     # Validate base64 first.
     padding = "=" * (-len(cursor) % 4)
@@ -913,6 +952,19 @@ def decode_receipt_cursor(cursor: str) -> tuple[datetime, UUID]:
         raise InvalidCursorError("invalid cursor uuid") from exc
     if id_str != str(receipt_id):
         raise InvalidCursorError("cursor uuid must be canonical lowercase form")
+
+    # Canonical validation: re-encode the decoded sort key and require exact
+    # equality with the supplied unpadded cursor. This catches noncanonical
+    # timestamp spellings (Z-form, non-UTC offsets, trailing-zero fractional
+    # seconds) that represent the same instant but would not reproduce the
+    # exact encoder output. JSON key ordering and separators are canonical
+    # (sort_keys=True, compact separators), so any payload-level deviation
+    # is also caught here.
+    canonical = encode_receipt_cursor(
+        created_at=created_at, receipt_id=receipt_id
+    )
+    if canonical != cursor:
+        raise InvalidCursorError("cursor is not in canonical encoder form")
 
     return created_at, receipt_id
 
@@ -996,12 +1048,15 @@ async def list_context_receipts(
     pagination never duplicates or omits rows when timestamps are equal.
 
     Profile narrowing:
-      - When the current credential is unprofiled (``memory_profile_id`` is
-        ``None``), no profile filter is applied — all receipts owned by the
-        tenant/principal are eligible.
-      - When profile-bound, only receipts whose manifest subject carries the
-        exact same ``memory_profile_id`` AND ``memory_profile_revision_id``
-        (as JSONB string values) are returned.
+      - When the current credential is unprofiled (both ``memory_profile_id``
+        and ``memory_profile_revision_id`` are ``None``), no profile filter
+        is applied — all receipts owned by the tenant/principal are eligible.
+      - When profile-bound (both non-null), only receipts whose manifest
+        subject carries the exact same ``memory_profile_id`` AND
+        ``memory_profile_revision_id`` (as JSONB string values) are returned.
+      - A partially specified context (exactly one null, one non-null) raises
+        :class:`PartialProfileContextError` — it is never treated as
+        unprofiled.
 
     Profile filtering is applied as a SQL WHERE clause BEFORE ``LIMIT`` so
     that an empty page means there are genuinely no more eligible rows, and
@@ -1014,6 +1069,15 @@ async def list_context_receipts(
 
     Does not commit or roll back.
     """
+    # Fail closed: a partially specified profile context is invalid.
+    # Exactly one of memory_profile_id / memory_profile_revision_id being null
+    # must NOT be treated as unprofiled (which would return unrestricted
+    # receipts).
+    if (memory_profile_id is None) != (memory_profile_revision_id is None):
+        raise PartialProfileContextError(
+            "partially specified profile context: exactly one of "
+            "memory_profile_id and memory_profile_revision_id is null"
+        )
     stmt = select(ContextReceipt).where(
         ContextReceipt.tenant_id == tenant_id,
         ContextReceipt.principal_id == principal_id,

@@ -44,9 +44,11 @@ from engram.context_receipts import (
     ContextReceiptIntegrityError,
     ContextReceiptVerificationResult,
     InvalidCursorError,
+    PartialProfileContextError,
     _verify_stored_record,
     decode_receipt_cursor,
     encode_receipt_cursor,
+    list_context_receipts,
     profile_eligible,
     verify_context_receipt_record,
 )
@@ -584,28 +586,220 @@ def test_stored_record_has_exactly_10_checks() -> None:
     assert len(result.checks) == 10
 
 
-def test_parse_failure_has_exactly_2_checks() -> None:
-    """A manifest parse failure returns exactly 2 checks:
-    manifest_parse=False and embedded_manifest_hash_absent=True."""
+def test_parse_failure_returns_all_10_stored_record_checks() -> None:
+    """A manifest parse failure must return ALL 10 stored-record check codes
+    exactly once in canonical order, not an abbreviated list.
+
+    Per F7: manifest_parse=False, and all other checks that require a parsed
+    manifest are also false because they cannot be established.
+    embedded_manifest_hash_absent is set truthfully from the raw stored JSON.
+    """
     receipt = _make_receipt()
     receipt.manifest = {"broken": True}
     result = _verify_stored_record(receipt)
-    assert len(result.checks) == 2
-    assert result.checks[0].code == "manifest_parse"
-    assert result.checks[0].passed is False
-    assert result.checks[1].code == "embedded_manifest_hash_absent"
-    assert result.checks[1].passed is True
+
+    assert result.status == "invalid"
+    assert result.failure_code == VERIFICATION_FAILURE_MANIFEST_PARSE_FAILED
+    assert result.manifest is None
+
+    # Must have exactly 10 checks, in canonical order.
+    codes = [c.code for c in result.checks]
+    expected = list(VERIFICATION_CHECK_CODES[:10])
+    assert codes == expected, f"parse failure must have all 10 codes in order: {codes}"
+
+    check_map = {c.code: c.passed for c in result.checks}
+    assert check_map["manifest_parse"] is False
+    # All checks that require a parsed manifest are false.
+    assert check_map["manifest_hash"] is False
+    assert check_map["packet_hash_binding"] is False
+    assert check_map["envelope_schema"] is False
+    assert check_map["envelope_schema_version"] is False
+    assert check_map["envelope_canonicalization"] is False
+    assert check_map["envelope_mode"] is False
+    assert check_map["subject_tenant"] is False
+    assert check_map["subject_principal"] is False
+    # embedded_manifest_hash_absent is true: {"broken": True} has no
+    # smuggled manifest_hash field.
+    assert check_map["embedded_manifest_hash_absent"] is True
 
 
-def test_embedded_hash_failure_has_exactly_2_checks() -> None:
-    """An embedded manifest_hash field produces exactly 2 checks."""
+def test_embedded_hash_failure_returns_all_10_checks() -> None:
+    """An embedded manifest_hash field must return ALL 10 stored-record check
+    codes exactly once in canonical order, with the failure code
+    EMBEDDED_MANIFEST_HASH_FORBIDDEN."""
     receipt = _make_receipt()
     tampered = copy.deepcopy(dict(receipt.manifest))
     tampered["manifest_hash"] = "sha256:" + "a" * 64
     receipt.manifest = tampered
     result = _verify_stored_record(receipt)
-    assert len(result.checks) == 2
-    assert result.checks[0].code == "manifest_parse"
-    assert result.checks[0].passed is False
-    assert result.checks[1].code == "embedded_manifest_hash_absent"
-    assert result.checks[1].passed is False
+
+    assert result.status == "invalid"
+    assert result.failure_code == VERIFICATION_FAILURE_EMBEDDED_MANIFEST_HASH_FORBIDDEN
+
+    codes = [c.code for c in result.checks]
+    expected = list(VERIFICATION_CHECK_CODES[:10])
+    assert codes == expected, f"hash failure must have all 10 codes in order: {codes}"
+
+    check_map = {c.code: c.passed for c in result.checks}
+    assert check_map["manifest_parse"] is False
+    assert check_map["embedded_manifest_hash_absent"] is False
+
+
+def test_no_outcome_has_duplicate_or_missing_checks() -> None:
+    """No verification outcome contains duplicate or missing check codes.
+
+    This is a property test covering the valid case and every failure mode.
+    """
+    receipts_and_expected_codes = [
+        # valid receipt
+        (_make_receipt(), None),
+        # parse failure
+        (_make_receipt(manifest_override={"broken": True}), None),
+        # hash mismatch
+        (_make_receipt(manifest_hash_override="sha256:" + "0" * 64), None),
+        # packet hash mismatch
+        (_make_receipt(packet_hash_override="sha256:" + "1" * 64), None),
+        # embedded hash
+        (
+            _make_receipt(
+                manifest_override={
+                    **_make_receipt().manifest,
+                    "manifest_hash": "sha256:" + "a" * 64,
+                }
+            ),
+            None,
+        ),
+    ]
+
+    for receipt, _ in receipts_and_expected_codes:
+        result = _verify_stored_record(receipt)
+        codes = [c.code for c in result.checks]
+        # No duplicates
+        assert len(codes) == len(set(codes)), f"duplicate codes in {codes}"
+        # All 10 stored-record codes present
+        assert set(codes) == set(VERIFICATION_CHECK_CODES[:10]), (
+            f"missing or extra codes: {codes}"
+        )
+        # In canonical order
+        assert codes == list(VERIFICATION_CHECK_CODES[:10]), (
+            f"codes not in canonical order: {codes}"
+        )
+
+
+# ─── F8: Partial profile context fail-closed ───────────────────────────
+
+
+async def test_partial_profile_id_set_revision_null_raises():
+    """list_context_receipts with profile ID set and revision null fails closed.
+
+    The partial-profile check is the first statement in the function body,
+    so it raises before any DB interaction. A None session is sufficient
+    to prove the guard fires.
+    """
+    with pytest.raises(PartialProfileContextError):
+        await list_context_receipts(
+            session=None,  # type: ignore[arg-type]
+            tenant_id=uuid.uuid4(),
+            principal_id=uuid.uuid4(),
+            memory_profile_id=uuid.uuid4(),
+            memory_profile_revision_id=None,
+        )
+
+
+async def test_partial_profile_revision_set_id_null_raises():
+    """list_context_receipts with revision set and profile ID null fails closed."""
+    with pytest.raises(PartialProfileContextError):
+        await list_context_receipts(
+            session=None,  # type: ignore[arg-type]
+            tenant_id=uuid.uuid4(),
+            principal_id=uuid.uuid4(),
+            memory_profile_id=None,
+            memory_profile_revision_id=uuid.uuid4(),
+        )
+
+
+# ─── Canonical cursor validation (F9) ─────────────────────────────────
+
+
+def _make_cursor_payload(
+    *,
+    created_at: str,
+    receipt_id_str: str | None = None,
+    version: int = 1,
+) -> str:
+    """Build an unpadded URL-safe base64 cursor from explicit field values."""
+    if receipt_id_str is None:
+        receipt_id_str = str(uuid.uuid4())
+    payload = json.dumps(
+        {"v": version, "created_at": created_at, "id": receipt_id_str}
+    ).encode()
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def test_cursor_rejects_z_form_timestamp() -> None:
+    """A cursor timestamp using Z (not +00:00) is rejected.
+
+    The encoder produces +00:00 via .astimezone(UTC).isoformat(). The Z-form
+    is timezone-aware and represents the same instant, but is not canonical.
+    """
+    rid = uuid.uuid4()
+    # Z-form
+    cursor = _make_cursor_payload(
+        created_at="2026-07-24T12:00:00Z", receipt_id_str=str(rid)
+    )
+    with pytest.raises(InvalidCursorError):
+        decode_receipt_cursor(cursor)
+
+
+def test_cursor_rejects_non_utc_offset() -> None:
+    """A cursor timestamp with a non-UTC offset (e.g. +05:00) is rejected
+    even though it represents the same instant."""
+    rid = uuid.uuid4()
+    cursor = _make_cursor_payload(
+        created_at="2026-07-24T17:00:00+05:00", receipt_id_str=str(rid)
+    )
+    with pytest.raises(InvalidCursorError):
+        decode_receipt_cursor(cursor)
+
+
+def test_cursor_rejects_noncanonical_fractional_seconds() -> None:
+    """A cursor timestamp with a noncanonical fractional-second representation
+    is rejected (e.g. trailing zeros that re-encode differently)."""
+    rid = uuid.uuid4()
+    # .000000 would re-encode as no fractional part (or differently)
+    cursor = _make_cursor_payload(
+        created_at="2026-07-24T12:00:00.000000+00:00", receipt_id_str=str(rid)
+    )
+    with pytest.raises(InvalidCursorError):
+        decode_receipt_cursor(cursor)
+
+
+def test_cursor_rejects_noncanonical_fractional_seconds_trailing_zeros() -> None:
+    """Trailing zeros in fractional seconds (e.g. .100000 vs .1) are rejected."""
+    rid = uuid.uuid4()
+    cursor = _make_cursor_payload(
+        created_at="2026-07-24T12:00:00.100000+00:00", receipt_id_str=str(rid)
+    )
+    with pytest.raises(InvalidCursorError):
+        decode_receipt_cursor(cursor)
+
+
+def test_cursor_encoder_round_trips() -> None:
+    """A cursor produced by encode_receipt_cursor still round-trips through
+    decode_receipt_cursor successfully."""
+    ts = datetime(2026, 7, 24, 12, 0, 0, tzinfo=UTC)
+    rid = uuid.uuid4()
+    cursor = encode_receipt_cursor(created_at=ts, receipt_id=rid)
+    decoded_ts, decoded_id = decode_receipt_cursor(cursor)
+    assert decoded_ts == ts
+    assert decoded_id == rid
+
+
+def test_cursor_encoder_with_microseconds_round_trips() -> None:
+    """A cursor with fractional seconds from the encoder round-trips."""
+    ts = datetime(2026, 7, 24, 12, 0, 0, 123456, tzinfo=UTC)
+    rid = uuid.uuid4()
+    cursor = encode_receipt_cursor(created_at=ts, receipt_id=rid)
+    decoded_ts, decoded_id = decode_receipt_cursor(cursor)
+    assert decoded_ts == ts
+    assert decoded_id == rid

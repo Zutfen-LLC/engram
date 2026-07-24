@@ -1465,6 +1465,7 @@ async def test_manifest_parse_failure_truthful_recall_log_exists() -> None:
     - manifest_parse: False
     - recall_log_exists: True
     - recall_log_binding: False (binding cannot be established without manifest)
+    - All 12 check codes exactly once in canonical order (F7).
     """
     owner = await _owner_connect()
     engine = _app_engine()
@@ -1545,9 +1546,107 @@ async def test_manifest_parse_failure_truthful_recall_log_exists() -> None:
             )
         assert result.status == "invalid"
 
+        # F7: all 12 check codes exactly once in canonical order.
+        codes = [c.code for c in result.checks]
+        assert len(codes) == 12
+        from engram.context_receipts import VERIFICATION_CHECK_CODES as _VCC
+
+        assert codes == list(_VCC)
+
         check_map = {c.code: c.passed for c in result.checks}
         assert check_map["manifest_parse"] is False
         assert check_map["recall_log_exists"] is True
+        assert check_map["recall_log_binding"] is False
+    finally:
+        await _cleanup(owner, tenant_id)
+        await engine.dispose()
+        await owner.close()
+
+
+# ─── 15b. Parse failure without parent: recall_log_exists=false ──────
+
+
+async def test_manifest_parse_failure_no_parent_recall_log_not_found() -> None:
+    """Parse failure without a parent recall log: recall_log_exists=False and
+    recall_log_binding=False. All 12 checks present (F7)."""
+    owner = await _owner_connect()
+    engine = _app_engine()
+    factory = _app_factory(engine)
+    tenant_id = uuid.uuid4()
+    principal_id = uuid.uuid4()
+    # Deliberately do NOT seed a recall log — the receipt references a
+    # nonexistent parent.
+    rl = uuid.uuid4()
+    rid = uuid.uuid4()
+    item_ids = [uuid.uuid4()]
+    try:
+        await _seed_tenant_principal(
+            owner, tenant_id=tenant_id, principal_id=principal_id, label="mpnp"
+        )
+        await _owner_insert_receipt(
+            owner,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            recall_log_id=rl,
+            receipt_id=rid,
+            item_ids=item_ids,
+        )
+
+        # Corrupt the manifest so it fails to parse.
+        corrupt_packet_hash = "sha256:" + "0" * 64
+        broken_manifest = {
+            "schema": "engram.context-manifest",
+            "schema_version": "1.0",
+            "canonicalization": "rfc8785",
+            "mode": "startup",
+            "subject": {
+                "tenant_id": str(tenant_id),
+                "principal_id": str(principal_id),
+            },
+            "request": {"invalid": True},
+            "versions": {"invalid": True},
+            "result": {"invalid": True},
+            "packet": {"hash": corrupt_packet_hash},
+            "items": [],
+        }
+        await owner.execute(
+            "UPDATE context_receipts SET manifest = $1::jsonb, "
+            "packet_hash = $2 WHERE id = $3",
+            json.dumps(broken_manifest),
+            corrupt_packet_hash,
+            rid,
+        )
+
+        async with factory() as session:
+            await _apply_rls(
+                session, tenant_id=tenant_id, principal_id=principal_id
+            )
+            from engram.context_receipts import get_context_receipt
+
+            receipt = await get_context_receipt(
+                session,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                receipt_id=rid,
+            )
+            assert receipt is not None
+            result = await verify_context_receipt_with_recall_log(
+                session,
+                receipt,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+            )
+        assert result.status == "invalid"
+
+        codes = [c.code for c in result.checks]
+        assert len(codes) == 12
+        from engram.context_receipts import VERIFICATION_CHECK_CODES as _VCC
+
+        assert codes == list(_VCC)
+
+        check_map = {c.code: c.passed for c in result.checks}
+        assert check_map["manifest_parse"] is False
+        assert check_map["recall_log_exists"] is False
         assert check_map["recall_log_binding"] is False
     finally:
         await _cleanup(owner, tenant_id)
@@ -1616,6 +1715,103 @@ async def test_verify_result_has_all_12_check_codes() -> None:
 
         assert codes == list(_VCC)
         assert all(c.passed for c in result.checks)
+    finally:
+        await _cleanup(owner, tenant_id)
+        await engine.dispose()
+        await owner.close()
+
+
+# ─── 17. Embedded manifest_hash forbidden returns all 12 checks ──────
+
+
+async def test_embedded_manifest_hash_forbidden_returns_all_12_checks() -> None:
+    """An embedded manifest_hash field in the stored JSON must return all 12
+    check codes exactly once in canonical order, with failure code
+    EMBEDDED_MANIFEST_HASH_FORBIDDEN (F7)."""
+    from engram.context_receipts import (
+        VERIFICATION_FAILURE_EMBEDDED_MANIFEST_HASH_FORBIDDEN,
+    )
+
+    owner = await _owner_connect()
+    engine = _app_engine()
+    factory = _app_factory(engine)
+    tenant_id = uuid.uuid4()
+    principal_id = uuid.uuid4()
+    rl = uuid.uuid4()
+    rid = uuid.uuid4()
+    item_ids = [uuid.uuid4()]
+    try:
+        await _seed_tenant_principal(
+            owner,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            label="emhf12",
+        )
+        await _insert_recall_log(
+            owner,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            recall_log_id=rl,
+            item_ids=item_ids,
+            byte_budget=8192,
+        )
+        await _owner_insert_receipt(
+            owner,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            recall_log_id=rl,
+            receipt_id=rid,
+            item_ids=item_ids,
+        )
+
+        # Smuggle a manifest_hash field inside the stored manifest JSON.
+        row = await owner.fetchrow(
+            "SELECT manifest FROM context_receipts WHERE id = $1", rid
+        )
+        tampered = dict(row["manifest"])
+        tampered["manifest_hash"] = "sha256:" + "a" * 64
+        await owner.execute(
+            "UPDATE context_receipts SET manifest = $1::jsonb WHERE id = $2",
+            json.dumps(tampered),
+            rid,
+        )
+
+        async with factory() as session:
+            await _apply_rls(
+                session, tenant_id=tenant_id, principal_id=principal_id
+            )
+            from engram.context_receipts import get_context_receipt
+
+            receipt = await get_context_receipt(
+                session,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                receipt_id=rid,
+            )
+            assert receipt is not None
+            result = await verify_context_receipt_with_recall_log(
+                session,
+                receipt,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+            )
+        assert result.status == "invalid"
+        assert (
+            result.failure_code
+            == VERIFICATION_FAILURE_EMBEDDED_MANIFEST_HASH_FORBIDDEN
+        )
+
+        codes = [c.code for c in result.checks]
+        assert len(codes) == 12
+        from engram.context_receipts import VERIFICATION_CHECK_CODES as _VCC
+
+        assert codes == list(_VCC)
+
+        check_map = {c.code: c.passed for c in result.checks}
+        assert check_map["manifest_parse"] is False
+        assert check_map["embedded_manifest_hash_absent"] is False
+        assert check_map["recall_log_exists"] is True
+        assert check_map["recall_log_binding"] is False
     finally:
         await _cleanup(owner, tenant_id)
         await engine.dispose()
