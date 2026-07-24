@@ -250,6 +250,12 @@ jobs:
         uses: actions/setup-node@v5
         with:
           node-version: "22"
+          # The conformance vectors are run directly with `node` against
+          # stdlib-only .mjs files — there is no npm/pnpm install step here.
+          # Disable package-manager auto-detection/cache so the presence of a
+          # root pnpm-lock.yaml (hosted platform, ENG-PORTAL-001A) does not make
+          # setup-node@v5 require pnpm on PATH.
+          package-manager-cache: false
 
       - name: Verify vectors (Python)
         run: python scripts/verify_context_manifest_vectors.py

@@ -72,6 +72,10 @@ jobs:
         uses: actions/setup-node@v5
         with:
           node-version: "22"
+          # We provision the pinned pnpm explicitly below; disable setup-node's
+          # package-manager auto-cache so the root pnpm-lock.yaml does not make
+          # it require pnpm on PATH before we install it.
+          package-manager-cache: false
 
       - name: Provision pinned pnpm (do not assume corepack)
         run: npm install -g pnpm@9.12.3
@@ -129,6 +133,9 @@ jobs:
         uses: actions/setup-node@v5
         with:
           node-version: "22"
+          # pnpm is provisioned explicitly below; disable package-manager
+          # auto-cache so the root pnpm-lock.yaml does not block setup-node.
+          package-manager-cache: false
 
       - name: Provision pinned pnpm
         run: npm install -g pnpm@9.12.3

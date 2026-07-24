@@ -35,12 +35,21 @@ REQUIRED_HOSTED = {
 }
 
 
+def _compose_args(*files: str) -> list[str]:
+    """Build a ``docker compose`` argument list with ``-f`` for each file."""
+    args: list[str] = []
+    for f in files:
+        args.extend(["-f", f])
+    return args
+
+
 def _run(args: Sequence[str]) -> str:
     return subprocess.run(args, check=True, capture_output=True, text=True).stdout
 
 
 def _resolve(*files: str) -> dict:
-    return json.loads(_run(["docker", "compose", *sum([["-f", f] for f in files], []), "config", "--format", "json"]))
+    cmd = ["docker", "compose", *_compose_args(*files), "config", "--format", "json"]
+    return json.loads(_run(cmd))
 
 
 def fail(msg: str) -> None:
@@ -51,15 +60,25 @@ def fail(msg: str) -> None:
 def main() -> int:
     # 1. Both validate.
     for files in ([ROOT], [ROOT, OVERLAY]):
-        subprocess.run(["docker", "compose", *sum([["-f", f] for f in files], []), "config", "-q"], check=True)
+        cmd = ["docker", "compose", *_compose_args(*files), "config", "-q"]
+        subprocess.run(cmd, check=True)
 
     # 2. Standard-stack non-regression.
-    standard = set(_run(["docker", "compose", "-f", ROOT, "config", "--services"]).split())
+    standard = set(
+        _run(["docker", "compose", *_compose_args(ROOT), "config", "--services"]).split()
+    )
     if standard != STANDARD_SERVICES:
-        fail(f"standard stack changed without overlay: {sorted(standard)} != {sorted(STANDARD_SERVICES)}")
+        fail(
+            "standard stack changed without overlay: "
+            f"{sorted(standard)} != {sorted(STANDARD_SERVICES)}"
+        )
 
     # 3. All hosted services present with overlay.
-    with_overlay = set(_run(["docker", "compose", "-f", ROOT, "-f", OVERLAY, "config", "--services"]).split())
+    with_overlay = set(
+        _run(
+            ["docker", "compose", *_compose_args(ROOT, OVERLAY), "config", "--services"]
+        ).split()
+    )
     missing = REQUIRED_HOSTED - with_overlay
     if missing:
         fail(f"missing hosted services: {sorted(missing)}")
@@ -82,8 +101,8 @@ def main() -> int:
     cp_db = cp_env.get("ENGRAM_CONTROL_DATABASE_URL", "")
     if "engram_control" not in cp_db:
         fail(f"Control Plane DB URL is not the dedicated control DB: {cp_db}")
-    # The core DB name (default engram) must not appear in a CP owner/runtime URL
-    # as the database path. The control plane points only at engram_control.
+    # The core DB name (default engram) must not appear in a CP owner/runtime
+    # URL as the database path. The control plane points only at engram_control.
     for key in ("ENGRAM_CONTROL_DATABASE_URL", "ENGRAM_CONTROL_OWNER_DATABASE_URL"):
         url = cp_env.get(key, "")
         if "/engram_control" not in url:
