@@ -605,12 +605,8 @@ async def test_distractor_heavy_inserts_intended_items(audit_tenant: Any) -> Non
     try:
         assert len(label_map) == 31  # 1 target + 30 distractors
 
-        # Verify the items exist in the DB
+        # Verify the items exist in the DB (owner-level query, no RLS needed)
         async with _test_session_factory() as session:
-            await session.execute(
-                text("SET LOCAL app.tenant_id = :tid"),
-                {"tid": tenant_id},
-            )
             count = (
                 await session.execute(
                     text(
