@@ -2531,8 +2531,15 @@ async def test_fingerprint_excludes_non_active_profile_embeddings(audit_tenant: 
                 f"F17 FAIL: count changed ({count1} -> {count2})"
             )
 
-            # Cleanup
+            # Cleanup: delete the dummy embedding first (FK constraint),
+            # then the dummy profile.
             async with _test_session_factory() as session:
+                await session.execute(
+                    text(
+                        "DELETE FROM memory_embeddings WHERE profile_id = :pid"
+                    ),
+                    {"pid": dummy_profile_id},
+                )
                 await session.execute(
                     text("DELETE FROM embedding_profiles WHERE id = :id"),
                     {"id": dummy_profile_id},
