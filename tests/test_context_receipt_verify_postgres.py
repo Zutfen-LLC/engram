@@ -1800,6 +1800,13 @@ async def test_embedded_manifest_hash_forbidden_returns_all_12_checks() -> None:
         )
 
         # Smuggle a manifest_hash field inside the stored manifest JSON.
+        # The chk_context_receipts_no_manifest_hash_field constraint
+        # prevents this state from being stored, so we must drop the
+        # constraint, corrupt, verify, then clean up and re-add.
+        await owner.execute(
+            "ALTER TABLE context_receipts DROP CONSTRAINT "
+            "IF EXISTS chk_context_receipts_no_manifest_hash_field"
+        )
         row = await owner.fetchrow(
             "SELECT manifest FROM context_receipts WHERE id = $1", rid
         )
@@ -1848,6 +1855,22 @@ async def test_embedded_manifest_hash_forbidden_returns_all_12_checks() -> None:
         assert check_map["recall_log_exists"] is True
         assert check_map["recall_log_binding"] is False
     finally:
+        # Delete the corrupted row before re-adding the constraint.
+        await owner.execute(
+            "DELETE FROM context_receipts WHERE id = $1", rid
+        )
+        await owner.execute(
+            "DO $$ BEGIN "
+            "IF NOT EXISTS ("
+            "  SELECT 1 FROM pg_constraint "
+            "  WHERE conname = 'chk_context_receipts_no_manifest_hash_field' "
+            "  AND conrelid = 'context_receipts'::regclass"
+            ") THEN "
+            "  ALTER TABLE context_receipts "
+            "  ADD CONSTRAINT chk_context_receipts_no_manifest_hash_field "
+            "  CHECK (NOT (manifest ? 'manifest_hash')); "
+            "END IF; END $$"
+        )
         await _cleanup(owner, tenant_id)
         await engine.dispose()
         await owner.close()
