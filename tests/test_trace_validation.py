@@ -731,3 +731,262 @@ def test_uppercase_prompt_sha256_fails(tmp_path: Path) -> None:
         trace, expected_item_id=iid, expected_fixture="recall", expected_run_id=rid
     )
     assert reason is not None
+
+
+# ── ENG-AUDIT-003A-FIX1: trace schema semantics regressions ──────────────────
+#
+# These tests prove the strict 2.0/2.1 field legality contract:
+#
+#   2.0 without configured_item_budget  → valid backward-compatible record
+#   2.0 with configured_item_budget=20  → rejected (HERMES_HOOK_TRACE_INVALID)
+#   2.1 with configured_item_budget=20  → valid
+#   2.1 missing configured_item_budget  → HERMES_TRACE_ITEM_BUDGET_UNPROVEN
+#   2.1 with configured_item_budget=true → rejected (HERMES_HOOK_TRACE_INVALID)
+#   2.1 with configured_item_budget=0   → rejected (HERMES_HOOK_TRACE_INVALID)
+#   2.1 with configured_item_budget=21  → rejected (HERMES_HOOK_TRACE_INVALID)
+#   unknown schema version             → rejected
+#
+# Stage 6 enforcement:
+#   Stage 6 + schema 2.0 without budget → HERMES_TRACE_ITEM_BUDGET_UNPROVEN
+#   Stage 6 + schema 2.0 with smuggled budget=20 → cannot pass
+#   Stage 6 + schema 2.1 missing budget → HERMES_TRACE_ITEM_BUDGET_UNPROVEN
+#   Stage 6 + schema 2.1 budget=5       → HERMES_TRACE_ITEM_BUDGET_MISMATCH
+#   Stage 6 + schema 2.1 budget=20      → passes budget validation
+#
+# No conditional assertions.
+
+
+def _valid_v21_record(
+    item_id: str,
+    *,
+    fixture: str = "recall",
+    run_id: str | None = None,
+    configured_item_budget: int | None = 20,
+) -> dict[str, Any]:
+    """Return a fully valid v2.1 hook-trace record with budget attestation."""
+    rec = _valid_record(item_id, fixture=fixture, run_id=run_id)
+    rec["schema_version"] = "2.1"
+    if configured_item_budget is not None:
+        rec["configured_item_budget"] = configured_item_budget
+    return rec
+
+
+# ── Parser-level tests ───────────────────────────────────────────────────────
+
+
+def test_parser_2_0_without_budget_is_valid() -> None:
+    """2.0 without configured_item_budget is a valid backward-compatible record."""
+    iid = str(uuid.uuid4())
+    rid = str(uuid.uuid4())
+    rec = _valid_record(iid, fixture="recall", run_id=rid)
+    parsed, fail_reason = cli._parse_hook_trace_record(rec)
+    assert parsed is not None
+    assert fail_reason is None
+    assert parsed.schema_version == "2.0"
+    assert parsed.configured_item_budget is None
+
+
+def test_parser_2_0_with_smuggled_budget_rejected() -> None:
+    """2.0 with configured_item_budget=20 is rejected."""
+    iid = str(uuid.uuid4())
+    rid = str(uuid.uuid4())
+    rec = _valid_record(iid, fixture="recall", run_id=rid)
+    rec["configured_item_budget"] = 20
+    parsed, fail_reason = cli._parse_hook_trace_record(rec)
+    assert parsed is None
+    assert fail_reason == "HERMES_HOOK_TRACE_INVALID"
+
+
+def test_parser_2_1_with_budget_20_is_valid() -> None:
+    """2.1 with configured_item_budget=20 is valid."""
+    iid = str(uuid.uuid4())
+    rid = str(uuid.uuid4())
+    rec = _valid_v21_record(iid, fixture="recall", run_id=rid, configured_item_budget=20)
+    parsed, fail_reason = cli._parse_hook_trace_record(rec)
+    assert parsed is not None
+    assert fail_reason is None
+    assert parsed.schema_version == "2.1"
+    assert parsed.configured_item_budget == 20
+
+
+def test_parser_2_1_missing_budget_rejected() -> None:
+    """2.1 missing configured_item_budget is budget-unproven."""
+    iid = str(uuid.uuid4())
+    rid = str(uuid.uuid4())
+    rec = _valid_v21_record(iid, fixture="recall", run_id=rid, configured_item_budget=None)
+    parsed, fail_reason = cli._parse_hook_trace_record(rec)
+    assert parsed is None
+    assert fail_reason == "HERMES_TRACE_ITEM_BUDGET_UNPROVEN"
+
+
+def test_parser_2_1_boolean_budget_rejected() -> None:
+    """2.1 with configured_item_budget=true is rejected (booleans are invalid)."""
+    iid = str(uuid.uuid4())
+    rid = str(uuid.uuid4())
+    rec = _valid_v21_record(iid, fixture="recall", run_id=rid, configured_item_budget=True)  # type: ignore[arg-type]
+    parsed, fail_reason = cli._parse_hook_trace_record(rec)
+    assert parsed is None
+    assert fail_reason == "HERMES_HOOK_TRACE_INVALID"
+
+
+def test_parser_2_1_zero_budget_rejected() -> None:
+    """2.1 with configured_item_budget=0 is rejected (must be 1..20)."""
+    iid = str(uuid.uuid4())
+    rid = str(uuid.uuid4())
+    rec = _valid_v21_record(iid, fixture="recall", run_id=rid, configured_item_budget=0)
+    parsed, fail_reason = cli._parse_hook_trace_record(rec)
+    assert parsed is None
+    assert fail_reason == "HERMES_HOOK_TRACE_INVALID"
+
+
+def test_parser_2_1_budget_21_rejected() -> None:
+    """2.1 with configured_item_budget=21 is rejected (must be 1..20)."""
+    iid = str(uuid.uuid4())
+    rid = str(uuid.uuid4())
+    rec = _valid_v21_record(iid, fixture="recall", run_id=rid, configured_item_budget=21)
+    parsed, fail_reason = cli._parse_hook_trace_record(rec)
+    assert parsed is None
+    assert fail_reason == "HERMES_HOOK_TRACE_INVALID"
+
+
+def test_parser_unknown_schema_version_rejected() -> None:
+    """Unknown schema version is rejected."""
+    iid = str(uuid.uuid4())
+    rid = str(uuid.uuid4())
+    rec = _valid_record(iid, fixture="recall", run_id=rid)
+    rec["schema_version"] = "3.0"
+    parsed, fail_reason = cli._parse_hook_trace_record(rec)
+    assert parsed is None
+    assert fail_reason == "HERMES_HOOK_TRACE_INVALID"
+
+
+# ── Stage 5 compatibility tests ──────────────────────────────────────────────
+
+
+def test_stage5_valid_2_0_without_budget_passes(tmp_path: Path) -> None:
+    """Stage 5 + valid schema 2.0 without budget passes trace validation."""
+    iid = str(uuid.uuid4())
+    rid = str(uuid.uuid4())
+    rec = _valid_record(iid, fixture="recall", run_id=rid)
+    trace = _write_trace(tmp_path, rec)
+    reason, _ = cli._validate_hook_trace(
+        trace, expected_item_id=iid, expected_fixture="recall", expected_run_id=rid
+    )
+    assert reason is None
+
+
+def test_stage5_valid_2_1_with_budget_5_passes(tmp_path: Path) -> None:
+    """Stage 5 + valid schema 2.1 with budget 5 passes trace validation
+    (Stage 5 does not require the budget to equal 20)."""
+    iid = str(uuid.uuid4())
+    rid = str(uuid.uuid4())
+    rec = _valid_v21_record(iid, fixture="recall", run_id=rid, configured_item_budget=5)
+    trace = _write_trace(tmp_path, rec)
+    reason, _ = cli._validate_hook_trace(
+        trace, expected_item_id=iid, expected_fixture="recall", expected_run_id=rid
+    )
+    assert reason is None
+
+
+def test_stage5_2_0_with_smuggled_budget_fails(tmp_path: Path) -> None:
+    """Stage 5 + schema 2.0 with smuggled budget fails at parser level."""
+    iid = str(uuid.uuid4())
+    rid = str(uuid.uuid4())
+    rec = _valid_record(iid, fixture="recall", run_id=rid)
+    rec["configured_item_budget"] = 20
+    trace = _write_trace(tmp_path, rec)
+    reason, _ = cli._validate_hook_trace(
+        trace, expected_item_id=iid, expected_fixture="recall", expected_run_id=rid
+    )
+    assert reason == "HERMES_HOOK_TRACE_INVALID"
+
+
+# ── Stage 6 enforcement tests ────────────────────────────────────────────────
+
+
+def test_stage6_2_0_without_budget_unproven(tmp_path: Path) -> None:
+    """Stage 6 + schema 2.0 without budget → HERMES_TRACE_ITEM_BUDGET_UNPROVEN."""
+    iid = str(uuid.uuid4())
+    rid = str(uuid.uuid4())
+    rec = _valid_record(iid, fixture="epistemic", run_id=rid)
+    trace = _write_trace(tmp_path, rec)
+    reason, _ = cli._validate_hook_trace(
+        trace,
+        expected_item_id=iid,
+        expected_fixture="epistemic",
+        expected_run_id=rid,
+        expected_item_budget=cli.AUDIT_HERMES_ITEM_BUDGET,
+    )
+    assert reason == "HERMES_TRACE_ITEM_BUDGET_UNPROVEN"
+
+
+def test_stage6_2_0_smuggled_budget_cannot_pass(tmp_path: Path) -> None:
+    """Stage 6 + schema 2.0 with smuggled budget=20 cannot pass.
+
+    The parser rejects the smuggled 2.0 record entirely, so the trace
+    file contains zero valid records. This test would fail against the
+    reviewed implementation that accepted the smuggled hybrid.
+    """
+    iid = str(uuid.uuid4())
+    rid = str(uuid.uuid4())
+    rec = _valid_record(iid, fixture="epistemic", run_id=rid)
+    rec["configured_item_budget"] = 20  # smuggle into 2.0
+    trace = _write_trace(tmp_path, rec)
+    reason, _ = cli._validate_hook_trace(
+        trace,
+        expected_item_id=iid,
+        expected_fixture="epistemic",
+        expected_run_id=rid,
+        expected_item_budget=cli.AUDIT_HERMES_ITEM_BUDGET,
+    )
+    assert reason == "HERMES_HOOK_TRACE_INVALID"
+
+
+def test_stage6_2_1_missing_budget_unproven(tmp_path: Path) -> None:
+    """Stage 6 + schema 2.1 missing budget → HERMES_TRACE_ITEM_BUDGET_UNPROVEN."""
+    iid = str(uuid.uuid4())
+    rid = str(uuid.uuid4())
+    rec = _valid_v21_record(iid, fixture="epistemic", run_id=rid, configured_item_budget=None)
+    trace = _write_trace(tmp_path, rec)
+    reason, _ = cli._validate_hook_trace(
+        trace,
+        expected_item_id=iid,
+        expected_fixture="epistemic",
+        expected_run_id=rid,
+        expected_item_budget=cli.AUDIT_HERMES_ITEM_BUDGET,
+    )
+    assert reason == "HERMES_TRACE_ITEM_BUDGET_UNPROVEN"
+
+
+def test_stage6_2_1_budget_5_mismatch(tmp_path: Path) -> None:
+    """Stage 6 + schema 2.1 budget=5 → HERMES_TRACE_ITEM_BUDGET_MISMATCH."""
+    iid = str(uuid.uuid4())
+    rid = str(uuid.uuid4())
+    rec = _valid_v21_record(iid, fixture="epistemic", run_id=rid, configured_item_budget=5)
+    trace = _write_trace(tmp_path, rec)
+    reason, _ = cli._validate_hook_trace(
+        trace,
+        expected_item_id=iid,
+        expected_fixture="epistemic",
+        expected_run_id=rid,
+        expected_item_budget=cli.AUDIT_HERMES_ITEM_BUDGET,
+    )
+    assert reason == "HERMES_TRACE_ITEM_BUDGET_MISMATCH"
+
+
+def test_stage6_2_1_budget_20_passes(tmp_path: Path) -> None:
+    """Stage 6 + schema 2.1 budget=20 passes budget validation."""
+    iid = str(uuid.uuid4())
+    rid = str(uuid.uuid4())
+    rec = _valid_v21_record(iid, fixture="epistemic", run_id=rid, configured_item_budget=20)
+    trace = _write_trace(tmp_path, rec)
+    reason, evidence = cli._validate_hook_trace(
+        trace,
+        expected_item_id=iid,
+        expected_fixture="epistemic",
+        expected_run_id=rid,
+        expected_item_budget=cli.AUDIT_HERMES_ITEM_BUDGET,
+    )
+    assert reason is None
+    assert evidence["configured_item_budget"] == 20
+    assert evidence["schema_version"] == "2.1"

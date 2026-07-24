@@ -2060,6 +2060,22 @@ def _parse_hook_trace_record(
     if record.get("provider") != "engram":
         return None, "HERMES_HOOK_TRACE_INVALID"
 
+    # ── Schema version field legality ───────────────────────────────────
+    # Schema 2.0: must NOT contain configured_item_budget.
+    # Schema 2.1: MUST contain a valid configured_item_budget.
+    if schema_version == "2.0":
+        if "configured_item_budget" in record:
+            return None, "HERMES_HOOK_TRACE_INVALID"
+    elif schema_version == "2.1":
+        cib_raw = record.get("configured_item_budget")
+        if cib_raw is None:
+            # 2.1 missing configured_item_budget — budget-unproven.
+            return None, "HERMES_TRACE_ITEM_BUDGET_UNPROVEN"
+        if not isinstance(cib_raw, int) or isinstance(cib_raw, bool):
+            return None, "HERMES_HOOK_TRACE_INVALID"
+        if cib_raw < 1 or cib_raw > 20:
+            return None, "HERMES_HOOK_TRACE_INVALID"
+
     # ── Boolean gates ───────────────────────────────────────────────────
     if record.get("recall_enabled") is not True:
         return None, "HERMES_HOOK_TRACE_INVALID"
@@ -2150,15 +2166,9 @@ def _parse_hook_trace_record(
     if injected_count != len(injected_item_ids):
         return None, "HERMES_HOOK_TRACE_INVALID"
 
-    # Schema 2.1: parse configured_item_budget (optional in 2.0).
-    configured_item_budget: int | None = None
-    cib_raw = record.get("configured_item_budget")
-    if cib_raw is not None:
-        if not isinstance(cib_raw, int) or isinstance(cib_raw, bool):
-            return None, "HERMES_HOOK_TRACE_INVALID"
-        if cib_raw < 1 or cib_raw > 20:
-            return None, "HERMES_HOOK_TRACE_INVALID"
-        configured_item_budget = cib_raw
+    # configured_item_budget was validated by schema version checks above.
+    # For 2.0 it is None (field absent). For 2.1 it is a valid 1..20 integer.
+    configured_item_budget = record["configured_item_budget"] if schema_version == "2.1" else None
 
     return ValidatedHookTrace(
         schema_version=schema_version,
@@ -2318,9 +2328,18 @@ def _validate_hook_trace(
     # ── Exactly one candidate → budget validation ──────────────────────
     trace = candidates[0]
 
-    # When expected_item_budget is set (Stage 6), require schema 2.1 with a
-    # matching configured_item_budget.
+    # Stage 6 (expected_item_budget is set) requires a trace that truthfully
+    # declares schema 2.1. Do NOT depend solely on the presence of
+    # configured_item_budget to infer the schema version — a malformed 2.0
+    # record carrying that field must be rejected at the parser level (which
+    # it now is), but even a valid 2.0 record cannot satisfy Stage 6.
     if expected_item_budget is not None:
+        if trace.schema_version != HOOK_TRACE_SCHEMA_VERSION_LATEST:
+            return "HERMES_TRACE_ITEM_BUDGET_UNPROVEN", {
+                "schema_version": trace.schema_version,
+                "expected_schema_version": HOOK_TRACE_SCHEMA_VERSION_LATEST,
+                "malformed_line_count": malformed_count,
+            }
         if trace.configured_item_budget is None:
             return "HERMES_TRACE_ITEM_BUDGET_UNPROVEN", {
                 "malformed_line_count": malformed_count,

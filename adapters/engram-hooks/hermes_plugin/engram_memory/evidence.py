@@ -391,28 +391,6 @@ def render_envelope(
     return render_envelope_result(items, recall_log_ids, traces, max_bytes).context
 
 
-def _find_rendered_item_ids(
-    context: str | None,
-    items: Sequence[EvidenceItem],
-) -> tuple[EvidenceItem, ...]:
-    """Determine which items actually appear in the rendered context.
-
-    An item is considered retained if its ``id`` appears in the rendered
-    context string as an XML attribute value. This accurately identifies
-    which items survived rendering even when content was truncated.
-    """
-    if context is None:
-        return ()
-    # Build a set of item IDs that appear in the context via id="..." attrs.
-    # Since the renderer always includes id="ITEM_ID" for each retained item,
-    # checking for the id attribute is reliable.
-    retained: list[EvidenceItem] = []
-    for item in items:
-        if f'id="{escape_text(item.id)}"' in context:
-            retained.append(item)
-    return tuple(retained)
-
-
 def render_envelope_result(
     items: Sequence[EvidenceItem],
     recall_log_ids: Sequence[str],
@@ -424,6 +402,10 @@ def render_envelope_result(
     The ``injected_items`` tuple contains only items that actually survived
     rendering into the final context. An item admitted by item count but
     dropped during byte-pressure fitting is NOT included.
+
+    Provenance is derived structurally (from the ``retained`` list at each
+    return point) rather than by re-parsing the rendered context string,
+    so it cannot disagree with the rendering logic.
     """
     if not items and not traces:
         return RenderedEnvelope(context=None, injected_items=())
@@ -436,7 +418,7 @@ def render_envelope_result(
             context = _assemble(item_blocks, original_trace_blocks, recall_log_ids)
             return RenderedEnvelope(
                 context=context,
-                injected_items=_find_rendered_item_ids(context, retained),
+                injected_items=tuple(retained),
             )
         drop_index = _drop_index(retained)
         if drop_index is None:
@@ -453,7 +435,7 @@ def render_envelope_result(
                 context = _assemble([item_block], trace_blocks, recall_log_ids)
                 return RenderedEnvelope(
                     context=context,
-                    injected_items=_find_rendered_item_ids(context, retained),
+                    injected_items=(retained[0],),
                 )
             if not trace_blocks:
                 break
