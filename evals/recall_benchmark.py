@@ -83,6 +83,7 @@ __all__ = [
     "ControlledCorpus",
     "ServiceBenchmarkSuite",
     "HttpBenchmarkClient",
+    "ResolvedContextEvidence",
     "small_controlled_corpus",
     "distractor_heavy_corpus",
     "existing_corpus_mode",
@@ -475,7 +476,7 @@ class BenchmarkReport:
     generated_at: str
     # F13: fingerprint of the actual eligible corpus population.
     eligible_corpus_fingerprint: str | None = None
-    eligible_corpus_fingerprint_schema: str = "eligible-corpus-v1"
+    eligible_corpus_fingerprint_schema: str = "eligible-corpus-v2"
     eligible_item_count: int | None = None
     # F15: resolved memory context provenance.
     memory_context_version: str | None = None
@@ -491,6 +492,24 @@ class QueryFixture:
     query: str
     expected_item_id: str
     label: str
+
+
+@dataclass(frozen=True)
+class ResolvedContextEvidence:
+    """F18: the exact resolved context used by ranking, fingerprinting, and report.
+
+    This is returned from the benchmark execution so the operator does not
+    construct a second context afterward. It carries only stable digests and
+    metadata — never raw tenant, principal, query, or item values.
+    """
+
+    memory_context_version: str
+    memory_profile_id: str | None  # digest only, never raw UUID in redacted report
+    memory_profile_revision_id: str | None
+    memory_profile_slug: str | None
+    memory_profile_version: int | None
+    workspace_id: str | None  # digest, not raw
+    workspace_accessible: bool
 
 
 # ---------------------------------------------------------------------------
@@ -787,17 +806,27 @@ class ServiceBenchmarkSuite:
         memory_profile_revision_id: str | None = None,
         memory_profile_slug: str | None = None,
         memory_profile_version: int | None = None,
-    ) -> Any:
+    ) -> tuple[ResolvedMemoryContext, str | None, bool]:
         """Build a ResolvedMemoryContext matching the audited recall context.
 
-        F15: when a memory profile is specified, resolves the profile revision
-        and workspace grants from the database to reproduce the exact same
-        eligibility context as the audited live recall. When no profile is
-        specified, falls back to unrestricted (compatibility) context.
+        F16/F18: when a memory profile is specified, resolves the profile
+        revision and workspace grants from the database and validates
+        slug/version/revision against the resolved DB row rather than merely
+        echoing their command-line values. When no profile is specified,
+        falls back to unrestricted (compatibility) context.
 
-        Raises PipelineError when the requested context cannot be proven to
-        match the original audit context (e.g., profile not found, disabled,
-        or revision mismatch).
+        F16: when an explicit workspace is requested, resolves it using the
+        same ``resolve_workspace_scope`` as production recall. An inaccessible
+        or nonexistent workspace fails closed — it does NOT fall back to
+        tenant-wide recall.
+
+        Returns ``(memory_context, validated_workspace_id, workspace_accessible)``
+        where ``validated_workspace_id`` is the resolved workspace UUID string
+        (or ``None`` when no workspace was requested or it is accessible).
+
+        Raises ``PipelineError`` when the requested context cannot be proven
+        to match the original audit context (e.g., profile not found,
+        disabled, slug/version mismatch, revision mismatch).
         """
         from sqlalchemy import text
 
@@ -820,85 +849,192 @@ class ServiceBenchmarkSuite:
         )
 
         if memory_profile_id is None:
-            return unrestricted_memory_context(principal)
+            ctx = unrestricted_memory_context(principal)
+        else:
+            # F18: resolve the profiled context from the database.
+            async with self.session_factory() as session:
+                row = (
+                    await session.execute(
+                        text(
+                            "SELECT p.id AS profile_id, p.slug, p.disabled_at, "
+                            "r.id AS revision_id, r.version, r.include_private, "
+                            "r.include_tenant, r.include_public, r.allow_tenant_write, "
+                            "r.allow_public_write, r.default_write_visibility, "
+                            "r.default_write_workspace_id, "
+                            "COALESCE(array_agg(g.workspace_id) FILTER (WHERE g.can_read), "
+                            "ARRAY[]::uuid[]) AS readable_workspace_ids, "
+                            "COALESCE(array_agg(g.workspace_id) FILTER (WHERE g.can_write), "
+                            "ARRAY[]::uuid[]) AS writable_workspace_ids "
+                            "FROM memory_profiles p "
+                            "JOIN memory_profile_revisions r "
+                            "ON r.tenant_id = p.tenant_id AND r.profile_id = p.id "
+                            "AND r.id = :revision_id "
+                            "LEFT JOIN memory_profile_workspace_grants g "
+                            "ON g.tenant_id = r.tenant_id AND g.revision_id = r.id "
+                            "WHERE p.tenant_id = :tenant_id AND p.id = :profile_id "
+                            "GROUP BY p.id, p.slug, p.disabled_at, r.id, r.version, "
+                            "r.include_private, r.include_tenant, r.include_public, "
+                            "r.allow_tenant_write, r.allow_public_write, "
+                            "r.default_write_visibility, r.default_write_workspace_id"
+                        ),
+                        {
+                            "tenant_id": tenant_id,
+                            "profile_id": memory_profile_id,
+                            "revision_id": memory_profile_revision_id or "",
+                        },
+                    )
+                ).mappings().first()
 
-        # F15: resolve the profiled context from the database.
-        async with self.session_factory() as session:
-            row = (
-                await session.execute(
-                    text(
-                        "SELECT p.id AS profile_id, p.slug, p.disabled_at, "
-                        "r.id AS revision_id, r.version, r.include_private, "
-                        "r.include_tenant, r.include_public, r.allow_tenant_write, "
-                        "r.allow_public_write, r.default_write_visibility, "
-                        "r.default_write_workspace_id, "
-                        "COALESCE(array_agg(g.workspace_id) FILTER (WHERE g.can_read), "
-                        "ARRAY[]::uuid[]) AS readable_workspace_ids, "
-                        "COALESCE(array_agg(g.workspace_id) FILTER (WHERE g.can_write), "
-                        "ARRAY[]::uuid[]) AS writable_workspace_ids "
-                        "FROM memory_profiles p "
-                        "JOIN memory_profile_revisions r "
-                        "ON r.tenant_id = p.tenant_id AND r.profile_id = p.id "
-                        "AND r.id = :revision_id "
-                        "LEFT JOIN memory_profile_workspace_grants g "
-                        "ON g.tenant_id = r.tenant_id AND g.revision_id = r.id "
-                        "WHERE p.tenant_id = :tenant_id AND p.id = :profile_id "
-                        "GROUP BY p.id, p.slug, p.disabled_at, r.id, r.version, "
-                        "r.include_private, r.include_tenant, r.include_public, "
-                        "r.allow_tenant_write, r.allow_public_write, "
-                        "r.default_write_visibility, r.default_write_workspace_id"
-                    ),
-                    {
-                        "tenant_id": tenant_id,
-                        "profile_id": memory_profile_id,
-                        "revision_id": memory_profile_revision_id or "",
-                    },
+            if row is None or row["disabled_at"] is not None:
+                raise PipelineError(
+                    "memory profile not found or disabled — "
+                    "cannot reproduce audit context"
                 )
-            ).mappings().first()
 
-        if row is None or row["disabled_at"] is not None:
-            raise PipelineError(
-                f"memory profile {memory_profile_id} not found or disabled — "
-                f"cannot reproduce audit context"
+            # F18: validate slug and version against the resolved DB row
+            # rather than merely echoing command-line values.
+            resolved_slug = str(row["slug"])
+            resolved_version = int(row["version"])
+            if memory_profile_slug is not None and memory_profile_slug != resolved_slug:
+                raise PipelineError(
+                    f"memory profile slug mismatch: requested '{memory_profile_slug}' "
+                    f"but resolved '{resolved_slug}' — cannot reproduce audit context"
+                )
+            if (
+                memory_profile_version is not None
+                and memory_profile_version != resolved_version
+            ):
+                raise PipelineError(
+                    f"memory profile version mismatch: requested {memory_profile_version} "
+                    f"but resolved {resolved_version} — cannot reproduce audit context"
+                )
+
+            # F18: validate revision ownership — revision must belong to the
+            # requested profile and tenant (the JOIN already enforces this,
+            # but assert explicitly for clarity).
+            if str(row["profile_id"]) != str(memory_profile_id):
+                raise PipelineError(
+                    "revision does not belong to the requested profile — "
+                    "cannot reproduce audit context"
+                )
+
+            from typing import cast as t_cast
+            from uuid import UUID
+
+            from engram.memory_context import WriteVisibility
+
+            readable_workspace_ids = frozenset(
+                UUID(str(value)) for value in row["readable_workspace_ids"]
+            )
+            writable_workspace_ids = frozenset(
+                UUID(str(value)) for value in row["writable_workspace_ids"]
+            )
+            default_workspace_id = (
+                UUID(str(row["default_write_workspace_id"]))
+                if row["default_write_workspace_id"] is not None
+                else None
             )
 
-        from typing import cast as t_cast
-        from uuid import UUID
+            ctx = ResolvedMemoryContext(
+                version=MEMORY_CONTEXT_VERSION,
+                tenant_id=UUID(tenant_id),
+                principal_id=UUID(principal_id),
+                api_key_id=None,
+                memory_profile_id=UUID(str(row["profile_id"])),
+                memory_profile_revision_id=UUID(str(row["revision_id"])),
+                memory_profile_slug=resolved_slug,
+                memory_profile_version=resolved_version,
+                include_private=bool(row["include_private"]),
+                include_tenant=bool(row["include_tenant"]),
+                include_public=bool(row["include_public"]),
+                readable_workspace_ids=readable_workspace_ids,
+                allow_tenant_write=bool(row["allow_tenant_write"]),
+                allow_public_write=bool(row["allow_public_write"]),
+                default_write_visibility=t_cast(
+                    WriteVisibility, str(row["default_write_visibility"])
+                ),
+                default_write_workspace_id=default_workspace_id,
+                writable_workspace_ids=writable_workspace_ids,
+                admin_workspace_bypass=False,
+            )
 
-        from engram.memory_context import WriteVisibility
+        # F16: resolve workspace scope using the same production function.
+        # An explicit workspace request that cannot be proven accessible
+        # fails closed — no silent fallback to tenant-wide recall.
+        validated_workspace_id: str | None = None
+        workspace_accessible = True
+        if workspace_id is not None:
+            from engram.memory_access import resolve_workspace_scope
 
-        readable_workspace_ids = frozenset(
-            UUID(str(value)) for value in row["readable_workspace_ids"]
-        )
-        writable_workspace_ids = frozenset(
-            UUID(str(value)) for value in row["writable_workspace_ids"]
-        )
-        default_workspace_id = (
-            UUID(str(row["default_write_workspace_id"]))
-            if row["default_write_workspace_id"] is not None
-            else None
+            async with self.session_factory() as session:
+                validated_workspace_id, workspace_accessible = (
+                    await resolve_workspace_scope(
+                        session,
+                        workspace=workspace_id,
+                        memory_context=ctx,
+                    )
+                )
+            if not workspace_accessible:
+                raise PipelineError(
+                    "explicit workspace is inaccessible or does not belong "
+                    "to the resolved profile context — cannot fall back to "
+                    "tenant-wide recall"
+                )
+
+        return ctx, validated_workspace_id, workspace_accessible
+
+    async def resolve_context_evidence(
+        self,
+        tenant_id: str,
+        principal_id: str,
+        *,
+        workspace_id: str | None = None,
+        memory_profile_id: str | None = None,
+        memory_profile_revision_id: str | None = None,
+        memory_profile_slug: str | None = None,
+        memory_profile_version: int | None = None,
+    ) -> tuple[ResolvedMemoryContext, str | None, ResolvedContextEvidence, Any, Any]:
+        """F18: resolve ONE authoritative context and return all evidence.
+
+        The operator must NOT construct a second context afterward. This method
+        resolves the same context used by ranking (``_build_memory_context``)
+        and additionally resolves the active embedding profile so that
+        fingerprinting, ranking, and report fields all use the exact same
+        resolved values.
+
+        Returns ``(memory_context, validated_workspace_id, context_evidence,
+        embedding_profile, session_factory)``.
+        """
+        ctx, ws_id, _ws_ok = await self._build_memory_context(
+            tenant_id,
+            principal_id,
+            workspace_id=workspace_id,
+            memory_profile_id=memory_profile_id,
+            memory_profile_revision_id=memory_profile_revision_id,
+            memory_profile_slug=memory_profile_slug,
+            memory_profile_version=memory_profile_version,
         )
 
-        return ResolvedMemoryContext(
-            version=MEMORY_CONTEXT_VERSION,
-            tenant_id=UUID(tenant_id),
-            principal_id=UUID(principal_id),
-            api_key_id=None,
-            memory_profile_id=UUID(str(row["profile_id"])),
-            memory_profile_revision_id=UUID(str(row["revision_id"])),
-            memory_profile_slug=str(row["slug"]),
-            memory_profile_version=int(row["version"]),
-            include_private=bool(row["include_private"]),
-            include_tenant=bool(row["include_tenant"]),
-            include_public=bool(row["include_public"]),
-            readable_workspace_ids=readable_workspace_ids,
-            allow_tenant_write=bool(row["allow_tenant_write"]),
-            allow_public_write=bool(row["allow_public_write"]),
-            default_write_visibility=t_cast(WriteVisibility, str(row["default_write_visibility"])),
-            default_write_workspace_id=default_workspace_id,
-            writable_workspace_ids=writable_workspace_ids,
-            admin_workspace_bypass=False,
+        from engram.embedding_profiles import get_active_profile
+
+        async with self.session_factory() as session:
+            ep = await get_active_profile(session)
+
+        evidence = ResolvedContextEvidence(
+            memory_context_version=ctx.version,
+            memory_profile_id=str(ctx.memory_profile_id) if ctx.memory_profile_id else None,
+            memory_profile_revision_id=(
+                str(ctx.memory_profile_revision_id)
+                if ctx.memory_profile_revision_id
+                else None
+            ),
+            memory_profile_slug=ctx.memory_profile_slug,
+            memory_profile_version=ctx.memory_profile_version,
+            workspace_id=ws_id,
+            workspace_accessible=ws_id is None or _ws_ok,
         )
+
+        return ctx, ws_id, evidence, ep, self.session_factory
 
     async def _run_pipeline_stages(
         self,
@@ -939,17 +1075,36 @@ class ServiceBenchmarkSuite:
         _SEMANTIC_REVIEW_STATUSES = ("active", "proposed")
 
         if memory_context_input is None:
-            memory_context = await self._build_memory_context(
-                tenant_id,
-                principal_id,
-                workspace_id=workspace_id,
-                memory_profile_id=memory_profile_id,
-                memory_profile_revision_id=memory_profile_revision_id,
-                memory_profile_slug=memory_profile_slug,
-                memory_profile_version=memory_profile_version,
+            memory_context, resolved_workspace_id, _ws_ok = (
+                await self._build_memory_context(
+                    tenant_id,
+                    principal_id,
+                    workspace_id=workspace_id,
+                    memory_profile_id=memory_profile_id,
+                    memory_profile_revision_id=memory_profile_revision_id,
+                    memory_profile_slug=memory_profile_slug,
+                    memory_profile_version=memory_profile_version,
+                )
             )
         else:
             memory_context = memory_context_input
+            # When a context is passed directly, also resolve workspace scope.
+            if workspace_id is not None:
+                from engram.memory_access import resolve_workspace_scope
+
+                async with self.session_factory() as session:
+                    resolved_workspace_id, ws_ok = await resolve_workspace_scope(
+                        session,
+                        workspace=workspace_id,
+                        memory_context=memory_context_input,
+                    )
+                if not ws_ok:
+                    raise PipelineError(
+                        "explicit workspace is inaccessible or does not belong "
+                        "to the resolved profile context"
+                    )
+            else:
+                resolved_workspace_id = None
 
         async with self.session_factory() as session:
             await apply_rls_context(
@@ -968,10 +1123,11 @@ class ServiceBenchmarkSuite:
             # --- Stage 0: active embedding profile ---
             embedding_profile = await get_active_profile(session)
 
-            # --- Stage 1: count eligible candidates (F1 fix) ---
+            # --- Stage 1: count eligible candidates (F1 fix, F16: workspace) ---
             eligible_count = await semantic.candidate_count(
                 session,
                 memory_context=memory_context,
+                workspace_id=resolved_workspace_id,
                 review_statuses=_SEMANTIC_REVIEW_STATUSES,
                 embedding_profile=embedding_profile,
             )
@@ -1009,6 +1165,7 @@ class ServiceBenchmarkSuite:
                 query_vector,
                 production_fetch_limit,
                 memory_context=memory_context,
+                workspace_id=resolved_workspace_id,
                 review_statuses=_SEMANTIC_REVIEW_STATUSES,
                 embedding_profile=embedding_profile,
             )
@@ -1055,6 +1212,7 @@ class ServiceBenchmarkSuite:
                     query_vector,
                     diagnostic_fetch_limit,
                     memory_context=memory_context,
+                    workspace_id=resolved_workspace_id,
                     review_statuses=_SEMANTIC_REVIEW_STATUSES,
                     embedding_profile=embedding_profile,
                 )
@@ -1149,7 +1307,7 @@ class ServiceBenchmarkSuite:
             expanded = await expand_recall_candidates(
                 session,
                 memory_context=memory_context,
-                workspace_id=None,
+                workspace_id=resolved_workspace_id,
                 semantic_items=enriched,
                 item_by_id=item_by_id,
                 now=datetime.now(UTC),
@@ -1528,13 +1686,32 @@ class ServiceBenchmarkSuite:
         config_version: str,
         eligible_corpus_fingerprint: str | None = None,
         eligible_item_count: int | None = None,
+        context_evidence: ResolvedContextEvidence | None = None,
+        # Legacy compatibility: these are still accepted but ignored when
+        # context_evidence is provided (they come from the same source).
         memory_context_version: str | None = None,
         memory_profile_slug: str | None = None,
         memory_profile_version: int | None = None,
         workspace_id: str | None = None,
     ) -> BenchmarkReport:
-        """Produce a machine-readable benchmark report with full provenance."""
+        """Produce a machine-readable benchmark report with full provenance.
+
+        F18: when ``context_evidence`` is provided, its resolved values
+        are used for the report's context fields — the operator must NOT
+        copy CLI input independently.
+        """
         summary = ServiceBenchmarkSuite.summarize(results)
+
+        # F18: prefer context_evidence (resolved from DB) over CLI-passed values.
+        if context_evidence is not None:
+            memory_context_version = context_evidence.memory_context_version
+            memory_profile_slug = context_evidence.memory_profile_slug
+            memory_profile_version = context_evidence.memory_profile_version
+            ws = context_evidence.workspace_id
+            workspace_id = ws
+        else:
+            ws = workspace_id
+
         return BenchmarkReport(
             repository_sha=repository_sha,
             scoring_version=scoring_version,
@@ -1576,7 +1753,7 @@ class ServiceBenchmarkSuite:
             "corpus_fingerprint": base["corpus_fingerprint"],
             "eligible_corpus_fingerprint": base.get("eligible_corpus_fingerprint"),
             "eligible_corpus_fingerprint_schema": base.get(
-                "eligible_corpus_fingerprint_schema", "eligible-corpus-v1"
+                "eligible_corpus_fingerprint_schema", "eligible-corpus-v2"
             ),
             "eligible_item_count": base.get("eligible_item_count"),
             "memory_context_version": base.get("memory_context_version"),
@@ -1638,61 +1815,92 @@ class ServiceBenchmarkSuite:
         self,
         *,
         tenant_id: str,
+        principal_id: str,
         memory_context: ResolvedMemoryContext,
-        embedding_profile_key: str,
+        embedding_profile_id: str,
+        embedding_dimensions: int,
+        workspace_id: str | None = None,
     ) -> tuple[str, int]:
-        """F13: compute a tenant-safe fingerprint of the exact eligible population.
+        """F17: compute a tenant-safe fingerprint of the exact eligible population.
 
-        Hashes a canonical sorted representation of every ranking-relevant
-        mutable field for each eligible item: review status, validity,
-        source trust, confidence, importance, verification, conflict status,
-        created_at, embedding profile, embedding status, and content/vector
-        hashes.
+        Uses the SAME eligibility contract as semantic recall:
+        - active embedding profile ID and dimensions
+        - embedding_status='ready'
+        - embedding non-null
+        - active/proposed item state (review_status IN ('active','proposed'))
+        - valid_to IS NULL
+        - read_eligibility_expression(memory_context)
+        - optional exact workspace filter
 
-        Does NOT include raw memory content. Returns (fingerprint, item_count).
+        Applies the tenant/principal RLS context before the query.
+
+        Hashes the exact eligible rows in deterministic order without raw
+        memory content. Uses SHA-256 for vector material. Returns
+        (fingerprint, item_count).
+
+        The fingerprint and eligible count MUST equal semantic.candidate_count
+        under the same resolved context and workspace.
         """
         from sqlalchemy import text
 
+        from engram.db import apply_rls_context
+
+        # Build the SQL with read_eligibility_expression injected as raw SQL
+        # (matching semantic.candidate_count exactly).
+        from engram.memory_access import read_eligibility_expression
+
+        eligibility_sql = str(
+            read_eligibility_expression(memory_context).compile(
+                compile_kwargs={"literal_binds": True}
+            )
+        )
+
+        query = (
+            "SELECT mi.id::text, mi.review_status, mi.source_trust, "
+            "mi.memory_confidence, mi.importance, mi.human_verified, "
+            "mi.conflict_type, mi.conflict_resolution_status, "
+            "mi.created_at, mi.content_hash, "
+            "encode(digest(CAST(me.embedding AS TEXT), 'sha256'), 'hex') AS embedding_hash "
+            "FROM memory_items mi "
+            "JOIN memory_embeddings me "
+            "ON me.memory_item_id = mi.id "
+            "AND me.tenant_id = mi.tenant_id "
+            "WHERE me.profile_id = :profile_id "
+            "AND me.embedding_dim = :dimensions "
+            "AND me.embedding_status = 'ready' "
+            "AND me.embedding IS NOT NULL "
+            "AND mi.review_status IN ('active', 'proposed') "
+            "AND mi.valid_to IS NULL "
+            f"AND {eligibility_sql}"
+        )
+        params: dict[str, Any] = {
+            "profile_id": embedding_profile_id,
+            "dimensions": embedding_dimensions,
+        }
+        if workspace_id is not None:
+            query += " AND mi.workspace_id = :workspace_id"
+            params["workspace_id"] = workspace_id
+        query += " ORDER BY mi.id::text"
+
         h = hashlib.sha256()
-        h.update(b"eligible-corpus-v1")
-        h.update(embedding_profile_key.encode())
+        h.update(b"eligible-corpus-v2")
+        h.update(embedding_profile_id.encode())
+        h.update(str(embedding_dimensions).encode())
+        if workspace_id is not None:
+            h.update(b"workspace:")
+            h.update(workspace_id.encode())
 
         async with self.session_factory() as session:
+            await apply_rls_context(
+                session, tenant_id=tenant_id, principal_id=principal_id
+            )
             rows = (
-                await session.execute(
-                    text(
-                        "SELECT mi.id::text, mi.review_status, mi.valid_to, "
-                        "mi.source_trust, mi.memory_confidence, mi.importance, "
-                        "mi.human_verified, mi.conflict_type, "
-                        "mi.conflict_resolution_status, mi.created_at, "
-                        "mi.content_hash, "
-                        "me.embedding_status, me.profile_id::text, "
-                        "md5(me.embedding::text) AS embedding_hash "
-                        "FROM memory_items mi "
-                        "LEFT JOIN memory_embeddings me "
-                        "ON me.memory_item_id = mi.id "
-                        "AND me.tenant_id = mi.tenant_id "
-                        "WHERE mi.tenant_id = :tenant_id "
-                        "AND mi.valid_to IS NULL "
-                        "AND mi.review_status IN ('active', 'proposed') "
-                        "ORDER BY mi.id::text"
-                    ),
-                    {"tenant_id": tenant_id},
-                )
+                await session.execute(text(query), params)
             ).mappings().all()
 
-        item_count = 0
         for row in rows:
-            # Only include items with ready embeddings for the active profile.
-            if (
-                row["embedding_status"] != "ready"
-                or row["profile_id"] is None
-            ):
-                continue
-            item_count += 1
             h.update(str(row["id"]).encode())
             h.update(str(row["review_status"]).encode())
-            h.update(str(row["valid_to"]).encode())
             h.update(str(round(float(row["source_trust"] or 0), 6)).encode())
             h.update(str(round(float(row["memory_confidence"] or 0), 6)).encode())
             h.update(str(round(float(row["importance"] or 0), 6)).encode())
@@ -1701,11 +1909,9 @@ class ServiceBenchmarkSuite:
             h.update(str(row["conflict_resolution_status"]).encode())
             h.update(str(row["created_at"]).encode())
             h.update(str(row["content_hash"]).encode())
-            h.update(str(row["embedding_status"]).encode())
-            h.update(str(row["profile_id"]).encode())
             h.update(str(row["embedding_hash"]).encode())
 
-        return h.hexdigest()[:16], item_count
+        return h.hexdigest()[:16], len(rows)
 
 
 # ---------------------------------------------------------------------------

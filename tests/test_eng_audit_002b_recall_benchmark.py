@@ -1714,8 +1714,10 @@ async def test_eligible_corpus_fingerprint_changes_on_metadata(audit_tenant: Any
         ctx = unrestricted_memory_context(principal)
 
         fp1, count1 = await suite.compute_eligible_corpus_fingerprint(
-            tenant_id=tenant_id, memory_context=ctx,
-            embedding_profile_key=ep.profile_key,
+            tenant_id=tenant_id, principal_id=admin_id,
+            memory_context=ctx,
+            embedding_profile_id=str(ep.id),
+            embedding_dimensions=ep.dimensions,
         )
 
         # Change a ranking-relevant field on one item.
@@ -1730,8 +1732,10 @@ async def test_eligible_corpus_fingerprint_changes_on_metadata(audit_tenant: Any
             await session.commit()
 
         fp2, count2 = await suite.compute_eligible_corpus_fingerprint(
-            tenant_id=tenant_id, memory_context=ctx,
-            embedding_profile_key=ep.profile_key,
+            tenant_id=tenant_id, principal_id=admin_id,
+            memory_context=ctx,
+            embedding_profile_id=str(ep.id),
+            embedding_dimensions=ep.dimensions,
         )
 
         # UNCONDITIONAL: fingerprint changed after metadata change.
@@ -1775,8 +1779,10 @@ async def test_eligible_corpus_fingerprint_changes_on_add_remove(audit_tenant: A
         ctx = unrestricted_memory_context(principal)
 
         fp1, count1 = await suite.compute_eligible_corpus_fingerprint(
-            tenant_id=tenant_id, memory_context=ctx,
-            embedding_profile_key=ep.profile_key,
+            tenant_id=tenant_id, principal_id=admin_id,
+            memory_context=ctx,
+            embedding_profile_id=str(ep.id),
+            embedding_dimensions=ep.dimensions,
         )
 
         # Remove one item's embedding (makes it ineligible for semantic search).
@@ -1791,8 +1797,10 @@ async def test_eligible_corpus_fingerprint_changes_on_add_remove(audit_tenant: A
             await session.commit()
 
         fp2, count2 = await suite.compute_eligible_corpus_fingerprint(
-            tenant_id=tenant_id, memory_context=ctx,
-            embedding_profile_key=ep.profile_key,
+            tenant_id=tenant_id, principal_id=admin_id,
+            memory_context=ctx,
+            embedding_profile_id=str(ep.id),
+            embedding_dimensions=ep.dimensions,
         )
 
         # UNCONDITIONAL: fingerprint changed.
@@ -1839,12 +1847,16 @@ async def test_eligible_corpus_fingerprint_stable(audit_tenant: Any) -> None:
         ctx = unrestricted_memory_context(principal)
 
         fp1, count1 = await suite.compute_eligible_corpus_fingerprint(
-            tenant_id=tenant_id, memory_context=ctx,
-            embedding_profile_key=ep.profile_key,
+            tenant_id=tenant_id, principal_id=admin_id,
+            memory_context=ctx,
+            embedding_profile_id=str(ep.id),
+            embedding_dimensions=ep.dimensions,
         )
         fp2, count2 = await suite.compute_eligible_corpus_fingerprint(
-            tenant_id=tenant_id, memory_context=ctx,
-            embedding_profile_key=ep.profile_key,
+            tenant_id=tenant_id, principal_id=admin_id,
+            memory_context=ctx,
+            embedding_profile_id=str(ep.id),
+            embedding_dimensions=ep.dimensions,
         )
 
         # UNCONDITIONAL: fingerprint stable.
@@ -1886,8 +1898,10 @@ async def test_eligible_corpus_fingerprint_ignores_ineligible(audit_tenant: Any)
         ctx = unrestricted_memory_context(principal)
 
         fp1, count1 = await suite.compute_eligible_corpus_fingerprint(
-            tenant_id=tenant_id, memory_context=ctx,
-            embedding_profile_key=ep.profile_key,
+            tenant_id=tenant_id, principal_id=admin_id,
+            memory_context=ctx,
+            embedding_profile_id=str(ep.id),
+            embedding_dimensions=ep.dimensions,
         )
 
         # Insert an ineligible item (rejected review_status) in the same tenant.
@@ -1916,8 +1930,10 @@ async def test_eligible_corpus_fingerprint_ignores_ineligible(audit_tenant: Any)
             await session.commit()
 
         fp2, count2 = await suite.compute_eligible_corpus_fingerprint(
-            tenant_id=tenant_id, memory_context=ctx,
-            embedding_profile_key=ep.profile_key,
+            tenant_id=tenant_id, principal_id=admin_id,
+            memory_context=ctx,
+            embedding_profile_id=str(ep.id),
+            embedding_dimensions=ep.dimensions,
         )
 
         # UNCONDITIONAL: fingerprint unchanged (ineligible item not counted).
@@ -2111,3 +2127,564 @@ def test_redacted_report_omits_raw_identifiers() -> None:
     # Digests and truncated IDs are OK.
     assert "abcdef0123456789" in redacted_str  # query digest preserved
     assert "99999999***" in redacted_str  # truncated item ID
+
+
+# ---------------------------------------------------------------------------
+# FIX4 TESTS: F16-F19 — workspace binding, context-faithful fingerprint,
+# profile/revision validation, report context fidelity, redaction
+# ---------------------------------------------------------------------------
+
+
+async def _create_workspace(
+    tenant_id: str,
+    slug: str,
+    principal_id: str,
+) -> str:
+    """Create a workspace and add the principal as a member. Return workspace UUID."""
+    import uuid as uuid_mod
+
+    ws_id = str(uuid_mod.uuid4())
+    async with _test_session_factory() as session:
+        await session.execute(
+            text(
+                "INSERT INTO workspaces (id, tenant_id, name, slug) "
+                "VALUES (:id, :tid, :name, :slug)"
+            ),
+            {"id": ws_id, "tid": tenant_id, "name": slug, "slug": slug},
+        )
+        await session.execute(
+            text(
+                "INSERT INTO workspace_members (id, workspace_id, principal_id, role) "
+                "VALUES (:id, :ws, :pid, 'member')"
+            ),
+            {"id": str(uuid_mod.uuid4()), "ws": ws_id, "pid": principal_id},
+        )
+        await session.commit()
+    return ws_id
+
+
+async def _insert_item_with_embedding(
+    tenant_id: str,
+    principal_id: str,
+    content: str,
+    embedding_vector: list[float],
+    *,
+    workspace_id: str | None = None,
+    visibility: str = "workspace",
+    source_trust: float = 0.50,
+) -> str:
+    """Insert a memory item with embedding and return its UUID."""
+    import uuid as uuid_mod
+
+    item_id = str(uuid_mod.uuid4())
+    async with _test_session_factory() as session:
+        ws_col = ", workspace_id" if workspace_id else ""
+        ws_val = ", :ws_id" if workspace_id else ""
+        params: dict[str, Any] = {
+            "id": item_id,
+            "tenant_id": tenant_id,
+            "principal_id": principal_id,
+            "content": content,
+            "content_hash": f"sha256:{uuid_mod.uuid4().hex}",
+            "visibility": visibility,
+            "source_trust": source_trust,
+        }
+        if workspace_id:
+            params["ws_id"] = workspace_id
+
+        await session.execute(
+            text(
+                "INSERT INTO memory_items ("
+                "id, tenant_id, principal_id, content, content_hash, kind, "
+                f"visibility, review_status, memory_confidence, source_trust, "
+                "importance, human_verified, source_type, authority, "
+                "created_at, valid_from"
+                f"{ws_col}"
+                ") VALUES ("
+                ":id, :tenant_id, :principal_id, :content, :content_hash, 'fact', "
+                ":visibility, 'active', 0.50, :source_trust, "
+                "0.50, false, 'manual', 10, "
+                "now(), now()"
+                f"{ws_val}"
+                ")"
+            ),
+            params,
+        )
+
+        # Resolve embedding profile
+        row = (
+            await session.execute(
+                text(
+                    "SELECT id::text, model, dimensions FROM embedding_profiles "
+                    "WHERE state='active' LIMIT 1"
+                )
+            )
+        ).one()
+        profile_id = str(row[0])
+        model = str(row[1])
+        dimensions = int(row[2])
+
+        rendered = "[" + ",".join(str(v) for v in embedding_vector) + "]"
+        await session.execute(
+            text(
+                "INSERT INTO memory_embeddings "
+                "(id, memory_item_id, tenant_id, profile_id, embedding_model, "
+                "embedding_dim, embedding, embedding_status) "
+                "VALUES (:eid, :item_id, :tenant_id, :profile_id, :model, "
+                ":dimensions, CAST(:embedding AS vector), 'ready')"
+            ),
+            {
+                "eid": str(uuid_mod.uuid4()),
+                "item_id": item_id,
+                "tenant_id": tenant_id,
+                "profile_id": profile_id,
+                "model": model,
+                "dimensions": dimensions,
+                "embedding": rendered,
+            },
+        )
+        await session.commit()
+    return item_id
+
+
+async def _cleanup_items(item_ids: list[str]) -> None:
+    """Delete items and their embeddings by ID."""
+    if not item_ids:
+        return
+    async with _test_session_factory() as session:
+        await session.execute(
+            text("DELETE FROM memory_embeddings WHERE memory_item_id = ANY(:ids)"),
+            {"ids": item_ids},
+        )
+        await session.execute(
+            text("DELETE FROM memory_items WHERE id = ANY(:ids)"),
+            {"ids": item_ids},
+        )
+        await session.commit()
+
+
+async def test_workspace_isolation_excludes_other_workspace(audit_tenant: Any) -> None:
+    """F16: A benchmark scoped to workspace A must exclude workspace B from
+    candidate count, stage ranks, selected set, and fingerprint.
+    """
+    if not await _db_ok():
+        pytest.skip("requires PostgreSQL with pgvector")
+    tenant_id, admin_id = audit_tenant
+    assert tenant_id is not None
+
+    dims = await _get_dimensions()
+    query_vec = [0.0] * dims
+    query_vec[0] = 1.0
+
+    ws_a = await _create_workspace(tenant_id, f"ws-a-{uuid.uuid4().hex[:6]}", admin_id)
+    ws_b = await _create_workspace(tenant_id, f"ws-b-{uuid.uuid4().hex[:6]}", admin_id)
+
+    item_a = await _insert_item_with_embedding(
+        tenant_id, admin_id, "workspace A target item",
+        list(query_vec), workspace_id=ws_a,
+    )
+    item_b = await _insert_item_with_embedding(
+        tenant_id, admin_id, "workspace B unrelated item",
+        list(query_vec), workspace_id=ws_b,
+    )
+
+    try:
+        suite = ServiceBenchmarkSuite(_test_session_factory)
+
+        result = await suite.run_single_query(
+            tenant_id=tenant_id,
+            principal_id=admin_id,
+            query="workspace A query",
+            query_vector=list(query_vec),
+            expected_item_id=item_a,
+            item_budget=10,
+            workspace_id=ws_a,
+        )
+
+        assert result.error is None
+        assert result.stages is not None
+        stages = result.stages
+
+        # UNCONDITIONAL: candidate count is 1 (only ws_a item), not 2
+        assert stages.eligible_candidate_count == 1, (
+            f"Expected 1 eligible in workspace A, got {stages.eligible_candidate_count}"
+        )
+
+        # UNCONDITIONAL: item_a is selected
+        assert stages.final_served_rank == 0
+        assert stages.exclusion_disposition == ExclusionDisposition.SELECTED
+
+        # Fingerprint under ws_a should also be 1
+        from engram.auth import Principal
+        from engram.embedding_profiles import get_active_profile
+        from engram.memory_context import unrestricted_memory_context
+
+        principal = Principal(
+            tenant_id=tenant_id, principal_id=admin_id, api_key_id="",
+            scopes=("read",), memory_profile_id=None,
+            memory_profile_revision_id=None, memory_profile_slug=None,
+            memory_profile_version=None,
+        )
+        ctx = unrestricted_memory_context(principal)
+
+        async with _test_session_factory() as session:
+            ep = await get_active_profile(session)
+
+        fp_a, count_a = await suite.compute_eligible_corpus_fingerprint(
+            tenant_id=tenant_id, principal_id=admin_id,
+            memory_context=ctx,
+            embedding_profile_id=str(ep.id),
+            embedding_dimensions=ep.dimensions,
+            workspace_id=ws_a,
+        )
+        assert count_a == 1, (
+            f"Fingerprint count for ws_a should be 1, got {count_a}"
+        )
+    finally:
+        await _cleanup_items([item_a, item_b])
+        async with _test_session_factory() as session:
+            await session.execute(
+                text("DELETE FROM workspaces WHERE id IN (:a, :b)"),
+                {"a": ws_a, "b": ws_b},
+            )
+            await session.commit()
+
+
+async def test_inaccessible_workspace_fails_closed(audit_tenant: Any) -> None:
+    """F16: An inaccessible or nonexistent explicit workspace must fail closed
+    rather than return tenant-wide results.
+    """
+    if not await _db_ok():
+        pytest.skip("requires PostgreSQL with pgvector")
+    tenant_id, admin_id = audit_tenant
+    assert tenant_id is not None
+
+    dims = await _get_dimensions()
+    query_vec = [0.0] * dims
+    query_vec[0] = 1.0
+
+    suite = ServiceBenchmarkSuite(_test_session_factory)
+
+    # A nonexistent workspace UUID must fail closed.
+    fake_ws = str(uuid.uuid4())
+    with pytest.raises(PipelineError):
+        await suite.run_single_query(
+            tenant_id=tenant_id,
+            principal_id=admin_id,
+            query="nonexistent workspace",
+            query_vector=list(query_vec),
+            expected_item_id=str(uuid.uuid4()),
+            item_budget=10,
+            workspace_id=fake_ws,
+        )
+
+
+async def test_fingerprint_count_equals_candidate_count(audit_tenant: Any) -> None:
+    """F17: fingerprint eligible count must equal semantic.candidate_count
+    under the same resolved context and workspace.
+    """
+    if not await _db_ok():
+        pytest.skip("requires PostgreSQL with pgvector")
+    tenant_id, admin_id = audit_tenant
+    assert tenant_id is not None
+
+    dims = await _get_dimensions()
+    profile = small_controlled_corpus(dims)
+    corpus = ControlledCorpus(tenant_id, admin_id, profile)
+    await corpus.setup(_test_session_factory)
+
+    try:
+        suite = ServiceBenchmarkSuite(_test_session_factory)
+
+        from engram import semantic
+        from engram.auth import Principal
+        from engram.db import apply_rls_context
+        from engram.embedding_profiles import get_active_profile
+        from engram.memory_context import unrestricted_memory_context
+
+        principal = Principal(
+            tenant_id=tenant_id, principal_id=admin_id, api_key_id="",
+            scopes=("read",), memory_profile_id=None,
+            memory_profile_revision_id=None, memory_profile_slug=None,
+            memory_profile_version=None,
+        )
+        ctx = unrestricted_memory_context(principal)
+
+        async with _test_session_factory() as session:
+            ep = await get_active_profile(session)
+            await apply_rls_context(session, tenant_id=tenant_id, principal_id=admin_id)
+            cc = await semantic.candidate_count(
+                session,
+                memory_context=ctx,
+                review_statuses=("active", "proposed"),
+                embedding_profile=ep,
+            )
+
+        fp, fp_count = await suite.compute_eligible_corpus_fingerprint(
+            tenant_id=tenant_id, principal_id=admin_id,
+            memory_context=ctx,
+            embedding_profile_id=str(ep.id),
+            embedding_dimensions=ep.dimensions,
+        )
+
+        # UNCONDITIONAL: fingerprint count == candidate_count
+        assert fp_count == cc, (
+            f"Fingerprint count ({fp_count}) must equal candidate_count ({cc})"
+        )
+    finally:
+        await corpus.teardown(_test_session_factory)
+
+
+async def test_fingerprint_excludes_non_active_profile_embeddings(audit_tenant: Any) -> None:
+    """F17: a ready embedding under a different or inactive profile must not
+    alter the fingerprint.
+    """
+    if not await _db_ok():
+        pytest.skip("requires PostgreSQL with pgvector")
+    tenant_id, admin_id = audit_tenant
+    assert tenant_id is not None
+
+    dims = await _get_dimensions()
+    profile = small_controlled_corpus(dims)
+    corpus = ControlledCorpus(tenant_id, admin_id, profile)
+    await corpus.setup(_test_session_factory)
+
+    try:
+        suite = ServiceBenchmarkSuite(_test_session_factory)
+
+        from engram.auth import Principal
+        from engram.embedding_profiles import get_active_profile
+        from engram.memory_context import unrestricted_memory_context
+
+        principal = Principal(
+            tenant_id=tenant_id, principal_id=admin_id, api_key_id="",
+            scopes=("read",), memory_profile_id=None,
+            memory_profile_revision_id=None, memory_profile_slug=None,
+            memory_profile_version=None,
+        )
+        ctx = unrestricted_memory_context(principal)
+
+        async with _test_session_factory() as session:
+            ep = await get_active_profile(session)
+
+        fp1, count1 = await suite.compute_eligible_corpus_fingerprint(
+            tenant_id=tenant_id, principal_id=admin_id,
+            memory_context=ctx,
+            embedding_profile_id=str(ep.id),
+            embedding_dimensions=ep.dimensions,
+        )
+
+        # Insert an embedding for one of the items under a DIFFERENT profile.
+        # Create a dummy inactive profile.
+        import uuid as uuid_mod
+
+        dummy_profile_id = str(uuid_mod.uuid4())
+        dummy_item_id = corpus._item_ids[0] if corpus._item_ids else None
+        if dummy_item_id:
+            async with _test_session_factory() as session:
+                await session.execute(
+                    text(
+                        "INSERT INTO embedding_profiles "
+                        "(id, tenant_id, model, dimensions, state, profile_key) "
+                        "VALUES (:id, :tid, 'dummy-model', :dims, 'inactive', :key)"
+                    ),
+                    {
+                        "id": dummy_profile_id,
+                        "tid": tenant_id,
+                        "dims": dims,
+                        "key": "dummy-profile",
+                    },
+                )
+                vec = [0.0] * dims
+                vec[0] = 1.0
+                rendered = "[" + ",".join(str(v) for v in vec) + "]"
+                await session.execute(
+                    text(
+                        "INSERT INTO memory_embeddings "
+                        "(id, memory_item_id, tenant_id, profile_id, embedding_model, "
+                        "embedding_dim, embedding, embedding_status) "
+                        "VALUES (:eid, :item_id, :tid, :pid, 'dummy-model', "
+                        ":dims, CAST(:emb AS vector), 'ready')"
+                    ),
+                    {
+                        "eid": str(uuid_mod.uuid4()),
+                        "item_id": dummy_item_id,
+                        "tid": tenant_id,
+                        "pid": dummy_profile_id,
+                        "dims": dims,
+                        "emb": rendered,
+                    },
+                )
+                await session.commit()
+
+            fp2, count2 = await suite.compute_eligible_corpus_fingerprint(
+                tenant_id=tenant_id, principal_id=admin_id,
+                memory_context=ctx,
+                embedding_profile_id=str(ep.id),
+                embedding_dimensions=ep.dimensions,
+            )
+
+            # UNCONDITIONAL: fingerprint unchanged and count unchanged
+            assert fp1 == fp2, (
+                "F17 FAIL: inactive-profile embedding should not alter fingerprint"
+            )
+            assert count1 == count2, (
+                f"F17 FAIL: count changed ({count1} -> {count2})"
+            )
+
+            # Cleanup
+            async with _test_session_factory() as session:
+                await session.execute(
+                    text("DELETE FROM embedding_profiles WHERE id = :id"),
+                    {"id": dummy_profile_id},
+                )
+                await session.commit()
+    finally:
+        await corpus.teardown(_test_session_factory)
+
+
+async def test_report_context_fields_match_resolved_context(audit_tenant: Any) -> None:
+    """F18: report context fields must equal the actual resolved context used
+    by the ranking pipeline, not CLI input copied independently.
+    """
+    if not await _db_ok():
+        pytest.skip("requires PostgreSQL with pgvector")
+    tenant_id, admin_id = audit_tenant
+    assert tenant_id is not None
+
+    dims = await _get_dimensions()
+    profile = small_controlled_corpus(dims)
+    corpus = ControlledCorpus(tenant_id, admin_id, profile)
+    label_map = await corpus.setup(_test_session_factory)
+
+    try:
+        from engram.relationship_recall import RECALL_SCORING_VERSION
+
+        target_id = label_map["target"]
+        suite = ServiceBenchmarkSuite(_test_session_factory)
+
+        # Resolve context evidence (F18)
+        ctx, ws_id, context_evidence, ep, _ = await suite.resolve_context_evidence(
+            tenant_id=tenant_id,
+            principal_id=admin_id,
+        )
+
+        result = await suite.run_single_query(
+            tenant_id=tenant_id,
+            principal_id=admin_id,
+            query=profile.query_text,
+            query_vector=profile.query_vector,
+            expected_item_id=target_id,
+            item_budget=10,
+        )
+
+        report = ServiceBenchmarkSuite.generate_report(
+            repository_sha="test-sha",
+            results=[result],
+            corpus_profile=profile,
+            embedding_profile_key=ep.profile_key,
+            embedding_model=ep.model,
+            embedding_dimensions=ep.dimensions,
+            scoring_version=RECALL_SCORING_VERSION,
+            config_version="v1",
+            context_evidence=context_evidence,
+        )
+
+        # UNCONDITIONAL: report fields match resolved context
+        assert report.memory_context_version == context_evidence.memory_context_version
+        assert report.memory_profile_slug == context_evidence.memory_profile_slug
+        assert report.memory_profile_version == context_evidence.memory_profile_version
+        assert report.workspace_id == context_evidence.workspace_id
+    finally:
+        await corpus.teardown(_test_session_factory)
+
+
+async def test_resolve_context_evidence_validates_profile(audit_tenant: Any) -> None:
+    """F18: profile slug/version mismatch must fail closed."""
+    if not await _db_ok():
+        pytest.skip("requires PostgreSQL with pgvector")
+    tenant_id, admin_id = audit_tenant
+    assert tenant_id is not None
+
+    # Create a memory profile
+    import uuid as uuid_mod
+
+    profile_id = str(uuid_mod.uuid4())
+    revision_id = str(uuid_mod.uuid4())
+    slug = f"bench-profile-{uuid_mod.uuid4().hex[:6]}"
+
+    async with _test_engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO memory_profiles "
+                "(id, tenant_id, name, slug, created_by_principal_id) "
+                "VALUES (:id, :tid, :name, :slug, :pid)"
+            ),
+            {"id": profile_id, "tid": tenant_id, "name": slug, "slug": slug, "pid": admin_id},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO memory_profile_revisions "
+                "(id, tenant_id, profile_id, version, created_by_principal_id, reason) "
+                "VALUES (:id, :tid, :pid, 1, :cpid, 'test')"
+            ),
+            {"id": revision_id, "tid": tenant_id, "pid": profile_id, "cpid": admin_id},
+        )
+        await conn.execute(
+            text("UPDATE memory_profiles SET active_revision_id = :rid WHERE id = :pid"),
+            {"rid": revision_id, "pid": profile_id},
+        )
+
+    try:
+        suite = ServiceBenchmarkSuite(_test_session_factory)
+
+        # Slug mismatch must fail closed
+        with pytest.raises(PipelineError):
+            await suite.resolve_context_evidence(
+                tenant_id=tenant_id,
+                principal_id=admin_id,
+                memory_profile_id=profile_id,
+                memory_profile_revision_id=revision_id,
+                memory_profile_slug="wrong-slug",
+                memory_profile_version=1,
+            )
+
+        # Version mismatch must fail closed
+        with pytest.raises(PipelineError):
+            await suite.resolve_context_evidence(
+                tenant_id=tenant_id,
+                principal_id=admin_id,
+                memory_profile_id=profile_id,
+                memory_profile_revision_id=revision_id,
+                memory_profile_slug=slug,
+                memory_profile_version=99,
+            )
+
+        # Correct values must succeed
+        ctx, ws_id, evidence, ep, _ = await suite.resolve_context_evidence(
+            tenant_id=tenant_id,
+            principal_id=admin_id,
+            memory_profile_id=profile_id,
+            memory_profile_revision_id=revision_id,
+            memory_profile_slug=slug,
+            memory_profile_version=1,
+        )
+
+        # UNCONDITIONAL: evidence matches resolved context
+        assert evidence.memory_profile_slug == slug
+        assert evidence.memory_profile_version == 1
+        assert evidence.memory_profile_id == profile_id
+    finally:
+        async with _test_engine.begin() as conn:
+            await conn.execute(
+                text("DELETE FROM memory_profile_workspace_grants WHERE revision_id = :rid"),
+                {"rid": revision_id},
+            )
+            await conn.execute(
+                text("DELETE FROM memory_profile_revisions WHERE id = :rid"),
+                {"rid": revision_id},
+            )
+            await conn.execute(
+                text("DELETE FROM memory_profiles WHERE id = :pid"),
+                {"pid": profile_id},
+            )

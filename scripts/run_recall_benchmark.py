@@ -25,7 +25,7 @@ Existing corpus with injected embedding (resolves active EmbeddingProfile):
         --use-embedding-provider \\
         --output /tmp/fixture-e-report.json
 
-With memory profile and workspace context (F15):
+With memory profile and workspace context (F15/F16/F18):
 
     python scripts/run_recall_benchmark.py \\
         --mode existing \\
@@ -42,6 +42,10 @@ With memory profile and workspace context (F15):
 The script emits a machine-readable JSON report with all ranking stages,
 corpus fingerprint, embedding profile, resolved memory context, and
 production-window diagnostics.
+
+F18: the script resolves ONE authoritative ResolvedMemoryContext via
+``resolve_context_evidence`` and uses it for ranking, fingerprinting, and
+report fields. The operator does NOT construct a second context afterward.
 
 Requires a live PostgreSQL with the v2 schema and pgvector.
 """
@@ -75,7 +79,6 @@ async def run(args: argparse.Namespace) -> int:
     from sqlalchemy.pool import NullPool
 
     from engram.config import settings
-    from engram.embedding_profiles import get_active_profile
     from engram.relationship_recall import RECALL_SCORING_VERSION
     from evals.recall_benchmark import (
         ControlledCorpus,
@@ -90,9 +93,21 @@ async def run(args: argparse.Namespace) -> int:
     )
 
     try:
-        # --- Resolve active EmbeddingProfile (F14) ---
-        async with session_factory() as session:
-            ep = await get_active_profile(session)
+        suite = ServiceBenchmarkSuite(session_factory)
+
+        # ===================================================================
+        # F18: Resolve ONE authoritative context for ranking, fingerprinting,
+        # and report. The operator must NOT construct a second context.
+        # ===================================================================
+        ctx, ws_id, context_evidence, ep, _sf = await suite.resolve_context_evidence(
+            tenant_id=args.tenant_id,
+            principal_id=args.principal_id,
+            workspace_id=args.workspace_id,
+            memory_profile_id=args.memory_profile_id,
+            memory_profile_revision_id=args.memory_profile_revision_id,
+            memory_profile_slug=args.memory_profile_slug,
+            memory_profile_version=args.memory_profile_version,
+        )
 
         # --- Resolve query vector ---
         query_vector: list[float] | None = None
@@ -101,7 +116,6 @@ async def run(args: argparse.Namespace) -> int:
         if args.query_vector_file:
             with open(args.query_vector_file) as f:
                 query_vector = list(json.load(f))
-            # F14: validate dimensions match the active profile.
             if len(query_vector) != ep.dimensions:
                 print(
                     f"ERROR: query vector dims ({len(query_vector)}) do not match "
@@ -111,8 +125,6 @@ async def run(args: argparse.Namespace) -> int:
                 return 2
 
         if query_vector is None and args.use_embedding_provider:
-            # F14: resolve the active EmbeddingProfile BEFORE generating the
-            # embedding, and pass it explicitly to generate_embedding.
             from engram.embeddings import generate_embedding
 
             async def profile_aware_embedding_fn(query: str) -> list[float] | None:
@@ -138,7 +150,6 @@ async def run(args: argparse.Namespace) -> int:
                 query_embedding_fn=embedding_fn,
             )
         else:
-            # Controlled mode.
             dims = ep.dimensions
             profile = small_controlled_corpus(dims)
             corpus = ControlledCorpus(args.tenant_id, args.principal_id, profile)
@@ -147,8 +158,6 @@ async def run(args: argparse.Namespace) -> int:
                 args.expected_item_id = label_map["target"]
 
         try:
-            suite = ServiceBenchmarkSuite(session_factory)
-
             query_vector_for_run = query_vector if query_vector else profile.query_vector
 
             result = await suite.run_single_query(
@@ -171,25 +180,17 @@ async def run(args: argparse.Namespace) -> int:
             if corpus is not None:
                 await corpus.teardown(session_factory)
 
-        # --- Compute eligible corpus fingerprint (F13) ---
-        from engram.auth import Principal
-        from engram.memory_context import unrestricted_memory_context
-
-        principal = Principal(
-            tenant_id=args.tenant_id,
-            principal_id=args.principal_id,
-            api_key_id="",
-            scopes=("read",),
-            memory_profile_id=args.memory_profile_id,
-            memory_profile_revision_id=args.memory_profile_revision_id,
-            memory_profile_slug=args.memory_profile_slug,
-            memory_profile_version=args.memory_profile_version,
-        )
-        ctx = unrestricted_memory_context(principal)
+        # ===================================================================
+        # F17: Compute eligible corpus fingerprint using the SAME resolved
+        # context, embedding profile, and workspace as ranking.
+        # ===================================================================
         eligible_fp, eligible_count = await suite.compute_eligible_corpus_fingerprint(
             tenant_id=args.tenant_id,
+            principal_id=args.principal_id,
             memory_context=ctx,
-            embedding_profile_key=ep.profile_key,
+            embedding_profile_id=str(ep.id),
+            embedding_dimensions=ep.dimensions,
+            workspace_id=ws_id,
         )
 
         # --- Build the report ---
@@ -218,6 +219,8 @@ async def run(args: argparse.Namespace) -> int:
                 )
                 all_results.append(comp_result)
 
+        # F18: pass context_evidence so report fields come from the resolved
+        # context, not CLI input.
         report = ServiceBenchmarkSuite.generate_report(
             repository_sha=sha,
             results=all_results,
@@ -229,10 +232,7 @@ async def run(args: argparse.Namespace) -> int:
             config_version="v1",
             eligible_corpus_fingerprint=eligible_fp,
             eligible_item_count=eligible_count,
-            memory_context_version=ctx.version,
-            memory_profile_slug=args.memory_profile_slug,
-            memory_profile_version=args.memory_profile_version,
-            workspace_id=args.workspace_id,
+            context_evidence=context_evidence,
         )
 
         # --- Output ---
@@ -292,7 +292,7 @@ def main() -> int:
         action="store_true",
         help="Resolve active EmbeddingProfile and use it to generate the query vector",
     )
-    # F15: memory profile and workspace context.
+    # F16/F18: memory profile and workspace context.
     parser.add_argument("--memory-profile-id", default=None, help="Memory profile UUID")
     parser.add_argument(
         "--memory-profile-revision-id", default=None, help="Memory profile revision UUID"
