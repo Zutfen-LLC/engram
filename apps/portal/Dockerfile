@@ -36,6 +36,8 @@ COPY packages/portal-sdk ./packages/portal-sdk
 COPY packages/ui ./packages/ui
 
 WORKDIR /app/apps/portal
+# Ensure public/ exists even if empty (the runner COPY below needs it).
+RUN mkdir -p ./public
 # Build the SDK and UI are consumed as workspace source; Next resolves them.
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN pnpm exec next build
