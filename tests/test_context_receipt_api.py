@@ -565,7 +565,7 @@ async def test_detail_readable_for_integrity_invalid_row():
     async with _test_session_factory() as session:
         await session.execute(
             text(
-                "UPDATE context_receipts SET manifest_hash = 'sha256:deadbeef' "
+                "UPDATE context_receipts SET manifest_hash = 'sha256:" + "d" * 64 + "' "
                 "WHERE id = :rid"
             ),
             {"rid": receipt_id},
@@ -641,7 +641,7 @@ async def test_verify_returns_invalid_with_stable_code_for_corrupt_receipt():
     async with _test_session_factory() as session:
         await session.execute(
             text(
-                "UPDATE context_receipts SET manifest_hash = 'sha256:corrupt' "
+                "UPDATE context_receipts SET manifest_hash = 'sha256:" + "c" * 64 + "' "
                 "WHERE id = :rid"
             ),
             {"rid": receipt_id},

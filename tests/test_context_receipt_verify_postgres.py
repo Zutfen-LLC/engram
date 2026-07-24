@@ -1030,8 +1030,7 @@ async def test_verify_detects_packet_hash_corruption() -> None:
         # manifest's embedded packet.hash. The
         # chk_context_receipts_packet_agreement check constraint prevents
         # storing a mismatched state, so we temporarily drop it, corrupt,
-        # and re-add it. This simulates a post-store DB-level corruption
-        # that bypasses application-layer integrity.
+        # verify, then clean up the row before re-adding the constraint.
         await owner.execute(
             "ALTER TABLE context_receipts "
             "DROP CONSTRAINT IF EXISTS chk_context_receipts_packet_agreement"
@@ -1040,11 +1039,6 @@ async def test_verify_detects_packet_hash_corruption() -> None:
             "UPDATE context_receipts SET packet_hash = $1 WHERE id = $2",
             "sha256:" + "0" * 64,
             rid,
-        )
-        await owner.execute(
-            "ALTER TABLE context_receipts "
-            "ADD CONSTRAINT chk_context_receipts_packet_agreement CHECK ("
-            "(manifest -> 'packet' ->> 'hash' = packet_hash) IS TRUE)"
         )
 
         async with factory() as session:
@@ -1068,6 +1062,25 @@ async def test_verify_detects_packet_hash_corruption() -> None:
             )
         assert result.status == "invalid"
         assert result.failure_code == VERIFICATION_FAILURE_PACKET_HASH_BINDING_MISMATCH
+
+        # Re-add the constraint we dropped. Delete the corrupted row first
+        # so it does not violate the constraint on re-add.
+        await owner.execute(
+            "DELETE FROM context_receipts WHERE id = $1", rid
+        )
+        # Use a DO block to safely re-add only if missing.
+        await owner.execute(
+            "DO $$ BEGIN "
+            "IF NOT EXISTS ("
+            "  SELECT 1 FROM pg_constraint "
+            "  WHERE conname = 'chk_context_receipts_packet_agreement'"
+            "  AND conrelid = 'context_receipts'::regclass"
+            ") THEN "
+            "  ALTER TABLE context_receipts "
+            "  ADD CONSTRAINT chk_context_receipts_packet_agreement "
+            "  CHECK ((manifest -> 'packet' ->> 'hash' = packet_hash) IS TRUE); "
+            "END IF; END $$"
+        )
     finally:
         await _cleanup(owner, tenant_id)
         await engine.dispose()
@@ -1482,13 +1495,26 @@ async def test_manifest_parse_failure_truthful_recall_log_exists() -> None:
             item_ids=item_ids,
         )
 
-        # Corrupt the manifest JSON so it fails to parse. We must also
-        # satisfy chk_context_receipts_manifest_is_object (manifest IS a
-        # JSON object), so we replace with a valid JSON object that won't
-        # parse as a ContextManifestV1.
+        # Corrupt the manifest JSON so it fails to parse as a
+        # ContextManifestV1 but still satisfies all structural check
+        # constraints (manifest sections are objects, subject tenant/
+        # principal match envelope, packet.hash matches envelope).
+        corrupt_packet_hash = "sha256:" + "0" * 64
+        broken_manifest = {
+            "subject": {
+                "tenant_id": str(tenant_id),
+                "principal_id": str(principal_id),
+            },
+            "request": {"invalid": True},
+            "versions": {"invalid": True},
+            "result": {"invalid": True},
+            "packet": {"hash": corrupt_packet_hash},
+        }
         await owner.execute(
-            "UPDATE context_receipts SET manifest = $1::jsonb WHERE id = $2",
-            json.dumps({"broken": "manifest"}),
+            "UPDATE context_receipts SET manifest = $1::jsonb, "
+            "packet_hash = $2 WHERE id = $3",
+            json.dumps(broken_manifest),
+            corrupt_packet_hash,
             rid,
         )
 
