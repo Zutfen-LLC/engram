@@ -90,6 +90,10 @@ def _prepare_stage_6(s: RunState) -> None:
         "agent_direct_access": True,
         "readiness": "READY_FOR_RECALL",
         "semantic_recall_selected": True,
+        "effective_hermes_item_budget": cli.AUDIT_HERMES_ITEM_BUDGET,
+        "hermes_item_budget_explicit": True,
+        "inside_item_budget_window": True,
+        "injection_window_preflight_passed": True,
     }
 
 
@@ -134,12 +138,19 @@ def _make_hook_trace(
     *,
     fixture: str = "recall",
     run_id: str | None = None,
+    schema_version: str = "2.1",
+    configured_item_budget: int | None = 20,
 ) -> Path:
     """Write a valid hook audit trace JSONL file for a given fixture item ID.
 
-    Produces a schema 2.0 record with audit binding fields (prompt hash,
-    session digest, turn index, run ID, fixture lane) matching what the
-    actual recall_bridge + audit_trace pipeline would emit.
+    Produces a schema 2.1 record (default) with audit binding fields (prompt
+    hash, session digest, turn index, run ID, fixture lane) and
+    configured_item_budget, matching what the actual recall_bridge +
+    audit_trace pipeline would emit.
+
+    Pass ``schema_version="2.0"`` and ``configured_item_budget=None`` to
+    produce a legacy v2.0 trace (no budget attestation) for backward
+    compatibility tests.
     """
     import hashlib
 
@@ -155,7 +166,7 @@ def _make_hook_trace(
     trace = tmp_path / f"trace-{item_id[:8]}.jsonl"
     record = {
         "schema": "engram.hermes-hook-audit-trace",
-        "schema_version": "2.0",
+        "schema_version": schema_version,
         "timestamp": datetime.now(UTC).isoformat(),
         "hook": "pre_llm_call",
         "provider": "engram",
@@ -179,6 +190,8 @@ def _make_hook_trace(
     if run_id is not None:
         record["audit_run_id"] = run_id
     record["audit_fixture"] = fixture
+    if configured_item_budget is not None:
+        record["configured_item_budget"] = configured_item_budget
     trace.write_text(json.dumps(record) + "\n", encoding="utf-8")
     return trace
 
@@ -1269,6 +1282,10 @@ async def test_epistemic_fixture_creation_is_pending_and_scope_matched(
     monkeypatch.setattr(cli, "_wait_for_recall_readiness", _ready)
     cfg = cli.AuditConfig()
     cfg.base_url, cfg.reviewer_key, cfg.agent_key = "http://test", "reviewer", "agent"
+    # The epistemic child must have an explicit item budget of 20 for the
+    # injection-window preflight to pass.
+    cfg.hermes_recall_item_budget = cli.AUDIT_HERMES_ITEM_BUDGET
+    cfg.hermes_recall_item_budget_explicit = True
     await cli.stage_6_epistemic_safety_create(s, cfg)
     stage = s.stage("stage_6_epistemic_safety")
     assert seen["classify"]["visibility"] == "tenant"

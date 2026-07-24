@@ -360,22 +360,66 @@ def _fit_single_item(
     return best
 
 
+@dataclass(frozen=True, slots=True)
+class RenderedEnvelope:
+    """Result of rendering the recall envelope with post-render provenance.
+
+    ``context`` is the final rendered string (or None if nothing fit).
+    ``injected_items`` are the EvidenceItem records actually retained in the
+    final rendered context — NOT the pre-render admitted evidence list.
+
+    This distinction matters for audit trace provenance: an item admitted by
+    item count but removed by context-byte rendering must NOT be reported as
+    injected.
+    """
+
+    context: str | None
+    injected_items: tuple[EvidenceItem, ...]
+
+
 def render_envelope(
     items: Sequence[EvidenceItem],
     recall_log_ids: Sequence[str],
     traces: Sequence[CompactTrace],
     max_bytes: int,
 ) -> str | None:
-    """Pack deterministic context while retaining semantic-origin evidence first."""
+    """Pack deterministic context while retaining semantic-origin evidence first.
+
+    This is the string-returning interface preserved for backward compatibility.
+    Use :func:`render_envelope_result` when you need post-render item provenance.
+    """
+    return render_envelope_result(items, recall_log_ids, traces, max_bytes).context
+
+
+def render_envelope_result(
+    items: Sequence[EvidenceItem],
+    recall_log_ids: Sequence[str],
+    traces: Sequence[CompactTrace],
+    max_bytes: int,
+) -> RenderedEnvelope:
+    """Pack deterministic context, returning both the string and retained items.
+
+    The ``injected_items`` tuple contains only items that actually survived
+    rendering into the final context. An item admitted by item count but
+    dropped during byte-pressure fitting is NOT included.
+
+    Provenance is derived structurally (from the ``retained`` list at each
+    return point) rather than by re-parsing the rendered context string,
+    so it cannot disagree with the rendering logic.
+    """
     if not items and not traces:
-        return None
+        return RenderedEnvelope(context=None, injected_items=())
     original_trace_blocks = [_render_trace(trace) for trace in traces]
     retained = list(items)
 
     while len(retained) > 1:
         item_blocks = [_render_item(item, item.content) for item in retained]
         if len(_assemble(item_blocks, original_trace_blocks, recall_log_ids).encode()) <= max_bytes:
-            return _assemble(item_blocks, original_trace_blocks, recall_log_ids)
+            context = _assemble(item_blocks, original_trace_blocks, recall_log_ids)
+            return RenderedEnvelope(
+                context=context,
+                injected_items=tuple(retained),
+            )
         drop_index = _drop_index(retained)
         if drop_index is None:
             break
@@ -388,7 +432,11 @@ def render_envelope(
                 retained[0], trace_blocks, recall_log_ids, max_bytes
             )
             if item_block is not None:
-                return _assemble([item_block], trace_blocks, recall_log_ids)
+                context = _assemble([item_block], trace_blocks, recall_log_ids)
+                return RenderedEnvelope(
+                    context=context,
+                    injected_items=(retained[0],),
+                )
             if not trace_blocks:
                 break
             trace_blocks.pop(0)
@@ -397,6 +445,9 @@ def render_envelope(
     while trace_blocks:
         rendered = _assemble((), trace_blocks, recall_log_ids)
         if len(rendered.encode()) <= max_bytes:
-            return rendered
+            return RenderedEnvelope(
+                context=rendered,
+                injected_items=(),  # only trace blocks fit — no evidence items
+            )
         trace_blocks.pop(0)
-    return None
+    return RenderedEnvelope(context=None, injected_items=())

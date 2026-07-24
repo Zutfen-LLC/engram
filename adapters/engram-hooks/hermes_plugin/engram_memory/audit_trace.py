@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 _TRACE_ENV_VAR = "ENGRAM_HOOKS_AUDIT_TRACE_FILE"
 _SCHEMA = "engram.hermes-hook-audit-trace"
-_SCHEMA_VERSION = "2.0"
+_SCHEMA_VERSION = "2.1"
 
 # Audit-only metadata environment variables (never affect recall behavior).
 _AUDIT_RUN_ID_ENV = "ENGRAM_HOOKS_AUDIT_RUN_ID"
@@ -186,6 +186,13 @@ def _build_record(outcome_data: dict[str, object]) -> dict[str, object]:
         "native_memory_used": False,
         "error_code": error_code,
     }
+
+    # Schema 2.1: configured_item_budget attests the actual item budget the
+    # child used. This is the integer value from config.recall_item_budget,
+    # clamped to [1, 20] by HooksConfig. No configuration paths or env values.
+    item_budget_raw = outcome_data.get("configured_item_budget")
+    if isinstance(item_budget_raw, int) and not isinstance(item_budget_raw, bool):
+        record["configured_item_budget"] = item_budget_raw
 
     # ── Audit binding fields ────────────────────────────────────────────
     # Compute actual prompt hash from the query received by pre_llm_call.

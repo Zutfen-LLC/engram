@@ -14,7 +14,13 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from .evidence import CompactTrace, EvidenceItem, merge_evidence, normalize_items, render_envelope
+from .evidence import (
+    CompactTrace,
+    EvidenceItem,
+    merge_evidence,
+    normalize_items,
+    render_envelope_result,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -421,12 +427,13 @@ class RecallBridge:
                 evidence = merge_evidence(
                     state.startup_evidence, (), self.config.recall_item_budget
                 )
-                context = render_envelope(
+                rendered = render_envelope_result(
                     evidence,
                     state.startup_recall_log_ids,
                     traces,
                     self.config.recall_max_context_bytes,
                 )
+                context = rendered.context
                 logger.info(
                     "Engram recall: session=%s query=%s turn=%d generation=%d "
                     "disposition=%s failures=%d breaker=%s elapsed_ms=%d",
@@ -512,12 +519,18 @@ class RecallBridge:
                 )
                 log_ids = state.startup_recall_log_ids
 
-            context = render_envelope(
+            rendered = render_envelope_result(
                 evidence,
                 log_ids,
                 traces,
                 self.config.recall_max_context_bytes,
             )
+            context = rendered.context
+            # The items actually retained in the final rendered context —
+            # NOT the pre-render admitted evidence list. An item admitted by
+            # item count but dropped during context-byte rendering must NOT
+            # be reported as injected.
+            injected_items = rendered.injected_items
             # Audit trace: emit one sanitized record when the env var is set.
             # Import is deferred so test contexts that don't have the full
             # plugin package initialized can still exercise recall_bridge.
@@ -538,18 +551,21 @@ class RecallBridge:
                         if outcome.semantic.completed
                         else []
                     ),
-                    "injected_item_ids": [item.id for item in evidence] if evidence else [],
+                    "injected_item_ids": (
+                        [item.id for item in injected_items] if injected_items else []
+                    ),
                     "error_code": (
                         outcome.disposition.value if not outcome.semantic_completed else None
                     ),
                     "query": query,
                     "session_id": session_id,
                     "turn_index": turn_index,
+                    "configured_item_budget": self.config.recall_item_budget,
                 })
             except Exception:  # noqa: BLE001 — trace is best-effort, never breaks recall
                 pass
-            if context and evidence and self.config.recall_followup_turns:
-                trace = self._trace(turn_index, query_digest, evidence, log_ids)
+            if context and injected_items and self.config.recall_followup_turns:
+                trace = self._trace(turn_index, query_digest, injected_items, log_ids)
                 previous = state.recent_traces[-1] if state.recent_traces else None
                 deduped_trace = self._dedupe_adjacent_trace(trace, previous)
                 if deduped_trace is not None:
