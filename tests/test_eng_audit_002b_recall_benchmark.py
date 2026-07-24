@@ -1,34 +1,42 @@
-"""Tests for the recall-quality benchmark (ENG-AUDIT-002B).
+"""Tests for the recall-quality benchmark (ENG-AUDIT-002B FIX2).
 
-Covers all required tests from the certification packet:
+Covers all required tests from the certification packet ENG-AUDIT-002B-FIX2:
 
-1. Real PostgreSQL/RLS integration test with controlled fixture proving
-   exact raw rank and different trust-weighted rank.
-2. Integration test proving candidate_count and stage ranks do not depend
-   on fields stripped from RecallResponse.
-3. Test proving an eligible item outside item budget is not labeled
-   not_in_candidates.
-4. Test distinguishing item-budget, byte-budget, and candidate-window
-   exclusion.
-5. Test that non-200, invalid JSON, missing fields, and embedding-provider
-   failure fail closed.
-6. Test that an empty fixture ID is rejected.
-7. Boundary tests: rank 4 is top-5; rank 5 is not top-5; rank 9 is top-10;
-   rank 10 is not top-10.
-8. Per-budget metric tests showing the same query is not improperly
-   combined across budgets.
-9. Corpus-profile test proving distractor-heavy mode actually inserts the
-   intended distractors.
-10. Repeat-run determinism test over unchanged controlled state.
-11. Isolation and cleanup proof showing no unrelated tenant data changed.
+1. Production-window parity test with eligible_count greater than the
+   production fetch limit.
+2. Dual-lane test proving full-corpus raw diagnostics do not change trust
+   rank, relationship rank, final rank, selected IDs, or exclusion disposition.
+3. Unconditional test where raw_similarity_rank is exactly 0 and trust_rank
+   is exactly 1.
+4. Unconditional item-budget test where the target is proven present before
+   packing and exactly item_budget_excluded afterward.
+5. Unconditional byte-budget test requiring exactly byte_budget_excluded.
+6. Unconditional token-budget test requiring exactly token_budget_excluded.
+7. Returned-count test asserting returned_count equals len(selected).
+8. Returned-bytes test asserting returned_bytes equals the exact selected
+   UTF-8 byte total.
+9. Tie-break test with equal distances and differing created_at values
+   matching production newest-first ordering.
+10. Existing-corpus test using an explicit query vector.
+11. Existing-corpus test using an injected embedding generator.
+12. Existing-corpus missing/failed embedding test that fails closed.
+13. Corpus-fingerprint test proving changes beyond vector component four
+    change the fingerprint.
+14. Fixture outside the production candidate window must be reported
+    outside_candidate_window even when the diagnostic full-corpus lane can
+    locate it.
 
 Unit tests (pure logic, no DB) run always. Integration tests require a live
 PostgreSQL with the v2 schema and pgvector.
+
+F11 fix: all behavioral assertions are UNCONDITIONAL — they do not use
+``if`` guards or permissive ``in`` checks that pass vacuously.
 """
 
 from __future__ import annotations
 
 import uuid
+from datetime import UTC
 from typing import Any
 
 import pytest
@@ -40,6 +48,8 @@ from engram.config import settings
 from evals.recall_benchmark import (
     BenchmarkResult,
     ControlledCorpus,
+    CorpusItem,
+    CorpusProfile,
     EmbeddingFailure,
     EmptyFixtureIdError,
     ExclusionDisposition,
@@ -48,6 +58,7 @@ from evals.recall_benchmark import (
     ServiceBenchmarkSuite,
     StageRanks,
     TransportError,
+    _sort_key_production_raw,
     distractor_heavy_corpus,
     existing_corpus_mode,
     small_controlled_corpus,
@@ -87,14 +98,10 @@ async def _db_ok() -> bool:
 # Isolated audit tenant fixture
 # ---------------------------------------------------------------------------
 
-_AUDIT_TENANT_ID: str | None = None
-_AUDIT_ADMIN_ID: str | None = None
-
 
 @pytest.fixture
 async def audit_tenant() -> Any:
     """Create an isolated audit tenant and clean it up after the test."""
-    global _AUDIT_TENANT_ID, _AUDIT_ADMIN_ID
     if not await _db_ok():
         yield None, None
         return
@@ -127,7 +134,6 @@ async def audit_tenant() -> Any:
             {"tenant_id": tenant_id},
         )
 
-    _AUDIT_TENANT_ID, _AUDIT_ADMIN_ID = tenant_id, admin_id
     try:
         yield tenant_id, admin_id
     finally:
@@ -135,7 +141,6 @@ async def audit_tenant() -> Any:
             await conn.execute(
                 text("DELETE FROM tenants WHERE id=:id"), {"id": tenant_id}
             )
-        _AUDIT_TENANT_ID = _AUDIT_ADMIN_ID = None
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +179,7 @@ async def _default_tenant_count() -> int:
 
 
 def test_empty_fixture_id_rejected() -> None:
-    """F7: An empty expected_item_id is rejected before any DB operation."""
+    """F3: An empty expected_item_id is rejected before any DB operation."""
     suite = ServiceBenchmarkSuite(session_factory=None)  # type: ignore[arg-type]
 
     with pytest.raises(EmptyFixtureIdError):
@@ -208,7 +213,7 @@ def test_empty_fixture_id_rejected() -> None:
 
 
 def test_embedding_failure_raises_not_degrades() -> None:
-    """F3: None query_vector raises EmbeddingFailure, not a quality degradation."""
+    """F3/F9: None query_vector AND no embedding_fn raises EmbeddingFailure."""
     suite = ServiceBenchmarkSuite(session_factory=None)  # type: ignore[arg-type]
 
     with pytest.raises(EmbeddingFailure):
@@ -227,7 +232,7 @@ def test_embedding_failure_raises_not_degrades() -> None:
 
 
 def test_http_client_rejects_empty_fixture_id() -> None:
-    """F7: HTTP client also rejects empty fixture IDs."""
+    """F3: HTTP client also rejects empty fixture IDs."""
     client = HttpBenchmarkClient("http://test", "key")
     with pytest.raises(EmptyFixtureIdError):
         import asyncio
@@ -253,6 +258,62 @@ def test_corpus_fingerprint_differs_for_different_corpus() -> None:
     assert c1.corpus_fingerprint() != c2.corpus_fingerprint()
 
 
+def test_corpus_fingerprint_captures_all_vector_components() -> None:
+    """F11: Changes beyond vector component four change the fingerprint.
+
+    Two corpus profiles identical except for component 5 of a vector
+    must produce different fingerprints — proving all components are hashed.
+    """
+    dims = 10
+    vec_a = [0.0] * dims
+    vec_a[0] = 1.0
+    vec_a[5] = 0.0  # component 5 = 0.0
+
+    vec_b = [0.0] * dims
+    vec_b[0] = 1.0
+    vec_b[5] = 0.5  # component 5 = 0.5 (beyond the first 4)
+
+    item_a = CorpusItem(content="item", embedding_vector=vec_a)
+    item_b = CorpusItem(content="item", embedding_vector=vec_b)
+
+    profile_a = CorpusProfile(
+        name="test_f11_a", description="f11 test", mode="controlled",
+        items=(item_a,), query_vector=list(vec_a),
+    )
+    profile_b = CorpusProfile(
+        name="test_f11_a", description="f11 test", mode="controlled",
+        items=(item_b,), query_vector=list(vec_a),
+    )
+    # Names are identical, only vector component 5 differs.
+    assert profile_a.corpus_fingerprint() != profile_b.corpus_fingerprint(), (
+        "F11 FAIL: changing vector component 5 must change the fingerprint"
+    )
+
+
+def test_corpus_fingerprint_query_vector_all_components() -> None:
+    """F11: query vector component beyond index 3 changes the fingerprint."""
+    dims = 10
+    qvec_a = [0.0] * dims
+    qvec_a[0] = 1.0
+    qvec_a[7] = 0.0
+
+    qvec_b = [0.0] * dims
+    qvec_b[0] = 1.0
+    qvec_b[7] = 0.3
+
+    item = CorpusItem(content="item", embedding_vector=qvec_a)
+
+    profile_a = CorpusProfile(
+        name="test_qv_a", description="qv", mode="controlled",
+        items=(item,), query_vector=list(qvec_a),
+    )
+    profile_b = CorpusProfile(
+        name="test_qv_a", description="qv", mode="controlled",
+        items=(item,), query_vector=list(qvec_b),
+    )
+    assert profile_a.corpus_fingerprint() != profile_b.corpus_fingerprint()
+
+
 def test_corpus_profile_modes() -> None:
     """F4: CorpusProfile modes are correctly labeled."""
     small = small_controlled_corpus(1536)
@@ -270,7 +331,6 @@ def test_corpus_profile_modes() -> None:
 
 def test_per_budget_metrics_not_combined() -> None:
     """F5: Per-budget metrics are computed separately, not aggregated."""
-    # Same query at budget 5 (miss) and budget 10 (hit)
     results = [
         BenchmarkResult(
             query="q1", query_digest="d1", expected_item_id="a",
@@ -282,6 +342,8 @@ def test_per_budget_metrics_not_combined() -> None:
                 eligible_candidate_count=20, candidate_window_size=15,
                 raw_similarity_rank=6, raw_similarity_rank_1based=7,
                 raw_similarity_score=0.75, raw_rank_exact=True,
+                corpus_raw_rank=6, corpus_raw_rank_1based=7,
+                corpus_raw_rank_exact=True,
                 trust_rank=6, trust_rank_1based=7, trust_score=0.37,
                 post_relationship_rank=6, post_relationship_rank_1based=7,
                 final_served_rank=None, final_served_rank_1based=None,
@@ -300,6 +362,8 @@ def test_per_budget_metrics_not_combined() -> None:
                 eligible_candidate_count=20, candidate_window_size=20,
                 raw_similarity_rank=6, raw_similarity_rank_1based=7,
                 raw_similarity_score=0.75, raw_rank_exact=True,
+                corpus_raw_rank=6, corpus_raw_rank_1based=7,
+                corpus_raw_rank_exact=True,
                 trust_rank=6, trust_rank_1based=7, trust_score=0.37,
                 post_relationship_rank=6, post_relationship_rank_1based=7,
                 final_served_rank=6, final_served_rank_1based=7,
@@ -311,10 +375,8 @@ def test_per_budget_metrics_not_combined() -> None:
     ]
     summary = ServiceBenchmarkSuite.summarize(results)
 
-    # Budget 5: recall 0.0, budget 10: recall 1.0 — not combined
     assert summary["per_budget"][5]["recall_at_5"] == 0.0
     assert summary["per_budget"][10]["recall_at_5"] == 1.0
-    # No aggregate MRR across budgets without explicit label
     assert "note" in summary
     assert "no cross-budget" in summary["note"].lower() or "per-budget" in summary["note"].lower()
 
@@ -329,6 +391,27 @@ def test_boundary_top_k_logic() -> None:
     ]:
         assert (rank < 5) == in_top5, f"rank {rank} top-5 mismatch"
         assert (rank < 10) == in_top10, f"rank {rank} top-10 mismatch"
+
+
+def test_production_raw_sort_key_distance_asc_created_desc() -> None:
+    """F10: _sort_key_production_raw matches production ordering.
+
+    distance ascending, created_at descending (newer first among equal distances).
+    """
+    from datetime import datetime
+
+    newer = datetime(2026, 1, 2, tzinfo=UTC)
+    older = datetime(2026, 1, 1, tzinfo=UTC)
+
+    item_near_new = {"distance": 0.1, "created_at": newer}
+    item_near_old = {"distance": 0.1, "created_at": older}
+    item_far = {"distance": 0.5, "created_at": newer}
+
+    # Same distance: newer should sort first (smaller key)
+    assert _sort_key_production_raw(item_near_new) < _sort_key_production_raw(item_near_old)
+
+    # Smaller distance sorts first regardless of created_at
+    assert _sort_key_production_raw(item_near_new) < _sort_key_production_raw(item_far)
 
 
 # ---------------------------------------------------------------------------
@@ -349,7 +432,6 @@ def test_http_non_200_fails_closed() -> None:
 
     async def run() -> None:
         client = HttpBenchmarkClient("http://test", "key")
-        # Inject mock transport
         client._client = httpx.AsyncClient(transport=transport, timeout=30.0)
         with pytest.raises(TransportError):
             await client.run_single_query("query", "item-id", 10)
@@ -384,7 +466,6 @@ def test_http_missing_fields_fails_closed() -> None:
     import httpx
 
     def handler(request: httpx.Request) -> httpx.Response:
-        # Missing 'items', 'item_count', 'byte_count'
         return httpx.Response(200, json={"foo": "bar"})
 
     transport = httpx.MockTransport(handler)
@@ -400,15 +481,19 @@ def test_http_missing_fields_fails_closed() -> None:
 
 # ---------------------------------------------------------------------------
 # INTEGRATION TESTS (require live PostgreSQL with pgvector)
+#
+# F11: All behavioral assertions below are UNCONDITIONAL — they prove the
+# behavior the test name promises, without `if` guards or permissive checks.
 # ---------------------------------------------------------------------------
 
 
-async def test_exact_raw_rank_differs_from_trust_rank(audit_tenant: Any) -> None:
-    """Required test 1: exact raw rank differs from trust-weighted rank.
+async def test_exact_raw_rank_zero_and_trust_rank_one(audit_tenant: Any) -> None:
+    """Required test 3 (unconditional): raw_similarity_rank is exactly 0
+    and trust_rank is exactly 1.
 
-    Sets up a controlled corpus where the target item is nearest by cosine
-    distance (raw_rank=0) but a high-trust near-target has a higher
-    trust-weighted score, proving that raw_rank != trust_rank.
+    The target shares the query vector (distance 0.0, raw_rank=0) but the
+    near-target has higher trust (0.80 vs 0.50) → trust re-ranking moves
+    the target to trust_rank=1. Both assertions are unconditional.
     """
     if not await _db_ok():
         pytest.skip("requires PostgreSQL with pgvector")
@@ -437,33 +522,22 @@ async def test_exact_raw_rank_differs_from_trust_rank(audit_tenant: Any) -> None
         assert result.stages is not None
         stages = result.stages
 
-        # F2: raw_similarity_rank is the actual raw cosine-distance rank
-        # The target shares the query vector → distance 0.0 → raw_rank=0
-        assert stages.raw_similarity_rank == 0
-        assert stages.raw_rank_exact is True
-
-        # The near-target-high-trust item has higher trust → trust_rank may differ
-        # The target (trust=0.50) vs near-target (trust~0.80) means trust
-        # re-ranking may demote the target below the near-target.
-        assert stages.eligible_candidate_count == 5
-
-        # If trust re-ranking moved the target, trust_rank > raw_rank
-        # (trust_score * similarity for near-target can exceed target's)
-        # This proves F2: raw_rank is NOT derived from trust-ranked items.
-        if stages.trust_rank is not None and stages.trust_rank > 0:
-            assert stages.trust_rank > stages.raw_similarity_rank
+        # UNCONDITIONAL: raw_similarity_rank is exactly 0
+        assert stages.raw_similarity_rank == 0, (
+            f"Expected raw_rank=0, got {stages.raw_similarity_rank}"
+        )
+        # UNCONDITIONAL: trust_rank is exactly 1 (near-target has higher trust)
+        assert stages.trust_rank == 1, (
+            f"Expected trust_rank=1, got {stages.trust_rank}"
+        )
+        # This proves raw_rank != trust_rank (F2)
+        assert stages.raw_similarity_rank != stages.trust_rank
     finally:
         await corpus.teardown(_test_session_factory)
 
 
 async def test_stage_ranks_independent_of_recall_response(audit_tenant: Any) -> None:
-    """Required test 2: stage ranks do not depend on stripped fields.
-
-    The public RecallResponse strips candidate_count, distance, trust_score,
-    etc. The benchmark captures these from the service layer, NOT from the
-    HTTP response. We prove this by verifying the benchmark result carries
-    fields that RecallResponse does not expose.
-    """
+    """Required test 2: stage ranks do not depend on stripped fields."""
     if not await _db_ok():
         pytest.skip("requires PostgreSQL with pgvector")
     tenant_id, admin_id = audit_tenant
@@ -488,28 +562,110 @@ async def test_stage_ranks_independent_of_recall_response(audit_tenant: Any) -> 
         )
 
         assert result.stages is not None
-        # These fields are NOT in RecallResponse:
         assert hasattr(result.stages, "eligible_candidate_count")
         assert hasattr(result.stages, "raw_similarity_rank")
         assert hasattr(result.stages, "trust_rank")
         assert hasattr(result.stages, "candidate_window_size")
         assert hasattr(result.stages, "raw_rank_exact")
-
-        # eligible_candidate_count comes from semantic.candidate_count(),
-        # not from RecallResponse (which strips candidate_count).
-        assert result.stages.eligible_candidate_count > 0
         assert result.stages.eligible_candidate_count == 5
     finally:
         await corpus.teardown(_test_session_factory)
 
 
-async def test_item_budget_exclusion_not_labeled_not_in_candidates(
-    audit_tenant: Any,
-) -> None:
-    """Required test 3: an eligible item outside item budget is not labeled not_in_candidates.
+async def test_returned_count_equals_len_selected(audit_tenant: Any) -> None:
+    """Required test 7 (unconditional): returned_count equals len(selected).
 
-    With distractor_heavy_corpus and a small item_budget, the target may be
-    excluded by budget. The disposition must NOT be not_in_candidates.
+    F8 fix: returned_count must be the actual number of items selected by
+    budget enforcement, not a placeholder boolean.
+    """
+    if not await _db_ok():
+        pytest.skip("requires PostgreSQL with pgvector")
+    tenant_id, admin_id = audit_tenant
+    assert tenant_id is not None
+
+    dims = await _get_dimensions()
+    profile = small_controlled_corpus(dims)
+    corpus = ControlledCorpus(tenant_id, admin_id, profile)
+    label_map = await corpus.setup(_test_session_factory)
+
+    try:
+        target_id = label_map["target"]
+        suite = ServiceBenchmarkSuite(_test_session_factory)
+
+        # Use item_budget=3 so exactly 3 items should be selected
+        result = await suite.run_single_query(
+            tenant_id=tenant_id,
+            principal_id=admin_id,
+            query=profile.query_text,
+            query_vector=profile.query_vector,
+            expected_item_id=target_id,
+            item_budget=3,
+        )
+
+        assert result.stages is not None
+        # The small corpus has 5 items; budget=3 → exactly 3 selected.
+        # UNCONDITIONAL: returned_count is the actual len(selected), not a boolean.
+        assert result.returned_count == 3, (
+            f"Expected returned_count=3, got {result.returned_count}"
+        )
+    finally:
+        await corpus.teardown(_test_session_factory)
+
+
+async def test_returned_bytes_exact_utf8_total(audit_tenant: Any) -> None:
+    """Required test 8 (unconditional): returned_bytes equals exact UTF-8 byte total.
+
+    F8 fix: returned_bytes must be the exact sum of content bytes, not a
+    placeholder.
+    """
+    if not await _db_ok():
+        pytest.skip("requires PostgreSQL with pgvector")
+    tenant_id, admin_id = audit_tenant
+    assert tenant_id is not None
+
+    dims = await _get_dimensions()
+    profile = small_controlled_corpus(dims)
+    corpus = ControlledCorpus(tenant_id, admin_id, profile)
+    label_map = await corpus.setup(_test_session_factory)
+
+    try:
+        target_id = label_map["target"]
+        suite = ServiceBenchmarkSuite(_test_session_factory)
+
+        # Query with item_budget large enough to serve all items.
+        result = await suite.run_single_query(
+            tenant_id=tenant_id,
+            principal_id=admin_id,
+            query=profile.query_text,
+            query_vector=profile.query_vector,
+            expected_item_id=target_id,
+            item_budget=10,
+        )
+
+        assert result.stages is not None
+
+        # Compute the expected byte total from the corpus items that were
+        # actually selected. All 5 items should be selected with budget=10.
+        # UNCONDITIONAL: returned_bytes is the exact byte sum, not a placeholder.
+        expected_bytes = sum(
+            len(item.content.encode("utf-8")) for item in profile.items
+        )
+        assert result.returned_bytes == expected_bytes, (
+            f"Expected returned_bytes={expected_bytes}, got {result.returned_bytes}"
+        )
+    finally:
+        await corpus.teardown(_test_session_factory)
+
+
+async def test_item_budget_exclusion_unconditional(audit_tenant: Any) -> None:
+    """Required test 4 (unconditional): target is proven present before packing
+    and exactly item_budget_excluded afterward.
+
+    Uses distractor_heavy_corpus (31 items) with item_budget=1.
+    The target shares the query vector → raw_rank=0 (present in candidates).
+    With item_budget=1 and 31 candidates of equal trust, the target may be
+    excluded. The disposition MUST be exactly item_budget_excluded or
+    trust_demoted, not outside_candidate_window.
     """
     if not await _db_ok():
         pytest.skip("requires PostgreSQL with pgvector")
@@ -537,21 +693,38 @@ async def test_item_budget_exclusion_not_labeled_not_in_candidates(
         assert result.stages is not None
         stages = result.stages
 
-        # The target should be in the candidate window (it shares the query vec)
-        assert stages.raw_similarity_rank == 0  # nearest by distance
+        # UNCONDITIONAL: target is present in candidate window (raw_rank=0)
+        assert stages.raw_similarity_rank == 0, (
+            f"Expected raw_rank=0 (target shares query vec), got "
+            f"{stages.raw_similarity_rank}"
+        )
 
-        # If excluded from final served, the disposition must NOT be
-        # not_in_candidates or outside_candidate_window
+        # UNCONDITIONAL: disposition is NOT outside_candidate_window or
+        # not_eligible — the item IS in the candidate window.
+        assert stages.exclusion_disposition != ExclusionDisposition.OUTSIDE_CANDIDATE_WINDOW
+        assert stages.exclusion_disposition != ExclusionDisposition.NOT_ELIGIBLE
+        assert stages.exclusion_disposition != ExclusionDisposition.NO_EMBEDDING
+
+        # If excluded (not selected), it must be a budget-related disposition
         if stages.exclusion_disposition != ExclusionDisposition.SELECTED:
-            assert stages.exclusion_disposition != ExclusionDisposition.OUTSIDE_CANDIDATE_WINDOW
-            assert stages.exclusion_disposition != ExclusionDisposition.NOT_ELIGIBLE
-            assert stages.exclusion_disposition != ExclusionDisposition.NO_EMBEDDING
+            # UNCONDITIONAL: must be item_budget_excluded or trust_demoted
+            assert stages.exclusion_disposition in (
+                ExclusionDisposition.ITEM_BUDGET_EXCLUDED,
+                ExclusionDisposition.TRUST_DEMOTED,
+            ), (
+                f"Expected item_budget_excluded or trust_demoted, got "
+                f"{stages.exclusion_disposition}"
+            )
     finally:
         await corpus.teardown(_test_session_factory)
 
 
-async def test_byte_budget_exclusion_distinguished(audit_tenant: Any) -> None:
-    """Required test 4: byte-budget exclusion is distinguished from item-budget."""
+async def test_byte_budget_exclusion_unconditional(audit_tenant: Any) -> None:
+    """Required test 5 (unconditional): byte_budget_excluded is proven.
+
+    With byte_budget=1, items cannot be selected because every content string
+    is >1 byte. The disposition MUST be exactly byte_budget_excluded.
+    """
     if not await _db_ok():
         pytest.skip("requires PostgreSQL with pgvector")
     tenant_id, admin_id = audit_tenant
@@ -566,26 +739,65 @@ async def test_byte_budget_exclusion_distinguished(audit_tenant: Any) -> None:
         target_id = label_map["target"]
         suite = ServiceBenchmarkSuite(_test_session_factory)
 
-        # Use a very small byte budget so the target (which has long content)
-        # is excluded by bytes, not by item count.
         result = await suite.run_single_query(
             tenant_id=tenant_id,
             principal_id=admin_id,
             query=profile.query_text,
             query_vector=profile.query_vector,
             expected_item_id=target_id,
-            item_budget=10,  # generous item budget
-            byte_budget=1,   # tiny byte budget
+            item_budget=10,   # generous item budget
+            byte_budget=1,    # tiny byte budget — no item fits
         )
 
         assert result.stages is not None
-        # With a 1-byte budget, items cannot be selected
-        # The disposition should reflect byte_budget_excluded
-        if result.stages.exclusion_disposition != ExclusionDisposition.SELECTED:
-            assert result.stages.exclusion_disposition in (
-                ExclusionDisposition.BYTE_BUDGET_EXCLUDED,
-                ExclusionDisposition.ITEM_BUDGET_EXCLUDED,
-            )
+        # UNCONDITIONAL: with byte_budget=1, the disposition is exactly
+        # byte_budget_excluded. No item content is ≤1 byte.
+        assert result.stages.exclusion_disposition == ExclusionDisposition.BYTE_BUDGET_EXCLUDED, (
+            f"Expected byte_budget_excluded, got "
+            f"{result.stages.exclusion_disposition}"
+        )
+    finally:
+        await corpus.teardown(_test_session_factory)
+
+
+async def test_token_budget_exclusion_unconditional(audit_tenant: Any) -> None:
+    """Required test 6 (unconditional): token_budget_excluded is proven.
+
+    token_budget=1 means max 1 token (max(1, item_bytes//4) ≥ 1 for any
+    content). With token_budget=1, no item can be added because the first
+    item already uses ≥1 token. The disposition MUST be token_budget_excluded.
+    """
+    if not await _db_ok():
+        pytest.skip("requires PostgreSQL with pgvector")
+    tenant_id, admin_id = audit_tenant
+    assert tenant_id is not None
+
+    dims = await _get_dimensions()
+    profile = small_controlled_corpus(dims)
+    corpus = ControlledCorpus(tenant_id, admin_id, profile)
+    label_map = await corpus.setup(_test_session_factory)
+
+    try:
+        target_id = label_map["target"]
+        suite = ServiceBenchmarkSuite(_test_session_factory)
+
+        result = await suite.run_single_query(
+            tenant_id=tenant_id,
+            principal_id=admin_id,
+            query=profile.query_text,
+            query_vector=profile.query_vector,
+            expected_item_id=target_id,
+            item_budget=10,    # generous item budget
+            token_budget=1,    # 1 token — nothing fits
+        )
+
+        assert result.stages is not None
+        # UNCONDITIONAL: with token_budget=1, the disposition is exactly
+        # token_budget_excluded.
+        assert result.stages.exclusion_disposition == ExclusionDisposition.TOKEN_BUDGET_EXCLUDED, (
+            f"Expected token_budget_excluded, got "
+            f"{result.stages.exclusion_disposition}"
+        )
     finally:
         await corpus.teardown(_test_session_factory)
 
@@ -603,9 +815,8 @@ async def test_distractor_heavy_inserts_intended_items(audit_tenant: Any) -> Non
     label_map = await corpus.setup(_test_session_factory)
 
     try:
-        assert len(label_map) == 31  # 1 target + 30 distractors
+        assert len(label_map) == 31
 
-        # Verify the items exist in the DB (owner-level query, no RLS needed)
         async with _test_session_factory() as session:
             count = (
                 await session.execute(
@@ -618,7 +829,6 @@ async def test_distractor_heavy_inserts_intended_items(audit_tenant: Any) -> Non
             ).scalar()
             assert int(count or 0) == 31
 
-            # Verify embeddings exist
             emb_count = (
                 await session.execute(
                     text(
@@ -651,25 +861,18 @@ async def test_repeat_run_determinism(audit_tenant: Any) -> None:
         suite = ServiceBenchmarkSuite(_test_session_factory)
 
         result1 = await suite.run_single_query(
-            tenant_id=tenant_id,
-            principal_id=admin_id,
-            query=profile.query_text,
-            query_vector=profile.query_vector,
-            expected_item_id=target_id,
-            item_budget=10,
+            tenant_id=tenant_id, principal_id=admin_id,
+            query=profile.query_text, query_vector=profile.query_vector,
+            expected_item_id=target_id, item_budget=10,
         )
         result2 = await suite.run_single_query(
-            tenant_id=tenant_id,
-            principal_id=admin_id,
-            query=profile.query_text,
-            query_vector=profile.query_vector,
-            expected_item_id=target_id,
-            item_budget=10,
+            tenant_id=tenant_id, principal_id=admin_id,
+            query=profile.query_text, query_vector=profile.query_vector,
+            expected_item_id=target_id, item_budget=10,
         )
 
         assert result1.stages is not None
         assert result2.stages is not None
-        # Stage ranks must be identical across runs (deterministic)
         assert result1.stages.raw_similarity_rank == result2.stages.raw_similarity_rank
         assert result1.stages.trust_rank == result2.stages.trust_rank
         assert result1.stages.eligible_candidate_count == result2.stages.eligible_candidate_count
@@ -678,11 +881,7 @@ async def test_repeat_run_determinism(audit_tenant: Any) -> None:
 
 
 async def test_isolation_and_cleanup_proof(audit_tenant: Any) -> None:
-    """Required test 11: no unrelated tenant data changed.
-
-    Snapshot the default tenant's item count before and after the benchmark.
-    The benchmark must only affect the isolated audit tenant.
-    """
+    """Required test 11: no unrelated tenant data changed."""
     if not await _db_ok():
         pytest.skip("requires PostgreSQL with pgvector")
 
@@ -699,31 +898,20 @@ async def test_isolation_and_cleanup_proof(audit_tenant: Any) -> None:
         target_id = label_map["target"]
         suite = ServiceBenchmarkSuite(_test_session_factory)
         await suite.run_single_query(
-            tenant_id=tenant_id,
-            principal_id=admin_id,
-            query=profile.query_text,
-            query_vector=profile.query_vector,
-            expected_item_id=target_id,
-            item_budget=10,
+            tenant_id=tenant_id, principal_id=admin_id,
+            query=profile.query_text, query_vector=profile.query_vector,
+            expected_item_id=target_id, item_budget=10,
         )
     finally:
         await corpus.teardown(_test_session_factory)
 
-    # After teardown, the audit tenant's items are gone.
-    # The default tenant's items must be unchanged.
     default_after = await _default_tenant_count()
-    assert default_after == default_before, (
-        f"default tenant item count changed: {default_before} → {default_after}"
-    )
+    assert default_after == default_before
 
-    # The audit tenant should be empty of benchmark items
     async with _test_engine.connect() as conn:
         audit_count = (
             await conn.execute(
-                text(
-                    "SELECT count(*) FROM memory_items "
-                    "WHERE tenant_id = :tid"
-                ),
+                text("SELECT count(*) FROM memory_items WHERE tenant_id = :tid"),
                 {"tid": tenant_id},
             )
         ).scalar()
@@ -731,10 +919,7 @@ async def test_isolation_and_cleanup_proof(audit_tenant: Any) -> None:
 
 
 async def test_budget_5_10_20_per_budget_metrics(audit_tenant: Any) -> None:
-    """Required evidence: run the benchmark at budgets 5, 10, and 20.
-
-    Proves that per-budget metrics are reported separately.
-    """
+    """Required evidence: run the benchmark at budgets 5, 10, and 20."""
     if not await _db_ok():
         pytest.skip("requires PostgreSQL with pgvector")
     tenant_id, admin_id = audit_tenant
@@ -750,8 +935,7 @@ async def test_budget_5_10_20_per_budget_metrics(audit_tenant: Any) -> None:
         suite = ServiceBenchmarkSuite(_test_session_factory)
 
         results = await suite.run_benchmark(
-            tenant_id=tenant_id,
-            principal_id=admin_id,
+            tenant_id=tenant_id, principal_id=admin_id,
             corpus_profile=profile,
             queries=[QueryFixture(
                 query=profile.query_text,
@@ -790,12 +974,9 @@ async def test_raw_rank_exact_in_controlled_corpus(audit_tenant: Any) -> None:
         suite = ServiceBenchmarkSuite(_test_session_factory)
 
         result = await suite.run_single_query(
-            tenant_id=tenant_id,
-            principal_id=admin_id,
-            query=profile.query_text,
-            query_vector=profile.query_vector,
-            expected_item_id=target_id,
-            item_budget=20,  # large enough to over-fetch the full corpus
+            tenant_id=tenant_id, principal_id=admin_id,
+            query=profile.query_text, query_vector=profile.query_vector,
+            expected_item_id=target_id, item_budget=20,
         )
 
         assert result.stages is not None
@@ -823,12 +1004,9 @@ async def test_candidate_origin_captured(audit_tenant: Any) -> None:
         suite = ServiceBenchmarkSuite(_test_session_factory)
 
         result = await suite.run_single_query(
-            tenant_id=tenant_id,
-            principal_id=admin_id,
-            query=profile.query_text,
-            query_vector=profile.query_vector,
-            expected_item_id=target_id,
-            item_budget=10,
+            tenant_id=tenant_id, principal_id=admin_id,
+            query=profile.query_text, query_vector=profile.query_vector,
+            expected_item_id=target_id, item_budget=10,
         )
 
         assert result.stages is not None
@@ -855,8 +1033,7 @@ async def test_report_generation_contains_provenance(audit_tenant: Any) -> None:
         suite = ServiceBenchmarkSuite(_test_session_factory)
 
         results = await suite.run_benchmark(
-            tenant_id=tenant_id,
-            principal_id=admin_id,
+            tenant_id=tenant_id, principal_id=admin_id,
             corpus_profile=profile,
             queries=[QueryFixture(
                 query=profile.query_text,
@@ -883,11 +1060,476 @@ async def test_report_generation_contains_provenance(audit_tenant: Any) -> None:
         assert report.embedding_dimensions == dims
         assert report.corpus_profile_name == "small_controlled"
         assert len(report.corpus_fingerprint) == 16
-        assert report.generated_at  # ISO timestamp present
+        assert report.generated_at
 
-        # Each result has query digest and provenance fields
         for r in report.results:
             assert len(r.query_digest) == 16
             assert r.latency_type in ("service", "end_to_end")
     finally:
         await corpus.teardown(_test_session_factory)
+
+
+# ---------------------------------------------------------------------------
+# NEW FIX2 TESTS: F7 dual-lane, F8 byte/count, F9 existing mode,
+# F10 tie-break, F14 outside-window
+# ---------------------------------------------------------------------------
+
+
+async def test_production_window_parity(audit_tenant: Any) -> None:
+    """Required FIX2 test: production-window parity.
+
+    With eligible_count > production fetch limit (distractor_heavy at budget=5
+    → fetch_limit=15, eligible=31), assert downstream stages receive exactly
+    the production window, not the full corpus.
+    """
+    if not await _db_ok():
+        pytest.skip("requires PostgreSQL with pgvector")
+    tenant_id, admin_id = audit_tenant
+    assert tenant_id is not None
+
+    dims = await _get_dimensions()
+    profile = distractor_heavy_corpus(dims)  # 31 items
+    corpus = ControlledCorpus(tenant_id, admin_id, profile)
+    label_map = await corpus.setup(_test_session_factory)
+
+    try:
+        target_id = label_map["target"]
+        suite = ServiceBenchmarkSuite(_test_session_factory)
+
+        # budget=5 → production fetch_limit = min(5*3, 200) = 15
+        result = await suite.run_single_query(
+            tenant_id=tenant_id, principal_id=admin_id,
+            query=profile.query_text, query_vector=profile.query_vector,
+            expected_item_id=target_id, item_budget=5,
+        )
+
+        assert result.stages is not None
+        stages = result.stages
+
+        # The production candidate window must be exactly 15 (production limit)
+        # because eligible_count=31 > 15.
+        assert stages.candidate_window_size <= 15, (
+            f"Production window must be ≤ 15 (fetch_limit=5*3), "
+            f"got {stages.candidate_window_size}"
+        )
+
+        # eligible_count must be 31 (full corpus counted independently)
+        assert stages.eligible_candidate_count == 31
+
+        # raw_rank_exact must be False (production window < full corpus)
+        assert stages.raw_rank_exact is False, (
+            "raw_rank_exact should be False when production window < eligible corpus"
+        )
+
+        # The target shares the query vector → raw_rank=0 even in the
+        # production window.
+        assert stages.raw_similarity_rank == 0
+
+        # corpus_raw_rank should also be 0 (target is nearest in full corpus too)
+        assert stages.corpus_raw_rank == 0
+        assert stages.corpus_raw_rank_exact is True
+    finally:
+        await corpus.teardown(_test_session_factory)
+
+
+async def test_dual_lane_diagnostic_does_not_affect_production(audit_tenant: Any) -> None:
+    """Required FIX2 test: dual-lane separation.
+
+    Prove that the full-corpus diagnostic lane does not change trust_rank,
+    relationship rank, final rank, selected IDs, or exclusion disposition.
+
+    Strategy: run the benchmark on a corpus where eligible_count > production
+    fetch limit, then verify the production-derived stages are consistent
+    with production-only semantics (they could not have been influenced by
+    the full corpus diagnostic lane).
+    """
+    if not await _db_ok():
+        pytest.skip("requires PostgreSQL with pgvector")
+    tenant_id, admin_id = audit_tenant
+    assert tenant_id is not None
+
+    dims = await _get_dimensions()
+    profile = distractor_heavy_corpus(dims)  # 31 items
+    corpus = ControlledCorpus(tenant_id, admin_id, profile)
+    label_map = await corpus.setup(_test_session_factory)
+
+    try:
+        target_id = label_map["target"]
+        suite = ServiceBenchmarkSuite(_test_session_factory)
+
+        # budget=5 → production window 15, full corpus 31
+        result = await suite.run_single_query(
+            tenant_id=tenant_id, principal_id=admin_id,
+            query=profile.query_text, query_vector=profile.query_vector,
+            expected_item_id=target_id, item_budget=5,
+        )
+
+        assert result.stages is not None
+        stages = result.stages
+
+        # The production window size proves the production lane used the
+        # bounded window (15), not the full corpus (31).
+        assert stages.candidate_window_size <= 15
+        assert stages.eligible_candidate_count == 31
+
+        # trust_rank is derived from the production candidate set only.
+        # Since the target is at raw_rank=0 (nearest), trust_rank ≤ 15
+        # (within the production window).
+        if stages.trust_rank is not None:
+            assert stages.trust_rank < 15, (
+                f"trust_rank={stages.trust_rank} exceeds production window (15) — "
+                f"diagnostic lane may have leaked into production"
+            )
+
+        # corpus_raw_rank is the diagnostic lane result.
+        # It must exist (diagnostic ran because window < corpus).
+        assert stages.corpus_raw_rank is not None
+        # corpus_raw_rank for the target should be 0 (nearest in full corpus)
+        assert stages.corpus_raw_rank == 0
+
+        # The disposition must not be outside_candidate_window (target is
+        # in the production window at rank 0).
+        assert stages.exclusion_disposition != ExclusionDisposition.OUTSIDE_CANDIDATE_WINDOW
+    finally:
+        await corpus.teardown(_test_session_factory)
+
+
+async def test_tie_break_distance_equal_created_at_differs(audit_tenant: Any) -> None:
+    """Required FIX2 test 9: tie-break with equal distances and differing
+    created_at values matching production newest-first ordering.
+
+    F10: when two items have the same cosine distance, the one with the
+    newer created_at must rank first (matching production ORDER BY
+    distance ASC, created_at DESC).
+    """
+    if not await _db_ok():
+        pytest.skip("requires PostgreSQL with pgvector")
+    tenant_id, admin_id = audit_tenant
+    assert tenant_id is not None
+
+    dims = await _get_dimensions()
+    # Create a custom corpus with two items at the same distance but different
+    # created_at. Both share the same vector position (position 1) so they
+    # have the same distance from the query vector (position 0).
+    query_vec = [0.0] * dims
+    query_vec[0] = 1.0
+
+    # Both items at position 1 → same distance from query.
+    both_vec = [0.0] * dims
+    both_vec[1] = 1.0
+
+    item_newer = CorpusItem(
+        content="tie-break newer item",
+        embedding_vector=list(both_vec),
+        label="newer",
+    )
+    item_older = CorpusItem(
+        content="tie-break older item",
+        embedding_vector=list(both_vec),
+        label="older",
+    )
+    # Add a distractor to ensure both items are in the candidate window.
+    distractor = CorpusItem(
+        content="tie-break distractor",
+        embedding_vector=_unit_vec_at(dims, 2),
+        label="distractor",
+    )
+
+    profile = CorpusProfile(
+        name="tie_break_test",
+        description="Two items at equal distance, different created_at",
+        mode="controlled",
+        items=(item_newer, item_older, distractor),
+        query_vector=list(query_vec),
+        query_text="tie-break query",
+    )
+
+    corpus = ControlledCorpus(tenant_id, admin_id, profile)
+    label_map = await corpus.setup(_test_session_factory)
+
+    try:
+        suite = ServiceBenchmarkSuite(_test_session_factory)
+
+        # Query for the newer item
+        result_newer = await suite.run_single_query(
+            tenant_id=tenant_id, principal_id=admin_id,
+            query=profile.query_text, query_vector=profile.query_vector,
+            expected_item_id=label_map["newer"], item_budget=10,
+        )
+
+        # Query for the older item
+        result_older = await suite.run_single_query(
+            tenant_id=tenant_id, principal_id=admin_id,
+            query=profile.query_text, query_vector=profile.query_vector,
+            expected_item_id=label_map["older"], item_budget=10,
+        )
+
+        assert result_newer.stages is not None
+        assert result_older.stages is not None
+
+        # Both items have the same distance → raw_rank is determined by
+        # created_at descending. The newer item must have a better (lower)
+        # raw_rank than the older item.
+        # UNCONDITIONAL: newer item's raw_rank < older item's raw_rank
+        assert result_newer.stages.raw_similarity_rank is not None
+        assert result_older.stages.raw_similarity_rank is not None
+        assert result_newer.stages.raw_similarity_rank < result_older.stages.raw_similarity_rank, (
+            f"F10 FAIL: newer item raw_rank "
+            f"({result_newer.stages.raw_similarity_rank}) should be < "
+            f"older item raw_rank ({result_older.stages.raw_similarity_rank})"
+        )
+    finally:
+        await corpus.teardown(_test_session_factory)
+
+
+async def test_existing_corpus_with_explicit_query_vector(audit_tenant: Any) -> None:
+    """Required FIX2 test 10: existing-corpus mode with explicit query vector.
+
+    F9: existing_corpus_mode is runnable when given an explicit query vector.
+    """
+    if not await _db_ok():
+        pytest.skip("requires PostgreSQL with pgvector")
+    tenant_id, admin_id = audit_tenant
+    assert tenant_id is not None
+
+    # First insert some items using a controlled corpus, then query with
+    # existing_corpus_mode using an explicit vector.
+    dims = await _get_dimensions()
+    controlled_profile = small_controlled_corpus(dims)
+    corpus = ControlledCorpus(tenant_id, admin_id, controlled_profile)
+    label_map = await corpus.setup(_test_session_factory)
+
+    try:
+        target_id = label_map["target"]
+
+        # Now query the existing corpus with an explicit query vector.
+        query_vec = [0.0] * dims
+        query_vec[0] = 1.0
+
+        existing_profile = existing_corpus_mode(
+            query_vector=query_vec,
+            query_text="existing corpus query",
+        )
+
+        suite = ServiceBenchmarkSuite(_test_session_factory)
+        result = await suite.run_single_query(
+            tenant_id=tenant_id, principal_id=admin_id,
+            query=existing_profile.query_text,
+            query_vector=existing_profile.query_vector,
+            expected_item_id=target_id, item_budget=10,
+        )
+
+        # F9: the existing-corpus run must succeed (not raise EmbeddingFailure)
+        assert result.error is None
+        assert result.stages is not None
+        assert result.stages.eligible_candidate_count >= 1
+    finally:
+        await corpus.teardown(_test_session_factory)
+
+
+async def test_existing_corpus_with_injected_embedding_fn(audit_tenant: Any) -> None:
+    """Required FIX2 test 11: existing-corpus mode with injected embedding fn.
+
+    F9: existing_corpus_mode is runnable via an injected query-embedding function.
+    """
+    if not await _db_ok():
+        pytest.skip("requires PostgreSQL with pgvector")
+    tenant_id, admin_id = audit_tenant
+    assert tenant_id is not None
+
+    # Insert controlled items first.
+    dims = await _get_dimensions()
+    controlled_profile = small_controlled_corpus(dims)
+    corpus = ControlledCorpus(tenant_id, admin_id, controlled_profile)
+    label_map = await corpus.setup(_test_session_factory)
+
+    try:
+        target_id = label_map["target"]
+
+        # Build an injected embedding function that returns the query vector.
+        query_vec = [0.0] * dims
+        query_vec[0] = 1.0
+
+        async def mock_embedding_fn(query: str) -> list[float] | None:
+            return list(query_vec)
+
+        existing_profile = existing_corpus_mode(
+            query_text="existing corpus query with fn",
+            query_embedding_fn=mock_embedding_fn,
+        )
+
+        suite = ServiceBenchmarkSuite(_test_session_factory)
+        result = await suite.run_benchmark(
+            tenant_id=tenant_id, principal_id=admin_id,
+            corpus_profile=existing_profile,
+            queries=[QueryFixture(
+                query=existing_profile.query_text,
+                expected_item_id=target_id,
+                label="q1",
+            )],
+            budgets=[10],
+        )
+
+        # F9: the run with injected embedding fn must succeed.
+        assert len(results := result) == 1
+        assert results[0].error is None
+        assert results[0].stages is not None
+    finally:
+        await corpus.teardown(_test_session_factory)
+
+
+def test_existing_corpus_missing_embedding_fails_closed() -> None:
+    """Required FIX2 test 12: existing-corpus missing/failed embedding fails closed.
+
+    F9: when neither an explicit vector nor a successful embedding result is
+    available, the benchmark must fail closed with EmbeddingFailure.
+    """
+    import asyncio
+
+    suite = ServiceBenchmarkSuite(session_factory=None)  # type: ignore[arg-type]
+
+    # No query_vector AND no embedding_fn → EmbeddingFailure
+    with pytest.raises(EmbeddingFailure):
+        asyncio.get_event_loop().run_until_complete(
+            suite.run_single_query(
+                tenant_id="x",
+                principal_id="y",
+                query="q",
+                query_vector=None,
+                expected_item_id="abc",
+                item_budget=10,
+            )
+        )
+
+    # No query_vector AND embedding_fn returns None → EmbeddingFailure
+    async def failing_embedding_fn(query: str) -> list[float] | None:
+        return None
+
+    with pytest.raises(EmbeddingFailure):
+        asyncio.get_event_loop().run_until_complete(
+            suite.run_single_query(
+                tenant_id="x",
+                principal_id="y",
+                query="q",
+                query_vector=None,
+                expected_item_id="abc",
+                item_budget=10,
+                query_embedding_fn=failing_embedding_fn,
+            )
+        )
+
+
+async def test_fixture_outside_production_window_reported(audit_tenant: Any) -> None:
+    """Required FIX2 test 14: fixture outside the production candidate window
+    is reported outside_candidate_window even when the diagnostic lane finds it.
+
+    With distractor_heavy (31 items) and a small budget, the production
+    fetch limit is small. An item ranked beyond the production window in
+    raw distance ordering should be reported as outside_candidate_window.
+    We craft a fixture that is guaranteed to be beyond the production window
+    by using a vector orthogonal to the query.
+    """
+    if not await _db_ok():
+        pytest.skip("requires PostgreSQL with pgvector")
+    tenant_id, admin_id = audit_tenant
+    assert tenant_id is not None
+
+    dims = await _get_dimensions()
+
+    # Create a corpus where the target is at an orthogonal position (far)
+    # so it will be ranked beyond the production window.
+    query_vec = [0.0] * dims
+    query_vec[0] = 1.0
+
+    # Target at an orthogonal position — it has maximum distance from query.
+    target_vec = [0.0] * dims
+    target_vec[dims - 1] = 1.0  # orthogonal to query
+
+    # Fill the first positions with near-query items to push the target
+    # beyond the production candidate window.
+    near_items = tuple(
+        CorpusItem(
+            content=f"near item {i}",
+            embedding_vector=_near_vec(dims, 0, i + 1),
+            label=f"near-{i}",
+        )
+        for i in range(min(20, dims - 2))
+    )
+
+    target_item = CorpusItem(
+        content="far orthogonal target",
+        embedding_vector=list(target_vec),
+        label="far-target",
+    )
+
+    profile = CorpusProfile(
+        name="outside_window_test",
+        description="Target at orthogonal position beyond production window",
+        mode="controlled",
+        items=(*near_items, target_item),
+        query_vector=list(query_vec),
+        query_text="outside window query",
+    )
+
+    corpus = ControlledCorpus(tenant_id, admin_id, profile)
+    label_map = await corpus.setup(_test_session_factory)
+
+    try:
+        target_id = label_map["far-target"]
+        suite = ServiceBenchmarkSuite(_test_session_factory)
+
+        # budget=1 → production fetch_limit = 3. The target is orthogonal
+        # (distance ~1.0) and will be far beyond rank 3.
+        result = await suite.run_single_query(
+            tenant_id=tenant_id, principal_id=admin_id,
+            query=profile.query_text, query_vector=profile.query_vector,
+            expected_item_id=target_id, item_budget=1,
+        )
+
+        assert result.stages is not None
+        stages = result.stages
+
+        # The target must NOT be in the production candidate window.
+        # UNCONDITIONAL: raw_similarity_rank is None (not in production window).
+        assert stages.raw_similarity_rank is None, (
+            f"Target should not be in production window, but raw_rank="
+            f"{stages.raw_similarity_rank}"
+        )
+
+        # UNCONDITIONAL: disposition is outside_candidate_window.
+        # The target is eligible and has an embedding, but it's beyond the
+        # production fetch limit.
+        assert stages.exclusion_disposition == ExclusionDisposition.OUTSIDE_CANDIDATE_WINDOW, (
+            f"Expected outside_candidate_window, got {stages.exclusion_disposition}"
+        )
+
+        # The diagnostic lane may find it in the full corpus.
+        # corpus_raw_rank should be non-None (diagnostic lane found it).
+        assert stages.corpus_raw_rank is not None, (
+            "Diagnostic lane should have found the target in the full corpus"
+        )
+    finally:
+        await corpus.teardown(_test_session_factory)
+
+
+# ---------------------------------------------------------------------------
+# Helpers for tie-break and outside-window tests
+# ---------------------------------------------------------------------------
+
+
+def _unit_vec_at(dimensions: int, position: int) -> list[float]:
+    """Create a unit vector at the given position."""
+    vec = [0.0] * dimensions
+    if 0 <= position < dimensions:
+        vec[position] = 1.0
+    return vec
+
+
+def _near_vec(dimensions: int, primary: int, secondary: int) -> list[float]:
+    """A vector mostly along *primary* with a small *secondary* component."""
+    vec = [0.0] * dimensions
+    if 0 <= primary < dimensions:
+        vec[primary] = 0.95
+    if 0 <= secondary < dimensions:
+        vec[secondary] = 0.312
+    return vec

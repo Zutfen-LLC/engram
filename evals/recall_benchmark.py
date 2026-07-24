@@ -8,15 +8,17 @@ This is NOT a production endpoint. It operates at the service/test-harness
 layer where exact pipeline stages are available, and uses an isolated audit
 tenant under real PostgreSQL with RLS enabled.
 
-Key properties (correcting defects F1–F6 from the original PR):
+Key properties (correcting defects F1-F11 from the certification packets):
 
 - **Exact candidate count** (F1): eligible_candidate_count comes from
   ``semantic.candidate_count()``, NOT from the public ``RecallResponse`` which
   strips ``candidate_count``.
 
-- **True raw similarity rank** (F2): raw_similarity_rank is computed by cosine
-  distance over the complete eligible controlled corpus BEFORE trust
-  re-ranking, not from the trust-ranked final returned items.
+- **True raw similarity rank** (F2/F10): raw_similarity_rank is computed by
+  cosine distance over the production candidate window BEFORE trust
+  re-ranking, using the exact production ordering (distance ascending, then
+  ``created_at`` descending). A separate diagnostic lane can optionally
+  examine the complete eligible corpus for ``corpus_raw_rank``.
 
 - **Fail-closed** (F3): non-2xx HTTP, malformed JSON, missing fields, and
   embedding failures are explicit BenchmarkErrors, never quality degradation.
@@ -33,6 +35,24 @@ Key properties (correcting defects F1–F6 from the original PR):
   ``expand_recall_candidates``, ``_enforce_semantic_budget``) under real
   PostgreSQL, not constructed dataclasses.
 
+- **Dual-lane separation** (F7): the production lane uses the exact production
+  fetch limit ``min(item_limit * _SEMANTIC_OVERFETCH, _SEMANTIC_OVERFETCH_CAP)``
+  and feeds only that window through enrichment, relationship expansion, and
+  budget enforcement. The diagnostic raw-rank lane optionally inspects the
+  complete eligible corpus solely to calculate ``corpus_raw_rank``. The
+  diagnostic set never feeds into the production lane.
+
+- **Actual measurements** (F8): ``returned_count = len(selected)`` and
+  ``returned_bytes`` is the exact sum of UTF-8 content bytes in the selected
+  set — never placeholder values.
+
+- **Existing-corpus executable** (F9): ``existing_corpus_mode`` is runnable via
+  either an explicit query vector or an injected query-embedding function that
+  uses the active embedding profile. Fails closed when neither is available.
+
+- **Complete fingerprint** (F11): the corpus fingerprint hashes every vector
+  component, not just the first four.
+
 Requires a live PostgreSQL with the v2 schema and pgvector.
 """
 
@@ -40,6 +60,7 @@ from __future__ import annotations
 
 import hashlib
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -66,6 +87,10 @@ __all__ = [
     "distractor_heavy_corpus",
     "existing_corpus_mode",
 ]
+
+# Type alias for the injected query-embedding function (F9).
+# signature: async (query: str) -> list[float] | None
+QueryEmbeddingFn = Callable[[str], Awaitable[list[float] | None]]
 
 
 # ---------------------------------------------------------------------------
@@ -151,8 +176,9 @@ class CorpusProfile:
 
     ``mode='controlled'`` profiles carry ``items`` and ``query_vector`` and are
     reproducible across runs. ``mode='existing'`` profiles use whatever corpus
-    is already in the tenant — ranks are window-relative and ``raw_rank_exact``
-    will be ``False``.
+    is already in the tenant — ranks are window-relative. Existing mode is
+    runnable via an explicit ``query_vector`` or an injected
+    ``query_embedding_fn`` that uses the active embedding profile.
     """
 
     name: str
@@ -162,13 +188,18 @@ class CorpusProfile:
     query_vector: list[float] | None = None
     # The query text used for the benchmark (for report provenance).
     query_text: str = ""
+    # F9: for existing mode, an injected query-embedding function.
+    query_embedding_fn: QueryEmbeddingFn | None = None
 
     @property
     def is_controlled(self) -> bool:
         return self.mode == "controlled"
 
     def corpus_fingerprint(self) -> str:
-        """Stable SHA-256 fingerprint of the corpus definition."""
+        """Stable SHA-256 fingerprint of the complete corpus definition.
+
+        F11 fix: hashes ALL vector components, not just the first four.
+        """
         h = hashlib.sha256()
         h.update(self.name.encode())
         h.update(self.mode.encode())
@@ -182,16 +213,16 @@ class CorpusProfile:
             h.update(item.kind.encode())
             h.update(item.visibility.encode())
             if item.embedding_vector is not None:
-                # Use a compact representation of the vector direction.
+                # F11: hash the complete vector, not just the first 4 components.
                 h.update(str(len(item.embedding_vector)).encode())
-                # Only the first few components matter for direction fingerprinting
-                # since controlled vectors use unit vectors.
-                for v in item.embedding_vector[:4]:
+                for v in item.embedding_vector:
                     h.update(str(round(v, 6)).encode())
             else:
                 h.update(b"no-embedding")
         if self.query_vector is not None:
-            for v in self.query_vector[:4]:
+            # F11: hash all query vector components too.
+            h.update(str(len(self.query_vector)).encode())
+            for v in self.query_vector:
                 h.update(str(round(v, 6)).encode())
         return h.hexdigest()[:16]
 
@@ -311,19 +342,35 @@ def distractor_heavy_corpus(dimensions: int) -> CorpusProfile:
     )
 
 
-def existing_corpus_mode() -> CorpusProfile:
+def existing_corpus_mode(
+    *,
+    query_vector: list[float] | None = None,
+    query_text: str = "",
+    query_embedding_fn: QueryEmbeddingFn | None = None,
+) -> CorpusProfile:
     """Use whatever corpus is already in the tenant.
 
     No items are inserted. Ranks are window-relative (raw_rank_exact=False)
     because the production over-fetch window may not cover the full corpus.
+
+    F9 fix: existing mode is now executable. Provide either:
+
+    - ``query_vector``: an explicit query vector (dims must match the active
+      embedding profile), OR
+    - ``query_embedding_fn``: an async function that takes the query text and
+      returns a vector (or None on failure) using the active embedding profile.
+
+    Fails closed when neither an explicit vector nor a successful embedding
+    result is available.
     """
     return CorpusProfile(
         name="existing",
         description="Existing tenant corpus — no controlled items inserted",
         mode="existing",
         items=(),
-        query_vector=None,
-        query_text="",
+        query_vector=query_vector,
+        query_text=query_text,
+        query_embedding_fn=query_embedding_fn,
     )
 
 
@@ -338,27 +385,42 @@ class StageRanks:
 
     All ranks are 0-based. ``position_1based`` is provided for each rank in
     the ``*_rank_1based`` fields for operator-readable reports.
+
+    F7 dual-lane: ``raw_similarity_rank`` is computed over the production
+    candidate window. ``corpus_raw_rank`` is optionally computed over the
+    complete eligible corpus (diagnostic lane) and is always separate from the
+    production pipeline.
     """
 
     eligible_candidate_count: int
     candidate_window_size: int
 
-    # Stage 1: raw semantic rank (by cosine distance, before trust re-ranking)
+    # Stage 1a: raw semantic rank in the PRODUCTION candidate window
+    # (by cosine distance, before trust re-ranking).
+    # F10: ordered by distance ascending, then created_at descending
+    # (matching production semantic.search ordering exactly).
     raw_similarity_rank: int | None
     raw_similarity_rank_1based: int | None
     raw_similarity_score: float | None  # 1 - distance
-    raw_rank_exact: bool  # True only when complete eligible corpus was examined
+    raw_rank_exact: bool  # True only when production window covers the full corpus
 
-    # Stage 2: trust re-ranking
+    # Stage 1b (diagnostic lane, F7): raw rank over the COMPLETE eligible corpus.
+    # Only populated when the diagnostic lane was run. This rank CANNOT
+    # influence trust_rank, post_relationship_rank, final_served_rank, etc.
+    corpus_raw_rank: int | None
+    corpus_raw_rank_1based: int | None
+    corpus_raw_rank_exact: bool  # True only when full corpus was examined
+
+    # Stage 2: trust re-ranking (production lane only)
     trust_rank: int | None  # position after trust-weighted re-ranking
     trust_rank_1based: int | None
     trust_score: float | None
 
-    # Stage 3: relationship expansion
+    # Stage 3: relationship expansion (production lane only)
     post_relationship_rank: int | None
     post_relationship_rank_1based: int | None
 
-    # Stage 4: final served rank (after budget enforcement)
+    # Stage 4: final served rank (after budget enforcement, production lane only)
     final_served_rank: int | None
     final_served_rank_1based: int | None
     final_score: float | None
@@ -375,7 +437,11 @@ class StageRanks:
 
 @dataclass(frozen=True)
 class BenchmarkResult:
-    """One query-item-budget measurement."""
+    """One query-item-budget measurement.
+
+    F8 fix: ``returned_count`` and ``returned_bytes`` are actual measurements
+    of the selected set, not placeholders.
+    """
 
     query: str
     query_digest: str  # SHA-256 prefix for safe provenance
@@ -386,8 +452,8 @@ class BenchmarkResult:
     top_k_hit: dict[str, bool]
     latency_ms: float
     latency_type: str  # "service" or "end_to_end"
-    returned_bytes: int
-    returned_count: int
+    returned_bytes: int  # F8: exact sum of UTF-8 content bytes in selected
+    returned_count: int  # F8: len(selected)
     stages: StageRanks | None
     error: str | None = None  # None when successful
 
@@ -555,6 +621,30 @@ class ControlledCorpus:
 
 
 # ---------------------------------------------------------------------------
+# Production ordering helpers (F10)
+# ---------------------------------------------------------------------------
+
+
+def _sort_key_production_raw(item: dict[str, Any]) -> tuple[float, float]:
+    """Production raw-distance sort key: distance asc, then created_at desc.
+
+    Matches ``semantic.search()`` SQL ordering: ``ORDER BY distance ASC,
+    created_at DESC``. Uses the same negation trick as
+    ``semantic._sort_created_desc``.
+    """
+    distance = float(item.get("distance", 1.0))
+    created_at = item.get("created_at")
+    if created_at is None:
+        ts_key = float("inf")
+    else:
+        try:
+            ts_key = float(-created_at.timestamp())
+        except (AttributeError, ValueError, OSError):
+            ts_key = float("inf")
+    return (distance, ts_key)
+
+
+# ---------------------------------------------------------------------------
 # Service-layer benchmark suite
 # ---------------------------------------------------------------------------
 
@@ -565,6 +655,12 @@ class ServiceBenchmarkSuite:
     Uses the real production pipeline functions under real PostgreSQL with RLS
     enabled. Each query's pipeline stages are captured exactly, producing
     deterministic, reproducible stage ranks.
+
+    F7 dual-lane architecture: the production lane uses the exact production
+    fetch limit and feeds only that window through enrichment, relationship
+    expansion, and budget enforcement. The diagnostic raw-rank lane
+    optionally examines the complete eligible corpus solely to compute
+    ``corpus_raw_rank`` — it never feeds into the production lane.
 
     Usage::
 
@@ -591,25 +687,33 @@ class ServiceBenchmarkSuite:
         byte_budget: int | None = None,
         token_budget: int | None = None,
         memory_context: ResolvedMemoryContext | None = None,
+        query_embedding_fn: QueryEmbeddingFn | None = None,
     ) -> BenchmarkResult:
         """Run one query at one budget and capture full stage decomposition.
 
         Raises ``EmptyFixtureIdError`` if expected_item_id is empty.
-        Raises ``EmbeddingFailure`` if query_vector is None.
+        Raises ``EmbeddingFailure`` if query_vector is None AND no
+        query_embedding_fn is provided or it returns None (F9).
         """
-        # F3/F7: reject empty expected_item_id before any DB operation.
+        # F3: reject empty expected_item_id before any DB operation.
         if not expected_item_id or not expected_item_id.strip():
             raise EmptyFixtureIdError()
 
-        # F3: embedding failure must fail closed.
+        # F9: resolve query vector — explicit, or via injected embedding fn.
         if query_vector is None:
-            raise EmbeddingFailure("query_vector is None — embedding generation failed")
+            if query_embedding_fn is not None:
+                query_vector = await query_embedding_fn(query)
+            if query_vector is None:
+                raise EmbeddingFailure(
+                    "query_vector is None and no query_embedding_fn produced a "
+                    "vector — embedding generation failed"
+                )
 
         query_digest = hashlib.sha256(query.encode()).hexdigest()[:16]
         start = time.monotonic()
 
         try:
-            stages = await self._run_pipeline_stages(
+            stages, selected = await self._run_pipeline_stages(
                 tenant_id=tenant_id,
                 principal_id=principal_id,
                 query_vector=query_vector,
@@ -634,10 +738,10 @@ class ServiceBenchmarkSuite:
             "top_10": final_rank is not None and final_rank < 10,
         }
 
-        # Returned bytes: sum of content bytes in the final served list.
-        # We approximate from the stage data — the exact byte_count comes from
-        # the production pipeline. For the service-layer benchmark, we compute
-        # it from the selected items.
+        # F8: returned_count and returned_bytes are exact measurements.
+        returned_count = len(selected)
+        returned_bytes = sum(len(c["content"].encode("utf-8")) for c in selected)
+
         return BenchmarkResult(
             query=query,
             query_digest=query_digest,
@@ -648,8 +752,8 @@ class ServiceBenchmarkSuite:
             top_k_hit=top_k,
             latency_ms=round(latency_ms, 1),
             latency_type="service",
-            returned_bytes=stages.eligible_candidate_count,  # placeholder; set below
-            returned_count=(stages.final_served_rank is not None),
+            returned_bytes=returned_bytes,
+            returned_count=returned_count,
             stages=stages,
             error=None,
         )
@@ -684,8 +788,13 @@ class ServiceBenchmarkSuite:
         byte_budget: int | None,
         token_budget: int | None,
         memory_context_input: ResolvedMemoryContext | None,
-    ) -> StageRanks:
-        """Execute the production pipeline stage-by-stage, capturing exact ranks."""
+    ) -> tuple[StageRanks, list[dict[str, Any]]]:
+        """Execute the production pipeline stage-by-stage, capturing exact ranks.
+
+        F7 dual-lane: production lane uses exact production fetch limit.
+        Diagnostic lane optionally examines full corpus for corpus_raw_rank.
+        Returns (StageRanks, selected_items) — selected for F8 byte/count.
+        """
         from uuid import UUID as UUID_Type
 
         from sqlalchemy import select
@@ -743,56 +852,106 @@ class ServiceBenchmarkSuite:
                     token_budget=resolved_token,
                 )
 
-            # --- Determine fetch limit ---
-            # For exact raw ranks, we need to examine the complete eligible
-            # corpus. In controlled mode, eligible_count is small and the
-            # production over-fetch covers it. In existing mode, we use the
-            # production over-fetch and report raw_rank_exact=False.
-            item_limit = resolved_item if resolved_item is not None else settings.recall_item_budget
+            # ===================================================================
+            # F7 PRODUCTION LANE: exact production fetch limit
+            # ===================================================================
+            # Use the EXACT production formula from execute_semantic_recall:
+            #   fetch_limit = min(item_limit * _SEMANTIC_OVERFETCH, _SEMANTIC_OVERFETCH_CAP)
+            # Do NOT inflate this to eligible_count — that would feed an
+            # enlarged set through downstream production stages.
+            item_limit = (
+                resolved_item if resolved_item is not None else settings.recall_item_budget
+            )
             production_fetch_limit = min(
                 item_limit * recall_mod._SEMANTIC_OVERFETCH,
                 recall_mod._SEMANTIC_OVERFETCH_CAP,
             )
 
-            # For exact raw ranks, fetch the complete eligible corpus.
-            exact_fetch_limit = max(eligible_count, production_fetch_limit)
-            raw_rank_exact = eligible_count <= exact_fetch_limit
-
-            # --- Stage 2: semantic search (raw distance ordering + trust re-ranking) ---
-            candidates = await semantic.search(
+            # --- Production lane: semantic search with exact production limit ---
+            production_candidates = await semantic.search(
                 session,
                 query_vector,
-                exact_fetch_limit,
+                production_fetch_limit,
                 memory_context=memory_context,
                 review_statuses=_SEMANTIC_REVIEW_STATUSES,
                 embedding_profile=embedding_profile,
             )
 
-            candidate_window_size = len(candidates)
-            raw_rank_exact = candidate_window_size >= eligible_count
+            candidate_window_size = len(production_candidates)
 
-            candidate_ids = {c["id"] for c in candidates}
+            # raw_rank_exact: True only when the production window covers
+            # the full eligible corpus (small controlled corpus case).
+            production_window_exact = candidate_window_size >= eligible_count
 
-            # --- Compute raw similarity rank (by distance, before trust) ---
-            by_distance = sorted(
-                candidates,
-                key=lambda c: (c.get("distance", 1.0), str(c.get("created_at", ""))),
+            production_candidate_ids = {c["id"] for c in production_candidates}
+
+            # --- F10: Compute raw similarity rank in production window ---
+            # Match production ordering exactly: distance asc, then
+            # created_at desc (same as semantic.search SQL ORDER BY).
+            by_distance_prod = sorted(
+                production_candidates, key=_sort_key_production_raw
             )
-            raw_rank = self._find_rank(by_distance, expected_item_id)
-            raw_score = self._find_field(candidates, expected_item_id, "similarity_score")
+            raw_rank = self._find_rank(by_distance_prod, expected_item_id)
+            raw_score = self._find_field(
+                production_candidates, expected_item_id, "similarity_score"
+            )
 
-            # --- Compute trust rank (candidates are already trust-ranked by search()) ---
-            trust_rank = self._find_rank(candidates, expected_item_id)
-            trust_score = self._find_field(candidates, expected_item_id, "trust_score")
+            # --- Compute trust rank (candidates are already trust-ranked) ---
+            trust_rank = self._find_rank(production_candidates, expected_item_id)
+            trust_score = self._find_field(
+                production_candidates, expected_item_id, "trust_score"
+            )
 
-            # --- Check if expected item is in the candidate window ---
-            if expected_item_id not in candidate_ids:
-                # Determine: not_eligible, no_embedding, or outside_candidate_window
+            # ===================================================================
+            # F7 DIAGNOSTIC LANE (optional): full corpus raw rank
+            # ===================================================================
+            # Only examine the complete eligible corpus if it exceeds the
+            # production window — otherwise the production lane already
+            # provides exact ranks and the diagnostic lane is redundant.
+            corpus_raw_rank: int | None = None
+            corpus_raw_rank_exact: bool = False
+
+            if not production_window_exact and eligible_count > candidate_window_size:
+                # Fetch the complete eligible corpus for diagnostic ranking.
+                diagnostic_fetch_limit = max(eligible_count, production_fetch_limit)
+                diagnostic_candidates = await semantic.search(
+                    session,
+                    query_vector,
+                    diagnostic_fetch_limit,
+                    memory_context=memory_context,
+                    review_statuses=_SEMANTIC_REVIEW_STATUSES,
+                    embedding_profile=embedding_profile,
+                )
+                diagnostic_exact = len(diagnostic_candidates) >= eligible_count
+                by_distance_diag = sorted(
+                    diagnostic_candidates, key=_sort_key_production_raw
+                )
+                corpus_raw_rank = self._find_rank(by_distance_diag, expected_item_id)
+                corpus_raw_rank_exact = diagnostic_exact
+            elif production_window_exact:
+                # Production window already covered the full corpus.
+                corpus_raw_rank = raw_rank
+                corpus_raw_rank_exact = True
+
+            # ===================================================================
+            # PRODUCTION LANE: check candidate window membership
+            # ===================================================================
+            if expected_item_id not in production_candidate_ids:
+                # The expected item is NOT in the production candidate window.
+                # This is outside_candidate_window — even if the diagnostic
+                # lane found it in the full corpus.
                 disposition = await self._classify_absence(
                     session,
                     expected_item_id,
                     tenant_id,
                 )
+                # If the diagnostic lane found the item, it is specifically
+                # outside the PRODUCTION candidate window, not missing entirely.
+                if (
+                    corpus_raw_rank is not None
+                    and disposition == ExclusionDisposition.OUTSIDE_CANDIDATE_WINDOW
+                ):
+                    disposition = ExclusionDisposition.OUTSIDE_CANDIDATE_WINDOW
                 return self._make_absent_stages(
                     eligible_count=eligible_count,
                     window_size=candidate_window_size,
@@ -803,12 +962,18 @@ class ServiceBenchmarkSuite:
                     token_budget=resolved_token,
                     raw_rank=raw_rank,
                     raw_score=raw_score,
-                    raw_rank_exact=raw_rank_exact,
+                    raw_rank_exact=production_window_exact,
+                    corpus_raw_rank=corpus_raw_rank,
+                    corpus_raw_rank_exact=corpus_raw_rank_exact,
+                    trust_rank=trust_rank,
+                    trust_score=trust_score,
                 )
 
-            # --- Stage 3: enrich candidates with MemoryItem fields ---
-            # (replicating execute_semantic_recall steps 4-5)
-            cand_uuid_ids = [UUID_Type(c["id"]) for c in candidates]
+            # ===================================================================
+            # PRODUCTION LANE: enrich, expand, enforce budget
+            # ===================================================================
+            # Only the production candidate window flows downstream.
+            cand_uuid_ids = [UUID_Type(c["id"]) for c in production_candidates]
             item_by_id: dict[UUID_Type, MemoryItem] = {}
             if cand_uuid_ids:
                 rows = await session.execute(
@@ -820,7 +985,7 @@ class ServiceBenchmarkSuite:
                 item_by_id = {item.id: item for item in rows.scalars().all()}
 
             enriched: list[dict[str, Any]] = []
-            for cand in candidates:
+            for cand in production_candidates:
                 item = item_by_id.get(UUID_Type(cand["id"]))
                 if item is None:
                     continue
@@ -844,7 +1009,7 @@ class ServiceBenchmarkSuite:
                     }
                 )
 
-            # --- Stage 4: relationship expansion ---
+            # --- Relationship expansion (production lane only) ---
             expanded = await expand_recall_candidates(
                 session,
                 memory_context=memory_context,
@@ -855,7 +1020,9 @@ class ServiceBenchmarkSuite:
             )
 
             post_rel_rank = self._find_rank(expanded, expected_item_id)
-            candidate_origin = self._find_field(expanded, expected_item_id, "origin") or "semantic"
+            candidate_origin = (
+                self._find_field(expanded, expected_item_id, "origin") or "semantic"
+            )
 
             # Check if item was dropped by expansion ceiling
             expanded_ids = {c["id"] for c in expanded}
@@ -870,12 +1037,14 @@ class ServiceBenchmarkSuite:
                     token_budget=resolved_token,
                     raw_rank=raw_rank,
                     raw_score=raw_score,
-                    raw_rank_exact=raw_rank_exact,
+                    raw_rank_exact=production_window_exact,
+                    corpus_raw_rank=corpus_raw_rank,
+                    corpus_raw_rank_exact=corpus_raw_rank_exact,
                     trust_rank=trust_rank,
                     trust_score=trust_score,
                 )
 
-            # --- Stage 5: budget enforcement ---
+            # --- Budget enforcement (production lane only) ---
             selected = recall_mod._enforce_semantic_budget(
                 expanded,
                 byte_budget=resolved_byte,
@@ -909,13 +1078,18 @@ class ServiceBenchmarkSuite:
                 raw_similarity_rank=raw_rank,
                 raw_similarity_rank_1based=(raw_rank + 1) if raw_rank is not None else None,
                 raw_similarity_score=round(raw_score, 4) if raw_score is not None else None,
-                raw_rank_exact=raw_rank_exact,
+                raw_rank_exact=production_window_exact,
+                corpus_raw_rank=corpus_raw_rank,
+                corpus_raw_rank_1based=(
+                    (corpus_raw_rank + 1) if corpus_raw_rank is not None else None
+                ),
+                corpus_raw_rank_exact=corpus_raw_rank_exact,
                 trust_rank=trust_rank,
                 trust_rank_1based=(trust_rank + 1) if trust_rank is not None else None,
                 trust_score=round(trust_score, 4) if trust_score is not None else None,
                 post_relationship_rank=post_rel_rank,
                 post_relationship_rank_1based=(post_rel_rank + 1)
-                    if post_rel_rank is not None else None,
+                if post_rel_rank is not None else None,
                 final_served_rank=final_rank,
                 final_served_rank_1based=(final_rank + 1) if final_rank is not None else None,
                 final_score=round(final_score, 4) if final_score is not None else None,
@@ -924,7 +1098,7 @@ class ServiceBenchmarkSuite:
                 item_budget=resolved_item,
                 byte_budget=resolved_byte,
                 token_budget=resolved_token,
-            )
+            ), selected
 
     @staticmethod
     def _find_rank(items: list[dict[str, Any]], expected_id: str) -> int | None:
@@ -1068,9 +1242,11 @@ class ServiceBenchmarkSuite:
         raw_rank: int | None = None,
         raw_score: float | None = None,
         raw_rank_exact: bool = False,
+        corpus_raw_rank: int | None = None,
+        corpus_raw_rank_exact: bool = False,
         trust_rank: int | None = None,
         trust_score: float | None = None,
-    ) -> StageRanks:
+    ) -> tuple[StageRanks, list[dict[str, Any]]]:
         """Build StageRanks for an item absent from a given stage."""
         return StageRanks(
             eligible_candidate_count=eligible_count,
@@ -1079,6 +1255,9 @@ class ServiceBenchmarkSuite:
             raw_similarity_rank_1based=(raw_rank + 1) if raw_rank is not None else None,
             raw_similarity_score=round(raw_score, 4) if raw_score is not None else None,
             raw_rank_exact=raw_rank_exact,
+            corpus_raw_rank=corpus_raw_rank,
+            corpus_raw_rank_1based=(corpus_raw_rank + 1) if corpus_raw_rank is not None else None,
+            corpus_raw_rank_exact=corpus_raw_rank_exact,
             trust_rank=trust_rank,
             trust_rank_1based=(trust_rank + 1) if trust_rank is not None else None,
             trust_score=round(trust_score, 4) if trust_score is not None else None,
@@ -1092,7 +1271,7 @@ class ServiceBenchmarkSuite:
             item_budget=item_budget,
             byte_budget=byte_budget,
             token_budget=token_budget,
-        )
+        ), []
 
     async def run_benchmark(
         self,
@@ -1120,6 +1299,7 @@ class ServiceBenchmarkSuite:
         )
 
         query_vector = corpus_profile.query_vector
+        query_embedding_fn = corpus_profile.query_embedding_fn
 
         results: list[BenchmarkResult] = []
         for qf in queries:
@@ -1135,6 +1315,7 @@ class ServiceBenchmarkSuite:
                     if i < len(resolved_byte_budgets) else None,
                     token_budget=resolved_token_budgets[i]
                     if i < len(resolved_token_budgets) else None,
+                    query_embedding_fn=query_embedding_fn,
                 )
                 results.append(result)
         return results
@@ -1311,6 +1492,7 @@ class HttpBenchmarkClient:
                 )
 
         items = data["items"]
+        # F8: use actual byte_count from the response.
         returned_bytes = data["byte_count"]
 
         # Find the expected item's position (0-based).
@@ -1337,7 +1519,7 @@ class HttpBenchmarkClient:
             latency_ms=round(latency_ms, 1),
             latency_type="end_to_end",
             returned_bytes=returned_bytes,
-            returned_count=len(items),
+            returned_count=len(items),  # F8: actual count
             stages=None,  # Stage decomposition unavailable via HTTP
             error=None,
         )
