@@ -54,6 +54,7 @@ def create_app() -> FastAPI:
         admin,
         agents,
         classify,
+        context_receipts,
         diary,
         export,
         health,
@@ -74,6 +75,7 @@ def create_app() -> FastAPI:
     app.include_router(kg.router, prefix="/v1", tags=["knowledge-graph"])
     app.include_router(taxonomy.router, prefix="/v1", tags=["taxonomy"])
     app.include_router(diary.router, prefix="/v1", tags=["diary"])
+    app.include_router(context_receipts.router, prefix="/v1", tags=["context-receipts"])
     app.include_router(export.router, prefix="/v1", tags=["export"])
     app.include_router(admin.router, prefix="/v1", tags=["admin"])
     app.include_router(telemetry.router, prefix="/v1", tags=["telemetry"])

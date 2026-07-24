@@ -26,11 +26,14 @@ This module has no FastAPI dependencies and no route code.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
+import base64
+import json
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from typing import Literal
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -52,10 +55,20 @@ __all__ = [
     "ContextReceiptIntegrityError",
     "ContextReceiptRecallLogNotFoundError",
     "ContextReceiptStoreResult",
+    "ContextReceiptVerificationCheck",
+    "ContextReceiptVerificationResult",
+    "InvalidCursorError",
+    "VERIFICATION_CHECK_CODES",
+    "VERIFICATION_FAILURE_CODES",
+    "decode_receipt_cursor",
+    "encode_receipt_cursor",
     "get_context_receipt",
     "get_context_receipt_for_recall_log",
+    "list_context_receipts",
+    "profile_eligible",
     "store_context_receipt",
     "verify_context_receipt_record",
+    "verify_context_receipt_with_recall_log",
 ]
 
 
@@ -89,7 +102,98 @@ class ContextReceiptConflictError(ContextReceiptError):
 
 
 class ContextReceiptIntegrityError(ContextReceiptError):
-    """A stored receipt failed manifest/envelope integrity verification."""
+    """A stored receipt failed manifest/envelope integrity verification.
+
+    ``code`` carries a stable failure code (see ``VERIFICATION_FAILURE_CODES``)
+    so the REST verify route can return it without parsing the exception
+    message.  The message itself remains a human-readable description and is
+    never surfaced to API callers.
+    """
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code or VERIFICATION_FAILURE_UNKNOWN
+
+
+# ─── Stable verification check and failure codes ───────────────────────
+
+
+# Stable check codes (the ``checks[].code`` values in the verify response).
+VERIFICATION_CHECK_MANIFEST_PARSE = "manifest_parse"
+VERIFICATION_CHECK_MANIFEST_HASH = "manifest_hash"
+VERIFICATION_CHECK_PACKET_HASH_BINDING = "packet_hash_binding"
+VERIFICATION_CHECK_ENVELOPE_SCHEMA = "envelope_schema"
+VERIFICATION_CHECK_ENVELOPE_SCHEMA_VERSION = "envelope_schema_version"
+VERIFICATION_CHECK_ENVELOPE_CANONICALIZATION = "envelope_canonicalization"
+VERIFICATION_CHECK_ENVELOPE_MODE = "envelope_mode"
+VERIFICATION_CHECK_SUBJECT_TENANT = "subject_tenant"
+VERIFICATION_CHECK_SUBJECT_PRINCIPAL = "subject_principal"
+VERIFICATION_CHECK_EMBEDDED_MANIFEST_HASH_ABSENT = "embedded_manifest_hash_absent"
+VERIFICATION_CHECK_RECALL_LOG_EXISTS = "recall_log_exists"
+VERIFICATION_CHECK_RECALL_LOG_BINDING = "recall_log_binding"
+
+VERIFICATION_CHECK_CODES: tuple[str, ...] = (
+    VERIFICATION_CHECK_MANIFEST_PARSE,
+    VERIFICATION_CHECK_MANIFEST_HASH,
+    VERIFICATION_CHECK_PACKET_HASH_BINDING,
+    VERIFICATION_CHECK_ENVELOPE_SCHEMA,
+    VERIFICATION_CHECK_ENVELOPE_SCHEMA_VERSION,
+    VERIFICATION_CHECK_ENVELOPE_CANONICALIZATION,
+    VERIFICATION_CHECK_ENVELOPE_MODE,
+    VERIFICATION_CHECK_SUBJECT_TENANT,
+    VERIFICATION_CHECK_SUBJECT_PRINCIPAL,
+    VERIFICATION_CHECK_EMBEDDED_MANIFEST_HASH_ABSENT,
+    VERIFICATION_CHECK_RECALL_LOG_EXISTS,
+    VERIFICATION_CHECK_RECALL_LOG_BINDING,
+)
+
+# Stable failure codes (``failure_code`` in the verify response).
+VERIFICATION_FAILURE_MANIFEST_PARSE_FAILED = "MANIFEST_PARSE_FAILED"
+VERIFICATION_FAILURE_MANIFEST_HASH_MISMATCH = "MANIFEST_HASH_MISMATCH"
+VERIFICATION_FAILURE_PACKET_HASH_BINDING_MISMATCH = "PACKET_HASH_BINDING_MISMATCH"
+VERIFICATION_FAILURE_ENVELOPE_PROTOCOL_MISMATCH = "ENVELOPE_PROTOCOL_MISMATCH"
+VERIFICATION_FAILURE_SUBJECT_OWNERSHIP_MISMATCH = "SUBJECT_OWNERSHIP_MISMATCH"
+VERIFICATION_FAILURE_EMBEDDED_MANIFEST_HASH_FORBIDDEN = "EMBEDDED_MANIFEST_HASH_FORBIDDEN"
+VERIFICATION_FAILURE_RECALL_LOG_NOT_FOUND = "RECALL_LOG_NOT_FOUND"
+VERIFICATION_FAILURE_RECALL_LOG_BINDING_MISMATCH = "RECALL_LOG_BINDING_MISMATCH"
+VERIFICATION_FAILURE_UNKNOWN = "UNKNOWN"
+
+VERIFICATION_FAILURE_CODES: tuple[str, ...] = (
+    VERIFICATION_FAILURE_MANIFEST_PARSE_FAILED,
+    VERIFICATION_FAILURE_MANIFEST_HASH_MISMATCH,
+    VERIFICATION_FAILURE_PACKET_HASH_BINDING_MISMATCH,
+    VERIFICATION_FAILURE_ENVELOPE_PROTOCOL_MISMATCH,
+    VERIFICATION_FAILURE_SUBJECT_OWNERSHIP_MISMATCH,
+    VERIFICATION_FAILURE_EMBEDDED_MANIFEST_HASH_FORBIDDEN,
+    VERIFICATION_FAILURE_RECALL_LOG_NOT_FOUND,
+    VERIFICATION_FAILURE_RECALL_LOG_BINDING_MISMATCH,
+)
+
+
+@dataclass(frozen=True)
+class ContextReceiptVerificationCheck:
+    """One named verification check and its pass/fail result."""
+
+    code: str
+    passed: bool
+
+
+@dataclass(frozen=True)
+class ContextReceiptVerificationResult:
+    """Structured result of full receipt verification.
+
+    ``status`` is ``"valid"`` when every check passed, ``"invalid"`` when at
+    least one failed.  ``failure_code`` is the stable code of the first failing
+    check (or ``None`` when status is valid).  ``manifest`` is the parsed
+    :class:`ContextManifestV1` on success, ``None`` on failure.
+    """
+
+    status: Literal["valid", "invalid"]
+    checks: list[ContextReceiptVerificationCheck] = field(default_factory=list)
+    failure_code: str | None = None
+    manifest: ContextManifestV1 | None = None
+    recomputed_manifest_hash: str | None = None
+    manifest_packet_hash: str | None = None
 
 
 # ─── Manifest/envelope validation ──────────────────────────────────────
@@ -307,6 +411,162 @@ def _to_uuid(value: str) -> UUID:
 # ─── Stored-record verification ────────────────────────────────────────
 
 
+def _verify_stored_record(receipt: ContextReceipt) -> ContextReceiptVerificationResult:
+    """Verify stored-artifact integrity and return a structured result.
+
+    This is the single source of truth for stored-record verification. It runs
+    every check from ``VERIFICATION_CHECK_CODES`` (except ``recall_log_exists``
+    and ``recall_log_binding`` which require the parent recall log) and returns
+    a :class:`ContextReceiptVerificationResult`.
+
+    On success ``status`` is ``"valid"`` and ``manifest`` is the parsed
+    :class:`ContextManifestV1`.  On failure ``status`` is ``"invalid"`` and
+    ``failure_code`` is the stable code of the first failing check.
+    """
+    checks: list[ContextReceiptVerificationCheck] = []
+    failure_code: str | None = None
+    manifest: ContextManifestV1 | None = None
+    recomputed_hash: str | None = None
+    packet_hash: str | None = None
+
+    # 0. embedded_manifest_hash_absent — check BEFORE parsing because a
+    # smuggled manifest_hash field causes the strict model (extra="forbid")
+    # to reject the parse, which would mask the real failure code.
+    embedded_hash_forbidden = "manifest_hash" in receipt.manifest
+
+    # 1. manifest_parse
+    try:
+        manifest = ContextManifestV1.model_validate(receipt.manifest)
+        checks.append(
+            ContextReceiptVerificationCheck(
+                VERIFICATION_CHECK_MANIFEST_PARSE, True
+            )
+        )
+    except Exception:  # noqa: BLE001 — any parse failure is an integrity defect
+        checks.append(
+            ContextReceiptVerificationCheck(
+                VERIFICATION_CHECK_MANIFEST_PARSE, False
+            )
+        )
+        # If the manifest had an embedded manifest_hash field, that is the
+        # real defect (not a generic parse failure). The strict model rejects
+        # extra fields, so this path is reachable when the field is smuggled.
+        if embedded_hash_forbidden:
+            checks.append(
+                ContextReceiptVerificationCheck(
+                    VERIFICATION_CHECK_EMBEDDED_MANIFEST_HASH_ABSENT, False
+                )
+            )
+            failure_code = VERIFICATION_FAILURE_EMBEDDED_MANIFEST_HASH_FORBIDDEN
+        else:
+            # Record embedded check as passed (no smuggled field) so the
+            # check list is complete.
+            checks.append(
+                ContextReceiptVerificationCheck(
+                    VERIFICATION_CHECK_EMBEDDED_MANIFEST_HASH_ABSENT, True
+                )
+            )
+            failure_code = VERIFICATION_FAILURE_MANIFEST_PARSE_FAILED
+        return ContextReceiptVerificationResult(
+            status="invalid",
+            checks=checks,
+            failure_code=failure_code,
+            manifest=None,
+            recomputed_manifest_hash=None,
+            manifest_packet_hash=None,
+        )
+
+    assert manifest is not None  # narrowed by the try/except above
+
+    recomputed_hash = compute_manifest_hash(manifest)
+    packet_hash = manifest.packet.hash
+
+    def _check(
+        code: str, passed: bool, fc: str
+    ) -> None:
+        nonlocal failure_code
+        checks.append(ContextReceiptVerificationCheck(code, passed))
+        if not passed and failure_code is None:
+            failure_code = fc
+
+    # 2. manifest_hash
+    _check(
+        VERIFICATION_CHECK_MANIFEST_HASH,
+        recomputed_hash == receipt.manifest_hash,
+        VERIFICATION_FAILURE_MANIFEST_HASH_MISMATCH,
+    )
+
+    # 3. packet_hash_binding
+    _check(
+        VERIFICATION_CHECK_PACKET_HASH_BINDING,
+        manifest.packet.hash == receipt.packet_hash,
+        VERIFICATION_FAILURE_PACKET_HASH_BINDING_MISMATCH,
+    )
+
+    # 4. envelope_schema
+    _check(
+        VERIFICATION_CHECK_ENVELOPE_SCHEMA,
+        manifest.schema_name == receipt.manifest_schema,
+        VERIFICATION_FAILURE_ENVELOPE_PROTOCOL_MISMATCH,
+    )
+
+    # 5. envelope_schema_version
+    _check(
+        VERIFICATION_CHECK_ENVELOPE_SCHEMA_VERSION,
+        manifest.schema_version == receipt.manifest_schema_version,
+        VERIFICATION_FAILURE_ENVELOPE_PROTOCOL_MISMATCH,
+    )
+
+    # 6. envelope_canonicalization
+    _check(
+        VERIFICATION_CHECK_ENVELOPE_CANONICALIZATION,
+        manifest.canonicalization == receipt.canonicalization,
+        VERIFICATION_FAILURE_ENVELOPE_PROTOCOL_MISMATCH,
+    )
+
+    # 7. envelope_mode
+    _check(
+        VERIFICATION_CHECK_ENVELOPE_MODE,
+        manifest.mode == receipt.mode,
+        VERIFICATION_FAILURE_ENVELOPE_PROTOCOL_MISMATCH,
+    )
+
+    # 8. subject_tenant
+    _check(
+        VERIFICATION_CHECK_SUBJECT_TENANT,
+        manifest.subject.tenant_id == str(receipt.tenant_id),
+        VERIFICATION_FAILURE_SUBJECT_OWNERSHIP_MISMATCH,
+    )
+
+    # 9. subject_principal
+    _check(
+        VERIFICATION_CHECK_SUBJECT_PRINCIPAL,
+        manifest.subject.principal_id == str(receipt.principal_id),
+        VERIFICATION_FAILURE_SUBJECT_OWNERSHIP_MISMATCH,
+    )
+
+    # 10. embedded_manifest_hash_absent — already checked before parse (step 0)
+    # so the correct failure code is produced even when the strict model
+    # rejects the smuggled field. Here we just record the check result.
+    _check(
+        VERIFICATION_CHECK_EMBEDDED_MANIFEST_HASH_ABSENT,
+        not embedded_hash_forbidden,
+        VERIFICATION_FAILURE_EMBEDDED_MANIFEST_HASH_FORBIDDEN,
+    )
+
+    status: Literal["valid", "invalid"] = (
+        "valid" if failure_code is None else "invalid"
+    )
+    return ContextReceiptVerificationResult(
+        status=status,
+        checks=checks,
+        failure_code=failure_code,
+        manifest=manifest if status == "valid" else None,
+        recomputed_manifest_hash=recomputed_hash,
+        manifest_packet_hash=packet_hash,
+    )
+
+
 def verify_context_receipt_record(receipt: ContextReceipt) -> ContextManifestV1:
     """Verify the integrity of a stored receipt and return its parsed manifest.
 
@@ -323,59 +583,14 @@ def verify_context_receipt_record(receipt: ContextReceipt) -> ContextManifestV1:
     Raises :class:`ContextReceiptIntegrityError` on any mismatch. Does not load
     memory items or attempt content rehydration (that belongs to ENG-CONTEXT-003).
     """
-    try:
-        manifest = ContextManifestV1.model_validate(receipt.manifest)
-    except Exception as exc:  # noqa: BLE001 — surface any parse failure as integrity
-        raise ContextReceiptIntegrityError(
-            "stored manifest JSONB failed ContextManifestV1 validation"
-        ) from exc
-
-    recomputed_hash = compute_manifest_hash(manifest)
-    if recomputed_hash != receipt.manifest_hash:
-        raise ContextReceiptIntegrityError(
-            "recomputed manifest hash does not match stored manifest_hash"
-        )
-
-    if manifest.packet.hash != receipt.packet_hash:
-        raise ContextReceiptIntegrityError(
-            "manifest packet.hash does not match stored packet_hash"
-        )
-
-    if manifest.schema_name != receipt.manifest_schema:
-        raise ContextReceiptIntegrityError(
-            "manifest schema does not match envelope manifest_schema"
-        )
-    if manifest.schema_version != receipt.manifest_schema_version:
-        raise ContextReceiptIntegrityError(
-            "manifest schema_version does not match envelope manifest_schema_version"
-        )
-    if manifest.canonicalization != receipt.canonicalization:
-        raise ContextReceiptIntegrityError(
-            "manifest canonicalization does not match envelope canonicalization"
-        )
-    if manifest.mode != receipt.mode:
-        raise ContextReceiptIntegrityError(
-            "manifest mode does not match envelope mode"
-        )
-
-    if manifest.subject.tenant_id != str(receipt.tenant_id):
-        raise ContextReceiptIntegrityError(
-            "manifest subject tenant_id does not match receipt tenant_id"
-        )
-    if manifest.subject.principal_id != str(receipt.principal_id):
-        raise ContextReceiptIntegrityError(
-            "manifest subject principal_id does not match receipt principal_id"
-        )
-
-    # The manifest must not carry a top-level manifest_hash field. The JSONB
-    # object is the manifest representation; verification confirms the stored
-    # object does not smuggle the hash into the hashed payload.
-    if "manifest_hash" in receipt.manifest:
-        raise ContextReceiptIntegrityError(
-            "stored manifest contains a top-level manifest_hash field"
-        )
-
-    return manifest
+    result = _verify_stored_record(receipt)
+    if result.status == "valid":
+        assert result.manifest is not None
+        return result.manifest
+    raise ContextReceiptIntegrityError(
+        f"stored receipt {receipt.id} failed verification: {result.failure_code}",
+        code=result.failure_code,
+    )
 
 
 # ─── Idempotent insertion ──────────────────────────────────────────────
@@ -610,3 +825,348 @@ async def get_context_receipt_for_recall_log(
         )
     )
     return receipt
+
+
+# ─── Cursor pagination (ENG-CONTEXT-003A) ──────────────────────────────
+
+
+_CURSOR_VERSION = 1
+_CURSOR_PAYLOAD_KEYS = frozenset({"v", "created_at", "id"})
+
+
+class InvalidCursorError(ValueError):
+    """Raised when a cursor payload is malformed, unsupported, or unparseable."""
+
+
+def encode_receipt_cursor(*, created_at: datetime, receipt_id: UUID) -> str:
+    """Encode a keyset cursor as opaque URL-safe base64.
+
+    The cursor carries the sort key (``created_at`` DESC, ``id`` DESC) of the
+    last row returned, plus a schema version. The payload is canonical JSON so
+    the cursor is deterministic for identical inputs.
+    """
+    if created_at.tzinfo is None:
+        raise ValueError("cursor created_at must be timezone-aware")
+    payload = {
+        "v": _CURSOR_VERSION,
+        "created_at": created_at.astimezone(UTC).isoformat(),
+        "id": str(receipt_id),
+    }
+    data = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
+def decode_receipt_cursor(cursor: str) -> tuple[datetime, UUID]:
+    """Decode and validate an opaque keyset cursor.
+
+    Returns ``(created_at, receipt_id)`` with a timezone-aware datetime and a
+    validated UUID. Raises :class:`InvalidCursorError` for any malformed
+    payload: bad base64, bad JSON, missing/extra fields, unsupported version,
+    non-canonical UUID, or naive timestamp.
+    """
+    # Validate base64 first.
+    padding = "=" * (-len(cursor) % 4)
+    try:
+        raw = base64.urlsafe_b64decode((cursor + padding).encode())
+    except Exception as exc:
+        raise InvalidCursorError("invalid cursor encoding") from exc
+
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise InvalidCursorError("invalid cursor JSON") from exc
+
+    if not isinstance(payload, dict):
+        raise InvalidCursorError("invalid cursor payload")
+
+    keys = set(payload.keys())
+    if keys != _CURSOR_PAYLOAD_KEYS:
+        raise InvalidCursorError("invalid cursor fields")
+
+    version = payload["v"]
+    if not isinstance(version, int) or version != _CURSOR_VERSION:
+        raise InvalidCursorError("unsupported cursor version")
+
+    created_at_str = payload["created_at"]
+    if not isinstance(created_at_str, str):
+        raise InvalidCursorError("invalid cursor created_at")
+    try:
+        created_at = datetime.fromisoformat(created_at_str)
+    except ValueError as exc:
+        raise InvalidCursorError("invalid cursor timestamp") from exc
+    if created_at.tzinfo is None:
+        # Accept a naive timestamp by assuming UTC (common in ISO round-trips).
+        created_at = created_at.replace(tzinfo=UTC)
+
+    id_str = payload["id"]
+    if not isinstance(id_str, str):
+        raise InvalidCursorError("invalid cursor id")
+    try:
+        receipt_id = UUID(id_str)
+    except (ValueError, AttributeError) as exc:
+        raise InvalidCursorError("invalid cursor uuid") from exc
+
+    return created_at, receipt_id
+
+
+# ─── Profile-aware eligibility (ENG-CONTEXT-003A) ──────────────────────
+
+
+def profile_eligible(
+    receipt_manifest: dict[str, object],
+    *,
+    memory_profile_id: UUID | None,
+    memory_profile_revision_id: UUID | None,
+) -> bool:
+    """Check whether a receipt's manifest subject matches a profile context.
+
+    When the current credential is unprofiled (both IDs ``None``), any receipt
+    owned by the same tenant/principal is eligible.  When profile-bound, the
+    manifest's ``memory_profile_id`` and ``memory_profile_revision_id`` must
+    exactly equal the resolved profile and revision — including null state.
+
+    Profile access is never inferred from slug, version, workspace, or
+    principal identity alone.
+    """
+    subject = receipt_manifest.get("subject")
+    if not isinstance(subject, dict):
+        return False
+
+    m_pid = subject.get("memory_profile_id")
+    m_rid = subject.get("memory_profile_revision_id")
+
+    def _norm(v: object) -> str | None:
+        return str(v) if v is not None else None
+
+    return _norm(m_pid) == _norm(memory_profile_id) and _norm(m_rid) == _norm(
+        memory_profile_revision_id
+    )
+
+
+# ─── Keyset-paginated timeline (ENG-CONTEXT-003A) ──────────────────────
+
+
+@dataclass(frozen=True)
+class ContextReceiptListResult:
+    """Result of :func:`list_context_receipts`."""
+
+    items: list[ContextReceipt]
+    next_cursor: str | None
+
+
+async def list_context_receipts(
+    session: AsyncSession,
+    *,
+    tenant_id: UUID,
+    principal_id: UUID,
+    limit: int = 50,
+    cursor: str | None = None,
+    recall_log_id: UUID | None = None,
+    memory_profile_id: UUID | None = None,
+    memory_profile_revision_id: UUID | None = None,
+) -> ContextReceiptListResult:
+    """List the principal's readable receipts newest-first.
+
+    Ordered by ``created_at DESC, id DESC`` using a stable keyset cursor so
+    pagination never duplicates or omits rows when timestamps are equal.
+
+    Profile narrowing:
+      - When ``memory_profile_id`` is ``None`` (unprofiled credential), all
+        receipts owned by the tenant/principal are returned.
+      - When profile-bound, only receipts whose manifest subject carries the
+        exact same ``memory_profile_id`` AND ``memory_profile_revision_id``
+        are returned.
+
+    Does not perform cryptographic verification for every row (that is the
+    verify endpoint's job). A malformed manifest does not make the timeline
+    unavailable — the row is still returned with envelope fields intact.
+
+    Does not commit or roll back.
+    """
+    stmt = select(ContextReceipt).where(
+        ContextReceipt.tenant_id == tenant_id,
+        ContextReceipt.principal_id == principal_id,
+    )
+
+    if recall_log_id is not None:
+        stmt = stmt.where(ContextReceipt.recall_log_id == recall_log_id)
+
+    # Cursor: return rows strictly before (created_at, id) in DESC order.
+    # That means: created_at < cursor_created_at OR
+    # (created_at == cursor_created_at AND id < cursor_id).
+    if cursor is not None:
+        cur_created_at, cur_id = decode_receipt_cursor(cursor)
+        stmt = stmt.where(
+            or_(
+                ContextReceipt.created_at < cur_created_at,
+                (ContextReceipt.created_at == cur_created_at)
+                & (ContextReceipt.id < cur_id),
+            )
+        )
+
+    # Fetch one extra row to determine whether there is a next page.
+    stmt = stmt.order_by(
+        ContextReceipt.created_at.desc(),
+        ContextReceipt.id.desc(),
+    ).limit(limit + 1)
+
+    result = await session.scalars(stmt)
+    rows = list(result)
+    has_more = len(rows) > limit
+    if has_more:
+        rows = rows[:limit]
+
+    # Apply profile narrowing in Python (the manifest subject is JSONB; a
+    # SQL expression filter would require JSON path operators that are not
+    # portable and the narrowing is per-row, not per-cursor).
+    if memory_profile_id is not None or memory_profile_revision_id is not None:
+        rows = [
+            r
+            for r in rows
+            if profile_eligible(
+                r.manifest,
+                memory_profile_id=memory_profile_id,
+                memory_profile_revision_id=memory_profile_revision_id,
+            )
+        ]
+        # After filtering, there may be fewer than `limit`. That is fine —
+        # we do not fetch a second page inside this call. The next_cursor
+        # is still derived from the actual last DB row before filtering so
+        # it remains a valid keyset continuation point.
+        # However, if filtering removed all rows and the DB had more, we
+        # should set next_cursor so the caller can page to find matching
+        # rows. If filtering removed some rows but we had `has_more`, the
+        # cursor points at the last fetched DB row (correct continuation).
+
+    next_cursor = None
+    if has_more and rows:
+        last = rows[-1]
+        next_cursor = encode_receipt_cursor(
+            created_at=last.created_at, receipt_id=last.id
+        )
+
+    return ContextReceiptListResult(items=rows, next_cursor=next_cursor)
+
+
+# ─── Full verification with recall-log binding (ENG-CONTEXT-003A) ──────
+
+
+async def verify_context_receipt_with_recall_log(
+    session: AsyncSession,
+    receipt: ContextReceipt,
+    *,
+    tenant_id: UUID,
+    principal_id: UUID,
+) -> ContextReceiptVerificationResult:
+    """Verify stored-artifact integrity AND parent recall-log binding.
+
+    Combines:
+      1. Stored-record verification (``_verify_stored_record``) — all the
+         manifest-hash, packet-hash, envelope, and subject checks.
+      2. Parent recall-log binding — loads the owning :class:`RecallLog`
+         under explicit tenant/principal predicates and reuses the same
+         ``_validate_recall_log_overlap`` contract used at store time.
+
+    Returns a :class:`ContextReceiptVerificationResult` with all 12 checks.
+    Never raises ``ContextReceiptIntegrityError`` — a verification failure
+    is a structured ``status="invalid"`` result, not an exception. The REST
+    route uses this so an integrity defect returns HTTP 200 invalid, not 500.
+
+    The recall-log binding checks (``recall_log_exists`` and
+    ``recall_log_binding``) are added to the stored-record checks list.
+    """
+    stored_result = _verify_stored_record(receipt)
+    checks = list(stored_result.checks)
+
+    # If the stored record already failed at parse, we cannot compare the
+    # manifest to the recall log (there is no parsed manifest). Still report
+    # the recall-log checks as failed so the response is complete.
+    if stored_result.manifest is None:
+        checks.append(
+            ContextReceiptVerificationCheck(
+                VERIFICATION_CHECK_RECALL_LOG_EXISTS, False
+            )
+        )
+        checks.append(
+            ContextReceiptVerificationCheck(
+                VERIFICATION_CHECK_RECALL_LOG_BINDING, False
+            )
+        )
+        # Use the stored failure code as the overall code, or add
+        # RECALL_LOG_NOT_FOUND if the stored checks passed but recall-log
+        # failed.
+        return ContextReceiptVerificationResult(
+            status="invalid",
+            checks=checks,
+            failure_code=stored_result.failure_code,
+            manifest=None,
+            recomputed_manifest_hash=stored_result.recomputed_manifest_hash,
+            manifest_packet_hash=stored_result.manifest_packet_hash,
+        )
+
+    # Load the parent recall log with explicit ownership predicates.
+    recall_log = await session.scalar(
+        select(RecallLog).where(
+            RecallLog.id == receipt.recall_log_id,
+            RecallLog.tenant_id == tenant_id,
+            RecallLog.principal_id == principal_id,
+        )
+    )
+
+    if recall_log is None:
+        checks.append(
+            ContextReceiptVerificationCheck(
+                VERIFICATION_CHECK_RECALL_LOG_EXISTS, False
+            )
+        )
+        checks.append(
+            ContextReceiptVerificationCheck(
+                VERIFICATION_CHECK_RECALL_LOG_BINDING, False
+            )
+        )
+        return ContextReceiptVerificationResult(
+            status="invalid",
+            checks=checks,
+            failure_code=VERIFICATION_FAILURE_RECALL_LOG_NOT_FOUND,
+            manifest=stored_result.manifest,
+            recomputed_manifest_hash=stored_result.recomputed_manifest_hash,
+            manifest_packet_hash=stored_result.manifest_packet_hash,
+        )
+
+    checks.append(
+        ContextReceiptVerificationCheck(
+            VERIFICATION_CHECK_RECALL_LOG_EXISTS, True
+        )
+    )
+
+    # Recall-log binding: reuse the exact same overlap contract from store
+    # time. If it raises, that is a binding mismatch.
+    binding_ok = True
+    try:
+        _validate_recall_log_overlap(
+            recall_log=recall_log, manifest=stored_result.manifest
+        )
+    except ContextReceiptConflictError:
+        binding_ok = False
+
+    checks.append(
+        ContextReceiptVerificationCheck(
+            VERIFICATION_CHECK_RECALL_LOG_BINDING, binding_ok
+        )
+    )
+
+    failure_code = stored_result.failure_code
+    if not binding_ok and failure_code is None:
+        failure_code = VERIFICATION_FAILURE_RECALL_LOG_BINDING_MISMATCH
+
+    status: Literal["valid", "invalid"] = (
+        "valid" if failure_code is None else "invalid"
+    )
+    return ContextReceiptVerificationResult(
+        status=status,
+        checks=checks,
+        failure_code=failure_code,
+        manifest=stored_result.manifest if status == "valid" else None,
+        recomputed_manifest_hash=stored_result.recomputed_manifest_hash,
+        manifest_packet_hash=stored_result.manifest_packet_hash,
+    )

@@ -15,6 +15,14 @@
 > decided in ENG-CONTEXT-002C); an inspect/verify API lands in
 > ENG-CONTEXT-003. Only `mode=startup` is supported. Semantic recall creates
 > no receipt while the feature is enabled.
+> **Status (ENG-CONTEXT-003A):** The receipt inspect and integrity
+> verification API is **implemented**. Three read-only REST endpoints
+> (`GET /v1/context-receipts`, `GET /v1/context-receipts/{id}`, `GET
+> /v1/context-receipts/{id}/verify`) expose the receipt substrate with
+> principal isolation, profile narrowing, keyset pagination, and structured
+> verification with stable check/failure codes. See
+> [docs/ops/context-receipt-inspection.md](ops/context-receipt-inspection.md).
+> No production recall or receipt-write behavior changed.
 
 The Context Manifest is the deterministic, versioned artifact beneath the
 **Engram Context Ledger**. It lets Engram answer one question with proof:

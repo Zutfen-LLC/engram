@@ -1636,7 +1636,13 @@ Auditability is part of the trust model, not a compliance afterthought.
 > feature is `false` (the default) the route guard performs **no
 > receipt-specific work at all**. Receipt IDs/hashes remain **invisible to
 > clients** (exposure lands in ENG-CONTEXT-002C); an **inspect/verify API**
-> is deferred to ENG-CONTEXT-003. Only `mode="startup"` is supported;
+> is **implemented** (ENG-CONTEXT-003A): three read-only REST endpoints
+> (`GET /v1/context-receipts`, `GET /v1/context-receipts/{id}`, `GET
+> /v1/context-receipts/{id}/verify`) expose the receipt substrate with
+> principal isolation, profile narrowing, keyset pagination, and structured
+> verification with stable check/failure codes (see
+> `docs/ops/context-receipt-inspection.md`). No production recall or
+> receipt-write behavior changed. Only `mode="startup"` is supported;
 > semantic recall creates no receipt while the feature is enabled.
 
 The context manifest is the deterministic, content-addressed artifact that
