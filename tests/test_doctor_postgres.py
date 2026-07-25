@@ -48,6 +48,16 @@ async def _fresh_engine():
         _test_engine, class_=AsyncSession, expire_on_commit=False
     )
     yield
+    # Every test in this module seeds its own tenant(s) (never the seeded
+    # 'default' tenant) and never mutates anything itself (that is the whole
+    # point of the no-mutation proof), so cleanup here is safe: deleting the
+    # tenant cascades to its principals/recall_logs/context_receipts/jobs/
+    # usage_events/tenant_config. Without this, orphaned context_receipts
+    # rows survive across test MODULES and their ON DELETE RESTRICT to
+    # recall_logs breaks other files' unscoped `DELETE FROM recall_logs`
+    # cleanup fixtures (e.g. tests/test_graph_recall.py).
+    async with _test_engine.begin() as conn:
+        await conn.execute(text("DELETE FROM tenants WHERE slug != 'default'"))
     await _test_engine.dispose()
 
 
