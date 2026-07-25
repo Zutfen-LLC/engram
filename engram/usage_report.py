@@ -1060,6 +1060,55 @@ async def _hourly_series(session: AsyncSession, window: ReportWindow) -> list[di
     return await _rows(session, sql, params)
 
 
+@dataclass
+class OperationalSnapshot:
+    """Bounded subset of :func:`build_report`'s sections for non-metering callers.
+
+    ``engram doctor`` (ENG-LOOP-001A) needs coverage/candidate-funnel/worker/
+    storage evidence but not the heavier by-principal, provider-economics,
+    retrieval, conflict-economics, or hourly-series sections. This reuses the
+    exact same aggregation SQL as the dogfood usage report via
+    :func:`build_operational_snapshot` instead of duplicating it.
+    """
+
+    tenant_id: str | None
+    since: datetime
+    until: datetime
+    coverage: dict[str, Any]
+    candidate_funnel: dict[str, Any]
+    worker: dict[str, Any]
+    storage: dict[str, Any]
+
+
+async def build_operational_snapshot(
+    session: AsyncSession,
+    *,
+    tenant_id: str | None,
+    since: datetime,
+    until: datetime,
+) -> OperationalSnapshot:
+    """Build the bounded operational subset of the usage report.
+
+    ``session`` follows the same role contract as :func:`build_report`: pass
+    the owner session for deployment-wide (``tenant_id=None``) evidence, or
+    filter explicitly by tenant — every query here already applies an
+    explicit tenant predicate when ``tenant_id`` is given, correct under RLS
+    too. Does not compute ``by_principal``, ``provider_economics``,
+    ``retrieval``, ``conflict_economics``, or ``hourly_series`` — callers that
+    need those should use :func:`build_report`.
+    """
+    window = ReportWindow(tenant_id=tenant_id, since=since, until=until)
+    return OperationalSnapshot(
+        tenant_id=tenant_id,
+        since=since,
+        until=until,
+        coverage=await _coverage_section(session, window),
+        candidate_funnel=await _candidate_funnel_section(session, window),
+        worker=await _worker_section(session, window),
+        storage=await _storage_section(session, window),
+    )
+
+
 async def build_report(
     session: AsyncSession,
     *,
