@@ -30,6 +30,12 @@ from engram.tenant_initialization import initialize_tenant
 _VISIBLE_ASCII = re.compile(r"^[\x21-\x7e]{1,255}$")
 _SLUG = re.compile(r"^[a-z][a-z0-9-]{0,254}$")
 
+# This deliberately remains a no-op production seam.  Certification tests
+# monkeypatch it to prove that every mutation boundary is protected by the
+# route's single transaction; callers cannot influence it.
+async def provisioning_stage(_stage: str) -> None:
+    return None
+
 
 @dataclass(frozen=True)
 class ProvisionTenantInput:
@@ -72,7 +78,12 @@ def validate_tenant_slug(value: str) -> str:
 
 
 def validate_name(value: str, field: str) -> str:
-    if not value or len(value) > 255:
+    if (
+        not value
+        or not value.strip()
+        or len(value) > 255
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
         raise ValueError(f"{field} must be from 1 through 255 characters")
     return value
 
@@ -228,6 +239,7 @@ async def provision_tenant_human(
             # The caller supplied the slug, so this does not disclose a hidden
             # resource; all other database details stay private.
             raise _conflict("TENANT_SLUG_CONFLICT", "Tenant slug is already unavailable") from exc
+        await provisioning_stage("tenant_inserted")
         tenant_binding = TenantProvisioningBinding(
             service_client_id=identity.id,
             external_ref=request.tenant.external_ref,
@@ -235,7 +247,8 @@ async def provision_tenant_human(
         )
         session.add(tenant_binding)
         await session.flush()
-        await initialize_tenant(session, tenant)
+        await provisioning_stage("tenant_binding_inserted")
+        await initialize_tenant(session, tenant, stage_hook=provisioning_stage)
         tenant_created = True
     else:
         existing_tenant = await session.get(Tenant, tenant_binding.tenant_id)
@@ -282,6 +295,7 @@ async def provision_tenant_human(
             raise _conflict(
                 "PROVISIONING_CONFLICT", "Principal external identity conflicts with request"
             ) from exc
+        await provisioning_stage("principal_inserted")
         principal_binding = PrincipalProvisioningBinding(
             service_client_id=identity.id,
             tenant_binding_id=tenant_binding.id,
@@ -291,6 +305,7 @@ async def provision_tenant_human(
         )
         session.add(principal_binding)
         await session.flush()
+        await provisioning_stage("principal_binding_inserted")
         principal_created = True
     else:
         existing_principal = await session.get(Principal, principal_binding.principal_id)
@@ -311,16 +326,20 @@ async def provision_tenant_human(
             principal_binding_id=principal_binding.id,
         )
     )
+    await session.flush()
+    await provisioning_stage("idempotency_inserted")
     credential.last_used_at = datetime.now(UTC)
     result = ProvisionResult(tenant, principal, tenant_created, principal_created, False)
     if tenant_created:
         await _event(
             session, identity, credential, result, "tenant.provisioned", request_id, request
         )
+        await provisioning_stage("tenant_success_event_inserted")
     if principal_created:
         await _event(
             session, identity, credential, result, "principal.provisioned", request_id, request
         )
+        await provisioning_stage("principal_success_event_inserted")
     if not tenant_created and not principal_created:
         await _event(
             session,
@@ -331,6 +350,7 @@ async def provision_tenant_human(
             request_id,
             request,
         )
+    await provisioning_stage("credential_last_used_updated")
     return result
 
 

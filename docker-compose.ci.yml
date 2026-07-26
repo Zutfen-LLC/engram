@@ -38,6 +38,7 @@ services:
       ENGRAM_AUTH_ENABLED: "false"
       ENGRAM_SERVICE_PROVISIONING_ENABLED: "true"
       ENGRAM_PROVISIONER_DATABASE_URL: postgresql+asyncpg://engram_provisioner:engram_provisioner@postgres:5432/engram
+      ENGRAM_FAIL_ON_DB_SKIP: "1"
       ENGRAM_EMBEDDING_PROVIDER: none
       PYTHONUNBUFFERED: "1"
     depends_on:

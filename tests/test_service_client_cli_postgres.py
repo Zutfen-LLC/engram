@@ -15,7 +15,7 @@ from engram.cli import _run_service_client
 from engram.migrations import normalize_asyncpg_url
 from engram.service_auth import parse_service_credential
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.service_provisioning_postgres]
 
 
 async def _connect(url: str):  # type: ignore[no-untyped-def]

@@ -12,7 +12,7 @@ import pytest
 
 from engram.migrations import normalize_asyncpg_url
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.service_provisioning_postgres]
 
 
 async def _connect(url: str):  # type: ignore[no-untyped-def]
@@ -142,6 +142,54 @@ async def test_provisioner_role_posture_and_narrow_grants(role_proof) -> None:  
         await conn.execute("SELECT * FROM memory_items")
     with pytest.raises(asyncpg.InsufficientPrivilegeError):
         await conn.execute("CREATE TABLE prohibited_provisioner_table (id int)")
+
+
+@pytest.mark.parametrize(
+    "table",
+    (
+        "memory_items",
+        "memory_embeddings",
+        "recall_logs",
+        "context_receipts",
+        "api_keys",
+        "workspaces",
+        "usage_events",
+        "classification_runs",
+    ),
+)
+async def test_provisioner_cannot_read_non_provisioning_data(
+    role_proof, table: str
+) -> None:  # type: ignore[no-untyped-def]
+    """Every denial uses a savepoint so one expected error cannot mask another."""
+    import asyncpg
+
+    conn = role_proof["provisioner"]
+    async with conn.transaction(), conn.transaction():
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await conn.fetch(f"SELECT * FROM {table} LIMIT 1")
+
+
+async def test_provisioner_cannot_mutate_authority_or_provisioning_history(role_proof) -> None:  # type: ignore[no-untyped-def]
+    import asyncpg
+
+    proof = role_proof
+    conn = proof["provisioner"]
+    denied = (
+        ("UPDATE service_clients SET permissions=ARRAY['tenant.provision'] WHERE id=$1", proof["first_client"]),
+        ("UPDATE service_clients SET display_name='changed' WHERE id=$1", proof["first_client"]),
+        ("UPDATE service_client_credentials SET status='revoked' WHERE service_client_id=$1", proof["first_client"]),
+        ("UPDATE service_client_credentials SET expires_at=now() WHERE service_client_id=$1", proof["first_client"]),
+        ("DELETE FROM tenant_provisioning_bindings WHERE service_client_id=$1", proof["first_client"]),
+        ("UPDATE tenant_provisioning_bindings SET external_ref='changed' WHERE service_client_id=$1", proof["first_client"]),
+        ("DELETE FROM service_provisioning_idempotency WHERE service_client_id=$1", proof["first_client"]),
+        ("DELETE FROM service_provisioning_events WHERE service_client_id=$1", proof["first_client"]),
+    )
+    async with conn.transaction():
+        await conn.execute("SELECT set_config('app.service_client_id', $1, true)", str(proof["first_client"]))
+        for statement, value in denied:
+            async with conn.transaction():
+                with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                    await conn.execute(statement, value)
 
 
 async def test_service_context_rls_hides_other_clients_and_events_are_append_only(role_proof) -> None:  # type: ignore[no-untyped-def]

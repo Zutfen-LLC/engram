@@ -27,7 +27,7 @@ from engram.service_auth import (
     parse_service_credential,
 )
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.service_provisioning_postgres]
 
 
 def _owner_url() -> str | None:
@@ -306,6 +306,134 @@ async def test_real_provisioning_contract_replay_resolution_and_audit(service_st
         assert forbidden not in serialized_events
 
 
+@pytest.mark.parametrize(
+    "changed_path",
+    (("tenant", "name"), ("tenant", "slug"), ("human_principal", "name")),
+)
+async def test_idempotency_and_immutable_identity_conflicts_are_distinct(
+    service_stack, changed_path: tuple[str, str]
+) -> None:  # type: ignore[no-untyped-def]
+    stack = service_stack
+    original = _body(stack["tag"])
+    key = f"identity-{stack['tag']}-{changed_path[0]}-{changed_path[1]}"
+    created = await stack["client"].post(
+        "/v1/service/provisioning/tenant-human", headers=_headers(stack, key), json=original
+    )
+    assert created.status_code == 201
+    changed = _body(stack["tag"])
+    changed[changed_path[0]][changed_path[1]] = (
+        f"other-{stack['tag']}" if changed_path[1] == "slug" else "Changed immutable name"
+    )
+    reused = await stack["client"].post(
+        "/v1/service/provisioning/tenant-human", headers=_headers(stack, key), json=changed
+    )
+    assert reused.status_code == 409
+    assert reused.json()["detail"]["code"] == "IDEMPOTENCY_KEY_REUSED"
+    immutable = await stack["client"].post(
+        "/v1/service/provisioning/tenant-human",
+        headers=_headers(stack, f"new-{key}"),
+        json=changed,
+    )
+    assert immutable.status_code == 409
+    assert immutable.json()["detail"]["code"] == "PROVISIONING_CONFLICT"
+    assert await stack["owner"].fetchval(
+        "SELECT count(*) FROM service_provisioning_idempotency WHERE service_client_id=$1", stack["client_id"]
+    ) == 1
+
+
+async def test_unbound_slug_is_never_adopted_or_bound(service_stack) -> None:  # type: ignore[no-untyped-def]
+    stack = service_stack
+    body = _body(stack["tag"])
+    unrelated = uuid.uuid4()
+    await stack["owner"].execute(
+        "INSERT INTO tenants (id,name,slug) VALUES ($1,$2,$3)",
+        unrelated,
+        "Unrelated tenant",
+        body["tenant"]["slug"],
+    )
+    try:
+        response = await stack["client"].post(
+            "/v1/service/provisioning/tenant-human",
+            headers=_headers(stack, f"slug-conflict-{stack['tag']}"),
+            json=body,
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "TENANT_SLUG_CONFLICT"
+        assert await stack["owner"].fetchval(
+            "SELECT count(*) FROM tenant_provisioning_bindings WHERE tenant_id=$1", unrelated
+        ) == 0
+        assert await stack["owner"].fetchval(
+            "SELECT count(*) FROM service_provisioning_idempotency WHERE service_client_id=$1",
+            stack["client_id"],
+        ) == 0
+    finally:
+        await stack["owner"].execute("DELETE FROM tenants WHERE id=$1", unrelated)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"tenant": {"id": str(uuid.uuid4())}},
+        {"tenant": {"workspace": "forbidden"}},
+        {"human_principal": {"type": "agent"}},
+        {"human_principal": {"internal_key": "forbidden"}},
+        {"agent": {"name": "forbidden"}},
+        {"api_key": {"scope": "forbidden"}},
+        {"memory_profile": {"slug": "forbidden"}},
+    ),
+)
+async def test_forbidden_or_invalid_public_fields_are_sanitized(
+    service_stack, payload: dict[str, Any]
+) -> None:  # type: ignore[no-untyped-def]
+    stack = service_stack
+    body = _body(stack["tag"])
+    for key, value in payload.items():
+        if key in body and isinstance(value, dict):
+            body[key].update(value)
+        else:
+            body[key] = value
+    response = await stack["client"].post(
+        "/v1/service/provisioning/tenant-human",
+        headers={"Authorization": f"Bearer {stack['credential']}"},
+        json=body,
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "INVALID_REQUEST"
+    _assert_service_headers(response)
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        None,
+        {
+            "tenant": {"external_ref": "non-ascii-\u00e9", "name": "Tenant", "slug": "tenant"},
+            "human_principal": {"external_ref": "human", "name": "Human"},
+        },
+        {
+            "tenant": {"external_ref": "tenant", "name": "\t", "slug": "tenant"},
+            "human_principal": {"external_ref": "human", "name": "Human"},
+        },
+    ),
+)
+async def test_missing_or_invalid_request_contract_is_sanitized(
+    service_stack, body: dict[str, Any] | None
+) -> None:  # type: ignore[no-untyped-def]
+    stack = service_stack
+    response = await stack["client"].post(
+        "/v1/service/provisioning/tenant-human",
+        headers=(
+            {"Authorization": f"Bearer {stack['credential']}"}
+            if body is None
+            else _headers(stack, f"invalid-contract-{uuid.uuid4()}")
+        ),
+        json=_body(stack["tag"]) if body is None else body,
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "INVALID_REQUEST"
+    _assert_service_headers(response)
+
+
 async def test_locked_authority_revalidation_rejects_changed_state(service_stack) -> None:  # type: ignore[no-untyped-def]
     stack = service_stack
     credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=stack["credential"])
@@ -320,6 +448,119 @@ async def test_locked_authority_revalidation_rejects_changed_state(service_stack
             )
     assert exc_info.value.status_code == 401
     assert exc_info.value.detail["code"] == "SERVICE_UNAUTHORIZED"
+
+
+@pytest.mark.parametrize(
+    "transition",
+    ("revoked", "disabled", "expired", "reassigned", "permissions_removed"),
+)
+async def test_preliminary_service_auth_is_revalidated_under_locks(
+    service_stack, transition: str
+) -> None:  # type: ignore[no-untyped-def]
+    """Real preliminary authentication never authorizes a changed credential."""
+    stack = service_stack
+    owner = stack["owner"]
+    credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=stack["credential"])
+    identity = await get_current_service_client(credentials)
+    second_client: uuid.UUID | None = None
+    try:
+        if transition == "revoked":
+            await owner.execute(
+                "UPDATE service_client_credentials SET status='revoked', revoked_at=now() WHERE id=$1",
+                stack["credential_id"],
+            )
+        elif transition == "disabled":
+            await owner.execute(
+                "UPDATE service_clients SET status='disabled', disabled_at=now() WHERE id=$1",
+                stack["client_id"],
+            )
+        elif transition == "expired":
+            await owner.execute(
+                "UPDATE service_client_credentials SET expires_at=$2 WHERE id=$1",
+                stack["credential_id"],
+                datetime.now(UTC) - timedelta(seconds=1),
+            )
+        elif transition == "reassigned":
+            second_client = uuid.uuid4()
+            await owner.execute(
+                "INSERT INTO service_clients (id,slug,display_name,permissions) VALUES ($1,$2,$3,$4)",
+                second_client,
+                f"reassigned-{stack['tag']}",
+                "Reassigned proof",
+                ["tenant.provision", "principal.provision"],
+            )
+            await owner.execute(
+                "UPDATE service_client_credentials SET service_client_id=$2 WHERE id=$1",
+                stack["credential_id"],
+                second_client,
+            )
+        else:
+            await owner.execute(
+                "UPDATE service_clients SET permissions=ARRAY['tenant.provision'] WHERE id=$1",
+                stack["client_id"],
+            )
+        async with require_provisioner_session_factory()() as session, session.begin():
+            with pytest.raises(HTTPException) as exc_info:
+                await lock_and_validate_service_authority(
+                    session, identity, ("tenant.provision", "principal.provision")
+                )
+        assert exc_info.value.status_code == 401
+        assert exc_info.value.detail["code"] == "SERVICE_UNAUTHORIZED"
+        for table in (
+            "tenant_provisioning_bindings",
+            "principal_provisioning_bindings",
+            "service_provisioning_idempotency",
+            "service_provisioning_events",
+        ):
+            assert await owner.fetchval(
+                f"SELECT count(*) FROM {table} WHERE service_client_id=$1", stack["client_id"]
+            ) == 0
+    finally:
+        if transition == "reassigned":
+            await owner.execute(
+                "UPDATE service_client_credentials SET service_client_id=$2 WHERE id=$1",
+                stack["credential_id"],
+                stack["client_id"],
+            )
+            assert second_client is not None
+            await owner.execute("DELETE FROM service_clients WHERE id=$1", second_client)
+        elif transition == "revoked":
+            await owner.execute(
+                "UPDATE service_client_credentials SET status='active', revoked_at=NULL WHERE id=$1",
+                stack["credential_id"],
+            )
+        elif transition == "disabled":
+            await owner.execute(
+                "UPDATE service_clients SET status='active', disabled_at=NULL WHERE id=$1", stack["client_id"]
+            )
+        elif transition == "expired":
+            await owner.execute(
+                "UPDATE service_client_credentials SET expires_at=NULL WHERE id=$1", stack["credential_id"]
+            )
+        else:
+            await owner.execute(
+                "UPDATE service_clients SET permissions=$2 WHERE id=$1",
+                stack["client_id"],
+                ["tenant.provision", "principal.provision"],
+            )
+
+
+@pytest.mark.parametrize("permissions", (["principal.provision"], ["tenant.provision"]))
+async def test_missing_preliminary_service_permission_is_forbidden(
+    service_stack, permissions: list[str]
+) -> None:  # type: ignore[no-untyped-def]
+    stack = service_stack
+    await stack["owner"].execute(
+        "UPDATE service_clients SET permissions=$2 WHERE id=$1", stack["client_id"], permissions
+    )
+    response = await stack["client"].post(
+        "/v1/service/provisioning/tenant-human",
+        headers=_headers(stack, f"missing-permission-{uuid.uuid4()}"),
+        json=_body(stack["tag"]),
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "SERVICE_FORBIDDEN"
+    _assert_service_headers(response)
 
 
 async def test_database_rejects_ambiguous_service_client_display_names(service_stack) -> None:  # type: ignore[no-untyped-def]
@@ -369,6 +610,133 @@ async def test_concurrent_provisioning_creates_one_resource_set(service_stack, k
     ) == expected_idempotency
 
 
+@pytest.mark.parametrize("field", ("name", "slug", "principal_name"))
+async def test_concurrent_conflicting_requests_have_one_success_and_one_bounded_conflict(
+    service_stack, field: str
+) -> None:  # type: ignore[no-untyped-def]
+    stack = service_stack
+    first_body = _body(stack["tag"])
+    second_body = _body(stack["tag"])
+    if field == "principal_name":
+        second_body["human_principal"]["name"] = "Different human name"
+    else:
+        second_body["tenant"][field] = f"different-{stack['tag']}" if field == "slug" else "Different tenant name"
+    start = asyncio.Event()
+
+    async def invoke(body: dict[str, Any], suffix: str):
+        await start.wait()
+        return await stack["client"].post(
+            "/v1/service/provisioning/tenant-human",
+            headers=_headers(stack, f"conflicting-{field}-{suffix}-{stack['tag']}"),
+            json=body,
+        )
+
+    first, second = asyncio.create_task(invoke(first_body, "one")), asyncio.create_task(
+        invoke(second_body, "two")
+    )
+    start.set()
+    responses = await asyncio.gather(first, second)
+    assert sorted(response.status_code for response in responses) == [201, 409]
+    loser = next(response for response in responses if response.status_code == 409)
+    assert loser.json()["detail"]["code"] == "PROVISIONING_CONFLICT"
+    assert await stack["owner"].fetchval(
+        "SELECT count(*) FROM service_provisioning_events "
+        "WHERE service_client_id=$1 AND event_type='provisioning.conflict'",
+        stack["client_id"],
+    ) == 1
+
+
+async def test_independent_service_clients_isolate_same_external_references(
+    service_stack,
+) -> None:  # type: ignore[no-untyped-def]
+    """The service-client ID is part of every reconciliation identity and lock."""
+    stack = service_stack
+    owner = stack["owner"]
+    second_client_id, second_credential_id = uuid.uuid4(), uuid.uuid4()
+    second_credential = generate_service_credential()
+    second_parsed = parse_service_credential(second_credential)
+    second_http = AsyncClient(transport=ASGITransport(app=create_app()), base_url="http://test")
+    second_tenant_ids: list[uuid.UUID] = []
+    await owner.execute(
+        "INSERT INTO service_clients (id,slug,display_name,permissions) VALUES ($1,$2,$3,$4)",
+        second_client_id,
+        f"independent-{stack['tag']}",
+        "Independent service proof",
+        ["tenant.provision", "principal.provision"],
+    )
+    await owner.execute(
+        "INSERT INTO service_client_credentials "
+        "(id,service_client_id,key_id,secret_digest,digest_algorithm) VALUES ($1,$2,$3,$4,'sha256')",
+        second_credential_id,
+        second_client_id,
+        second_parsed.key_id,
+        digest_service_secret(second_parsed.secret),
+    )
+    try:
+        first_body = _body(stack["tag"])
+        second_body = _body(stack["tag"], name="Independent tenant", slug=f"independent-{stack['tag']}")
+        second_body["human_principal"]["name"] = "Independent human"
+        start = asyncio.Event()
+
+        async def first_request():  # type: ignore[no-untyped-def]
+            await start.wait()
+            return await stack["client"].post(
+                "/v1/service/provisioning/tenant-human",
+                headers=_headers(stack, f"independent-one-{stack['tag']}"),
+                json=first_body,
+            )
+
+        async def second_request():  # type: ignore[no-untyped-def]
+            await start.wait()
+            return await second_http.post(
+                "/v1/service/provisioning/tenant-human",
+                headers={
+                    "Authorization": f"Bearer {second_credential}",
+                    "Idempotency-Key": f"independent-two-{stack['tag']}",
+                },
+                json=second_body,
+            )
+
+        first, second = asyncio.create_task(first_request()), asyncio.create_task(second_request())
+        start.set()
+        first_response, second_response = await asyncio.gather(first, second)
+        assert {first_response.status_code, second_response.status_code} == {201}
+        assert first_response.json()["tenant"]["id"] != second_response.json()["tenant"]["id"]
+        assert first_response.json()["principal"]["id"] != second_response.json()["principal"]["id"]
+        second_tenant_ids = [uuid.UUID(second_response.json()["tenant"]["id"])]
+        for client_id in (stack["client_id"], second_client_id):
+            assert await owner.fetchval(
+                "SELECT count(*) FROM tenant_provisioning_bindings WHERE service_client_id=$1", client_id
+            ) == 1
+            assert await owner.fetchval(
+                "SELECT count(*) FROM principal_provisioning_bindings WHERE service_client_id=$1", client_id
+            ) == 1
+            assert await owner.fetchval(
+                "SELECT count(*) FROM service_provisioning_idempotency WHERE service_client_id=$1", client_id
+            ) == 1
+    finally:
+        await second_http.aclose()
+        async with owner.transaction():
+            await owner.execute(
+                "DELETE FROM service_provisioning_events WHERE service_client_id=$1", second_client_id
+            )
+            await owner.execute(
+                "DELETE FROM service_provisioning_idempotency WHERE service_client_id=$1", second_client_id
+            )
+            await owner.execute(
+                "DELETE FROM principal_provisioning_bindings WHERE service_client_id=$1", second_client_id
+            )
+            await owner.execute(
+                "DELETE FROM tenant_provisioning_bindings WHERE service_client_id=$1", second_client_id
+            )
+            await owner.execute(
+                "DELETE FROM service_client_credentials WHERE id=$1", second_credential_id
+            )
+            await owner.execute("DELETE FROM service_clients WHERE id=$1", second_client_id)
+            for tenant_id in second_tenant_ids:
+                await owner.execute("DELETE FROM tenants WHERE id=$1", tenant_id)
+
+
 async def test_unexpected_initialization_failure_rolls_back_every_resource(
     service_stack, monkeypatch: pytest.MonkeyPatch
 ) -> None:  # type: ignore[no-untyped-def]
@@ -396,3 +764,73 @@ async def test_unexpected_initialization_failure_rolls_back_every_resource(
         assert await stack["owner"].fetchval(
             f"SELECT count(*) FROM {table} WHERE service_client_id=$1", stack["client_id"]
         ) == 0
+
+
+@pytest.mark.parametrize(
+    "stage",
+    (
+        "tenant_inserted",
+        "tenant_binding_inserted",
+        "memory_kinds_initialized",
+        "tenant_config_initialized",
+        "principal_inserted",
+        "principal_binding_inserted",
+        "idempotency_inserted",
+        "tenant_success_event_inserted",
+        "principal_success_event_inserted",
+        "credential_last_used_updated",
+    ),
+)
+async def test_every_provisioning_mutation_stage_rolls_back_completely(
+    service_stack, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:  # type: ignore[no-untyped-def]
+    """Unexpected failures never leave a partially-provisioned resource set."""
+    import engram.provisioning as provisioning
+
+    stack = service_stack
+    before_last_used = await stack["owner"].fetchval(
+        "SELECT last_used_at FROM service_client_credentials WHERE id=$1", stack["credential_id"]
+    )
+
+    async def fail_at(actual_stage: str) -> None:
+        if actual_stage == stage:
+            raise RuntimeError("injected provisioning stage failure")
+
+    monkeypatch.setattr(provisioning, "provisioning_stage", fail_at)
+    body = _body(stack["tag"])
+    response = await stack["client"].post(
+        "/v1/service/provisioning/tenant-human",
+        headers=_headers(stack, f"rollback-{stage}-{stack['tag']}"),
+        json=body,
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "SERVICE_UNAVAILABLE"
+    assert "injected" not in response.text
+    _assert_service_headers(response)
+
+    owner = stack["owner"]
+    for table in (
+        "tenant_provisioning_bindings",
+        "principal_provisioning_bindings",
+        "service_provisioning_idempotency",
+        "service_provisioning_events",
+    ):
+        assert await owner.fetchval(
+            f"SELECT count(*) FROM {table} WHERE service_client_id=$1", stack["client_id"]
+        ) == 0
+    assert await owner.fetchval("SELECT count(*) FROM tenants WHERE slug=$1", body["tenant"]["slug"]) == 0
+    assert await owner.fetchval(
+        "SELECT count(*) FROM principals p JOIN tenants t ON t.id=p.tenant_id WHERE t.slug=$1",
+        body["tenant"]["slug"],
+    ) == 0
+    assert await owner.fetchval(
+        "SELECT count(*) FROM tenant_config c JOIN tenants t ON t.id=c.tenant_id WHERE t.slug=$1",
+        body["tenant"]["slug"],
+    ) == 0
+    assert await owner.fetchval(
+        "SELECT count(*) FROM memory_kinds k JOIN tenants t ON t.id=k.tenant_id WHERE t.slug=$1",
+        body["tenant"]["slug"],
+    ) == 0
+    assert await owner.fetchval(
+        "SELECT last_used_at FROM service_client_credentials WHERE id=$1", stack["credential_id"]
+    ) == before_last_used

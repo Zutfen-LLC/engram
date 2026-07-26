@@ -10,6 +10,15 @@ from pytest import Session
 
 _DB_SKIP_REASON = "requires a live PostgreSQL with the v2 schema"
 _db_skipped_tests: list[str] = []
+_service_provisioning_certification_nodeids: set[str] = set()
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Remember required provisioning proofs without coupling to skip prose."""
+    _service_provisioning_certification_nodeids.clear()
+    _service_provisioning_certification_nodeids.update(
+        item.nodeid for item in items if item.get_closest_marker("service_provisioning_postgres")
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -101,7 +110,10 @@ def pytest_runtest_logreport(report: TestReport) -> None:
         return
     if report.when != "call" or not report.skipped:
         return
-    if _DB_SKIP_REASON in str(report.longrepr):
+    if (
+        _DB_SKIP_REASON in str(report.longrepr)
+        or report.nodeid in _service_provisioning_certification_nodeids
+    ):
         _db_skipped_tests.append(report.nodeid)
 
 
