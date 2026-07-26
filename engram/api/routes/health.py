@@ -17,6 +17,7 @@ from engram.auth import (
     Principal,
     get_current_principal,
 )
+from engram.config import settings
 from engram.db import get_session
 from engram.models import Principal as PrincipalModel
 
@@ -100,6 +101,40 @@ async def readiness(
                     ),
                 },
             )
+
+        if settings.service_provisioning_enabled:
+            from engram.db import require_provisioner_session_factory
+
+            try:
+                async with require_provisioner_session_factory()() as provisioner:
+                    role = (
+                        await provisioner.execute(
+                            text(
+                                "SELECT rolsuper, rolbypassrls FROM pg_roles "
+                                "WHERE rolname = current_user"
+                            )
+                        )
+                    ).mappings().first()
+                    tables = await provisioner.execute(
+                        text(
+                            "SELECT count(*) FROM information_schema.tables "
+                            "WHERE table_schema = 'public' "
+                            "AND table_name IN ('service_clients', 'service_client_credentials', "
+                            "'tenant_provisioning_bindings', 'principal_provisioning_bindings', "
+                            "'service_provisioning_idempotency', 'service_provisioning_events')"
+                        )
+                    )
+                    invalid_role = role is None or role["rolsuper"] or role["rolbypassrls"]
+                    if invalid_role or tables.scalar() != 6:
+                        return JSONResponse(
+                            status_code=503,
+                            content={"status": "not_ready", "provisioning": "misconfigured"},
+                        )
+            except Exception:
+                return JSONResponse(
+                    status_code=503,
+                    content={"status": "not_ready", "provisioning": "unavailable"},
+                )
 
         return {
             "status": "ready",

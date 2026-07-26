@@ -47,6 +47,15 @@ cannot cause a cross-tenant leak when the service connects through the app role.
 Migrations and admin commands run as the owner (which bypasses RLS) via
 `ENGRAM_OWNER_DATABASE_URL`.
 
+## Optional service provisioning
+
+Service-to-service provisioning is off by default. To enable it, migrate first,
+set `ENGRAM_SERVICE_PROVISIONING_ENABLED=true`, and configure
+`ENGRAM_PROVISIONER_DATABASE_URL` for the dedicated `engram_provisioner` role.
+There is no fallback to either the app or owner URL. Readiness fails closed when
+the role is unavailable, superuser/BYPASSRLS, or the service-provisioning tables
+are absent. The worker does not need this URL.
+
 Optionally, `ENGRAM_READ_DATABASE_URL` (ENG-AUD-011) points startup recall's
 bounded candidate selection at a read replica instead of the primary. Unset
 (the default) falls back to `ENGRAM_DATABASE_URL` — there is no bundled

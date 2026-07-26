@@ -37,6 +37,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
     yield
     # Shutdown: clean up resources
+    from engram.db import provisioner_engine
+
+    if provisioner_engine is not None:
+        await provisioner_engine.dispose()
 
 
 def create_app() -> FastAPI:
@@ -62,6 +66,7 @@ def create_app() -> FastAPI:
         memory,
         memory_profiles,
         review,
+        service_provisioning,
         taxonomy,
         telemetry,
     )
@@ -79,6 +84,7 @@ def create_app() -> FastAPI:
     app.include_router(export.router, prefix="/v1", tags=["export"])
     app.include_router(admin.router, prefix="/v1", tags=["admin"])
     app.include_router(telemetry.router, prefix="/v1", tags=["telemetry"])
+    app.include_router(service_provisioning.router, prefix="/v1", tags=["service-provisioning"])
 
     # V2-BL-004: every caller-facing route must declare an explicit scope
     # policy (or be marked exempt). Validated eagerly here so a route added

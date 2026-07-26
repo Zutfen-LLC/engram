@@ -30,6 +30,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.routing import APIRoute, iter_route_contexts
 
 from engram.auth import ScopePolicy
+from engram.service_auth import ServicePolicy
 
 RouteKey = tuple[str, str]  # (method, path)
 
@@ -42,19 +43,19 @@ def _iter_api_route_contexts(app: FastAPI) -> Iterator[Any]:
             yield ctx
 
 
-def validate_scope_policy_completeness(app: FastAPI) -> dict[RouteKey, ScopePolicy]:
+def validate_scope_policy_completeness(app: FastAPI) -> dict[RouteKey, ScopePolicy | ServicePolicy]:
     """Return the runtime ``{(method, path): ScopePolicy}`` map, or raise.
 
     Raises ``RuntimeError`` if any application route has zero scope-policy
     dependencies (undeclared — the scope invariant is violated) or more than
     one (conflicting guards on the same route).
     """
-    result: dict[RouteKey, ScopePolicy] = {}
+    result: dict[RouteKey, ScopePolicy | ServicePolicy] = {}
     for ctx in _iter_api_route_contexts(app):
         policies = [
             dep.call.policy
             for dep in ctx.dependant.dependencies
-            if isinstance(getattr(dep.call, "policy", None), ScopePolicy)
+            if isinstance(getattr(dep.call, "policy", None), (ScopePolicy, ServicePolicy))
         ]
         methods = sorted((ctx.methods or set()) - _IGNORED_METHODS)
         for method in methods:
@@ -72,8 +73,13 @@ def validate_scope_policy_completeness(app: FastAPI) -> dict[RouteKey, ScopePoli
     return result
 
 
-def policy_to_openapi_extension(policy: ScopePolicy) -> dict[str, Any]:
+def policy_to_openapi_extension(policy: ScopePolicy | ServicePolicy) -> dict[str, Any]:
     """Render a :class:`ScopePolicy` as the ``x-engram-scope-policy`` value."""
+    if isinstance(policy, ServicePolicy):
+        return {
+            "auth_class": policy.auth_class,
+            "permissions": list(policy.permissions),
+        }
     if policy.exempt:
         return {"exempt": True, "reason": policy.description or "exempt"}
     ext: dict[str, Any] = {}
@@ -114,6 +120,10 @@ def build_custom_openapi(app: FastAPI) -> dict[str, Any]:
         if operation is None:
             continue
         operation["x-engram-scope-policy"] = policy_to_openapi_extension(policy)
+
+    schema.setdefault("components", {}).setdefault("securitySchemes", {})[
+        "EngramServiceCredential"
+    ] = {"type": "http", "scheme": "bearer", "bearerFormat": "engsvc"}
 
     app.openapi_schema = schema
     return schema

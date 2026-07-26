@@ -39,12 +39,12 @@ from engram.memory_kinds import (
     BUILTIN_KIND_NAMES,
     NAME_PATTERN,
     invalidate_memory_kind_cache,
-    seed_builtin_kinds,
 )
 from engram.memory_profiles import ProfileNotFoundError, validate_key_binding
-from engram.models import ApiKey, MemoryKind, Tenant, TenantConfig, Workspace
+from engram.models import ApiKey, MemoryKind, Tenant, Workspace
 from engram.models import Principal as PrincipalModel
 from engram.promotion import auto_promote_proposed_memories, summarize
+from engram.tenant_initialization import initialize_tenant
 
 router = APIRouter()
 
@@ -261,21 +261,7 @@ async def create_tenant(
     tenant = Tenant(name=body.name, slug=body.slug, created_at=datetime.now(UTC))
     session.add(tenant)
     await session.flush()
-    # Seed the builtin kind registry (ENG-AUD-010 / F17) so the new tenant can
-    # write memory items immediately — memory_items.kind is now FK-governed by
-    # memory_kinds, so a tenant with zero registry rows could write nothing.
-    await seed_builtin_kinds(session, tenant.id)
-    # Unlike legacy rows upgraded by migration 016, a newly created tenant is
-    # intentionally enrolled in the evidence lane by its real config row.
-    config = await session.scalar(
-        select(TenantConfig).where(
-            TenantConfig.tenant_id == tenant.id, TenantConfig.active.is_(True)
-        )
-    )
-    if config is None:
-        session.add(
-            TenantConfig(tenant_id=tenant.id, active=True, auto_promote_evidence_enabled=True)
-        )
+    await initialize_tenant(session, tenant)
     await session.commit()
     await session.refresh(tenant)
     return TenantOut(id=tenant.id, name=tenant.name, slug=tenant.slug)

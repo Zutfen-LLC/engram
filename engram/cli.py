@@ -75,6 +75,27 @@ def main() -> None:
         default="bootstrap",
         help="Label for the bootstrap key (default: 'bootstrap').",
     )
+
+    service_client_parser = sub.add_parser(
+        "service-client", help="Manage service provisioning clients and credentials (owner DB only)."
+    )
+    service_client_sub = service_client_parser.add_subparsers(dest="service_client_command", required=True)
+    service_client_create = service_client_sub.add_parser("create", help="Create a client and one credential.")
+    service_client_create.add_argument("--slug", required=True)
+    service_client_create.add_argument("--display-name", required=True)
+    service_client_create.add_argument("--permission", action="append", default=None)
+    service_client_create.add_argument("--json", action="store_true")
+    service_client_rotate = service_client_sub.add_parser("rotate-key", help="Create an overlapping credential.")
+    service_client_rotate.add_argument("client")
+    service_client_rotate.add_argument("--label", default=None)
+    service_client_rotate.add_argument("--expires-at", default=None)
+    service_client_rotate.add_argument("--json", action="store_true")
+    service_client_revoke = service_client_sub.add_parser("revoke-key", help="Revoke a credential by UUID or key id.")
+    service_client_revoke.add_argument("credential")
+    service_client_disable = service_client_sub.add_parser("disable", help="Disable a client immediately.")
+    service_client_disable.add_argument("client")
+    service_client_enable = service_client_sub.add_parser("enable", help="Enable a client without restoring revoked keys.")
+    service_client_enable.add_argument("client")
     bootstrap_parser.add_argument(
         "--scopes",
         default="read,write,admin,export",
@@ -400,6 +421,11 @@ def main() -> None:
                 )
             )
         )
+    elif args.command == "service-client":
+        from engram.config import settings
+
+        database_url = settings.owner_database_url or settings.database_url
+        raise SystemExit(asyncio.run(_run_service_client(args, database_url)))
     elif args.command == "promote-proposed":
         raise SystemExit(asyncio.run(_run_promotion(args.tenant, args.limit, dry_run=args.dry_run)))
     elif args.command == "backfill-embeddings":
@@ -882,6 +908,114 @@ async def _run_bootstrap_key(
         file=sys.stderr,
     )
     return 0
+
+
+async def _run_service_client(args: argparse.Namespace, database_url: str) -> int:
+    """Owner-only service-client management; stdout is the only secret sink."""
+    import json
+
+    import asyncpg
+
+    from engram.migrations import normalize_asyncpg_url
+    from engram.service_auth import (
+        canonicalize_service_permissions,
+        digest_service_secret,
+        generate_service_credential,
+        parse_service_credential,
+    )
+
+    async def event(conn: asyncpg.Connection, client_id: str, event_type: str) -> None:
+        await conn.execute(
+            "INSERT INTO service_provisioning_events "
+            "(service_client_id, event_type, outcome, request_id, details) "
+            "VALUES ($1::uuid, $2, 'success', 'operator-cli', '{}'::jsonb)",
+            client_id,
+            event_type,
+        )
+
+    conn = await asyncpg.connect(normalize_asyncpg_url(database_url))
+    try:
+        command = args.service_client_command
+        async with conn.transaction():
+            if command == "create":
+                permissions = canonicalize_service_permissions(
+                    args.permission or ["tenant.provision", "principal.provision"]
+                )
+                credential = generate_service_credential()
+                parsed = parse_service_credential(credential)
+                row = await conn.fetchrow(
+                    "INSERT INTO service_clients (slug, display_name, permissions) VALUES ($1, $2, $3) "
+                    "RETURNING id::text AS id, slug, display_name",
+                    args.slug,
+                    args.display_name,
+                    permissions,
+                )
+                await conn.execute(
+                    "INSERT INTO service_client_credentials "
+                    "(service_client_id, key_id, secret_digest, digest_algorithm) "
+                    "VALUES ($1::uuid, $2, $3, 'sha256')",
+                    row["id"],
+                    parsed.key_id,
+                    digest_service_secret(parsed.secret),
+                )
+                await event(conn, row["id"], "service_client.created")
+                await event(conn, row["id"], "service_credential.created")
+                payload = {
+                    "id": row["id"], "slug": row["slug"], "display_name": row["display_name"],
+                    "permissions": permissions, "credential": credential,
+                }
+                if args.json:
+                    print(json.dumps(payload, sort_keys=True))
+                else:
+                    print(f"service_client_id: {row['id']}\ncredential: {credential}")
+                return 0
+            if command == "rotate-key":
+                row = await conn.fetchrow(
+                    "SELECT id::text AS id FROM service_clients WHERE id::text = $1 OR slug = $1 FOR UPDATE",
+                    args.client,
+                )
+                if row is None:
+                    print("ERROR: service client not found", file=sys.stderr)
+                    return 1
+                credential = generate_service_credential()
+                parsed = parse_service_credential(credential)
+                credential_id = await conn.fetchval(
+                    "INSERT INTO service_client_credentials "
+                    "(service_client_id, key_id, secret_digest, digest_algorithm, label, expires_at) "
+                    "VALUES ($1::uuid, $2, $3, 'sha256', $4, $5::timestamptz) RETURNING id::text",
+                    row["id"], parsed.key_id, digest_service_secret(parsed.secret), args.label, args.expires_at,
+                )
+                await event(conn, row["id"], "service_credential.created")
+                payload = {"credential_id": credential_id, "credential": credential}
+                print(json.dumps(payload, sort_keys=True) if args.json else f"credential: {credential}")
+                return 0
+            if command == "revoke-key":
+                row = await conn.fetchrow(
+                    "UPDATE service_client_credentials SET status = 'revoked', revoked_at = COALESCE(revoked_at, now()) "
+                    "WHERE (id::text = $1 OR key_id = $1) AND status = 'active' "
+                    "RETURNING service_client_id::text AS service_client_id",
+                    args.credential,
+                )
+                if row is not None:
+                    await event(conn, row["service_client_id"], "service_credential.revoked")
+                print("revoked" if row is not None else "already revoked or not found")
+                return 0
+            row = await conn.fetchrow(
+                "UPDATE service_clients SET status = $2, disabled_at = "
+                "CASE WHEN $2 = 'disabled' THEN COALESCE(disabled_at, now()) ELSE NULL END, updated_at = now() "
+                "WHERE (id::text = $1 OR slug = $1) AND status <> $2 RETURNING id::text AS id",
+                args.client,
+                "disabled" if command == "disable" else "active",
+            )
+            if row is not None:
+                await event(conn, row["id"], f"service_client.{command}d")
+            print(command + "d" if row is not None else f"already {command}d or not found")
+            return 0
+    except (ValueError, asyncpg.PostgresError):
+        print("ERROR: service client operation failed", file=sys.stderr)
+        return 1
+    finally:
+        await conn.close()
 
 
 async def _run_promotion(
