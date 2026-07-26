@@ -25,7 +25,7 @@ def test_trust_proof_files_are_unique_existing_root_suite_tests() -> None:
         assert resolved_path.is_file()
 
 
-def test_hosted_workflow_runs_one_complete_real_db_gate() -> None:
+def test_hosted_workflow_runs_supplemental_merge_ref_real_db_gate() -> None:
     workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text()
 
     assert "scripts/run_trust_proof.py" not in workflow
@@ -41,7 +41,7 @@ def test_hosted_workflow_runs_one_complete_real_db_gate() -> None:
     assert "docker compose -f docker-compose.ci.yml up --build" not in normalized_workflow
     assert "if: always()" in workflow
     assert "down -v --remove-orphans" in normalized_workflow
-    assert re.search(r"^  compose-real-db-ci:\s*$", workflow, re.MULTILINE)
+    assert re.search(r"^  compose-real-db-merge-ref:\s*$", workflow, re.MULTILINE)
     assert re.search(r"^  compose-validate:\s*$", workflow, re.MULTILINE)
 
 
@@ -79,7 +79,7 @@ def test_hosted_workflow_uses_read_only_github_hosted_runners() -> None:
     workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text()
 
     assert "runs-on: self-hosted" not in workflow
-    # Four read-only hosted jobs: compose-real-db-ci, compose-validate, the
+    # Four read-only hosted jobs: compose-real-db-merge-ref, compose-validate, the
     # parallel conformance-vectors cross-language job (ENG-CONTEXT-001), and
     # the parallel lock-drift gate (uv.lock ↔ pyproject.toml consistency).
     assert workflow.count("runs-on: ubuntu-24.04") == 4
@@ -107,6 +107,19 @@ def test_hosted_workflow_builds_once_with_event_isolated_cache() -> None:
     assert "ENGRAM_CI_IMAGE: engram-ci:${{ github.sha }}" in workflow
     assert "docker/login-action" not in workflow
     assert "pull_request_target" not in workflow
+
+
+def test_exact_head_workflow_checks_out_and_tests_the_pr_head() -> None:
+    workflow = (REPOSITORY_ROOT / ".github/workflows/exact-head-ci.yml").read_text()
+
+    assert re.search(r"^  compose-real-db-exact-head:\s*$", workflow, re.MULTILINE)
+    assert "ref: ${{ github.event.pull_request.head.sha }}" in workflow
+    assert "ENGRAM_CI_IMAGE: engram-ci:${{ github.event.pull_request.head.sha }}" in workflow
+    assert 'ACTUAL_HEAD="$(git rev-parse HEAD)"' in workflow
+    assert 'test "$ACTUAL_HEAD" = "$EXPECTED_HEAD"' in workflow
+    assert workflow.count("Run Compose Real-DB CI Stack") == 1
+    assert "--exit-code-from engram-test" in workflow
+    assert "if: always()" in workflow
 
 
 def test_compose_supports_prebuilt_hosted_and_local_build_modes() -> None:

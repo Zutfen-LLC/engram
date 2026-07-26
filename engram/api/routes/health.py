@@ -110,8 +110,13 @@ async def readiness(
                     role = (
                         await provisioner.execute(
                             text(
-                                "SELECT rolsuper, rolbypassrls FROM pg_roles "
-                                "WHERE rolname = current_user"
+                                "SELECT r.rolname, r.rolcanlogin, r.rolsuper, r.rolbypassrls, "
+                                "r.rolcreatedb, r.rolcreaterole, r.rolreplication, r.rolinherit, "
+                                "EXISTS (SELECT 1 FROM pg_auth_members m "
+                                "WHERE m.member = r.oid) AS prohibited_membership, "
+                                "has_schema_privilege(current_user, 'public', 'CREATE') "
+                                "AS schema_create "
+                                "FROM pg_roles r WHERE r.rolname = current_user"
                             )
                         )
                     ).mappings().first()
@@ -124,8 +129,24 @@ async def readiness(
                             "'service_provisioning_idempotency', 'service_provisioning_events')"
                         )
                     )
-                    invalid_role = role is None or role["rolsuper"] or role["rolbypassrls"]
-                    if invalid_role or tables.scalar() != 6:
+                    expected_role = settings.provisioner_database_role
+                    invalid_role = (
+                        role is None
+                        or role["rolname"] != expected_role
+                        or not role["rolcanlogin"]
+                        or role["rolsuper"]
+                        or role["rolbypassrls"]
+                        or role["rolcreatedb"]
+                        or role["rolcreaterole"]
+                        or role["rolreplication"]
+                        or role["rolinherit"]
+                        or role["prohibited_membership"]
+                        or role["schema_create"]
+                    )
+                    function = await provisioner.execute(
+                        text("SELECT to_regprocedure('current_service_client_id()') IS NOT NULL")
+                    )
+                    if invalid_role or tables.scalar() != 6 or not function.scalar():
                         return JSONResponse(
                             status_code=503,
                             content={"status": "not_ready", "provisioning": "misconfigured"},

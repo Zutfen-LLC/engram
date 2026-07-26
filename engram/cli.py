@@ -424,8 +424,13 @@ def main() -> None:
     elif args.command == "service-client":
         from engram.config import settings
 
-        database_url = settings.owner_database_url or settings.database_url
-        raise SystemExit(asyncio.run(_run_service_client(args, database_url)))
+        if not settings.owner_database_url:
+            print(
+                "ERROR: ENGRAM_OWNER_DATABASE_URL is required for service-client management.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        raise SystemExit(asyncio.run(_run_service_client(args, settings.owner_database_url)))
     elif args.command == "promote-proposed":
         raise SystemExit(asyncio.run(_run_promotion(args.tenant, args.limit, dry_run=args.dry_run)))
     elif args.command == "backfill-embeddings":
@@ -933,8 +938,9 @@ async def _run_service_client(args: argparse.Namespace, database_url: str) -> in
             event_type,
         )
 
-    conn = await asyncpg.connect(normalize_asyncpg_url(database_url))
+    conn: asyncpg.Connection | None = None
     try:
+        conn = await asyncpg.connect(normalize_asyncpg_url(database_url))
         command = args.service_client_command
         async with conn.transaction():
             if command == "create":
@@ -998,24 +1004,49 @@ async def _run_service_client(args: argparse.Namespace, database_url: str) -> in
                 )
                 if row is not None:
                     await event(conn, row["service_client_id"], "service_credential.revoked")
-                print("revoked" if row is not None else "already revoked or not found")
-                return 0
+                    print("revoked")
+                    return 0
+                known = await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM service_client_credentials "
+                    "WHERE id::text = $1 OR key_id = $1)",
+                    args.credential,
+                )
+                if known:
+                    print("already revoked")
+                    return 0
+                print("ERROR: service credential not found", file=sys.stderr)
+                return 1
+            target_status = {"disable": "disabled", "enable": "active"}[command]
             row = await conn.fetchrow(
                 "UPDATE service_clients SET status = $2, disabled_at = "
                 "CASE WHEN $2 = 'disabled' THEN COALESCE(disabled_at, now()) ELSE NULL END, updated_at = now() "
                 "WHERE (id::text = $1 OR slug = $1) AND status <> $2 RETURNING id::text AS id",
                 args.client,
-                "disabled" if command == "disable" else "active",
+                target_status,
             )
             if row is not None:
-                await event(conn, row["id"], f"service_client.{command}d")
-            print(command + "d" if row is not None else f"already {command}d or not found")
-            return 0
+                event_type = {
+                    "disable": "service_client.disabled",
+                    "enable": "service_client.enabled",
+                }[command]
+                await event(conn, row["id"], event_type)
+                print("disabled" if command == "disable" else "enabled")
+                return 0
+            known = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM service_clients WHERE id::text = $1 OR slug = $1)",
+                args.client,
+            )
+            if known:
+                print(f"already {command}d")
+                return 0
+            print("ERROR: service client not found", file=sys.stderr)
+            return 1
     except (ValueError, asyncpg.PostgresError):
         print("ERROR: service client operation failed", file=sys.stderr)
         return 1
     finally:
-        await conn.close()
+        if conn is not None:
+            await conn.close()
 
 
 async def _run_promotion(

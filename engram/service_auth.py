@@ -19,6 +19,7 @@ from uuid import UUID
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.config import settings
 
@@ -121,6 +122,11 @@ def _unauthorized() -> HTTPException:
     )
 
 
+def service_unauthorized_exception() -> HTTPException:
+    """Generic service auth failure reused by preliminary and locked checks."""
+    return _unauthorized()
+
+
 async def get_current_service_client(
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),  # noqa: B008
 ) -> ServiceClientIdentity:
@@ -172,6 +178,55 @@ async def get_current_service_client(
     return ServiceClientIdentity(
         id=UUID(str(row["service_client_id"])),
         credential_id=UUID(str(row["credential_id"])),
+        permissions=permissions,
+    )
+
+
+async def lock_and_validate_service_authority(
+    session: AsyncSession,
+    identity: ServiceClientIdentity,
+    required_permissions: tuple[str, ...],
+) -> ServiceClientIdentity:
+    """Revalidate the credential/client under row locks in the write transaction.
+
+    The preliminary dependency intentionally remains a cheap generic reject.
+    This second check is authoritative: revocation, disablement, expiry,
+    reassignment, and permission changes that occur after preliminary auth
+    serialize against this locked read before provisioning can mutate state.
+    """
+    row = (
+        await session.execute(
+            text(
+                "SELECT c.id AS credential_id, c.service_client_id, c.status AS credential_status, "
+                "c.expires_at, s.id AS client_id, s.status AS client_status, s.permissions "
+                "FROM service_client_credentials c "
+                "JOIN service_clients s ON s.id = c.service_client_id "
+                # PostgreSQL requires UPDATE privilege for this lock. The
+                # migration grants only an inert timestamp column on clients
+                # and last_used_at on credentials; neither permits changing
+                # service authority, but both permit this serialization point.
+                "WHERE c.id = :credential_id FOR UPDATE OF c, s"
+            ),
+            {"credential_id": identity.credential_id},
+        )
+    ).mappings().first()
+    if (
+        row is None
+        or UUID(str(row["credential_id"])) != identity.credential_id
+        or UUID(str(row["service_client_id"])) != identity.id
+        or UUID(str(row["client_id"])) != identity.id
+        or row["credential_status"] != "active"
+        or row["client_status"] != "active"
+        or (row["expires_at"] is not None and row["expires_at"] <= datetime.now(UTC))
+    ):
+        raise service_unauthorized_exception()
+    raw_permissions = row["permissions"]
+    permissions = tuple(raw_permissions if isinstance(raw_permissions, list) else [])
+    if not all(permission in permissions for permission in required_permissions):
+        raise service_unauthorized_exception()
+    return ServiceClientIdentity(
+        id=identity.id,
+        credential_id=identity.credential_id,
         permissions=permissions,
     )
 

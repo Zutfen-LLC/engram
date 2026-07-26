@@ -11,6 +11,29 @@ BEGIN
 END
 $$;
 
+-- Converge pre-existing roles as well as freshly-created ones.  This is
+-- intentionally explicit: an old manual role must not retain broader flags
+-- merely because CREATE ROLE was skipped above.
+ALTER ROLE engram_provisioner LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB
+    NOCREATEROLE NOREPLICATION NOINHERIT;
+-- Membership permits SET ROLE even when NOINHERIT is set, so converge an
+-- existing role to no memberships at all.  This also removes indirect paths
+-- to owner or application authority.
+DO $$
+DECLARE granted_role NAME;
+BEGIN
+    FOR granted_role IN
+        SELECT parent.rolname
+        FROM pg_auth_members membership
+        JOIN pg_roles member_role ON member_role.oid = membership.member
+        JOIN pg_roles parent ON parent.oid = membership.roleid
+        WHERE member_role.rolname = 'engram_provisioner'
+    LOOP
+        EXECUTE format('REVOKE %I FROM engram_provisioner', granted_role);
+    END LOOP;
+END
+$$;
+
 GRANT USAGE ON SCHEMA public TO engram_provisioner;
 
 CREATE OR REPLACE FUNCTION current_service_client_id() RETURNS UUID AS $$
@@ -147,7 +170,6 @@ CREATE TABLE service_provisioning_events (
 -- tables contain no tenant data and the provisioner has no write authority on
 -- clients themselves.
 GRANT SELECT ON service_clients, service_client_credentials TO engram_provisioner;
-GRANT UPDATE(last_used_at) ON service_client_credentials TO engram_provisioner;
 GRANT SELECT, INSERT ON tenant_provisioning_bindings, principal_provisioning_bindings,
     service_provisioning_idempotency, service_provisioning_events TO engram_provisioner;
 GRANT SELECT, INSERT ON tenants, principals, tenant_config, memory_kinds TO engram_provisioner;
@@ -229,6 +251,10 @@ CREATE POLICY provisioner_seed_memory_kinds_insert ON memory_kinds FOR INSERT TO
 
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM engram_provisioner;
 GRANT SELECT ON service_clients, service_client_credentials TO engram_provisioner;
+-- These inert per-row UPDATE grants are required by PostgreSQL for
+-- SELECT ... FOR UPDATE. They do not permit a provisioner to alter client
+-- status, permissions, credentials, or any provisioning resource.
+GRANT UPDATE(updated_at) ON service_clients TO engram_provisioner;
 GRANT UPDATE(last_used_at) ON service_client_credentials TO engram_provisioner;
 GRANT SELECT, INSERT ON tenant_provisioning_bindings, principal_provisioning_bindings,
     service_provisioning_idempotency, service_provisioning_events TO engram_provisioner;

@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     # the application or owner role would collapse the provisioning boundary.
     service_provisioning_enabled: bool = False
     provisioner_database_url: str | None = None
+    provisioner_database_role: str = "engram_provisioner"
 
     # Read-oriented database URL (ENG-AUD-011 / F18). Optional: when unset,
     # read-heavy paths (currently: startup recall candidate selection) use

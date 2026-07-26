@@ -181,7 +181,13 @@ async def provision_tenant_human(
         )
         credential.last_used_at = datetime.now(UTC)
         await _event(
-            session, identity, credential, result, "provisioning.idempotent_replay", request_id
+            session,
+            identity,
+            credential,
+            result,
+            "provisioning.idempotent_replay",
+            request_id,
+            request,
         )
         return result
 
@@ -326,6 +332,36 @@ async def provision_tenant_human(
             request,
         )
     return result
+
+
+async def record_provisioning_conflict(
+    session: AsyncSession,
+    identity: ServiceClientIdentity,
+    credential: ServiceClientCredential,
+    request: ProvisionRequest,
+    request_id: str,
+    reason_code: str,
+) -> None:
+    """Append a bounded deterministic-conflict audit row after savepoint rollback.
+
+    The provisioning work is executed in a savepoint. On a deterministic 409,
+    that savepoint rolls back every resource mutation; this append-only row is
+    then committed by the surrounding authenticated transaction. It contains
+    only stable codes and SHA-256 external-reference digests.
+    """
+    session.add(
+        ServiceProvisioningEvent(
+            service_client_id=identity.id,
+            credential_id=credential.id,
+            event_type="provisioning.conflict",
+            outcome="failure",
+            request_id=request_id[:128],
+            reason_code=reason_code,
+            external_tenant_ref_digest=_digest(request.tenant.external_ref),
+            external_principal_ref_digest=_digest(request.human_principal.external_ref),
+            details={},
+        )
+    )
 
 
 async def _event(

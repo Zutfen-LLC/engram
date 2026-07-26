@@ -10,8 +10,10 @@
 # It runs ONCE (first boot). To change the app-role password later (existing
 # volume), set it directly:
 #     psql -U engram -d engram -c "ALTER ROLE engram_app WITH PASSWORD '...';"
-# (Editing POSTGRES_APP_PASSWORD after first boot has no effect, exactly like
-#  POSTGRES_PASSWORD itself.)
+# (Editing POSTGRES_APP_PASSWORD or POSTGRES_PROVISIONER_PASSWORD after first
+# boot has no effect, exactly like POSTGRES_PASSWORD itself. For an existing
+# volume, use the documented interactive `\\password engram_provisioner`
+# procedure in docs/deployment.md.)
 set -eo pipefail
 
 # These are exported by the official postgres image during initdb.
@@ -33,4 +35,4 @@ ALTER ROLE :"app_user" WITH LOGIN PASSWORD :'app_password' NOBYPASSRLS;
 ALTER ROLE :"provisioner_user" WITH LOGIN PASSWORD :'provisioner_password' NOBYPASSRLS;
 EOSQL
 
-echo "engram initdb: set password for application role ${APP_USER}"
+echo "engram initdb: set passwords for application and provisioner roles"

@@ -4,22 +4,29 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, field_validator
+from sqlalchemy import select
 
-from engram.db import require_provisioner_session_factory
+from engram.api.service_boundary import request_id_for
+from engram.db import apply_service_client_context, require_provisioner_session_factory
 from engram.models import ServiceClientCredential
 from engram.provisioning import (
     ProvisionPrincipalInput,
     ProvisionRequest,
     ProvisionTenantInput,
     provision_tenant_human,
+    record_provisioning_conflict,
     validate_external_ref,
     validate_idempotency_key,
     validate_name,
     validate_tenant_slug,
 )
-from engram.service_auth import PROVISION_TENANT_HUMAN, ServiceClientIdentity
+from engram.service_auth import (
+    PROVISION_TENANT_HUMAN,
+    ServiceClientIdentity,
+    lock_and_validate_service_authority,
+)
 
 router = APIRouter()
 
@@ -86,31 +93,34 @@ class ServiceProvisionResponse(BaseModel):
 )
 async def provision_tenant_human_route(
     body: ServiceProvisionRequest,
+    request_http: Request,
     response: Response,
     identity: ServiceClientIdentity = Depends(PROVISION_TENANT_HUMAN),  # noqa: B008
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-    request_id: str | None = Header(default=None, alias="X-Request-ID"),
 ) -> ServiceProvisionResponse:
+    effective_request_id = request_id_for(request_http)
     try:
         valid_idempotency_key = validate_idempotency_key(idempotency_key)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"code": "INVALID_REQUEST", "message": str(exc)},
-            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
         ) from exc
     request = ProvisionRequest(
         tenant=ProvisionTenantInput(**body.tenant.model_dump()),
         human_principal=ProvisionPrincipalInput(**body.human_principal.model_dump()),
     )
-    effective_request_id = (
-        request_id
-        if request_id and request_id.isascii() and len(request_id) <= 128
-        else str(uuid.uuid4())
-    )
+    conflict: HTTPException | None = None
     try:
         async with require_provisioner_session_factory()() as session, session.begin():
-            credential = await session.get(ServiceClientCredential, identity.credential_id)
+            locked_identity = await lock_and_validate_service_authority(
+                session, identity, ("tenant.provision", "principal.provision")
+            )
+            credential = await session.scalar(
+                select(ServiceClientCredential)
+                .where(ServiceClientCredential.id == locked_identity.credential_id)
+                .with_for_update()
+            )
             if credential is None:
                 # Credential state may have changed after authentication;
                 # do not perform provisioning with stale authority.
@@ -121,33 +131,45 @@ async def provision_tenant_human_route(
                         "message": "Service authentication failed",
                     },
                 )
-            result = await provision_tenant_human(
-                session,
-                identity,
-                credential,
-                request,
-                valid_idempotency_key,
-                effective_request_id,
-            )
-    except HTTPException as exc:
-        exc.headers = {
-            **(exc.headers or {}),
-            "Cache-Control": "no-store",
-            "Pragma": "no-cache",
-            "Referrer-Policy": "no-referrer",
-            "X-Request-ID": effective_request_id,
-        }
+            # Keep the RLS context outside the nested resource savepoint so a
+            # deterministic conflict can roll back resources yet still append
+            # its bounded conflict event in the outer transaction.
+            await apply_service_client_context(session, locked_identity.id)
+            try:
+                async with session.begin_nested():
+                    result = await provision_tenant_human(
+                        session,
+                        locked_identity,
+                        credential,
+                        request,
+                        valid_idempotency_key,
+                        effective_request_id,
+                    )
+            except HTTPException as exc:
+                if exc.status_code != status.HTTP_409_CONFLICT:
+                    raise
+                reason = (
+                    exc.detail.get("code", "PROVISIONING_CONFLICT")
+                    if isinstance(exc.detail, dict)
+                    else "PROVISIONING_CONFLICT"
+                )
+                await record_provisioning_conflict(
+                    session,
+                    locked_identity,
+                    credential,
+                    request,
+                    effective_request_id,
+                    str(reason),
+                )
+                conflict = exc
+        if conflict is not None:
+            raise conflict
+    except HTTPException:
         raise
     except Exception:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={"code": "SERVICE_UNAVAILABLE", "message": "Provisioning is unavailable"},
-            headers={
-                "Cache-Control": "no-store",
-                "Pragma": "no-cache",
-                "Referrer-Policy": "no-referrer",
-                "X-Request-ID": effective_request_id,
-            },
         ) from None
 
     response.status_code = (
@@ -156,15 +178,7 @@ async def provision_tenant_human_route(
         or (not result.tenant_created and not result.principal_created)
         else status.HTTP_201_CREATED
     )
-    response.headers.update(
-        {
-            "Cache-Control": "no-store",
-            "Pragma": "no-cache",
-            "Referrer-Policy": "no-referrer",
-            "Idempotency-Replayed": str(result.idempotency_replayed).lower(),
-            "X-Request-ID": effective_request_id,
-        }
-    )
+    response.headers["Idempotency-Replayed"] = str(result.idempotency_replayed).lower()
     return ServiceProvisionResponse(
         tenant=TenantOut(id=result.tenant.id, name=result.tenant.name, slug=result.tenant.slug),
         principal=PrincipalOut(

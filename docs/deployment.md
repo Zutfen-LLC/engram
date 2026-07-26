@@ -53,8 +53,25 @@ Service-to-service provisioning is off by default. To enable it, migrate first,
 set `ENGRAM_SERVICE_PROVISIONING_ENABLED=true`, and configure
 `ENGRAM_PROVISIONER_DATABASE_URL` for the dedicated `engram_provisioner` role.
 There is no fallback to either the app or owner URL. Readiness fails closed when
-the role is unavailable, superuser/BYPASSRLS, or the service-provisioning tables
-are absent. The worker does not need this URL.
+the configured connection is not that role, the role has any elevated attribute
+or membership, schema CREATE privilege, or the service-provisioning tables and
+required function are absent. The worker does not need this URL.
+
+On a persisted Compose volume, `docker-entrypoint-initdb.d` does not run again.
+After applying migration 027 as the owner, assign or rotate the provisioner
+password interactively (so it is not placed in a command argument or shell
+history):
+
+```bash
+docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+-- in psql, enter the new password only at the hidden prompt:
+\password engram_provisioner
+```
+
+Then update the secret source that supplies `POSTGRES_PROVISIONER_PASSWORD` and
+restart `engram-service`. This applies to existing volumes as well as new
+deployments; changing the environment value alone does not alter an existing
+database role.
 
 Optionally, `ENGRAM_READ_DATABASE_URL` (ENG-AUD-011) points startup recall's
 bounded candidate selection at a read replica instead of the primary. Unset
