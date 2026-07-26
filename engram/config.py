@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     # the table-owning superuser so migrations and admin commands work.
     owner_database_url: str | None = None
 
+    # Optional, dedicated least-privilege connection for service-to-service
+    # tenant provisioning.  It intentionally has no fallback: pointing this at
+    # the application or owner role would collapse the provisioning boundary.
+    service_provisioning_enabled: bool = False
+    provisioner_database_url: str | None = None
+
     # Read-oriented database URL (ENG-AUD-011 / F18). Optional: when unset,
     # read-heavy paths (currently: startup recall candidate selection) use
     # ``database_url`` like every other request. When set, it should point at
@@ -210,6 +216,14 @@ class Settings(BaseSettings):
         limit = min(limit, self.startup_recall_candidate_limit_max)
         limit = max(limit, self.recall_item_budget)
         self.startup_recall_candidate_limit = limit
+        return self
+
+    @model_validator(mode="after")
+    def _validate_service_provisioner(self) -> Settings:
+        if self.service_provisioning_enabled and not self.provisioner_database_url:
+            raise ValueError(
+                "provisioner_database_url is required when service_provisioning_enabled=true"
+            )
         return self
 
     @model_validator(mode="after")
