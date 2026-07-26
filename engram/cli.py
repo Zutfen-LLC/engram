@@ -927,6 +927,7 @@ async def _run_service_client(args: argparse.Namespace, database_url: str) -> in
         digest_service_secret,
         generate_service_credential,
         parse_service_credential,
+        validate_service_client_display_name,
     )
 
     async def event(conn: asyncpg.Connection, client_id: str, event_type: str) -> None:
@@ -938,15 +939,25 @@ async def _run_service_client(args: argparse.Namespace, database_url: str) -> in
             event_type,
         )
 
+    # Validate operator input before opening an owner connection. This makes
+    # malformed create commands fail closed without touching the database.
+    try:
+        if args.service_client_command == "create":
+            args.display_name = validate_service_client_display_name(args.display_name)
+            args.permission = canonicalize_service_permissions(
+                args.permission or ["tenant.provision", "principal.provision"]
+            )
+    except ValueError:
+        print("ERROR: invalid service client input", file=sys.stderr)
+        return 1
+
     conn: asyncpg.Connection | None = None
     try:
         conn = await asyncpg.connect(normalize_asyncpg_url(database_url))
         command = args.service_client_command
         async with conn.transaction():
             if command == "create":
-                permissions = canonicalize_service_permissions(
-                    args.permission or ["tenant.provision", "principal.provision"]
-                )
+                permissions = args.permission
                 credential = generate_service_credential()
                 parsed = parse_service_credential(credential)
                 row = await conn.fetchrow(

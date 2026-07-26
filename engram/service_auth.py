@@ -114,6 +114,19 @@ def canonicalize_service_permissions(permissions: list[str]) -> list[str]:
     return [permission for permission in CANONICAL_SERVICE_PERMISSION_ORDER if permission in values]
 
 
+def validate_service_client_display_name(value: str) -> str:
+    """Validate the immutable operator-facing service-client name.
+
+    Names are stored verbatim, so leading/trailing whitespace is rejected
+    rather than silently normalized into an ambiguous database identity.
+    """
+    if not value or value != value.strip() or len(value) > 255:
+        raise ValueError(
+            "service client display name must be 1 through 255 non-whitespace characters"
+        )
+    return value
+
+
 def _unauthorized() -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,

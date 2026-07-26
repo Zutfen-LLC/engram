@@ -70,6 +70,10 @@ CREATE TABLE service_clients (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     disabled_at TIMESTAMPTZ,
     CONSTRAINT chk_service_client_slug CHECK (slug ~ '^[a-z][a-z0-9-]{0,99}$'),
+    CONSTRAINT chk_service_client_display_name CHECK (
+        char_length(display_name) BETWEEN 1 AND 255
+        AND display_name = btrim(display_name)
+    ),
     CONSTRAINT chk_service_client_permissions CHECK (service_permissions_are_canonical(permissions)),
     CONSTRAINT chk_service_client_status CHECK (status IN ('active', 'disabled')),
     CONSTRAINT chk_service_client_disabled CHECK (

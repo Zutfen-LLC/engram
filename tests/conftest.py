@@ -85,8 +85,15 @@ async def _dispose_db_engines_after_test():
     yield
     import engram.db as db_module
 
-    for eng in (db_module.engine, db_module.owner_engine, db_module.read_engine):
-        await eng.dispose()
+    engines = (
+        db_module.engine,
+        db_module.owner_engine,
+        db_module.read_engine,
+        db_module.provisioner_engine,
+    )
+    for eng in engines:
+        if eng is not None:
+            await eng.dispose()
 
 
 def pytest_runtest_logreport(report: TestReport) -> None:

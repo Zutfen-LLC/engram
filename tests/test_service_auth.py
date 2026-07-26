@@ -9,6 +9,7 @@ from engram.service_auth import (
     digest_service_secret,
     generate_service_credential,
     parse_service_credential,
+    validate_service_client_display_name,
     verify_service_secret,
 )
 
@@ -36,3 +37,13 @@ def test_service_permissions_are_canonical_and_do_not_accept_duplicates() -> Non
         canonicalize_service_permissions(["tenant.provision", "tenant.provision"])
     with pytest.raises(ValueError, match="unknown"):
         canonicalize_service_permissions(["read"])
+
+
+@pytest.mark.parametrize("value", ["", "   ", " name", "name ", "x" * 256])
+def test_service_client_display_name_is_nonempty_bounded_and_unambiguous(value: str) -> None:
+    with pytest.raises(ValueError, match="display name"):
+        validate_service_client_display_name(value)
+
+
+def test_service_client_display_name_preserves_valid_value() -> None:
+    assert validate_service_client_display_name("Control Plane") == "Control Plane"
