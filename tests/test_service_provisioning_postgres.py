@@ -310,13 +310,14 @@ async def test_database_rejects_ambiguous_service_client_display_names(service_s
     import asyncpg
 
     stack = service_stack
-    with pytest.raises(asyncpg.CheckViolationError):
-        await stack["owner"].execute(
-            "INSERT INTO service_clients (slug,display_name,permissions) VALUES ($1,$2,$3)",
-            f"invalid-name-{stack['tag']}",
-            "   ",
-            ["tenant.provision"],
-        )
+    for suffix, display_name in (("blank", "   "), ("leading", " Control")):
+        with pytest.raises(asyncpg.CheckViolationError):
+            await stack["owner"].execute(
+                "INSERT INTO service_clients (slug,display_name,permissions) VALUES ($1,$2,$3)",
+                f"invalid-name-{suffix}-{stack['tag']}",
+                display_name,
+                ["tenant.provision"],
+            )
 
 
 @pytest.mark.parametrize("keys", [("same", "same"), ("first", "second")])
