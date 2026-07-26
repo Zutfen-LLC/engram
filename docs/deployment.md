@@ -1036,6 +1036,13 @@ contract.
 
 ## 12. Troubleshooting
 
+> **Not sure where to start?** Run `engram doctor` first — a read-only,
+> bounded command that composes health, identity, usage, worker, review,
+> recall, and Context Receipt evidence into one report telling you whether
+> the service and its automatic memory loop are healthy, degraded,
+> unhealthy, or unobservable. See
+> [Automatic Memory Loop Doctor](ops/automatic-loop-doctor.md).
+
 | Symptom | Likely cause / fix |
 | --- | --- |
 | `docker compose up` builds then the container runs the test suite forever and never serves `/health` | The `engram-service` build is missing `target: runtime`. The Dockerfile is multi-stage and its final stage is `ci` (whose CMD runs tests, not uvicorn). `docker-compose.yml` sets `build: { context: ., target: runtime }` — keep that if you fork/customize the compose file. |

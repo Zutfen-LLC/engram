@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+import uuid
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -285,6 +287,60 @@ def main() -> None:
         help="Emit stable machine-readable JSON instead of a human-readable report.",
     )
 
+    # --- doctor -----------------------------------------------------------------
+    doctor_parser = sub.add_parser(
+        "doctor",
+        help="Read-only automatic-memory-loop doctor (ENG-LOOP-001A): composes "
+        "health, identity, usage-report, review, recall, and Context Receipt "
+        "evidence into one bounded report answering whether Engram and its "
+        "automatic memory loop are healthy, degraded, unhealthy, or "
+        "unobservable. Never mutates memory, configuration, or queues. "
+        "Reads the API key only from ENGRAM_API_KEY.",
+    )
+    doctor_parser.add_argument(
+        "--base-url",
+        default=None,
+        help="Engram API URL. Default: ENGRAM_BASE_URL, else a loopback URL on "
+        "the configured service port.",
+    )
+    doctor_parser.add_argument(
+        "--tenant",
+        default=None,
+        help="Tenant UUID for database-level evidence. Default: the tenant "
+        "returned by /whoami. When identity cannot be resolved, deployment-wide "
+        "non-content counts may be reported and tenant-specific checks are "
+        "marked unknown.",
+    )
+    doctor_parser.add_argument(
+        "--since",
+        default=None,
+        help="Timezone-aware ISO-8601 window start. Default: 24 hours before --until.",
+    )
+    doctor_parser.add_argument(
+        "--until",
+        default=None,
+        help="Timezone-aware ISO-8601 window end. Default: now (UTC).",
+    )
+    doctor_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Operator database URL. Default: ENGRAM_OWNER_DATABASE_URL, then "
+        "ENGRAM_DATABASE_URL. Accepts postgresql+asyncpg:// or postgresql:// "
+        "schemes. Never echoed, serialized, or logged.",
+    )
+    doctor_parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=None,
+        help="Finite positive HTTP/diagnostic timeout in seconds (default: 10).",
+    )
+    doctor_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit only the stable engram.doctor JSON report. Human-readable "
+        "output remains the default.",
+    )
+
     args = parser.parse_args()
     if args.command == "serve":
         import uvicorn
@@ -400,6 +456,59 @@ def main() -> None:
                     tenant=args.tenant,
                     since=args.since,
                     until=args.until,
+                    as_json=args.json,
+                )
+            )
+        )
+    elif args.command == "doctor":
+        from engram.config import settings
+        from engram.doctor import (
+            DEFAULT_TIMEOUT_SECONDS,
+            parse_iso8601,
+            resolve_base_url,
+            resolve_database_url,
+            validate_timeout_seconds,
+        )
+
+        timeout_seconds = DEFAULT_TIMEOUT_SECONDS
+        if args.timeout_seconds is not None:
+            try:
+                timeout_seconds = validate_timeout_seconds(args.timeout_seconds)
+            except ValueError as exc:
+                parser.error(str(exc))
+
+        since_dt = None
+        if args.since is not None:
+            try:
+                since_dt = parse_iso8601(args.since, param_name="--since")
+            except ValueError as exc:
+                parser.error(str(exc))
+
+        until_dt = None
+        if args.until is not None:
+            try:
+                until_dt = parse_iso8601(args.until, param_name="--until")
+            except ValueError as exc:
+                parser.error(str(exc))
+
+        if args.tenant is not None:
+            try:
+                uuid.UUID(args.tenant)
+            except ValueError:
+                parser.error(f"--tenant must be a valid UUID (got {args.tenant!r})")
+
+        base_url = resolve_base_url(args.base_url, settings_obj=settings)
+        database_url = resolve_database_url(args.database_url)
+
+        raise SystemExit(
+            asyncio.run(
+                _run_doctor(
+                    base_url=base_url,
+                    tenant=args.tenant,
+                    since=since_dt,
+                    until=until_dt,
+                    timeout_seconds=timeout_seconds,
+                    database_url=database_url,
                     as_json=args.json,
                 )
             )
@@ -1431,6 +1540,54 @@ async def _run_usage_report(
     else:
         _print_human_usage_report(report)
     return 0
+
+
+# --- doctor ------------------------------------------------------------------
+
+
+async def _run_doctor(
+    *,
+    base_url: str,
+    tenant: str | None,
+    since: datetime | None,
+    until: datetime | None,
+    timeout_seconds: float,
+    database_url: str | None,
+    as_json: bool,
+) -> int:
+    """Build and print the read-only automatic-memory-loop doctor report.
+
+    Reads the API key only from ``ENGRAM_API_KEY`` — there is no ``--api-key``
+    flag, so the secret never appears in shell history or the process list.
+    Never mutates memory, configuration, or queues (ENG-LOOP-001A).
+    """
+    import os
+
+    from engram.doctor import render_human, run_doctor
+
+    api_key = os.environ.get("ENGRAM_API_KEY")
+    try:
+        report = await run_doctor(
+            base_url=base_url,
+            api_key=api_key,
+            tenant=tenant,
+            since=since,
+            until=until,
+            timeout_seconds=timeout_seconds,
+            database_url=database_url,
+        )
+    except Exception as exc:  # noqa: BLE001 - the report itself failing to build is exit 2
+        print(
+            f"ERROR: doctor report could not be constructed safely ({type(exc).__name__}).",
+            file=sys.stderr,
+        )
+        return 2
+
+    if as_json:
+        print(report.model_dump_json(indent=2, by_alias=True))
+    else:
+        print(render_human(report))
+    return report.exit_code
 
 
 if __name__ == "__main__":
