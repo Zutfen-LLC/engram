@@ -8,14 +8,16 @@ it locally with ``docker compose up``.
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi.responses import JSONResponse
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 
 from engram.api.app import create_app
-from engram.api.routes.health import whoami
+from engram.api.routes.health import readiness, whoami
 from engram.auth import Principal
 from engram.db import engine
 
@@ -84,3 +86,31 @@ async def test_ready_requires_db(client):
     from engram.api.routes.health import pgvector_version_satisfies
 
     assert pgvector_version_satisfies(body["pgvector"])
+
+
+async def test_ready_sanitizes_exception_message() -> None:
+    """A driver/connection exception must never leak str(exception) into /ready.
+
+    A connection or driver exception can embed a DSN, hostname, username, or
+    password (ENG-LOOP-001A-FIX1). Only the categorical outcome and the
+    exception's type name (never its message) may be exposed.
+    """
+
+    class _LeakySentinelError(Exception):
+        pass
+
+    session = AsyncMock()
+    session.execute.side_effect = _LeakySentinelError(
+        "connection failed: postgresql://sentinel_user:SENTINEL_PW_VALUE@sentinel-host/db"
+    )
+    response = await readiness(session=session)
+    assert isinstance(response, JSONResponse)
+    assert response.status_code == 503
+    body = json.loads(bytes(response.body))
+    assert body["status"] == "not_ready"
+    assert body["database"] == "unavailable"
+    assert body["error_type"] == "_LeakySentinelError"
+    rendered = json.dumps(body)
+    assert "SENTINEL_PW_VALUE" not in rendered
+    assert "sentinel_user" not in rendered
+    assert "sentinel-host" not in rendered

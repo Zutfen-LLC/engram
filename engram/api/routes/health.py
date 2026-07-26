@@ -107,9 +107,16 @@ async def readiness(
             "pgvector": pgvector_version,
         }
     except Exception as e:
+        # Never return str(e): a driver/connection exception can embed a DSN,
+        # hostname, username, or password. Only the categorical outcome and
+        # the exception's type name (never its message) are safe to expose.
         return JSONResponse(
             status_code=503,
-            content={"status": "not_ready", "database": str(e)},
+            content={
+                "status": "not_ready",
+                "database": "unavailable",
+                "error_type": type(e).__name__,
+            },
         )
 
 

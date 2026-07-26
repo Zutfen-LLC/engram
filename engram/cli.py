@@ -325,7 +325,8 @@ def main() -> None:
         "--database-url",
         default=None,
         help="Operator database URL. Default: ENGRAM_OWNER_DATABASE_URL, then "
-        "ENGRAM_DATABASE_URL. Never echoed, serialized, or logged.",
+        "ENGRAM_DATABASE_URL. Accepts postgresql+asyncpg:// or postgresql:// "
+        "schemes. Never echoed, serialized, or logged.",
     )
     doctor_parser.add_argument(
         "--timeout-seconds",

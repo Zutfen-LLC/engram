@@ -29,7 +29,7 @@ from sqlalchemy.pool import NullPool
 from engram.config import settings
 from engram.context_receipts import store_context_receipt
 from engram.doctor import run_doctor
-from tests.context_receipt_helpers import build_manifest
+from tests.context_receipt_helpers import build_manifest, manifest_hash
 
 _DB_SKIP_REASON = "requires a live PostgreSQL with the v2 schema"
 
@@ -268,8 +268,10 @@ async def _run(tenant_id: uuid.UUID, *, usage_telemetry_enabled: bool = True) ->
         # client-supplied timestamp, so a window bound frozen at module-import
         # time could exclude a row committed moments later. A fresh `until`
         # (with a short forward buffer) safely covers everything already
-        # committed by the time this call is made.
-        until = datetime.now(UTC) + timedelta(minutes=5)
+        # committed by the time this call is made. Kept small (not minutes)
+        # so it does not itself inflate a due-pending job's apparent age past
+        # the FIX-4 due-pending diagnostic threshold in precision tests.
+        until = datetime.now(UTC) + timedelta(seconds=30)
         since = until - timedelta(hours=25)
         return await run_doctor(
             base_url="http://test",
@@ -354,6 +356,52 @@ async def test_worker_queue_warns_on_aged_pending_backlog() -> None:
     check = _check(report, "worker.queue")
     assert check.status == "warn"
     assert check.reason_code == "PENDING_BACKLOG_AGED"
+    assert check.evidence["due_pending_jobs"] == 1
+
+
+async def test_worker_queue_future_scheduled_old_job_remains_healthy() -> None:
+    """An old-created job scheduled to run in the future is not yet due (FIX-4).
+
+    Only ``run_after``-due backlog may trigger a warning — an intentionally
+    scheduled or backed-off retry must not be diagnosed as an aged backlog
+    merely because ``created_at`` is old.
+    """
+    if not await _db_ok():
+        pytest.skip(_DB_SKIP_REASON)
+    async with _test_session_factory() as session:
+        tenant_id, _ = await _seed_tenant(session, label="wq-future")
+        await _insert_job(
+            session,
+            tenant_id=tenant_id,
+            status="pending",
+            created_at=NOW - timedelta(hours=2),
+            run_after=NOW + timedelta(hours=1),
+        )
+    report = await _run(tenant_id)
+    check = _check(report, "worker.queue")
+    assert check.status == "pass"
+    assert check.reason_code == "WORKER_HEALTHY"
+    assert check.evidence["due_pending_jobs"] == 0
+
+
+async def test_worker_queue_due_job_only_slightly_overdue_remains_healthy() -> None:
+    """A due job overdue by only a few seconds stays under the diagnostic threshold."""
+    if not await _db_ok():
+        pytest.skip(_DB_SKIP_REASON)
+    async with _test_session_factory() as session:
+        tenant_id, _ = await _seed_tenant(session, label="wq-just-due")
+        await _insert_job(
+            session,
+            tenant_id=tenant_id,
+            status="pending",
+            created_at=NOW - timedelta(seconds=10),
+            run_after=NOW - timedelta(seconds=10),
+        )
+    report = await _run(tenant_id)
+    check = _check(report, "worker.queue")
+    assert check.status == "pass"
+    assert check.reason_code == "WORKER_HEALTHY"
+    assert check.evidence["due_pending_jobs"] == 1
 
 
 # --- capture.lifecycle / capture.remember --------------------------------------
@@ -471,6 +519,64 @@ async def test_capture_remember_healthy_when_candidates_succeed() -> None:
     check = _check(report, "capture.remember")
     assert check.status == "pass"
     assert check.reason_code == "REMEMBER_PIPELINE_HEALTHY"
+
+
+async def test_capture_remember_unresolved_candidate_does_not_pass() -> None:
+    """A candidate.observed with no matching outcome yet must never read as healthy.
+
+    ENG-LOOP-001A-FIX1 / FIX-3: an unresolved logical candidate must never be
+    silently folded into a successful or failed terminal outcome.
+    """
+    if not await _db_ok():
+        pytest.skip(_DB_SKIP_REASON)
+    async with _test_session_factory() as session:
+        tenant_id, principal_id = await _seed_tenant(session, label="unresolved-only")
+        await _insert_usage_event(
+            session, tenant_id=tenant_id, principal_id=principal_id,
+            event_type="candidate.observed", operation="process_memory_candidate",
+            status="accepted_for_processing", created_at=NOW - timedelta(minutes=20),
+            correlation_id=uuid.uuid4(), input_bytes=100,
+        )
+        # Deliberately no candidate.outcome event for this correlation_id.
+    report = await _run(tenant_id)
+    check = _check(report, "capture.remember")
+    assert check.status == "warn"
+    assert check.reason_code == "REMEMBER_OUTCOMES_PENDING"
+    assert check.evidence["unresolved_candidates"] == 1
+    assert check.evidence["created"] == 0
+    assert check.evidence["failed"] == 0
+
+
+async def test_capture_remember_success_plus_unresolved_does_not_pass() -> None:
+    if not await _db_ok():
+        pytest.skip(_DB_SKIP_REASON)
+    async with _test_session_factory() as session:
+        tenant_id, principal_id = await _seed_tenant(session, label="mixed-unresolved")
+        resolved_correlation_id = uuid.uuid4()
+        await _insert_usage_event(
+            session, tenant_id=tenant_id, principal_id=principal_id,
+            event_type="candidate.observed", operation="process_memory_candidate",
+            status="accepted_for_processing", created_at=NOW - timedelta(minutes=20),
+            correlation_id=resolved_correlation_id, input_bytes=100,
+        )
+        await _insert_usage_event(
+            session, tenant_id=tenant_id, principal_id=principal_id,
+            event_type="candidate.outcome", operation="process_memory_candidate",
+            status="created", created_at=NOW - timedelta(minutes=19),
+            correlation_id=resolved_correlation_id,
+        )
+        await _insert_usage_event(
+            session, tenant_id=tenant_id, principal_id=principal_id,
+            event_type="candidate.observed", operation="process_memory_candidate",
+            status="accepted_for_processing", created_at=NOW - timedelta(minutes=15),
+            correlation_id=uuid.uuid4(), input_bytes=100,
+        )
+    report = await _run(tenant_id)
+    check = _check(report, "capture.remember")
+    assert check.status == "warn"
+    assert check.reason_code == "REMEMBER_OUTCOMES_PENDING"
+    assert check.evidence["created"] == 1
+    assert check.evidence["unresolved_candidates"] == 1
 
 
 # --- recall.activity -------------------------------------------------------------
@@ -636,6 +742,187 @@ async def test_receipts_activity_latest_receipt_invalid() -> None:
     assert check.status == "fail"
     assert check.reason_code == "LATEST_RECEIPT_INVALID"
     assert check.evidence["latest_verification_status"] == "invalid"
+
+
+async def _insert_raw_receipt(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    principal_id: uuid.UUID,
+    recall_log_id: uuid.UUID,
+    item_ids: list[uuid.UUID],
+    created_at: datetime,
+    stored_manifest_hash: str | None = None,
+    receipt_id: uuid.UUID | None = None,
+) -> Any:
+    """Insert a context_receipts row with an explicit created_at (raw SQL).
+
+    ``store_context_receipt`` always uses the server's ``now()`` default, so
+    window-scoping/tie-break tests that need explicit control over
+    ``created_at`` insert directly, mirroring the syntactically-valid-but-
+    wrong-hash pattern already used for the "invalid receipt" test above.
+    ``stored_manifest_hash=None`` computes the correct RFC 8785 hash (a
+    genuinely valid receipt); any other value is inserted verbatim (an
+    invalid receipt whose format still satisfies the DB CHECK constraint).
+    """
+    import json as _json
+
+    manifest = build_manifest(
+        tenant_id=str(tenant_id), principal_id=str(principal_id),
+        item_ids=[str(i) for i in item_ids], byte_budget=8192,
+    )
+    payload = manifest.model_dump(mode="json", by_alias=True, exclude_none=False)
+    correct_hash = manifest_hash(manifest)
+    row_id = receipt_id or uuid.uuid4()
+    await session.execute(
+        text(
+            "INSERT INTO context_receipts (id, tenant_id, principal_id, "
+            "recall_log_id, manifest_schema, manifest_schema_version, "
+            "canonicalization, mode, manifest, manifest_hash, packet_hash, created_at) "
+            "VALUES (:id, :tid, :pid, :rlid, 'engram.context-manifest', '1.0', "
+            "'rfc8785', 'startup', CAST(:manifest AS jsonb), :mh, :ph, :created_at)"
+        ),
+        {
+            "id": row_id,
+            "tid": tenant_id,
+            "pid": principal_id,
+            "rlid": recall_log_id,
+            "manifest": _json.dumps(payload),
+            "mh": stored_manifest_hash if stored_manifest_hash is not None else correct_hash,
+            "ph": manifest.packet.hash,
+            "created_at": created_at,
+        },
+    )
+    await session.commit()
+    return row_id
+
+
+async def test_receipts_activity_invalid_receipt_outside_window_does_not_fail() -> None:
+    """A receipt outside [since, until) must never affect the report."""
+    if not await _db_ok():
+        pytest.skip(_DB_SKIP_REASON)
+    settings.context_receipt_dark_write_enabled = False
+    async with _test_session_factory() as session:
+        tenant_id, principal_id = await _seed_tenant(session, label="receipt-old-invalid")
+        item_ids = [uuid.uuid4()]
+        recall_log_id = await _insert_recall_log(
+            session, tenant_id=tenant_id, principal_id=principal_id, mode="startup",
+            created_at=NOW - timedelta(hours=26), item_ids=item_ids, byte_budget=8192,
+        )
+        # Invalid AND far outside the default ~25h report window.
+        await _insert_raw_receipt(
+            session, tenant_id=tenant_id, principal_id=principal_id,
+            recall_log_id=recall_log_id, item_ids=item_ids,
+            created_at=NOW - timedelta(hours=26), stored_manifest_hash="sha256:" + "a" * 64,
+        )
+    report = await _run(tenant_id)
+    check = _check(report, "receipts.activity")
+    assert check.reason_code != "LATEST_RECEIPT_INVALID"
+    assert check.status != "fail"
+
+
+async def test_receipts_activity_selects_in_window_over_newer_out_of_window() -> None:
+    """The newest receipt WITHIN the window is selected, not a newer one outside it."""
+    if not await _db_ok():
+        pytest.skip(_DB_SKIP_REASON)
+    settings.context_receipt_dark_write_enabled = True
+    async with _test_session_factory() as session:
+        tenant_id, principal_id = await _seed_tenant(session, label="receipt-window-pick")
+        in_window_items = [uuid.uuid4()]
+        in_window_recall_log = await _insert_recall_log(
+            session, tenant_id=tenant_id, principal_id=principal_id, mode="startup",
+            created_at=NOW - timedelta(minutes=5), item_ids=in_window_items, byte_budget=8192,
+        )
+        # Valid, in-window receipt.
+        await _insert_raw_receipt(
+            session, tenant_id=tenant_id, principal_id=principal_id,
+            recall_log_id=in_window_recall_log, item_ids=in_window_items,
+            created_at=NOW - timedelta(minutes=5),
+        )
+        # A newer but OUT-OF-WINDOW, INVALID receipt on a separate recall log —
+        # if window scoping were broken, this one (being "latest" overall)
+        # would be selected instead and the report would incorrectly fail.
+        future_items = [uuid.uuid4()]
+        future_recall_log = await _insert_recall_log(
+            session, tenant_id=tenant_id, principal_id=principal_id, mode="startup",
+            created_at=NOW + timedelta(minutes=10), item_ids=future_items, byte_budget=8192,
+        )
+        await _insert_raw_receipt(
+            session, tenant_id=tenant_id, principal_id=principal_id,
+            recall_log_id=future_recall_log, item_ids=future_items,
+            created_at=NOW + timedelta(minutes=10), stored_manifest_hash="sha256:" + "b" * 64,
+        )
+    report = await _run(tenant_id)
+    check = _check(report, "receipts.activity")
+    assert check.status == "pass"
+    assert check.reason_code == "RECEIPTS_HEALTHY"
+    assert check.evidence["latest_verification_status"] == "valid"
+
+
+async def test_receipts_activity_invalid_receipt_fails_even_when_dark_writes_disabled() -> None:
+    """Local write configuration must never hide existing receipt corruption."""
+    if not await _db_ok():
+        pytest.skip(_DB_SKIP_REASON)
+    settings.context_receipt_dark_write_enabled = False
+    async with _test_session_factory() as session:
+        tenant_id, principal_id = await _seed_tenant(session, label="receipt-inv-disabled")
+        item_ids = [uuid.uuid4()]
+        recall_log_id = await _insert_recall_log(
+            session, tenant_id=tenant_id, principal_id=principal_id, mode="startup",
+            created_at=NOW - timedelta(minutes=5), item_ids=item_ids, byte_budget=8192,
+        )
+        await _insert_raw_receipt(
+            session, tenant_id=tenant_id, principal_id=principal_id,
+            recall_log_id=recall_log_id, item_ids=item_ids,
+            created_at=NOW - timedelta(minutes=5), stored_manifest_hash="sha256:" + "c" * 64,
+        )
+    report = await _run(tenant_id)
+    check = _check(report, "receipts.activity")
+    assert check.status == "fail"
+    assert check.reason_code == "LATEST_RECEIPT_INVALID"
+    assert check.evidence["dark_write_enabled"] is False
+
+
+async def test_receipts_activity_deterministic_tie_break_on_equal_timestamp() -> None:
+    """Two receipts sharing one created_at resolve identically via descending id."""
+    if not await _db_ok():
+        pytest.skip(_DB_SKIP_REASON)
+    settings.context_receipt_dark_write_enabled = True
+    async with _test_session_factory() as session:
+        tenant_id, principal_id = await _seed_tenant(session, label="receipt-tiebreak")
+        shared_created_at = NOW - timedelta(minutes=5)
+        low_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
+        high_id = uuid.UUID("ffffffff-ffff-ffff-ffff-fffffffffffe")
+
+        items_a = [uuid.uuid4()]
+        recall_log_a = await _insert_recall_log(
+            session, tenant_id=tenant_id, principal_id=principal_id, mode="startup",
+            created_at=shared_created_at, item_ids=items_a, byte_budget=8192,
+        )
+        # Lower UUID: valid.
+        await _insert_raw_receipt(
+            session, tenant_id=tenant_id, principal_id=principal_id,
+            recall_log_id=recall_log_a, item_ids=items_a,
+            created_at=shared_created_at, receipt_id=low_id,
+        )
+
+        items_b = [uuid.uuid4()]
+        recall_log_b = await _insert_recall_log(
+            session, tenant_id=tenant_id, principal_id=principal_id, mode="startup",
+            created_at=shared_created_at, item_ids=items_b, byte_budget=8192,
+        )
+        # Higher UUID, same timestamp: invalid. Deterministic DESC id order
+        # must select THIS one, so the report must fail.
+        await _insert_raw_receipt(
+            session, tenant_id=tenant_id, principal_id=principal_id,
+            recall_log_id=recall_log_b, item_ids=items_b,
+            created_at=shared_created_at, stored_manifest_hash="sha256:" + "d" * 64,
+            receipt_id=high_id,
+        )
+    report = await _run(tenant_id)
+    check = _check(report, "receipts.activity")
+    assert check.status == "fail"
+    assert check.reason_code == "LATEST_RECEIPT_INVALID"
 
 
 # --- tenant isolation --------------------------------------------------------------
@@ -819,3 +1106,44 @@ async def test_run_doctor_never_calls_embedding_or_classification_provider() -> 
     classification_check = _check(report, "config.classification")
     assert embeddings_check.reason_code != "EMBEDDING_CONFIG_INVALID"
     assert classification_check.reason_code != "CLASSIFICATION_CONFIG_INVALID"
+
+
+# --- FIX-7: --database-url scheme acceptance + one-shot engine disposal --------
+
+
+async def test_database_url_bare_postgresql_scheme_builds_a_working_one_shot_engine() -> None:
+    """A bare postgresql:// --database-url must work end-to-end, not just postgresql+asyncpg://.
+
+    Exercises the real ``_build_session_factory`` path (no injected
+    ``session_factory``), proving the scheme is normalized to an
+    asyncpg-capable engine that can actually reach the live database, and
+    that the one-shot engine this run constructs is disposed cleanly
+    (ENG-LOOP-001A-FIX1 / FIX-7).
+    """
+    if not await _db_ok():
+        pytest.skip(_DB_SKIP_REASON)
+    async with _test_session_factory() as session:
+        tenant_id, principal_id = await _seed_tenant(session, label="fix7-bare-scheme")
+        await _insert_recall_log(
+            session, tenant_id=tenant_id, principal_id=principal_id, mode="startup",
+            created_at=NOW - timedelta(minutes=5),
+        )
+
+    assert settings.database_url.startswith("postgresql+asyncpg://")
+    bare_url = "postgresql://" + settings.database_url[len("postgresql+asyncpg://") :]
+
+    report = await run_doctor(
+        base_url="http://test",
+        tenant=str(tenant_id),
+        since=SINCE,
+        until=NOW,
+        database_url=bare_url,
+        http_transport=httpx.MockTransport(_healthy_handler(tenant_id)),
+        clock=lambda: NOW,
+    )
+    # A real query actually ran against the live database — a DB-dependent
+    # check reflects the seeded recall log rather than degrading to
+    # "unknown" (which would mean the one-shot engine never connected).
+    recall_check = _check(report, "recall.activity")
+    assert recall_check.status == "pass"
+    assert recall_check.reason_code == "RECALL_ACTIVITY_RECENT"

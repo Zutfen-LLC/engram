@@ -20,6 +20,7 @@ raise) so one unavailable check never aborts the rest of the report.
 
 from __future__ import annotations
 
+import asyncio
 import decimal
 import math
 import os
@@ -34,7 +35,7 @@ from typing import Any, Literal, TypeVar
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import select, text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from engram import __version__
 from engram.context_receipts import verify_context_receipt_with_recall_log
@@ -53,12 +54,14 @@ __all__ = [
     "DoctorScope",
     "DoctorWindow",
     "aggregate_status",
+    "normalize_database_url",
     "parse_iso8601",
     "render_human",
     "resolve_base_url",
     "resolve_database_url",
     "resolve_window",
     "run_doctor",
+    "seconds_to_statement_timeout_ms",
     "validate_timeout_seconds",
 ]
 
@@ -273,6 +276,17 @@ def validate_timeout_seconds(value: float) -> float:
     return numeric
 
 
+def seconds_to_statement_timeout_ms(seconds: float) -> int:
+    """Convert a validated positive timeout to PostgreSQL statement_timeout ms.
+
+    Uses ceiling (never floor/truncate) with a floor of 1, so an accepted
+    positive sub-millisecond timeout can never silently become 0 —
+    PostgreSQL interprets ``statement_timeout=0`` as *no timeout*, which
+    would defeat the bound entirely (ENG-LOOP-001A-FIX1 / FIX-6).
+    """
+    return max(1, math.ceil(seconds * 1000))
+
+
 def parse_iso8601(value: str, *, param_name: str) -> datetime:
     """Parse a timezone-aware ISO-8601 timestamp; reject naive timestamps."""
     try:
@@ -331,6 +345,21 @@ def resolve_database_url(explicit: str | None) -> str | None:
     return os.environ.get("ENGRAM_OWNER_DATABASE_URL") or os.environ.get("ENGRAM_DATABASE_URL")
 
 
+def normalize_database_url(url: str) -> str:
+    """Rewrite a bare ``postgresql://`` scheme to ``postgresql+asyncpg://``.
+
+    ``create_async_engine`` requires an async-capable driver encoded in the
+    URL; a bare ``postgresql://`` resolves to the synchronous psycopg2
+    dialect and raises at engine-construction time rather than at connect
+    time. ``postgresql+asyncpg://`` (and any other explicit driver, e.g.
+    ``postgresql+psycopg://``) is returned unchanged (ENG-LOOP-001A-FIX1 /
+    FIX-7).
+    """
+    if url.startswith("postgresql://"):
+        return "postgresql+asyncpg://" + url[len("postgresql://") :]
+    return url
+
+
 # --- HTTP-based checks --------------------------------------------------------
 
 
@@ -380,6 +409,43 @@ async def _check_service_health(client: httpx.AsyncClient) -> DoctorCheck:
     )
 
 
+_READY_STATUS_VALUES = frozenset({"ready", "not_ready"})
+_READY_DATABASE_VALUES = frozenset({"connected", "unavailable"})
+_READY_RLS_VALUES = frozenset({"ok", "no_tenant_context"})
+_VERSION_STRING_RE = re.compile(r"^\d+(\.\d+){0,2}$")
+
+
+def _safe_readiness_evidence(body: dict[str, Any], http_status: int) -> dict[str, Any]:
+    """Allow-list only known categorical/version values from ``/ready``.
+
+    ``/ready`` is treated as untrusted input — it may come from another
+    Engram version, a misconfigured proxy, or a hostile server. Only values
+    that exactly match a known safe category or a validated version-number
+    shape are ever copied into evidence; free-text fields such as ``reason``,
+    ``detail``, ``error``, or ``message`` are never copied, regardless of
+    their content.
+    """
+    evidence: dict[str, Any] = {"http_status": http_status}
+    status = body.get("status")
+    if status in _READY_STATUS_VALUES:
+        evidence["status"] = status
+    database = body.get("database")
+    if database in _READY_DATABASE_VALUES:
+        evidence["database"] = database
+    rls = body.get("rls")
+    if rls in _READY_RLS_VALUES:
+        evidence["rls"] = rls
+    pgvector = body.get("pgvector")
+    if pgvector == "missing" or (
+        isinstance(pgvector, str) and _VERSION_STRING_RE.match(pgvector)
+    ):
+        evidence["pgvector"] = pgvector
+    minimum_required = body.get("minimum_required")
+    if isinstance(minimum_required, str) and _VERSION_STRING_RE.match(minimum_required):
+        evidence["minimum_required"] = minimum_required
+    return evidence
+
+
 async def _check_service_readiness(client: httpx.AsyncClient) -> DoctorCheck:
     try:
         resp = await client.get("/ready")
@@ -394,16 +460,16 @@ async def _check_service_readiness(client: httpx.AsyncClient) -> DoctorCheck:
         body = resp.json()
     except ValueError:
         body = {}
-    safe_keys = ("status", "database", "rls", "pgvector", "minimum_required", "reason")
-    evidence: dict[str, Any] = {
-        k: body.get(k) for k in safe_keys if isinstance(body, dict) and k in body
-    }
-    evidence["http_status"] = resp.status_code
-    if resp.status_code == 200 and isinstance(body, dict) and body.get("status") == "ready":
+    if not isinstance(body, dict):
+        body = {}
+    evidence = _safe_readiness_evidence(body, resp.status_code)
+    if resp.status_code == 200 and evidence.get("status") == "ready":
         return _check(
             CHECK_SERVICE_READINESS, "pass", "SERVICE_READY", "Service reports ready.",
             evidence=evidence,
         )
+    # The summary and remediation are always generated locally from validated
+    # categories, never from remote prose (e.g. a `reason` field).
     return _check(
         CHECK_SERVICE_READINESS,
         "fail",
@@ -536,6 +602,75 @@ async def _check_identity(
     return check, tenant_id, source
 
 
+_MAX_REVIEW_QUEUE_SAMPLE = 100
+
+
+def _nonneg_int_or_none(value: Any) -> int | None:
+    """Strict non-negative integer check: rejects bool, str, float, negatives."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value >= 0 else None
+
+
+def _validate_review_stats(body: Any) -> dict[str, int] | None:
+    """Validate the review/stats payload; ``None`` means invalid/untrustworthy.
+
+    ``body`` is untrusted: a malformed but HTTP-200 response must not abort
+    report construction, nor coerce non-numeric/negative/boolean counts into
+    numbers. A missing status key means zero (a real hygiene report omits
+    counts for empty buckets); a present-but-wrong-typed value is rejected.
+    """
+    if not isinstance(body, dict):
+        return None
+    by_status = body.get("by_review_status")
+    if not isinstance(by_status, dict):
+        return None
+    result: dict[str, int] = {}
+    for key in ("active", "proposed", "disputed"):
+        parsed = _nonneg_int_or_none(by_status.get(key, 0))
+        if parsed is None:
+            return None
+        result[key] = parsed
+    total = _nonneg_int_or_none(body.get("total", 0))
+    if total is None:
+        return None
+    result["total"] = total
+    return result
+
+
+def _validate_review_queue(body: Any) -> list[list[str]] | None:
+    """Validate the bounded review/queue payload; ``None`` means invalid.
+
+    Returns each item's ``promotion_blockers`` list (only field ever read —
+    everything else, including ``content``, is discarded immediately without
+    being copied anywhere). A single malformed item invalidates the whole
+    sample rather than being silently skipped into a false PASS.
+    """
+    if not isinstance(body, list) or len(body) > _MAX_REVIEW_QUEUE_SAMPLE:
+        return None
+    blocker_lists: list[list[str]] = []
+    for item in body:
+        if not isinstance(item, dict):
+            return None
+        blockers = item.get("promotion_blockers", [])
+        if not isinstance(blockers, list) or not all(isinstance(b, str) for b in blockers):
+            return None
+        blocker_lists.append(blockers)
+    return blocker_lists
+
+
+def _rank_blockers(blocker_lists: list[list[str]]) -> list[dict[str, Any]]:
+    """Top-5 blockers, excluding the universal marker, deterministically ordered."""
+    counter: Counter[str] = Counter()
+    for blockers in blocker_lists:
+        for blocker in blockers:
+            if blocker == "conflict_recheck_not_run":
+                continue
+            counter[blocker] += 1
+    ranked = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+    return [{"code": code, "count": n} for code, n in ranked]
+
+
 async def _check_review_backlog(client: httpx.AsyncClient) -> DoctorCheck:
     try:
         stats_resp = await client.get("/v1/review/stats")
@@ -566,44 +701,58 @@ async def _check_review_backlog(client: httpx.AsyncClient) -> DoctorCheck:
             CHECK_REVIEW_BACKLOG, "unknown", "REVIEW_BACKLOG_UNAVAILABLE",
             "GET /v1/review/stats returned malformed JSON.",
         )
-    if not isinstance(stats_body, dict):
+
+    validated_stats = _validate_review_stats(stats_body)
+    if validated_stats is None:
         return _check(
             CHECK_REVIEW_BACKLOG, "unknown", "REVIEW_BACKLOG_UNAVAILABLE",
-            "GET /v1/review/stats returned an unexpected JSON shape.",
+            "GET /v1/review/stats returned an invalid shape.",
         )
 
-    by_status = stats_body.get("by_review_status") or {}
     evidence: dict[str, Any] = {
-        "active_count": int(by_status.get("active", 0) or 0),
-        "proposed_count": int(by_status.get("proposed", 0) or 0),
-        "disputed_count": int(by_status.get("disputed", 0) or 0),
-        "total_count": int(stats_body.get("total", 0) or 0),
+        "active_count": validated_stats["active"],
+        "proposed_count": validated_stats["proposed"],
+        "disputed_count": validated_stats["disputed"],
+        "total_count": validated_stats["total"],
     }
 
-    top_blockers: list[dict[str, Any]] = []
-    queue_sample_size = 0
+    # A PASS requires BOTH stats and the bounded queue to be successfully
+    # retrieved and validated; partial (stats-only) evidence may still be
+    # returned alongside an `unknown` status when the queue portion fails.
+    queue_error: str | None = None
+    queue_body: Any = None
     try:
-        queue_resp = await client.get("/v1/review/queue", params={"limit": 100})
-        if queue_resp.status_code == 200:
-            items = queue_resp.json()
-            if isinstance(items, list):
-                queue_sample_size = len(items)
-                counter: Counter[str] = Counter()
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    for blocker in item.get("promotion_blockers") or []:
-                        if blocker == "conflict_recheck_not_run":
-                            continue
-                        counter[str(blocker)] += 1
-                top_blockers = [
-                    {"code": code, "count": n} for code, n in counter.most_common(5)
-                ]
-    except (httpx.RequestError, ValueError):
-        pass
+        queue_resp = await client.get(
+            "/v1/review/queue", params={"limit": _MAX_REVIEW_QUEUE_SAMPLE}
+        )
+    except httpx.RequestError:
+        queue_error = "GET /v1/review/queue was unreachable."
+    else:
+        if queue_resp.status_code != 200:
+            queue_error = f"GET /v1/review/queue returned HTTP {queue_resp.status_code}."
+        else:
+            try:
+                queue_body = queue_resp.json()
+            except ValueError:
+                queue_error = "GET /v1/review/queue returned malformed JSON."
 
-    evidence["queue_sample_size"] = queue_sample_size
-    evidence["top_blockers"] = top_blockers
+    blocker_lists = None
+    if queue_error is None:
+        blocker_lists = _validate_review_queue(queue_body)
+        if blocker_lists is None:
+            queue_error = "GET /v1/review/queue returned an invalid shape."
+
+    if queue_error is not None or blocker_lists is None:
+        return _check(
+            CHECK_REVIEW_BACKLOG,
+            "unknown",
+            "REVIEW_QUEUE_UNAVAILABLE",
+            queue_error or "GET /v1/review/queue returned an invalid shape.",
+            evidence=evidence,
+        )
+
+    evidence["queue_sample_size"] = len(blocker_lists)
+    evidence["top_blockers"] = _rank_blockers(blocker_lists)
     evidence["promotion_preview_limitation"] = (
         "conflict_recheck_not_run is excluded from blocker ranking; promotion "
         "preview never runs the conflict recheck."
@@ -764,7 +913,7 @@ async def _job_health_counts(
     tenant_id: str | None,
     lease_stale_after_seconds: int,
     now: datetime,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     dead_where = ["status = 'dead'"]
     dead_params: dict[str, Any] = {}
     if tenant_id is not None:
@@ -784,9 +933,35 @@ async def _job_health_counts(
     stale_count = await session.scalar(
         text(f"SELECT count(*) FROM jobs WHERE {' AND '.join(stale_where)}"), stale_params
     )
+
+    # Only jobs that are actually DUE (run_after <= effective now) count as
+    # backlog — a retry sleeping under backoff or a job intentionally
+    # scheduled in the future is not yet runnable and must not be diagnosed
+    # as an aged backlog just because it is old (ENG-LOOP-001A-FIX1 / FIX-4).
+    due_where = ["status = 'pending'", "run_after <= :now"]
+    due_params: dict[str, Any] = {"now": now}
+    if tenant_id is not None:
+        due_where.append("tenant_id = :tenant_id")
+        due_params["tenant_id"] = tenant_id
+    due_row = (
+        await session.execute(
+            text(
+                "SELECT count(*) AS n, min(run_after) AS oldest_run_after "
+                f"FROM jobs WHERE {' AND '.join(due_where)}"
+            ),
+            due_params,
+        )
+    ).mappings().one()
+    oldest_run_after = due_row["oldest_run_after"]
+    oldest_due_pending_age_seconds = (
+        (now - oldest_run_after).total_seconds() if oldest_run_after is not None else None
+    )
+
     return {
         "dead_jobs": int(dead_count or 0),
         "stale_running_jobs": int(stale_count or 0),
+        "due_pending_jobs": int(due_row["n"] or 0),
+        "oldest_due_pending_age_seconds": oldest_due_pending_age_seconds,
     }
 
 
@@ -883,22 +1058,40 @@ async def _receipts_activity_evidence(
         unmatched_params,
     )
 
-    latest_stmt = select(ContextReceipt).order_by(ContextReceipt.created_at.desc()).limit(1)
+    # Scoped to the SAME [since, until) window as every other figure here —
+    # otherwise a report for an older window could fail because of a receipt
+    # entirely outside that window (ENG-LOOP-001A-FIX1 / FIX-5). Deterministic
+    # tie-break (id DESC) so two receipts sharing one created_at timestamp
+    # resolve identically on every run.
+    latest_stmt = (
+        select(ContextReceipt)
+        .where(ContextReceipt.created_at >= since, ContextReceipt.created_at < until)
+        .order_by(ContextReceipt.created_at.desc(), ContextReceipt.id.desc())
+        .limit(1)
+    )
     if tenant_id is not None:
         latest_stmt = latest_stmt.where(ContextReceipt.tenant_id == tenant_id)
     latest_receipt = (await session.execute(latest_stmt)).scalars().first()
 
     latest_verification_status: str | None = None
+    latest_verification_error: str | None = None
     latest_receipt_at = None
     if latest_receipt is not None:
         latest_receipt_at = latest_receipt.created_at
-        result = await verify_context_receipt_with_recall_log(
-            session,
-            latest_receipt,
-            tenant_id=latest_receipt.tenant_id,
-            principal_id=latest_receipt.principal_id,
-        )
-        latest_verification_status = result.status
+        # Verification is isolated from the count queries above: a technical
+        # failure verifying the receipt (e.g. a transient error loading the
+        # parent recall log) must not be conflated with stored-artifact
+        # corruption, and must not erase the already-gathered counts.
+        try:
+            result = await verify_context_receipt_with_recall_log(
+                session,
+                latest_receipt,
+                tenant_id=latest_receipt.tenant_id,
+                principal_id=latest_receipt.principal_id,
+            )
+            latest_verification_status = result.status
+        except Exception as exc:  # noqa: BLE001 - see docstring
+            latest_verification_error = type(exc).__name__
 
     return {
         "startup_recall_count": int(startup_recall_count or 0),
@@ -906,6 +1099,7 @@ async def _receipts_activity_evidence(
         "unmatched_startup_recall_count": int(unmatched_count or 0),
         "latest_receipt_at": latest_receipt_at,
         "latest_verification_status": latest_verification_status,
+        "latest_verification_error": latest_verification_error,
     }
 
 
@@ -915,7 +1109,7 @@ async def _receipts_activity_evidence(
 def _check_worker_queue(
     *,
     snapshot: OperationalSnapshot | None,
-    job_health: dict[str, int] | None,
+    job_health: dict[str, Any] | None,
     tenant_unresolved: bool,
     db_error: str | None,
     lease_stale_after_seconds: int,
@@ -945,11 +1139,17 @@ def _check_worker_queue(
         )
     dead = job_health["dead_jobs"]
     stale = job_health["stale_running_jobs"]
-    oldest_pending = snapshot.worker.get("oldest_pending_age_seconds")
+    due_pending = job_health["due_pending_jobs"]
+    oldest_due_pending = job_health["oldest_due_pending_age_seconds"]
     evidence = {
         "dead_jobs": dead,
         "stale_running_jobs": stale,
-        "oldest_pending_age_seconds": oldest_pending,
+        "due_pending_jobs": due_pending,
+        "oldest_due_pending_age_seconds": oldest_due_pending,
+        # Legacy usage-report figure (oldest PENDING job by created_at,
+        # regardless of run_after) retained for transparency only — the
+        # status decision below uses only DUE pending work.
+        "oldest_pending_age_seconds": snapshot.worker.get("oldest_pending_age_seconds"),
     }
     if dead > 0:
         return _check(
@@ -971,13 +1171,19 @@ def _check_worker_queue(
                 "Confirm a worker process is running; stale jobs are reclaimed automatically."
             ],
         )
-    oldest_pending_numeric = float(oldest_pending) if oldest_pending is not None else None
-    if oldest_pending_numeric is not None and oldest_pending_numeric > lease_stale_after_seconds:
+    oldest_due_pending_numeric = (
+        float(oldest_due_pending) if oldest_due_pending is not None else None
+    )
+    if (
+        oldest_due_pending_numeric is not None
+        and oldest_due_pending_numeric > lease_stale_after_seconds
+    ):
         return _check(
             CHECK_WORKER_QUEUE,
             "warn",
             "PENDING_BACKLOG_AGED",
-            f"Oldest pending job has waited {int(oldest_pending_numeric)}s.",
+            f"Oldest due pending job has waited {int(oldest_due_pending_numeric)}s "
+            f"past its scheduled run time ({due_pending} job(s) currently due).",
             evidence=evidence,
             remediation=["Confirm the worker ('engram worker') is running."],
         )
@@ -1094,7 +1300,12 @@ def _check_capture_remember(
     deduped = int(funnel.get("deduped", 0) or 0)
     superseded = int(funnel.get("superseded", 0) or 0)
     failed = int(funnel.get("failed", 0) or 0)
-    unresolved = int(funnel.get("candidate_ingests_unresolved", 0) or 0)
+    # The full LOGICAL unresolved-candidate count (ingest-based AND legacy
+    # correlation-only candidates with no terminal outcome yet) drives the
+    # status decision below; a narrower ingest-only count is also preserved
+    # in evidence for operators who want that specific breakdown.
+    unresolved = int(funnel.get("unresolved_candidates", 0) or 0)
+    unresolved_ingests = int(funnel.get("candidate_ingests_unresolved", 0) or 0)
     lifecycle_extracted = int(funnel.get("lifecycle_extracted", 0) or 0)
     success = created + deduped + superseded
     evidence: dict[str, Any] = {
@@ -1103,7 +1314,8 @@ def _check_capture_remember(
         "deduped": deduped,
         "superseded": superseded,
         "failed": failed,
-        "unresolved_ingests": unresolved,
+        "unresolved_candidates": unresolved,
+        "unresolved_ingests": unresolved_ingests,
         "time_to_first_success_ms_p50": funnel.get("time_to_first_success_ms_p50"),
         "time_to_first_success_ms_p90": funnel.get("time_to_first_success_ms_p90"),
     }
@@ -1123,7 +1335,32 @@ def _check_capture_remember(
             "No candidate activity observed in the window.",
             evidence=evidence,
         )
-    if failed > 0 and success == 0:
+
+    has_success = success > 0
+    has_failed = failed > 0
+    has_unresolved = unresolved > 0
+
+    # An unresolved logical candidate (no terminal outcome yet) is never
+    # silently folded into success or failure — only a genuinely resolved
+    # terminal outcome can produce PASS or FAIL.
+    if has_success and has_failed:
+        summary = f"{failed} remember attempt(s) failed in the window."
+        if has_unresolved:
+            summary += f" {unresolved} candidate(s) also remain unresolved."
+        return _check(
+            CHECK_CAPTURE_REMEMBER, "warn", "REMEMBER_PARTIAL_FAILURES", summary,
+            evidence=evidence,
+        )
+    if has_failed:
+        if has_unresolved:
+            return _check(
+                CHECK_CAPTURE_REMEMBER,
+                "warn",
+                "REMEMBER_OUTCOMES_PENDING",
+                f"{failed} failed and {unresolved} unresolved candidate(s); "
+                "no successful outcome yet in the window.",
+                evidence=evidence,
+            )
         return _check(
             CHECK_CAPTURE_REMEMBER,
             "fail",
@@ -1132,19 +1369,28 @@ def _check_capture_remember(
             evidence=evidence,
             remediation=["Inspect worker/service logs for the remember pipeline."],
         )
-    if failed > 0:
+    if has_unresolved:
         return _check(
             CHECK_CAPTURE_REMEMBER,
             "warn",
-            "REMEMBER_PARTIAL_FAILURES",
-            f"{failed} remember attempt(s) failed in the window.",
+            "REMEMBER_OUTCOMES_PENDING",
+            f"{unresolved} candidate(s) have not yet resolved to a terminal outcome.",
+            evidence=evidence,
+        )
+    if has_success:
+        return _check(
+            CHECK_CAPTURE_REMEMBER,
+            "pass",
+            "REMEMBER_PIPELINE_HEALTHY",
+            "Candidates are reaching the server and resolving successfully.",
             evidence=evidence,
         )
     return _check(
         CHECK_CAPTURE_REMEMBER,
-        "pass",
-        "REMEMBER_PIPELINE_HEALTHY",
-        "Candidates are reaching the server and resolving successfully.",
+        "unknown",
+        "REMEMBER_EVIDENCE_INCOMPLETE",
+        "Candidate observations exist but no success, failure, or unresolved "
+        "outcome could be established from available evidence.",
         evidence=evidence,
     )
 
@@ -1196,6 +1442,15 @@ def _check_receipts_activity(
     tenant_unresolved: bool,
     db_error: str | None,
 ) -> DoctorCheck:
+    """Evaluate receipt integrity for the requested window.
+
+    Precedence (ENG-LOOP-001A-FIX1 / FIX-5): stored-artifact corruption of the
+    latest IN-WINDOW receipt is reported as a failure regardless of whether
+    new receipt dark writes happen to be enabled on THIS process right now —
+    local write configuration must never hide an existing integrity defect.
+    ``RECEIPTS_DISABLED`` is reached only once no invalid/unverifiable
+    receipt has been detected.
+    """
     dark_write_enabled = bool(settings_obj.context_receipt_dark_write_enabled)
     if tenant_unresolved:
         return _check(
@@ -1205,34 +1460,15 @@ def _check_receipts_activity(
             "Tenant scope could not be resolved; receipt evidence cannot be scoped.",
             evidence={"dark_write_enabled": dark_write_enabled},
         )
-    if not dark_write_enabled:
-        return _check(
-            CHECK_RECEIPTS_ACTIVITY,
-            "warn",
-            "RECEIPTS_DISABLED",
-            "Context Receipt dark writes are disabled on this process.",
-            evidence={"dark_write_enabled": False},
-            remediation=[
-                "Set ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_ENABLED=true to enable receipt writes."
-            ],
-        )
     if receipts_evidence is None:
         return _check(
             CHECK_RECEIPTS_ACTIVITY,
             "unknown",
             "RECEIPTS_EVIDENCE_UNAVAILABLE",
             "Receipt evidence unavailable (database inspection failed).",
-            evidence={"dark_write_enabled": True, "error_type": db_error},
+            evidence={"dark_write_enabled": dark_write_enabled, "error_type": db_error},
         )
-    evidence: dict[str, Any] = {"dark_write_enabled": True, **receipts_evidence}
-    if receipts_evidence["startup_recall_count"] == 0:
-        return _check(
-            CHECK_RECEIPTS_ACTIVITY,
-            "unknown",
-            "NO_STARTUP_RECALL_TO_ASSESS",
-            "No startup recalls in the window to assess receipt creation.",
-            evidence=evidence,
-        )
+    evidence: dict[str, Any] = {"dark_write_enabled": dark_write_enabled, **receipts_evidence}
     if receipts_evidence["latest_verification_status"] == "invalid":
         return _check(
             CHECK_RECEIPTS_ACTIVITY,
@@ -1243,6 +1479,34 @@ def _check_receipts_activity(
             remediation=[
                 "Investigate the receipt repository/verification path for data corruption."
             ],
+        )
+    if receipts_evidence.get("latest_verification_error"):
+        return _check(
+            CHECK_RECEIPTS_ACTIVITY,
+            "unknown",
+            "LATEST_RECEIPT_UNVERIFIABLE",
+            "The latest Context Receipt could not be verified (not a confirmed "
+            "corruption finding).",
+            evidence=evidence,
+        )
+    if not dark_write_enabled:
+        return _check(
+            CHECK_RECEIPTS_ACTIVITY,
+            "warn",
+            "RECEIPTS_DISABLED",
+            "Context Receipt dark writes are disabled on this process.",
+            evidence=evidence,
+            remediation=[
+                "Set ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_ENABLED=true to enable receipt writes."
+            ],
+        )
+    if receipts_evidence["startup_recall_count"] == 0:
+        return _check(
+            CHECK_RECEIPTS_ACTIVITY,
+            "unknown",
+            "NO_STARTUP_RECALL_TO_ASSESS",
+            "No startup recalls in the window to assess receipt creation.",
+            evidence=evidence,
         )
     if (
         receipts_evidence["receipt_count"] == 0
@@ -1268,15 +1532,28 @@ def _check_receipts_activity(
 # --- Session-factory construction --------------------------------------------
 
 
-def _build_session_factory(database_url: str | None) -> Callable[[], Any]:
+def _build_session_factory(
+    database_url: str | None,
+) -> tuple[Callable[[], Any], AsyncEngine | None]:
+    """Build a session factory, plus the ad hoc engine (if any) that backs it.
+
+    ``database_url is None`` reuses the process's already-configured,
+    caller-owned ``owner_session_factory`` — the second element is ``None``
+    so the caller never disposes an engine it does not own. An explicit
+    ``database_url`` builds a one-shot engine for this run only; the caller
+    is responsible for disposing it exactly once (ENG-LOOP-001A-FIX1 /
+    FIX-7), since nothing else references or reuses it.
+    """
     if database_url is None:
         from engram.db import owner_session_factory
 
-        return owner_session_factory
+        return owner_session_factory, None
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-    engine = create_async_engine(database_url, echo=False, pool_size=1, max_overflow=0)
-    return async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    engine = create_async_engine(
+        normalize_database_url(database_url), echo=False, pool_size=1, max_overflow=0
+    )
+    return async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False), engine
 
 
 def _default_clock() -> datetime:
@@ -1295,7 +1572,7 @@ def _default_settings() -> Any:
 @dataclass(frozen=True)
 class _DbEvidence:
     snapshot: OperationalSnapshot | None
-    job_health: dict[str, int] | None
+    job_health: dict[str, Any] | None
     lifecycle_extra: dict[str, Any] | None
     recall_evidence: dict[str, Any] | None
     receipts_evidence: dict[str, Any] | None
@@ -1313,43 +1590,54 @@ async def _gather_db_evidence(
     timeout_seconds: float,
 ) -> _DbEvidence:
     try:
-        async with session_factory() as session:
-            if session.bind is not None and session.bind.dialect.name == "postgresql":
-                await session.execute(text("SET TRANSACTION READ ONLY"))
-                # Bound every statement in this transaction so a hung/slow
-                # query cannot hang doctor indefinitely, matching the HTTP
-                # client's own --timeout-seconds bound.
-                await session.execute(
-                    text("SELECT set_config('statement_timeout', :ms, true)"),
-                    {"ms": str(int(timeout_seconds * 1000))},
-                )
+        # One bounded deadline covers session acquisition, transaction setup,
+        # every evidence query, and rollback — a session factory whose async
+        # context entry itself stalls (not just a slow query) can otherwise
+        # hang doctor indefinitely (ENG-LOOP-001A-FIX1 / FIX-6).
+        async with asyncio.timeout(timeout_seconds):
+            async with session_factory() as session:
+                if session.bind is not None and session.bind.dialect.name == "postgresql":
+                    await session.execute(text("SET TRANSACTION READ ONLY"))
+                    # Bound every statement in this transaction so a hung/slow
+                    # query cannot hang doctor indefinitely, matching the HTTP
+                    # client's own --timeout-seconds bound.
+                    await session.execute(
+                        text("SELECT set_config('statement_timeout', :ms, true)"),
+                        {"ms": str(seconds_to_statement_timeout_ms(timeout_seconds))},
+                    )
 
-            snapshot, err1 = await _isolated(
-                session,
-                build_operational_snapshot(session, tenant_id=tenant_id, since=since, until=until),
-            )
-            job_health, err2 = await _isolated(
-                session,
-                _job_health_counts(
+                snapshot, err1 = await _isolated(
                     session,
-                    tenant_id=tenant_id,
-                    lease_stale_after_seconds=lease_stale_after_seconds,
-                    now=now,
-                ),
-            )
-            lifecycle_extra, err3 = await _isolated(
-                session,
-                _lifecycle_summary_extra(session, tenant_id=tenant_id, since=since, until=until),
-            )
-            recall_evidence, err4 = await _isolated(
-                session,
-                _recall_activity_counts(session, tenant_id=tenant_id, since=since, until=until),
-            )
-            receipts_evidence, err5 = await _isolated(
-                session,
-                _receipts_activity_evidence(session, tenant_id=tenant_id, since=since, until=until),
-            )
-            await session.rollback()
+                    build_operational_snapshot(
+                        session, tenant_id=tenant_id, since=since, until=until
+                    ),
+                )
+                job_health, err2 = await _isolated(
+                    session,
+                    _job_health_counts(
+                        session,
+                        tenant_id=tenant_id,
+                        lease_stale_after_seconds=lease_stale_after_seconds,
+                        now=now,
+                    ),
+                )
+                lifecycle_extra, err3 = await _isolated(
+                    session,
+                    _lifecycle_summary_extra(
+                        session, tenant_id=tenant_id, since=since, until=until
+                    ),
+                )
+                recall_evidence, err4 = await _isolated(
+                    session,
+                    _recall_activity_counts(session, tenant_id=tenant_id, since=since, until=until),
+                )
+                receipts_evidence, err5 = await _isolated(
+                    session,
+                    _receipts_activity_evidence(
+                        session, tenant_id=tenant_id, since=since, until=until
+                    ),
+                )
+                await session.rollback()
         error_type = next((e for e in (err1, err2, err3, err4, err5) if e), None)
         return _DbEvidence(
             snapshot=snapshot,
@@ -1360,6 +1648,8 @@ async def _gather_db_evidence(
             error_type=error_type,
         )
     except Exception as exc:  # noqa: BLE001 - DB inspection must never abort the report
+        # Never surface str(exc): a connection/provider/timeout exception can
+        # embed a DSN, hostname, username, or password.
         return _DbEvidence(
             snapshot=None,
             job_health=None,
@@ -1394,96 +1684,109 @@ async def run_doctor(
     now = (clock or _default_clock)()
     resolved_since, resolved_until = resolve_window(since=since, until=until, now=now)
     effective_settings = settings_obj if settings_obj is not None else _default_settings()
-    factory = (
-        session_factory if session_factory is not None else _build_session_factory(database_url)
-    )
+    one_shot_engine: AsyncEngine | None = None
+    if session_factory is not None:
+        factory = session_factory
+    else:
+        factory, one_shot_engine = _build_session_factory(database_url)
 
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    client_kwargs: dict[str, Any] = {
-        "base_url": base_url,
-        "timeout": timeout_seconds,
-        "headers": headers,
-    }
-    if http_transport is not None:
-        client_kwargs["transport"] = http_transport
+    try:
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        client_kwargs: dict[str, Any] = {
+            "base_url": base_url,
+            "timeout": timeout_seconds,
+            "headers": headers,
+        }
+        if http_transport is not None:
+            client_kwargs["transport"] = http_transport
 
-    checks: list[DoctorCheck] = []
-    async with httpx.AsyncClient(**client_kwargs) as client:
-        checks.append(await _check_service_health(client))
-        checks.append(await _check_service_readiness(client))
+        checks: list[DoctorCheck] = []
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            checks.append(await _check_service_health(client))
+            checks.append(await _check_service_readiness(client))
 
-        identity_check, effective_tenant, tenant_source = await _check_identity(
-            client, requested_tenant=tenant
-        )
-        checks.append(identity_check)
-        tenant_unresolved = effective_tenant is None
+            identity_check, effective_tenant, tenant_source = await _check_identity(
+                client, requested_tenant=tenant
+            )
+            checks.append(identity_check)
+            tenant_unresolved = effective_tenant is None
 
-        db_evidence = await _gather_db_evidence(
-            factory,
-            tenant_id=effective_tenant,
-            since=resolved_since,
-            until=resolved_until,
-            now=now,
-            lease_stale_after_seconds=effective_settings.job_lease_stale_after_seconds,
-            timeout_seconds=timeout_seconds,
-        )
-
-        checks.append(_check_config_embeddings(effective_settings, snapshot=db_evidence.snapshot))
-        checks.append(_check_config_classification(effective_settings))
-        checks.append(
-            _check_worker_queue(
-                snapshot=db_evidence.snapshot,
-                job_health=db_evidence.job_health,
-                tenant_unresolved=tenant_unresolved,
-                db_error=db_evidence.error_type,
+            db_evidence = await _gather_db_evidence(
+                factory,
+                tenant_id=effective_tenant,
+                since=resolved_since,
+                until=resolved_until,
+                now=now,
                 lease_stale_after_seconds=effective_settings.job_lease_stale_after_seconds,
+                timeout_seconds=timeout_seconds,
             )
-        )
-        checks.append(
-            _check_capture_lifecycle(
-                settings_obj=effective_settings,
-                snapshot=db_evidence.snapshot,
-                lifecycle_extra=db_evidence.lifecycle_extra,
-                tenant_unresolved=tenant_unresolved,
-                db_error=db_evidence.error_type,
-            )
-        )
-        checks.append(
-            _check_capture_remember(
-                settings_obj=effective_settings,
-                snapshot=db_evidence.snapshot,
-                tenant_unresolved=tenant_unresolved,
-                db_error=db_evidence.error_type,
-            )
-        )
-        checks.append(
-            _check_recall_activity(
-                recall_evidence=db_evidence.recall_evidence,
-                tenant_unresolved=tenant_unresolved,
-                db_error=db_evidence.error_type,
-            )
-        )
-        checks.append(
-            _check_receipts_activity(
-                settings_obj=effective_settings,
-                receipts_evidence=db_evidence.receipts_evidence,
-                tenant_unresolved=tenant_unresolved,
-                db_error=db_evidence.error_type,
-            )
-        )
-        checks.append(await _check_review_backlog(client))
 
-    overall_status, exit_code = aggregate_status(checks)
-    return DoctorReport(
-        engram_version=__version__,
-        generated_at=now,
-        window=DoctorWindow(since=resolved_since, until=resolved_until),
-        scope=DoctorScope(tenant_id=effective_tenant, source=tenant_source),
-        overall_status=overall_status,
-        exit_code=exit_code,
-        checks=checks,
-        limitations=list(REQUIRED_LIMITATIONS),
-    )
+            checks.append(
+                _check_config_embeddings(effective_settings, snapshot=db_evidence.snapshot)
+            )
+            checks.append(_check_config_classification(effective_settings))
+            checks.append(
+                _check_worker_queue(
+                    snapshot=db_evidence.snapshot,
+                    job_health=db_evidence.job_health,
+                    tenant_unresolved=tenant_unresolved,
+                    db_error=db_evidence.error_type,
+                    lease_stale_after_seconds=effective_settings.job_lease_stale_after_seconds,
+                )
+            )
+            checks.append(
+                _check_capture_lifecycle(
+                    settings_obj=effective_settings,
+                    snapshot=db_evidence.snapshot,
+                    lifecycle_extra=db_evidence.lifecycle_extra,
+                    tenant_unresolved=tenant_unresolved,
+                    db_error=db_evidence.error_type,
+                )
+            )
+            checks.append(
+                _check_capture_remember(
+                    settings_obj=effective_settings,
+                    snapshot=db_evidence.snapshot,
+                    tenant_unresolved=tenant_unresolved,
+                    db_error=db_evidence.error_type,
+                )
+            )
+            checks.append(
+                _check_recall_activity(
+                    recall_evidence=db_evidence.recall_evidence,
+                    tenant_unresolved=tenant_unresolved,
+                    db_error=db_evidence.error_type,
+                )
+            )
+            checks.append(
+                _check_receipts_activity(
+                    settings_obj=effective_settings,
+                    receipts_evidence=db_evidence.receipts_evidence,
+                    tenant_unresolved=tenant_unresolved,
+                    db_error=db_evidence.error_type,
+                )
+            )
+            checks.append(await _check_review_backlog(client))
+
+        overall_status, exit_code = aggregate_status(checks)
+        return DoctorReport(
+            engram_version=__version__,
+            generated_at=now,
+            window=DoctorWindow(since=resolved_since, until=resolved_until),
+            scope=DoctorScope(tenant_id=effective_tenant, source=tenant_source),
+            overall_status=overall_status,
+            exit_code=exit_code,
+            checks=checks,
+            limitations=list(REQUIRED_LIMITATIONS),
+        )
+    finally:
+        # Only an engine THIS call constructed (an explicit --database-url,
+        # never the injected/global owner_session_factory) is ours to
+        # dispose. Disposed exactly once, on every path: success, a raised
+        # exception, or the internal DB-evidence timeout (ENG-LOOP-001A-FIX1
+        # / FIX-7).
+        if one_shot_engine is not None:
+            await one_shot_engine.dispose()
 
 
 # --- Rendering -----------------------------------------------------------------

@@ -22,9 +22,12 @@ read-only PostgreSQL evidence (reusing the same aggregation SQL as
 - **Evidence-based, not a live probe.** It never issues a recall (a recall
   writes recall logs, may run lazy promotion, and may create a Context
   Receipt) and never calls a live embedding or classification provider.
-- **Bounded.** Every HTTP request and database statement is bounded by
-  `--timeout-seconds`. One failed or unreachable check never aborts the rest
-  of the report — the fullest safe report is always produced.
+- **Bounded.** Every HTTP request is bounded by `--timeout-seconds`. All
+  database evidence gathering — including acquiring a session, not just each
+  statement — runs under one outer `--timeout-seconds` deadline, so a stalled
+  connection or session factory cannot hang the report. One failed or
+  unreachable check never aborts the rest of the report — the fullest safe
+  report is always produced.
 
 ## Usage
 
@@ -50,7 +53,7 @@ engram doctor --tenant 11111111-1111-1111-1111-111111111111 \
 | `--base-url`         | Engram API URL. Default: `ENGRAM_BASE_URL`, else a loopback URL on the configured service port. |
 | `--tenant`            | Tenant UUID for database-level evidence. Default: the tenant returned by `/whoami`. When identity cannot be resolved, tenant-specific checks are marked `unknown` rather than silently reporting deployment-wide counts as tenant truth. |
 | `--since` / `--until` | Timezone-aware ISO-8601 window bounds. Default: the last 24 hours. |
-| `--database-url`      | Operator database URL. Default: `ENGRAM_OWNER_DATABASE_URL`, then `ENGRAM_DATABASE_URL`. Never echoed, serialized, or logged. |
+| `--database-url`      | Operator database URL. Default: `ENGRAM_OWNER_DATABASE_URL`, then `ENGRAM_DATABASE_URL`. Accepts `postgresql://` or `postgresql+asyncpg://` (the former is normalized to the latter). Never echoed, serialized, or logged. |
 | `--timeout-seconds`   | Finite, strictly positive HTTP/diagnostic timeout (default 10s). Zero, negative, NaN, and infinite values are rejected, not coerced. |
 | `--json`              | Emit only the stable `engram.doctor` JSON report. Human-readable output is the default. |
 
@@ -108,12 +111,12 @@ counts, timestamps, status codes, and configuration-presence booleans.
 | 3 | `identity.scopes` | `GET /whoami` | Fail on auth failure or missing read/write. Warn on tenant mismatch. `admin` satisfies every scope. | Does not prove an agent's key/scopes, only the CLI's. |
 | 4 | `config.embeddings` | Local `ENGRAM_EMBEDDING_*` settings + storage counts | Warn if `provider=none`. Fail only for an inconsistent enabled provider. | No live provider call. |
 | 5 | `config.classification` | Local `ENGRAM_CLASSIFICATION_*` settings | Warn if `provider=none` (rule-only). Fail only for an inconsistent enabled provider. | No live provider call. |
-| 6 | `worker.queue` | `usage_report` worker aggregation + bounded dead/stale/due-pending queries | Fail on dead or stale-running jobs. Warn on an aged pending backlog. | Describes the queue, not a specific worker process. |
+| 6 | `worker.queue` | `usage_report` worker aggregation + bounded dead/stale/due-pending queries | Fail on dead or stale-running jobs. Warn on an aged **due** pending backlog (`run_after <= now`) — an old `created_at` alone, for a job not yet due, is not a symptom. | Describes the queue, not a specific worker process. |
 | 7 | `capture.lifecycle` | `usage_report` coverage/candidate-funnel + client `lifecycle_summary` events | Unknown when telemetry is disabled. Warn on no evidence or reported errors. | Client-reported, untrusted diagnostic evidence. |
-| 8 | `capture.remember` | `usage_report` candidate-funnel (server-observed) | Warn when extraction is observed but nothing reaches the server. Fail when every attempt in the window failed. | Requires `ENGRAM_USAGE_TELEMETRY_ENABLED=true`. |
+| 8 | `capture.remember` | `usage_report` candidate-funnel (server-observed) | Warn when extraction is observed but nothing reaches the server, or outcomes are still pending (unresolved candidates and no success/failure yet). Fail only when every resolved attempt in the window failed, with none succeeded or still pending. | Requires `ENGRAM_USAGE_TELEMETRY_ENABLED=true`. |
 | 9 | `recall.activity` | `recall_logs` (read-only) | Warn when no recall activity in the window. | Does not prove recalled context reached a model prompt. |
-| 10 | `receipts.activity` | Local dark-write setting + `context_receipts`/`recall_logs` + repository verifier | Warn when disabled or a gap exists (writes are fail-open). Fail when the latest receipt fails verification. Unknown when there is no startup recall to assess. | Proves what was served, not factual truth or causality. |
-| 11 | `review.backlog` | `GET /v1/review/stats` + bounded `GET /v1/review/queue?limit=100` | Pass when observed. Unknown when the credential lacks review authority or the call fails. | `conflict_recheck_not_run` is excluded from blocker ranking and reported as a known preview limitation; no conflict recheck runs. |
+| 10 | `receipts.activity` | Local dark-write setting + `context_receipts`/`recall_logs` + repository verifier | Selects the latest receipt **within the requested window** (ties broken deterministically). Fails on an invalid receipt regardless of whether dark writes are currently disabled locally. Otherwise warns when disabled or a gap exists (writes are fail-open). Unknown when there is no startup recall to assess, or the latest receipt could not be verified. | Proves what was served, not factual truth or causality. |
+| 11 | `review.backlog` | `GET /v1/review/stats` + bounded `GET /v1/review/queue?limit=100` | Passes only when both stats and queue evidence are present and strictly well-typed — malformed or nonsensical evidence is never coerced into a pass. Unknown when the credential lacks review authority, the call fails, or evidence fails validation. | `conflict_recheck_not_run` is excluded from blocker ranking and reported as a known preview limitation; no conflict recheck runs. |
 
 ## Example outputs (sanitized)
 
@@ -189,6 +192,78 @@ classifies, embeds, enqueues, retries, reclaims, archives, verifies,
 disputes, or supersedes anything. Database inspection runs inside an
 explicitly read-only transaction (`SET TRANSACTION READ ONLY` on PostgreSQL)
 and is rolled back on exit, never committed.
+
+## FIX1 corrections (ENG-LOOP-001A-FIX1)
+
+A post-review hardening pass corrected seven truthfulness, redaction, and
+bounded-execution defects found in the initial implementation. The 11-check
+report, its ordering, the `engram.doctor` v1.0 schema, exit-code mapping, and
+read-only guarantees are unchanged; only the semantics below were corrected.
+
+1. **`/ready` redaction.** `GET /ready`'s exception handler
+   (`engram/api/routes/health.py`) no longer returns `str(exception)` — a
+   driver/connection exception can embed a DSN, hostname, username, or
+   password. It now returns only the exception's type name
+   (`error_type`). `service.readiness` evidence is built from a strict
+   allow-list of known categorical/version fields (`_safe_readiness_evidence`)
+   and never copies `reason`/`detail`/`error`/`message` from the response
+   body, even if `/ready` is later changed to include them.
+2. **`review.backlog` strict validation.** Both `/v1/review/stats` and
+   `/v1/review/queue` evidence are now validated for well-formed types before
+   a pass is possible — a malformed count, a negative number, or an
+   unexpected shape can no longer be silently coerced into a healthy report.
+   Malformed evidence degrades to `unknown` (`REVIEW_BACKLOG_UNAVAILABLE` for
+   malformed stats, `REVIEW_QUEUE_UNAVAILABLE` for a malformed queue sample)
+   rather than aborting the report.
+3. **`capture.remember` unresolved-candidate truthfulness.** The check now
+   reads the full unresolved-candidate count (not just the ingest-specific
+   subset) and truthfully distinguishes three states: at least one success
+   (healthy, even with unresolved candidates pending), no success and no
+   failure but unresolved candidates exist (`REMEMBER_OUTCOMES_PENDING`, not
+   a failure), and every resolved attempt failed with nothing else pending
+   (`REMEMBER_PIPELINE_FAILED`). It no longer calls an unresolved
+   candidate "healthy" by omission, nor claims "every attempt failed" while
+   unresolved candidates are still in flight.
+4. **`worker.queue` due-pending backlog.** The aged-pending-backlog warning
+   now requires the oldest pending job to actually be **due**
+   (`run_after <= now`), computed via a dedicated bounded query. A job
+   scheduled for the future is never flagged as backlog merely because it was
+   *created* long ago.
+5. **`receipts.activity` window-scoped selection + integrity precedence.**
+   The "latest receipt" query now filters to the requested `[since, until)`
+   window (deterministically tie-broken by `created_at DESC, id DESC`)
+   instead of picking the newest receipt in the whole table regardless of
+   window. An invalid receipt now fails the check
+   (`LATEST_RECEIPT_INVALID`) **before** the disabled-dark-writes check, so a
+   real integrity failure is never masked by "receipts are disabled here."
+   A verification error that isn't a clean valid/invalid result is reported
+   separately (`LATEST_RECEIPT_UNVERIFIABLE`) rather than erasing the
+   evidence gathered so far.
+6. **Bounded DB evidence gathering.** A `--timeout-seconds` value under one
+   millisecond can no longer round down to `statement_timeout=0` (Postgres'
+   spelling for *unlimited*) — timeouts round up to at least 1ms
+   (`seconds_to_statement_timeout_ms`). The entire DB-evidence-gathering
+   operation, including acquiring a session (not just each statement), now
+   runs under one outer `asyncio.timeout(--timeout-seconds)` deadline, so a
+   session factory whose connection acquisition itself stalls cannot hang
+   the report.
+7. **`--database-url` scheme acceptance + one-shot engine disposal.** An
+   explicit `--database-url` now accepts both `postgresql://` and
+   `postgresql+asyncpg://` (the former is normalized to the latter, since
+   `create_async_engine` requires an async-capable driver encoded in the
+   URL). The ad hoc one-shot engine built for an explicit `--database-url`
+   is disposed exactly once — on success, on a raised exception, and on the
+   internal DB-evidence timeout — and only when this run constructed it; the
+   injected/global `owner_session_factory` path is never disposed.
+
+**Explicitly unchanged (non-goals held throughout FIX1):** no new REST
+endpoint; no database migration; no changes to recall, promotion, trust,
+review, RLS, profile narrowing, or Context Manifest contracts; no diagnostic
+recall; no live provider calls; no enabling of telemetry, receipts,
+embeddings, classification, or Hermes; no Hermes process inspection; no
+dashboard, tracing, or metrics framework; no changes to `engram usage-report`'s
+existing JSON schema or human output; no broadening into session-summary or
+live-dogfood slices; no `engram.doctor` schema version bump.
 
 See also: [Context Receipt Inspection](context-receipt-inspection.md),
 [dogfood usage metering](dogfood-usage-metering.md).

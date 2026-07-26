@@ -9,8 +9,10 @@ no-mutation, cross-tenant isolation) live in ``tests/test_doctor_postgres.py``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -26,21 +28,45 @@ from engram.doctor import (
     DoctorReport,
     DoctorScope,
     DoctorWindow,
+    _build_session_factory,
+    _check_capture_remember,
     _check_identity,
+    _check_receipts_activity,
     _check_review_backlog,
     _check_service_health,
     _check_service_readiness,
     aggregate_status,
+    normalize_database_url,
     parse_iso8601,
     render_human,
     resolve_base_url,
     resolve_database_url,
     resolve_window,
     run_doctor,
+    seconds_to_statement_timeout_ms,
     validate_timeout_seconds,
 )
+from engram.usage_report import OperationalSnapshot
 
 FIXED_NOW = datetime(2026, 7, 25, 12, 0, 0, tzinfo=UTC)
+
+
+class _TelemetryEnabledSettings:
+    usage_telemetry_enabled = True
+
+
+def _snapshot_with_funnel(funnel: dict[str, Any]) -> OperationalSnapshot:
+    base_funnel = {
+        "candidate_observations": 0, "created": 0, "deduped": 0, "superseded": 0,
+        "failed": 0, "unresolved_candidates": 0, "candidate_ingests_unresolved": 0,
+        "lifecycle_extracted": 0, "time_to_first_success_ms_p50": None,
+        "time_to_first_success_ms_p90": None,
+    }
+    base_funnel.update(funnel)
+    return OperationalSnapshot(
+        tenant_id="tenant-a", since=FIXED_NOW, until=FIXED_NOW,
+        coverage={}, candidate_funnel=base_funnel, worker={}, storage={},
+    )
 
 
 def _pass(check_id: str) -> DoctorCheck:
@@ -102,6 +128,20 @@ def test_validate_timeout_seconds_rejects_infinity():
 def test_validate_timeout_seconds_rejects_bool():
     with pytest.raises(ValueError, match="numeric"):
         validate_timeout_seconds(True)  # type: ignore[arg-type]
+
+
+def test_seconds_to_statement_timeout_ms_sub_millisecond_never_becomes_zero():
+    """A validated positive sub-ms timeout must never round down to 0 (no timeout)."""
+    assert seconds_to_statement_timeout_ms(0.0001) == 1
+    assert seconds_to_statement_timeout_ms(0.0000001) == 1
+
+
+def test_seconds_to_statement_timeout_ms_exact_second():
+    assert seconds_to_statement_timeout_ms(1.0) == 1000
+
+
+def test_seconds_to_statement_timeout_ms_rounds_up_not_down():
+    assert seconds_to_statement_timeout_ms(1.0001) == 1001
 
 
 def test_parse_iso8601_requires_tzaware():
@@ -190,6 +230,186 @@ def test_resolve_database_url_precedence(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.delenv("ENGRAM_DATABASE_URL")
     assert resolve_database_url(None) is None
+
+
+def test_normalize_database_url_rewrites_bare_postgresql_scheme():
+    """A bare postgresql:// must become postgresql+asyncpg:// (ENG-LOOP-001A-FIX1)."""
+    assert (
+        normalize_database_url("postgresql://user:pw@host:5432/db")
+        == "postgresql+asyncpg://user:pw@host:5432/db"
+    )
+
+
+def test_normalize_database_url_passes_through_explicit_asyncpg_scheme():
+    url = "postgresql+asyncpg://user:pw@host:5432/db"
+    assert normalize_database_url(url) == url
+
+
+def test_normalize_database_url_leaves_other_explicit_drivers_untouched():
+    """An operator-chosen non-asyncpg driver is never silently rewritten."""
+    url = "postgresql+psycopg://user:pw@host:5432/db"
+    assert normalize_database_url(url) == url
+
+
+async def test_build_session_factory_normalizes_and_returns_disposable_engine():
+    """An explicit --database-url builds a one-shot, normalized, disposable engine."""
+    factory, engine = _build_session_factory("postgresql://user:pw@host:5432/db")
+    try:
+        assert engine is not None
+        assert engine.url.drivername == "postgresql+asyncpg"
+        assert callable(factory)
+    finally:
+        await engine.dispose()
+
+
+def test_build_session_factory_reuses_global_factory_with_no_engine_to_dispose():
+    """``database_url=None`` reuses the process-owned factory; nothing to dispose."""
+    factory, engine = _build_session_factory(None)
+    assert engine is None
+    assert callable(factory)
+
+
+class _DisposeTrackingEngine:
+    def __init__(self) -> None:
+        self.dispose_calls = 0
+
+    async def dispose(self) -> None:
+        self.dispose_calls += 1
+
+
+class _ImmediatelyFailingSession:
+    """A fake AsyncSession-context-manager whose __aenter__ always raises."""
+
+    async def __aenter__(self) -> _ImmediatelyFailingSession:
+        raise RuntimeError("sentinel DB failure")
+
+    async def __aexit__(self, *exc_info: object) -> bool:
+        return False
+
+
+async def test_run_doctor_disposes_one_shot_engine_exactly_once_on_db_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A one-shot engine built from --database-url must be disposed exactly once.
+
+    Even when every DB-evidence query fails, disposal must still happen — the
+    engine this run constructed is never leaked (ENG-LOOP-001A-FIX1 / FIX-7).
+    """
+    fake_engine = _DisposeTrackingEngine()
+
+    def _fake_build_session_factory(database_url: str | None) -> tuple[Any, Any]:
+        assert database_url == "postgresql://explicit-host/db"
+        return (lambda: _ImmediatelyFailingSession()), fake_engine
+
+    monkeypatch.setattr("engram.doctor._build_session_factory", _fake_build_session_factory)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        if path == "/ready":
+            return httpx.Response(200, json={"status": "ready", "database": "connected"})
+        if path == "/whoami":
+            return httpx.Response(
+                200,
+                json={
+                    "principal_id": "p", "principal_type": "admin", "tenant_id": "t",
+                    "scopes": ["admin"], "api_key_id": "k", "memory_profile": None,
+                },
+            )
+        if path == "/v1/review/stats":
+            return httpx.Response(
+                200,
+                json={"by_review_status": {}, "by_kind": {}, "by_confidence": {}, "total": 0},
+            )
+        if path == "/v1/review/queue":
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, json={})
+
+    report = await run_doctor(
+        base_url="http://test",
+        database_url="postgresql://explicit-host/db",
+        http_transport=httpx.MockTransport(handler),
+        clock=lambda: FIXED_NOW,
+    )
+    assert fake_engine.dispose_calls == 1
+    by_id = {c.id: c for c in report.checks}
+    assert by_id["worker.queue"].status == "unknown"
+
+
+async def test_run_doctor_disposes_one_shot_engine_exactly_once_on_raised_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Disposal must also happen when report construction itself raises."""
+    fake_engine = _DisposeTrackingEngine()
+
+    def _fake_build_session_factory(database_url: str | None) -> tuple[Any, Any]:
+        return (lambda: _ImmediatelyFailingSession()), fake_engine
+
+    monkeypatch.setattr("engram.doctor._build_session_factory", _fake_build_session_factory)
+
+    def _explode(request: httpx.Request) -> httpx.Response:
+        raise RuntimeError("transport exploded")
+
+    with pytest.raises(RuntimeError, match="transport exploded"):
+        await run_doctor(
+            base_url="http://test",
+            database_url="postgresql://explicit-host/db",
+            http_transport=httpx.MockTransport(_explode),
+            clock=lambda: FIXED_NOW,
+        )
+    assert fake_engine.dispose_calls == 1
+
+
+async def test_run_doctor_does_not_call_build_session_factory_when_injected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller-injected session_factory bypasses one-shot engine construction.
+
+    ``_build_session_factory`` (and thus ``create_async_engine``) must never
+    run when a session_factory is injected — there is nothing for run_doctor
+    to own or dispose in this path.
+    """
+
+    def _fail_if_called(database_url: str | None) -> tuple[Any, Any]:
+        raise AssertionError(
+            "_build_session_factory must not be called when session_factory is injected"
+        )
+
+    monkeypatch.setattr("engram.doctor._build_session_factory", _fail_if_called)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        if path == "/ready":
+            return httpx.Response(200, json={"status": "ready", "database": "connected"})
+        if path == "/whoami":
+            return httpx.Response(
+                200,
+                json={
+                    "principal_id": "p", "principal_type": "admin", "tenant_id": "t",
+                    "scopes": ["admin"], "api_key_id": "k", "memory_profile": None,
+                },
+            )
+        if path == "/v1/review/stats":
+            return httpx.Response(
+                200,
+                json={"by_review_status": {}, "by_kind": {}, "by_confidence": {}, "total": 0},
+            )
+        if path == "/v1/review/queue":
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, json={})
+
+    report = await run_doctor(
+        base_url="http://test",
+        http_transport=httpx.MockTransport(handler),
+        session_factory=lambda: _ImmediatelyFailingSession(),
+        clock=lambda: FIXED_NOW,
+    )
+    by_id = {c.id: c for c in report.checks}
+    assert by_id["service.health"].status == "pass"
+    assert by_id["worker.queue"].status == "unknown"
 
 
 # --- Status aggregation / exit codes ------------------------------------------
@@ -293,6 +513,180 @@ def test_render_human_unhealthy():
     assert "[FAIL   ]" in text
 
 
+# --- capture.remember status truth table (ENG-LOOP-001A-FIX1 / FIX-3) --------
+
+
+def test_remember_unresolved_only_warns_not_pass():
+    """Unresolved-only candidate activity does not pass."""
+    snapshot = _snapshot_with_funnel(
+        {"candidate_observations": 1, "unresolved_candidates": 1}
+    )
+    check = _check_capture_remember(
+        settings_obj=_TelemetryEnabledSettings(), snapshot=snapshot,
+        tenant_unresolved=False, db_error=None,
+    )
+    assert check.status == "warn"
+    assert check.reason_code == "REMEMBER_OUTCOMES_PENDING"
+
+
+def test_remember_success_plus_unresolved_does_not_pass():
+    """One success plus one unresolved candidate does not pass."""
+    snapshot = _snapshot_with_funnel(
+        {"candidate_observations": 2, "created": 1, "unresolved_candidates": 1}
+    )
+    check = _check_capture_remember(
+        settings_obj=_TelemetryEnabledSettings(), snapshot=snapshot,
+        tenant_unresolved=False, db_error=None,
+    )
+    assert check.status == "warn"
+    assert check.reason_code == "REMEMBER_OUTCOMES_PENDING"
+
+
+def test_remember_failure_plus_unresolved_is_not_pipeline_failed():
+    """A failure plus an unresolved candidate must not claim every attempt failed."""
+    snapshot = _snapshot_with_funnel(
+        {"candidate_observations": 2, "failed": 1, "unresolved_candidates": 1}
+    )
+    check = _check_capture_remember(
+        settings_obj=_TelemetryEnabledSettings(), snapshot=snapshot,
+        tenant_unresolved=False, db_error=None,
+    )
+    assert check.status == "warn"
+    assert check.reason_code == "REMEMBER_OUTCOMES_PENDING"
+
+
+def test_remember_success_plus_failure_is_partial_failures_warning():
+    snapshot = _snapshot_with_funnel(
+        {"candidate_observations": 2, "created": 1, "failed": 1}
+    )
+    check = _check_capture_remember(
+        settings_obj=_TelemetryEnabledSettings(), snapshot=snapshot,
+        tenant_unresolved=False, db_error=None,
+    )
+    assert check.status == "warn"
+    assert check.reason_code == "REMEMBER_PARTIAL_FAILURES"
+
+
+def test_remember_success_failure_and_unresolved_mentions_unresolved():
+    snapshot = _snapshot_with_funnel(
+        {"candidate_observations": 3, "created": 1, "failed": 1, "unresolved_candidates": 1}
+    )
+    check = _check_capture_remember(
+        settings_obj=_TelemetryEnabledSettings(), snapshot=snapshot,
+        tenant_unresolved=False, db_error=None,
+    )
+    assert check.status == "warn"
+    assert check.reason_code == "REMEMBER_PARTIAL_FAILURES"
+    assert "unresolved" in check.summary
+
+
+def test_remember_failure_only_no_success_no_unresolved_fails():
+    snapshot = _snapshot_with_funnel({"candidate_observations": 1, "failed": 1})
+    check = _check_capture_remember(
+        settings_obj=_TelemetryEnabledSettings(), snapshot=snapshot,
+        tenant_unresolved=False, db_error=None,
+    )
+    assert check.status == "fail"
+    assert check.reason_code == "REMEMBER_PIPELINE_FAILED"
+
+
+def test_remember_success_only_passes():
+    snapshot = _snapshot_with_funnel({"candidate_observations": 1, "created": 1})
+    check = _check_capture_remember(
+        settings_obj=_TelemetryEnabledSettings(), snapshot=snapshot,
+        tenant_unresolved=False, db_error=None,
+    )
+    assert check.status == "pass"
+    assert check.reason_code == "REMEMBER_PIPELINE_HEALTHY"
+
+
+def test_remember_incomplete_evidence_is_unknown_not_pass():
+    """Observations exist but the funnel accounts for no success/failure/unresolved."""
+    snapshot = _snapshot_with_funnel({"candidate_observations": 1})
+    check = _check_capture_remember(
+        settings_obj=_TelemetryEnabledSettings(), snapshot=snapshot,
+        tenant_unresolved=False, db_error=None,
+    )
+    assert check.status == "unknown"
+    assert check.reason_code == "REMEMBER_EVIDENCE_INCOMPLETE"
+
+
+def test_remember_evidence_distinguishes_logical_from_ingest_unresolved():
+    snapshot = _snapshot_with_funnel(
+        {
+            "candidate_observations": 2, "unresolved_candidates": 2,
+            "candidate_ingests_unresolved": 1,
+        }
+    )
+    check = _check_capture_remember(
+        settings_obj=_TelemetryEnabledSettings(), snapshot=snapshot,
+        tenant_unresolved=False, db_error=None,
+    )
+    assert check.evidence["unresolved_candidates"] == 2
+    assert check.evidence["unresolved_ingests"] == 1
+
+
+# --- receipts.activity precedence (ENG-LOOP-001A-FIX1 / FIX-5) ---------------
+
+
+class _DarkWriteSettings:
+    def __init__(self, enabled: bool) -> None:
+        self.context_receipt_dark_write_enabled = enabled
+
+
+def test_receipts_invalid_receipt_fails_even_when_dark_writes_disabled():
+    """Local write configuration must never hide an existing integrity defect."""
+    evidence = {
+        "startup_recall_count": 1, "receipt_count": 1, "unmatched_startup_recall_count": 0,
+        "latest_receipt_at": FIXED_NOW, "latest_verification_status": "invalid",
+        "latest_verification_error": None,
+    }
+    check = _check_receipts_activity(
+        settings_obj=_DarkWriteSettings(False), receipts_evidence=evidence,
+        tenant_unresolved=False, db_error=None,
+    )
+    assert check.status == "fail"
+    assert check.reason_code == "LATEST_RECEIPT_INVALID"
+
+
+def test_receipts_unverifiable_is_unknown_not_healthy():
+    evidence = {
+        "startup_recall_count": 1, "receipt_count": 1, "unmatched_startup_recall_count": 0,
+        "latest_receipt_at": FIXED_NOW, "latest_verification_status": None,
+        "latest_verification_error": "SomeTransientError",
+    }
+    check = _check_receipts_activity(
+        settings_obj=_DarkWriteSettings(True), receipts_evidence=evidence,
+        tenant_unresolved=False, db_error=None,
+    )
+    assert check.status == "unknown"
+    assert check.reason_code == "LATEST_RECEIPT_UNVERIFIABLE"
+
+
+def test_receipts_unverifiable_takes_precedence_over_disabled():
+    evidence = {
+        "startup_recall_count": 1, "receipt_count": 1, "unmatched_startup_recall_count": 0,
+        "latest_receipt_at": FIXED_NOW, "latest_verification_status": None,
+        "latest_verification_error": "SomeTransientError",
+    }
+    check = _check_receipts_activity(
+        settings_obj=_DarkWriteSettings(False), receipts_evidence=evidence,
+        tenant_unresolved=False, db_error=None,
+    )
+    assert check.status == "unknown"
+    assert check.reason_code == "LATEST_RECEIPT_UNVERIFIABLE"
+
+
+def test_receipts_evidence_unavailable_regardless_of_dark_write_setting():
+    check = _check_receipts_activity(
+        settings_obj=_DarkWriteSettings(False), receipts_evidence=None,
+        tenant_unresolved=False, db_error="SomeError",
+    )
+    assert check.status == "unknown"
+    assert check.reason_code == "RECEIPTS_EVIDENCE_UNAVAILABLE"
+    assert check.evidence["dark_write_enabled"] is False
+
+
 # --- Individual check failure does not abort the rest -------------------------
 
 
@@ -353,6 +747,84 @@ async def test_individual_check_failure_does_not_abort_report():
     # DB-dependent checks degrade gracefully rather than raising.
     assert by_id["worker.queue"].status == "unknown"
     assert by_id["recall.activity"].status == "unknown"
+
+
+class _StallingSession:
+    """A fake AsyncSession-context-manager whose __aenter__ stalls."""
+
+    def __init__(self, delay_seconds: float) -> None:
+        self._delay_seconds = delay_seconds
+
+    async def __aenter__(self) -> _StallingSession:
+        await asyncio.sleep(self._delay_seconds)
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> bool:
+        return False
+
+
+async def test_stalled_session_acquisition_produces_completed_report_not_a_hang():
+    """A session factory whose async context entry stalls must not hang doctor.
+
+    The outer database-evidence deadline (ENG-LOOP-001A-FIX1 / FIX-6) bounds
+    session ACQUISITION itself, not just individual statements.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        if path == "/ready":
+            return httpx.Response(200, json={"status": "ready", "database": "connected"})
+        if path == "/whoami":
+            return httpx.Response(
+                200,
+                json={
+                    "principal_id": "p", "principal_type": "admin", "tenant_id": "t",
+                    "scopes": ["admin"], "api_key_id": "k", "memory_profile": None,
+                },
+            )
+        if path == "/v1/review/stats":
+            return httpx.Response(
+                200,
+                json={"by_review_status": {}, "by_kind": {}, "by_confidence": {}, "total": 0},
+            )
+        if path == "/v1/review/queue":
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, json={})
+
+    def _stalling_factory() -> _StallingSession:
+        return _StallingSession(delay_seconds=5.0)
+
+    started = time.monotonic()
+    report = await run_doctor(
+        base_url="http://test",
+        timeout_seconds=0.2,
+        http_transport=httpx.MockTransport(handler),
+        session_factory=_stalling_factory,
+        clock=lambda: FIXED_NOW,
+    )
+    elapsed = time.monotonic() - started
+    # Bounded by the 0.2s deadline, not the session's 5s stall.
+    assert elapsed < 4.0
+
+    ids = [c.id for c in report.checks]
+    assert ids == list(CHECK_ORDER)
+    by_id = {c.id: c for c in report.checks}
+    # Every DB-dependent check degrades to unknown rather than the whole
+    # report hanging or raising.
+    assert by_id["worker.queue"].status == "unknown"
+    assert by_id["capture.remember"].status == "unknown"
+    assert by_id["recall.activity"].status == "unknown"
+    assert by_id["receipts.activity"].status == "unknown"
+    # HTTP-only checks are unaffected by the stalled database resource.
+    assert by_id["service.health"].status == "pass"
+    assert by_id["identity.scopes"].status == "pass"
+    assert by_id["review.backlog"].status == "pass"
+    # No sentinel/timeout internals leak; only a safe type name may appear.
+    dumped = json.dumps(by_id["worker.queue"].evidence)
+    assert "5.0" not in dumped
+    assert "_StallingSession" not in dumped
 
 
 # --- JSON stdout purity / DoctorReport is valid JSON ---------------------------
@@ -476,6 +948,81 @@ async def test_service_readiness_not_ready_503():
     assert check.status == "fail"
     assert check.reason_code == "SERVICE_NOT_READY"
     assert check.evidence["pgvector"] == "0.6.0"
+
+
+async def test_service_readiness_malicious_body_never_leaks_free_text():
+    """/ready is untrusted input: only known categorical/version values survive."""
+
+    def handler(request):
+        return httpx.Response(
+            503,
+            json={
+                "status": "not_ready",
+                "database": "postgresql://sentinel_user:SENTINEL_PW@sentinel-host/db",
+                "rls": "arbitrary text injected by a hostile server",
+                "pgvector": "0.6.0; DROP TABLE tenants;",
+                "minimum_required": "not-a-version <script>",
+                "reason": "leaked secret token=SENTINEL_TOKEN_VALUE",
+                "detail": "SENTINEL_DETAIL_VALUE",
+                "error": "SENTINEL_ERROR_VALUE",
+                "message": "SENTINEL_MESSAGE_VALUE",
+            },
+        )
+
+    async with await _client(handler) as client:
+        check = await _check_service_readiness(client)
+    assert check.status == "fail"
+    assert check.reason_code == "SERVICE_NOT_READY"
+    rendered = json.dumps(check.evidence)
+    for sentinel in (
+        "sentinel_user", "SENTINEL_PW", "sentinel-host", "SENTINEL_TOKEN_VALUE",
+        "SENTINEL_DETAIL_VALUE", "SENTINEL_ERROR_VALUE", "SENTINEL_MESSAGE_VALUE",
+        "DROP TABLE", "<script>", "arbitrary text injected",
+    ):
+        assert sentinel not in rendered
+    # Unvalidated fields are dropped outright, not merely truncated.
+    assert "database" not in check.evidence
+    assert "rls" not in check.evidence
+    assert "pgvector" not in check.evidence
+    assert "minimum_required" not in check.evidence
+    assert "reason" not in check.evidence
+    assert check.evidence["status"] == "not_ready"
+    assert check.evidence["http_status"] == 503
+
+
+async def test_service_readiness_timeout():
+    def handler(request):
+        raise httpx.TimeoutException("timed out", request=request)
+
+    async with await _client(handler) as client:
+        check = await _check_service_readiness(client)
+    assert check.status == "fail"
+    assert check.reason_code == "SERVICE_READINESS_UNREACHABLE"
+
+
+async def test_service_readiness_malformed_json():
+    def handler(request):
+        return httpx.Response(503, text="not json")
+
+    async with await _client(handler) as client:
+        check = await _check_service_readiness(client)
+    assert check.status == "fail"
+    assert check.reason_code == "SERVICE_NOT_READY"
+    assert check.evidence["http_status"] == 503
+    assert "status" not in check.evidence
+
+
+async def test_service_readiness_no_tenant_context():
+    def handler(request):
+        return httpx.Response(
+            503, json={"status": "not_ready", "database": "connected", "rls": "no_tenant_context"}
+        )
+
+    async with await _client(handler) as client:
+        check = await _check_service_readiness(client)
+    assert check.status == "fail"
+    assert check.evidence["rls"] == "no_tenant_context"
+    assert check.evidence["database"] == "connected"
 
 
 async def test_service_readiness_unreachable():
@@ -645,6 +1192,209 @@ async def test_review_backlog_unavailable_on_500():
         check = await _check_review_backlog(client)
     assert check.status == "unknown"
     assert check.reason_code == "REVIEW_BACKLOG_UNAVAILABLE"
+
+
+def _stats_handler(by_review_status: Any, total: Any = 1) -> Any:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/review/stats":
+            return httpx.Response(
+                200,
+                json={
+                    "by_review_status": by_review_status, "by_kind": {}, "by_confidence": {},
+                    "total": total,
+                },
+            )
+        if request.url.path == "/v1/review/queue":
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, json={})
+
+    return handler
+
+
+@pytest.mark.parametrize(
+    "by_review_status",
+    [
+        [1, 2, 3],
+        "active",
+        None,
+    ],
+)
+async def test_review_backlog_stats_by_status_wrong_shape(by_review_status: Any):
+    async with await _client(_stats_handler(by_review_status)) as client:
+        check = await _check_review_backlog(client)
+    assert check.status == "unknown"
+    assert check.reason_code == "REVIEW_BACKLOG_UNAVAILABLE"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("active", "3"),  # numeric-looking string, not an int
+        ("active", -1),  # negative
+        ("active", True),  # bool must not be accepted as an int
+        ("proposed", 1.5),  # float
+        ("disputed", [1]),  # list
+    ],
+)
+async def test_review_backlog_stats_count_wrong_type_or_negative(field: str, value: Any):
+    by_status = {"active": 1, "proposed": 0, "disputed": 0}
+    by_status[field] = value
+    async with await _client(_stats_handler(by_status)) as client:
+        check = await _check_review_backlog(client)
+    assert check.status == "unknown"
+    assert check.reason_code == "REVIEW_BACKLOG_UNAVAILABLE"
+
+
+async def test_review_backlog_stats_total_wrong_type():
+    async with await _client(
+        _stats_handler({"active": 1, "proposed": 0, "disputed": 0}, total="1")
+    ) as client:
+        check = await _check_review_backlog(client)
+    assert check.status == "unknown"
+    assert check.reason_code == "REVIEW_BACKLOG_UNAVAILABLE"
+
+
+async def test_review_backlog_stats_missing_status_key_defaults_to_zero():
+    """A missing bucket key means zero, not an invalidating shape error."""
+    async with await _client(_stats_handler({"active": 2}, total=2)) as client:
+        check = await _check_review_backlog(client)
+    assert check.status == "pass"
+    assert check.evidence["proposed_count"] == 0
+    assert check.evidence["disputed_count"] == 0
+
+
+def _valid_stats_and_queue_handler(queue_response: httpx.Response) -> Any:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/review/stats":
+            return httpx.Response(
+                200,
+                json={
+                    "by_review_status": {"active": 1, "proposed": 0, "disputed": 0},
+                    "by_kind": {}, "by_confidence": {}, "total": 1,
+                },
+            )
+        if request.url.path == "/v1/review/queue":
+            return queue_response
+        return httpx.Response(404, json={})
+
+    return handler
+
+
+async def test_review_backlog_queue_500_is_unknown_not_fail():
+    handler = _valid_stats_and_queue_handler(httpx.Response(500, json={"detail": "boom"}))
+    async with await _client(handler) as client:
+        check = await _check_review_backlog(client)
+    assert check.status == "unknown"
+    assert check.reason_code == "REVIEW_QUEUE_UNAVAILABLE"
+    # Partial safe stats evidence is retained even though the queue failed.
+    assert check.evidence["active_count"] == 1
+
+
+async def test_review_backlog_queue_timeout():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/review/stats":
+            return httpx.Response(
+                200,
+                json={
+                    "by_review_status": {"active": 1, "proposed": 0, "disputed": 0},
+                    "by_kind": {}, "by_confidence": {}, "total": 1,
+                },
+            )
+        raise httpx.TimeoutException("timed out", request=request)
+
+    async with await _client(handler) as client:
+        check = await _check_review_backlog(client)
+    assert check.status == "unknown"
+    assert check.reason_code == "REVIEW_QUEUE_UNAVAILABLE"
+
+
+async def test_review_backlog_queue_malformed_json():
+    handler = _valid_stats_and_queue_handler(httpx.Response(200, text="not json"))
+    async with await _client(handler) as client:
+        check = await _check_review_backlog(client)
+    assert check.status == "unknown"
+    assert check.reason_code == "REVIEW_QUEUE_UNAVAILABLE"
+
+
+async def test_review_backlog_queue_non_list_shape():
+    handler = _valid_stats_and_queue_handler(httpx.Response(200, json={"items": []}))
+    async with await _client(handler) as client:
+        check = await _check_review_backlog(client)
+    assert check.status == "unknown"
+    assert check.reason_code == "REVIEW_QUEUE_UNAVAILABLE"
+
+
+async def test_review_backlog_queue_item_blockers_not_a_list():
+    handler = _valid_stats_and_queue_handler(
+        httpx.Response(200, json=[{"promotion_blockers": "min_age_not_met"}])
+    )
+    async with await _client(handler) as client:
+        check = await _check_review_backlog(client)
+    assert check.status == "unknown"
+    assert check.reason_code == "REVIEW_QUEUE_UNAVAILABLE"
+
+
+async def test_review_backlog_queue_blocker_list_has_non_string():
+    handler = _valid_stats_and_queue_handler(
+        httpx.Response(200, json=[{"promotion_blockers": ["min_age_not_met", 42]}])
+    )
+    async with await _client(handler) as client:
+        check = await _check_review_backlog(client)
+    assert check.status == "unknown"
+    assert check.reason_code == "REVIEW_QUEUE_UNAVAILABLE"
+
+
+async def test_review_backlog_top_blockers_deterministic_tie_break():
+    """Equal counts break ties by ascending blocker code, not insertion order."""
+    items = [
+        {"promotion_blockers": ["zeta_blocker", "conflict_recheck_not_run"]},
+        {"promotion_blockers": ["alpha_blocker"]},
+    ]
+    handler = _valid_stats_and_queue_handler(httpx.Response(200, json=items))
+    async with await _client(handler) as client:
+        check = await _check_review_backlog(client)
+    assert check.status == "pass"
+    codes = [b["code"] for b in check.evidence["top_blockers"]]
+    assert codes == ["alpha_blocker", "zeta_blocker"]
+
+
+async def test_review_backlog_failure_does_not_abort_other_checks():
+    """A malformed review response must not prevent the other 10 checks from running."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        if path == "/ready":
+            return httpx.Response(200, json={"status": "ready", "database": "connected"})
+        if path == "/whoami":
+            return httpx.Response(
+                200,
+                json={
+                    "principal_id": "p", "principal_type": "admin", "tenant_id": "t",
+                    "scopes": ["admin"], "api_key_id": "k", "memory_profile": None,
+                },
+            )
+        if path == "/v1/review/stats":
+            return httpx.Response(200, json={"by_review_status": "not-a-mapping", "total": 1})
+        return httpx.Response(404, json={})
+
+    def _unreachable_db(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("db unavailable in this unit test")
+
+    report = await run_doctor(
+        base_url="http://test",
+        http_transport=httpx.MockTransport(handler),
+        session_factory=_unreachable_db,
+        clock=lambda: FIXED_NOW,
+    )
+    ids = [c.id for c in report.checks]
+    assert ids == list(CHECK_ORDER)
+    by_id = {c.id: c for c in report.checks}
+    assert by_id["review.backlog"].status == "unknown"
+    assert by_id["review.backlog"].reason_code == "REVIEW_BACKLOG_UNAVAILABLE"
+    assert by_id["service.health"].status == "pass"
+    assert by_id["identity.scopes"].status == "pass"
 
 
 # --- Redaction -----------------------------------------------------------------
