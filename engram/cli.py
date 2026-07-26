@@ -524,7 +524,7 @@ def main() -> None:
                 parser.error(f"--tenant must be a valid UUID (got {args.tenant!r})")
 
         base_url = resolve_base_url(args.base_url, settings_obj=settings)
-        database_url = resolve_database_url(args.database_url)
+        doctor_database_url = resolve_database_url(args.database_url)
 
         raise SystemExit(
             asyncio.run(
@@ -534,7 +534,7 @@ def main() -> None:
                     since=since_dt,
                     until=until_dt,
                     timeout_seconds=timeout_seconds,
-                    database_url=database_url,
+                    database_url=doctor_database_url,
                     as_json=args.json,
                 )
             )
