@@ -93,6 +93,9 @@ EXPECTED_MATRIX: dict[tuple[str, str], dict] = {
     ("GET", "/v1/context-receipts"): {"all_of": ("read",)},
     ("GET", "/v1/context-receipts/{receipt_id}"): {"all_of": ("read",)},
     ("GET", "/v1/context-receipts/{receipt_id}/verify"): {"all_of": ("read",)},
+    ("POST", "/v1/service/provisioning/tenant-human"): {
+        "service_permissions": ("tenant.provision", "principal.provision"),
+    },
 }
 
 
@@ -115,6 +118,8 @@ def test_runtime_matrix_matches_canonical_matrix(runtime_policy_map):
             assert not policy.exempt, f"{key} should not be exempt"
             assert policy.all_of == expected.get("all_of", ()), key
             assert policy.any_of == expected.get("any_of", ()), key
+            if "service_permissions" in expected:
+                assert policy.permissions == expected["service_permissions"], key
 
 
 def test_only_health_and_ready_are_exempt(runtime_policy_map):

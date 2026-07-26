@@ -57,6 +57,12 @@ class ServiceClientIdentity:
 @dataclass(frozen=True)
 class ServicePolicy:
     permissions: tuple[str, ...]
+    # These fields deliberately mirror ScopePolicy's surface so the complete
+    # route-policy inventory can continue to inspect every authentication class
+    # uniformly. They are always empty: service permissions are not scopes.
+    all_of: tuple[str, ...] = ()
+    any_of: tuple[str, ...] = ()
+    exempt: bool = False
     description: str | None = None
     auth_class: str = "service-client"
 
@@ -175,7 +181,9 @@ class ServicePermissionGuard:
 
     def __init__(self, *permissions: ServicePermission) -> None:
         canonicalize_service_permissions(list(permissions))
-        self.policy = ServicePolicy(tuple(permissions), "External control-plane provisioning.")
+        self.policy = ServicePolicy(
+            permissions=tuple(permissions), description="External control-plane provisioning."
+        )
 
     async def __call__(
         self,
