@@ -33,13 +33,16 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, TypeVar
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from engram import __version__
+from engram.auth import VALID_PRINCIPAL_TYPES, VALID_SCOPES
 from engram.context_receipts import verify_context_receipt_with_recall_log
+from engram.memory_profiles import validate_slug as _validate_memory_profile_slug
 from engram.models import ContextReceipt
+from engram.promotion import PROMOTION_BLOCKER_CODES
 from engram.usage_report import OperationalSnapshot, build_operational_snapshot
 
 __all__ = [
@@ -345,19 +348,44 @@ def resolve_database_url(explicit: str | None) -> str | None:
     return os.environ.get("ENGRAM_OWNER_DATABASE_URL") or os.environ.get("ENGRAM_DATABASE_URL")
 
 
-def normalize_database_url(url: str) -> str:
-    """Rewrite a bare ``postgresql://`` scheme to ``postgresql+asyncpg://``.
+_ACCEPTED_DATABASE_DRIVERNAMES = frozenset({"postgresql", "postgresql+asyncpg"})
 
-    ``create_async_engine`` requires an async-capable driver encoded in the
-    URL; a bare ``postgresql://`` resolves to the synchronous psycopg2
-    dialect and raises at engine-construction time rather than at connect
-    time. ``postgresql+asyncpg://`` (and any other explicit driver, e.g.
-    ``postgresql+psycopg://``) is returned unchanged (ENG-LOOP-001A-FIX1 /
-    FIX-7).
+
+def normalize_database_url(url: str) -> str:
+    """Validate and normalize an explicit ``--database-url``.
+
+    Only a bare ``postgresql://`` or an explicit ``postgresql+asyncpg://``
+    is accepted; every other scheme or driver (``postgresql+psycopg://``,
+    ``postgresql+psycopg2://``, ``mysql://``, ``sqlite:///...``, or a
+    malformed URL) is rejected outright rather than passed through
+    unchanged, since ``create_async_engine`` requires an async-capable
+    driver and an unsupported or unavailable driver module can otherwise
+    raise unpredictably from deep inside SQLAlchemy or the driver itself
+    (ENG-LOOP-001A-FIX2 / FIX2-1).
+
+    Uses SQLAlchemy's own URL parser (``sqlalchemy.engine.make_url``)
+    rather than ad hoc string splitting, so percent-encoded credentials,
+    IPv6 hosts, ports, database names, and query parameters all survive
+    normalization intact.
+
+    Raises ``ValueError`` on rejection. The message is a fixed, generic
+    string — it never includes the supplied URL, credentials, host, or the
+    underlying parser's exception text, any of which could embed a DSN or
+    password.
     """
-    if url.startswith("postgresql://"):
-        return "postgresql+asyncpg://" + url[len("postgresql://") :]
-    return url
+    from sqlalchemy.engine import make_url
+
+    try:
+        parsed = make_url(url)
+    except Exception:
+        raise ValueError("--database-url could not be parsed") from None
+    if parsed.drivername == "postgresql":
+        parsed = parsed.set(drivername="postgresql+asyncpg")
+    if parsed.drivername not in _ACCEPTED_DATABASE_DRIVERNAMES:
+        raise ValueError(
+            "--database-url must use the postgresql:// or postgresql+asyncpg:// scheme"
+        )
+    return parsed.render_as_string(hide_password=False)
 
 
 # --- HTTP-based checks --------------------------------------------------------
@@ -482,6 +510,86 @@ async def _check_service_readiness(client: httpx.AsyncClient) -> DoctorCheck:
     )
 
 
+# Mirrors engram/api/routes/memory_profiles.py's ProfileCreate.slug
+# Field(max_length=255) — there is no named constant for this bound anywhere
+# in the codebase, so the literal is repeated here with a citation rather
+# than invented independently.
+_MAX_PROFILE_SLUG_LENGTH = 255
+
+
+class _WhoamiMemoryProfile(BaseModel):
+    """Strict, bounded validation of the nested ``memory_profile`` object.
+
+    ``/whoami`` is untrusted input (ENG-LOOP-001A-FIX2 / FIX2-2): every
+    field is validated against the same canonical rules used elsewhere in
+    the codebase (the memory-profile slug grammar) rather than trusted
+    as-is. Unknown/extra fields (e.g. future additions) are ignored, never
+    copied into evidence.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: uuid.UUID | None = None
+    slug: str
+    active_revision_id: uuid.UUID | None = None
+    version: int
+
+    @field_validator("slug")
+    @classmethod
+    def _validate_slug_shape(cls, value: str) -> str:
+        if not value or len(value) > _MAX_PROFILE_SLUG_LENGTH:
+            raise ValueError("memory_profile.slug length out of bounds")
+        try:
+            _validate_memory_profile_slug(value)
+        except Exception as exc:
+            raise ValueError("memory_profile.slug does not match the canonical grammar") from exc
+        return value
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def _validate_version_strict(cls, value: Any) -> int:
+        # Checked BEFORE pydantic's own int coercion: by default pydantic
+        # accepts True/False and numeric strings for an `int` field, both of
+        # which must be rejected here rather than silently coerced.
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("memory_profile.version must be a positive integer")
+        return value
+
+
+class _WhoamiResponse(BaseModel):
+    """Strict validation of an untrusted ``GET /whoami`` response body.
+
+    Only values that pass this model are ever used to resolve tenant scope
+    or to populate ``identity.scopes`` evidence — the original response
+    dict is never copied from directly (ENG-LOOP-001A-FIX2 / FIX2-2).
+    Unknown fields (e.g. ``api_key_id``) are ignored, never copied into
+    evidence.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    principal_id: uuid.UUID
+    tenant_id: uuid.UUID
+    principal_type: str
+    scopes: list[str]
+    memory_profile: _WhoamiMemoryProfile | None = None
+
+    @field_validator("principal_type")
+    @classmethod
+    def _validate_principal_type(cls, value: str) -> str:
+        if value not in VALID_PRINCIPAL_TYPES:
+            raise ValueError("principal_type is not a recognized value")
+        return value
+
+    @field_validator("scopes")
+    @classmethod
+    def _validate_scopes(cls, value: list[str]) -> list[str]:
+        for item in value:
+            if item not in VALID_SCOPES:
+                raise ValueError("scopes must contain only canonical scope strings")
+        return value
+
+
 async def _check_identity(
     client: httpx.AsyncClient, *, requested_tenant: str | None
 ) -> tuple[DoctorCheck, str | None, ScopeSource]:
@@ -551,17 +659,35 @@ async def _check_identity(
         tenant_id, source = _tenant_and_source(None)
         return check, tenant_id, source
 
-    scopes = {str(s) for s in (body.get("scopes") or [])}
+    try:
+        parsed = _WhoamiResponse.model_validate(body)
+    except ValidationError:
+        # Never surface pydantic's raw error text: it can echo the rejected
+        # input value verbatim (e.g. a credential-shaped principal_type or
+        # an arbitrary scope string), which would defeat the purpose of
+        # validating untrusted input in the first place
+        # (ENG-LOOP-001A-FIX2 / FIX2-2).
+        check = _check(
+            CHECK_IDENTITY_SCOPES, "fail", "IDENTITY_RESPONSE_INVALID",
+            "GET /whoami returned a malformed or unrecognized response body.",
+        )
+        tenant_id, source = _tenant_and_source(None)
+        return check, tenant_id, source
+
+    scopes = set(parsed.scopes)
     has_read = "admin" in scopes or "read" in scopes
     has_write = "admin" in scopes or "write" in scopes
-    whoami_tenant = body.get("tenant_id")
-    profile = body.get("memory_profile")
+    whoami_tenant = str(parsed.tenant_id)
+    profile = parsed.memory_profile
+    # Built only from validated model fields — never from the original
+    # response dict — so a field that failed validation can never reach
+    # evidence even indirectly (ENG-LOOP-001A-FIX2 / FIX2-2).
     evidence: dict[str, Any] = {
         "tenant_id": whoami_tenant,
-        "principal_type": body.get("principal_type"),
+        "principal_type": parsed.principal_type,
         "scopes": sorted(scopes),
-        "memory_profile_slug": profile.get("slug") if isinstance(profile, dict) else None,
-        "memory_profile_version": profile.get("version") if isinstance(profile, dict) else None,
+        "memory_profile_slug": profile.slug if profile is not None else None,
+        "memory_profile_version": profile.version if profile is not None else None,
     }
     tenant_id, source = _tenant_and_source(whoami_tenant)
 
@@ -604,6 +730,15 @@ async def _check_identity(
 
 _MAX_REVIEW_QUEUE_SAMPLE = 100
 
+# The review-preview-only marker, distinct from a real promotion blocker: it
+# means "the conflict recheck never ran," not that recheck rejected the
+# candidate. Combined with the canonical closed set of real promotion
+# blocker codes (the single source of truth in engram.promotion) to form the
+# only strings ever accepted in an untrusted queue item's promotion_blockers
+# (ENG-LOOP-001A-FIX2 / FIX2-3).
+_REVIEW_PREVIEW_MARKER = "conflict_recheck_not_run"
+_ALLOWED_REVIEW_QUEUE_BLOCKERS = PROMOTION_BLOCKER_CODES | {_REVIEW_PREVIEW_MARKER}
+
 
 def _nonneg_int_or_none(value: Any) -> int | None:
     """Strict non-negative integer check: rejects bool, str, float, negatives."""
@@ -617,8 +752,11 @@ def _validate_review_stats(body: Any) -> dict[str, int] | None:
 
     ``body`` is untrusted: a malformed but HTTP-200 response must not abort
     report construction, nor coerce non-numeric/negative/boolean counts into
-    numbers. A missing status key means zero (a real hygiene report omits
-    counts for empty buckets); a present-but-wrong-typed value is rejected.
+    numbers. A missing status-bucket key means zero (a real hygiene report
+    omits counts for empty buckets) — but ``total`` itself is REQUIRED; a
+    response that omits it is incomplete, not "zero" (ENG-LOOP-001A-FIX2 /
+    FIX2-3). The selected bucket counts may never sum to more than the
+    reported total.
     """
     if not isinstance(body, dict):
         return None
@@ -631,8 +769,12 @@ def _validate_review_stats(body: Any) -> dict[str, int] | None:
         if parsed is None:
             return None
         result[key] = parsed
-    total = _nonneg_int_or_none(body.get("total", 0))
+    if "total" not in body:
+        return None
+    total = _nonneg_int_or_none(body.get("total"))
     if total is None:
+        return None
+    if result["active"] + result["proposed"] + result["disputed"] > total:
         return None
     result["total"] = total
     return result
@@ -645,15 +787,23 @@ def _validate_review_queue(body: Any) -> list[list[str]] | None:
     everything else, including ``content``, is discarded immediately without
     being copied anywhere). A single malformed item invalidates the whole
     sample rather than being silently skipped into a false PASS.
+    ``promotion_blockers`` is REQUIRED on every item (no default to an empty
+    list), and every blocker string must be a canonical promotion-blocker
+    code or the review-preview marker — an unrecognized string (which could
+    be memory content, a URL, or a credential placed there by a buggy or
+    hostile server) invalidates the sample instead of being echoed
+    (ENG-LOOP-001A-FIX2 / FIX2-3).
     """
     if not isinstance(body, list) or len(body) > _MAX_REVIEW_QUEUE_SAMPLE:
         return None
     blocker_lists: list[list[str]] = []
     for item in body:
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or "promotion_blockers" not in item:
             return None
-        blockers = item.get("promotion_blockers", [])
-        if not isinstance(blockers, list) or not all(isinstance(b, str) for b in blockers):
+        blockers = item["promotion_blockers"]
+        if not isinstance(blockers, list) or not all(
+            isinstance(b, str) and b in _ALLOWED_REVIEW_QUEUE_BLOCKERS for b in blockers
+        ):
             return None
         blocker_lists.append(blockers)
     return blocker_lists
@@ -664,7 +814,7 @@ def _rank_blockers(blocker_lists: list[list[str]]) -> list[dict[str, Any]]:
     counter: Counter[str] = Counter()
     for blockers in blocker_lists:
         for blocker in blockers:
-            if blocker == "conflict_recheck_not_run":
+            if blocker == _REVIEW_PREVIEW_MARKER:
                 continue
             counter[blocker] += 1
     ranked = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
@@ -1543,6 +1693,12 @@ def _build_session_factory(
     ``database_url`` builds a one-shot engine for this run only; the caller
     is responsible for disposing it exactly once (ENG-LOOP-001A-FIX1 /
     FIX-7), since nothing else references or reuses it.
+
+    May raise: an unparseable or unsupported/rejected URL
+    (``normalize_database_url``), or an engine-construction failure (e.g. a
+    missing driver module). Callers must not let this propagate before the
+    HTTP-only checks have run — see ``_prepare_database_resource``
+    (ENG-LOOP-001A-FIX2 / FIX2-1).
     """
     if database_url is None:
         from engram.db import owner_session_factory
@@ -1554,6 +1710,85 @@ def _build_session_factory(
         normalize_database_url(database_url), echo=False, pool_size=1, max_overflow=0
     )
     return async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False), engine
+
+
+# A stable, locally generated category — never the varying exception type
+# name — for a database resource that could not be constructed at all (a
+# rejected/unparseable explicit --database-url, or an engine-construction
+# failure). Distinct from a per-check "*_EVIDENCE_UNAVAILABLE" reason code,
+# which is surfaced to operators; this is the internal `_DbEvidence.error_type`
+# category those reason codes report against (ENG-LOOP-001A-FIX2 / FIX2-1).
+_DATABASE_RESOURCE_UNAVAILABLE = "DATABASE_RESOURCE_UNAVAILABLE"
+
+
+@dataclass(frozen=True)
+class _DatabaseResource:
+    """Doctor's database dependency for one run, with explicit ownership.
+
+    ``session_factory`` is ``None`` when no usable database resource could
+    be constructed — DB-backed checks then degrade to ``unknown`` rather
+    than a malformed/unsupported/unconstructable input aborting the whole
+    report. ``owned_engine`` is set only when THIS run constructed a
+    one-shot engine from an explicit, accepted ``--database-url``; that is
+    the only case in which doctor ever disposes anything.
+    """
+
+    session_factory: Callable[[], Any] | None
+    owned_engine: AsyncEngine | None
+    error_type: str | None
+
+
+def _prepare_database_resource(
+    database_url: str | None, *, injected_factory: Callable[[], Any] | None
+) -> _DatabaseResource:
+    """Build the database resource for this run without ever raising.
+
+    A caller-injected ``session_factory`` is used as-is (caller-owned,
+    never disposed here). Otherwise, constructing the process-owned global
+    factory or a one-shot engine from an explicit ``database_url`` can fail
+    for many reasons — a malformed or unsupported URL, a missing driver
+    module, or an engine-construction error — every one of which is caught
+    here and converted into an unavailable resource, so a bad
+    ``--database-url`` degrades only the database-backed checks instead of
+    preventing service.health/service.readiness/identity.scopes/
+    review.backlog (all HTTP-only) from ever running (ENG-LOOP-001A-FIX2 /
+    FIX2-1).
+    """
+    if injected_factory is not None:
+        return _DatabaseResource(
+            session_factory=injected_factory, owned_engine=None, error_type=None
+        )
+    try:
+        factory, owned_engine = _build_session_factory(database_url)
+    except Exception:  # noqa: BLE001 - malformed/unsupported input must not abort the report
+        return _DatabaseResource(
+            session_factory=None,
+            owned_engine=None,
+            error_type=_DATABASE_RESOURCE_UNAVAILABLE,
+        )
+    return _DatabaseResource(session_factory=factory, owned_engine=owned_engine, error_type=None)
+
+
+async def _dispose_owned_engine_safely(
+    engine: AsyncEngine | None, timeout_seconds: float
+) -> None:
+    """Dispose a doctor-owned one-shot engine, bounded and fully suppressed.
+
+    Only an engine THIS run constructed (never the injected/global factory)
+    is ever passed here. A disposal exception or an indefinitely stalled
+    disposal must never alter, replace, or prevent an otherwise completed
+    DoctorReport — the report has already been built by the time this runs
+    (ENG-LOOP-001A-FIX2 / FIX2-1). Never logs or re-raises; only an
+    unrelated external cancellation (not this bound's own timeout)
+    propagates, since ``asyncio.CancelledError`` is not an ``Exception``.
+    """
+    if engine is None:
+        return
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            await engine.dispose()
+    except Exception:  # noqa: BLE001 - see docstring
+        pass
 
 
 def _default_clock() -> datetime:
@@ -1580,7 +1815,7 @@ class _DbEvidence:
 
 
 async def _gather_db_evidence(
-    session_factory: Callable[[], Any],
+    session_factory: Callable[[], Any] | None,
     *,
     tenant_id: str | None,
     since: datetime,
@@ -1589,6 +1824,20 @@ async def _gather_db_evidence(
     lease_stale_after_seconds: int,
     timeout_seconds: float,
 ) -> _DbEvidence:
+    if session_factory is None:
+        # No usable database resource could be constructed for this run (a
+        # rejected/unparseable --database-url or an engine-construction
+        # failure) — degrade every DB-backed check to unknown rather than
+        # ever attempting to use a nonexistent factory (ENG-LOOP-001A-FIX2 /
+        # FIX2-1).
+        return _DbEvidence(
+            snapshot=None,
+            job_health=None,
+            lifecycle_extra=None,
+            recall_evidence=None,
+            receipts_evidence=None,
+            error_type=_DATABASE_RESOURCE_UNAVAILABLE,
+        )
     try:
         # One bounded deadline covers session acquisition, transaction setup,
         # every evidence query, and rollback — a session factory whose async
@@ -1684,11 +1933,11 @@ async def run_doctor(
     now = (clock or _default_clock)()
     resolved_since, resolved_until = resolve_window(since=since, until=until, now=now)
     effective_settings = settings_obj if settings_obj is not None else _default_settings()
-    one_shot_engine: AsyncEngine | None = None
-    if session_factory is not None:
-        factory = session_factory
-    else:
-        factory, one_shot_engine = _build_session_factory(database_url)
+    # Never raises: a malformed/unsupported --database-url or an
+    # engine-construction failure must degrade only the database-backed
+    # checks, not abort report construction before the HTTP-only checks run
+    # (ENG-LOOP-001A-FIX2 / FIX2-1).
+    db_resource = _prepare_database_resource(database_url, injected_factory=session_factory)
 
     try:
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
@@ -1712,7 +1961,7 @@ async def run_doctor(
             tenant_unresolved = effective_tenant is None
 
             db_evidence = await _gather_db_evidence(
-                factory,
+                db_resource.session_factory,
                 tenant_id=effective_tenant,
                 since=resolved_since,
                 until=resolved_until,
@@ -1783,10 +2032,11 @@ async def run_doctor(
         # Only an engine THIS call constructed (an explicit --database-url,
         # never the injected/global owner_session_factory) is ours to
         # dispose. Disposed exactly once, on every path: success, a raised
-        # exception, or the internal DB-evidence timeout (ENG-LOOP-001A-FIX1
-        # / FIX-7).
-        if one_shot_engine is not None:
-            await one_shot_engine.dispose()
+        # exception, or the internal DB-evidence timeout
+        # (ENG-LOOP-001A-FIX1/FIX-7). Bounded and fully suppressed so a
+        # disposal failure or stall cannot alter an already-built report
+        # (ENG-LOOP-001A-FIX2 / FIX2-1).
+        await _dispose_owned_engine_safely(db_resource.owned_engine, timeout_seconds)
 
 
 # --- Rendering -----------------------------------------------------------------

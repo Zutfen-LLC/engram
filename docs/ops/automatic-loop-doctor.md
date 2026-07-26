@@ -53,7 +53,7 @@ engram doctor --tenant 11111111-1111-1111-1111-111111111111 \
 | `--base-url`         | Engram API URL. Default: `ENGRAM_BASE_URL`, else a loopback URL on the configured service port. |
 | `--tenant`            | Tenant UUID for database-level evidence. Default: the tenant returned by `/whoami`. When identity cannot be resolved, tenant-specific checks are marked `unknown` rather than silently reporting deployment-wide counts as tenant truth. |
 | `--since` / `--until` | Timezone-aware ISO-8601 window bounds. Default: the last 24 hours. |
-| `--database-url`      | Operator database URL. Default: `ENGRAM_OWNER_DATABASE_URL`, then `ENGRAM_DATABASE_URL`. Accepts `postgresql://` or `postgresql+asyncpg://` (the former is normalized to the latter). Never echoed, serialized, or logged. |
+| `--database-url`      | Operator database URL. Default: `ENGRAM_OWNER_DATABASE_URL`, then `ENGRAM_DATABASE_URL`. Only `postgresql://` and `postgresql+asyncpg://` are accepted (the former is normalized to the latter); every other scheme/driver is rejected. A rejected or unconstructable URL degrades only the database-backed checks — it never aborts the report. Never echoed, serialized, or logged. |
 | `--timeout-seconds`   | Finite, strictly positive HTTP/diagnostic timeout (default 10s). Zero, negative, NaN, and infinite values are rejected, not coerced. |
 | `--json`              | Emit only the stable `engram.doctor` JSON report. Human-readable output is the default. |
 
@@ -113,7 +113,7 @@ counts, timestamps, status codes, and configuration-presence booleans.
 | 5 | `config.classification` | Local `ENGRAM_CLASSIFICATION_*` settings | Warn if `provider=none` (rule-only). Fail only for an inconsistent enabled provider. | No live provider call. |
 | 6 | `worker.queue` | `usage_report` worker aggregation + bounded dead/stale/due-pending queries | Fail on dead or stale-running jobs. Warn on an aged **due** pending backlog (`run_after <= now`) — an old `created_at` alone, for a job not yet due, is not a symptom. | Describes the queue, not a specific worker process. |
 | 7 | `capture.lifecycle` | `usage_report` coverage/candidate-funnel + client `lifecycle_summary` events | Unknown when telemetry is disabled. Warn on no evidence or reported errors. | Client-reported, untrusted diagnostic evidence. |
-| 8 | `capture.remember` | `usage_report` candidate-funnel (server-observed) | Warn when extraction is observed but nothing reaches the server, or outcomes are still pending (unresolved candidates and no success/failure yet). Fail only when every resolved attempt in the window failed, with none succeeded or still pending. | Requires `ENGRAM_USAGE_TELEMETRY_ENABLED=true`. |
+| 8 | `capture.remember` | `usage_report` candidate-funnel (server-observed) | Pass only when at least one candidate succeeded, none failed, and none remain unresolved. Warn when any candidates remain unresolved (**including** when successes are also present — an unresolved candidate is never silently counted as healthy), when both successes and failures occurred, or when extraction was observed but nothing reached the server. Fail only when every resolved attempt failed and none remain unresolved. | Requires `ENGRAM_USAGE_TELEMETRY_ENABLED=true`. |
 | 9 | `recall.activity` | `recall_logs` (read-only) | Warn when no recall activity in the window. | Does not prove recalled context reached a model prompt. |
 | 10 | `receipts.activity` | Local dark-write setting + `context_receipts`/`recall_logs` + repository verifier | Selects the latest receipt **within the requested window** (ties broken deterministically). Fails on an invalid receipt regardless of whether dark writes are currently disabled locally. Otherwise warns when disabled or a gap exists (writes are fail-open). Unknown when there is no startup recall to assess, or the latest receipt could not be verified. | Proves what was served, not factual truth or causality. |
 | 11 | `review.backlog` | `GET /v1/review/stats` + bounded `GET /v1/review/queue?limit=100` | Passes only when both stats and queue evidence are present and strictly well-typed — malformed or nonsensical evidence is never coerced into a pass. Unknown when the credential lacks review authority, the call fails, or evidence fails validation. | `conflict_recheck_not_run` is excluded from blocker ranking and reported as a known preview limitation; no conflict recheck runs. |
@@ -217,13 +217,18 @@ read-only guarantees are unchanged; only the semantics below were corrected.
    rather than aborting the report.
 3. **`capture.remember` unresolved-candidate truthfulness.** The check now
    reads the full unresolved-candidate count (not just the ingest-specific
-   subset) and truthfully distinguishes three states: at least one success
-   (healthy, even with unresolved candidates pending), no success and no
-   failure but unresolved candidates exist (`REMEMBER_OUTCOMES_PENDING`, not
-   a failure), and every resolved attempt failed with nothing else pending
-   (`REMEMBER_PIPELINE_FAILED`). It no longer calls an unresolved
-   candidate "healthy" by omission, nor claims "every attempt failed" while
-   unresolved candidates are still in flight.
+   subset) and truthfully distinguishes every combination of outcome:
+   success-only with nothing unresolved is the only `pass`
+   (`REMEMBER_PIPELINE_HEALTHY`); an unresolved candidate is `warn`
+   (`REMEMBER_OUTCOMES_PENDING`) **regardless of whether a success is also
+   present** — an unresolved candidate is never silently counted as healthy
+   just because something else succeeded; a mix of success and failure is
+   `warn` (`REMEMBER_PARTIAL_FAILURES`); and only failures with nothing
+   unresolved and no success is `fail` (`REMEMBER_PIPELINE_FAILED`). It no
+   longer calls an unresolved candidate "healthy" by omission (ENG-LOOP-001A-FIX2
+   / FIX2-4 corrected this same claim in the FIX1 documentation and PR
+   description, which had drifted from the implementation), nor claims
+   "every attempt failed" while unresolved candidates are still in flight.
 4. **`worker.queue` due-pending backlog.** The aged-pending-backlog warning
    now requires the oldest pending job to actually be **due**
    (`run_after <= now`), computed via a dedicated bounded query. A job
@@ -264,6 +269,90 @@ embeddings, classification, or Hermes; no Hermes process inspection; no
 dashboard, tracing, or metrics framework; no changes to `engram usage-report`'s
 existing JSON schema or human output; no broadening into session-summary or
 live-dogfood slices; no `engram.doctor` schema version bump.
+
+## FIX2 corrections (ENG-LOOP-001A-FIX2)
+
+A second hardening pass closed four remaining truthfulness/fail-safety
+defects found in review of the FIX1 head. The 11-check report, ordering,
+schema, exit-code mapping, and read-only guarantees remain unchanged.
+
+1. **Database-resource construction and disposal are now subordinate to the
+   report's failure boundary.** Previously, constructing the database
+   resource (an explicit `--database-url` engine or the process-owned
+   factory) happened *before* `run_doctor`'s failure boundary — a malformed
+   or unsupported URL, a missing driver module, or an engine-construction
+   error could abort the entire report before `service.health`,
+   `service.readiness`, `identity.scopes`, or `review.backlog` ever ran.
+   Resource construction (`_prepare_database_resource`) now never raises: a
+   construction failure degrades every DB-backed check to `unknown`
+   (`DATABASE_RESOURCE_UNAVAILABLE`) while every HTTP-only check still
+   executes normally. Separately, disposing a one-shot engine
+   (`_dispose_owned_engine_safely`) is now bounded by an async timeout and
+   fully exception-suppressed, so a disposal failure or an indefinitely
+   stalled disposal can never alter, replace, or prevent an
+   already-completed report. `--database-url` acceptance is also now
+   *strict*: only `postgresql://` and `postgresql+asyncpg://` are accepted
+   (the former normalized to the latter); every other scheme or driver
+   (`postgresql+psycopg://`, `postgresql+psycopg2://`, `mysql://`,
+   `sqlite:///...`, or a malformed URL) is now explicitly **rejected**
+   rather than silently passed through to `create_async_engine`, which
+   previously could raise unpredictably from deep inside SQLAlchemy or an
+   unavailable driver module. URL parsing uses SQLAlchemy's own
+   `make_url`/`URL.set()`, so percent-encoded credentials, IPv6 hosts,
+   ports, database names, and query parameters all survive normalization
+   unchanged.
+2. **`/whoami` is now strictly validated as untrusted input.** Previously,
+   `scopes` was coerced with `str(...)` per entry (a string became a set of
+   characters, a mapping became its keys, a non-iterable could raise and
+   abort the report), and `tenant_id`, `principal_type`, and the memory
+   profile's slug/version were copied directly from the response into
+   evidence with no validation — a malicious or incompatible remote service
+   could place credential material or arbitrary prose there. A strict
+   internal response model now requires `principal_id`/`tenant_id` to be
+   real UUIDs, `principal_type` to be a member of the canonical principal-type
+   vocabulary (`engram.auth.VALID_PRINCIPAL_TYPES`), `scopes` to be a JSON
+   array containing only canonical scope strings
+   (`engram.auth.VALID_SCOPES`), and an optional `memory_profile` to have a
+   canonical-grammar slug (`engram.memory_profiles.validate_slug`, bounded
+   to 255 characters) and a strictly positive integer version (not a
+   boolean or a numeric string — pydantic's default `int` coercion accepts
+   both, so this is validated explicitly). A malformed response now yields
+   `identity.scopes` `fail`/`IDENTITY_RESPONSE_INVALID` with a locally
+   generated summary — never pydantic's raw validation error text, which
+   can echo the rejected value verbatim. An explicit `--tenant` is still
+   honored for database-level scope even when `/whoami` is malformed.
+3. **Review stats/queue evidence now requires complete payloads, and
+   blocker strings are allow-listed against the canonical vocabulary.**
+   `total` in `/v1/review/stats` was previously defaulted to `0` when
+   absent, letting an incomplete response pass as an empty backlog; it is
+   now required, and the selected status-bucket counts may never sum to
+   more than it. Each `/v1/review/queue` item's `promotion_blockers` was
+   previously defaulted to `[]` when absent; it is now required on every
+   item. Every blocker string must now be one of the canonical promotion
+   blocker codes exported from `engram.promotion.PROMOTION_BLOCKER_CODES`
+   (the same `BLOCK_*` constants the promotion engine itself produces) or
+   the review-preview marker `conflict_recheck_not_run` — an unrecognized
+   string (which could be memory content, a URL, or a credential placed
+   there by a buggy or hostile server) now invalidates the queue sample
+   (`REVIEW_QUEUE_UNAVAILABLE`) instead of being counted and echoed into
+   `top_blockers`.
+4. **Remember-pipeline documentation corrected to match the implemented
+   state machine.** The FIX1 documentation and PR description incorrectly
+   stated that a success is healthy even when unresolved candidates are
+   still pending. The implementation (and its tests) have always treated an
+   unresolved candidate as `warn`/`REMEMBER_OUTCOMES_PENDING` regardless of
+   whether a success is also present in the window — this was a
+   documentation defect, not an implementation defect, and no check
+   behavior changed as part of this correction. See the corrected
+   `capture.remember` row in the Checks table above.
+
+**Explicitly unchanged (non-goals held throughout FIX2):** no new doctor
+check; no `engram.doctor` schema-version bump; no database migration; no new
+REST endpoint; no changes to recall, ranking, budgets, promotion decisions,
+review transitions, trust, authority, RLS, profile narrowing, or Context
+Manifest contracts; no diagnostic recall; no external provider call; no
+automatic configuration or remediation; no Hermes process inspection or
+lifecycle change; no `engram usage-report` schema or rendering change.
 
 See also: [Context Receipt Inspection](context-receipt-inspection.md),
 [dogfood usage metering](dogfood-usage-metering.md).

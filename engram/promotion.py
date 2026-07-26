@@ -68,6 +68,31 @@ BLOCK_DISPUTE = "external_dispute"
 BLOCK_RECHECK = "conflict_recheck"
 BLOCK_REVIEW_POLICY = "review_policy"
 
+# The canonical, closed set of promotion-blocker codes this module can ever
+# produce. Exported so other read-only consumers (e.g. `engram.doctor`'s
+# review.backlog check) can allow-list untrusted remote blocker strings
+# against the single real source of truth, rather than maintaining a
+# separate, driftable copy of this vocabulary (ENG-LOOP-001A-FIX2 / FIX2-3).
+PROMOTION_BLOCKER_CODES: frozenset[str] = frozenset(
+    {
+        BLOCK_KIND_POLICY,
+        BLOCK_EVIDENCE_DISABLED,
+        BLOCK_NO_EVIDENCE,
+        BLOCK_SOURCE_PRIOR,
+        BLOCK_DISPOSITION,
+        BLOCK_TAXONOMY,
+        BLOCK_SCORE,
+        BLOCK_VERSION,
+        BLOCK_INCONSISTENT,
+        BLOCK_CONFIDENCE,
+        BLOCK_AGE,
+        BLOCK_CONFLICT,
+        BLOCK_DISPUTE,
+        BLOCK_RECHECK,
+        BLOCK_REVIEW_POLICY,
+    }
+)
+
 
 async def resolve_trusted_system_actor(session: AsyncSession, tenant_id: str) -> uuid.UUID:
     return await resolve_internal_system_actor(

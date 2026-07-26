@@ -35,6 +35,8 @@ from engram.doctor import (
     _check_review_backlog,
     _check_service_health,
     _check_service_readiness,
+    _dispose_owned_engine_safely,
+    _prepare_database_resource,
     aggregate_status,
     normalize_database_url,
     parse_iso8601,
@@ -245,9 +247,46 @@ def test_normalize_database_url_passes_through_explicit_asyncpg_scheme():
     assert normalize_database_url(url) == url
 
 
-def test_normalize_database_url_leaves_other_explicit_drivers_untouched():
-    """An operator-chosen non-asyncpg driver is never silently rewritten."""
-    url = "postgresql+psycopg://user:pw@host:5432/db"
+@pytest.mark.parametrize(
+    "url",
+    [
+        "postgresql+psycopg://user:pw@host:5432/db",
+        "postgresql+psycopg2://user:pw@host:5432/db",
+        "mysql://user:pw@host:3306/db",
+        "sqlite:///local.db",
+    ],
+)
+def test_normalize_database_url_rejects_unsupported_schemes(url: str):
+    """Only postgresql:// and postgresql+asyncpg:// are accepted (ENG-LOOP-001A-FIX2)."""
+    with pytest.raises(ValueError, match="postgresql"):
+        normalize_database_url(url)
+
+
+def test_normalize_database_url_rejects_unparseable_url():
+    with pytest.raises(ValueError):
+        normalize_database_url("not a url at all ###")
+
+
+def test_normalize_database_url_rejection_never_echoes_the_input():
+    sentinel = "postgresql+psycopg2://SENTINEL_USER:SENTINEL_PW@sentinel-host/db"
+    try:
+        normalize_database_url(sentinel)
+    except ValueError as exc:
+        assert "SENTINEL_USER" not in str(exc)
+        assert "SENTINEL_PW" not in str(exc)
+        assert "sentinel-host" not in str(exc)
+    else:
+        pytest.fail("expected normalize_database_url to reject an unsupported driver")
+
+
+def test_normalize_database_url_preserves_percent_encoded_credentials_and_query():
+    url = "postgresql://us%40er:p%40ss@host:5432/db?sslmode=require"
+    normalized = normalize_database_url(url)
+    assert normalized == "postgresql+asyncpg://us%40er:p%40ss@host:5432/db?sslmode=require"
+
+
+def test_normalize_database_url_preserves_ipv6_host():
+    url = "postgresql+asyncpg://[::1]:5432/db"
     assert normalize_database_url(url) == url
 
 
@@ -313,7 +352,9 @@ async def test_run_doctor_disposes_one_shot_engine_exactly_once_on_db_failure(
             return httpx.Response(
                 200,
                 json={
-                    "principal_id": "p", "principal_type": "admin", "tenant_id": "t",
+                    "principal_id": "22222222-2222-2222-2222-222222222222",
+                    "principal_type": "admin",
+                    "tenant_id": "11111111-1111-1111-1111-111111111111",
                     "scopes": ["admin"], "api_key_id": "k", "memory_profile": None,
                 },
             )
@@ -388,7 +429,9 @@ async def test_run_doctor_does_not_call_build_session_factory_when_injected(
             return httpx.Response(
                 200,
                 json={
-                    "principal_id": "p", "principal_type": "admin", "tenant_id": "t",
+                    "principal_id": "22222222-2222-2222-2222-222222222222",
+                    "principal_type": "admin",
+                    "tenant_id": "11111111-1111-1111-1111-111111111111",
                     "scopes": ["admin"], "api_key_id": "k", "memory_profile": None,
                 },
             )
@@ -410,6 +453,216 @@ async def test_run_doctor_does_not_call_build_session_factory_when_injected(
     by_id = {c.id: c for c in report.checks}
     assert by_id["service.health"].status == "pass"
     assert by_id["worker.queue"].status == "unknown"
+
+
+# --- FIX2-1: safe DB resource construction + bounded disposal -----------------
+
+
+def test_prepare_database_resource_malformed_url_is_unavailable_not_raised():
+    resource = _prepare_database_resource("not a url at all ###", injected_factory=None)
+    assert resource.session_factory is None
+    assert resource.owned_engine is None
+    assert resource.error_type == "DATABASE_RESOURCE_UNAVAILABLE"
+
+
+def test_prepare_database_resource_unsupported_scheme_is_unavailable():
+    resource = _prepare_database_resource(
+        "postgresql+psycopg2://user:pw@host/db", injected_factory=None
+    )
+    assert resource.session_factory is None
+    assert resource.owned_engine is None
+    assert resource.error_type == "DATABASE_RESOURCE_UNAVAILABLE"
+
+
+def test_prepare_database_resource_engine_construction_failure_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def _raise_with_sentinel(database_url: str | None) -> tuple[Any, Any]:
+        raise RuntimeError("connect failed: postgresql://SENTINEL_USER:SENTINEL_PW@sentinel-host/db")
+
+    monkeypatch.setattr("engram.doctor._build_session_factory", _raise_with_sentinel)
+    resource = _prepare_database_resource("postgresql://x/y", injected_factory=None)
+    assert resource.session_factory is None
+    assert resource.owned_engine is None
+    assert resource.error_type == "DATABASE_RESOURCE_UNAVAILABLE"
+
+
+def test_prepare_database_resource_injected_factory_bypasses_construction(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def _fail_if_called(database_url: str | None) -> tuple[Any, Any]:
+        raise AssertionError("_build_session_factory must not be called when injected")
+
+    monkeypatch.setattr("engram.doctor._build_session_factory", _fail_if_called)
+    sentinel_factory = object()
+    resource = _prepare_database_resource("postgresql://x/y", injected_factory=sentinel_factory)
+    assert resource.session_factory is sentinel_factory
+    assert resource.owned_engine is None
+    assert resource.error_type is None
+
+
+def _healthy_doctor_handler() -> Any:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        if path == "/ready":
+            return httpx.Response(200, json={"status": "ready", "database": "connected"})
+        if path == "/whoami":
+            return httpx.Response(
+                200,
+                json={
+                    "principal_id": "22222222-2222-2222-2222-222222222222",
+                    "principal_type": "admin",
+                    "tenant_id": "11111111-1111-1111-1111-111111111111",
+                    "scopes": ["admin"], "api_key_id": "k", "memory_profile": None,
+                },
+            )
+        if path == "/v1/review/stats":
+            return httpx.Response(
+                200,
+                json={"by_review_status": {}, "by_kind": {}, "by_confidence": {}, "total": 0},
+            )
+        if path == "/v1/review/queue":
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, json={})
+
+    return handler
+
+
+@pytest.mark.parametrize(
+    "bad_database_url",
+    [
+        "not a url at all ###",
+        "mysql://user:pw@host:3306/db",
+        "postgresql+psycopg://user:pw@host:5432/db",
+    ],
+)
+async def test_run_doctor_bad_database_url_produces_complete_report(bad_database_url: str):
+    """A malformed/unsupported --database-url must never abort report construction.
+
+    Every one of the 11 checks must still be emitted: HTTP-only checks pass
+    normally, DB-backed checks degrade to unknown (ENG-LOOP-001A-FIX2 /
+    FIX2-1).
+    """
+    report = await run_doctor(
+        base_url="http://test",
+        database_url=bad_database_url,
+        http_transport=httpx.MockTransport(_healthy_doctor_handler()),
+        clock=lambda: FIXED_NOW,
+    )
+    ids = [c.id for c in report.checks]
+    assert ids == list(CHECK_ORDER)
+    by_id = {c.id: c for c in report.checks}
+    assert by_id["service.health"].status == "pass"
+    assert by_id["service.readiness"].status == "pass"
+    assert by_id["identity.scopes"].status == "pass"
+    assert by_id["config.classification"].status in ("pass", "warn")
+    assert by_id["review.backlog"].status == "pass"
+    for db_check_id in (
+        "worker.queue", "capture.lifecycle", "capture.remember",
+        "recall.activity", "receipts.activity",
+    ):
+        assert by_id[db_check_id].status == "unknown"
+
+
+async def test_run_doctor_engine_construction_failure_with_sentinels_leaks_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def _raise_with_sentinels(database_url: str | None) -> tuple[Any, Any]:
+        raise RuntimeError(
+            "connect failed: postgresql://SENTINEL_DB_USER:SENTINEL_DB_PW@sentinel-db-host/x"
+        )
+
+    monkeypatch.setattr("engram.doctor._build_session_factory", _raise_with_sentinels)
+    report = await run_doctor(
+        base_url="http://test",
+        database_url="postgresql://x/y",
+        http_transport=httpx.MockTransport(_healthy_doctor_handler()),
+        clock=lambda: FIXED_NOW,
+    )
+    ids = [c.id for c in report.checks]
+    assert ids == list(CHECK_ORDER)
+    dumped = report.model_dump_json(by_alias=True)
+    assert "SENTINEL_DB_USER" not in dumped
+    assert "SENTINEL_DB_PW" not in dumped
+    assert "sentinel-db-host" not in dumped
+
+
+async def test_dispose_owned_engine_safely_noop_when_none():
+    await _dispose_owned_engine_safely(None, 1.0)
+
+
+async def test_dispose_owned_engine_safely_suppresses_sentinel_exception():
+    class _ExplodingEngine:
+        async def dispose(self) -> None:
+            raise RuntimeError("dispose failed: SENTINEL_DISPOSE_SECRET")
+
+    # Must not raise.
+    await _dispose_owned_engine_safely(_ExplodingEngine(), 1.0)
+
+
+async def test_dispose_owned_engine_safely_bounds_a_stalled_dispose():
+    class _StallingEngine:
+        async def dispose(self) -> None:
+            await asyncio.sleep(5.0)
+
+    started = time.monotonic()
+    await _dispose_owned_engine_safely(_StallingEngine(), 0.2)
+    elapsed = time.monotonic() - started
+    assert elapsed < 4.0
+
+
+async def test_run_doctor_disposal_exception_does_not_alter_completed_report(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A disposal exception must not prevent or alter an otherwise-complete report."""
+
+    class _ExplodingDisposeEngine:
+        async def dispose(self) -> None:
+            raise RuntimeError("dispose failed: SENTINEL_DISPOSE_SECRET")
+
+    def _fake_build_session_factory(database_url: str | None) -> tuple[Any, Any]:
+        return (lambda: _ImmediatelyFailingSession()), _ExplodingDisposeEngine()
+
+    monkeypatch.setattr("engram.doctor._build_session_factory", _fake_build_session_factory)
+    report = await run_doctor(
+        base_url="http://test",
+        database_url="postgresql://x/y",
+        http_transport=httpx.MockTransport(_healthy_doctor_handler()),
+        clock=lambda: FIXED_NOW,
+    )
+    ids = [c.id for c in report.checks]
+    assert ids == list(CHECK_ORDER)
+    dumped = report.model_dump_json(by_alias=True)
+    assert "SENTINEL_DISPOSE_SECRET" not in dumped
+
+
+async def test_run_doctor_stalled_disposal_does_not_hang_and_still_returns(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A disposal that stalls beyond the bound must not hang run_doctor."""
+
+    class _StallingDisposeEngine:
+        async def dispose(self) -> None:
+            await asyncio.sleep(5.0)
+
+    def _fake_build_session_factory(database_url: str | None) -> tuple[Any, Any]:
+        return (lambda: _ImmediatelyFailingSession()), _StallingDisposeEngine()
+
+    monkeypatch.setattr("engram.doctor._build_session_factory", _fake_build_session_factory)
+    started = time.monotonic()
+    report = await run_doctor(
+        base_url="http://test",
+        database_url="postgresql://x/y",
+        timeout_seconds=0.2,
+        http_transport=httpx.MockTransport(_healthy_doctor_handler()),
+        clock=lambda: FIXED_NOW,
+    )
+    elapsed = time.monotonic() - started
+    assert elapsed < 4.0
+    ids = [c.id for c in report.checks]
+    assert ids == list(CHECK_ORDER)
 
 
 # --- Status aggregation / exit codes ------------------------------------------
@@ -780,7 +1033,9 @@ async def test_stalled_session_acquisition_produces_completed_report_not_a_hang(
             return httpx.Response(
                 200,
                 json={
-                    "principal_id": "p", "principal_type": "admin", "tenant_id": "t",
+                    "principal_id": "22222222-2222-2222-2222-222222222222",
+                    "principal_type": "admin",
+                    "tenant_id": "11111111-1111-1111-1111-111111111111",
                     "scopes": ["admin"], "api_key_id": "k", "memory_profile": None,
                 },
             )
@@ -1040,9 +1295,9 @@ async def test_identity_admin_scope_satisfies_read_and_write():
         return httpx.Response(
             200,
             json={
-                "principal_id": "p",
+                "principal_id": "22222222-2222-2222-2222-222222222222",
                 "principal_type": "admin",
-                "tenant_id": "tenant-a",
+                "tenant_id": "11111111-1111-1111-1111-111111111111",
                 "scopes": ["admin"],
                 "api_key_id": "secret-key-id",
                 "memory_profile": None,
@@ -1053,7 +1308,7 @@ async def test_identity_admin_scope_satisfies_read_and_write():
         check, tenant_id, source = await _check_identity(client, requested_tenant=None)
     assert check.status == "pass"
     assert check.reason_code == "IDENTITY_READY"
-    assert tenant_id == "tenant-a"
+    assert tenant_id == "11111111-1111-1111-1111-111111111111"
     assert source == "whoami"
     # never leak the api_key_id, Authorization header, or credential digest.
     assert "secret-key-id" not in json.dumps(check.evidence)
@@ -1065,9 +1320,9 @@ async def test_identity_read_only_missing_write_fails():
         return httpx.Response(
             200,
             json={
-                "principal_id": "p",
+                "principal_id": "22222222-2222-2222-2222-222222222222",
                 "principal_type": "agent",
-                "tenant_id": "tenant-a",
+                "tenant_id": "11111111-1111-1111-1111-111111111111",
                 "scopes": ["read"],
                 "api_key_id": "k",
                 "memory_profile": None,
@@ -1111,9 +1366,9 @@ async def test_identity_tenant_mismatch_warns_but_retains_explicit_tenant():
         return httpx.Response(
             200,
             json={
-                "principal_id": "p",
+                "principal_id": "22222222-2222-2222-2222-222222222222",
                 "principal_type": "admin",
-                "tenant_id": "whoami-tenant",
+                "tenant_id": "33333333-3333-3333-3333-333333333333",
                 "scopes": ["admin"],
                 "api_key_id": "k",
                 "memory_profile": None,
@@ -1128,6 +1383,212 @@ async def test_identity_tenant_mismatch_warns_but_retains_explicit_tenant():
     assert check.reason_code == "TENANT_SCOPE_MISMATCH"
     assert tenant_id == "explicit-tenant"
     assert source == "argument"
+
+
+# --- FIX2-2: strict /whoami validation ----------------------------------------
+
+_VALID_WHOAMI_PRINCIPAL_ID = "22222222-2222-2222-2222-222222222222"
+_VALID_WHOAMI_TENANT_ID = "11111111-1111-1111-1111-111111111111"
+
+
+def _valid_whoami_body(**overrides: Any) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "principal_id": _VALID_WHOAMI_PRINCIPAL_ID,
+        "principal_type": "admin",
+        "tenant_id": _VALID_WHOAMI_TENANT_ID,
+        "scopes": ["admin"],
+        "api_key_id": "k",
+        "memory_profile": None,
+    }
+    body.update(overrides)
+    return body
+
+
+async def _identity_check_for(body: Any) -> DoctorCheck:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body)
+
+    async with await _client(handler) as client:
+        check, _, _ = await _check_identity(client, requested_tenant=None)
+    return check
+
+
+async def test_identity_valid_unprofiled_body_passes():
+    check = await _identity_check_for(_valid_whoami_body())
+    assert check.status == "pass"
+    assert check.reason_code == "IDENTITY_READY"
+    assert check.evidence["memory_profile_slug"] is None
+    assert check.evidence["memory_profile_version"] is None
+
+
+async def test_identity_valid_profiled_body_passes_and_emits_only_validated_fields():
+    check = await _identity_check_for(
+        _valid_whoami_body(
+            memory_profile={
+                "id": "44444444-4444-4444-4444-444444444444",
+                "slug": "concise-writer",
+                "active_revision_id": "55555555-5555-5555-5555-555555555555",
+                "version": 3,
+            }
+        )
+    )
+    assert check.status == "pass"
+    assert check.evidence["memory_profile_slug"] == "concise-writer"
+    assert check.evidence["memory_profile_version"] == 3
+    # The profile's id/active_revision_id are validated but never emitted.
+    assert "44444444-4444-4444-4444-444444444444" not in json.dumps(check.evidence)
+
+
+async def test_identity_admin_still_satisfies_read_and_write():
+    check = await _identity_check_for(_valid_whoami_body(scopes=["admin"]))
+    assert check.status == "pass"
+
+
+@pytest.mark.parametrize(
+    "bad_scopes",
+    [
+        "admin",  # a string, not an array
+        {"admin": True},  # a mapping
+        1,  # an integer
+        ["admin", 7],  # contains a non-string
+        ["admin", "SENTINEL_UNKNOWN_SCOPE"],  # contains an unrecognized value
+    ],
+)
+async def test_identity_rejects_malformed_scopes(bad_scopes: Any):
+    check = await _identity_check_for(_valid_whoami_body(scopes=bad_scopes))
+    assert check.status == "fail"
+    assert check.reason_code == "IDENTITY_RESPONSE_INVALID"
+
+
+async def test_identity_rejects_non_uuid_tenant_id():
+    check = await _identity_check_for(_valid_whoami_body(tenant_id="not-a-uuid"))
+    assert check.status == "fail"
+    assert check.reason_code == "IDENTITY_RESPONSE_INVALID"
+
+
+async def test_identity_rejects_non_uuid_principal_id():
+    check = await _identity_check_for(_valid_whoami_body(principal_id="not-a-uuid"))
+    assert check.status == "fail"
+    assert check.reason_code == "IDENTITY_RESPONSE_INVALID"
+
+
+async def test_identity_rejects_arbitrary_principal_type_prose():
+    check = await _identity_check_for(
+        _valid_whoami_body(principal_type="SENTINEL_CREDENTIAL_LOOKING_VALUE")
+    )
+    assert check.status == "fail"
+    assert check.reason_code == "IDENTITY_RESPONSE_INVALID"
+
+
+async def test_identity_rejects_memory_profile_as_list():
+    check = await _identity_check_for(_valid_whoami_body(memory_profile=["not", "an", "object"]))
+    assert check.status == "fail"
+    assert check.reason_code == "IDENTITY_RESPONSE_INVALID"
+
+
+async def test_identity_rejects_memory_profile_slug_violating_grammar():
+    check = await _identity_check_for(
+        _valid_whoami_body(memory_profile={"slug": "Not Valid Slug!", "version": 1})
+    )
+    assert check.status == "fail"
+    assert check.reason_code == "IDENTITY_RESPONSE_INVALID"
+
+
+async def test_identity_rejects_memory_profile_slug_too_long():
+    check = await _identity_check_for(
+        _valid_whoami_body(memory_profile={"slug": "a" * 256, "version": 1})
+    )
+    assert check.status == "fail"
+    assert check.reason_code == "IDENTITY_RESPONSE_INVALID"
+
+
+@pytest.mark.parametrize("bad_version", ["3", 3.0, True, 0, -1])
+async def test_identity_rejects_malformed_memory_profile_version(bad_version: Any):
+    check = await _identity_check_for(
+        _valid_whoami_body(memory_profile={"slug": "concise-writer", "version": bad_version})
+    )
+    assert check.status == "fail"
+    assert check.reason_code == "IDENTITY_RESPONSE_INVALID"
+
+
+async def test_run_doctor_malformed_identity_produces_complete_report():
+    """A malformed /whoami must degrade only identity, not abort the report."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        if path == "/ready":
+            return httpx.Response(200, json={"status": "ready", "database": "connected"})
+        if path == "/whoami":
+            return httpx.Response(200, json=_valid_whoami_body(scopes="not-a-list"))
+        if path == "/v1/review/stats":
+            return httpx.Response(
+                200,
+                json={"by_review_status": {}, "by_kind": {}, "by_confidence": {}, "total": 0},
+            )
+        if path == "/v1/review/queue":
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, json={})
+
+    report = await run_doctor(
+        base_url="http://test",
+        http_transport=httpx.MockTransport(handler),
+        session_factory=lambda: _ImmediatelyFailingSession(),
+        clock=lambda: FIXED_NOW,
+    )
+    ids = [c.id for c in report.checks]
+    assert ids == list(CHECK_ORDER)
+    by_id = {c.id: c for c in report.checks}
+    assert by_id["identity.scopes"].status == "fail"
+    assert by_id["identity.scopes"].reason_code == "IDENTITY_RESPONSE_INVALID"
+    assert by_id["service.health"].status == "pass"
+    assert by_id["review.backlog"].status == "pass"
+
+
+async def test_run_doctor_malformed_identity_never_leaks_sentinels():
+    """Every rejected identity field's sentinel must never reach any output surface."""
+    sentinel_type = "SENTINEL_PRINCIPAL_TYPE_CREDENTIAL_LOOKING"
+    sentinel_scope = "SENTINEL_UNKNOWN_SCOPE_VALUE"
+    sentinel_slug_input = "SENTINEL_INVALID_SLUG_VALUE"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        if path == "/ready":
+            return httpx.Response(200, json={"status": "ready", "database": "connected"})
+        if path == "/whoami":
+            return httpx.Response(
+                200,
+                json=_valid_whoami_body(
+                    principal_type=sentinel_type,
+                    scopes=["admin", sentinel_scope],
+                    memory_profile={"slug": sentinel_slug_input, "version": 1},
+                ),
+            )
+        if path == "/v1/review/stats":
+            return httpx.Response(
+                200,
+                json={"by_review_status": {}, "by_kind": {}, "by_confidence": {}, "total": 0},
+            )
+        if path == "/v1/review/queue":
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, json={})
+
+    report = await run_doctor(
+        base_url="http://test",
+        http_transport=httpx.MockTransport(handler),
+        session_factory=lambda: _ImmediatelyFailingSession(),
+        clock=lambda: FIXED_NOW,
+    )
+    by_id = {c.id: c for c in report.checks}
+    assert by_id["identity.scopes"].status == "fail"
+    dumped = report.model_dump_json(by_alias=True)
+    rendered = render_human(report)
+    for sentinel in (sentinel_type, sentinel_scope, sentinel_slug_input):
+        assert sentinel not in dumped
+        assert sentinel not in rendered
 
 
 async def test_review_backlog_observed_excludes_universal_marker():
@@ -1148,11 +1609,11 @@ async def test_review_backlog_observed_excludes_universal_marker():
                 json=[
                     {
                         "content": "TOP SECRET MEMORY CONTENT",
-                        "promotion_blockers": ["conflict_recheck_not_run", "min_age_not_met"],
+                        "promotion_blockers": ["conflict_recheck_not_run", "age"],
                     },
                     {
                         "content": "ANOTHER SECRET",
-                        "promotion_blockers": ["conflict_recheck_not_run", "min_age_not_met"],
+                        "promotion_blockers": ["conflict_recheck_not_run", "age"],
                     },
                 ],
             )
@@ -1167,7 +1628,7 @@ async def test_review_backlog_observed_excludes_universal_marker():
     assert check.evidence["disputed_count"] == 1
     blocker_codes = [b["code"] for b in check.evidence["top_blockers"]]
     assert "conflict_recheck_not_run" not in blocker_codes
-    assert {"code": "min_age_not_met", "count": 2} in check.evidence["top_blockers"]
+    assert {"code": "age", "count": 2} in check.evidence["top_blockers"]
     # memory content must never reach evidence.
     evidence_text = json.dumps(check.evidence)
     assert "TOP SECRET" not in evidence_text
@@ -1245,9 +1706,44 @@ async def test_review_backlog_stats_count_wrong_type_or_negative(field: str, val
     assert check.reason_code == "REVIEW_BACKLOG_UNAVAILABLE"
 
 
-async def test_review_backlog_stats_total_wrong_type():
+@pytest.mark.parametrize("bad_total", ["1", 1.5, True, -1, [1], {"n": 1}])
+async def test_review_backlog_stats_total_wrong_type(bad_total: Any):
     async with await _client(
-        _stats_handler({"active": 1, "proposed": 0, "disputed": 0}, total="1")
+        _stats_handler({"active": 1, "proposed": 0, "disputed": 0}, total=bad_total)
+    ) as client:
+        check = await _check_review_backlog(client)
+    assert check.status == "unknown"
+    assert check.reason_code == "REVIEW_BACKLOG_UNAVAILABLE"
+
+
+async def test_review_backlog_stats_missing_total_is_invalid():
+    """``total`` is required — a response omitting it entirely is incomplete,
+
+    not implicitly zero (ENG-LOOP-001A-FIX2 / FIX2-3).
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/review/stats":
+            return httpx.Response(
+                200,
+                json={
+                    "by_review_status": {"active": 1, "proposed": 0, "disputed": 0},
+                    "by_kind": {}, "by_confidence": {},
+                },
+            )
+        if request.url.path == "/v1/review/queue":
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, json={})
+
+    async with await _client(handler) as client:
+        check = await _check_review_backlog(client)
+    assert check.status == "unknown"
+    assert check.reason_code == "REVIEW_BACKLOG_UNAVAILABLE"
+
+
+async def test_review_backlog_stats_selected_counts_exceed_total():
+    async with await _client(
+        _stats_handler({"active": 5, "proposed": 5, "disputed": 5}, total=3)
     ) as client:
         check = await _check_review_backlog(client)
     assert check.status == "unknown"
@@ -1344,18 +1840,79 @@ async def test_review_backlog_queue_blocker_list_has_non_string():
     assert check.reason_code == "REVIEW_QUEUE_UNAVAILABLE"
 
 
+async def test_review_backlog_queue_item_missing_promotion_blockers_key():
+    """``promotion_blockers`` is required — no longer defaults to [] (ENG-LOOP-001A-FIX2)."""
+    handler = _valid_stats_and_queue_handler(
+        httpx.Response(200, json=[{"content": "no blockers key at all"}])
+    )
+    async with await _client(handler) as client:
+        check = await _check_review_backlog(client)
+    assert check.status == "unknown"
+    assert check.reason_code == "REVIEW_QUEUE_UNAVAILABLE"
+
+
+@pytest.mark.parametrize(
+    "bad_blockers",
+    [None, "age", {"age": True}, 1],
+)
+async def test_review_backlog_queue_promotion_blockers_wrong_type(bad_blockers: Any):
+    handler = _valid_stats_and_queue_handler(
+        httpx.Response(200, json=[{"promotion_blockers": bad_blockers}])
+    )
+    async with await _client(handler) as client:
+        check = await _check_review_backlog(client)
+    assert check.status == "unknown"
+    assert check.reason_code == "REVIEW_QUEUE_UNAVAILABLE"
+
+
+async def test_review_backlog_queue_unknown_blocker_code_is_invalid():
+    """An unrecognized blocker string invalidates the sample, never passes through."""
+    handler = _valid_stats_and_queue_handler(
+        httpx.Response(200, json=[{"promotion_blockers": ["age", "SENTINEL_UNKNOWN_BLOCKER"]}])
+    )
+    async with await _client(handler) as client:
+        check = await _check_review_backlog(client)
+    assert check.status == "unknown"
+    assert check.reason_code == "REVIEW_QUEUE_UNAVAILABLE"
+    assert "SENTINEL_UNKNOWN_BLOCKER" not in json.dumps(check.evidence)
+
+
+async def test_review_backlog_queue_credential_and_content_sentinel_blockers_never_leak():
+    """A blocker string containing credential/memory-content sentinels must never be echoed."""
+    sentinel_blocker = "SENTINEL_DB_PASSWORD_LOOKING_VALUE"
+    handler = _valid_stats_and_queue_handler(
+        httpx.Response(200, json=[{"promotion_blockers": ["age", sentinel_blocker]}])
+    )
+    async with await _client(handler) as client:
+        check = await _check_review_backlog(client)
+    assert check.status == "unknown"
+    assert sentinel_blocker not in json.dumps(check.evidence)
+    assert sentinel_blocker not in check.summary
+
+
+async def test_review_backlog_all_canonical_blocker_codes_accepted():
+    from engram.promotion import PROMOTION_BLOCKER_CODES
+
+    items = [{"promotion_blockers": [code]} for code in sorted(PROMOTION_BLOCKER_CODES)]
+    handler = _valid_stats_and_queue_handler(httpx.Response(200, json=items))
+    async with await _client(handler) as client:
+        check = await _check_review_backlog(client)
+    assert check.status == "pass"
+    assert check.reason_code == "REVIEW_BACKLOG_OBSERVED"
+
+
 async def test_review_backlog_top_blockers_deterministic_tie_break():
     """Equal counts break ties by ascending blocker code, not insertion order."""
     items = [
-        {"promotion_blockers": ["zeta_blocker", "conflict_recheck_not_run"]},
-        {"promotion_blockers": ["alpha_blocker"]},
+        {"promotion_blockers": ["taxonomy_confidence", "conflict_recheck_not_run"]},
+        {"promotion_blockers": ["age"]},
     ]
     handler = _valid_stats_and_queue_handler(httpx.Response(200, json=items))
     async with await _client(handler) as client:
         check = await _check_review_backlog(client)
     assert check.status == "pass"
     codes = [b["code"] for b in check.evidence["top_blockers"]]
-    assert codes == ["alpha_blocker", "zeta_blocker"]
+    assert codes == ["age", "taxonomy_confidence"]
 
 
 async def test_review_backlog_failure_does_not_abort_other_checks():
@@ -1371,7 +1928,9 @@ async def test_review_backlog_failure_does_not_abort_other_checks():
             return httpx.Response(
                 200,
                 json={
-                    "principal_id": "p", "principal_type": "admin", "tenant_id": "t",
+                    "principal_id": "22222222-2222-2222-2222-222222222222",
+                    "principal_type": "admin",
+                    "tenant_id": "11111111-1111-1111-1111-111111111111",
                     "scopes": ["admin"], "api_key_id": "k", "memory_profile": None,
                 },
             )
@@ -1395,6 +1954,44 @@ async def test_review_backlog_failure_does_not_abort_other_checks():
     assert by_id["review.backlog"].reason_code == "REVIEW_BACKLOG_UNAVAILABLE"
     assert by_id["service.health"].status == "pass"
     assert by_id["identity.scopes"].status == "pass"
+
+
+async def test_run_doctor_rejected_review_blocker_sentinel_never_leaks_anywhere():
+    """A rejected/unknown review blocker sentinel must never reach any output surface."""
+    sentinel_blocker = "SENTINEL_MEMORY_CONTENT_LOOKING_BLOCKER"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        if path == "/ready":
+            return httpx.Response(200, json={"status": "ready", "database": "connected"})
+        if path == "/whoami":
+            return httpx.Response(200, json=_valid_whoami_body())
+        if path == "/v1/review/stats":
+            return httpx.Response(
+                200,
+                json={"by_review_status": {"active": 1}, "by_kind": {}, "total": 1},
+            )
+        if path == "/v1/review/queue":
+            return httpx.Response(
+                200, json=[{"promotion_blockers": ["age", sentinel_blocker]}]
+            )
+        return httpx.Response(404, json={})
+
+    report = await run_doctor(
+        base_url="http://test",
+        http_transport=httpx.MockTransport(handler),
+        session_factory=lambda: _ImmediatelyFailingSession(),
+        clock=lambda: FIXED_NOW,
+    )
+    by_id = {c.id: c for c in report.checks}
+    assert by_id["review.backlog"].status == "unknown"
+    assert by_id["review.backlog"].reason_code == "REVIEW_QUEUE_UNAVAILABLE"
+    dumped = report.model_dump_json(by_alias=True)
+    rendered = render_human(report)
+    assert sentinel_blocker not in dumped
+    assert sentinel_blocker not in rendered
 
 
 # --- Redaction -----------------------------------------------------------------
@@ -1422,9 +2019,9 @@ async def test_run_doctor_never_leaks_api_key():
             return httpx.Response(
                 200,
                 json={
-                    "principal_id": "p",
+                    "principal_id": "22222222-2222-2222-2222-222222222222",
                     "principal_type": "admin",
-                    "tenant_id": "t",
+                    "tenant_id": "11111111-1111-1111-1111-111111111111",
                     "scopes": ["admin"],
                     "api_key_id": "k",
                     "memory_profile": None,
@@ -1474,9 +2071,9 @@ async def test_run_doctor_sanitizes_db_exception_to_type_name_only():
             return httpx.Response(
                 200,
                 json={
-                    "principal_id": "p",
+                    "principal_id": "22222222-2222-2222-2222-222222222222",
                     "principal_type": "admin",
-                    "tenant_id": "t",
+                    "tenant_id": "11111111-1111-1111-1111-111111111111",
                     "scopes": ["admin"],
                     "api_key_id": "k",
                     "memory_profile": None,

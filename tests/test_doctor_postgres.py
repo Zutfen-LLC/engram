@@ -1147,3 +1147,104 @@ async def test_database_url_bare_postgresql_scheme_builds_a_working_one_shot_eng
     recall_check = _check(report, "recall.activity")
     assert recall_check.status == "pass"
     assert recall_check.reason_code == "RECALL_ACTIVITY_RECENT"
+
+
+async def test_database_url_explicit_asyncpg_scheme_builds_a_working_one_shot_engine() -> None:
+    """An explicit postgresql+asyncpg:// --database-url must also work end-to-end."""
+    if not await _db_ok():
+        pytest.skip(_DB_SKIP_REASON)
+    async with _test_session_factory() as session:
+        tenant_id, principal_id = await _seed_tenant(session, label="fix2-asyncpg-scheme")
+        await _insert_recall_log(
+            session, tenant_id=tenant_id, principal_id=principal_id, mode="startup",
+            created_at=NOW - timedelta(minutes=5),
+        )
+
+    assert settings.database_url.startswith("postgresql+asyncpg://")
+
+    report = await run_doctor(
+        base_url="http://test",
+        tenant=str(tenant_id),
+        since=SINCE,
+        until=NOW,
+        database_url=settings.database_url,
+        http_transport=httpx.MockTransport(_healthy_handler(tenant_id)),
+        clock=lambda: NOW,
+    )
+    recall_check = _check(report, "recall.activity")
+    assert recall_check.status == "pass"
+    assert recall_check.reason_code == "RECALL_ACTIVITY_RECENT"
+
+
+class _DisposeCountingEngineProxy:
+    """Forwards everything to a real AsyncEngine except a counted ``dispose()``.
+
+    ``AsyncEngine.dispose`` cannot be reassigned directly (it is read-only),
+    so counting real disposal calls requires wrapping the engine object
+    itself rather than patching the method in place. The wrapped real
+    engine is what ``async_sessionmaker`` was already built against, so
+    session creation and querying are entirely unaffected — only the
+    disposal call this test cares about is intercepted.
+    """
+
+    def __init__(self, real_engine: Any) -> None:
+        self._real_engine = real_engine
+        self.dispose_calls = 0
+
+    async def dispose(self, *args: Any, **kwargs: Any) -> None:
+        self.dispose_calls += 1
+        await self._real_engine.dispose(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real_engine, name)
+
+
+async def test_database_url_one_shot_engine_disposed_exactly_once_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A one-shot engine backing a fully successful run is disposed exactly once.
+
+    Proves the FIX2-1 disposal guarantee holds even when database evidence
+    gathering succeeds outright against a real database, not just on a
+    failure/timeout path (ENG-LOOP-001A-FIX2 / FIX2-1).
+    """
+    if not await _db_ok():
+        pytest.skip(_DB_SKIP_REASON)
+    async with _test_session_factory() as session:
+        tenant_id, principal_id = await _seed_tenant(session, label="fix2-dispose-once")
+        await _insert_recall_log(
+            session, tenant_id=tenant_id, principal_id=principal_id, mode="startup",
+            created_at=NOW - timedelta(minutes=5),
+        )
+
+    import engram.doctor as doctor_module
+
+    original_build_session_factory = doctor_module._build_session_factory
+    proxies: list[_DisposeCountingEngineProxy] = []
+
+    def _wrapped_build_session_factory(database_url: str | None) -> tuple[Any, Any]:
+        factory, engine = original_build_session_factory(database_url)
+        if engine is None:
+            return factory, engine
+        proxy = _DisposeCountingEngineProxy(engine)
+        proxies.append(proxy)
+        return factory, proxy
+
+    monkeypatch.setattr(
+        "engram.doctor._build_session_factory", _wrapped_build_session_factory
+    )
+
+    report = await run_doctor(
+        base_url="http://test",
+        tenant=str(tenant_id),
+        since=SINCE,
+        until=NOW,
+        database_url=settings.database_url,
+        http_transport=httpx.MockTransport(_healthy_handler(tenant_id)),
+        clock=lambda: NOW,
+    )
+
+    recall_check = _check(report, "recall.activity")
+    assert recall_check.status == "pass"
+    assert len(proxies) == 1
+    assert proxies[0].dispose_calls == 1
