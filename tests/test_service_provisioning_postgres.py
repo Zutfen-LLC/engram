@@ -288,6 +288,22 @@ async def test_real_provisioning_contract_replay_resolution_and_audit(service_st
     assert conflict_event["external_tenant_ref_digest"] is not None
     assert conflict_event["external_principal_ref_digest"] is not None
     assert f"tenant-ref-{tag}" not in conflict_event["details"]
+    events = await owner.fetch(
+        "SELECT service_client_id, credential_id, tenant_id, principal_id, event_type, outcome, request_id, "
+        "reason_code, external_tenant_ref_digest, external_principal_ref_digest, details::text "
+        "FROM service_provisioning_events WHERE service_client_id=$1",
+        stack["client_id"],
+    )
+    serialized_events = "\n".join(str(dict(event)) for event in events)
+    for forbidden in (
+        body["tenant"]["external_ref"],
+        body["human_principal"]["external_ref"],
+        body["tenant"]["name"],
+        body["human_principal"]["name"],
+        key,
+        stack["credential"],
+    ):
+        assert forbidden not in serialized_events
 
 
 async def test_locked_authority_revalidation_rejects_changed_state(service_stack) -> None:  # type: ignore[no-untyped-def]
