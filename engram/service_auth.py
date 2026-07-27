@@ -36,6 +36,7 @@ _KEY_ID_LENGTH = 22
 _SECRET_LENGTH = 43  # urlsafe base64 encoding of 32 random bytes without padding
 _BASE62 = string.digits + string.ascii_lowercase + string.ascii_uppercase
 _TOKEN_RE = re.compile(r"^engsvc_([0-9A-Za-z]{22})_([A-Za-z0-9_-]{43})$")
+_SERVICE_CLIENT_SLUG_RE = re.compile(r"^[a-z][a-z0-9-]{0,99}$")
 _bearer = HTTPBearer(auto_error=False)
 
 
@@ -124,6 +125,31 @@ def validate_service_client_display_name(value: str) -> str:
         raise ValueError(
             "service client display name must be 1 through 255 non-whitespace characters"
         )
+    return value
+
+
+def validate_service_client_slug(value: str) -> str:
+    """Validate the database-backed service-client identifier before connecting."""
+    if _SERVICE_CLIENT_SLUG_RE.fullmatch(value) is None:
+        raise ValueError("invalid service client slug")
+    return value
+
+
+def validate_service_credential_label(value: str | None) -> str | None:
+    """Keep rotate-key labels within their persisted VARCHAR boundary."""
+    if value is not None and len(value) > 255:
+        raise ValueError("service credential label is too long")
+    return value
+
+
+def validate_service_credential_expiry(value: str | None) -> str | None:
+    """Reject malformed ISO-8601 expiry values before any credential is minted."""
+    if value is None:
+        return None
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("invalid service credential expiry") from exc
     return value
 
 

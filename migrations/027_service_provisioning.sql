@@ -15,7 +15,8 @@ $$;
 -- intentionally explicit: an old manual role must not retain broader flags
 -- merely because CREATE ROLE was skipped above.
 ALTER ROLE engram_provisioner LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB
-    NOCREATEROLE NOREPLICATION NOINHERIT;
+    NOCREATEROLE NOREPLICATION NOINHERIT CONNECTION LIMIT -1 VALID UNTIL 'infinity';
+ALTER ROLE engram_provisioner RESET ALL;
 -- Membership permits SET ROLE even when NOINHERIT is set, so converge an
 -- existing role to no memberships at all.  This also removes indirect paths
 -- to owner or application authority.
@@ -244,7 +245,11 @@ CREATE POLICY provisioner_tenant_config_select ON tenant_config FOR SELECT TO en
         WHERE b.tenant_id = tenant_config.tenant_id AND b.service_client_id = current_service_client_id()
     ));
 CREATE POLICY provisioner_memory_kinds_insert ON memory_kinds FOR INSERT TO engram_provisioner
-    WITH CHECK (current_service_client_id() IS NOT NULL);
+    WITH CHECK (EXISTS (
+        SELECT 1 FROM tenant_provisioning_bindings b
+        WHERE b.tenant_id = memory_kinds.tenant_id
+          AND b.service_client_id = current_service_client_id()
+    ));
 CREATE POLICY provisioner_memory_kinds_select ON memory_kinds FOR SELECT TO engram_provisioner
     USING (EXISTS (
         SELECT 1 FROM tenant_provisioning_bindings b

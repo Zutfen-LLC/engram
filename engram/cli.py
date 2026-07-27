@@ -928,6 +928,9 @@ async def _run_service_client(args: argparse.Namespace, database_url: str) -> in
         generate_service_credential,
         parse_service_credential,
         validate_service_client_display_name,
+        validate_service_client_slug,
+        validate_service_credential_expiry,
+        validate_service_credential_label,
     )
 
     async def event(conn: asyncpg.Connection, client_id: str, event_type: str) -> None:
@@ -943,10 +946,14 @@ async def _run_service_client(args: argparse.Namespace, database_url: str) -> in
     # malformed create commands fail closed without touching the database.
     try:
         if args.service_client_command == "create":
+            args.slug = validate_service_client_slug(args.slug)
             args.display_name = validate_service_client_display_name(args.display_name)
             args.permission = canonicalize_service_permissions(
                 args.permission or ["tenant.provision", "principal.provision"]
             )
+        elif args.service_client_command == "rotate-key":
+            args.label = validate_service_credential_label(args.label)
+            args.expires_at = validate_service_credential_expiry(args.expires_at)
     except ValueError:
         print("ERROR: invalid service client input", file=sys.stderr)
         return 1

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import sys
 import uuid
 from collections.abc import AsyncGenerator
 from pathlib import Path
@@ -42,6 +43,84 @@ def _provisioner_url(owner_url: str, database: str, password: str | None = None)
     return f"postgresql+asyncpg://{credentials}@{host}/{database}"
 
 
+async def _role_state(conn):  # type: ignore[no-untyped-def]
+    """Capture every cluster-global property this proof can disturb, without logging secrets."""
+    role = await conn.fetchrow(
+        "SELECT rolcanlogin,rolsuper,rolbypassrls,rolcreatedb,rolcreaterole,rolreplication,"
+        "rolinherit,rolconnlimit,rolvaliduntil,rolpassword "
+        "FROM pg_authid WHERE rolname='engram_provisioner'"
+    )
+    if role is None:
+        return None
+    memberships = await conn.fetch(
+        "SELECT parent.rolname FROM pg_auth_members membership "
+        "JOIN pg_roles member_role ON member_role.oid=membership.member "
+        "JOIN pg_roles parent ON parent.oid=membership.roleid "
+        "WHERE member_role.rolname='engram_provisioner' ORDER BY parent.rolname"
+    )
+    settings = await conn.fetch(
+        "SELECT unnest(setconfig) AS setting FROM pg_db_role_setting settings "
+        "JOIN pg_roles role ON role.oid=settings.setrole "
+        "WHERE role.rolname='engram_provisioner' AND settings.setdatabase=0 ORDER BY setting"
+    )
+    return dict(role) | {
+        "memberships": [row["rolname"] for row in memberships],
+        "rolconfig": [row["setting"] for row in settings],
+    }
+
+
+async def _restore_role_state(conn, state) -> None:  # type: ignore[no-untyped-def]
+    if state is None:
+        await conn.execute("DROP ROLE IF EXISTS engram_provisioner")
+        return
+    flags = (
+        ("LOGIN", "NOLOGIN", state["rolcanlogin"]),
+        ("SUPERUSER", "NOSUPERUSER", state["rolsuper"]),
+        ("BYPASSRLS", "NOBYPASSRLS", state["rolbypassrls"]),
+        ("CREATEDB", "NOCREATEDB", state["rolcreatedb"]),
+        ("CREATEROLE", "NOCREATEROLE", state["rolcreaterole"]),
+        ("REPLICATION", "NOREPLICATION", state["rolreplication"]),
+        ("INHERIT", "NOINHERIT", state["rolinherit"]),
+    )
+    command = "ALTER ROLE engram_provisioner " + " ".join(
+        enabled if value else disabled for enabled, disabled, value in flags
+    )
+    command += f" CONNECTION LIMIT {state['rolconnlimit']} "
+    command += (
+        "VALID UNTIL 'infinity'"
+        if state["rolvaliduntil"] is None
+        else ("VALID UNTIL " + repr(state["rolvaliduntil"].isoformat()))
+    )
+    await conn.execute(command)
+    current = await conn.fetch(
+        "SELECT parent.rolname FROM pg_auth_members membership "
+        "JOIN pg_roles member_role ON member_role.oid=membership.member "
+        "JOIN pg_roles parent ON parent.oid=membership.roleid "
+        "WHERE member_role.rolname='engram_provisioner'"
+    )
+    for row in current:
+        await conn.execute(f'REVOKE "{row["rolname"]}" FROM engram_provisioner')
+    for membership in state["memberships"]:
+        await conn.execute(f'GRANT "{membership}" TO engram_provisioner')
+    await conn.execute("ALTER ROLE engram_provisioner RESET ALL")
+    for setting in state["rolconfig"] or []:
+        name, value = setting.split("=", 1)
+        command = await conn.fetchval(
+            "SELECT format('ALTER ROLE engram_provisioner SET %I TO %L', $1, $2)", name, value
+        )
+        assert isinstance(command, str)
+        await conn.execute(command)
+    if state["rolpassword"] is None:
+        await conn.execute("ALTER ROLE engram_provisioner PASSWORD NULL")
+    else:
+        command = await conn.fetchval(
+            "SELECT format('ALTER ROLE engram_provisioner PASSWORD %L', $1::text)",
+            state["rolpassword"],
+        )
+        assert isinstance(command, str)
+        await conn.execute(command)
+
+
 async def _upgrade_session(
     factory: async_sessionmaker[AsyncSession],
 ) -> AsyncGenerator[AsyncSession, None]:
@@ -70,11 +149,9 @@ async def test_persisted_migration_026_to_027_preserves_data_and_converges_role(
     admin = await asyncpg.connect(normalize_asyncpg_url(owner_url))
     database_url = _with_database(owner_url, database)
     provisioner_url = _provisioner_url(owner_url, database)
-    # Preserve the cluster-global role password exactly.  The disposable
-    # database is isolated; PostgreSQL roles are not, so cleanup must be too.
-    original_password = await admin.fetchval(
-        "SELECT rolpassword FROM pg_authid WHERE rolname='engram_provisioner'"
-    )
+    # The disposable database is isolated; PostgreSQL roles are not. Snapshot
+    # the complete role state before making the deliberately hostile mutation.
+    original_role = await _role_state(admin)
     created_database = False
     upgrade_engine = None
     provisioner_engine = None
@@ -141,18 +218,35 @@ async def test_persisted_migration_026_to_027_preserves_data_and_converges_role(
                 ["read"],
                 "persisted upgrade key",
             )
+            pre_upgrade_config = await before.fetchrow(
+                "SELECT config_version,auto_promote_enabled,auto_promote_evidence_enabled "
+                "FROM tenant_config WHERE tenant_id=$1 AND active",
+                tenant_id,
+            )
+            pre_upgrade_kinds = await before.fetch(
+                "SELECT name FROM memory_kinds WHERE tenant_id=$1 AND is_builtin ORDER BY name",
+                tenant_id,
+            )
+            assert pre_upgrade_config is not None
+            assert pre_upgrade_kinds
         finally:
             await before.close()
 
         # This is deliberately hostile legacy state.  Migration 027 must
         # converge it instead of relying on a fresh CREATE ROLE branch.
+        if original_role is None:
+            await admin.execute("CREATE ROLE engram_provisioner LOGIN")
         await admin.execute(
-            "ALTER ROLE engram_provisioner LOGIN SUPERUSER BYPASSRLS CREATEDB CREATEROLE REPLICATION INHERIT"
+            "ALTER ROLE engram_provisioner LOGIN SUPERUSER BYPASSRLS CREATEDB CREATEROLE "
+            "REPLICATION INHERIT CONNECTION LIMIT 1 VALID UNTIL '2000-01-01'"
         )
+        await admin.execute("ALTER ROLE engram_provisioner SET work_mem TO '1MB'")
         await admin.execute("GRANT engram TO engram_provisioner")
         await admin.execute("ALTER ROLE engram_provisioner PASSWORD NULL")
         with pytest.raises(asyncpg.InvalidPasswordError):
             await asyncpg.connect(normalize_asyncpg_url(provisioner_url))
+        if os.getenv("ENGRAM_FORCE_UPGRADE_PROOF_FAILURE") == "1":
+            raise RuntimeError("forced upgrade proof failure")
 
         assert await _run_init_db(database_url) == 0
         after = await asyncpg.connect(normalize_asyncpg_url(database_url))
@@ -177,6 +271,21 @@ async def test_persisted_migration_026_to_027_preserves_data_and_converges_role(
             )
             assert (
                 await after.fetchval("SELECT count(*) FROM api_keys WHERE id=$1", api_key_id) == 1
+            )
+            assert (
+                await after.fetchrow(
+                    "SELECT config_version,auto_promote_enabled,auto_promote_evidence_enabled "
+                    "FROM tenant_config WHERE tenant_id=$1 AND active",
+                    tenant_id,
+                )
+                == pre_upgrade_config
+            )
+            assert (
+                await after.fetch(
+                    "SELECT name FROM memory_kinds WHERE tenant_id=$1 AND is_builtin ORDER BY name",
+                    tenant_id,
+                )
+                == pre_upgrade_kinds
             )
             role = await after.fetchrow(
                 "SELECT rolcanlogin,rolsuper,rolbypassrls,rolcreatedb,rolcreaterole,rolreplication,rolinherit,"
@@ -207,10 +316,26 @@ async def test_persisted_migration_026_to_027_preserves_data_and_converges_role(
         # Rerunning the same production command is migration tracking proof,
         # not a second direct execution of 027.
         assert await _run_init_db(database_url) == 0
+        after_second_run = await asyncpg.connect(normalize_asyncpg_url(database_url))
+        try:
+            assert (
+                await after_second_run.fetchval(
+                    "SELECT count(*) FROM schema_migrations WHERE filename='027_service_provisioning.sql'"
+                )
+                == 1
+            )
+            assert await after_second_run.fetchval("SELECT count(*) FROM service_clients") == 0
+            assert (
+                await after_second_run.fetchval("SELECT count(*) FROM service_client_credentials")
+                == 0
+            )
+        finally:
+            await after_second_run.close()
 
         assigned_password = secrets.token_urlsafe(32)
         password_sql = await admin.fetchval(
-            "SELECT format('ALTER ROLE engram_provisioner PASSWORD %L', $1::text)", assigned_password
+            "SELECT format('ALTER ROLE engram_provisioner PASSWORD %L', $1::text)",
+            assigned_password,
         )
         assert isinstance(password_sql, str)
         await admin.execute(password_sql)
@@ -294,24 +419,52 @@ async def test_persisted_migration_026_to_027_preserves_data_and_converges_role(
                 },
             )
         assert response.status_code == 201
+        verification = await asyncpg.connect(normalize_asyncpg_url(database_url))
+        try:
+            created_tenant = await verification.fetchval(
+                "SELECT tenant_id FROM tenant_provisioning_bindings WHERE service_client_id=$1",
+                client_id,
+            )
+            assert created_tenant is not None
+            assert (
+                await verification.fetchval(
+                    "SELECT count(*) FROM tenant_config WHERE tenant_id=$1 AND active "
+                    "AND auto_promote_evidence_enabled",
+                    created_tenant,
+                )
+                == 1
+            )
+            assert await verification.fetchval(
+                "SELECT count(*) FROM memory_kinds WHERE tenant_id=$1 AND is_builtin",
+                created_tenant,
+            ) == len(pre_upgrade_kinds)
+        finally:
+            await verification.close()
     finally:
-        if provisioner_engine is not None:
-            await provisioner_engine.dispose()
-        if upgrade_engine is not None:
-            await upgrade_engine.dispose()
-        if original_password is not None:
-            restore = await admin.fetchval(
-                "SELECT format('ALTER ROLE engram_provisioner PASSWORD %L', $1::text)", original_password
-            )
-            if isinstance(restore, str):
-                await admin.execute(restore)
-        await admin.execute(
-            "ALTER ROLE engram_provisioner LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION NOINHERIT"
-        )
-        await admin.execute("REVOKE engram FROM engram_provisioner")
+        cleanup_errors: list[str] = []
+        for engine in (provisioner_engine, upgrade_engine):
+            if engine is not None:
+                try:
+                    await engine.dispose()
+                except Exception as exc:  # pragma: no cover - defensive cleanup path
+                    cleanup_errors.append(type(exc).__name__)
         if created_database:
-            await admin.execute(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1", database
-            )
-            await admin.execute(f'DROP DATABASE "{database}"')
-        await admin.close()
+            try:
+                await admin.execute(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1",
+                    database,
+                )
+                await admin.execute(f'DROP DATABASE "{database}"')
+            except Exception as exc:  # pragma: no cover - defensive cleanup path
+                cleanup_errors.append(type(exc).__name__)
+        try:
+            await _restore_role_state(admin, original_role)
+            assert await _role_state(admin) == original_role
+        except Exception as exc:  # pragma: no cover - defensive cleanup path
+            cleanup_errors.append(type(exc).__name__)
+        try:
+            await admin.close()
+        except Exception as exc:  # pragma: no cover - defensive cleanup path
+            cleanup_errors.append(type(exc).__name__)
+        if cleanup_errors and sys.exc_info()[0] is None:
+            raise AssertionError(f"upgrade proof cleanup failed: {cleanup_errors}")

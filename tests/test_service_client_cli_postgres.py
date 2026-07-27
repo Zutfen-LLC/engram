@@ -291,3 +291,133 @@ async def test_cli_rejects_bad_display_name_before_connecting(capsys) -> None:  
     output = capsys.readouterr()
     assert output.out == ""
     assert output.err == "ERROR: invalid service client input\n"
+
+
+@pytest.mark.parametrize(
+    "slug",
+    ("Uppercase", "1leading-digit", "has space", "has.punctuation", "", "a" * 101),
+)
+async def test_cli_rejects_invalid_slug_without_creating_credentials_or_events(
+    owner_cli_db, capsys, slug: str
+) -> None:  # type: ignore[no-untyped-def]
+    proof = owner_cli_db
+    before_clients = await proof["owner"].fetchval("SELECT count(*) FROM service_clients")
+    before_credentials = await proof["owner"].fetchval(
+        "SELECT count(*) FROM service_client_credentials"
+    )
+    before_events = await proof["owner"].fetchval(
+        "SELECT count(*) FROM service_provisioning_events"
+    )
+
+    assert (
+        await _run_service_client(
+            _args("create", slug=slug, display_name="Invalid slug", permission=None, json=False),
+            proof["url"],
+        )
+        == 1
+    )
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err == "ERROR: invalid service client input\n"
+    assert await proof["owner"].fetchval("SELECT count(*) FROM service_clients") == before_clients
+    assert (
+        await proof["owner"].fetchval("SELECT count(*) FROM service_client_credentials")
+        == before_credentials
+    )
+    assert (
+        await proof["owner"].fetchval("SELECT count(*) FROM service_provisioning_events")
+        == before_events
+    )
+
+
+@pytest.mark.parametrize("expires_at", ("not-a-timestamp", "2024-02-30T12:00:00Z"))
+async def test_cli_rejects_invalid_expiry_without_committing_credential_or_event(
+    owner_cli_db, capsys, expires_at: str
+) -> None:  # type: ignore[no-untyped-def]
+    proof = owner_cli_db
+    slug = f"cli-proof-expiry-{proof['tag']}"
+    assert (
+        await _run_service_client(
+            _args("create", slug=slug, display_name="Expiry input", permission=None, json=False),
+            proof["url"],
+        )
+        == 0
+    )
+    capsys.readouterr()
+    client_id = await proof["owner"].fetchval("SELECT id FROM service_clients WHERE slug=$1", slug)
+    assert client_id is not None
+    before_credentials = await proof["owner"].fetchval(
+        "SELECT count(*) FROM service_client_credentials WHERE service_client_id=$1", client_id
+    )
+    before_events = await proof["owner"].fetchval(
+        "SELECT count(*) FROM service_provisioning_events WHERE service_client_id=$1", client_id
+    )
+
+    assert (
+        await _run_service_client(
+            _args("rotate-key", client=slug, label=None, expires_at=expires_at, json=False),
+            proof["url"],
+        )
+        == 1
+    )
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err == "ERROR: invalid service client input\n"
+    assert (
+        await proof["owner"].fetchval(
+            "SELECT count(*) FROM service_client_credentials WHERE service_client_id=$1", client_id
+        )
+        == before_credentials
+    )
+    assert (
+        await proof["owner"].fetchval(
+            "SELECT count(*) FROM service_provisioning_events WHERE service_client_id=$1", client_id
+        )
+        == before_events
+    )
+
+
+async def test_cli_rejects_oversized_rotate_label_without_minting_a_credential(
+    owner_cli_db, capsys
+) -> None:  # type: ignore[no-untyped-def]
+    proof = owner_cli_db
+    slug = f"cli-proof-label-{proof['tag']}"
+    assert (
+        await _run_service_client(
+            _args("create", slug=slug, display_name="Label input", permission=None, json=False),
+            proof["url"],
+        )
+        == 0
+    )
+    capsys.readouterr()
+    client_id = await proof["owner"].fetchval("SELECT id FROM service_clients WHERE slug=$1", slug)
+    assert client_id is not None
+    before_credentials = await proof["owner"].fetchval(
+        "SELECT count(*) FROM service_client_credentials WHERE service_client_id=$1", client_id
+    )
+    before_events = await proof["owner"].fetchval(
+        "SELECT count(*) FROM service_provisioning_events WHERE service_client_id=$1", client_id
+    )
+
+    assert (
+        await _run_service_client(
+            _args("rotate-key", client=slug, label="x" * 256, expires_at=None, json=False),
+            proof["url"],
+        )
+        == 1
+    )
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err == "ERROR: invalid service client input\n"
+    assert (
+        await proof["owner"].fetchval(
+            "SELECT count(*) FROM service_client_credentials WHERE service_client_id=$1", client_id
+        )
+        == before_credentials
+    )
+    assert (
+        await proof["owner"].fetchval(
+            "SELECT count(*) FROM service_provisioning_events WHERE service_client_id=$1", client_id
+        )
+        == before_events
+    )

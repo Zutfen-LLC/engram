@@ -38,6 +38,7 @@ async def role_proof() -> AsyncIterator[dict[str, Any]]:
     first_binding, second_binding = uuid.uuid4(), uuid.uuid4()
     first_principal, second_principal = uuid.uuid4(), uuid.uuid4()
     first_principal_binding, second_principal_binding = uuid.uuid4(), uuid.uuid4()
+    unbound_tenant = uuid.uuid4()
     try:
         async with owner.transaction():
             for client_id, suffix in ((first_client, "one"), (second_client, "two")):
@@ -147,6 +148,7 @@ async def role_proof() -> AsyncIterator[dict[str, Any]]:
             "second_tenant": second_tenant,
             "first_principal": first_principal,
             "second_principal": second_principal,
+            "unbound_tenant": unbound_tenant,
         }
     finally:
         await provisioner.close()
@@ -251,6 +253,153 @@ async def test_provisioner_role_posture_and_narrow_grants(role_proof) -> None:  
     ):
         with pytest.raises(asyncpg.InsufficientPrivilegeError):
             await conn.execute(statement)
+
+
+async def test_provisioner_owns_no_public_schema_objects(role_proof) -> None:  # type: ignore[no-untyped-def]
+    owner = role_proof["owner"]
+    provisioner_owned = await owner.fetchval(
+        "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "JOIN pg_roles r ON r.oid=c.relowner WHERE n.nspname='public' "
+        "AND r.rolname='engram_provisioner' AND c.relkind IN ('r','p','S','v','m','i')"
+    )
+    function_owned = await owner.fetchval(
+        "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace "
+        "JOIN pg_roles r ON r.oid=p.proowner WHERE n.nspname='public' "
+        "AND r.rolname='engram_provisioner'"
+    )
+    assert provisioner_owned == 0
+    assert function_owned == 0
+    assert (
+        await owner.fetchval(
+            "SELECT nspowner::regrole::text <> 'engram_provisioner' "
+            "FROM pg_namespace WHERE nspname='public'"
+        )
+        is True
+    )
+    for object_name in ("service_clients", "service_client_credentials", "tenants", "principals"):
+        assert (
+            await owner.fetchval(
+                "SELECT r.rolname <> 'engram_provisioner' FROM pg_class c "
+                "JOIN pg_roles r ON r.oid=c.relowner WHERE c.oid=$1::regclass",
+                object_name,
+            )
+            is True
+        )
+
+
+async def test_provisioner_can_only_update_inert_authority_columns_and_lock_rows(
+    role_proof,
+) -> None:  # type: ignore[no-untyped-def]
+    proof = role_proof
+    owner, conn = proof["owner"], proof["provisioner"]
+    before_client = await owner.fetchrow(
+        "SELECT * FROM service_clients WHERE id=$1", proof["first_client"]
+    )
+    before_credential = await owner.fetchrow(
+        "SELECT * FROM service_client_credentials WHERE service_client_id=$1", proof["first_client"]
+    )
+    assert before_client is not None and before_credential is not None
+    async with conn.transaction():
+        await conn.execute(
+            "UPDATE service_clients SET updated_at=now() WHERE id=$1", proof["first_client"]
+        )
+        await conn.execute(
+            "UPDATE service_client_credentials SET last_used_at=now() WHERE id=$1",
+            before_credential["id"],
+        )
+        await conn.fetch(
+            "SELECT id FROM service_clients WHERE id=$1 FOR UPDATE OF service_clients",
+            proof["first_client"],
+        )
+        await conn.fetch(
+            "SELECT id FROM service_client_credentials WHERE id=$1 FOR UPDATE OF service_client_credentials",
+            before_credential["id"],
+        )
+    after_client = await owner.fetchrow(
+        "SELECT * FROM service_clients WHERE id=$1", proof["first_client"]
+    )
+    after_credential = await owner.fetchrow(
+        "SELECT * FROM service_client_credentials WHERE id=$1", before_credential["id"]
+    )
+    assert after_client is not None and after_credential is not None
+    assert after_client["updated_at"] >= before_client["updated_at"]
+    assert after_credential["last_used_at"] is not None
+    for column in ("slug", "display_name", "permissions", "status", "disabled_at"):
+        assert after_client[column] == before_client[column]
+    for column in (
+        "service_client_id",
+        "key_id",
+        "secret_digest",
+        "digest_algorithm",
+        "label",
+        "status",
+        "expires_at",
+        "revoked_at",
+    ):
+        assert after_credential[column] == before_credential[column]
+
+
+@pytest.mark.parametrize(
+    ("statement", "values"),
+    (
+        (
+            "INSERT INTO api_keys (tenant_id,key_hash,scopes) VALUES ($1,$2,$3)",
+            ("first_tenant", "x", ["read"]),
+        ),
+        (
+            "INSERT INTO workspaces (tenant_id,name,slug) VALUES ($1,$2,$3)",
+            ("first_tenant", "denied", "denied"),
+        ),
+        (
+            "INSERT INTO principals (tenant_id,name,type) VALUES ($1,$2,'admin')",
+            ("first_tenant", "denied-admin"),
+        ),
+        (
+            "INSERT INTO principals (tenant_id,name,type) VALUES ($1,$2,'agent')",
+            ("first_tenant", "denied-agent"),
+        ),
+        (
+            "INSERT INTO principals (tenant_id,name,type,internal_key) VALUES ($1,$2,'system',$3)",
+            ("first_tenant", "denied-internal", "internal"),
+        ),
+        (
+            "INSERT INTO principals (tenant_id,name,type) VALUES ($1,$2,'user')",
+            ("unbound_tenant", "denied-unbound"),
+        ),
+        (
+            "INSERT INTO principals (tenant_id,name,type) VALUES ($1,$2,'user')",
+            ("second_tenant", "denied-other"),
+        ),
+        ("INSERT INTO tenant_config (tenant_id) VALUES ($1)", ("unbound_tenant",)),
+        ("INSERT INTO tenant_config (tenant_id) VALUES ($1)", ("second_tenant",)),
+        (
+            "INSERT INTO memory_kinds (tenant_id,name,display_name) VALUES ($1,$2,$3)",
+            ("unbound_tenant", "deniedkind", "Denied"),
+        ),
+        (
+            "INSERT INTO memory_kinds (tenant_id,name,display_name) VALUES ($1,$2,$3)",
+            ("second_tenant", "otherkind", "Other"),
+        ),
+    ),
+)
+async def test_provisioner_cannot_create_privileged_or_cross_client_resources(
+    role_proof, statement: str, values: tuple[object, ...]
+) -> None:  # type: ignore[no-untyped-def]
+    import asyncpg
+
+    proof = role_proof
+    resolved = tuple(
+        proof[value] if isinstance(value, str) and value in proof else value for value in values
+    )
+    conn = proof["provisioner"]
+    async with conn.transaction():
+        await conn.execute(
+            "SELECT set_config('app.service_client_id', $1, true)", str(proof["first_client"])
+        )
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            async with conn.transaction():
+                await conn.execute(statement, *resolved)
+        assert await conn.fetchval("SELECT 1") == 1
 
 
 @pytest.mark.parametrize(
