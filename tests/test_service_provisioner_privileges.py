@@ -402,6 +402,38 @@ async def test_provisioner_cannot_create_privileged_or_cross_client_resources(
         assert await conn.fetchval("SELECT 1") == 1
 
 
+async def test_provisioner_cannot_create_bound_user_with_internal_key(
+    role_proof,
+) -> None:  # type: ignore[no-untyped-def]
+    """Isolate the ``internal_key IS NULL`` predicate on an otherwise-valid user."""
+    import asyncpg
+
+    proof = role_proof
+    conn = proof["provisioner"]
+    name = f"denied-user-internal-{uuid.uuid4().hex[:12]}"
+    async with conn.transaction():
+        await conn.execute(
+            "SELECT set_config('app.service_client_id', $1, true)", str(proof["first_client"])
+        )
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            async with conn.transaction():
+                await conn.execute(
+                    "INSERT INTO principals (tenant_id,name,type,internal_key) VALUES ($1,$2,'user',$3)",
+                    proof["first_tenant"],
+                    name,
+                    "not-allowed",
+                )
+        assert await conn.fetchval("SELECT 1") == 1
+    assert (
+        await proof["owner"].fetchval(
+            "SELECT count(*) FROM principals WHERE tenant_id=$1 AND name=$2",
+            proof["first_tenant"],
+            name,
+        )
+        == 0
+    )
+
+
 @pytest.mark.parametrize(
     "table",
     (

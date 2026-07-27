@@ -145,7 +145,7 @@ async def test_persisted_migration_026_to_027_preserves_data_and_converges_role(
     owner_url = _owner_url()
     if owner_url is None:
         pytest.skip("requires owner PostgreSQL URL for persisted migration upgrade")
-    database = f"provision_upgrade_{uuid.uuid4().hex}"
+    database = os.getenv("ENGRAM_UPGRADE_PROOF_DATABASE") or f"provision_upgrade_{uuid.uuid4().hex}"
     admin = await asyncpg.connect(normalize_asyncpg_url(owner_url))
     bootstrap_provisioner_url = os.getenv("ENGRAM_PROVISIONER_DATABASE_URL")
     if bootstrap_provisioner_url is not None:
@@ -454,6 +454,15 @@ async def test_persisted_migration_026_to_027_preserves_data_and_converges_role(
                 "SELECT count(*) FROM memory_kinds WHERE tenant_id=$1 AND is_builtin",
                 created_tenant,
             ) == len(pre_upgrade_kinds)
+            principal = await verification.fetchrow(
+                "SELECT p.type,p.internal_key FROM principals p "
+                "JOIN principal_provisioning_bindings b ON b.principal_id=p.id "
+                "WHERE b.service_client_id=$1 AND b.tenant_id=$2",
+                client_id,
+                created_tenant,
+            )
+            assert principal is not None
+            assert dict(principal) == {"type": "user", "internal_key": None}
         finally:
             await verification.close()
     finally:
@@ -492,3 +501,42 @@ async def test_persisted_migration_026_to_027_preserves_data_and_converges_role(
             cleanup_errors.append(type(exc).__name__)
         if cleanup_errors and sys.exc_info()[0] is None:
             raise AssertionError(f"upgrade proof cleanup failed: {cleanup_errors}")
+
+
+async def test_forced_upgrade_failure_restores_role_and_removes_database() -> None:
+    """Run the hostile-mutation failure path out of process and inspect its cleanup."""
+    import asyncpg
+
+    owner_url = _owner_url()
+    if owner_url is None:
+        pytest.skip("requires owner PostgreSQL URL for forced upgrade cleanup proof")
+    database = f"provision_upgrade_forced_{uuid.uuid4().hex}"
+    admin = await asyncpg.connect(normalize_asyncpg_url(owner_url))
+    original_role = await _role_state(admin)
+    environment = os.environ.copy()
+    environment["ENGRAM_FORCE_UPGRADE_PROOF_FAILURE"] = "1"
+    environment["ENGRAM_UPGRADE_PROOF_DATABASE"] = database
+    try:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "tests/test_service_provisioning_upgrade.py::test_persisted_migration_026_to_027_preserves_data_and_converges_role",
+            cwd=str(Path(__file__).resolve().parents[1]),
+            env=environment,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _stderr = await process.communicate()
+        assert process.returncode != 0
+        assert b"forced upgrade proof failure" in stdout
+        assert await _role_state(admin) == original_role
+        assert (
+            await admin.fetchval(
+                "SELECT NOT EXISTS (SELECT 1 FROM pg_database WHERE datname=$1)", database
+            )
+            is True
+        )
+    finally:
+        await admin.close()
