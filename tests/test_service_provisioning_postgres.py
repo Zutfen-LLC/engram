@@ -1294,3 +1294,407 @@ async def test_agent_key_secret_is_once_only_and_replacement_is_atomic(
     assert replacement_replay.status_code == 200
     assert replacement_replay.json()["key"] is None
     assert replacement_replay.json()["credential_secret_available"] is False
+
+
+@pytest.mark.parametrize("same_idempotency_key", [True, False])
+async def test_concurrent_workspace_agent_requests_converge(
+    service_stack: dict[str, Any],
+    same_idempotency_key: bool,
+) -> None:
+    stack = service_stack
+    await _provision_onboarding_tenant(stack)
+    first_key = f"workspace-concurrent-{stack['tag']}"
+    second_key = (
+        first_key if same_idempotency_key else f"workspace-concurrent-other-{stack['tag']}"
+    )
+
+    responses = await asyncio.gather(
+        _provision_workspace_agent(stack, first_key),
+        _provision_workspace_agent(stack, second_key),
+    )
+
+    assert sorted(response.status_code for response in responses) == [200, 201]
+    response_bodies = [response.json() for response in responses]
+    for resource in ("workspace", "agent", "membership"):
+        assert len({body[resource]["id"] for body in response_bodies}) == 1
+    assert sum(body["idempotency_replayed"] for body in response_bodies) == (
+        1 if same_idempotency_key else 0
+    )
+    assert sum(body["created"]["workspace"] for body in response_bodies) == 1
+    assert sum(body["created"]["agent"] for body in response_bodies) == 1
+    assert sum(body["created"]["membership"] for body in response_bodies) == 1
+
+    owner = stack["owner"]
+    assert (
+        await owner.fetchval(
+            "SELECT count(*) FROM workspace_provisioning_bindings "
+            "WHERE service_client_id=$1",
+            stack["client_id"],
+        )
+        == 1
+    )
+    assert (
+        await owner.fetchval(
+            "SELECT count(*) FROM principal_provisioning_bindings b "
+            "JOIN principals p ON p.id=b.principal_id "
+            "WHERE b.service_client_id=$1 AND p.type='agent'",
+            stack["client_id"],
+        )
+        == 1
+    )
+    assert (
+        await owner.fetchval(
+            "SELECT count(*) FROM workspace_members m "
+            "JOIN principal_provisioning_bindings b ON b.principal_id=m.principal_id "
+            "WHERE b.service_client_id=$1",
+            stack["client_id"],
+        )
+        == 1
+    )
+    assert (
+        await owner.fetchval(
+            "SELECT count(*) FROM service_workspace_agent_idempotency "
+            "WHERE service_client_id=$1",
+            stack["client_id"],
+        )
+        == (1 if same_idempotency_key else 2)
+    )
+
+
+@pytest.mark.parametrize("same_idempotency_key", [True, False])
+async def test_concurrent_agent_key_replacements_issue_one_secret(
+    service_stack: dict[str, Any],
+    same_idempotency_key: bool,
+) -> None:
+    stack = service_stack
+    await _provision_onboarding_tenant(stack)
+    workspace_response = await _provision_workspace_agent(
+        stack, f"workspace-for-concurrent-key-{stack['tag']}"
+    )
+    assert workspace_response.status_code == 201
+    first_ref = f"concurrent-original-{stack['tag']}"
+    initial = await stack["client"].post(
+        "/v1/service/provisioning/agent-api-key",
+        headers=_headers(stack, f"concurrent-original-idem-{stack['tag']}"),
+        json=_agent_key_body(stack, external_ref=first_ref),
+    )
+    assert initial.status_code == 201
+
+    replacement_ref = f"concurrent-replacement-{stack['tag']}"
+    first_key = f"concurrent-replacement-idem-{stack['tag']}"
+    second_key = (
+        first_key
+        if same_idempotency_key
+        else f"concurrent-replacement-other-{stack['tag']}"
+    )
+    request_body = _agent_key_body(
+        stack,
+        external_ref=replacement_ref,
+        replaces_external_ref=first_ref,
+    )
+    responses = await asyncio.gather(
+        stack["client"].post(
+            "/v1/service/provisioning/agent-api-key",
+            headers=_headers(stack, first_key),
+            json=request_body,
+        ),
+        stack["client"].post(
+            "/v1/service/provisioning/agent-api-key",
+            headers=_headers(stack, second_key),
+            json=request_body,
+        ),
+    )
+
+    assert sorted(response.status_code for response in responses) == [200, 201]
+    response_bodies = [response.json() for response in responses]
+    assert len({body["api_key"]["id"] for body in response_bodies}) == 1
+    assert sum(body["created"] for body in response_bodies) == 1
+    assert sum(body["credential_secret_available"] for body in response_bodies) == 1
+    assert sum(body["key"] is not None for body in response_bodies) == 1
+    assert sum(body["idempotency_replayed"] for body in response_bodies) == (
+        1 if same_idempotency_key else 0
+    )
+
+    owner = stack["owner"]
+    rows = await owner.fetch(
+        "SELECT b.status,k.revoked_at "
+        "FROM agent_api_key_provisioning_bindings b "
+        "JOIN api_keys k ON k.id=b.api_key_id "
+        "WHERE b.service_client_id=$1 ORDER BY b.created_at",
+        stack["client_id"],
+    )
+    assert len(rows) == 2
+    assert sum(row["status"] == "active" and row["revoked_at"] is None for row in rows) == 1
+    assert sum(row["status"] == "replaced" and row["revoked_at"] is not None for row in rows) == 1
+    assert (
+        await owner.fetchval(
+            "SELECT count(*) FROM service_agent_key_idempotency "
+            "WHERE service_client_id=$1",
+            stack["client_id"],
+        )
+        == (2 if same_idempotency_key else 3)
+    )
+
+
+async def _raise_at_onboarding_stage(current_stage: str, target_stage: str) -> None:
+    if current_stage == target_stage:
+        raise RuntimeError("injected onboarding rollback proof")
+
+
+async def _onboarding_baseline(stack: dict[str, Any]) -> tuple[Any, int]:
+    return (
+        await stack["owner"].fetchval(
+            "SELECT last_used_at FROM service_client_credentials WHERE id=$1",
+            stack["credential_id"],
+        ),
+        await stack["owner"].fetchval(
+            "SELECT count(*) FROM service_provisioning_events WHERE service_client_id=$1",
+            stack["client_id"],
+        ),
+    )
+
+
+async def _assert_onboarding_baseline(
+    stack: dict[str, Any], baseline: tuple[Any, int]
+) -> None:
+    assert (
+        await stack["owner"].fetchval(
+            "SELECT last_used_at FROM service_client_credentials WHERE id=$1",
+            stack["credential_id"],
+        )
+        == baseline[0]
+    )
+    assert (
+        await stack["owner"].fetchval(
+            "SELECT count(*) FROM service_provisioning_events WHERE service_client_id=$1",
+            stack["client_id"],
+        )
+        == baseline[1]
+    )
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        "workspace_inserted",
+        "workspace_binding_inserted",
+        "agent_inserted",
+        "principal_binding_inserted",
+        "workspace_membership_inserted",
+        "workspace_agent_idempotency_inserted",
+        "workspace_agent_success_events_inserted",
+        "credential_last_used_updated",
+    ],
+)
+async def test_workspace_agent_rolls_back_at_every_mutation_stage(
+    service_stack: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    stack = service_stack
+    await _provision_onboarding_tenant(stack)
+    baseline = await _onboarding_baseline(stack)
+
+    async def fail_at_stage(current_stage: str) -> None:
+        await _raise_at_onboarding_stage(current_stage, stage)
+
+    monkeypatch.setattr("engram.service_onboarding.onboarding_stage", fail_at_stage)
+    response = await _provision_workspace_agent(
+        stack, f"workspace-rollback-{stage}-{stack['tag']}"
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "SERVICE_UNAVAILABLE"
+    owner = stack["owner"]
+    for table in (
+        "workspace_provisioning_bindings",
+        "service_workspace_agent_idempotency",
+    ):
+        assert (
+            await owner.fetchval(
+                f"SELECT count(*) FROM {table} WHERE service_client_id=$1",
+                stack["client_id"],
+            )
+            == 0
+        )
+    assert (
+        await owner.fetchval(
+            "SELECT count(*) FROM principal_provisioning_bindings b "
+            "JOIN principals p ON p.id=b.principal_id "
+            "WHERE b.service_client_id=$1 AND p.type='agent'",
+            stack["client_id"],
+        )
+        == 0
+    )
+    assert (
+        await owner.fetchval(
+            "SELECT count(*) FROM workspaces WHERE slug=$1",
+            _workspace_agent_body(stack)["workspace"]["slug"],
+        )
+        == 0
+    )
+    assert (
+        await owner.fetchval(
+            "SELECT count(*) FROM principals p "
+            "JOIN tenant_provisioning_bindings b ON b.tenant_id=p.tenant_id "
+            "WHERE b.service_client_id=$1 AND p.type='agent'",
+            stack["client_id"],
+        )
+        == 0
+    )
+    assert (
+        await owner.fetchval(
+            "SELECT count(*) FROM workspace_members m "
+            "JOIN principal_provisioning_bindings b ON b.principal_id=m.principal_id "
+            "WHERE b.service_client_id=$1",
+            stack["client_id"],
+        )
+        == 0
+    )
+    await _assert_onboarding_baseline(stack, baseline)
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        "api_key_inserted",
+        "api_key_binding_inserted",
+        "agent_key_idempotency_inserted",
+        "agent_key_success_event_inserted",
+        "credential_last_used_updated",
+    ],
+)
+async def test_initial_agent_key_rolls_back_at_every_mutation_stage(
+    service_stack: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    stack = service_stack
+    await _provision_onboarding_tenant(stack)
+    workspace_response = await _provision_workspace_agent(
+        stack, f"workspace-for-key-rollback-{stack['tag']}"
+    )
+    assert workspace_response.status_code == 201
+    baseline = await _onboarding_baseline(stack)
+
+    async def fail_at_stage(current_stage: str) -> None:
+        await _raise_at_onboarding_stage(current_stage, stage)
+
+    monkeypatch.setattr("engram.service_onboarding.onboarding_stage", fail_at_stage)
+    response = await stack["client"].post(
+        "/v1/service/provisioning/agent-api-key",
+        headers=_headers(stack, f"initial-key-rollback-{stage}-{stack['tag']}"),
+        json=_agent_key_body(stack, external_ref=f"initial-rollback-{stack['tag']}"),
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "SERVICE_UNAVAILABLE"
+    owner = stack["owner"]
+    for table in (
+        "agent_api_key_provisioning_bindings",
+        "service_agent_key_idempotency",
+    ):
+        assert (
+            await owner.fetchval(
+                f"SELECT count(*) FROM {table} WHERE service_client_id=$1",
+                stack["client_id"],
+            )
+            == 0
+        )
+    assert (
+        await owner.fetchval(
+            "SELECT count(*) FROM api_keys k "
+            "JOIN principal_provisioning_bindings b ON b.principal_id=k.principal_id "
+            "WHERE b.service_client_id=$1",
+            stack["client_id"],
+        )
+        == 0
+    )
+    await _assert_onboarding_baseline(stack, baseline)
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        "prior_api_key_revoked",
+        "prior_api_key_binding_replaced",
+        "replacement_api_key_inserted",
+        "api_key_binding_inserted",
+        "agent_key_idempotency_inserted",
+        "agent_key_success_event_inserted",
+        "credential_last_used_updated",
+    ],
+)
+async def test_agent_key_replacement_rolls_back_at_every_mutation_stage(
+    service_stack: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    stack = service_stack
+    await _provision_onboarding_tenant(stack)
+    workspace_response = await _provision_workspace_agent(
+        stack, f"workspace-for-replacement-rollback-{stack['tag']}"
+    )
+    assert workspace_response.status_code == 201
+    first_ref = f"replacement-rollback-original-{stack['tag']}"
+    initial = await stack["client"].post(
+        "/v1/service/provisioning/agent-api-key",
+        headers=_headers(stack, f"replacement-rollback-original-idem-{stack['tag']}"),
+        json=_agent_key_body(stack, external_ref=first_ref),
+    )
+    assert initial.status_code == 201
+    original_api_key_id = uuid.UUID(initial.json()["api_key"]["id"])
+    baseline = await _onboarding_baseline(stack)
+
+    async def fail_at_stage(current_stage: str) -> None:
+        await _raise_at_onboarding_stage(current_stage, stage)
+
+    monkeypatch.setattr("engram.service_onboarding.onboarding_stage", fail_at_stage)
+    response = await stack["client"].post(
+        "/v1/service/provisioning/agent-api-key",
+        headers=_headers(stack, f"replacement-key-rollback-{stage}-{stack['tag']}"),
+        json=_agent_key_body(
+            stack,
+            external_ref=f"replacement-rollback-new-{stack['tag']}",
+            replaces_external_ref=first_ref,
+        ),
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "SERVICE_UNAVAILABLE"
+    owner = stack["owner"]
+    binding_rows = await owner.fetch(
+        "SELECT status,replaced_at,api_key_id "
+        "FROM agent_api_key_provisioning_bindings WHERE service_client_id=$1",
+        stack["client_id"],
+    )
+    assert len(binding_rows) == 1
+    assert dict(binding_rows[0]) == {
+        "status": "active",
+        "replaced_at": None,
+        "api_key_id": original_api_key_id,
+    }
+    assert (
+        await owner.fetchval(
+            "SELECT count(*) FROM api_keys k "
+            "JOIN principal_provisioning_bindings b ON b.principal_id=k.principal_id "
+            "WHERE b.service_client_id=$1",
+            stack["client_id"],
+        )
+        == 1
+    )
+    assert (
+        await owner.fetchval(
+            "SELECT revoked_at FROM api_keys WHERE id=$1", original_api_key_id
+        )
+        is None
+    )
+    assert (
+        await owner.fetchval(
+            "SELECT count(*) FROM service_agent_key_idempotency "
+            "WHERE service_client_id=$1",
+            stack["client_id"],
+        )
+        == 1
+    )
+    await _assert_onboarding_baseline(stack, baseline)
