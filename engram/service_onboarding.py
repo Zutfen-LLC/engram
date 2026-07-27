@@ -662,6 +662,7 @@ async def provision_agent_api_key(
         )
     )
     if existing_binding is not None:
+        existing_api_key = await session.get(ApiKey, existing_binding.api_key_id)
         expected_replacement = request.api_key.replaces_external_ref
         reconciliation_prior: AgentApiKeyProvisioningBinding | None = None
         if expected_replacement is not None:
@@ -675,6 +676,20 @@ async def provision_agent_api_key(
         if (
             existing_binding.workspace_binding_id != workspace_binding.id
             or existing_binding.principal_binding_id != principal_binding.id
+            or existing_api_key is None
+            or existing_api_key.tenant_id != tenant_binding.tenant_id
+            or existing_api_key.principal_id != principal_binding.principal_id
+            or list(existing_api_key.scopes) != FIXED_AGENT_KEY_SCOPES
+            or existing_api_key.label != request.api_key.label
+            or existing_api_key.memory_profile_id is not None
+            or (
+                existing_binding.status == "active"
+                and existing_api_key.revoked_at is not None
+            )
+            or (
+                existing_binding.status == "replaced"
+                and existing_api_key.revoked_at is None
+            )
             or (
                 expected_replacement is None
                 and existing_binding.replaces_binding_id is not None
@@ -857,6 +872,7 @@ async def record_onboarding_conflict(
     request_id: str,
     reason_code: str,
 ) -> None:
+    credential.last_used_at = datetime.now(UTC)
     if isinstance(request, WorkspaceAgentRequest):
         tenant_ref = request.tenant_external_ref
         workspace_ref = request.workspace.external_ref
@@ -884,6 +900,7 @@ async def record_onboarding_conflict(
             details={},
         )
     )
+    await onboarding_stage("onboarding_conflict_recorded")
 
 
 async def _workspace_agent_event(

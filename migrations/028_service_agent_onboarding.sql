@@ -159,6 +159,197 @@ CREATE TABLE service_agent_key_idempotency (
     UNIQUE (service_client_id, key_digest)
 );
 
+-- The provisioner performs API-key and binding writes in one transaction, but
+-- column grants alone cannot express their cross-table commit invariant.
+-- Validate the final transaction state so no direct-role caller can split key
+-- revocation from binding replacement or fabricate key/binding identity.
+CREATE FUNCTION assert_service_agent_api_key_binding(binding_id UUID) RETURNS VOID AS $$
+DECLARE
+    binding_row RECORD;
+    prior_row RECORD;
+    successor_row RECORD;
+BEGIN
+    SELECT
+        binding.id,
+        binding.service_client_id,
+        binding.tenant_binding_id,
+        binding.tenant_id,
+        binding.workspace_binding_id,
+        binding.principal_binding_id,
+        binding.api_key_id,
+        binding.status,
+        binding.replaces_binding_id,
+        binding.replaced_at,
+        principal_binding.principal_id,
+        api_key.tenant_id AS api_key_tenant_id,
+        api_key.principal_id AS api_key_principal_id,
+        api_key.key_hash,
+        api_key.key_id,
+        api_key.secret_digest,
+        api_key.digest_algorithm,
+        api_key.scopes,
+        api_key.memory_profile_id,
+        api_key.revoked_at
+    INTO binding_row
+    FROM public.agent_api_key_provisioning_bindings AS binding
+    JOIN public.workspace_provisioning_bindings AS workspace_binding
+      ON workspace_binding.id = binding.workspace_binding_id
+     AND workspace_binding.tenant_binding_id = binding.tenant_binding_id
+     AND workspace_binding.tenant_id = binding.tenant_id
+     AND workspace_binding.service_client_id = binding.service_client_id
+    JOIN public.principal_provisioning_bindings AS principal_binding
+      ON principal_binding.id = binding.principal_binding_id
+     AND principal_binding.tenant_binding_id = binding.tenant_binding_id
+     AND principal_binding.tenant_id = binding.tenant_id
+     AND principal_binding.service_client_id = binding.service_client_id
+    JOIN public.principals AS principal
+      ON principal.id = principal_binding.principal_id
+     AND principal.tenant_id = principal_binding.tenant_id
+     AND principal.type = 'agent'
+     AND principal.internal_key IS NULL
+    JOIN public.workspace_members AS member
+      ON member.workspace_id = workspace_binding.workspace_id
+     AND member.principal_id = principal_binding.principal_id
+     AND member.role = 'member'
+    JOIN public.api_keys AS api_key ON api_key.id = binding.api_key_id
+    WHERE binding.id = binding_id;
+
+    IF NOT FOUND
+       OR binding_row.api_key_tenant_id <> binding_row.tenant_id
+       OR binding_row.api_key_principal_id IS DISTINCT FROM binding_row.principal_id
+       OR binding_row.key_hash IS NOT NULL
+       OR binding_row.key_id IS NULL
+       OR binding_row.secret_digest IS NULL
+       OR binding_row.digest_algorithm <> 'sha256'
+       OR binding_row.scopes <> ARRAY['read', 'write']::TEXT[]
+       OR binding_row.memory_profile_id IS NOT NULL
+       OR (
+           binding_row.status = 'active'
+           AND (
+               binding_row.revoked_at IS NOT NULL
+               OR binding_row.replaced_at IS NOT NULL
+           )
+       )
+       OR (
+           binding_row.status = 'replaced'
+           AND (
+               binding_row.revoked_at IS NULL
+               OR binding_row.replaced_at IS DISTINCT FROM binding_row.revoked_at
+           )
+       )
+    THEN
+        RAISE EXCEPTION 'service agent API-key binding integrity violation'
+            USING ERRCODE = '23514';
+    END IF;
+
+    IF binding_row.replaces_binding_id IS NOT NULL THEN
+        SELECT
+            prior.id,
+            prior.service_client_id,
+            prior.tenant_binding_id,
+            prior.tenant_id,
+            prior.workspace_binding_id,
+            prior.principal_binding_id,
+            prior.status,
+            prior.replaced_at,
+            prior_key.revoked_at
+        INTO prior_row
+        FROM public.agent_api_key_provisioning_bindings AS prior
+        JOIN public.api_keys AS prior_key ON prior_key.id = prior.api_key_id
+        WHERE prior.id = binding_row.replaces_binding_id;
+
+        IF NOT FOUND
+           OR prior_row.service_client_id <> binding_row.service_client_id
+           OR prior_row.tenant_binding_id <> binding_row.tenant_binding_id
+           OR prior_row.tenant_id <> binding_row.tenant_id
+           OR prior_row.workspace_binding_id <> binding_row.workspace_binding_id
+           OR prior_row.principal_binding_id <> binding_row.principal_binding_id
+           OR prior_row.status <> 'replaced'
+           OR prior_row.revoked_at IS NULL
+           OR prior_row.replaced_at IS DISTINCT FROM prior_row.revoked_at
+        THEN
+            RAISE EXCEPTION 'service agent API-key replacement lineage violation'
+                USING ERRCODE = '23514';
+        END IF;
+    END IF;
+
+    IF binding_row.status = 'replaced' THEN
+        SELECT
+            successor.id,
+            successor.service_client_id,
+            successor.tenant_binding_id,
+            successor.tenant_id,
+            successor.workspace_binding_id,
+            successor.principal_binding_id,
+            successor.status,
+            successor_key.revoked_at
+        INTO successor_row
+        FROM public.agent_api_key_provisioning_bindings AS successor
+        JOIN public.api_keys AS successor_key ON successor_key.id = successor.api_key_id
+        WHERE successor.replaces_binding_id = binding_row.id;
+
+        IF NOT FOUND
+           OR successor_row.service_client_id <> binding_row.service_client_id
+           OR successor_row.tenant_binding_id <> binding_row.tenant_binding_id
+           OR successor_row.tenant_id <> binding_row.tenant_id
+           OR successor_row.workspace_binding_id <> binding_row.workspace_binding_id
+           OR successor_row.principal_binding_id <> binding_row.principal_binding_id
+           OR successor_row.status <> 'active'
+           OR successor_row.revoked_at IS NOT NULL
+        THEN
+            RAISE EXCEPTION 'service agent API-key replacement is incomplete'
+                USING ERRCODE = '23514';
+        END IF;
+    END IF;
+END;
+$$ LANGUAGE plpgsql
+   SET search_path = pg_catalog, public;
+
+CREATE FUNCTION enforce_service_agent_key_binding() RETURNS TRIGGER AS $$
+BEGIN
+    PERFORM public.assert_service_agent_api_key_binding(NEW.id);
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql
+   SET search_path = pg_catalog, public;
+
+CREATE FUNCTION enforce_provisioner_api_key_binding() RETURNS TRIGGER AS $$
+DECLARE
+    binding_id UUID;
+BEGIN
+    IF session_user <> 'engram_provisioner' THEN
+        RETURN NULL;
+    END IF;
+    SELECT binding.id
+    INTO binding_id
+    FROM public.agent_api_key_provisioning_bindings AS binding
+    WHERE binding.api_key_id = NEW.id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'provisioner API key must have one valid service binding'
+            USING ERRCODE = '23514';
+    END IF;
+    PERFORM public.assert_service_agent_api_key_binding(binding_id);
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql
+   SET search_path = pg_catalog, public;
+
+REVOKE ALL ON FUNCTION assert_service_agent_api_key_binding(UUID) FROM PUBLIC;
+REVOKE ALL ON FUNCTION enforce_service_agent_key_binding() FROM PUBLIC;
+REVOKE ALL ON FUNCTION enforce_provisioner_api_key_binding() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION assert_service_agent_api_key_binding(UUID)
+    TO engram_provisioner;
+
+CREATE CONSTRAINT TRIGGER trg_service_agent_key_binding_integrity
+    AFTER INSERT OR UPDATE ON agent_api_key_provisioning_bindings
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION enforce_service_agent_key_binding();
+
+CREATE CONSTRAINT TRIGGER trg_provisioner_api_key_binding_integrity
+    AFTER INSERT OR UPDATE ON api_keys
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION enforce_provisioner_api_key_binding();
+
 ALTER TABLE service_provisioning_events
     ADD COLUMN workspace_id UUID REFERENCES workspaces(id) ON DELETE RESTRICT,
     ADD COLUMN api_key_id UUID REFERENCES api_keys(id) ON DELETE RESTRICT,

@@ -70,6 +70,12 @@ Core fixes the key scopes to `read` and `write` and leaves
 reconciliation returns the same key metadata with
 `credential_secret_available=false` and `key=null`.
 
+The external reference binds the complete immutable request, including
+`label`, fixed scopes, no memory profile, and replacement lineage. Reusing an
+external reference with a changed label or lineage returns
+`API_KEY_EXTERNAL_REF_CONFLICT`; Core does not create an idempotency record for
+the changed request.
+
 ## Recover from lost delivery
 
 Plaintext is deliberately unrecoverable. Replace the key explicitly with a new
@@ -92,3 +98,9 @@ Revocation and successor creation commit atomically. Losing this response has
 the same semantics: replay reports the secret unavailable, and a later
 replacement may replace that active successor. Never delete the workspace,
 agent, membership, or bindings to compensate for an ambiguous response.
+
+Deferred database constraints validate the final key/binding state at commit.
+They reject split revocation or binding updates, unbound provisioner-created
+keys, mismatched tenant/principal identity, non-fixed key policy, fabricated
+lineage, and any replacement that does not leave one active unrevoked
+successor.

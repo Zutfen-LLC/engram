@@ -32,7 +32,8 @@ Binding rows retain raw external references because reconciliation requires
 them. Idempotency records store only a key digest, and provisioning audit
 events store only SHA-256 external-reference digests. Events are append-only;
 a deterministic conflict rolls back resource mutations in a savepoint, then
-appends one bounded conflict event in the enclosing authenticated transaction.
+commits one bounded conflict event and the locked credential's
+`last_used_at` update together in the enclosing authenticated transaction.
 
 Stable workspace/agent resources are intentionally separate from credential
 issuance. Workspace-agent replays always return the same resource identifiers.
@@ -47,6 +48,12 @@ the prior key, marks its binding replaced, and creates its successor in one
 transaction. At most one service-provisioned key is active for a
 workspace-agent pair. Database revocation is authoritative; other replicas
 observe it within the configured API-key cache TTL.
+
+The database enforces this relationship with deferred constraint triggers, not
+application ordering alone. Provisioner-created key rows must have one matching
+binding at commit; tenant, agent principal, fixed scopes, absent memory profile,
+revocation state, and replacement lineage must agree across both tables.
+Partial revocation/replacement and a second unbound active key are rejected.
 
 These routes do not grant browser authority, create memory or agent activity,
 bind a memory profile, or implement Portal orchestration. See

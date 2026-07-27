@@ -152,7 +152,13 @@ async def readiness(
                         text(
                             "SELECT to_regprocedure('current_service_client_id()') IS NOT NULL "
                             "AND to_regprocedure("
-                            "'current_service_client_has_permission(text)') IS NOT NULL"
+                            "'current_service_client_has_permission(text)') IS NOT NULL "
+                            "AND to_regprocedure("
+                            "'assert_service_agent_api_key_binding(uuid)') IS NOT NULL "
+                            "AND to_regprocedure("
+                            "'enforce_service_agent_key_binding()') IS NOT NULL "
+                            "AND to_regprocedure("
+                            "'enforce_provisioner_api_key_binding()') IS NOT NULL"
                         )
                     )
                     if invalid_role or tables.scalar() != 10 or not function.scalar():

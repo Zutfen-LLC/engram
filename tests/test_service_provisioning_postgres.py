@@ -437,6 +437,12 @@ async def test_real_provisioning_contract_replay_resolution_and_audit(service_st
         assert event["external_tenant_ref_digest"] is not None
         assert event["external_principal_ref_digest"] is not None
 
+    conflict_usage_baseline = datetime(2000, 1, 1, tzinfo=UTC)
+    await owner.execute(
+        "UPDATE service_client_credentials SET last_used_at=$2 WHERE id=$1",
+        stack["credential_id"],
+        conflict_usage_baseline,
+    )
     conflict_body = _body(tag, name="Changed tenant")
     conflict = await client.post(
         "/v1/service/provisioning/tenant-human",
@@ -458,6 +464,13 @@ async def test_real_provisioning_contract_replay_resolution_and_audit(service_st
     assert conflict_event["external_tenant_ref_digest"] is not None
     assert conflict_event["external_principal_ref_digest"] is not None
     assert f"tenant-ref-{tag}" not in conflict_event["details"]
+    assert (
+        await owner.fetchval(
+            "SELECT last_used_at FROM service_client_credentials WHERE id=$1",
+            stack["credential_id"],
+        )
+        > conflict_usage_baseline
+    )
     events = await owner.fetch(
         "SELECT service_client_id, credential_id, tenant_id, principal_id, event_type, outcome, request_id, "
         "reason_code, external_tenant_ref_digest, external_principal_ref_digest, details::text "
@@ -1120,6 +1133,7 @@ def _agent_key_body(
     stack: dict[str, Any],
     *,
     external_ref: str,
+    label: str | None = "service agent",
     replaces_external_ref: str | None = None,
 ) -> dict[str, Any]:
     return {
@@ -1128,7 +1142,7 @@ def _agent_key_body(
         "agent_external_ref": f"agent-ref-{stack['tag']}",
         "api_key": {
             "external_ref": external_ref,
-            "label": "service agent",
+            "label": label,
             "replaces_external_ref": replaces_external_ref,
         },
     }
@@ -1296,6 +1310,256 @@ async def test_agent_key_secret_is_once_only_and_replacement_is_atomic(
     assert replacement_replay.json()["credential_secret_available"] is False
 
 
+async def test_initial_key_external_ref_rejects_changed_label_and_records_usage(
+    service_stack,
+) -> None:  # type: ignore[no-untyped-def]
+    stack = service_stack
+    await _provision_onboarding_tenant(stack)
+    workspace_response = await _provision_workspace_agent(
+        stack, f"workspace-for-label-conflict-{stack['tag']}"
+    )
+    assert workspace_response.status_code == 201
+    external_ref = f"label-conflict-initial-{stack['tag']}"
+    created = await stack["client"].post(
+        "/v1/service/provisioning/agent-api-key",
+        headers=_headers(stack, f"label-conflict-created-{stack['tag']}"),
+        json=_agent_key_body(stack, external_ref=external_ref, label="production"),
+    )
+    assert created.status_code == 201
+
+    baseline = datetime(2000, 1, 1, tzinfo=UTC)
+    await stack["owner"].execute(
+        "UPDATE service_client_credentials SET last_used_at=$2 WHERE id=$1",
+        stack["credential_id"],
+        baseline,
+    )
+    before_events = await stack["owner"].fetchval(
+        "SELECT count(*) FROM service_provisioning_events "
+        "WHERE service_client_id=$1 AND event_type='onboarding.conflict'",
+        stack["client_id"],
+    )
+    conflict = await stack["client"].post(
+        "/v1/service/provisioning/agent-api-key",
+        headers=_headers(stack, f"label-conflict-changed-{stack['tag']}"),
+        json=_agent_key_body(stack, external_ref=external_ref, label="development"),
+    )
+
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "API_KEY_EXTERNAL_REF_CONFLICT"
+    assert (
+        await stack["owner"].fetchval(
+            "SELECT count(*) FROM service_agent_key_idempotency "
+            "WHERE service_client_id=$1",
+            stack["client_id"],
+        )
+        == 1
+    )
+    conflict_evidence = await stack["owner"].fetchrow(
+        "SELECT reason_code FROM service_provisioning_events "
+        "WHERE service_client_id=$1 AND event_type='onboarding.conflict' "
+        "ORDER BY created_at DESC LIMIT 1",
+        stack["client_id"],
+    )
+    assert conflict_evidence is not None
+    assert conflict_evidence["reason_code"] == "API_KEY_EXTERNAL_REF_CONFLICT"
+    assert (
+        await stack["owner"].fetchval(
+            "SELECT count(*) FROM service_provisioning_events "
+            "WHERE service_client_id=$1 AND event_type='onboarding.conflict'",
+            stack["client_id"],
+        )
+        == before_events + 1
+    )
+    last_used_at = await stack["owner"].fetchval(
+        "SELECT last_used_at FROM service_client_credentials WHERE id=$1",
+        stack["credential_id"],
+    )
+    assert last_used_at > baseline
+
+
+async def test_replacement_external_ref_rejects_changed_label(
+    service_stack,
+) -> None:  # type: ignore[no-untyped-def]
+    stack = service_stack
+    await _provision_onboarding_tenant(stack)
+    workspace_response = await _provision_workspace_agent(
+        stack, f"workspace-for-replacement-label-conflict-{stack['tag']}"
+    )
+    assert workspace_response.status_code == 201
+    prior_ref = f"label-conflict-prior-{stack['tag']}"
+    initial = await stack["client"].post(
+        "/v1/service/provisioning/agent-api-key",
+        headers=_headers(stack, f"label-conflict-prior-idem-{stack['tag']}"),
+        json=_agent_key_body(stack, external_ref=prior_ref, label="initial"),
+    )
+    assert initial.status_code == 201
+    replacement_ref = f"label-conflict-replacement-{stack['tag']}"
+    replacement = await stack["client"].post(
+        "/v1/service/provisioning/agent-api-key",
+        headers=_headers(stack, f"label-conflict-replacement-idem-{stack['tag']}"),
+        json=_agent_key_body(
+            stack,
+            external_ref=replacement_ref,
+            label="production",
+            replaces_external_ref=prior_ref,
+        ),
+    )
+    assert replacement.status_code == 201
+
+    conflict = await stack["client"].post(
+        "/v1/service/provisioning/agent-api-key",
+        headers=_headers(stack, f"label-conflict-replacement-changed-{stack['tag']}"),
+        json=_agent_key_body(
+            stack,
+            external_ref=replacement_ref,
+            label="development",
+            replaces_external_ref=prior_ref,
+        ),
+    )
+
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "API_KEY_EXTERNAL_REF_CONFLICT"
+    assert (
+        await stack["owner"].fetchval(
+            "SELECT count(*) FROM service_agent_key_idempotency "
+            "WHERE service_client_id=$1",
+            stack["client_id"],
+        )
+        == 2
+    )
+    assert (
+        await stack["owner"].fetchval(
+            "SELECT count(*) FROM agent_api_key_provisioning_bindings "
+            "WHERE service_client_id=$1",
+            stack["client_id"],
+        )
+        == 2
+    )
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+async def test_concurrent_different_idempotency_keys_with_changed_labels_conflict(
+    service_stack: dict[str, Any],
+    replacement: bool,
+) -> None:
+    stack = service_stack
+    await _provision_onboarding_tenant(stack)
+    workspace_response = await _provision_workspace_agent(
+        stack, f"workspace-for-concurrent-label-conflict-{stack['tag']}"
+    )
+    assert workspace_response.status_code == 201
+    prior_ref: str | None = None
+    baseline_idempotency = 0
+    if replacement:
+        prior_ref = f"concurrent-label-prior-{stack['tag']}"
+        initial = await stack["client"].post(
+            "/v1/service/provisioning/agent-api-key",
+            headers=_headers(stack, f"concurrent-label-prior-idem-{stack['tag']}"),
+            json=_agent_key_body(stack, external_ref=prior_ref, label="initial"),
+        )
+        assert initial.status_code == 201
+        baseline_idempotency = 1
+    external_ref = f"concurrent-label-target-{stack['tag']}"
+
+    responses = await asyncio.gather(
+        stack["client"].post(
+            "/v1/service/provisioning/agent-api-key",
+            headers=_headers(stack, f"concurrent-label-one-{stack['tag']}"),
+            json=_agent_key_body(
+                stack,
+                external_ref=external_ref,
+                label="production",
+                replaces_external_ref=prior_ref,
+            ),
+        ),
+        stack["client"].post(
+            "/v1/service/provisioning/agent-api-key",
+            headers=_headers(stack, f"concurrent-label-two-{stack['tag']}"),
+            json=_agent_key_body(
+                stack,
+                external_ref=external_ref,
+                label="development",
+                replaces_external_ref=prior_ref,
+            ),
+        ),
+    )
+
+    assert sorted(response.status_code for response in responses) == [201, 409]
+    conflict = next(response for response in responses if response.status_code == 409)
+    assert conflict.json()["detail"]["code"] == "API_KEY_EXTERNAL_REF_CONFLICT"
+    assert (
+        await stack["owner"].fetchval(
+            "SELECT count(*) FROM service_agent_key_idempotency "
+            "WHERE service_client_id=$1",
+            stack["client_id"],
+        )
+        == baseline_idempotency + 1
+    )
+    assert (
+        await stack["owner"].fetchval(
+            "SELECT count(*) FROM agent_api_key_provisioning_bindings "
+            "WHERE service_client_id=$1 AND status='active'",
+            stack["client_id"],
+        )
+        == 1
+    )
+    assert (
+        await stack["owner"].fetchval(
+            "SELECT count(*) FROM service_provisioning_events "
+            "WHERE service_client_id=$1 AND event_type='onboarding.conflict' "
+            "AND reason_code='API_KEY_EXTERNAL_REF_CONFLICT'",
+            stack["client_id"],
+        )
+        == 1
+    )
+
+
+async def test_conflict_event_and_credential_usage_roll_back_together(
+    service_stack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    stack = service_stack
+    await _provision_onboarding_tenant(stack)
+    workspace_response = await _provision_workspace_agent(
+        stack, f"workspace-for-conflict-atomicity-{stack['tag']}"
+    )
+    assert workspace_response.status_code == 201
+    external_ref = f"conflict-atomicity-{stack['tag']}"
+    created = await stack["client"].post(
+        "/v1/service/provisioning/agent-api-key",
+        headers=_headers(stack, f"conflict-atomicity-created-{stack['tag']}"),
+        json=_agent_key_body(stack, external_ref=external_ref, label="production"),
+    )
+    assert created.status_code == 201
+    baseline = await _onboarding_baseline(stack)
+
+    async def fail_after_conflict_recorded(stage: str) -> None:
+        if stage == "onboarding_conflict_recorded":
+            raise RuntimeError("injected conflict transaction failure")
+
+    monkeypatch.setattr(
+        "engram.service_onboarding.onboarding_stage",
+        fail_after_conflict_recorded,
+    )
+    response = await stack["client"].post(
+        "/v1/service/provisioning/agent-api-key",
+        headers=_headers(stack, f"conflict-atomicity-changed-{stack['tag']}"),
+        json=_agent_key_body(stack, external_ref=external_ref, label="development"),
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "SERVICE_UNAVAILABLE"
+    await _assert_onboarding_baseline(stack, baseline)
+    assert (
+        await stack["owner"].fetchval(
+            "SELECT count(*) FROM service_agent_key_idempotency "
+            "WHERE service_client_id=$1",
+            stack["client_id"],
+        )
+        == 1
+    )
+
+
 @pytest.mark.parametrize("same_idempotency_key", [True, False])
 async def test_concurrent_workspace_agent_requests_converge(
     service_stack: dict[str, Any],
@@ -1433,6 +1697,174 @@ async def test_concurrent_agent_key_replacements_issue_one_secret(
             stack["client_id"],
         )
         == (2 if same_idempotency_key else 3)
+    )
+
+
+@pytest.mark.parametrize(
+    "attack",
+    [
+        "independent_binding_replacement",
+        "independent_key_revocation",
+        "mismatched_key_principal",
+        "fabricated_replacement_lineage",
+        "second_unrevoked_key",
+    ],
+)
+async def test_direct_provisioner_cannot_break_agent_key_commit_invariant(
+    service_stack: dict[str, Any],
+    attack: str,
+) -> None:
+    import asyncpg
+
+    stack = service_stack
+    provisioner_url = _provisioner_url()
+    assert provisioner_url is not None
+    await _provision_onboarding_tenant(stack)
+    first_workspace = await _provision_workspace_agent(
+        stack, f"workspace-for-direct-key-attack-{stack['tag']}"
+    )
+    assert first_workspace.status_code == 201
+    second_body = _workspace_agent_body(stack)
+    second_body["agent"] = {
+        "external_ref": f"second-agent-ref-{stack['tag']}",
+        "name": f"Second agent {stack['tag']}",
+    }
+    second_agent_response = await stack["client"].post(
+        "/v1/service/provisioning/workspace-agent",
+        headers=_headers(stack, f"second-agent-for-direct-attack-{stack['tag']}"),
+        json=second_body,
+    )
+    assert second_agent_response.status_code == 201
+    first_ref = f"direct-attack-initial-{stack['tag']}"
+    initial = await stack["client"].post(
+        "/v1/service/provisioning/agent-api-key",
+        headers=_headers(stack, f"direct-attack-initial-idem-{stack['tag']}"),
+        json=_agent_key_body(stack, external_ref=first_ref),
+    )
+    assert initial.status_code == 201
+
+    owner = stack["owner"]
+    identities = await owner.fetchrow(
+        "SELECT key_binding.id AS key_binding_id,key_binding.api_key_id,"
+        "key_binding.tenant_binding_id,key_binding.tenant_id,"
+        "key_binding.workspace_binding_id,key_binding.principal_binding_id,"
+        "first_principal.principal_id AS first_principal_id,"
+        "second_principal.id AS second_principal_binding_id,"
+        "second_principal.principal_id AS second_principal_id "
+        "FROM agent_api_key_provisioning_bindings key_binding "
+        "JOIN principal_provisioning_bindings first_principal "
+        "ON first_principal.id=key_binding.principal_binding_id "
+        "JOIN principal_provisioning_bindings second_principal "
+        "ON second_principal.service_client_id=key_binding.service_client_id "
+        "AND second_principal.tenant_binding_id=key_binding.tenant_binding_id "
+        "AND second_principal.external_ref=$2 "
+        "WHERE key_binding.service_client_id=$1",
+        stack["client_id"],
+        second_body["agent"]["external_ref"],
+    )
+    assert identities is not None
+    new_api_key_id = uuid.uuid4()
+    new_binding_id = uuid.uuid4()
+    key_id = uuid.uuid4().hex[:22]
+    secret_digest = uuid.uuid4().hex + uuid.uuid4().hex
+    statements: list[tuple[str, tuple[object, ...]]]
+    if attack == "independent_binding_replacement":
+        statements = [
+            (
+                "UPDATE agent_api_key_provisioning_bindings "
+                "SET status='replaced',replaced_at=now() WHERE id=$1",
+                (identities["key_binding_id"],),
+            )
+        ]
+    elif attack == "independent_key_revocation":
+        statements = [
+            (
+                "UPDATE api_keys SET revoked_at=now() WHERE id=$1",
+                (identities["api_key_id"],),
+            )
+        ]
+    else:
+        principal_id = (
+            identities["first_principal_id"]
+            if attack in {"mismatched_key_principal", "second_unrevoked_key"}
+            else identities["second_principal_id"]
+        )
+        statements = [
+            (
+                "INSERT INTO api_keys "
+                "(id,tenant_id,principal_id,key_hash,key_id,secret_digest,"
+                "digest_algorithm,scopes,label,memory_profile_id,revoked_at) "
+                "VALUES ($1,$2,$3,NULL,$4,$5,'sha256',$6,$7,NULL,NULL)",
+                (
+                    new_api_key_id,
+                    identities["tenant_id"],
+                    principal_id,
+                    key_id,
+                    secret_digest,
+                    ["read", "write"],
+                    f"direct-attack-{attack}",
+                ),
+            )
+        ]
+        if attack != "second_unrevoked_key":
+            statements.append(
+                (
+                    "INSERT INTO agent_api_key_provisioning_bindings "
+                    "(id,service_client_id,tenant_binding_id,tenant_id,"
+                    "workspace_binding_id,principal_binding_id,external_ref,"
+                    "api_key_id,status,replaces_binding_id) "
+                    "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9)",
+                    (
+                        new_binding_id,
+                        stack["client_id"],
+                        identities["tenant_binding_id"],
+                        identities["tenant_id"],
+                        identities["workspace_binding_id"],
+                        identities["second_principal_binding_id"],
+                        f"direct-attack-{attack}-{stack['tag']}",
+                        new_api_key_id,
+                        (
+                            identities["key_binding_id"]
+                            if attack == "fabricated_replacement_lineage"
+                            else None
+                        ),
+                    ),
+                )
+            )
+
+    provisioner = await _connect(provisioner_url)
+    try:
+        with pytest.raises(asyncpg.CheckViolationError):
+            async with provisioner.transaction():
+                await provisioner.execute(
+                    "SELECT set_config('app.service_client_id',$1,true)",
+                    str(stack["client_id"]),
+                )
+                for statement, values in statements:
+                    await provisioner.execute(statement, *values)
+                await provisioner.execute("SET CONSTRAINTS ALL IMMEDIATE")
+    finally:
+        await provisioner.close()
+
+    original = await owner.fetchrow(
+        "SELECT binding.status,binding.replaced_at,key.revoked_at "
+        "FROM agent_api_key_provisioning_bindings binding "
+        "JOIN api_keys key ON key.id=binding.api_key_id WHERE binding.id=$1",
+        identities["key_binding_id"],
+    )
+    assert original is not None
+    assert dict(original) == {
+        "status": "active",
+        "replaced_at": None,
+        "revoked_at": None,
+    }
+    assert await owner.fetchval("SELECT count(*) FROM api_keys WHERE id=$1", new_api_key_id) == 0
+    assert (
+        await owner.fetchval(
+            "SELECT count(*) FROM agent_api_key_provisioning_bindings WHERE id=$1",
+            new_binding_id,
+        )
+        == 0
     )
 
 

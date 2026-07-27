@@ -77,6 +77,9 @@ Migration 028 converges the existing role without changing its persisted
 password. It grants only binding-scoped workspace, agent-membership, and
 ordinary API-key provisioning authority; the role still has no memory, job,
 review, export, schema-create, object-ownership, or role-membership authority.
+Deferred commit constraints prevent its column-level key and binding writes
+from splitting revocation and replacement, creating an unbound second key, or
+binding a key to a mismatched tenant, agent, policy, or replacement lineage.
 It also leaves every existing service-client permission array unchanged. Use
 the owner-only `engram service-client set-permissions` command to grant the new
 `workspace.provision`, `agent.provision`, and `api_key.provision` permissions.
