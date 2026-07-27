@@ -24,3 +24,20 @@ engram service-client revoke-key <credential-id-or-key-id>
 `disable` immediately invalidates every credential for a client; `enable`
 re-enables the client but never restores revoked credentials. Do not pass a raw
 credential on a command line, in logs, or to a browser.
+
+New clients default to only `tenant.provision` and `principal.provision`.
+Existing clients are never silently upgraded. Replace a client's complete
+permission set explicitly:
+
+```bash
+engram service-client set-permissions control-plane \
+  --permission tenant.provision \
+  --permission principal.provision \
+  --permission workspace.provision \
+  --permission agent.provision \
+  --permission api_key.provision
+```
+
+The command locks the client row, canonicalizes the replacement set, and
+records one `service_client.permissions_changed` event only when the set
+changes. It does not rotate, revoke, or print credentials.

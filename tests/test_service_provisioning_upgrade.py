@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
 import secrets
@@ -17,7 +18,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from engram.cli import _run_init_db
+from engram.cli import _run_init_db, _run_service_client
 from engram.migrations import discover_migrations, normalize_asyncpg_url
 from engram.service_auth import (
     digest_service_secret,
@@ -501,6 +502,213 @@ async def test_persisted_migration_026_to_027_preserves_data_and_converges_role(
             cleanup_errors.append(type(exc).__name__)
         if cleanup_errors and sys.exc_info()[0] is None:
             raise AssertionError(f"upgrade proof cleanup failed: {cleanup_errors}")
+
+
+async def test_persisted_migration_027_to_028_preserves_service_state_and_permissions(
+    tmp_path: Path,
+) -> None:
+    import asyncpg
+
+    owner_url = _owner_url()
+    if owner_url is None:
+        pytest.skip("requires owner PostgreSQL URL for persisted migration upgrade")
+    database = f"onboarding_upgrade_{uuid.uuid4().hex}"
+    admin = await asyncpg.connect(normalize_asyncpg_url(owner_url))
+    original_role = await _role_state(admin)
+    created_database = False
+    try:
+        await admin.execute(f'CREATE DATABASE "{database}"')
+        created_database = True
+        database_url = _with_database(owner_url, database)
+        through_027 = tmp_path / "through-027-migrations"
+        through_027.mkdir()
+        for migration in discover_migrations():
+            if migration.name <= "027_service_provisioning.sql":
+                (through_027 / migration.name).symlink_to(migration.resolve())
+        assert await _run_init_db(database_url, migrations_dir=through_027) == 0
+
+        persisted = await asyncpg.connect(normalize_asyncpg_url(database_url))
+        client_id, credential_id = uuid.uuid4(), uuid.uuid4()
+        tenant_id, tenant_binding_id = uuid.uuid4(), uuid.uuid4()
+        principal_id, principal_binding_id = uuid.uuid4(), uuid.uuid4()
+        try:
+            await persisted.execute(
+                "INSERT INTO service_clients "
+                "(id,slug,display_name,permissions) VALUES ($1,$2,$3,$4)",
+                client_id,
+                f"persisted-client-{client_id.hex[:12]}",
+                "Persisted migration 027 client",
+                ["tenant.provision", "principal.provision"],
+            )
+            await persisted.execute(
+                "INSERT INTO service_client_credentials "
+                "(id,service_client_id,key_id,secret_digest,digest_algorithm) "
+                "VALUES ($1,$2,$3,$4,'sha256')",
+                credential_id,
+                client_id,
+                f"persisted{credential_id.hex[:13]}",
+                "b" * 64,
+            )
+            await persisted.execute(
+                "INSERT INTO tenants (id,name,slug) VALUES ($1,$2,$3)",
+                tenant_id,
+                "Persisted tenant",
+                f"persisted-tenant-{tenant_id.hex[:12]}",
+            )
+            await persisted.execute(
+                "INSERT INTO principals (id,tenant_id,name,type) "
+                "VALUES ($1,$2,$3,'user')",
+                principal_id,
+                tenant_id,
+                "Persisted human",
+            )
+            await persisted.execute(
+                "INSERT INTO tenant_provisioning_bindings "
+                "(id,service_client_id,external_ref,tenant_id) VALUES ($1,$2,$3,$4)",
+                tenant_binding_id,
+                client_id,
+                "persisted-tenant-ref",
+                tenant_id,
+            )
+            await persisted.execute(
+                "INSERT INTO principal_provisioning_bindings "
+                "(id,service_client_id,tenant_binding_id,tenant_id,external_ref,principal_id) "
+                "VALUES ($1,$2,$3,$4,$5,$6)",
+                principal_binding_id,
+                client_id,
+                tenant_binding_id,
+                tenant_id,
+                "persisted-human-ref",
+                principal_id,
+            )
+            await persisted.execute(
+                "INSERT INTO service_provisioning_idempotency "
+                "(service_client_id,key_digest,request_digest,tenant_binding_id,"
+                "principal_binding_id) VALUES ($1,$2,$3,$4,$5)",
+                client_id,
+                b"k" * 32,
+                b"r" * 32,
+                tenant_binding_id,
+                principal_binding_id,
+            )
+            await persisted.execute(
+                "INSERT INTO service_provisioning_events "
+                "(service_client_id,credential_id,tenant_id,principal_id,event_type,"
+                "outcome,request_id) "
+                "VALUES ($1,$2,$3,$4,'principal.provisioned','success','upgrade-proof')",
+                client_id,
+                credential_id,
+                tenant_id,
+                principal_id,
+            )
+        finally:
+            await persisted.close()
+
+        before_password = await admin.fetchval(
+            "SELECT rolpassword FROM pg_authid WHERE rolname='engram_provisioner'"
+        )
+        await admin.execute(
+            "ALTER ROLE engram_provisioner SUPERUSER BYPASSRLS CREATEDB CREATEROLE "
+            "REPLICATION INHERIT"
+        )
+        await admin.execute("ALTER ROLE engram_provisioner SET work_mem TO '1MB'")
+        await admin.execute("GRANT engram TO engram_provisioner")
+
+        assert await _run_init_db(database_url) == 0
+        upgraded = await asyncpg.connect(normalize_asyncpg_url(database_url))
+        try:
+            assert (
+                await upgraded.fetchval(
+                    "SELECT count(*) FROM schema_migrations "
+                    "WHERE filename='028_service_agent_onboarding.sql'"
+                )
+                == 1
+            )
+            assert (
+                await upgraded.fetchval(
+                    "SELECT permissions FROM service_clients WHERE id=$1", client_id
+                )
+                == ["tenant.provision", "principal.provision"]
+            )
+            for table in (
+                "service_client_credentials",
+                "tenant_provisioning_bindings",
+                "principal_provisioning_bindings",
+                "service_provisioning_idempotency",
+                "service_provisioning_events",
+            ):
+                assert (
+                    await upgraded.fetchval(
+                        f"SELECT count(*) FROM {table} WHERE service_client_id=$1",
+                        client_id,
+                    )
+                    == 1
+                )
+            role = await upgraded.fetchrow(
+                "SELECT rolsuper,rolbypassrls,rolcreatedb,rolcreaterole,"
+                "rolreplication,rolinherit,"
+                "(SELECT count(*) FROM pg_auth_members WHERE member=r.oid) memberships "
+                "FROM pg_roles r WHERE rolname='engram_provisioner'"
+            )
+            assert role is not None
+            assert tuple(role.values()) == (False, False, False, False, False, False, 0)
+        finally:
+            await upgraded.close()
+        assert (
+            await admin.fetchval(
+                "SELECT rolpassword FROM pg_authid WHERE rolname='engram_provisioner'"
+            )
+            == before_password
+        )
+
+        permissions = [
+            "tenant.provision",
+            "principal.provision",
+            "workspace.provision",
+            "agent.provision",
+            "api_key.provision",
+        ]
+        assert (
+            await _run_service_client(
+                argparse.Namespace(
+                    service_client_command="set-permissions",
+                    client=str(client_id),
+                    permission=permissions,
+                    json=True,
+                ),
+                database_url,
+            )
+            == 0
+        )
+        verify = await asyncpg.connect(normalize_asyncpg_url(database_url))
+        try:
+            assert (
+                await verify.fetchval(
+                    "SELECT permissions FROM service_clients WHERE id=$1", client_id
+                )
+                == permissions
+            )
+            assert (
+                await verify.fetchval(
+                    "SELECT count(*) FROM service_provisioning_events "
+                    "WHERE service_client_id=$1 "
+                    "AND event_type='service_client.permissions_changed'",
+                    client_id,
+                )
+                == 1
+            )
+        finally:
+            await verify.close()
+        assert await _run_init_db(database_url) == 0
+    finally:
+        if created_database:
+            await admin.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1",
+                database,
+            )
+            await admin.execute(f'DROP DATABASE "{database}"')
+        await _restore_role_state(admin, original_role)
+        await admin.close()
 
 
 async def test_forced_upgrade_failure_restores_role_and_removes_database() -> None:

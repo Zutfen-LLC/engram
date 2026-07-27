@@ -92,7 +92,13 @@ async def service_stack(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[dict[s
         client_id,
         slug,
         f"Service proof {tag}",
-        ["tenant.provision", "principal.provision"],
+        [
+            "tenant.provision",
+            "principal.provision",
+            "workspace.provision",
+            "agent.provision",
+            "api_key.provision",
+        ],
     )
     await owner.execute(
         "INSERT INTO service_client_credentials "
@@ -123,6 +129,23 @@ async def service_stack(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[dict[s
         async with owner.transaction():
             await owner.execute(
                 "DELETE FROM service_provisioning_events WHERE service_client_id=$1", client_id
+            )
+            await owner.execute(
+                "DELETE FROM service_agent_key_idempotency WHERE service_client_id=$1", client_id
+            )
+            await owner.execute(
+                "DELETE FROM service_workspace_agent_idempotency "
+                "WHERE service_client_id=$1",
+                client_id,
+            )
+            await owner.execute(
+                "DELETE FROM agent_api_key_provisioning_bindings "
+                "WHERE service_client_id=$1",
+                client_id,
+            )
+            await owner.execute(
+                "DELETE FROM workspace_provisioning_bindings WHERE service_client_id=$1",
+                client_id,
             )
             await owner.execute(
                 "DELETE FROM service_provisioning_idempotency WHERE service_client_id=$1", client_id
@@ -1055,3 +1078,219 @@ async def test_every_provisioning_mutation_stage_rolls_back_completely(
         )
         == before_last_used
     )
+
+
+async def _provision_onboarding_tenant(stack: dict[str, Any]) -> dict[str, Any]:
+    body = _body(stack["tag"])
+    response = await stack["client"].post(
+        "/v1/service/provisioning/tenant-human",
+        headers=_headers(stack, f"tenant-onboarding-{stack['tag']}"),
+        json=body,
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def _workspace_agent_body(stack: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "tenant_external_ref": f"tenant-ref-{stack['tag']}",
+        "workspace": {
+            "external_ref": f"workspace-ref-{stack['tag']}",
+            "name": f"Workspace {stack['tag']}",
+            "slug": f"workspace-{stack['tag']}",
+        },
+        "agent": {
+            "external_ref": f"agent-ref-{stack['tag']}",
+            "name": f"Agent {stack['tag']}",
+        },
+    }
+
+
+async def _provision_workspace_agent(
+    stack: dict[str, Any], idempotency_key: str
+) -> Any:
+    return await stack["client"].post(
+        "/v1/service/provisioning/workspace-agent",
+        headers=_headers(stack, idempotency_key),
+        json=_workspace_agent_body(stack),
+    )
+
+
+def _agent_key_body(
+    stack: dict[str, Any],
+    *,
+    external_ref: str,
+    replaces_external_ref: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "tenant_external_ref": f"tenant-ref-{stack['tag']}",
+        "workspace_external_ref": f"workspace-ref-{stack['tag']}",
+        "agent_external_ref": f"agent-ref-{stack['tag']}",
+        "api_key": {
+            "external_ref": external_ref,
+            "label": "service agent",
+            "replaces_external_ref": replaces_external_ref,
+        },
+    }
+
+
+async def test_workspace_agent_creation_replay_and_reconciliation_are_stable(
+    service_stack,
+) -> None:  # type: ignore[no-untyped-def]
+    stack = service_stack
+    tenant = await _provision_onboarding_tenant(stack)
+    key = f"workspace-agent-{stack['tag']}"
+    created = await _provision_workspace_agent(stack, key)
+    assert created.status_code == 201, created.text
+    body = created.json()
+    assert body["created"] == {"workspace": True, "agent": True, "membership": True}
+    assert body["idempotency_replayed"] is False
+    assert body["workspace"]["tenant_id"] == tenant["tenant"]["id"]
+    assert body["agent"]["tenant_id"] == tenant["tenant"]["id"]
+    assert body["agent"]["type"] == "agent"
+    assert body["membership"]["role"] == "member"
+    assert body["membership"]["workspace_id"] == body["workspace"]["id"]
+    assert body["membership"]["principal_id"] == body["agent"]["id"]
+    _assert_service_headers(created)
+
+    replay = await _provision_workspace_agent(stack, key)
+    assert replay.status_code == 200
+    assert replay.json()["idempotency_replayed"] is True
+    assert replay.headers["idempotency-replayed"] == "true"
+    for resource in ("workspace", "agent", "membership"):
+        assert replay.json()[resource]["id"] == body[resource]["id"]
+
+    reconciled = await _provision_workspace_agent(
+        stack, f"workspace-agent-reconcile-{stack['tag']}"
+    )
+    assert reconciled.status_code == 200
+    assert reconciled.json()["created"] == {
+        "workspace": False,
+        "agent": False,
+        "membership": False,
+    }
+    assert reconciled.json()["idempotency_replayed"] is False
+
+    owner = stack["owner"]
+    assert (
+        await owner.fetchval(
+            "SELECT count(*) FROM workspace_provisioning_bindings "
+            "WHERE service_client_id=$1",
+            stack["client_id"],
+        )
+        == 1
+    )
+    agent_row = await owner.fetchrow(
+        "SELECT p.type,p.internal_key,m.role "
+        "FROM principal_provisioning_bindings b "
+        "JOIN principals p ON p.id=b.principal_id "
+        "JOIN workspace_members m ON m.principal_id=p.id "
+        "WHERE b.service_client_id=$1 AND p.type='agent'",
+        stack["client_id"],
+    )
+    assert agent_row is not None
+    assert dict(agent_row) == {"type": "agent", "internal_key": None, "role": "member"}
+
+
+async def test_agent_key_secret_is_once_only_and_replacement_is_atomic(
+    service_stack,
+) -> None:  # type: ignore[no-untyped-def]
+    stack = service_stack
+    await _provision_onboarding_tenant(stack)
+    workspace_response = await _provision_workspace_agent(
+        stack, f"workspace-agent-for-key-{stack['tag']}"
+    )
+    assert workspace_response.status_code == 201
+
+    first_ref = f"key-ref-{stack['tag']}"
+    first_idempotency = f"agent-key-{stack['tag']}"
+    issued = await stack["client"].post(
+        "/v1/service/provisioning/agent-api-key",
+        headers=_headers(stack, first_idempotency),
+        json=_agent_key_body(stack, external_ref=first_ref),
+    )
+    assert issued.status_code == 201, issued.text
+    issued_body = issued.json()
+    plaintext = issued_body["key"]
+    assert isinstance(plaintext, str) and plaintext.startswith("eng_")
+    assert issued_body["created"] is True
+    assert issued_body["replacement"] is False
+    assert issued_body["credential_secret_available"] is True
+    assert issued_body["api_key"]["scopes"] == ["read", "write"]
+    assert issued_body["api_key"]["memory_profile_id"] is None
+
+    stored = await stack["owner"].fetchrow(
+        "SELECT key_id,secret_digest,key_hash,scopes,memory_profile_id,revoked_at "
+        "FROM api_keys WHERE id=$1",
+        uuid.UUID(issued_body["api_key"]["id"]),
+    )
+    assert stored is not None
+    assert stored["key_id"] and stored["secret_digest"]
+    assert stored["key_hash"] is None
+    assert stored["scopes"] == ["read", "write"]
+    assert stored["memory_profile_id"] is None
+    assert plaintext not in str(dict(stored))
+
+    replay = await stack["client"].post(
+        "/v1/service/provisioning/agent-api-key",
+        headers=_headers(stack, first_idempotency),
+        json=_agent_key_body(stack, external_ref=first_ref),
+    )
+    assert replay.status_code == 200
+    assert replay.json()["api_key"]["id"] == issued_body["api_key"]["id"]
+    assert replay.json()["created"] is False
+    assert replay.json()["credential_secret_available"] is False
+    assert replay.json()["key"] is None
+    assert replay.headers["idempotency-replayed"] == "true"
+
+    replacement_ref = f"replacement-ref-{stack['tag']}"
+    replaced = await stack["client"].post(
+        "/v1/service/provisioning/agent-api-key",
+        headers=_headers(stack, f"replacement-idem-{stack['tag']}"),
+        json=_agent_key_body(
+            stack,
+            external_ref=replacement_ref,
+            replaces_external_ref=first_ref,
+        ),
+    )
+    assert replaced.status_code == 201, replaced.text
+    replacement_body = replaced.json()
+    assert replacement_body["created"] is True
+    assert replacement_body["replacement"] is True
+    assert replacement_body["key"].startswith("eng_")
+    assert replacement_body["key"] != plaintext
+
+    rows = await stack["owner"].fetch(
+        "SELECT b.status,b.replaces_binding_id,k.revoked_at "
+        "FROM agent_api_key_provisioning_bindings b "
+        "JOIN api_keys k ON k.id=b.api_key_id "
+        "WHERE b.service_client_id=$1 ORDER BY b.created_at",
+        stack["client_id"],
+    )
+    assert len(rows) == 2
+    assert rows[0]["status"] == "replaced"
+    assert rows[0]["revoked_at"] is not None
+    assert rows[1]["status"] == "active"
+    assert rows[1]["replaces_binding_id"] is not None
+    assert rows[1]["revoked_at"] is None
+    assert (
+        await stack["owner"].fetchval(
+            "SELECT count(*) FROM agent_api_key_provisioning_bindings "
+            "WHERE service_client_id=$1 AND status='active'",
+            stack["client_id"],
+        )
+        == 1
+    )
+
+    replacement_replay = await stack["client"].post(
+        "/v1/service/provisioning/agent-api-key",
+        headers=_headers(stack, f"replacement-idem-{stack['tag']}"),
+        json=_agent_key_body(
+            stack,
+            external_ref=replacement_ref,
+            replaces_external_ref=first_ref,
+        ),
+    )
+    assert replacement_replay.status_code == 200
+    assert replacement_replay.json()["key"] is None
+    assert replacement_replay.json()["credential_secret_available"] is False

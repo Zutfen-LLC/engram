@@ -126,7 +126,12 @@ async def readiness(
                             "WHERE table_schema = 'public' "
                             "AND table_name IN ('service_clients', 'service_client_credentials', "
                             "'tenant_provisioning_bindings', 'principal_provisioning_bindings', "
-                            "'service_provisioning_idempotency', 'service_provisioning_events')"
+                            "'workspace_provisioning_bindings', "
+                            "'agent_api_key_provisioning_bindings', "
+                            "'service_provisioning_idempotency', "
+                            "'service_workspace_agent_idempotency', "
+                            "'service_agent_key_idempotency', "
+                            "'service_provisioning_events')"
                         )
                     )
                     expected_role = settings.provisioner_database_role
@@ -144,9 +149,13 @@ async def readiness(
                         or role["schema_create"]
                     )
                     function = await provisioner.execute(
-                        text("SELECT to_regprocedure('current_service_client_id()') IS NOT NULL")
+                        text(
+                            "SELECT to_regprocedure('current_service_client_id()') IS NOT NULL "
+                            "AND to_regprocedure("
+                            "'current_service_client_has_permission(text)') IS NOT NULL"
+                        )
                     )
-                    if invalid_role or tables.scalar() != 6 or not function.scalar():
+                    if invalid_role or tables.scalar() != 10 or not function.scalar():
                         return JSONResponse(
                             status_code=503,
                             content={"status": "not_ready", "provisioning": "misconfigured"},

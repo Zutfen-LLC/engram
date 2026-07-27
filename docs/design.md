@@ -72,11 +72,15 @@ Single-agent memory is the on-ramp. Multi-agent institutional memory is the moat
    **Service provisioning boundary (ENG-CORE-PROVISION-001A):** A service
    client is neither a tenant principal nor an internal actor. It authenticates
    only with a separately formatted `engsvc_` credential and narrowly scoped
-   service permissions (`tenant.provision`, `principal.provision`), not tenant
+   service permissions (`tenant.provision`, `principal.provision`,
+   `workspace.provision`, `agent.provision`, `api_key.provision`), not tenant
    API-key scopes. The dedicated `engram_provisioner` database role is likewise
-   not an application or owner role: it can provision a service-owned tenant
-   and human principal but cannot read memory, issue API keys, create agents or
-   workspaces, review, export, or use ordinary Core APIs.
+   not an application or owner role: it can provision service-bound tenants,
+   humans, workspaces, agent members, and fixed read/write agent API keys, but
+   cannot read memory, create arbitrary keys or scopes, review, export, or use
+   ordinary Core APIs. Stable workspace/agent resources reconcile separately
+   from one-time API-key secret delivery; replay never reconstructs plaintext,
+   and explicit replacement atomically revokes an unrecoverable prior key.
 
 4. **REST core, MCP/SDK as thin wrappers.** The service exposes a clean HTTP API. MCP is one client adapter. Any framework can adopt it.
 

@@ -23,15 +23,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from engram.api_key_issuance import issue_api_key
 from engram.auth import (
-    DIGEST_ALGORITHM,
     READ_SCOPE,
     WRITE_SCOPE,
     canonicalize_scopes,
-    digest_api_key_secret,
-    generate_api_key,
     get_current_principal,
-    parse_api_key,
     validate_principal_name,
     validate_principal_type,
 )
@@ -39,7 +36,7 @@ from engram.auth import (
     Principal as AuthPrincipal,
 )
 from engram.db import get_session
-from engram.memory_profiles import ProfileNotFoundError, validate_key_binding
+from engram.memory_profiles import ProfileNotFoundError
 from engram.models import Principal as PrincipalModel
 
 router = APIRouter()
@@ -126,10 +123,6 @@ async def create_agent(
         ) from exc
 
     scopes = body.validated_scopes()
-    try:
-        active_profile = await validate_key_binding(session, tenant_id, body.memory_profile_id)
-    except ProfileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="memory profile not found") from exc
 
     # Create the agent principal.
     principal = PrincipalModel(
@@ -141,74 +134,31 @@ async def create_agent(
     session.add(principal)
     await session.flush()  # get principal.id
 
-    # Issue a scoped API key for the new agent.
-    plaintext = generate_api_key()
-    parsed = parse_api_key(plaintext)
-    assert parsed.key_id is not None
-    secret_digest = digest_api_key_secret(parsed.secret)
     key_label = body.label or f"agent:{body.name}"
-    key_id_uuid = uuid.uuid4()
-    # Detect SQLite (test path) vs Postgres (production). On Postgres,
-    # asyncpg natively binds Python lists to TEXT[] columns. SQLite needs
-    # a comma-separated string (auth._parse_scopes handles both).
-    dialect_name = session.bind.dialect.name if session.bind else ""
-    is_sqlite = dialect_name == "sqlite"
-    scopes_value: str | list[str] = ",".join(scopes) if is_sqlite else scopes
-
-    key_params: dict[str, object] = {
-            "id": str(key_id_uuid),
-            "tid": str(tenant_id),
-            "pid": str(principal.id),
-            "kid": parsed.key_id,
-            "sd": secret_digest,
-            "da": DIGEST_ALGORITHM,
-            "sc": scopes_value,
-            "lbl": key_label,
-            "mpid": str(body.memory_profile_id) if body.memory_profile_id else None,
-            "ts": datetime.now(UTC),
-        }
-    if is_sqlite:
-        await session.execute(
-            text(
-                "INSERT INTO api_keys "
-                "(id, tenant_id, principal_id, key_hash, key_id, secret_digest, "
-                "digest_algorithm, scopes, label, created_at, revoked_at) "
-                "VALUES (:id, :tid, :pid, NULL, :kid, :sd, :da, :sc, :lbl, :ts, NULL)"
-            ), key_params,
+    try:
+        issued = await issue_api_key(
+            session,
+            tenant_id=tenant_id,
+            principal_id=principal.id,
+            scopes=scopes,
+            label=key_label,
+            memory_profile_id=body.memory_profile_id,
+            profile_event_actor_principal_id=uuid.UUID(caller.principal_id),
+            profile_event_reason="Agent API key issuance",
         )
-    else:
-        await session.execute(
-            text(
-                "INSERT INTO api_keys "
-                "(id, tenant_id, principal_id, key_hash, key_id, secret_digest, "
-                "digest_algorithm, scopes, label, memory_profile_id, created_at, revoked_at) "
-                "VALUES (:id, :tid, :pid, NULL, :kid, :sd, :da, :sc, :lbl, :mpid, :ts, NULL)"
-            ), key_params,
-        )
-    if active_profile is not None:
-        await session.execute(
-            text(
-                "INSERT INTO memory_profile_events "
-                "(tenant_id, profile_id, revision_id, actor_principal_id, event_type, reason, details) "
-                "VALUES (:tenant_id, :profile_id, :revision_id, :actor_principal_id, "
-                "'profile_bound_at_key_issuance', 'Agent API key issuance', "
-                "jsonb_build_object('api_key_id', CAST(:key_id AS text), "
-                "'label', CAST(:label AS text)))"
-            ),
-            {"tenant_id": str(tenant_id), "profile_id": str(active_profile.id),
-             "revision_id": str(active_profile.revision_id), "actor_principal_id": str(caller.principal_id),
-             "key_id": str(key_id_uuid), "label": key_label},
-        )
+    except ProfileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="memory profile not found") from exc
     await session.commit()
     await session.refresh(principal)
+    active_profile = issued.active_profile
 
     return AgentCreated(
         id=principal.id,
         name=principal.name,
         type=principal.type,
         created_at=principal.created_at,
-        key=plaintext,
-        key_id=key_id_uuid,
+        key=issued.plaintext,
+        key_id=issued.api_key.id,
         scopes=scopes,
         label=key_label,
         memory_profile_id=body.memory_profile_id,

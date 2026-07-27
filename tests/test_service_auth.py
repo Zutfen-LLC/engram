@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import itertools
+
 import pytest
 
 from engram.service_auth import (
+    CANONICAL_SERVICE_PERMISSION_ORDER,
     canonicalize_service_permissions,
     digest_service_secret,
     generate_service_credential,
@@ -37,6 +40,31 @@ def test_service_permissions_are_canonical_and_do_not_accept_duplicates() -> Non
         canonicalize_service_permissions(["tenant.provision", "tenant.provision"])
     with pytest.raises(ValueError, match="unknown"):
         canonicalize_service_permissions(["read"])
+
+
+def test_extended_service_permissions_are_canonical() -> None:
+    assert canonicalize_service_permissions(
+        [
+            "api_key.provision",
+            "agent.provision",
+            "workspace.provision",
+            "principal.provision",
+            "tenant.provision",
+        ]
+    ) == [
+        "tenant.provision",
+        "principal.provision",
+        "workspace.provision",
+        "agent.provision",
+        "api_key.provision",
+    ]
+
+
+def test_every_nonempty_service_permission_subset_is_valid() -> None:
+    permissions = list(CANONICAL_SERVICE_PERMISSION_ORDER)
+    for size in range(1, len(permissions) + 1):
+        for subset in itertools.combinations(permissions, size):
+            assert canonicalize_service_permissions(list(reversed(subset))) == list(subset)
 
 
 @pytest.mark.parametrize("value", ["", "   ", " name", "name ", "x" * 256])

@@ -111,6 +111,20 @@ class PrincipalProvisioningBinding(Base):
     )
 
 
+class WorkspaceProvisioningBinding(Base):
+    __tablename__ = "workspace_provisioning_bindings"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    service_client_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    tenant_binding_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    external_ref: Mapped[str] = mapped_column(String(255), nullable=False)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
 class ServiceProvisioningIdempotency(Base):
     __tablename__ = "service_provisioning_idempotency"
 
@@ -125,6 +139,53 @@ class ServiceProvisioningIdempotency(Base):
     )
 
 
+class ServiceWorkspaceAgentIdempotency(Base):
+    __tablename__ = "service_workspace_agent_idempotency"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    service_client_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    key_digest: Mapped[bytes] = mapped_column(nullable=False)
+    request_digest: Mapped[bytes] = mapped_column(nullable=False)
+    workspace_binding_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    principal_binding_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    workspace_member_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class AgentApiKeyProvisioningBinding(Base):
+    __tablename__ = "agent_api_key_provisioning_bindings"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    service_client_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    tenant_binding_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    workspace_binding_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    principal_binding_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    external_ref: Mapped[str] = mapped_column(String(255), nullable=False)
+    api_key_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    replaces_binding_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    replaced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ServiceAgentKeyIdempotency(Base):
+    __tablename__ = "service_agent_key_idempotency"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    service_client_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    key_digest: Mapped[bytes] = mapped_column(nullable=False)
+    request_digest: Mapped[bytes] = mapped_column(nullable=False)
+    api_key_binding_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
 class ServiceProvisioningEvent(Base):
     __tablename__ = "service_provisioning_events"
 
@@ -133,12 +194,16 @@ class ServiceProvisioningEvent(Base):
     credential_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     principal_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    api_key_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
     outcome: Mapped[str] = mapped_column(String(16), nullable=False)
     request_id: Mapped[str] = mapped_column(String(128), nullable=False)
     reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     external_tenant_ref_digest: Mapped[bytes | None] = mapped_column(nullable=True)
     external_principal_ref_digest: Mapped[bytes | None] = mapped_column(nullable=True)
+    external_workspace_ref_digest: Mapped[bytes | None] = mapped_column(nullable=True)
+    external_api_key_ref_digest: Mapped[bytes | None] = mapped_column(nullable=True)
     details: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False

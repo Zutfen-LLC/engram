@@ -441,8 +441,6 @@ async def test_provisioner_cannot_create_bound_user_with_internal_key(
         "memory_embeddings",
         "recall_logs",
         "context_receipts",
-        "api_keys",
-        "workspaces",
         "usage_events",
         "classification_runs",
     ),
@@ -459,6 +457,50 @@ async def test_provisioner_cannot_read_non_provisioning_data(role_proof, table: 
             # commit of an aborted transaction.
             async with conn.transaction():
                 await conn.fetch(f"SELECT * FROM {table} LIMIT 1")
+
+
+async def test_provisioner_workspace_and_api_key_reads_are_binding_scoped(role_proof) -> None:  # type: ignore[no-untyped-def]
+    conn = role_proof["provisioner"]
+    async with conn.transaction():
+        await conn.execute(
+            "SELECT set_config('app.service_client_id',$1,true)",
+            str(role_proof["first_client"]),
+        )
+        assert await conn.fetchval("SELECT count(*) FROM workspaces") == 0
+        assert await conn.fetchval("SELECT count(*) FROM api_keys") == 0
+
+
+async def test_ordinary_app_role_has_no_service_control_plane_table_authority(
+    role_proof,
+) -> None:  # type: ignore[no-untyped-def]
+    app_url = os.getenv("ENGRAM_APP_DATABASE_URL")
+    if not app_url:
+        pytest.skip("requires the non-owner application PostgreSQL URL")
+    app = await _connect(app_url)
+    try:
+        for table in (
+            "service_clients",
+            "service_client_credentials",
+            "tenant_provisioning_bindings",
+            "principal_provisioning_bindings",
+            "workspace_provisioning_bindings",
+            "agent_api_key_provisioning_bindings",
+            "service_provisioning_idempotency",
+            "service_workspace_agent_idempotency",
+            "service_agent_key_idempotency",
+            "service_provisioning_events",
+        ):
+            for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+                assert (
+                    await app.fetchval(
+                        "SELECT has_table_privilege(current_user,$1,$2)",
+                        table,
+                        privilege,
+                    )
+                    is False
+                )
+    finally:
+        await app.close()
 
 
 async def test_provisioner_cannot_mutate_authority_or_provisioning_history(role_proof) -> None:  # type: ignore[no-untyped-def]

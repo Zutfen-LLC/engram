@@ -58,7 +58,7 @@ or membership, schema CREATE privilege, or the service-provisioning tables and
 required function are absent. The worker does not need this URL.
 
 On a persisted Compose volume, `docker-entrypoint-initdb.d` does not run again.
-After applying migration 027 as the owner, assign or rotate the provisioner
+After applying migrations 027 and 028 as the owner, assign or rotate the provisioner
 password interactively (so it is not placed in a command argument or shell
 history):
 
@@ -72,6 +72,14 @@ Then update the secret source that supplies `POSTGRES_PROVISIONER_PASSWORD` and
 restart `engram-service`. This applies to existing volumes as well as new
 deployments; changing the environment value alone does not alter an existing
 database role.
+
+Migration 028 converges the existing role without changing its persisted
+password. It grants only binding-scoped workspace, agent-membership, and
+ordinary API-key provisioning authority; the role still has no memory, job,
+review, export, schema-create, object-ownership, or role-membership authority.
+It also leaves every existing service-client permission array unchanged. Use
+the owner-only `engram service-client set-permissions` command to grant the new
+`workspace.provision`, `agent.provision`, and `api_key.provision` permissions.
 
 Optionally, `ENGRAM_READ_DATABASE_URL` (ENG-AUD-011) points startup recall's
 bounded candidate selection at a read replica instead of the primary. Unset

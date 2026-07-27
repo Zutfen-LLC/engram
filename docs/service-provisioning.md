@@ -1,34 +1,54 @@
 # Service provisioning
 
-`POST /v1/service/provisioning/tenant-human` is the generic boundary for a
-trusted external control plane to create or resolve one Core tenant and one
-human (`type=user`) principal. It is not a Portal, browser, subscription, or
-workspace API.
+Core exposes three generic external-control-plane operations:
 
-It accepts `Authorization: Bearer engsvc_<key_id>_<secret>` and a required
-`Idempotency-Key`. Service credentials have only the `tenant.provision` and
-`principal.provision` permissions; these are not tenant API-key scopes. An
-`engsvc_` credential cannot use ordinary Core routes, and an `eng_` credential
-cannot use this route.
+- `POST /v1/service/provisioning/tenant-human` creates or resolves a tenant and
+  human (`type=user`) principal.
+- `POST /v1/service/provisioning/workspace-agent` creates or resolves one
+  workspace, agent principal, and `member` workspace membership inside a
+  service-owned tenant.
+- `POST /v1/service/provisioning/agent-api-key` issues or atomically replaces
+  the fixed `read` + `write` ordinary API key for that workspace-agent pair.
 
-The request contains opaque tenant and human external references plus immutable
-Core display names and tenant slug. References are scoped to the authenticated
-service client. Core never adopts an existing tenant by matching a name or slug:
-an unbound slug produces `TENANT_SLUG_CONFLICT`. The same human reference may
-therefore map to separate principals in separate tenants.
+All accept `Authorization: Bearer engsvc_<key_id>_<secret>` and a required
+`Idempotency-Key`. Service permissions are `tenant.provision`,
+`principal.provision`, `workspace.provision`, `agent.provision`, and
+`api_key.provision`; these are not tenant API-key scopes. An `engsvc_`
+credential cannot use ordinary Core routes, and an `eng_` credential cannot
+use service routes.
+
+Requests contain opaque external references and Core names/slugs, never caller
+selected Core resource UUIDs. References are scoped to the authenticated
+service client. Core never adopts an existing resource by matching a name or
+slug. Unknown and cross-service tenant bindings are indistinguishable.
 
 Responses are cache-disabled and return `201` for creation, `200` for
 reconciliation or an idempotent replay, and `Idempotency-Replayed: true` for a
 replay. Every response has `Cache-Control: no-store`, `Pragma: no-cache`,
-`Referrer-Policy: no-referrer`, and an `X-Request-ID`; a valid caller request
-ID is retained and an invalid or missing one is replaced before authentication
-or validation. Request validation failures use `INVALID_REQUEST` without
-echoing sensitive input.
+`Referrer-Policy: no-referrer`, and an `X-Request-ID`. Validation failures use
+`INVALID_REQUEST` without echoing input.
 
-The binding rows retain raw external references because reconciliation requires
-them. Idempotency records store only a key digest, and provisioning audit events
-store only SHA-256 external-reference digests. Events are append-only; a
-deterministic conflict rolls back all provisioning mutations in a savepoint,
-then appends one bounded `provisioning.conflict` audit event in the enclosing
-authenticated transaction. New tenants receive the same builtin memory kinds
-and active configuration as `POST /v1/admin/tenants`.
+Binding rows retain raw external references because reconciliation requires
+them. Idempotency records store only a key digest, and provisioning audit
+events store only SHA-256 external-reference digests. Events are append-only;
+a deterministic conflict rolls back resource mutations in a savepoint, then
+appends one bounded conflict event in the enclosing authenticated transaction.
+
+Stable workspace/agent resources are intentionally separate from credential
+issuance. Workspace-agent replays always return the same resource identifiers.
+An API-key plaintext secret exists only in the successful `201` creation
+response. Replays and reconciliation return
+`credential_secret_available=false` and `key=null`; Core cannot reconstruct or
+read the secret.
+
+If delivery is lost, call the API-key operation with a new API-key external
+reference and `replaces_external_ref` naming the active binding. Core revokes
+the prior key, marks its binding replaced, and creates its successor in one
+transaction. At most one service-provisioned key is active for a
+workspace-agent pair. Database revocation is authoritative; other replicas
+observe it within the configured API-key cache TTL.
+
+These routes do not grant browser authority, create memory or agent activity,
+bind a memory profile, or implement Portal orchestration. See
+`docs/service-agent-onboarding.md` for request contracts and the lost-delivery
+runbook.
