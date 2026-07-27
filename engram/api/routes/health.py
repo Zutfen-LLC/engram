@@ -17,6 +17,7 @@ from engram.auth import (
     Principal,
     get_current_principal,
 )
+from engram.config import settings
 from engram.db import get_session
 from engram.models import Principal as PrincipalModel
 
@@ -100,6 +101,61 @@ async def readiness(
                     ),
                 },
             )
+
+        if settings.service_provisioning_enabled:
+            from engram.db import require_provisioner_session_factory
+
+            try:
+                async with require_provisioner_session_factory()() as provisioner:
+                    role = (
+                        await provisioner.execute(
+                            text(
+                                "SELECT r.rolname, r.rolcanlogin, r.rolsuper, r.rolbypassrls, "
+                                "r.rolcreatedb, r.rolcreaterole, r.rolreplication, r.rolinherit, "
+                                "EXISTS (SELECT 1 FROM pg_auth_members m "
+                                "WHERE m.member = r.oid) AS prohibited_membership, "
+                                "has_schema_privilege(current_user, 'public', 'CREATE') "
+                                "AS schema_create "
+                                "FROM pg_roles r WHERE r.rolname = current_user"
+                            )
+                        )
+                    ).mappings().first()
+                    tables = await provisioner.execute(
+                        text(
+                            "SELECT count(*) FROM information_schema.tables "
+                            "WHERE table_schema = 'public' "
+                            "AND table_name IN ('service_clients', 'service_client_credentials', "
+                            "'tenant_provisioning_bindings', 'principal_provisioning_bindings', "
+                            "'service_provisioning_idempotency', 'service_provisioning_events')"
+                        )
+                    )
+                    expected_role = settings.provisioner_database_role
+                    invalid_role = (
+                        role is None
+                        or role["rolname"] != expected_role
+                        or not role["rolcanlogin"]
+                        or role["rolsuper"]
+                        or role["rolbypassrls"]
+                        or role["rolcreatedb"]
+                        or role["rolcreaterole"]
+                        or role["rolreplication"]
+                        or role["rolinherit"]
+                        or role["prohibited_membership"]
+                        or role["schema_create"]
+                    )
+                    function = await provisioner.execute(
+                        text("SELECT to_regprocedure('current_service_client_id()') IS NOT NULL")
+                    )
+                    if invalid_role or tables.scalar() != 6 or not function.scalar():
+                        return JSONResponse(
+                            status_code=503,
+                            content={"status": "not_ready", "provisioning": "misconfigured"},
+                        )
+            except Exception:
+                return JSONResponse(
+                    status_code=503,
+                    content={"status": "not_ready", "provisioning": "unavailable"},
+                )
 
         return {
             "status": "ready",

@@ -69,6 +69,15 @@ Single-agent memory is the on-ramp. Multi-agent institutional memory is the moat
 
 3. **Multi-tenant from day one.** Every table has `tenant_id`. Row Level Security enforces isolation at the database level — one forgotten WHERE clause cannot cause a cross-tenant leak.
 
+   **Service provisioning boundary (ENG-CORE-PROVISION-001A):** A service
+   client is neither a tenant principal nor an internal actor. It authenticates
+   only with a separately formatted `engsvc_` credential and narrowly scoped
+   service permissions (`tenant.provision`, `principal.provision`), not tenant
+   API-key scopes. The dedicated `engram_provisioner` database role is likewise
+   not an application or owner role: it can provision a service-owned tenant
+   and human principal but cannot read memory, issue API keys, create agents or
+   workspaces, review, export, or use ordinary Core APIs.
+
 4. **REST core, MCP/SDK as thin wrappers.** The service exposes a clean HTTP API. MCP is one client adapter. Any framework can adopt it.
 
 5. **Content is append-first; metadata changes are audited.** Memory content is never UPDATEd. Supersession/invalidation marks old rows. Metadata changes such as wing, room, visibility, and review status are recorded in `item_events` for full audit trail.

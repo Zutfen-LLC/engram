@@ -75,7 +75,13 @@ def _override_ready_session(app, *, tenant_id, pgvector_version):
 
 
 @pytest.fixture()
-def app():
+def app(monkeypatch):
+    # These tests isolate the normal app-role readiness contract. Provisioner
+    # readiness has its own database-backed checks and should not force this
+    # mocked session fixture to open a second real connection.
+    from engram.config import settings
+
+    monkeypatch.setattr(settings, "service_provisioning_enabled", False)
     return create_app()
 
 

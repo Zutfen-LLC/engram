@@ -63,6 +63,31 @@ read_engine = create_async_engine(
 
 read_session_factory = async_sessionmaker(read_engine, class_=AsyncSession, expire_on_commit=False)
 
+# This engine exists only when explicitly enabled.  It never falls back to the
+# owner or ordinary application URL; callers must fail closed instead.
+provisioner_engine = (
+    create_async_engine(
+        settings.provisioner_database_url,
+        echo=False,
+        pool_size=5,
+        max_overflow=5,
+    )
+    if settings.service_provisioning_enabled and settings.provisioner_database_url
+    else None
+)
+provisioner_session_factory = (
+    async_sessionmaker(provisioner_engine, class_=AsyncSession, expire_on_commit=False)
+    if provisioner_engine is not None
+    else None
+)
+
+
+def require_provisioner_session_factory() -> async_sessionmaker[AsyncSession]:
+    """Return the dedicated provisioning factory or fail closed."""
+    if provisioner_session_factory is None:
+        raise RuntimeError("service provisioning infrastructure is unavailable")
+    return provisioner_session_factory
+
 # Seed principal name / tenant slug used as the default RLS context when auth is
 # disabled (Phase 1A). These match the rows inserted by migrations/001_init.sql.
 _DEFAULT_TENANT_SLUG = "default"
@@ -122,6 +147,16 @@ async def clear_rls_context(session: AsyncSession) -> None:
     any pending/failed transaction to leave the session clean.
     """
     await session.rollback()
+
+
+async def apply_service_client_context(
+    session: AsyncSession, service_client_id: str | UUID
+) -> None:
+    """Install the transaction-local service-client identity for provisioner RLS."""
+    await session.execute(
+        text("SELECT set_config('app.service_client_id', :sid, true)"),
+        {"sid": str(service_client_id)},
+    )
 
 
 async def get_session(

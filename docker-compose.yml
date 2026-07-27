@@ -111,6 +111,8 @@ services:
       # Consumed by migrations/app_role_password.sh on first boot only.
       POSTGRES_APP_USER: ${POSTGRES_APP_USER:-engram_app}
       POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:-engram_app}
+      POSTGRES_PROVISIONER_USER: ${POSTGRES_PROVISIONER_USER:-engram_provisioner}
+      POSTGRES_PROVISIONER_PASSWORD: ${POSTGRES_PROVISIONER_PASSWORD:-engram_provisioner}
     volumes:
       - engram-db-data:/var/lib/postgresql/data
       - ./migrations:/docker-entrypoint-initdb.d:ro
@@ -132,6 +134,8 @@ services:
       ENGRAM_HOST: 0.0.0.0
       ENGRAM_PORT: 8000
       ENGRAM_AUTH_ENABLED: ${ENGRAM_AUTH_ENABLED:-false}
+      ENGRAM_SERVICE_PROVISIONING_ENABLED: ${ENGRAM_SERVICE_PROVISIONING_ENABLED:-false}
+      ENGRAM_PROVISIONER_DATABASE_URL: postgresql+asyncpg://${POSTGRES_PROVISIONER_USER:-engram_provisioner}:${POSTGRES_PROVISIONER_PASSWORD:-engram_provisioner}@postgres:5432/${POSTGRES_DB:-engram}
       # API key cache — used by the auth middleware on the API request path.
       ENGRAM_API_KEY_CACHE_TTL_SECONDS: ${ENGRAM_API_KEY_CACHE_TTL_SECONDS:-60}
       ENGRAM_API_KEY_CACHE_MAX_SIZE: ${ENGRAM_API_KEY_CACHE_MAX_SIZE:-4096}

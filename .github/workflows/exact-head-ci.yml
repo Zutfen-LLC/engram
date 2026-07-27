@@ -1,0 +1,66 @@
+name: Exact PR Head CI
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: exact-pr-head-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  compose-real-db-exact-head:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      ENGRAM_CI_IMAGE: engram-ci:${{ github.event.pull_request.head.sha }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Assert exact PR head checkout
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          ACTUAL_HEAD="$(git rev-parse HEAD)"
+          echo "Expected PR head: $EXPECTED_HEAD"
+          echo "Checked out head: $ACTUAL_HEAD"
+          test "$ACTUAL_HEAD" = "$EXPECTED_HEAD"
+
+      - name: Validate Compose Config
+        run: docker compose -f docker-compose.ci.yml config -q
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and load CI image for exact PR head
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          target: ci
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.ENGRAM_CI_IMAGE }}
+          cache-from: type=gha,scope=engram-ci
+          cache-to: type=gha,mode=min,scope=engram-ci-exact-head
+          provenance: false
+
+      - name: Run Compose Real-DB CI Stack
+        run: docker compose -f docker-compose.ci.yml up --no-build --abort-on-container-exit --exit-code-from engram-test
+
+      - name: Show Compose Logs On Failure
+        if: failure()
+        run: docker compose -f docker-compose.ci.yml logs --no-color
+
+      - name: Clean Up Compose Stack
+        if: always()
+        run: docker compose -f docker-compose.ci.yml down -v --remove-orphans

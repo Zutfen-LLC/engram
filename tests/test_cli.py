@@ -13,6 +13,7 @@ insertion) are exercised by the Compose-backed CI path against a real Postgres.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -35,6 +36,22 @@ from engram.migrations import (
     migration_filename,
     normalize_asyncpg_url,
 )
+
+
+def test_service_client_cli_requires_owner_url_without_app_fallback(monkeypatch, capsys):
+    """Owner-only control-plane mutations must not fall back to app credentials."""
+    import engram.cli as cli_mod
+    from engram.config import settings
+
+    monkeypatch.setattr(settings, "owner_database_url", None)
+    monkeypatch.setattr(settings, "database_url", "postgresql+asyncpg://app-only/engram")
+    monkeypatch.setattr(sys, "argv", ["engram", "service-client", "disable", "control-plane"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.main()
+
+    assert exc_info.value.code == 2
+    assert "ENGRAM_OWNER_DATABASE_URL is required" in capsys.readouterr().err
 
 # --- init-db: migration discovery / URL normalization --------------------
 

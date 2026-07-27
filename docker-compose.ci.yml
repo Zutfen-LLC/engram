@@ -12,6 +12,8 @@ services:
       # isolation tests connect as this role to prove enforcement.
       POSTGRES_APP_USER: engram_app
       POSTGRES_APP_PASSWORD: engram_app
+      POSTGRES_PROVISIONER_USER: engram_provisioner
+      POSTGRES_PROVISIONER_PASSWORD: engram_provisioner
     volumes:
       - ./migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
@@ -34,6 +36,9 @@ services:
       # App-role DSN consumed ONLY by the non-owner RLS isolation tests.
       ENGRAM_APP_DATABASE_URL: postgresql+asyncpg://engram_app:engram_app@postgres:5432/engram
       ENGRAM_AUTH_ENABLED: "false"
+      ENGRAM_SERVICE_PROVISIONING_ENABLED: "true"
+      ENGRAM_PROVISIONER_DATABASE_URL: postgresql+asyncpg://engram_provisioner:engram_provisioner@postgres:5432/engram
+      ENGRAM_FAIL_ON_DB_SKIP: "1"
       ENGRAM_EMBEDDING_PROVIDER: none
       PYTHONUNBUFFERED: "1"
     depends_on:

@@ -9,7 +9,16 @@ from _pytest.terminal import TerminalReporter
 from pytest import Session
 
 _DB_SKIP_REASON = "requires a live PostgreSQL with the v2 schema"
-_db_skipped_tests: list[str] = []
+_db_skipped_tests: set[str] = set()
+_service_provisioning_certification_nodeids: set[str] = set()
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Remember required provisioning proofs without coupling to skip prose."""
+    _service_provisioning_certification_nodeids.clear()
+    _service_provisioning_certification_nodeids.update(
+        item.nodeid for item in items if item.get_closest_marker("service_provisioning_postgres")
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -85,17 +94,30 @@ async def _dispose_db_engines_after_test():
     yield
     import engram.db as db_module
 
-    for eng in (db_module.engine, db_module.owner_engine, db_module.read_engine):
-        await eng.dispose()
+    engines = (
+        db_module.engine,
+        db_module.owner_engine,
+        db_module.read_engine,
+        db_module.provisioner_engine,
+    )
+    for eng in engines:
+        if eng is not None:
+            await eng.dispose()
 
 
 def pytest_runtest_logreport(report: TestReport) -> None:
     if os.environ.get("ENGRAM_FAIL_ON_DB_SKIP") != "1":
         return
-    if report.when != "call" or not report.skipped:
+    if report.when not in {"setup", "call"} or not report.skipped:
         return
-    if _DB_SKIP_REASON in str(report.longrepr):
-        _db_skipped_tests.append(report.nodeid)
+    if (
+        _DB_SKIP_REASON in str(report.longrepr)
+        or report.nodeid in _service_provisioning_certification_nodeids
+    ):
+        # A fixture can skip during setup and pytest can report the same
+        # node more than once (for example when teardown also reports).  The
+        # certification summary is a list of affected tests, not reports.
+        _db_skipped_tests.add(report.nodeid)
 
 
 def pytest_sessionfinish(session: Session, exitstatus: int) -> None:
@@ -105,7 +127,7 @@ def pytest_sessionfinish(session: Session, exitstatus: int) -> None:
         return
     terminal = session.config.pluginmanager.get_plugin("terminalreporter")
     if isinstance(terminal, TerminalReporter):
-        joined = ", ".join(_db_skipped_tests)
+        joined = ", ".join(sorted(_db_skipped_tests))
         terminal.write_line(
             f"Database-required tests skipped unexpectedly: {joined}",
             red=True,
