@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import secrets
 import sys
@@ -47,7 +48,7 @@ async def _role_state(conn):  # type: ignore[no-untyped-def]
     """Capture every cluster-global property this proof can disturb, without logging secrets."""
     role = await conn.fetchrow(
         "SELECT rolcanlogin,rolsuper,rolbypassrls,rolcreatedb,rolcreaterole,rolreplication,"
-        "rolinherit,rolconnlimit,rolvaliduntil,rolpassword "
+        "rolinherit,rolconnlimit,rolvaliduntil::text AS rolvaliduntil,rolpassword "
         "FROM pg_authid WHERE rolname='engram_provisioner'"
     )
     if role is None:
@@ -85,12 +86,11 @@ async def _restore_role_state(conn, state) -> None:  # type: ignore[no-untyped-d
     command = "ALTER ROLE engram_provisioner " + " ".join(
         enabled if value else disabled for enabled, disabled, value in flags
     )
-    command += f" CONNECTION LIMIT {state['rolconnlimit']} "
-    command += (
-        "VALID UNTIL 'infinity'"
-        if state["rolvaliduntil"] is None
-        else ("VALID UNTIL " + repr(state["rolvaliduntil"].isoformat()))
+    valid_until = await conn.fetchval(
+        "SELECT format('VALID UNTIL %L', $1::text)", state["rolvaliduntil"]
     )
+    assert isinstance(valid_until, str)
+    command += f" CONNECTION LIMIT {state['rolconnlimit']} {valid_until}"
     await conn.execute(command)
     current = await conn.fetch(
         "SELECT parent.rolname FROM pg_auth_members membership "
@@ -147,6 +147,22 @@ async def test_persisted_migration_026_to_027_preserves_data_and_converges_role(
         pytest.skip("requires owner PostgreSQL URL for persisted migration upgrade")
     database = f"provision_upgrade_{uuid.uuid4().hex}"
     admin = await asyncpg.connect(normalize_asyncpg_url(owner_url))
+    bootstrap_provisioner_url = os.getenv("ENGRAM_PROVISIONER_DATABASE_URL")
+    if bootstrap_provisioner_url is not None:
+        # pg_isready can turn healthy while docker-entrypoint is still running
+        # its final password script. Do not snapshot a cluster-global role until
+        # that out-of-band bootstrap mutation is complete.
+        for _ in range(40):
+            try:
+                bootstrap = await asyncpg.connect(normalize_asyncpg_url(bootstrap_provisioner_url))
+            except (asyncpg.InvalidPasswordError, OSError):
+                await asyncio.sleep(0.25)
+            else:
+                await bootstrap.close()
+                break
+        else:
+            await admin.close()
+            raise AssertionError("provisioner bootstrap did not become ready")
     database_url = _with_database(owner_url, database)
     provisioner_url = _provisioner_url(owner_url, database)
     # The disposable database is isolated; PostgreSQL roles are not. Snapshot
@@ -459,9 +475,17 @@ async def test_persisted_migration_026_to_027_preserves_data_and_converges_role(
                 cleanup_errors.append(type(exc).__name__)
         try:
             await _restore_role_state(admin, original_role)
-            assert await _role_state(admin) == original_role
+            restored_role = await _role_state(admin)
+            if restored_role != original_role:
+                if restored_role is None or original_role is None:
+                    mismatch = ["existence"]
+                else:
+                    mismatch = [
+                        name for name in original_role if restored_role[name] != original_role[name]
+                    ]
+                raise AssertionError(f"role state restoration mismatch: {mismatch}")
         except Exception as exc:  # pragma: no cover - defensive cleanup path
-            cleanup_errors.append(type(exc).__name__)
+            cleanup_errors.append(str(exc))
         try:
             await admin.close()
         except Exception as exc:  # pragma: no cover - defensive cleanup path
