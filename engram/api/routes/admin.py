@@ -18,16 +18,12 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from engram.api_key_issuance import issue_api_key
 from engram.auth import (
     ADMIN_SCOPE,
-    DIGEST_ALGORITHM,
     InternalPrincipalCredentialError,
-    assert_principal_credentialable,
     canonicalize_scopes,
-    digest_api_key_secret,
-    generate_api_key,
     get_current_principal,
-    parse_api_key,
     validate_principal_name,
     validate_principal_type,
 )
@@ -40,8 +36,8 @@ from engram.memory_kinds import (
     NAME_PATTERN,
     invalidate_memory_kind_cache,
 )
-from engram.memory_profiles import ProfileNotFoundError, validate_key_binding
-from engram.models import ApiKey, MemoryKind, Tenant, Workspace
+from engram.memory_profiles import ProfileNotFoundError
+from engram.models import MemoryKind, Tenant, Workspace
 from engram.models import Principal as PrincipalModel
 from engram.promotion import auto_promote_proposed_memories, summarize
 from engram.tenant_initialization import initialize_tenant
@@ -339,58 +335,26 @@ async def create_api_key(
     session: AsyncSession = Depends(get_session),  # noqa: B008
     caller: AuthPrincipal = Depends(get_current_principal),  # noqa: B008
 ) -> ApiKeyOut:
-    # Reject key issuance for internal (non-credentialable) principals
-    # (V2-BL-003B). The validation resolves the principal inside the caller's
-    # tenant context; a cross-tenant internal principal ID is not disclosed.
-    if body.principal_id is not None:
-        try:
-            await assert_principal_credentialable(
-                session,
-                tenant_id=body.tenant_id,
-                principal_id=body.principal_id,
-            )
-        except InternalPrincipalCredentialError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="API keys cannot be issued for this principal",
-            ) from exc
     try:
-        active_profile = await validate_key_binding(session, body.tenant_id, body.memory_profile_id)
+        issued = await issue_api_key(
+            session,
+            tenant_id=body.tenant_id,
+            principal_id=body.principal_id,
+            scopes=body.scopes,
+            label=body.label,
+            memory_profile_id=body.memory_profile_id,
+            profile_event_actor_principal_id=uuid.UUID(caller.principal_id),
+        )
+    except InternalPrincipalCredentialError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="API keys cannot be issued for this principal",
+        ) from exc
     except ProfileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="memory profile not found") from exc
-    plaintext = generate_api_key()
-    parsed = parse_api_key(plaintext)
-    assert parsed.key_id is not None  # new-format keys always carry a key_id
-    api_key = ApiKey(
-        tenant_id=body.tenant_id,
-        principal_id=body.principal_id,
-        memory_profile_id=body.memory_profile_id,
-        key_hash=None,
-        key_id=parsed.key_id,
-        secret_digest=digest_api_key_secret(parsed.secret),
-        digest_algorithm=DIGEST_ALGORITHM,
-        scopes=body.scopes,
-        label=body.label,
-        created_at=datetime.now(UTC),
-    )
-    session.add(api_key)
-    await session.flush()
-    if active_profile is not None:
-        await session.execute(
-            text(
-                "INSERT INTO memory_profile_events "
-                "(tenant_id, profile_id, revision_id, actor_principal_id, event_type, reason, details) "
-                "VALUES (:tenant_id, :profile_id, :revision_id, :actor_principal_id, "
-                "'profile_bound_at_key_issuance', 'API key issuance', "
-                "jsonb_build_object('api_key_id', CAST(:key_id AS text), "
-                "'label', CAST(:label AS text)))"
-            ),
-            {"tenant_id": str(body.tenant_id), "profile_id": str(active_profile.id),
-             "revision_id": str(active_profile.revision_id), "key_id": str(api_key.id),
-             "label": body.label, "actor_principal_id": caller.principal_id},
-        )
     await session.commit()
-    await session.refresh(api_key)
+    api_key = issued.api_key
+    active_profile = issued.active_profile
     return ApiKeyOut(
         id=api_key.id,
         tenant_id=api_key.tenant_id,
@@ -401,7 +365,7 @@ async def create_api_key(
         memory_profile_revision_id=active_profile.revision_id if active_profile else None,
         memory_profile_slug=active_profile.slug if active_profile else None,
         memory_profile_version=active_profile.version if active_profile else None,
-        key=plaintext,
+        key=issued.plaintext,
     )
 
 

@@ -366,9 +366,11 @@ async def record_provisioning_conflict(
 
     The provisioning work is executed in a savepoint. On a deterministic 409,
     that savepoint rolls back every resource mutation; this append-only row is
-    then committed by the surrounding authenticated transaction. It contains
-    only stable codes and SHA-256 external-reference digests.
+    then committed with authenticated credential usage by the surrounding
+    transaction. It contains only stable codes and SHA-256 external-reference
+    digests.
     """
+    credential.last_used_at = datetime.now(UTC)
     session.add(
         ServiceProvisioningEvent(
             service_client_id=identity.id,

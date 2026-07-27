@@ -46,7 +46,7 @@ def _override_normal_ready_session(app) -> None:  # type: ignore[no-untyped-def]
     app.dependency_overrides[get_session] = override_get_session
 
 
-def _install_provisioner(monkeypatch, role: dict[str, object], *, tables: int = 6, function=True):  # type: ignore[no-untyped-def]
+def _install_provisioner(monkeypatch, role: dict[str, object], *, tables: int = 10, function=True):  # type: ignore[no-untyped-def]
     import engram.db as db_module
 
     class ProvisionerSession:
@@ -102,7 +102,7 @@ async def test_ready_rejects_any_invalid_provisioner_posture(monkeypatch, overri
     assert response.json()["provisioning"] == "misconfigured"
 
 
-@pytest.mark.parametrize(("tables", "function"), [(5, True), (6, False)])
+@pytest.mark.parametrize(("tables", "function"), [(9, True), (10, False)])
 async def test_ready_rejects_missing_provisioning_objects(monkeypatch, tables, function):  # type: ignore[no-untyped-def]
     from engram.config import settings
 

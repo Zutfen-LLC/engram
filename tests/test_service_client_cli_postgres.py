@@ -377,6 +377,79 @@ async def test_cli_rejects_invalid_expiry_without_committing_credential_or_event
     )
 
 
+async def test_cli_set_permissions_is_explicit_audited_and_idempotent(
+    owner_cli_db, capsys
+) -> None:  # type: ignore[no-untyped-def]
+    proof = owner_cli_db
+    slug = f"cli-proof-permissions-{proof['tag']}"
+    assert (
+        await _run_service_client(
+            _args(
+                "create",
+                slug=slug,
+                display_name="Permission update",
+                permission=None,
+                json=False,
+            ),
+            proof["url"],
+        )
+        == 0
+    )
+    capsys.readouterr()
+    permissions = [
+        "tenant.provision",
+        "principal.provision",
+        "workspace.provision",
+        "agent.provision",
+        "api_key.provision",
+    ]
+    args = _args(
+        "set-permissions",
+        client=slug,
+        permission=list(reversed(permissions)),
+        json=True,
+    )
+    assert await _run_service_client(args, proof["url"]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["permissions"] == permissions
+    assert output["changed"] is True
+
+    row = await proof["owner"].fetchrow(
+        "SELECT id,permissions FROM service_clients WHERE slug=$1", slug
+    )
+    assert row is not None
+    assert row["permissions"] == permissions
+    events = await proof["owner"].fetch(
+        "SELECT details FROM service_provisioning_events "
+        "WHERE service_client_id=$1 "
+        "AND event_type='service_client.permissions_changed'",
+        row["id"],
+    )
+    assert len(events) == 1
+    assert json.loads(events[0]["details"]) == {
+        "old_permissions": ["tenant.provision", "principal.provision"],
+        "new_permissions": permissions,
+    }
+
+    no_op = _args(
+        "set-permissions",
+        client=slug,
+        permission=permissions,
+        json=False,
+    )
+    assert await _run_service_client(no_op, proof["url"]) == 0
+    assert capsys.readouterr().out == "unchanged\n"
+    assert (
+        await proof["owner"].fetchval(
+            "SELECT count(*) FROM service_provisioning_events "
+            "WHERE service_client_id=$1 "
+            "AND event_type='service_client.permissions_changed'",
+            row["id"],
+        )
+        == 1
+    )
+
+
 async def test_cli_rejects_oversized_rotate_label_without_minting_a_credential(
     owner_cli_db, capsys
 ) -> None:  # type: ignore[no-untyped-def]

@@ -96,6 +96,14 @@ def main() -> None:
     service_client_disable.add_argument("client")
     service_client_enable = service_client_sub.add_parser("enable", help="Enable a client without restoring revoked keys.")
     service_client_enable.add_argument("client")
+    service_client_permissions = service_client_sub.add_parser(
+        "set-permissions", help="Replace a service client's complete permission set."
+    )
+    service_client_permissions.add_argument("client")
+    service_client_permissions.add_argument(
+        "--permission", action="append", required=True
+    )
+    service_client_permissions.add_argument("--json", action="store_true")
     bootstrap_parser.add_argument(
         "--scopes",
         default="read,write,admin,export",
@@ -954,6 +962,8 @@ async def _run_service_client(args: argparse.Namespace, database_url: str) -> in
         elif args.service_client_command == "rotate-key":
             args.label = validate_service_credential_label(args.label)
             args.expires_at = validate_service_credential_expiry(args.expires_at)
+        elif args.service_client_command == "set-permissions":
+            args.permission = canonicalize_service_permissions(args.permission)
     except ValueError:
         print("ERROR: invalid service client input", file=sys.stderr)
         return 1
@@ -1034,6 +1044,44 @@ async def _run_service_client(args: argparse.Namespace, database_url: str) -> in
                     return 0
                 print("ERROR: service credential not found", file=sys.stderr)
                 return 1
+            if command == "set-permissions":
+                row = await conn.fetchrow(
+                    "SELECT id::text AS id, permissions FROM service_clients "
+                    "WHERE id::text = $1 OR slug = $1 FOR UPDATE",
+                    args.client,
+                )
+                if row is None:
+                    print("ERROR: service client not found", file=sys.stderr)
+                    return 1
+                old_permissions = list(row["permissions"])
+                changed = old_permissions != args.permission
+                if changed:
+                    await conn.execute(
+                        "UPDATE service_clients SET permissions=$2, updated_at=now() "
+                        "WHERE id=$1::uuid",
+                        row["id"],
+                        args.permission,
+                    )
+                    await conn.execute(
+                        "INSERT INTO service_provisioning_events "
+                        "(service_client_id,event_type,outcome,request_id,details) "
+                        "VALUES ($1::uuid,'service_client.permissions_changed','success',"
+                        "'operator-cli',jsonb_build_object("
+                        "'old_permissions',$2::text[],'new_permissions',$3::text[]))",
+                        row["id"],
+                        old_permissions,
+                        args.permission,
+                    )
+                payload = {
+                    "id": row["id"],
+                    "permissions": args.permission,
+                    "changed": changed,
+                }
+                if args.json:
+                    print(json.dumps(payload, sort_keys=True))
+                else:
+                    print("updated" if changed else "unchanged")
+                return 0
             target_status = {"disable": "disabled", "enable": "active"}[command]
             row = await conn.fetchrow(
                 "UPDATE service_clients SET status = $2, disabled_at = "

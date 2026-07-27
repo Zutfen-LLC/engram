@@ -23,13 +23,28 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.config import settings
 
-ServicePermission = Literal["tenant.provision", "principal.provision"]
+ServicePermission = Literal[
+    "tenant.provision",
+    "principal.provision",
+    "workspace.provision",
+    "agent.provision",
+    "api_key.provision",
+]
 VALID_SERVICE_PERMISSIONS: frozenset[str] = frozenset(
-    {"tenant.provision", "principal.provision"}
+    {
+        "tenant.provision",
+        "principal.provision",
+        "workspace.provision",
+        "agent.provision",
+        "api_key.provision",
+    }
 )
 CANONICAL_SERVICE_PERMISSION_ORDER: tuple[ServicePermission, ...] = (
     "tenant.provision",
     "principal.provision",
+    "workspace.provision",
+    "agent.provision",
+    "api_key.provision",
 )
 _PREFIX = "engsvc_"
 _KEY_ID_LENGTH = 22
@@ -293,3 +308,5 @@ class ServicePermissionGuard:
 
 
 PROVISION_TENANT_HUMAN = ServicePermissionGuard("tenant.provision", "principal.provision")
+PROVISION_WORKSPACE_AGENT = ServicePermissionGuard("workspace.provision", "agent.provision")
+PROVISION_AGENT_API_KEY = ServicePermissionGuard("api_key.provision")

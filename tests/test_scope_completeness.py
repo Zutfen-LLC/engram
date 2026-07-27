@@ -96,6 +96,12 @@ EXPECTED_MATRIX: dict[tuple[str, str], dict] = {
     ("POST", "/v1/service/provisioning/tenant-human"): {
         "service_permissions": ("tenant.provision", "principal.provision"),
     },
+    ("POST", "/v1/service/provisioning/workspace-agent"): {
+        "service_permissions": ("workspace.provision", "agent.provision"),
+    },
+    ("POST", "/v1/service/provisioning/agent-api-key"): {
+        "service_permissions": ("api_key.provision",),
+    },
 }
 
 
