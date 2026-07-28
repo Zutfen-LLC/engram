@@ -24,7 +24,8 @@ FROM base AS ci-dependencies
 # Resolve third-party dependencies from package metadata before copying source.
 # Minimal package directories let setuptools evaluate each local project without
 # allowing application or test changes to invalidate this expensive layer.
-COPY pyproject.toml README.md LICENSE.md ./
+# uv.lock joins them so this layer also invalidates when dependencies change.
+COPY pyproject.toml README.md LICENSE.md uv.lock ./
 COPY sdk/engram-client/pyproject.toml sdk/engram-client/pyproject.toml
 COPY adapters/mcp-server/pyproject.toml adapters/mcp-server/README.md adapters/mcp-server/
 COPY adapters/engram-hooks/pyproject.toml adapters/engram-hooks/README.md adapters/engram-hooks/
@@ -40,8 +41,30 @@ RUN mkdir -p \
         adapters/mcp-server/engram_mcp/__init__.py \
         adapters/engram-hooks/engram_hooks/__init__.py
 
+# Pin every third-party version that uv.lock resolves, so the image CI tests in
+# matches what `uv sync --extra dev` gives developers locally. Without this the
+# build re-resolves the floating floors in pyproject.toml (fastapi>=0.115,
+# openai>=1.0, ...) on every cache miss, so an upstream release could break CI
+# with no change to this repository.
+#
+# uv.lock is exported as a *constraints* file rather than installed directly:
+# it covers only the root project, while the SDK and adapters still resolve
+# their own dependencies (notably `mcp` and `pyyaml`, which uv.lock does not
+# track) — now bounded by these pins wherever the trees overlap.
+#
+# `uv export --frozen` never rewrites uv.lock and fails if it has drifted from
+# pyproject.toml, so this repeats the lock-drift gate inside the build.
+# uv is pinned to the same version the lock-drift CI job uses.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install \
+    pip install "uv==0.11.29" && \
+    uv export \
+        --frozen \
+        --extra dev \
+        --no-emit-project \
+        --no-hashes \
+        --format requirements-txt \
+        -o /tmp/ci-constraints.txt && \
+    pip install -c /tmp/ci-constraints.txt \
         "setuptools>=68" \
         wheel \
         -e ".[dev]" \
