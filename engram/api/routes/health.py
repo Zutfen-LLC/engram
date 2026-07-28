@@ -166,6 +166,30 @@ async def readiness(
                             status_code=503,
                             content={"status": "not_ready", "provisioning": "misconfigured"},
                         )
+                    if settings.delegation_enabled:
+                        delegation_objects = await provisioner.scalar(
+                            text(
+                                "SELECT "
+                                "to_regclass('service_delegation_grants') IS NOT NULL "
+                                "AND to_regclass('service_delegation_tokens') IS NOT NULL "
+                                "AND to_regclass('service_delegation_idempotency') IS NOT NULL "
+                                "AND to_regclass('service_delegation_events') IS NOT NULL "
+                                "AND to_regprocedure("
+                                "'issue_service_delegation(uuid,text,text,text,text,bytea,"
+                                "bytea,text,text,integer,text)') IS NOT NULL "
+                                "AND to_regprocedure("
+                                "'revoke_service_delegation(uuid,text,text,text,text,text,text)') "
+                                "IS NOT NULL"
+                            )
+                        )
+                        if not delegation_objects:
+                            return JSONResponse(
+                                status_code=503,
+                                content={
+                                    "status": "not_ready",
+                                    "delegation": "misconfigured",
+                                },
+                            )
             except Exception:
                 return JSONResponse(
                     status_code=503,

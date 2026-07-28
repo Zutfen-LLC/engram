@@ -41,3 +41,7 @@ engram service-client set-permissions control-plane \
 The command locks the client row, canonicalizes the replacement set, and
 records one `service_client.permissions_changed` event only when the set
 changes. It does not rotate, revoke, or print credentials.
+
+A delegation broker is a separate client with only `delegation.issue`; do not
+add that permission to the provisioning binding owner. See
+`docs/ops/service-delegation.md`.

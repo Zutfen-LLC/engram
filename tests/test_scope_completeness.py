@@ -102,6 +102,12 @@ EXPECTED_MATRIX: dict[tuple[str, str], dict] = {
     ("POST", "/v1/service/provisioning/agent-api-key"): {
         "service_permissions": ("api_key.provision",),
     },
+    ("POST", "/v1/service/delegations"): {
+        "service_permissions": ("delegation.issue",),
+    },
+    ("POST", "/v1/service/delegations/revoke"): {
+        "service_permissions": ("delegation.issue",),
+    },
 }
 
 

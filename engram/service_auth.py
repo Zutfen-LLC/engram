@@ -29,6 +29,7 @@ ServicePermission = Literal[
     "workspace.provision",
     "agent.provision",
     "api_key.provision",
+    "delegation.issue",
 ]
 VALID_SERVICE_PERMISSIONS: frozenset[str] = frozenset(
     {
@@ -37,6 +38,7 @@ VALID_SERVICE_PERMISSIONS: frozenset[str] = frozenset(
         "workspace.provision",
         "agent.provision",
         "api_key.provision",
+        "delegation.issue",
     }
 )
 CANONICAL_SERVICE_PERMISSION_ORDER: tuple[ServicePermission, ...] = (
@@ -45,6 +47,7 @@ CANONICAL_SERVICE_PERMISSION_ORDER: tuple[ServicePermission, ...] = (
     "workspace.provision",
     "agent.provision",
     "api_key.provision",
+    "delegation.issue",
 )
 _PREFIX = "engsvc_"
 _KEY_ID_LENGTH = 22
@@ -290,8 +293,13 @@ class ServicePermissionGuard:
 
     def __init__(self, *permissions: ServicePermission) -> None:
         canonicalize_service_permissions(list(permissions))
+        description = (
+            "External control-plane delegation."
+            if permissions == ("delegation.issue",)
+            else "External control-plane provisioning."
+        )
         self.policy = ServicePolicy(
-            permissions=tuple(permissions), description="External control-plane provisioning."
+            permissions=tuple(permissions), description=description
         )
 
     async def __call__(
@@ -310,3 +318,4 @@ class ServicePermissionGuard:
 PROVISION_TENANT_HUMAN = ServicePermissionGuard("tenant.provision", "principal.provision")
 PROVISION_WORKSPACE_AGENT = ServicePermissionGuard("workspace.provision", "agent.provision")
 PROVISION_AGENT_API_KEY = ServicePermissionGuard("api_key.provision")
+ISSUE_DELEGATION = ServicePermissionGuard("delegation.issue")

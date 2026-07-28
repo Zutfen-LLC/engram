@@ -84,6 +84,14 @@ It also leaves every existing service-client permission array unchanged. Use
 the owner-only `engram service-client set-permissions` command to grant the new
 `workspace.provision`, `agent.provision`, and `api_key.provision` permissions.
 
+Migration 029 adds `delegation.issue` without granting it to any existing
+client. To enable single-use delegated reads, set
+`ENGRAM_DELEGATION_ENABLED=true`, choose default and maximum TTLs between 30
+and 300 seconds, create a separate broker with only `delegation.issue`, and
+create an owner-controlled grant to the provisioning binding owner. Readiness
+checks the delegation tables and functions only when the feature is enabled.
+See `docs/ops/service-delegation.md` for the runbook and response-loss recovery.
+
 Optionally, `ENGRAM_READ_DATABASE_URL` (ENG-AUD-011) points startup recall's
 bounded candidate selection at a read replica instead of the primary. Unset
 (the default) falls back to `ENGRAM_DATABASE_URL` — there is no bundled

@@ -109,6 +109,9 @@ docker compose exec engram-service engram bootstrap-key
 
 For the full walkthrough — auth enablement, backup/restore, upgrades, embeddings,
 and troubleshooting — see **[`docs/deployment.md`](docs/deployment.md)**.
+External control planes can use the optional, single-use read broker documented
+in **[`docs/ops/service-delegation.md`](docs/ops/service-delegation.md)**; its
+delegated credentials are never browser tokens or ordinary API keys.
 
 See `docs/design.md` for the full architecture.
 

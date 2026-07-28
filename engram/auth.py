@@ -110,6 +110,8 @@ class Principal:
     memory_profile_revision_id: str | None = None
     memory_profile_slug: str | None = None
     memory_profile_version: int | None = None
+    delegated_token_id: str | None = None
+    delegation_grant_id: str | None = None
 
     @property
     def is_internal(self) -> bool:
@@ -577,6 +579,22 @@ async def get_current_principal(
         )
 
     token = credentials.credentials
+
+    # Delegated credentials are an exact, separate grammar. Dispatch before
+    # ordinary API-key parsing so malformed or unknown engd_ material can
+    # never enter the legacy bcrypt fallback.
+    if token.startswith("engd_"):
+        if not settings.delegation_enabled:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or revoked API key",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        from engram.delegation_auth import resolve_delegated_principal
+
+        return await resolve_delegated_principal(
+            token, request_id=request.headers.get("X-Request-ID")
+        )
 
     try:
         parsed = parse_api_key(token)

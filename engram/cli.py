@@ -104,6 +104,47 @@ def main() -> None:
         "--permission", action="append", required=True
     )
     service_client_permissions.add_argument("--json", action="store_true")
+    delegation_grant_parser = sub.add_parser(
+        "delegation-grant",
+        help="Manage owner-controlled service delegation grants (owner DB only).",
+    )
+    delegation_grant_sub = delegation_grant_parser.add_subparsers(
+        dest="delegation_grant_command", required=True
+    )
+    delegation_grant_create = delegation_grant_sub.add_parser("create")
+    delegation_grant_create.add_argument("--issuer", required=True)
+    delegation_grant_create.add_argument("--binding-owner", required=True)
+    delegation_grant_create.add_argument("--max-ttl-seconds", required=True, type=int)
+    delegation_grant_create.add_argument(
+        "--reason",
+        choices=[
+            "operator_action",
+            "security_incident",
+            "policy_changed",
+            "credential_rotation",
+            "client_disabled",
+        ],
+        default="operator_action",
+    )
+    delegation_grant_create.add_argument("--json", action="store_true")
+    delegation_grant_revoke = delegation_grant_sub.add_parser("revoke")
+    delegation_grant_revoke.add_argument("--issuer", required=True)
+    delegation_grant_revoke.add_argument("--binding-owner", required=True)
+    delegation_grant_revoke.add_argument(
+        "--reason",
+        choices=[
+            "operator_action",
+            "security_incident",
+            "policy_changed",
+            "credential_rotation",
+            "client_disabled",
+        ],
+        required=True,
+    )
+    delegation_grant_revoke.add_argument("--json", action="store_true")
+    delegation_grant_list = delegation_grant_sub.add_parser("list")
+    delegation_grant_list.add_argument("--issuer", default=None)
+    delegation_grant_list.add_argument("--json", action="store_true")
     bootstrap_parser.add_argument(
         "--scopes",
         default="read,write,admin,export",
@@ -439,6 +480,16 @@ def main() -> None:
             )
             raise SystemExit(2)
         raise SystemExit(asyncio.run(_run_service_client(args, settings.owner_database_url)))
+    elif args.command == "delegation-grant":
+        from engram.config import settings
+
+        if not settings.owner_database_url:
+            print(
+                "ERROR: ENGRAM_OWNER_DATABASE_URL is required for delegation-grant management.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        raise SystemExit(asyncio.run(_run_delegation_grant(args, settings.owner_database_url)))
     elif args.command == "promote-proposed":
         raise SystemExit(asyncio.run(_run_promotion(args.tenant, args.limit, dry_run=args.dry_run)))
     elif args.command == "backfill-embeddings":
@@ -1109,6 +1160,209 @@ async def _run_service_client(args: argparse.Namespace, database_url: str) -> in
             return 1
     except (ValueError, asyncpg.PostgresError):
         print("ERROR: service client operation failed", file=sys.stderr)
+        return 1
+    finally:
+        if conn is not None:
+            await conn.close()
+
+
+async def _run_delegation_grant(args: argparse.Namespace, database_url: str) -> int:
+    """Owner-only grant management; never creates or prints credentials."""
+    import json
+
+    import asyncpg
+
+    from engram.migrations import normalize_asyncpg_url
+    from engram.service_auth import validate_service_client_slug
+
+    try:
+        issuer_slug = (
+            validate_service_client_slug(args.issuer)
+            if args.issuer is not None
+            else None
+        )
+        owner_slug = (
+            validate_service_client_slug(args.binding_owner)
+            if hasattr(args, "binding_owner")
+            else None
+        )
+        if (
+            args.delegation_grant_command == "create"
+            and not 30 <= args.max_ttl_seconds <= 300
+        ):
+            raise ValueError("invalid TTL")
+        if issuer_slug is not None and owner_slug is not None and issuer_slug == owner_slug:
+            raise ValueError("issuer and binding owner must differ")
+    except ValueError:
+        print("ERROR: invalid delegation grant input", file=sys.stderr)
+        return 1
+
+    conn: asyncpg.Connection | None = None
+    try:
+        conn = await asyncpg.connect(normalize_asyncpg_url(database_url))
+        command = args.delegation_grant_command
+        if command == "list":
+            rows = await conn.fetch(
+                "SELECT grant_row.id::text AS id,issuer.slug AS issuer_slug,"
+                "owner_client.slug AS binding_owner_slug,grant_row.status,"
+                "grant_row.max_ttl_seconds,grant_row.created_at,grant_row.updated_at,"
+                "grant_row.revoked_at FROM service_delegation_grants grant_row "
+                "JOIN service_clients issuer "
+                "ON issuer.id=grant_row.issuer_service_client_id "
+                "JOIN service_clients owner_client "
+                "ON owner_client.id=grant_row.binding_owner_service_client_id "
+                "WHERE ($1::text IS NULL OR issuer.slug=$1) "
+                "ORDER BY grant_row.created_at,grant_row.id",
+                issuer_slug,
+            )
+            list_payload = [dict(row) for row in rows]
+            if args.json:
+                print(json.dumps(list_payload, default=str, sort_keys=True))
+            else:
+                for row in list_payload:
+                    print(
+                        f"{row['id']} issuer={row['issuer_slug']} "
+                        f"binding_owner={row['binding_owner_slug']} "
+                        f"status={row['status']} max_ttl_seconds={row['max_ttl_seconds']}"
+                    )
+            return 0
+
+        async with conn.transaction():
+            clients = await conn.fetch(
+                "SELECT id::text AS id,slug,status,permissions FROM service_clients "
+                "WHERE slug=ANY($1::text[]) ORDER BY id FOR UPDATE",
+                [issuer_slug, owner_slug],
+            )
+            by_slug = {row["slug"]: row for row in clients}
+            if issuer_slug not in by_slug or owner_slug not in by_slug:
+                print("ERROR: service client not found", file=sys.stderr)
+                return 1
+            issuer = by_slug[issuer_slug]
+            owner = by_slug[owner_slug]
+            if (
+                issuer["status"] != "active"
+                or owner["status"] != "active"
+                or "delegation.issue" not in issuer["permissions"]
+            ):
+                print("ERROR: delegation grant authority is invalid", file=sys.stderr)
+                return 1
+
+            active = await conn.fetchrow(
+                "SELECT id::text AS id,max_ttl_seconds,status,created_at,updated_at,"
+                "revoked_at FROM service_delegation_grants "
+                "WHERE issuer_service_client_id=$1::uuid "
+                "AND binding_owner_service_client_id=$2::uuid AND status='active' "
+                "FOR UPDATE",
+                issuer["id"],
+                owner["id"],
+            )
+            if command == "create":
+                if active is not None and active["max_ttl_seconds"] != args.max_ttl_seconds:
+                    print(
+                        "ERROR: active grant TTL differs; revoke it before creating a new grant",
+                        file=sys.stderr,
+                    )
+                    return 1
+                created = active is None
+                row = active
+                if row is None:
+                    row = await conn.fetchrow(
+                        "INSERT INTO service_delegation_grants "
+                        "(issuer_service_client_id,binding_owner_service_client_id,"
+                        "max_ttl_seconds) VALUES ($1::uuid,$2::uuid,$3) "
+                        "RETURNING id::text AS id,max_ttl_seconds,status,created_at,"
+                        "updated_at,revoked_at",
+                        issuer["id"],
+                        owner["id"],
+                        args.max_ttl_seconds,
+                    )
+                    await conn.execute(
+                        "INSERT INTO service_delegation_events "
+                        "(event_type,outcome,issuer_service_client_id,"
+                        "binding_owner_service_client_id,grant_id,request_id,"
+                        "reason_code,details) VALUES "
+                        "('delegation_grant.created','success',$1::uuid,$2::uuid,"
+                        "$3::uuid,'operator-cli',$4,"
+                        "jsonb_build_object("
+                        "'ttl_seconds',$5::integer,'disposition','created'))",
+                        issuer["id"],
+                        owner["id"],
+                        row["id"],
+                        args.reason,
+                        args.max_ttl_seconds,
+                    )
+                result_payload: dict[str, Any] = {
+                    "id": row["id"],
+                    "issuer_slug": issuer_slug,
+                    "binding_owner_slug": owner_slug,
+                    "status": row["status"],
+                    "max_ttl_seconds": row["max_ttl_seconds"],
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                    "revoked_at": row["revoked_at"],
+                    "created": created,
+                }
+            else:
+                if active is None:
+                    row = await conn.fetchrow(
+                        "SELECT id::text AS id,max_ttl_seconds,status,created_at,"
+                        "updated_at,revoked_at FROM service_delegation_grants "
+                        "WHERE issuer_service_client_id=$1::uuid "
+                        "AND binding_owner_service_client_id=$2::uuid "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        issuer["id"],
+                        owner["id"],
+                    )
+                    if row is None:
+                        print("ERROR: delegation grant not found", file=sys.stderr)
+                        return 1
+                    revoked = False
+                else:
+                    row = await conn.fetchrow(
+                        "UPDATE service_delegation_grants SET status='revoked',"
+                        "revoked_at=now(),updated_at=now(),revocation_reason=$2 "
+                        "WHERE id=$1::uuid RETURNING id::text AS id,max_ttl_seconds,"
+                        "status,created_at,updated_at,revoked_at",
+                        active["id"],
+                        args.reason,
+                    )
+                    revoked = True
+                    await conn.execute(
+                        "INSERT INTO service_delegation_events "
+                        "(event_type,outcome,issuer_service_client_id,"
+                        "binding_owner_service_client_id,grant_id,request_id,"
+                        "reason_code,details) VALUES "
+                        "('delegation_grant.revoked','success',$1::uuid,$2::uuid,"
+                        "$3::uuid,'operator-cli',$4,"
+                        "jsonb_build_object('disposition','revoked'))",
+                        issuer["id"],
+                        owner["id"],
+                        row["id"],
+                        args.reason,
+                    )
+                result_payload = {
+                    "id": row["id"],
+                    "issuer_slug": issuer_slug,
+                    "binding_owner_slug": owner_slug,
+                    "status": row["status"],
+                    "max_ttl_seconds": row["max_ttl_seconds"],
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                    "revoked_at": row["revoked_at"],
+                    "revoked": revoked,
+                }
+            if args.json:
+                print(json.dumps(result_payload, default=str, sort_keys=True))
+            else:
+                if result_payload.get("created"):
+                    print("created")
+                elif result_payload.get("revoked"):
+                    print("revoked")
+                else:
+                    print("unchanged")
+            return 0
+    except (ValueError, asyncpg.PostgresError):
+        print("ERROR: delegation grant operation failed", file=sys.stderr)
         return 1
     finally:
         if conn is not None:

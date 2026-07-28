@@ -178,6 +178,9 @@ def main() -> int:
     # derived from the pinned stock-Hermes revision.
     _run("pytest", "-q", *_pytest_flags("engram-hooks"), "adapters/engram-hooks/tests")
 
+    _section("Credential Leak Scan")
+    _run("python", "scripts/scan_credential_leaks.py")
+
     _section("CI Result")
     print("All Compose-backed CI checks passed.", flush=True)
     return 0
