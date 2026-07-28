@@ -25,11 +25,21 @@ DROP FUNCTION revoke_service_delegation(
 DROP FUNCTION issue_service_delegation(
     UUID, TEXT, TEXT, TEXT, TEXT, BYTEA, BYTEA, TEXT, TEXT, INTEGER, TEXT
 );
+DROP TRIGGER trg_service_delegation_invalidate_principal ON principals;
+DROP TRIGGER trg_service_delegation_invalidate_credential
+    ON service_client_credentials;
+DROP TRIGGER trg_service_delegation_invalidate_client ON service_clients;
+DROP FUNCTION invalidate_service_delegations_for_principal();
+DROP FUNCTION invalidate_service_delegations_for_credential();
+DROP FUNCTION invalidate_service_delegations_for_client();
 DROP TABLE service_delegation_events;
 DROP FUNCTION reject_service_delegation_event_mutation();
 DROP TABLE service_delegation_idempotency;
+DROP TRIGGER trg_service_delegation_invalidate_grant
+    ON service_delegation_grants;
 DROP TABLE service_delegation_tokens;
 DROP FUNCTION validate_service_delegation_token_subject();
+DROP FUNCTION invalidate_service_delegations_for_grant();
 DROP TABLE service_delegation_grants;
 DROP FUNCTION enforce_service_delegation_grant_history();
 

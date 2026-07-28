@@ -969,13 +969,235 @@ async def test_authority_invalidation_denies_unused_token(
             material.token, request_id=f"invalidation-{invalidation}"
         )
     assert exc.value.status_code == 401
-    if invalidation == "token_expired":
-        row = await owner.fetchrow(
-            "SELECT status,revocation_reason FROM service_delegation_tokens WHERE id=$1",
-            issued["delegation_token_id"],
+    row = await owner.fetchrow(
+        "SELECT status,revocation_reason FROM service_delegation_tokens WHERE id=$1",
+        issued["delegation_token_id"],
+    )
+    assert row is not None
+    expected_reason = "expired" if invalidation == "token_expired" else "authority_invalidated"
+    assert tuple(row.values()) == ("revoked", expected_reason)
+
+
+@pytest.mark.parametrize(
+    "authority",
+    [
+        "issuer_status",
+        "issuer_permission",
+        "binding_owner_status",
+        "credential_status",
+        "principal_subject",
+    ],
+)
+async def test_authority_loss_restore_cycle_permanently_revokes_unused_token(
+    delegation_db, authority: str  # type: ignore[no-untyped-def]
+) -> None:
+    proof = delegation_db
+    material, issued = await _issue(
+        proof,
+        external_ref=f"authority-cycle-{authority}-{uuid.uuid4().hex}",
+        idempotency_digest=os.urandom(32),
+        request_digest=os.urandom(32),
+    )
+    owner = proof["owner"]
+
+    if authority == "issuer_status":
+        await owner.execute(
+            "UPDATE service_clients SET status='disabled',disabled_at=now() WHERE id=$1",
+            proof["broker_id"],
         )
-        assert row is not None
-        assert tuple(row.values()) == ("revoked", "expired")
+        await owner.execute(
+            "UPDATE service_clients SET status='active',disabled_at=NULL WHERE id=$1",
+            proof["broker_id"],
+        )
+    elif authority == "issuer_permission":
+        await owner.execute(
+            "UPDATE service_clients SET permissions=$2 WHERE id=$1",
+            proof["broker_id"],
+            ["tenant.provision"],
+        )
+        await owner.execute(
+            "UPDATE service_clients SET permissions=$2 WHERE id=$1",
+            proof["broker_id"],
+            ["delegation.issue"],
+        )
+    elif authority == "binding_owner_status":
+        await owner.execute(
+            "UPDATE service_clients SET status='disabled',disabled_at=now() WHERE id=$1",
+            proof["binding_owner_id"],
+        )
+        await owner.execute(
+            "UPDATE service_clients SET status='active',disabled_at=NULL WHERE id=$1",
+            proof["binding_owner_id"],
+        )
+    elif authority == "credential_status":
+        await owner.execute(
+            "UPDATE service_client_credentials SET status='revoked',revoked_at=now() "
+            "WHERE id=$1",
+            proof["broker_credential_id"],
+        )
+        await owner.execute(
+            "UPDATE service_client_credentials SET status='active',revoked_at=NULL "
+            "WHERE id=$1",
+            proof["broker_credential_id"],
+        )
+    else:
+        await owner.execute(
+            "UPDATE principals SET type='admin' WHERE id=$1",
+            proof["principal_id"],
+        )
+        await owner.execute(
+            "UPDATE principals SET type='user' WHERE id=$1",
+            proof["principal_id"],
+        )
+
+    token_state = await owner.fetchrow(
+        "SELECT status,revocation_reason FROM service_delegation_tokens WHERE id=$1",
+        issued["delegation_token_id"],
+    )
+    assert token_state is not None
+    assert tuple(token_state.values()) == ("revoked", "authority_invalidated")
+    assert await owner.fetchval(
+        "SELECT count(*) FROM service_delegation_events "
+        "WHERE delegation_token_id=$1 AND event_type='delegation.denied' "
+        "AND request_id='authority-invalidation' "
+        "AND reason_code='authority_invalidated'",
+        issued["delegation_token_id"],
+    ) == 1
+
+    with pytest.raises(HTTPException) as exc:
+        await resolve_delegated_principal(
+            material.token, request_id=f"authority-cycle-use-{authority}"
+        )
+    assert exc.value.status_code == 401
+
+
+async def test_elapsed_credential_authority_loss_before_first_use_is_terminal(
+    delegation_db,  # type: ignore[no-untyped-def]
+) -> None:
+    proof = delegation_db
+    material, issued = await _issue(
+        proof,
+        external_ref=f"elapsed-authority-{uuid.uuid4().hex}",
+        idempotency_digest=os.urandom(32),
+        request_digest=os.urandom(32),
+    )
+    owner = proof["owner"]
+    await owner.execute(
+        "UPDATE service_client_credentials "
+        "SET expires_at=clock_timestamp()+interval '200 milliseconds' WHERE id=$1",
+        proof["broker_credential_id"],
+    )
+    assert await owner.fetchval(
+        "SELECT status FROM service_delegation_tokens WHERE id=$1",
+        issued["delegation_token_id"],
+    ) == "active"
+
+    await asyncio.sleep(0.35)
+    await owner.execute(
+        "UPDATE service_client_credentials SET expires_at=NULL WHERE id=$1",
+        proof["broker_credential_id"],
+    )
+    token_state = await owner.fetchrow(
+        "SELECT status,revocation_reason FROM service_delegation_tokens WHERE id=$1",
+        issued["delegation_token_id"],
+    )
+    assert token_state is not None
+    assert tuple(token_state.values()) == ("revoked", "authority_invalidated")
+
+    with pytest.raises(HTTPException) as exc:
+        await resolve_delegated_principal(
+            material.token, request_id="elapsed-authority-restored"
+        )
+    assert exc.value.status_code == 401
+
+
+async def test_use_that_observes_elapsed_authority_loss_revokes_atomically(
+    delegation_db,  # type: ignore[no-untyped-def]
+) -> None:
+    proof = delegation_db
+    material, issued = await _issue(
+        proof,
+        external_ref=f"observed-elapsed-authority-{uuid.uuid4().hex}",
+        idempotency_digest=os.urandom(32),
+        request_digest=os.urandom(32),
+    )
+    owner = proof["owner"]
+    await owner.execute(
+        "UPDATE service_client_credentials "
+        "SET expires_at=clock_timestamp()+interval '200 milliseconds' WHERE id=$1",
+        proof["broker_credential_id"],
+    )
+    assert await owner.fetchval(
+        "SELECT status FROM service_delegation_tokens WHERE id=$1",
+        issued["delegation_token_id"],
+    ) == "active"
+
+    await asyncio.sleep(0.35)
+    with pytest.raises(HTTPException) as exc:
+        await resolve_delegated_principal(
+            material.token, request_id="observed-elapsed-authority"
+        )
+    assert exc.value.status_code == 401
+    token_state = await owner.fetchrow(
+        "SELECT status,revocation_reason FROM service_delegation_tokens WHERE id=$1",
+        issued["delegation_token_id"],
+    )
+    assert token_state is not None
+    assert tuple(token_state.values()) == ("revoked", "authority_invalidated")
+    assert await owner.fetchval(
+        "SELECT count(*) FROM service_delegation_events "
+        "WHERE delegation_token_id=$1 AND request_id='observed-elapsed-authority' "
+        "AND event_type='delegation.denied' AND reason_code='authority_invalid'",
+        issued["delegation_token_id"],
+    ) == 1
+
+
+async def test_explicit_revoke_succeeds_while_subject_is_invalid(
+    delegation_db,  # type: ignore[no-untyped-def]
+) -> None:
+    proof = delegation_db
+    external_ref = f"invalid-subject-revoke-{uuid.uuid4().hex}"
+    _material, issued = await _issue(
+        proof,
+        external_ref=external_ref,
+        idempotency_digest=os.urandom(32),
+        request_digest=os.urandom(32),
+    )
+    await proof["owner"].execute(
+        "UPDATE principals SET type='admin' WHERE id=$1",
+        proof["principal_id"],
+    )
+
+    async with proof["provisioner"].transaction():
+        await proof["provisioner"].execute(
+            "SELECT set_config('app.service_client_id',$1,true)",
+            str(proof["broker_id"]),
+        )
+        revoked = await proof["provisioner"].fetchrow(
+            "SELECT * FROM revoke_service_delegation($1,$2,$3,$4,$5,$6,$7)",
+            proof["broker_credential_id"],
+            proof["owner_slug"],
+            proof["tenant_ref"],
+            proof["principal_ref"],
+            external_ref,
+            "operator_action",
+            f"invalid-subject-revoke-{uuid.uuid4().hex}",
+        )
+    assert revoked is not None
+    assert dict(revoked) == {
+        "disposition": "already_revoked",
+        "revoked": False,
+        "error_code": None,
+    }
+    assert await proof["owner"].fetchval(
+        "SELECT revocation_reason FROM service_delegation_tokens WHERE id=$1",
+        issued["delegation_token_id"],
+    ) == "authority_invalidated"
+
+    await proof["owner"].execute(
+        "UPDATE principals SET type='user' WHERE id=$1",
+        proof["principal_id"],
+    )
 
 
 async def test_authority_separation_human_subject_and_binding_integrity(
@@ -1326,6 +1548,10 @@ async def test_provisioner_has_function_execute_but_no_delegation_table_dml(
         "ORDER BY proname",
         [
             "enforce_service_delegation_grant_history",
+            "invalidate_service_delegations_for_client",
+            "invalidate_service_delegations_for_credential",
+            "invalidate_service_delegations_for_grant",
+            "invalidate_service_delegations_for_principal",
             "issue_service_delegation",
             "reject_service_delegation_event_mutation",
             "revoke_service_delegation",
@@ -1334,6 +1560,10 @@ async def test_provisioner_has_function_execute_but_no_delegation_table_dml(
     )
     assert [tuple(row.values()) for row in function_acl] == [
         ("enforce_service_delegation_grant_history", False, False),
+        ("invalidate_service_delegations_for_client", False, False),
+        ("invalidate_service_delegations_for_credential", False, False),
+        ("invalidate_service_delegations_for_grant", False, False),
+        ("invalidate_service_delegations_for_principal", False, False),
         ("issue_service_delegation", False, True),
         ("reject_service_delegation_event_mutation", False, False),
         ("revoke_service_delegation", False, True),

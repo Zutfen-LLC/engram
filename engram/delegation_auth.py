@@ -31,7 +31,7 @@ DELEGATION_MAX_TTL_SECONDS = 300
 _KEY_ID_LENGTH = 22
 _SECRET_LENGTH = 43
 _BASE62 = string.digits + string.ascii_lowercase + string.ascii_uppercase
-_TOKEN_RE = re.compile(r"^engd_([0-9A-Za-z]{22})\*([A-Za-z0-9_-]{43})$")
+_TOKEN_RE = re.compile(r"^engd_([0-9A-Za-z]{22})_([A-Za-z0-9_-]{43})$")
 _VISIBLE_ASCII = re.compile(r"^[\x21-\x7e]{1,255}$")
 _IDEMPOTENCY = re.compile(r"^[\x21-\x7e]{1,128}$")
 _REQUEST_ID = re.compile(r"^[\x21-\x7e]{1,128}$")
@@ -63,7 +63,7 @@ def _random_base62(length: int) -> str:
 def generate_delegation_token() -> DelegationTokenMaterial:
     key_id = _random_base62(_KEY_ID_LENGTH)
     secret = secrets.token_urlsafe(32)
-    token = f"{DELEGATION_PREFIX}{key_id}*{secret}"
+    token = f"{DELEGATION_PREFIX}{key_id}_{secret}"
     return DelegationTokenMaterial(
         token=token,
         key_id=key_id,
@@ -309,6 +309,14 @@ async def resolve_delegated_principal(token: str, *, request_id: str | None) -> 
                     and token_row.audience == DELEGATION_AUDIENCE
                 )
                 if not valid:
+                    await session.execute(
+                        text(
+                            "UPDATE service_delegation_tokens SET status='revoked',"
+                            "revoked_at=now(),revocation_reason='authority_invalidated' "
+                            "WHERE id=:id AND status='active'"
+                        ),
+                        {"id": token_row.id},
+                    )
                     await _append_denial(
                         session,
                         token_row,

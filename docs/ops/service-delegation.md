@@ -13,7 +13,8 @@ Core has three deliberately separate bearer grammars:
   or delegation routes.
 - `engd_` is an opaque, database-backed, single-use delegated credential. It
   authenticates as one existing bound `type=user` principal with scope exactly
-  `read` and audience `engram-core`.
+  `read` and audience `engram-core`. Its exact Bearer-compatible grammar is
+  `engd_<22-character-base62-key-id>_<43-character-URL-safe-secret>`.
 
 An `engd_` credential is never a service credential or ordinary API key.
 Service routes accept only strict `engsvc_` credentials. Delegated material is
@@ -111,6 +112,13 @@ An unused token fails authentication after any of these events:
 - removal of `delegation.issue`;
 - delegation-grant revocation;
 - binding or human-principal integrity failure.
+
+Authority loss is terminal for every token that was active at the time. Database
+triggers revoke affected tokens during explicit permission, client, credential,
+grant, or subject-authority changes, so restoring the prior state does not
+restore a token. If authentication itself first discovers invalid authority
+(for example, a credential expires by passage of time), that same transaction
+marks the token revoked before returning `401`. A fresh token is always required.
 
 All caller responses remain generic. Append-only events contain bounded reason
 codes and SHA-256 external-reference digests, never raw references, raw

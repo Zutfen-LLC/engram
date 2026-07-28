@@ -209,6 +209,7 @@ CREATE TABLE service_delegation_tokens (
                     'entitlement_changed',
                     'operator_action',
                     'credential_rotation',
+                    'authority_invalidated',
                     'expired'
                 )
             )
@@ -328,8 +329,224 @@ CREATE TRIGGER trg_service_delegation_events_append_only
     FOR EACH ROW EXECUTE FUNCTION reject_service_delegation_event_mutation();
 REVOKE ALL ON FUNCTION reject_service_delegation_event_mutation() FROM PUBLIC;
 
+CREATE FUNCTION invalidate_service_delegations_for_client() RETURNS TRIGGER AS $$
+DECLARE
+    v_token RECORD;
+    v_now TIMESTAMPTZ := clock_timestamp();
+    v_issuer_authority_changed BOOLEAN;
+    v_owner_authority_changed BOOLEAN;
+BEGIN
+    v_issuer_authority_changed :=
+        (
+            OLD.status = 'active'
+            AND 'delegation.issue' = ANY(OLD.permissions)
+        ) IS DISTINCT FROM (
+            NEW.status = 'active'
+            AND 'delegation.issue' = ANY(NEW.permissions)
+        );
+    v_owner_authority_changed :=
+        (OLD.status = 'active') IS DISTINCT FROM (NEW.status = 'active');
+
+    FOR v_token IN
+        UPDATE service_delegation_tokens
+        SET status = 'revoked',
+            revoked_at = v_now,
+            revocation_reason = 'authority_invalidated'
+        WHERE status = 'active'
+          AND (
+              (
+                  issuer_service_client_id = NEW.id
+                  AND v_issuer_authority_changed
+              )
+              OR (
+                  binding_owner_service_client_id = NEW.id
+                  AND v_owner_authority_changed
+              )
+          )
+        RETURNING *
+    LOOP
+        INSERT INTO service_delegation_events (
+            event_type, outcome, issuer_service_client_id,
+            issuer_credential_id, binding_owner_service_client_id,
+            grant_id, delegation_token_id, tenant_id, principal_id,
+            request_id, reason_code, details
+        ) VALUES (
+            'delegation.denied', 'failure',
+            v_token.issuer_service_client_id, v_token.issuer_credential_id,
+            v_token.binding_owner_service_client_id, v_token.grant_id,
+            v_token.id, v_token.tenant_id, v_token.principal_id,
+            'authority-invalidation', 'authority_invalidated',
+            '{"disposition":"denied"}'::jsonb
+        );
+    END LOOP;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
+CREATE TRIGGER trg_service_delegation_invalidate_client
+    AFTER UPDATE OF status, permissions ON service_clients
+    FOR EACH ROW EXECUTE FUNCTION invalidate_service_delegations_for_client();
+REVOKE ALL ON FUNCTION invalidate_service_delegations_for_client() FROM PUBLIC;
+
+CREATE FUNCTION invalidate_service_delegations_for_credential() RETURNS TRIGGER AS $$
+DECLARE
+    v_token RECORD;
+    v_now TIMESTAMPTZ := clock_timestamp();
+    v_authority_changed BOOLEAN;
+BEGIN
+    v_authority_changed :=
+        (
+            OLD.status = 'active'
+            AND (OLD.expires_at IS NULL OR OLD.expires_at > v_now)
+        ) IS DISTINCT FROM (
+            NEW.status = 'active'
+            AND (NEW.expires_at IS NULL OR NEW.expires_at > v_now)
+        )
+        OR OLD.service_client_id IS DISTINCT FROM NEW.service_client_id;
+
+    IF v_authority_changed THEN
+        FOR v_token IN
+            UPDATE service_delegation_tokens
+            SET status = 'revoked',
+                revoked_at = v_now,
+                revocation_reason = 'authority_invalidated'
+            WHERE status = 'active'
+              AND issuer_credential_id = NEW.id
+            RETURNING *
+        LOOP
+            INSERT INTO service_delegation_events (
+                event_type, outcome, issuer_service_client_id,
+                issuer_credential_id, binding_owner_service_client_id,
+                grant_id, delegation_token_id, tenant_id, principal_id,
+                request_id, reason_code, details
+            ) VALUES (
+                'delegation.denied', 'failure',
+                v_token.issuer_service_client_id, v_token.issuer_credential_id,
+                v_token.binding_owner_service_client_id, v_token.grant_id,
+                v_token.id, v_token.tenant_id, v_token.principal_id,
+                'authority-invalidation', 'authority_invalidated',
+                '{"disposition":"denied"}'::jsonb
+            );
+        END LOOP;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
+CREATE TRIGGER trg_service_delegation_invalidate_credential
+    AFTER UPDATE OF service_client_id, status, expires_at
+    ON service_client_credentials
+    FOR EACH ROW EXECUTE FUNCTION invalidate_service_delegations_for_credential();
+REVOKE ALL ON FUNCTION invalidate_service_delegations_for_credential() FROM PUBLIC;
+
+CREATE FUNCTION invalidate_service_delegations_for_grant() RETURNS TRIGGER AS $$
+DECLARE
+    v_token RECORD;
+    v_now TIMESTAMPTZ := clock_timestamp();
+BEGIN
+    IF OLD.status IS DISTINCT FROM NEW.status
+       OR OLD.issuer_service_client_id IS DISTINCT FROM NEW.issuer_service_client_id
+       OR OLD.binding_owner_service_client_id
+          IS DISTINCT FROM NEW.binding_owner_service_client_id
+    THEN
+        FOR v_token IN
+            UPDATE service_delegation_tokens
+            SET status = 'revoked',
+                revoked_at = v_now,
+                revocation_reason = 'authority_invalidated'
+            WHERE status = 'active'
+              AND grant_id = NEW.id
+            RETURNING *
+        LOOP
+            INSERT INTO service_delegation_events (
+                event_type, outcome, issuer_service_client_id,
+                issuer_credential_id, binding_owner_service_client_id,
+                grant_id, delegation_token_id, tenant_id, principal_id,
+                request_id, reason_code, details
+            ) VALUES (
+                'delegation.denied', 'failure',
+                v_token.issuer_service_client_id, v_token.issuer_credential_id,
+                v_token.binding_owner_service_client_id, v_token.grant_id,
+                v_token.id, v_token.tenant_id, v_token.principal_id,
+                'authority-invalidation', 'authority_invalidated',
+                '{"disposition":"denied"}'::jsonb
+            );
+        END LOOP;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
+CREATE TRIGGER trg_service_delegation_invalidate_grant
+    AFTER UPDATE OF issuer_service_client_id, binding_owner_service_client_id, status
+    ON service_delegation_grants
+    FOR EACH ROW EXECUTE FUNCTION invalidate_service_delegations_for_grant();
+REVOKE ALL ON FUNCTION invalidate_service_delegations_for_grant() FROM PUBLIC;
+
+CREATE FUNCTION invalidate_service_delegations_for_principal() RETURNS TRIGGER AS $$
+DECLARE
+    v_token RECORD;
+    v_now TIMESTAMPTZ := clock_timestamp();
+BEGIN
+    IF (OLD.type = 'user' AND OLD.internal_key IS NULL)
+       IS DISTINCT FROM (NEW.type = 'user' AND NEW.internal_key IS NULL)
+    THEN
+        FOR v_token IN
+            UPDATE service_delegation_tokens
+            SET status = 'revoked',
+                revoked_at = v_now,
+                revocation_reason = 'authority_invalidated'
+            WHERE status = 'active'
+              AND principal_id = NEW.id
+            RETURNING *
+        LOOP
+            INSERT INTO service_delegation_events (
+                event_type, outcome, issuer_service_client_id,
+                issuer_credential_id, binding_owner_service_client_id,
+                grant_id, delegation_token_id, tenant_id, principal_id,
+                request_id, reason_code, details
+            ) VALUES (
+                'delegation.denied', 'failure',
+                v_token.issuer_service_client_id, v_token.issuer_credential_id,
+                v_token.binding_owner_service_client_id, v_token.grant_id,
+                v_token.id, v_token.tenant_id, v_token.principal_id,
+                'authority-invalidation', 'authority_invalidated',
+                '{"disposition":"denied"}'::jsonb
+            );
+        END LOOP;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
+CREATE TRIGGER trg_service_delegation_invalidate_principal
+    AFTER UPDATE OF type, internal_key ON principals
+    FOR EACH ROW EXECUTE FUNCTION invalidate_service_delegations_for_principal();
+REVOKE ALL ON FUNCTION invalidate_service_delegations_for_principal() FROM PUBLIC;
+
 CREATE FUNCTION validate_service_delegation_token_subject() RETURNS TRIGGER AS $$
 BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        IF ROW(
+               OLD.grant_id,
+               OLD.issuer_service_client_id,
+               OLD.issuer_credential_id,
+               OLD.binding_owner_service_client_id,
+               OLD.tenant_binding_id,
+               OLD.principal_binding_id,
+               OLD.tenant_id,
+               OLD.principal_id
+           ) IS NOT DISTINCT FROM ROW(
+               NEW.grant_id,
+               NEW.issuer_service_client_id,
+               NEW.issuer_credential_id,
+               NEW.binding_owner_service_client_id,
+               NEW.tenant_binding_id,
+               NEW.principal_binding_id,
+               NEW.tenant_id,
+               NEW.principal_id
+           )
+        THEN
+            RETURN NEW;
+        END IF;
+    END IF;
+
     IF NOT EXISTS (
         SELECT 1
         FROM principals AS principal
@@ -343,6 +560,13 @@ BEGIN
           AND binding.id = NEW.principal_binding_id
           AND binding.service_client_id = NEW.binding_owner_service_client_id
           AND binding.tenant_binding_id = NEW.tenant_binding_id
+          AND EXISTS (
+              SELECT 1
+              FROM service_client_credentials AS credential
+              WHERE credential.id = NEW.issuer_credential_id
+                AND credential.service_client_id =
+                    NEW.issuer_service_client_id
+          )
     ) THEN
         RAISE EXCEPTION 'delegation subject integrity violation'
             USING ERRCODE = '23514';

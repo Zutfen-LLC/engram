@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 
 import pytest
@@ -34,14 +35,22 @@ def test_delegation_token_grammar_digest_and_secret_safe_repr() -> None:
     assert material.secret_digest not in repr(material)
 
 
+def test_every_generated_delegation_credential_is_valid_bearer_material() -> None:
+    bearer_token = re.compile(r"^[A-Za-z0-9\-._~+/]+={0,}$")
+    for _ in range(100):
+        material = generate_delegation_token()
+        assert bearer_token.fullmatch(material.token)
+        assert "*" not in material.token
+
+
 @pytest.mark.parametrize(
     "token",
     [
         "engd_",
-        "engd_" + "a" * 22 + "_" + "b" * 43,
+        "engd_" + "a" * 22 + "*" + "b" * 43,
         "engd_" + "é" * 22 + "*" + "b" * 43,
-        "engd_" + "a" * 22 + "*" + "b" * 42,
-        "eng_" + "a" * 22 + "*" + "b" * 43,
+        "engd_" + "a" * 22 + "_" + "b" * 42,
+        "eng_" + "a" * 22 + "_" + "b" * 43,
     ],
 )
 def test_delegation_token_parser_is_strict(token: str) -> None:
