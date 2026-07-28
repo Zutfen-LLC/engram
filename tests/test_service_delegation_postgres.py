@@ -1179,6 +1179,83 @@ async def test_explicit_revoke_and_permission_removal_invalidate(
     assert exc.value.status_code == 401
 
 
+async def test_revoke_returns_every_truthful_idempotent_disposition(
+    delegation_db,  # type: ignore[no-untyped-def]
+) -> None:
+    proof = delegation_db
+
+    async def revoke(external_ref: str, request_id: str) -> Any:
+        async with proof["provisioner"].transaction():
+            await proof["provisioner"].execute(
+                "SELECT set_config('app.service_client_id',$1,true)",
+                str(proof["broker_id"]),
+            )
+            row = await proof["provisioner"].fetchrow(
+                "SELECT * FROM revoke_service_delegation($1,$2,$3,$4,$5,$6,$7)",
+                proof["broker_credential_id"],
+                proof["owner_slug"],
+                proof["tenant_ref"],
+                proof["principal_ref"],
+                external_ref,
+                "operator_action",
+                request_id,
+            )
+        assert row is not None
+        return row
+
+    revoked_external_ref = f"revoke-disposition-{uuid.uuid4().hex}"
+    _material, _issued = await _issue(
+        proof,
+        external_ref=revoked_external_ref,
+        idempotency_digest=os.urandom(32),
+        request_digest=os.urandom(32),
+    )
+    assert tuple(
+        (
+            await revoke(
+                revoked_external_ref,
+                f"revoke-disposition-created-{uuid.uuid4().hex}",
+            )
+        ).values()
+    ) == ("revoked", True, None)
+    assert tuple(
+        (
+            await revoke(
+                revoked_external_ref,
+                f"revoke-disposition-replayed-{uuid.uuid4().hex}",
+            )
+        ).values()
+    ) == ("already_revoked", False, None)
+
+    used_external_ref = f"revoke-used-{uuid.uuid4().hex}"
+    used_material, _issued = await _issue(
+        proof,
+        external_ref=used_external_ref,
+        idempotency_digest=os.urandom(32),
+        request_digest=os.urandom(32),
+    )
+    await resolve_delegated_principal(
+        used_material.token, request_id=f"revoke-used-use-{uuid.uuid4().hex}"
+    )
+    assert tuple(
+        (
+            await revoke(
+                used_external_ref,
+                f"revoke-disposition-used-{uuid.uuid4().hex}",
+            )
+        ).values()
+    ) == ("already_used", False, None)
+
+    assert tuple(
+        (
+            await revoke(
+                f"revoke-not-found-{uuid.uuid4().hex}",
+                f"revoke-disposition-not-found-{uuid.uuid4().hex}",
+            )
+        ).values()
+    ) == ("not_found", False, None)
+
+
 async def test_provisioner_has_function_execute_but_no_delegation_table_dml(
     delegation_db,  # type: ignore[no-untyped-def]
 ) -> None:
