@@ -74,6 +74,27 @@ jobs:
       - name: Run Compose Real-DB CI Stack
         run: docker compose -f docker-compose.ci.yml up --no-build --abort-on-container-exit --exit-code-from engram-test
 
+      # Must run before the stack is torn down. `docker compose cp` reads from
+      # the stopped container, so results survive a failing run — which is the
+      # case that matters.
+      - name: Export JUnit Test Results
+        if: always()
+        run: |
+          mkdir -p test-results
+          docker compose -f docker-compose.ci.yml cp \
+            engram-test:/app/test-results/. test-results/ \
+            || echo "No test results to export (the suite may not have started)."
+          ls -la test-results || true
+
+      - name: Upload JUnit Test Results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-merge-ref-${{ github.run_id }}-${{ github.run_attempt }}
+          path: test-results/
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Show Compose Logs On Failure
         if: failure()
         run: docker compose -f docker-compose.ci.yml logs --no-color
@@ -82,8 +103,81 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.ci.yml down -v --remove-orphans
 
+  # Builds and boots the production `runtime` image. Every other job builds the
+  # `ci` target only, so without this a broken `pip install .`, a runtime
+  # dependency that only the dev extras were providing, or a broken uvicorn
+  # entrypoint reaches main undetected.
+  runtime-image-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      ENGRAM_RUNTIME_IMAGE: engram-runtime:${{ github.sha }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and load runtime image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.ENGRAM_RUNTIME_IMAGE }}
+          cache-from: type=gha,scope=engram-runtime
+          cache-to: type=gha,mode=min,scope=engram-runtime
+          provenance: false
+
+      - name: Verify the non-editable install imports and exposes its entrypoint
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint python "$ENGRAM_RUNTIME_IMAGE" \
+            -c "import engram.api.app, engram.cli; print('package imports OK')"
+          docker run --rm --entrypoint engram "$ENGRAM_RUNTIME_IMAGE" --help > /dev/null
+          echo "console script OK"
+
+      - name: Boot the runtime image against a real database
+        run: |
+          docker compose -f docker-compose.ci.yml --profile smoke up -d --wait \
+            --wait-timeout 180 engram-runtime-smoke
+
+      - name: Assert liveness and readiness
+        run: |
+          set -euo pipefail
+
+          probe() {
+            path=$1
+            code=$(curl -sS -o /tmp/probe.json -w '%{http_code}' "http://localhost:8000$path")
+            echo "GET $path -> $code"
+            cat /tmp/probe.json
+            echo
+            test "$code" = "200"
+          }
+
+          probe /health
+          # /ready is the load-bearing assertion: it proves the production image
+          # reached Postgres as the non-owner app role under FORCE RLS, resolved
+          # a tenant context, and found pgvector >= 0.8.
+          probe /ready
+
+      - name: Show Smoke Logs On Failure
+        if: failure()
+        run: docker compose -f docker-compose.ci.yml --profile smoke logs --no-color
+
+      - name: Clean Up Smoke Stack
+        if: always()
+        run: docker compose -f docker-compose.ci.yml --profile smoke down -v --remove-orphans
+
   compose-validate:
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
 
     steps:
       - uses: actions/checkout@v6

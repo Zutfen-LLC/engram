@@ -1,6 +1,36 @@
 services:
   postgres:
     image: pgvector/pgvector:pg16
+    # Durability is worthless here: this cluster is created from the bundled
+    # migrations on every run and destroyed with `down -v`, so nothing it
+    # writes is meant to survive the job.
+    #
+    # Do not expect these flags to make the suite faster — measured, they do
+    # not. Root suite before: 481s/2956 tests. After, on two runs of the same
+    # commit: 508s and 500s/2992 tests, i.e. per-test cost unchanged to within
+    # the ~8s run-to-run variance those two samples establish. That is the
+    # expected result, not an anomaly: the suite's `--durations` profile is
+    # flat (slowest test 2.45s, top 25 ~7% of wall clock), so it is bound by
+    # per-test fixed overhead, not by commit durability. They are kept because
+    # they are free and correct for a disposable cluster, not as an
+    # optimization. Real wins have to come from the per-test overhead —
+    # sharding the suite across runners is the open item.
+    #
+    # max_connections is raised for that future: each test process opens
+    # several pooled engines (runtime, owner, read, provisioner) and the
+    # default 100 leaves no headroom for running the suite in parallel.
+    command: >
+      postgres
+      -c fsync=off
+      -c synchronous_commit=off
+      -c full_page_writes=off
+      -c max_connections=200
+    # PGDATA in RAM. Bounded explicitly so a runaway test cannot exhaust the
+    # runner's memory: the seeded cluster is ~40 MB and the service-provisioning
+    # suites add a handful of ~8 MB databases, so 2g is generous. Postgres fails
+    # loudly on a full data directory rather than corrupting anything.
+    tmpfs:
+      - /var/lib/postgresql/data:size=2g
     environment:
       POSTGRES_DB: engram
       # Owner/migration superuser (bypasses RLS). The existing test suites run
@@ -44,3 +74,45 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+
+  # Production-image smoke check. CI otherwise only ever builds the `ci` target,
+  # so the `runtime` target — a different install path (`pip install .`, no dev
+  # extras, non-editable) behind a different entrypoint (uvicorn) — could break
+  # and reach main undetected.
+  #
+  # Held behind a Compose profile so it is excluded from the default `up` that
+  # runs the test suite; start it with:
+  #   docker compose -f docker-compose.ci.yml --profile smoke up -d --wait \
+  #       engram-runtime-smoke
+  engram-runtime-smoke:
+    profiles: ["smoke"]
+    image: ${ENGRAM_RUNTIME_IMAGE:-engram-runtime:local}
+    pull_policy: never
+    build:
+      context: .
+      target: runtime
+    environment:
+      # Connect as the non-owner application role under FORCE RLS, exactly as
+      # the deployment stack in docker-compose.yml does. This is the one place
+      # CI exercises the production role configuration end to end.
+      ENGRAM_DATABASE_URL: postgresql+asyncpg://engram_app:engram_app@postgres:5432/engram
+      ENGRAM_OWNER_DATABASE_URL: postgresql+asyncpg://engram:engram@postgres:5432/engram
+      ENGRAM_EMBEDDING_PROVIDER: none
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Liveness only (/health is DB-free), mirroring docker-compose.yml. The
+    # workflow asserts /ready separately so a DB/RLS/pgvector failure surfaces
+    # as an explicit assertion instead of a healthcheck timeout.
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - >-
+          python -c "import sys,urllib.request as u;
+          sys.exit(0 if u.urlopen('http://localhost:8000/health',timeout=5).status==200 else 1)"
+      interval: 5s
+      timeout: 5s
+      retries: 24
