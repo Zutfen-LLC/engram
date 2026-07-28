@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     service_provisioning_enabled: bool = False
     provisioner_database_url: str | None = None
     provisioner_database_role: str = "engram_provisioner"
+    delegation_enabled: bool = False
+    delegation_default_ttl_seconds: int = 60
+    delegation_max_ttl_seconds: int = 300
 
     # Read-oriented database URL (ENG-AUD-011 / F18). Optional: when unset,
     # read-heavy paths (currently: startup recall candidate selection) use
@@ -224,6 +227,21 @@ class Settings(BaseSettings):
         if self.service_provisioning_enabled and not self.provisioner_database_url:
             raise ValueError(
                 "provisioner_database_url is required when service_provisioning_enabled=true"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_delegation(self) -> Settings:
+        if not 30 <= self.delegation_max_ttl_seconds <= 300:
+            raise ValueError("delegation_max_ttl_seconds must be between 30 and 300")
+        if not 30 <= self.delegation_default_ttl_seconds <= self.delegation_max_ttl_seconds:
+            raise ValueError(
+                "delegation_default_ttl_seconds must be between 30 and "
+                "delegation_max_ttl_seconds"
+            )
+        if self.delegation_enabled and not self.service_provisioning_enabled:
+            raise ValueError(
+                "service_provisioning_enabled must be true when delegation_enabled=true"
             )
         return self
 

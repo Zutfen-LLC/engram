@@ -193,4 +193,5 @@ def test_ci_runner_selects_complete_root_suite_with_skip_and_timing_guards() -> 
 
     assert 'env["ENGRAM_FAIL_ON_DB_SKIP"] = "1"' in runner
     assert '_run("pytest", "-q", "--durations=25", "tests", env=env)' in runner
+    assert '_run("python", "scripts/scan_credential_leaks.py")' in runner
     assert "run_trust_proof.py" not in runner

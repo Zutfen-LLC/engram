@@ -652,6 +652,7 @@ async def test_persisted_migration_027_to_028_preserves_service_state_and_permis
             )
             assert role is not None
             assert tuple(role.values()) == (False, False, False, False, False, False, 0)
+
         finally:
             await upgraded.close()
         assert (
@@ -700,6 +701,196 @@ async def test_persisted_migration_027_to_028_preserves_service_state_and_permis
         finally:
             await verify.close()
         assert await _run_init_db(database_url) == 0
+    finally:
+        if created_database:
+            await admin.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1",
+                database,
+            )
+            await admin.execute(f'DROP DATABASE "{database}"')
+        await _restore_role_state(admin, original_role)
+        await admin.close()
+
+
+async def test_persisted_migration_028_to_029_preserves_service_state_and_permissions(
+    tmp_path: Path,
+) -> None:
+    """Migration 029 adds vocabulary without silently granting it to existing clients."""
+    import asyncpg
+
+    owner_url = _owner_url()
+    if owner_url is None:
+        pytest.skip("requires owner PostgreSQL URL for persisted delegation upgrade")
+    database = f"delegation_upgrade_{uuid.uuid4().hex}"
+    admin = await asyncpg.connect(normalize_asyncpg_url(owner_url))
+    original_role = await _role_state(admin)
+    created_database = False
+    try:
+        await admin.execute(f'CREATE DATABASE "{database}"')
+        created_database = True
+        database_url = _with_database(owner_url, database)
+        through_028 = tmp_path / "through-028-migrations"
+        through_028.mkdir()
+        for migration in discover_migrations():
+            if migration.name <= "028_service_agent_onboarding.sql":
+                (through_028 / migration.name).symlink_to(migration.resolve())
+        assert await _run_init_db(database_url, migrations_dir=through_028) == 0
+
+        persisted = await asyncpg.connect(normalize_asyncpg_url(database_url))
+        client_id, credential_id = uuid.uuid4(), uuid.uuid4()
+        tenant_id, tenant_binding_id = uuid.uuid4(), uuid.uuid4()
+        principal_id, principal_binding_id = uuid.uuid4(), uuid.uuid4()
+        permissions = [
+            "tenant.provision",
+            "principal.provision",
+            "workspace.provision",
+            "agent.provision",
+            "api_key.provision",
+        ]
+        try:
+            await persisted.execute(
+                "INSERT INTO service_clients (id,slug,display_name,permissions) "
+                "VALUES ($1,$2,'Persisted migration 028 client',$3)",
+                client_id,
+                f"persisted-delegation-{client_id.hex[:12]}",
+                permissions,
+            )
+            await persisted.execute(
+                "INSERT INTO service_client_credentials "
+                "(id,service_client_id,key_id,secret_digest,digest_algorithm) "
+                "VALUES ($1,$2,$3,$4,'sha256')",
+                credential_id,
+                client_id,
+                f"persisted{credential_id.hex[:13]}",
+                "c" * 64,
+            )
+            await persisted.execute(
+                "INSERT INTO tenants (id,name,slug) VALUES ($1,'Persisted delegation tenant',$2)",
+                tenant_id,
+                f"persisted-delegation-tenant-{tenant_id.hex[:10]}",
+            )
+            await persisted.execute(
+                "INSERT INTO principals (id,tenant_id,name,type) "
+                "VALUES ($1,$2,'Persisted delegation human','user')",
+                principal_id,
+                tenant_id,
+            )
+            await persisted.execute(
+                "INSERT INTO tenant_provisioning_bindings "
+                "(id,service_client_id,external_ref,tenant_id) VALUES ($1,$2,$3,$4)",
+                tenant_binding_id,
+                client_id,
+                "persisted-delegation-tenant-ref",
+                tenant_id,
+            )
+            await persisted.execute(
+                "INSERT INTO principal_provisioning_bindings "
+                "(id,service_client_id,tenant_binding_id,tenant_id,external_ref,principal_id) "
+                "VALUES ($1,$2,$3,$4,$5,$6)",
+                principal_binding_id,
+                client_id,
+                tenant_binding_id,
+                tenant_id,
+                "persisted-delegation-principal-ref",
+                principal_id,
+            )
+            before = {
+                "permissions": await persisted.fetchval(
+                    "SELECT permissions FROM service_clients WHERE id=$1", client_id
+                ),
+                "credentials": await persisted.fetchval(
+                    "SELECT count(*) FROM service_client_credentials "
+                    "WHERE service_client_id=$1",
+                    client_id,
+                ),
+                "tenant_bindings": await persisted.fetchval(
+                    "SELECT count(*) FROM tenant_provisioning_bindings "
+                    "WHERE service_client_id=$1",
+                    client_id,
+                ),
+                "principal_bindings": await persisted.fetchval(
+                    "SELECT count(*) FROM principal_provisioning_bindings "
+                    "WHERE service_client_id=$1",
+                    client_id,
+                ),
+            }
+        finally:
+            await persisted.close()
+
+        before_password = await admin.fetchval(
+            "SELECT rolpassword FROM pg_authid WHERE rolname='engram_provisioner'"
+        )
+        assert await _run_init_db(database_url) == 0
+        upgraded = await asyncpg.connect(normalize_asyncpg_url(database_url))
+        try:
+            assert await upgraded.fetchval(
+                "SELECT count(*) FROM schema_migrations "
+                "WHERE filename='029_service_delegation.sql'"
+            ) == 1
+            assert await upgraded.fetchval(
+                "SELECT permissions FROM service_clients WHERE id=$1", client_id
+            ) == before["permissions"] == permissions
+            assert "delegation.issue" not in before["permissions"]
+            assert await upgraded.fetchval(
+                "SELECT count(*) FROM service_client_credentials "
+                "WHERE service_client_id=$1",
+                client_id,
+            ) == before["credentials"]
+            assert await upgraded.fetchval(
+                "SELECT count(*) FROM tenant_provisioning_bindings "
+                "WHERE service_client_id=$1",
+                client_id,
+            ) == before["tenant_bindings"]
+            assert await upgraded.fetchval(
+                "SELECT count(*) FROM principal_provisioning_bindings "
+                "WHERE service_client_id=$1",
+                client_id,
+            ) == before["principal_bindings"]
+            for table in (
+                "service_delegation_grants",
+                "service_delegation_tokens",
+                "service_delegation_idempotency",
+                "service_delegation_events",
+            ):
+                assert await upgraded.fetchval(f"SELECT count(*) FROM {table}") == 0
+            role = await upgraded.fetchrow(
+                "SELECT rolsuper,rolbypassrls,rolcreatedb,rolcreaterole,"
+                "rolreplication,rolinherit,"
+                "(SELECT count(*) FROM pg_auth_members WHERE member=r.oid) memberships "
+                "FROM pg_roles r WHERE rolname='engram_provisioner'"
+            )
+            assert role is not None
+            assert tuple(role.values()) == (False, False, False, False, False, False, 0)
+
+            downgrade_sql = (
+                Path(__file__).resolve().parents[1]
+                / "migrations"
+                / "downgrades"
+                / "029_service_delegation.sql"
+            ).read_text()
+            await upgraded.execute(downgrade_sql)
+            for table in (
+                "service_delegation_grants",
+                "service_delegation_tokens",
+                "service_delegation_idempotency",
+                "service_delegation_events",
+            ):
+                assert await upgraded.fetchval("SELECT to_regclass($1)", table) is None
+            assert await upgraded.fetchval(
+                "SELECT permissions FROM service_clients WHERE id=$1", client_id
+            ) == permissions
+            assert await upgraded.fetchval(
+                "SELECT service_permissions_are_canonical($1::text[])", permissions
+            )
+            assert not await upgraded.fetchval(
+                "SELECT service_permissions_are_canonical($1::text[])",
+                permissions + ["delegation.issue"],
+            )
+        finally:
+            await upgraded.close()
+        assert await admin.fetchval(
+            "SELECT rolpassword FROM pg_authid WHERE rolname='engram_provisioner'"
+        ) == before_password
     finally:
         if created_database:
             await admin.execute(

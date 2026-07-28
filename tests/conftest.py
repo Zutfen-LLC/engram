@@ -42,6 +42,23 @@ def _restore_auth_enabled_default():
 
 
 @pytest.fixture(autouse=True)
+def _restore_delegation_defaults():
+    from engram.config import settings
+
+    original = (
+        settings.delegation_enabled,
+        settings.delegation_default_ttl_seconds,
+        settings.delegation_max_ttl_seconds,
+    )
+    yield
+    (
+        settings.delegation_enabled,
+        settings.delegation_default_ttl_seconds,
+        settings.delegation_max_ttl_seconds,
+    ) = original
+
+
+@pytest.fixture(autouse=True)
 def _restore_usage_telemetry_enabled_default():
     """Guard against global `settings.usage_telemetry_enabled` leakage.
 
