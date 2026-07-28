@@ -47,20 +47,27 @@ RUN mkdir -p \
 # openai>=1.0, ...) on every cache miss, so an upstream release could break CI
 # with no change to this repository.
 #
-# uv.lock is exported as a *constraints* file rather than installed directly:
-# it covers only the root project, while the SDK and adapters still resolve
-# their own dependencies (notably `mcp` and `pyyaml`, which uv.lock does not
-# track) — now bounded by these pins wherever the trees overlap.
+# The export must cover the whole workspace (`--all-packages`), not just the
+# root project. A root-only lock cannot describe this image: `mcp` alone pulls
+# in httpx2, mcp-types, opentelemetry-api, pyjwt and truststore, which a
+# root-only lock has no entry for while still bounding the packages `mcp`
+# shares with the service. Constraining an environment the lock does not
+# describe makes pip backtrack to whatever ancient version fits — silently,
+# because a constraints file bounds versions but never forces one. With every
+# package pinned to a set uv proved consistent, pip must install that set or
+# fail loudly.
 #
-# `uv export --frozen` never rewrites uv.lock and fails if it has drifted from
-# pyproject.toml, so this repeats the lock-drift gate inside the build.
-# uv is pinned to the same version the lock-drift CI job uses.
+# `--no-emit-workspace` drops the four local members; they are installed
+# editable below. `uv export --frozen` never rewrites uv.lock and fails if it
+# has drifted from pyproject.toml, so this repeats the lock-drift gate inside
+# the build. uv is pinned to the same version the lock-drift CI job uses.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install "uv==0.11.29" && \
     uv export \
         --frozen \
-        --extra dev \
-        --no-emit-project \
+        --all-packages \
+        --all-extras \
+        --no-emit-workspace \
         --no-hashes \
         --format requirements-txt \
         -o /tmp/ci-constraints.txt && \

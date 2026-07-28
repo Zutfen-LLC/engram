@@ -68,6 +68,15 @@ def test_hosted_workflow_runs_conformance_and_lock_drift_gates() -> None:
     # The lock gate never rewrites the lockfile.
     assert "uv lock\n" not in workflow
 
+    # The lock must span the whole workspace, not just the root project, or the
+    # gate silently ignores the SDK and adapters — and the CI image cannot be
+    # pinned from it. See the Dockerfile contract test for why that matters.
+    project = (REPOSITORY_ROOT / "pyproject.toml").read_text()
+    assert "[tool.uv.workspace]" in project
+    for member in ("sdk/engram-client", "adapters/mcp-server", "adapters/engram-hooks"):
+        assert f'"{member}"' in project
+    assert "engram-client = { workspace = true }" in project
+
     assert (
         "group: ${{ github.workflow }}-"
         "${{ github.event.pull_request.number || github.ref }}"
@@ -262,15 +271,20 @@ def test_ci_dockerfile_separates_dependencies_from_source_binding() -> None:
 
     # The CI image installs third-party versions pinned by uv.lock rather than
     # re-resolving the floating floors in pyproject.toml, so the image CI tests
-    # in matches `uv sync --extra dev`. Exported as a constraints file because
-    # uv.lock covers only the root project; the SDK and adapters still resolve
-    # their own trees, bounded by these pins. `--frozen` never rewrites the
-    # lockfile and fails on drift, repeating the lock-drift gate in the build.
+    # in matches `uv sync`. The export MUST cover the whole workspace: a
+    # root-only export cannot describe this image (mcp alone adds httpx2,
+    # mcp-types, opentelemetry-api, pyjwt and truststore), and constraining an
+    # environment the lock does not describe makes pip silently backtrack to an
+    # ancient version that fits — which is how mcp 0.1.0 once got installed.
     dependency_block = dockerfile[dependency_install:ci_stage]
     assert "uv export" in dependency_block
     assert "--frozen" in dependency_block
-    assert "--no-emit-project" in dependency_block
+    assert "--all-packages" in dependency_block
+    assert "--all-extras" in dependency_block
+    # Local members are installed editable, never from the constraints file.
+    assert "--no-emit-workspace" in dependency_block
     assert "pip install -c /tmp/ci-constraints.txt" in dependency_block
+    # `--frozen` never rewrites the lockfile, repeating the lock-drift gate.
     assert "uv lock" not in dependency_block
     # Pinned to the same uv the lock-drift job uses.
     assert 'pip install "uv==0.11.29"' in dependency_block
