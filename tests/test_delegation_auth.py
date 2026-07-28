@@ -50,7 +50,10 @@ def test_every_generated_delegation_credential_is_valid_bearer_material() -> Non
         "engd_" + "a" * 22 + "*" + "b" * 43,
         "engd_" + "é" * 22 + "*" + "b" * 43,
         "engd_" + "a" * 22 + "_" + "b" * 42,
-        "eng_" + "a" * 22 + "_" + "b" * 43,
+        pytest.param(
+            "eng_" + "a" * 22 + "_" + "b" * 43,
+            id="ordinary-api-key",
+        ),
     ],
 )
 def test_delegation_token_parser_is_strict(token: str) -> None:
