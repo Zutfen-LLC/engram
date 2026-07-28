@@ -57,6 +57,27 @@ jobs:
       - name: Run Compose Real-DB CI Stack
         run: docker compose -f docker-compose.ci.yml up --no-build --abort-on-container-exit --exit-code-from engram-test
 
+      # Must run before the stack is torn down. `docker compose cp` reads from
+      # the stopped container, so results survive a failing run — which is the
+      # case that matters.
+      - name: Export JUnit Test Results
+        if: always()
+        run: |
+          mkdir -p test-results
+          docker compose -f docker-compose.ci.yml cp \
+            engram-test:/app/test-results/. test-results/ \
+            || echo "No test results to export (the suite may not have started)."
+          ls -la test-results || true
+
+      - name: Upload JUnit Test Results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-exact-head-${{ github.run_id }}-${{ github.run_attempt }}
+          path: test-results/
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Show Compose Logs On Failure
         if: failure()
         run: docker compose -f docker-compose.ci.yml logs --no-color

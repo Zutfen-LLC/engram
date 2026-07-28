@@ -5,9 +5,28 @@ from __future__ import annotations
 import asyncio
 import os
 import subprocess
+from pathlib import Path
 from typing import Final
 
 import asyncpg
+
+# JUnit XML lands here so the workflow can copy it out of the stopped container
+# and upload it as an artifact. Failures are then readable as structured test
+# results instead of by scrolling a Compose log interleaved with Postgres
+# output. Overridable so a local `make compose-ci` can redirect it.
+RESULTS_DIR: Final[Path] = Path(os.environ.get("ENGRAM_CI_RESULTS_DIR", "/app/test-results"))
+
+# Per-test wall-clock ceiling. The slowest test in the suite runs ~2.5s, so 60s
+# is ~24x headroom and only trips on a genuine hang. The concurrency suites
+# (worker dedup/auto-supersede/flagging, promotion review/feedback, manual
+# invalidation) are the realistic deadlock sources; before this a hang consumed
+# the full 30-minute job timeout and never named the offending test.
+#
+# The `signal` method is deliberate: `thread` hard-exits via os._exit(), which
+# would abort pytest before it writes the JUnit XML above. `signal` raises
+# inside the test, so the run reports the culprit, writes results, and carries
+# on to the remaining tests.
+TEST_TIMEOUT_SECONDS: Final[int] = 60
 
 DB_TABLES: Final[tuple[str, ...]] = (
     "tenants",
@@ -44,6 +63,15 @@ def _section(title: str) -> None:
 def _run(*args: str, env: dict[str, str] | None = None) -> None:
     print(f"+ {' '.join(args)}", flush=True)
     subprocess.run(args, check=True, env=env)
+
+
+def _pytest_flags(suite: str) -> tuple[str, ...]:
+    """Return the reporting/timeout flags shared by every pytest invocation."""
+    return (
+        f"--timeout={TEST_TIMEOUT_SECONDS}",
+        "--timeout-method=signal",
+        f"--junitxml={RESULTS_DIR / f'{suite}.xml'}",
+    )
 
 
 async def _verify_database() -> None:
@@ -109,6 +137,8 @@ async def _verify_database() -> None:
 
 
 def main() -> int:
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
     _section("Database Migration Verification")
     asyncio.run(_verify_database())
 
@@ -121,25 +151,32 @@ def main() -> int:
     _section("Root Service Tests")
     env = dict(os.environ)
     env["ENGRAM_FAIL_ON_DB_SKIP"] = "1"
-    _run("pytest", "-q", "--durations=25", "tests", env=env)
+    _run("pytest", "-q", "--durations=25", *_pytest_flags("root"), "tests", env=env)
 
     # Hosted CI runs the complete root suite once. The canonical trust proof
     # remains an explicit operator/local selector via ``make trust-proof`` and
     # ``make compose-trust-proof`` and must not be rerun inside the hosted gate.
 
     _section("SDK Tests")
-    _run("pytest", "-q", "-c", "sdk/engram-client/pyproject.toml", "sdk/engram-client/tests")
+    _run(
+        "pytest",
+        "-q",
+        "-c",
+        "sdk/engram-client/pyproject.toml",
+        *_pytest_flags("sdk"),
+        "sdk/engram-client/tests",
+    )
 
     _section("MCP Adapter Tests")
     # ENGRAM_FAIL_ON_DB_SKIP=1 makes a DB-backed integration skip fail the run,
     # so API/SDK drift that breaks the MCP round trips fails CI instead of
     # silently skipping. The DB is available in the CI Compose stack.
-    _run("pytest", "-q", "adapters/mcp-server/tests", env=env)
+    _run("pytest", "-q", *_pytest_flags("mcp-adapter"), "adapters/mcp-server/tests", env=env)
 
     _section("engram-hooks Tests")
     # No DB or network needed: the write-contract suite uses a hermetic fixture
     # derived from the pinned stock-Hermes revision.
-    _run("pytest", "-q", "adapters/engram-hooks/tests")
+    _run("pytest", "-q", *_pytest_flags("engram-hooks"), "adapters/engram-hooks/tests")
 
     _section("Credential Leak Scan")
     _run("python", "scripts/scan_credential_leaks.py")

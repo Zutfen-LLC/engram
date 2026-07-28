@@ -38,6 +38,11 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "pytest-cov>=5.0",
+    # Per-test wall-clock ceiling. The suite is concurrency-heavy (worker dedup,
+    # auto-supersede, flagging, promotion review/feedback, manual invalidation)
+    # and a deadlock there used to burn the whole 30-minute job timeout without
+    # naming the offending test. See scripts/run_ci.py for the configured value.
+    "pytest-timeout>=2.3",
     "httpx>=0.27",
     "ruff>=0.5",
     "mypy>=1.10",
@@ -85,3 +90,20 @@ strict = true
 [[tool.mypy.overrides]]
 module = "asyncpg"
 ignore_missing_imports = true
+
+# The SDK and adapters are workspace members so uv.lock resolves one consistent
+# set across everything installed together. A root-only lock could not describe
+# the CI image — `mcp` pulls in httpx2, mcp-types, opentelemetry-api, pyjwt and
+# truststore, which a root-only lock has no entry for — so it could not be used
+# to pin that image. This also widens the lock-drift CI gate to cover the SDK
+# and adapters, which it previously ignored.
+#
+# Adding the members does not perturb the service's own resolution: starlette,
+# fastapi, pydantic, httpx and anyio are unchanged from the root-only lock.
+[tool.uv.workspace]
+members = ["sdk/engram-client", "adapters/mcp-server", "adapters/engram-hooks"]
+
+# engram-client is unpublished, so the adapters' `engram-client>=0.1.0`
+# requirement must resolve to the local member rather than PyPI.
+[tool.uv.sources]
+engram-client = { workspace = true }
