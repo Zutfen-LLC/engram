@@ -577,6 +577,22 @@ async def get_current_principal(
             detail="Missing or invalid Authorization header",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    request_scope = getattr(request, "scope", None)
+    authorization_headers = (
+        sum(
+            1
+            for name, _value in request_scope.get("headers", ())
+            if name.lower() == b"authorization"
+        )
+        if isinstance(request_scope, dict)
+        else 1
+    )
+    if authorization_headers != 1:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid Authorization header",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     token = credentials.credentials
 
@@ -590,10 +606,11 @@ async def get_current_principal(
                 detail="Invalid or revoked API key",
                 headers={"WWW-Authenticate": "Bearer"},
             )
+        from engram.api.service_boundary import request_id_for
         from engram.delegation_auth import resolve_delegated_principal
 
         return await resolve_delegated_principal(
-            token, request_id=request.headers.get("X-Request-ID")
+            token, request_id=request_id_for(request)
         )
 
     try:

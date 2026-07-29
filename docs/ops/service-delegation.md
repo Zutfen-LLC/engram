@@ -76,6 +76,15 @@ Every replay or exact external-reference reconciliation returns `200`,
 Responses carry `no-store`, `no-cache`, `no-referrer`, request-ID, and replay
 headers.
 
+Every ordinary HTTP request that presents an `engd_` Bearer attempt receives
+the same `no-store`, `no-cache`, `no-referrer`, and `X-Request-ID` response
+boundary, including authentication, validation, scope, routing, method, and
+bounded internal failures. The boundary recognizes the reserved credential
+prefix before authentication but does not validate, retain, authenticate, or
+consume the token. It establishes one validated or generated request ID that
+is shared by the response and delegation consumption or denial evidence.
+Ordinary `eng_` API-key response headers remain unchanged.
+
 The token is consumed atomically during successful authentication, before route
 scope evaluation or handler execution. Therefore a write, review, export,
 admin, or service-route attempt cannot execute and still consumes that token.

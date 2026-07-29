@@ -11,7 +11,7 @@ from sqlalchemy.exc import DataError, IntegrityError
 
 from engram.api.errors import data_error_handler, integrity_error_handler
 from engram.api.service_boundary import (
-    ServiceResponseBoundaryMiddleware,
+    SensitiveResponseBoundaryMiddleware,
     service_request_validation_handler,
 )
 
@@ -59,7 +59,7 @@ def create_app() -> FastAPI:
     app.add_exception_handler(IntegrityError, integrity_error_handler)
     app.add_exception_handler(DataError, data_error_handler)
     app.add_exception_handler(RequestValidationError, service_request_validation_handler)
-    app.add_middleware(ServiceResponseBoundaryMiddleware)
+    app.add_middleware(SensitiveResponseBoundaryMiddleware)
 
     from engram.api.routes import (
         admin,
