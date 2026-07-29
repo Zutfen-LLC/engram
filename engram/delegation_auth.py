@@ -21,6 +21,7 @@ from typing import Any
 from fastapi import HTTPException, status
 from sqlalchemy import text
 
+from engram.api.service_boundary import effective_request_id
 from engram.auth import Principal
 
 DELEGATION_PREFIX = "engd_"
@@ -34,7 +35,6 @@ _BASE62 = string.digits + string.ascii_lowercase + string.ascii_uppercase
 _TOKEN_RE = re.compile(r"^engd_([0-9A-Za-z]{22})_([A-Za-z0-9_-]{43})$")
 _VISIBLE_ASCII = re.compile(r"^[\x21-\x7e]{1,255}$")
 _IDEMPOTENCY = re.compile(r"^[\x21-\x7e]{1,128}$")
-_REQUEST_ID = re.compile(r"^[\x21-\x7e]{1,128}$")
 
 
 @dataclass(frozen=True)
@@ -144,9 +144,8 @@ def canonical_delegation_request_digest(
 
 
 def request_id_or_generated(candidate: str | None) -> str:
-    if candidate is not None and _REQUEST_ID.fullmatch(candidate) is not None:
-        return candidate
-    return str(uuid.uuid4())
+    """Compatibility wrapper for isolated calls outside the ASGI boundary."""
+    return effective_request_id(candidate)
 
 
 def delegated_unauthorized() -> HTTPException:

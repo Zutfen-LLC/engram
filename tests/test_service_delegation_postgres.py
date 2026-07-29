@@ -242,6 +242,247 @@ async def _issue(
     return material, row
 
 
+def _assert_delegated_headers(response: Any, request_id: str | None = None) -> str:
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    assert response.headers["referrer-policy"] == "no-referrer"
+    effective_request_id = response.headers["x-request-id"]
+    if request_id is None:
+        assert str(uuid.UUID(effective_request_id)) == effective_request_id
+    else:
+        assert effective_request_id == request_id
+    return effective_request_id
+
+
+async def test_delegated_http_boundary_and_audit_request_id_correlation(
+    delegation_db,  # type: ignore[no-untyped-def]
+) -> None:
+    proof = delegation_db
+    settings.auth_enabled = True
+
+    async def issue(label: str):  # type: ignore[no-untyped-def]
+        return await _issue(
+            proof,
+            external_ref=f"boundary-{label}-{uuid.uuid4().hex}",
+            idempotency_digest=os.urandom(32),
+            request_digest=os.urandom(32),
+        )
+
+    success_material, success_issued = await issue("success")
+    items_material, items_issued = await issue("items")
+    invalid_secret_material, invalid_secret_issued = await issue("invalid-secret")
+    expired_material, expired_issued = await issue("expired")
+    replay_material, replay_issued = await issue("replay")
+    revoked_material, revoked_issued = await issue("revoked")
+    authority_material, authority_issued = await issue("authority")
+    scope_material, scope_issued = await issue("scope")
+    routing_material, routing_issued = await issue("routing")
+    validation_material, validation_issued = await issue("validation")
+
+    await proof["owner"].execute(
+        "UPDATE service_delegation_tokens "
+        "SET issued_at=now()-interval '40 seconds',expires_at=now()-interval '1 second' "
+        "WHERE id=$1",
+        expired_issued["delegation_token_id"],
+    )
+    await resolve_delegated_principal(
+        replay_material.token, request_id="boundary-replay-first-use"
+    )
+    await proof["owner"].execute(
+        "UPDATE service_delegation_tokens SET status='revoked',revoked_at=now(),"
+        "revocation_reason='operator_action' WHERE id=$1",
+        revoked_issued["delegation_token_id"],
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        success_request_id = f"boundary-success-{uuid.uuid4().hex}"
+        success = await client.get(
+            "/whoami",
+            headers={
+                "Authorization": f"Bearer {success_material.token}",
+                "X-Request-ID": success_request_id,
+            },
+        )
+        assert success.status_code == 200
+        _assert_delegated_headers(success, success_request_id)
+
+        items = await client.get(
+            "/v1/items",
+            headers={
+                "Authorization": f"Bearer {items_material.token}",
+                "X-Request-ID": "invalid request id",
+            },
+        )
+        assert items.status_code == 200
+        items_request_id = _assert_delegated_headers(items)
+
+        invalid_secret_token = f"engd_{invalid_secret_material.key_id}_{'A' * 43}"
+        invalid_secret_request_id = f"boundary-invalid-secret-{uuid.uuid4().hex}"
+        invalid_secret = await client.get(
+            "/whoami",
+            headers={
+                "Authorization": f"Bearer {invalid_secret_token}",
+                "X-Request-ID": invalid_secret_request_id,
+            },
+        )
+        assert invalid_secret.status_code == 401
+        _assert_delegated_headers(invalid_secret, invalid_secret_request_id)
+
+        failure_cases = (
+            (
+                expired_material.token,
+                f"boundary-expired-{uuid.uuid4().hex}",
+                expired_issued["delegation_token_id"],
+            ),
+            (
+                replay_material.token,
+                f"boundary-replay-{uuid.uuid4().hex}",
+                replay_issued["delegation_token_id"],
+            ),
+            (
+                revoked_material.token,
+                f"boundary-revoked-{uuid.uuid4().hex}",
+                revoked_issued["delegation_token_id"],
+            ),
+        )
+        for token, request_id, _token_id in failure_cases:
+            denied = await client.get(
+                "/whoami",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "X-Request-ID": request_id,
+                },
+            )
+            assert denied.status_code == 401
+            _assert_delegated_headers(denied, request_id)
+
+        scope_request_id = f"boundary-scope-{uuid.uuid4().hex}"
+        scope_denied = await client.post(
+            "/v1/remember",
+            headers={
+                "Authorization": f"Bearer {scope_material.token}",
+                "X-Request-ID": scope_request_id,
+            },
+            json={"content": "delegated write must not execute"},
+        )
+        assert scope_denied.status_code == 403
+        _assert_delegated_headers(scope_denied, scope_request_id)
+
+        routing_request_id = f"boundary-routing-{uuid.uuid4().hex}"
+        missing = await client.get(
+            "/not-a-route",
+            headers={
+                "Authorization": f"Bearer {routing_material.token}",
+                "X-Request-ID": routing_request_id,
+            },
+        )
+        method = await client.post(
+            "/whoami",
+            headers={"Authorization": f"Bearer {routing_material.token}"},
+        )
+        assert missing.status_code == 404
+        assert method.status_code == 405
+        _assert_delegated_headers(missing, routing_request_id)
+        _assert_delegated_headers(method)
+
+        routing_success_request_id = f"boundary-routing-success-{uuid.uuid4().hex}"
+        routing_success = await client.get(
+            "/whoami",
+            headers={
+                "Authorization": f"Bearer {routing_material.token}",
+                "X-Request-ID": routing_success_request_id,
+            },
+        )
+        routing_replay = await client.get(
+            "/whoami",
+            headers={"Authorization": f"Bearer {routing_material.token}"},
+        )
+        assert routing_success.status_code == 200
+        assert routing_replay.status_code == 401
+        _assert_delegated_headers(routing_success, routing_success_request_id)
+        _assert_delegated_headers(routing_replay)
+
+        validation_request_id = f"boundary-validation-{uuid.uuid4().hex}"
+        validation = await client.get(
+            "/v1/items/not-a-uuid",
+            headers={
+                "Authorization": f"Bearer {validation_material.token}",
+                "X-Request-ID": validation_request_id,
+            },
+        )
+        validation_replay = await client.get(
+            "/whoami",
+            headers={"Authorization": f"Bearer {validation_material.token}"},
+        )
+        assert validation.status_code == 422
+        assert validation_replay.status_code == 401
+        _assert_delegated_headers(validation, validation_request_id)
+        _assert_delegated_headers(validation_replay)
+
+        await proof["owner"].execute(
+            "UPDATE service_client_credentials SET status='revoked',revoked_at=now() "
+            "WHERE id=$1",
+            proof["broker_credential_id"],
+        )
+        authority_request_id = f"boundary-authority-{uuid.uuid4().hex}"
+        authority_denied = await client.get(
+            "/whoami",
+            headers={
+                "Authorization": f"Bearer {authority_material.token}",
+                "X-Request-ID": authority_request_id,
+            },
+        )
+        assert authority_denied.status_code == 401
+        _assert_delegated_headers(authority_denied, authority_request_id)
+
+    expected_event_ids = {
+        (success_issued["delegation_token_id"], success_request_id, "delegation.used"),
+        (items_issued["delegation_token_id"], items_request_id, "delegation.used"),
+        (
+            invalid_secret_issued["delegation_token_id"],
+            invalid_secret_request_id,
+            "delegation.denied",
+        ),
+        (scope_issued["delegation_token_id"], scope_request_id, "delegation.used"),
+        (
+            routing_issued["delegation_token_id"],
+            routing_success_request_id,
+            "delegation.used",
+        ),
+        (
+            validation_issued["delegation_token_id"],
+            validation_request_id,
+            "delegation.used",
+        ),
+        (
+            authority_issued["delegation_token_id"],
+            authority_request_id,
+            "delegation.denied",
+        ),
+    }
+    expected_event_ids.update(
+        (token_id, request_id, "delegation.denied")
+        for _token, request_id, token_id in failure_cases
+    )
+    event_rows = await proof["owner"].fetch(
+        "SELECT delegation_token_id,request_id,event_type "
+        "FROM service_delegation_events WHERE request_id=ANY($1::text[])",
+        [request_id for _token_id, request_id, _event_type in expected_event_ids],
+    )
+    assert {
+        (row["delegation_token_id"], row["request_id"], row["event_type"])
+        for row in event_rows
+    } == expected_event_ids
+    assert await proof["owner"].fetchval(
+        "SELECT count(*) FROM service_delegation_events "
+        "WHERE delegation_token_id=$1 AND event_type='delegation.used'",
+        routing_issued["delegation_token_id"],
+    ) == 1
+
+
 async def test_issue_replay_storage_and_single_use(delegation_db) -> None:  # type: ignore[no-untyped-def]
     proof = delegation_db
     external_ref = f"delegation-{uuid.uuid4().hex}"
