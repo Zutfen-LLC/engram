@@ -573,6 +573,11 @@ async def get_current_principal(
         async with _get_session_factory()() as session:
             return await _resolve_default_principal(session)
 
+    request_state = getattr(request, "state", None)
+    preauthenticated = getattr(request_state, "review_delegated_principal", None)
+    if isinstance(preauthenticated, Principal):
+        return preauthenticated
+
     if credentials is None or credentials.scheme.lower() != "bearer":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

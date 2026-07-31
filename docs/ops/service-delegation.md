@@ -172,9 +172,26 @@ Core consumes a matching token before route execution. A purpose mismatch
 revokes the token and returns the generic delegated `401`. A later `404` or
 `409` does not restore the token.
 
+Core checks the raw request before framework body validation for an `engdr_`
+attempt. Malformed JSON, duplicate keys, oversized bodies, forbidden fields,
+invalid content types, invalid UTF-8, query parameters, and noncanonical paths
+are terminal purpose mismatches. Core does not store the raw header or body.
+
 The review event actor is always the bound human. Internal event columns record
-the review token, grant, authority class, and purpose. API responses do not
-expose those columns.
+the review token, grant, authority class, purpose, target item, and target
+review status. PostgreSQL binds this evidence to the issued token. API
+responses do not expose those columns.
+
+Idempotency keys are issuer-global across read and review authority. A key that
+is reused across authority classes returns a conflict. If the conflict event
+references the existing token, all token attribution comes from that token.
+The event does not label a read token as review authority or a review token as
+read authority.
+
+An authorized revoke for a review external reference that does not exist
+returns `not_found`. Its event records the authenticated issuer, credential,
+owner, grant, and external-reference digests. It leaves the token, tenant,
+principal, and purpose attribution null because Core did not resolve a token.
 
 Read and review grants are separate. `delegation.issue` cannot issue or revoke
 a review token. `delegation.review.issue` cannot issue or revoke a read token.

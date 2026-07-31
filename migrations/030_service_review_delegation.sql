@@ -83,7 +83,7 @@ ALTER TABLE service_delegation_tokens
     ADD COLUMN purpose_name VARCHAR(32),
     ADD COLUMN purpose_digest BYTEA,
     ADD COLUMN target_item_id UUID,
-    ADD COLUMN target_review_status VARCHAR(16);
+    ADD COLUMN target_review_status TEXT;
 
 ALTER TABLE service_delegation_tokens
     DROP CONSTRAINT chk_service_delegation_token_state;
@@ -179,6 +179,32 @@ ALTER TABLE service_delegation_tokens
             authority_class,
             purpose_name,
             principal_id
+        ),
+    ADD CONSTRAINT uq_service_delegation_token_event_attribution
+        UNIQUE (
+            id,
+            issuer_service_client_id,
+            binding_owner_service_client_id,
+            grant_id,
+            authority_class,
+            tenant_id,
+            principal_id
+        ),
+    ADD CONSTRAINT uq_service_delegation_token_event_purpose
+        UNIQUE (
+            id,
+            authority_class,
+            purpose_name
+        ),
+    ADD CONSTRAINT uq_service_delegation_token_review_target
+        UNIQUE (
+            id,
+            grant_id,
+            authority_class,
+            purpose_name,
+            principal_id,
+            target_item_id,
+            target_review_status
         );
 
 ALTER TABLE service_delegation_tokens
@@ -262,10 +288,60 @@ ALTER TABLE service_delegation_events
                         )
                         AND purpose_name IS NULL
                     )
+                    OR (
+                        event_type = 'delegation.resolved_existing'
+                        AND delegation_token_id IS NULL
+                        AND tenant_id IS NULL
+                        AND principal_id IS NULL
+                        AND purpose_name IS NULL
+                        AND details ->> 'disposition' = 'not_found'
+                    )
                     OR purpose_name IN ('review.queue', 'review.transition')
                 )
             )
-        );
+        ),
+    ADD CONSTRAINT chk_service_delegation_event_token_attribution
+        CHECK (
+            delegation_token_id IS NULL
+            OR (
+                issuer_service_client_id IS NOT NULL
+                AND binding_owner_service_client_id IS NOT NULL
+                AND grant_id IS NOT NULL
+                AND tenant_id IS NOT NULL
+                AND principal_id IS NOT NULL
+                AND (authority_class = 'read' OR purpose_name IS NOT NULL)
+            )
+        ),
+    ADD CONSTRAINT fk_service_delegation_event_token_attribution
+        FOREIGN KEY (
+            delegation_token_id,
+            issuer_service_client_id,
+            binding_owner_service_client_id,
+            grant_id,
+            authority_class,
+            tenant_id,
+            principal_id
+        )
+        REFERENCES service_delegation_tokens(
+            id,
+            issuer_service_client_id,
+            binding_owner_service_client_id,
+            grant_id,
+            authority_class,
+            tenant_id,
+            principal_id
+        ) ON DELETE RESTRICT NOT VALID,
+    ADD CONSTRAINT fk_service_delegation_event_token_purpose
+        FOREIGN KEY (
+            delegation_token_id,
+            authority_class,
+            purpose_name
+        )
+        REFERENCES service_delegation_tokens(
+            id,
+            authority_class,
+            purpose_name
+        ) NOT VALID;
 
 ALTER TABLE item_events
     ADD COLUMN delegated_review_token_id UUID,
@@ -287,8 +363,10 @@ ALTER TABLE item_events
                 AND delegated_review_grant_id IS NOT NULL
                 AND delegated_review_authority_class = 'review'
                 AND delegated_review_purpose = 'review.transition'
+                AND actor_principal_id IS NOT NULL
                 AND event_type = 'review_change'
                 AND field_name = 'review_status'
+                AND new_value IS NOT NULL
                 AND new_value IN ('active', 'rejected')
             )
         ),
@@ -298,14 +376,18 @@ ALTER TABLE item_events
             delegated_review_grant_id,
             delegated_review_authority_class,
             delegated_review_purpose,
-            actor_principal_id
+            actor_principal_id,
+            item_id,
+            new_value
         )
         REFERENCES service_delegation_tokens(
             id,
             grant_id,
             authority_class,
             purpose_name,
-            principal_id
+            principal_id,
+            target_item_id,
+            target_review_status
         ) ON DELETE RESTRICT;
 
 DROP TRIGGER trg_service_delegation_token_subject ON service_delegation_tokens;
@@ -833,6 +915,9 @@ BEGIN
         p_authority_class || ':' || v_tenant_binding.id::TEXT || ':' ||
         v_principal_binding.id::TEXT || ':' || p_delegation_external_ref, 0
     ));
+    -- Idempotency keys remain issuer-global. If a key crosses authority
+    -- classes, token attribution in the conflict event comes only from the
+    -- existing token.
     SELECT idem.request_digest, token.*
     INTO v_existing_idem
     FROM service_delegation_idempotency AS idem
@@ -850,10 +935,15 @@ BEGIN
                 external_tenant_ref_digest, external_principal_ref_digest,
                 external_delegation_ref_digest, details
             ) VALUES (
-                'delegation.conflict', 'failure', v_issuer_id,
-                p_issuer_credential_id, v_owner.id, v_grant.id,
+                'delegation.conflict', 'failure',
+                v_existing_idem.issuer_service_client_id,
+                p_issuer_credential_id,
+                v_existing_idem.binding_owner_service_client_id,
+                v_existing_idem.grant_id,
                 v_existing_idem.id, v_existing_idem.tenant_id,
-                v_existing_idem.principal_id, p_authority_class, p_purpose_name,
+                v_existing_idem.principal_id,
+                v_existing_idem.authority_class,
+                v_existing_idem.purpose_name,
                 p_request_id, 'idempotency_key_reused',
                 sha256(convert_to(p_tenant_external_ref, 'UTF8')),
                 sha256(convert_to(p_principal_external_ref, 'UTF8')),
@@ -927,10 +1017,15 @@ BEGIN
                 external_tenant_ref_digest, external_principal_ref_digest,
                 external_delegation_ref_digest, details
             ) VALUES (
-                'delegation.conflict', 'failure', v_issuer_id,
-                p_issuer_credential_id, v_owner.id, v_grant.id,
+                'delegation.conflict', 'failure',
+                v_existing_token.issuer_service_client_id,
+                p_issuer_credential_id,
+                v_existing_token.binding_owner_service_client_id,
+                v_existing_token.grant_id,
                 v_existing_token.id, v_existing_token.tenant_id,
-                v_existing_token.principal_id, p_authority_class, p_purpose_name,
+                v_existing_token.principal_id,
+                v_existing_token.authority_class,
+                v_existing_token.purpose_name,
                 p_request_id, 'external_ref_conflict',
                 sha256(convert_to(p_tenant_external_ref, 'UTF8')),
                 sha256(convert_to(p_principal_external_ref, 'UTF8')),

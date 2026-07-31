@@ -255,7 +255,7 @@ class ServiceDelegationToken(Base):
     purpose_name: Mapped[str | None] = mapped_column(String(32), nullable=True)
     purpose_digest: Mapped[bytes | None] = mapped_column(nullable=True)
     target_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
-    target_review_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    target_review_status: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
     issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

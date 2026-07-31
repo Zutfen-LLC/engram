@@ -9,9 +9,11 @@ import uuid
 import pytest
 from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
+from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
 from starlette.requests import Request
 
+from engram.api.app import app
 from engram.api.routes.service_review_delegation import ReviewDelegationIssueRequest
 from engram.auth import Principal, get_current_principal
 from engram.config import Settings, settings
@@ -283,3 +285,17 @@ async def test_malformed_review_token_never_enters_ordinary_or_read_fallback(
     with pytest.raises(HTTPException) as exc:
         await get_current_principal(request, credentials)
     assert exc.value.status_code == 401
+
+
+async def test_ordinary_invalid_json_behavior_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "auth_enabled", False)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"/v1/items/{uuid.uuid4()}/review",
+            headers={"Content-Type": "application/json"},
+            content=b'{"review_status":',
+        )
+    assert response.status_code == 422
+    assert isinstance(response.json()["detail"], list)

@@ -109,6 +109,9 @@ ALTER TABLE item_events
     DROP COLUMN delegated_review_purpose;
 
 ALTER TABLE service_delegation_events
+    DROP CONSTRAINT fk_service_delegation_event_token_purpose,
+    DROP CONSTRAINT fk_service_delegation_event_token_attribution,
+    DROP CONSTRAINT chk_service_delegation_event_token_attribution,
     DROP CONSTRAINT chk_service_delegation_event_purpose,
     DROP COLUMN purpose_name,
     DROP COLUMN authority_class;
@@ -119,6 +122,9 @@ ALTER TABLE service_delegation_tokens
     DROP CONSTRAINT chk_service_delegation_token_class_scope,
     DROP CONSTRAINT chk_service_delegation_token_purpose,
     DROP CONSTRAINT uq_service_delegation_token_review_attribution,
+    DROP CONSTRAINT uq_service_delegation_token_event_attribution,
+    DROP CONSTRAINT uq_service_delegation_token_event_purpose,
+    DROP CONSTRAINT uq_service_delegation_token_review_target,
     DROP CONSTRAINT uq_service_delegation_token_external_ref_class;
 DROP INDEX idx_service_delegation_tokens_external_ref;
 ALTER TABLE service_delegation_tokens

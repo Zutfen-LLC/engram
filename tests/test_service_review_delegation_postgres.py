@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import uuid
@@ -309,6 +310,24 @@ async def _insert_item(
     return item_id
 
 
+async def _enable_read_authority(proof: dict[str, Any]) -> uuid.UUID:
+    read_grant_id = uuid.uuid4()
+    await proof["owner"].execute(
+        "UPDATE service_clients SET permissions=$2 WHERE id=$1",
+        proof["broker_id"],
+        ["delegation.issue", "delegation.review.issue"],
+    )
+    await proof["owner"].execute(
+        "INSERT INTO service_delegation_grants "
+        "(id,issuer_service_client_id,binding_owner_service_client_id,"
+        "authority_class,max_ttl_seconds) VALUES ($1,$2,$3,'read',60)",
+        read_grant_id,
+        proof["broker_id"],
+        proof["binding_owner_id"],
+    )
+    return read_grant_id
+
+
 def _headers(token: str, request_id: str | None = None) -> dict[str, str]:
     headers = {"Authorization": f"Bearer {token}"}
     if request_id is not None:
@@ -442,6 +461,229 @@ async def test_review_service_issue_replay_storage_revoke_and_class_isolation(
         proof["binding_owner_id"],
     )
     assert [row["authority_class"] for row in grants] == ["read", "review"]
+
+
+async def test_review_service_revoke_nonexistent_is_truthful_not_found(
+    review_delegation_db: dict[str, Any],
+) -> None:
+    proof = review_delegation_db
+    external_ref = f"missing-review-{uuid.uuid4().hex}"
+    before_tokens = await proof["owner"].fetch(
+        "SELECT id,status,revocation_reason FROM service_delegation_tokens "
+        "WHERE issuer_service_client_id=$1 ORDER BY id",
+        proof["broker_id"],
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/v1/service/review-delegations/revoke",
+            headers={"Authorization": f"Bearer {proof['broker_credential']}"},
+            json={
+                "binding_owner_service_client_slug": proof["owner_slug"],
+                "tenant_external_ref": proof["tenant_ref"],
+                "principal_external_ref": proof["principal_ref"],
+                "delegation_external_ref": external_ref,
+                "reason": "operator_action",
+            },
+        )
+    assert response.status_code == 200
+    assert response.json() == {"disposition": "not_found", "revoked": False}
+    assert response.json().get("detail", {}).get("code") != "REVIEW_DELEGATION_UNAVAILABLE"
+    _assert_sensitive_headers(response)
+
+    after_tokens = await proof["owner"].fetch(
+        "SELECT id,status,revocation_reason FROM service_delegation_tokens "
+        "WHERE issuer_service_client_id=$1 ORDER BY id",
+        proof["broker_id"],
+    )
+    assert after_tokens == before_tokens
+    events = await proof["owner"].fetch(
+        "SELECT event_type,outcome,issuer_service_client_id,issuer_credential_id,"
+        "binding_owner_service_client_id,grant_id,delegation_token_id,tenant_id,"
+        "principal_id,authority_class,purpose_name,reason_code,"
+        "external_tenant_ref_digest,external_principal_ref_digest,"
+        "external_delegation_ref_digest,details "
+        "FROM service_delegation_events "
+        "WHERE issuer_service_client_id=$1 AND reason_code='operator_action'",
+        proof["broker_id"],
+    )
+    assert len(events) == 1
+    event = events[0]
+    assert event["event_type"] == "delegation.resolved_existing"
+    assert event["outcome"] == "success"
+    assert event["issuer_service_client_id"] == proof["broker_id"]
+    assert event["issuer_credential_id"] == proof["credential_id"]
+    assert event["binding_owner_service_client_id"] == proof["binding_owner_id"]
+    assert event["grant_id"] == proof["review_grant_id"]
+    assert event["delegation_token_id"] is None
+    assert event["tenant_id"] is None
+    assert event["principal_id"] is None
+    assert event["authority_class"] == "review"
+    assert event["purpose_name"] is None
+    assert event["external_tenant_ref_digest"] == hashlib.sha256(
+        proof["tenant_ref"].encode()
+    ).digest()
+    assert event["external_principal_ref_digest"] == hashlib.sha256(
+        proof["principal_ref"].encode()
+    ).digest()
+    assert event["external_delegation_ref_digest"] == hashlib.sha256(
+        external_ref.encode()
+    ).digest()
+    assert json.loads(event["details"]) == {"disposition": "not_found"}
+
+
+async def test_cross_class_idempotency_conflict_uses_existing_token_attribution(
+    review_delegation_db: dict[str, Any],
+) -> None:
+    proof = review_delegation_db
+    read_grant_id = await _enable_read_authority(proof)
+    previous_delegation_enabled = settings.delegation_enabled
+    settings.delegation_enabled = True
+    idempotency_key = f"cross-class-{uuid.uuid4().hex}"
+    read_external_ref = f"read-cross-class-{uuid.uuid4().hex}"
+    review_external_ref = f"review-cross-class-{uuid.uuid4().hex}"
+    headers = {
+        "Authorization": f"Bearer {proof['broker_credential']}",
+        "Idempotency-Key": idempotency_key,
+    }
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            read_response = await client.post(
+                "/v1/service/delegations",
+                headers=headers,
+                json={
+                    "binding_owner_service_client_slug": proof["owner_slug"],
+                    "tenant_external_ref": proof["tenant_ref"],
+                    "principal_external_ref": proof["principal_ref"],
+                    "delegation_external_ref": read_external_ref,
+                    "ttl_seconds": 30,
+                },
+            )
+            assert read_response.status_code == 201
+            review_response = await client.post(
+                "/v1/service/review-delegations",
+                headers=headers,
+                json={
+                    "binding_owner_service_client_slug": proof["owner_slug"],
+                    "tenant_external_ref": proof["tenant_ref"],
+                    "principal_external_ref": proof["principal_ref"],
+                    "delegation_external_ref": review_external_ref,
+                    "purpose": {"kind": "review.queue"},
+                    "ttl_seconds": 30,
+                },
+            )
+    finally:
+        settings.delegation_enabled = previous_delegation_enabled
+
+    assert review_response.status_code == 409
+    assert review_response.json()["detail"]["code"] == "IDEMPOTENCY_KEY_REUSED"
+    assert await proof["owner"].fetchval(
+        "SELECT count(*) FROM service_delegation_tokens "
+        "WHERE issuer_service_client_id=$1 AND authority_class='review'",
+        proof["broker_id"],
+    ) == 0
+    read_token = await proof["owner"].fetchrow(
+        "SELECT id,issuer_service_client_id,binding_owner_service_client_id,"
+        "grant_id,tenant_id,principal_id,authority_class,purpose_name "
+        "FROM service_delegation_tokens WHERE external_ref=$1",
+        read_external_ref,
+    )
+    assert read_token is not None
+    assert read_token["grant_id"] == read_grant_id
+    event = await proof["owner"].fetchrow(
+        "SELECT issuer_service_client_id,binding_owner_service_client_id,"
+        "grant_id,delegation_token_id,tenant_id,principal_id,authority_class,"
+        "purpose_name,reason_code FROM service_delegation_events "
+        "WHERE delegation_token_id=$1 AND event_type='delegation.conflict'",
+        read_token["id"],
+    )
+    assert event is not None
+    assert event["reason_code"] == "idempotency_key_reused"
+    for field in (
+        "issuer_service_client_id",
+        "binding_owner_service_client_id",
+        "grant_id",
+        "tenant_id",
+        "principal_id",
+        "authority_class",
+        "purpose_name",
+    ):
+        assert event[field] == read_token[field]
+
+
+async def test_delegation_event_token_attribution_is_database_enforced(
+    review_delegation_db: dict[str, Any],
+) -> None:
+    import asyncpg
+
+    proof = review_delegation_db
+    read_grant_id = await _enable_read_authority(proof)
+    _material, issued, _external_ref = await _issue(
+        proof,
+        purpose=canonical_review_queue_purpose(),
+    )
+    token = await proof["owner"].fetchrow(
+        "SELECT id,issuer_service_client_id,issuer_credential_id,"
+        "binding_owner_service_client_id,grant_id,tenant_id,principal_id,"
+        "authority_class,purpose_name FROM service_delegation_tokens WHERE id=$1",
+        issued["delegation_token_id"],
+    )
+    assert token is not None
+    other_tenant_id = await proof["owner"].fetchval(
+        "SELECT id FROM tenants WHERE id<>$1 ORDER BY created_at LIMIT 1",
+        proof["tenant_id"],
+    )
+    assert other_tenant_id is not None
+    mismatches = (
+        {"authority_class": "read", "purpose_name": None},
+        {"grant_id": read_grant_id},
+        {"purpose_name": "review.transition"},
+        {"tenant_id": other_tenant_id},
+        {"principal_id": proof["other_principal_id"]},
+    )
+    for mismatch in mismatches:
+        values = dict(token)
+        values.update(mismatch)
+        with pytest.raises(asyncpg.ForeignKeyViolationError):
+            await proof["owner"].execute(
+                "INSERT INTO service_delegation_events "
+                "(event_type,outcome,issuer_service_client_id,issuer_credential_id,"
+                "binding_owner_service_client_id,grant_id,delegation_token_id,"
+                "tenant_id,principal_id,authority_class,purpose_name,request_id,"
+                "reason_code,details) VALUES "
+                "('delegation.conflict','failure',$1,$2,$3,$4,$5,$6,$7,$8,$9,"
+                "$10,'direct_consistency_check','{\"disposition\":\"conflict\"}'::jsonb)",
+                values["issuer_service_client_id"],
+                values["issuer_credential_id"],
+                values["binding_owner_service_client_id"],
+                values["grant_id"],
+                values["id"],
+                values["tenant_id"],
+                values["principal_id"],
+                values["authority_class"],
+                values["purpose_name"],
+                f"event-consistency-{uuid.uuid4().hex}",
+            )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await proof["owner"].execute(
+            "INSERT INTO service_delegation_events "
+            "(event_type,outcome,issuer_service_client_id,issuer_credential_id,"
+            "binding_owner_service_client_id,grant_id,delegation_token_id,"
+            "tenant_id,principal_id,authority_class,purpose_name,request_id,"
+            "reason_code,details) VALUES "
+            "('delegation_grant.created','success',$1,$2,$3,$4,$5,$6,$7,"
+            "'review',NULL,$8,'direct_consistency_check',"
+            "'{\"disposition\":\"conflict\"}'::jsonb)",
+            token["issuer_service_client_id"],
+            token["issuer_credential_id"],
+            token["binding_owner_service_client_id"],
+            token["grant_id"],
+            token["id"],
+            token["tenant_id"],
+            token["principal_id"],
+            f"event-consistency-{uuid.uuid4().hex}",
+        )
 
 
 async def test_review_queue_is_fixed_visible_and_purpose_confined(
@@ -621,6 +863,60 @@ async def test_review_transition_is_single_use_and_has_internal_attribution(
             issued["delegation_token_id"],
             proof["review_grant_id"],
         )
+    wrong_item_id = await _insert_item(proof, visibility="tenant")
+    with pytest.raises(asyncpg.ForeignKeyViolationError):
+        await proof["owner"].execute(
+            "INSERT INTO item_events "
+            "(item_id,tenant_id,memory_context_version,event_type,field_name,"
+            "new_value,actor_principal_id,delegated_review_token_id,"
+            "delegated_review_grant_id,delegated_review_authority_class,"
+            "delegated_review_purpose) VALUES "
+            "($1,$2,'legacy-unprofiled-v0','review_change','review_status',$3,"
+            "$4,$5,$6,'review','review.transition')",
+            wrong_item_id,
+            proof["tenant_id"],
+            target_status,
+            proof["principal_id"],
+            issued["delegation_token_id"],
+            proof["review_grant_id"],
+        )
+    wrong_status = "rejected" if target_status == "active" else "active"
+    with pytest.raises(asyncpg.ForeignKeyViolationError):
+        await proof["owner"].execute(
+            "INSERT INTO item_events "
+            "(item_id,tenant_id,memory_context_version,event_type,field_name,"
+            "new_value,actor_principal_id,delegated_review_token_id,"
+            "delegated_review_grant_id,delegated_review_authority_class,"
+            "delegated_review_purpose) VALUES "
+            "($1,$2,'legacy-unprofiled-v0','review_change','review_status',$3,"
+            "$4,$5,$6,'review','review.transition')",
+            item_id,
+            proof["tenant_id"],
+            wrong_status,
+            proof["principal_id"],
+            issued["delegation_token_id"],
+            proof["review_grant_id"],
+        )
+    _queue_material, queue_issued, _queue_ref = await _issue(
+        proof,
+        purpose=canonical_review_queue_purpose(),
+    )
+    with pytest.raises(asyncpg.ForeignKeyViolationError):
+        await proof["owner"].execute(
+            "INSERT INTO item_events "
+            "(item_id,tenant_id,memory_context_version,event_type,field_name,"
+            "new_value,actor_principal_id,delegated_review_token_id,"
+            "delegated_review_grant_id,delegated_review_authority_class,"
+            "delegated_review_purpose) VALUES "
+            "($1,$2,'legacy-unprofiled-v0','review_change','review_status',$3,"
+            "$4,$5,$6,'review','review.transition')",
+            item_id,
+            proof["tenant_id"],
+            target_status,
+            proof["principal_id"],
+            queue_issued["delegation_token_id"],
+            proof["review_grant_id"],
+        )
 
 
 async def test_transition_purpose_mismatches_revoke_without_memory_mutation(
@@ -632,6 +928,16 @@ async def test_transition_purpose_mismatches_revoke_without_memory_mutation(
     expected = {"review_status": "active", "reason": "exact reason"}
     cases: tuple[tuple[str, bytes, str], ...] = (
         (f"/v1/items/{other_item_id}/review", json.dumps(expected).encode(), "application/json"),
+        (
+            f"/v1/items/{item_id}/review?debug=1",
+            json.dumps(expected).encode(),
+            "application/json",
+        ),
+        (
+            f"/v1/items/{str(item_id).upper()}/review",
+            json.dumps(expected).encode(),
+            "application/json",
+        ),
         (
             f"/v1/items/{item_id}/review",
             json.dumps({"review_status": "rejected", "reason": "exact reason"}).encode(),
@@ -656,6 +962,26 @@ async def test_transition_purpose_mismatches_revoke_without_memory_mutation(
             f"/v1/items/{item_id}/review",
             json.dumps(expected).encode(),
             "application/json; charset=ascii",
+        ),
+        (
+            f"/v1/items/{item_id}/review",
+            json.dumps(expected).encode(),
+            "text/json",
+        ),
+        (
+            f"/v1/items/{item_id}/review",
+            b'{"review_status":',
+            "application/json",
+        ),
+        (
+            f"/v1/items/{item_id}/review",
+            b'{"review_status":"active","reason":"\xff"}',
+            "application/json",
+        ),
+        (
+            f"/v1/items/{item_id}/review",
+            b"x" * 4097,
+            "application/json",
         ),
     )
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -685,6 +1011,13 @@ async def test_transition_purpose_mismatches_revoke_without_memory_mutation(
                 "AND reason_code='purpose_mismatch'",
                 issued["delegation_token_id"],
             ) == 1
+            retry = await client.post(
+                f"/v1/items/{item_id}/review",
+                headers=_headers(material.token),
+                json=expected,
+            )
+            assert retry.status_code == 401
+            assert retry.json()["detail"] == "Invalid or revoked API key"
     assert await proof["owner"].fetchval(
         "SELECT review_status FROM memory_items WHERE id=$1",
         item_id,
@@ -950,6 +1283,27 @@ async def test_review_authority_refuses_downgrade_atomically(
     import asyncpg
 
     proof = review_delegation_db
+    item_id = await _insert_item(proof, visibility="tenant")
+    material, _issued, _external_ref = await _issue(
+        proof,
+        purpose=canonical_review_transition_purpose(
+            item_id=str(item_id),
+            review_status="active",
+            reason="downgrade evidence",
+        ),
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"/v1/items/{item_id}/review",
+            headers=_headers(material.token),
+            json={"review_status": "active", "reason": "downgrade evidence"},
+        )
+    assert response.status_code == 200
+    assert await proof["owner"].fetchval(
+        "SELECT count(*) FROM item_events "
+        "WHERE item_id=$1 AND delegated_review_token_id IS NOT NULL",
+        item_id,
+    ) == 1
     downgrade_sql = (
         Path(__file__).resolve().parents[1]
         / "migrations"
