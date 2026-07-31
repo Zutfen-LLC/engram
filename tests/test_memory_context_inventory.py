@@ -59,6 +59,10 @@ _EXPLICITLY_UNAFFECTED_GET_ROUTES = {
     ("GET", "/v1/context-receipts"),
     ("GET", "/v1/context-receipts/{receipt_id}"),
     ("GET", "/v1/context-receipts/{receipt_id}/verify"),
+    (
+        "GET",
+        "/v1/service/portal-installation-enrollments/{installation_external_ref}",
+    ),
 }
 
 

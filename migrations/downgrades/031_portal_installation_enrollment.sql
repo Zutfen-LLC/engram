@@ -17,6 +17,11 @@ $$;
 DROP FUNCTION enroll_portal_installation(
     BYTEA, UUID, BYTEA, BYTEA, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT
 );
+DROP FUNCTION rotate_portal_installation_credentials(
+    BYTEA, UUID, INTEGER, UUID, BYTEA, BYTEA,
+    TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT
+);
+DROP FUNCTION terminate_portal_installation_enrollment(UUID, TEXT, TEXT);
 DROP TRIGGER trg_portal_enrollment_event_check
     ON portal_installation_enrollment_events;
 DROP TRIGGER trg_portal_enrollment_grant_check ON service_delegation_grants;
@@ -37,3 +42,5 @@ DROP FUNCTION reject_portal_enrollment_event_mutation();
 DROP TABLE portal_installation_enrollment_events;
 DROP TABLE portal_installation_enrollment_clients;
 DROP TABLE portal_installation_enrollments;
+ALTER TABLE service_client_credentials
+    DROP COLUMN portal_enrollment_revocation_reason;

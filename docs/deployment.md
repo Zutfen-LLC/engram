@@ -107,6 +107,36 @@ The endpoint creates exactly one provisioning owner, one read broker, one review
 broker, and two 60-second grants. Core selects all slugs, permissions, authority
 classes, and TTL limits.
 
+An active enrollment has one credential generation. It has one current active
+credential for each fixed role. Portal can rotate all three credentials in one
+request at
+`POST /v1/service/portal-installation-enrollments/rotate-credentials`. The
+request must include the installation reference, expected generation, rotation
+reference, and three caller-generated key IDs and SHA-256 digests. It must also
+include the pairing authorization and an `Idempotency-Key` header. Do not send
+raw service credentials to Core. An exact replay returns the committed
+generation. A changed replay or stale generation returns a bounded conflict.
+
+Portal can reconcile the enrollment at
+`GET /v1/service/portal-installation-enrollments/{installation_external_ref}`.
+The response contains only the lifecycle status, credential generation, and
+three readiness values. It does not contain credential or authority details.
+
+Only a database owner can terminate enrolled authority. Termination is atomic
+and irreversible. It revokes all enrolled credentials and grants. It disables
+all three clients. It also invalidates active delegated tokens.
+
+```bash
+engram portal-enrollment terminate \
+  --installation <installation-uuid> \
+  --reason security_incident
+```
+
+The command accepts `operator_action`, `security_incident`, or
+`client_disabled`. A repeated command succeeds without a second terminal event.
+Generic service-client and delegation-grant mutation commands reject enrolled
+targets. Use the Portal enrollment termination command for these targets.
+
 For local development, create one high-entropy pairing credential in a file
 outside the repository. Do not print or copy the credential into `.env`.
 
