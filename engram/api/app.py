@@ -74,6 +74,7 @@ def create_app() -> FastAPI:
         kg,
         memory,
         memory_profiles,
+        portal_enrollment,
         review,
         service_delegation,
         service_provisioning,
@@ -96,6 +97,7 @@ def create_app() -> FastAPI:
     app.include_router(admin.router, prefix="/v1", tags=["admin"])
     app.include_router(telemetry.router, prefix="/v1", tags=["telemetry"])
     app.include_router(service_provisioning.router, prefix="/v1", tags=["service-provisioning"])
+    app.include_router(portal_enrollment.router, prefix="/v1", tags=["portal-enrollment"])
     app.include_router(service_delegation.router, prefix="/v1", tags=["service-delegation"])
     app.include_router(
         service_review_delegation.router,

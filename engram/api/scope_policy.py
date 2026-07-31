@@ -124,6 +124,11 @@ def build_custom_openapi(app: FastAPI) -> dict[str, Any]:
     schema.setdefault("components", {}).setdefault("securitySchemes", {})[
         "EngramServiceCredential"
     ] = {"type": "http", "scheme": "bearer", "bearerFormat": "engsvc"}
+    schema["components"]["securitySchemes"]["EngramPortalEnrollmentCredential"] = {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "engpair",
+    }
 
     app.openapi_schema = schema
     return schema
