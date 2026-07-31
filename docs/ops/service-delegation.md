@@ -176,6 +176,10 @@ Core checks the raw request before framework body validation for an `engdr_`
 attempt. Malformed JSON, duplicate keys, oversized bodies, forbidden fields,
 invalid content types, invalid UTF-8, query parameters, and noncanonical paths
 are terminal purpose mismatches. Core does not store the raw header or body.
+Duplicate Authorization headers cannot bypass this check. If they contain one
+distinct review credential, Core terminally denies that credential. If they
+contain multiple distinct review credentials, Core rejects the request without
+selecting one.
 
 The review event actor is always the bound human. Internal event columns record
 the review token, grant, authority class, purpose, target item, and target

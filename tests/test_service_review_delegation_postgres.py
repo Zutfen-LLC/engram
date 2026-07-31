@@ -1028,6 +1028,82 @@ async def test_transition_purpose_mismatches_revoke_without_memory_mutation(
     ) == 0
 
 
+async def test_duplicate_authorization_review_attempts_fail_before_body_validation(
+    review_delegation_db: dict[str, Any],
+) -> None:
+    proof = review_delegation_db
+    item_id = await _insert_item(proof, visibility="tenant")
+    expected = {"review_status": "active", "reason": "exact reason"}
+    purpose = canonical_review_transition_purpose(
+        item_id=str(item_id),
+        review_status="active",
+        reason="exact reason",
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        for arrangement in ("review_first", "review_last", "review_duplicate"):
+            material, issued, _external_ref = await _issue(proof, purpose=purpose)
+            review_header = ("Authorization", f"Bearer {material.token}")
+            other_header = ("Authorization", "Bearer eng_ordinary")
+            if arrangement == "review_first":
+                authorization_headers = [review_header, other_header]
+            elif arrangement == "review_last":
+                authorization_headers = [other_header, review_header]
+            else:
+                authorization_headers = [review_header, review_header]
+
+            response = await client.post(
+                f"/v1/items/{item_id}/review",
+                headers=authorization_headers + [("Content-Type", "application/json")],
+                content=b'{"review_status":',
+            )
+            assert response.status_code == 401
+            assert response.json()["detail"] == "Invalid or revoked API key"
+            _assert_sensitive_headers(response)
+            row = await proof["owner"].fetchrow(
+                "SELECT status,revocation_reason FROM service_delegation_tokens WHERE id=$1",
+                issued["delegation_token_id"],
+            )
+            assert tuple(row.values()) == ("revoked", "purpose_mismatch")
+            assert await proof["owner"].fetchval(
+                "SELECT count(*) FROM service_delegation_events "
+                "WHERE delegation_token_id=$1 AND event_type='delegation.denied' "
+                "AND reason_code='purpose_mismatch'",
+                issued["delegation_token_id"],
+            ) == 1
+
+            retry = await client.post(
+                f"/v1/items/{item_id}/review",
+                headers=_headers(material.token),
+                json=expected,
+            )
+            assert retry.status_code == 401
+            assert retry.json()["detail"] == "Invalid or revoked API key"
+
+        first_material, _first_issued, _first_ref = await _issue(proof, purpose=purpose)
+        second_material, _second_issued, _second_ref = await _issue(proof, purpose=purpose)
+        distinct_response = await client.post(
+            f"/v1/items/{item_id}/review",
+            headers=[
+                ("Authorization", f"Bearer {first_material.token}"),
+                ("Authorization", f"Bearer {second_material.token}"),
+                ("Content-Type", "application/json"),
+            ],
+            content=b'{"review_status":',
+        )
+
+    assert distinct_response.status_code == 401
+    assert distinct_response.json()["detail"] == "Invalid or revoked API key"
+    _assert_sensitive_headers(distinct_response)
+    assert await proof["owner"].fetchval(
+        "SELECT review_status FROM memory_items WHERE id=$1",
+        item_id,
+    ) == "proposed"
+    assert await proof["owner"].fetchval(
+        "SELECT count(*) FROM item_events WHERE item_id=$1",
+        item_id,
+    ) == 0
+
+
 async def test_matching_missing_stale_and_opposing_transition_race_are_bounded(
     review_delegation_db: dict[str, Any],
 ) -> None:

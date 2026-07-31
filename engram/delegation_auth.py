@@ -14,6 +14,7 @@ import re
 import secrets
 import string
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -608,6 +609,7 @@ async def resolve_review_delegated_principal(
     *,
     request: Request,
     request_id: str | None,
+    force_purpose_mismatch: bool = False,
 ) -> Principal:
     """Consume one purpose-matched review token before handler execution."""
     try:
@@ -754,10 +756,10 @@ async def resolve_review_delegated_principal(
                     )
                     denied = True
                 else:
-                    try:
-                        actual_purpose = await review_purpose_from_request(request)
-                    except (ValueError, RuntimeError):
-                        actual_purpose = None
+                    actual_purpose = None
+                    if not force_purpose_mismatch:
+                        with suppress(ValueError, RuntimeError):
+                            actual_purpose = await review_purpose_from_request(request)
                     purpose_matches = (
                         actual_purpose is not None
                         and actual_purpose.name == token_row.purpose_name

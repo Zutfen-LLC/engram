@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 from fastapi import HTTPException, Request
@@ -43,27 +44,40 @@ def is_delegated_request(request: Request) -> bool:
     return False
 
 
-def _review_delegation_token(scope: Scope) -> str | None:
-    """Return one review token without retaining the raw authorization header."""
+@dataclass(frozen=True)
+class _ReviewDelegationAttempt:
+    credential: str | None
+    ambiguous: bool
+
+
+def _review_delegation_attempt(scope: Scope) -> _ReviewDelegationAttempt | None:
+    """Classify any review Bearer value without retaining raw headers."""
     authorization_values = [
         raw_value
         for name, raw_value in scope.get("headers", ())
         if name.lower() == _AUTHORIZATION_HEADER
     ]
-    if len(authorization_values) != 1:
+    review_credentials: set[str] = set()
+    for raw_value in authorization_values:
+        if not isinstance(raw_value, bytes):
+            continue
+        value = raw_value.decode("latin-1")
+        scheme, separator, credential = value.partition(" ")
+        if (
+            separator
+            and scheme.lower() == "bearer"
+            and credential.startswith(_REVIEW_DELEGATION_PREFIX)
+        ):
+            review_credentials.add(credential)
+    if not review_credentials:
         return None
-    raw_value = authorization_values[0]
-    if not isinstance(raw_value, bytes):
-        return None
-    value = raw_value.decode("latin-1")
-    scheme, separator, credential = value.partition(" ")
-    if (
-        not separator
-        or scheme.lower() != "bearer"
-        or not credential.startswith(_REVIEW_DELEGATION_PREFIX)
-    ):
-        return None
-    return credential
+    selected_credential = (
+        next(iter(review_credentials)) if len(review_credentials) == 1 else None
+    )
+    return _ReviewDelegationAttempt(
+        credential=selected_credential,
+        ambiguous=len(authorization_values) != 1,
+    )
 
 
 async def _bounded_review_body(receive: Receive) -> bytes:
@@ -107,8 +121,8 @@ class ReviewDelegationRequestMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        token = _review_delegation_token(scope)
-        if token is None:
+        attempt = _review_delegation_attempt(scope)
+        if attempt is None:
             await self.app(scope, receive, send)
             return
 
@@ -127,14 +141,24 @@ class ReviewDelegationRequestMiddleware:
             return
 
         body = await _bounded_review_body(receive)
+        if attempt.credential is None:
+            response = JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid or revoked API key"},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            await response(scope, _replay_receive(b""), send)
+            return
+
         auth_request = StarletteRequest(scope, _replay_receive(body))
         try:
             from engram.delegation_auth import resolve_review_delegated_principal
 
             principal = await resolve_review_delegated_principal(
-                token,
+                attempt.credential,
                 request=auth_request,
                 request_id=request_id_for(auth_request),
+                force_purpose_mismatch=attempt.ambiguous,
             )
         except HTTPException as exc:
             response = JSONResponse(
