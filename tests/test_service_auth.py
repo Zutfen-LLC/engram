@@ -51,6 +51,7 @@ def test_extended_service_permissions_are_canonical() -> None:
             "principal.provision",
             "tenant.provision",
             "delegation.issue",
+            "delegation.review.issue",
         ]
     ) == [
         "tenant.provision",
@@ -59,6 +60,7 @@ def test_extended_service_permissions_are_canonical() -> None:
         "agent.provision",
         "api_key.provision",
         "delegation.issue",
+        "delegation.review.issue",
     ]
 
 

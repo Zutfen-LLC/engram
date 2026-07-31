@@ -29,6 +29,10 @@ the effective response request ID is also used for Core delegation audit
 evidence. This is a response boundary for direct Core routes, not a generic
 hosted proxy or a browser token-delivery mechanism.
 
-Delegated review is deferred. It requires an explicit step-up design that
-preserves the authenticated reviewer, represented party, transition policy,
-and audit attribution; the read-only broker must not be broadened for it.
+Core now provides a separate purpose-bound review step-up primitive. It uses
+the `engdr_` credential domain and the `delegation.review.issue` service
+permission. It does not broaden the read broker.
+
+Portal integration remains deferred. A future Portal BFF can request one queue
+inspection or one proposed-item activation or rejection. It must not deliver
+Core or service credentials to the browser.

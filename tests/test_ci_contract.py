@@ -247,6 +247,24 @@ def test_env_example_documents_context_receipt_dark_write_settings() -> None:
     assert "ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_TIMEOUT_SECONDS=1.0" in env
 
 
+def test_compose_and_env_document_review_delegation_settings() -> None:
+    compose = (REPOSITORY_ROOT / "docker-compose.yml").read_text()
+    ci_compose = (REPOSITORY_ROOT / "docker-compose.ci.yml").read_text()
+    env = (REPOSITORY_ROOT / ".env.example").read_text()
+
+    api_section = compose.split("engram-service:", 1)[1].split("engram-worker:", 1)[0]
+    worker_section = compose.split("engram-worker:", 1)[1]
+    for setting in (
+        "ENGRAM_REVIEW_DELEGATION_ENABLED",
+        "ENGRAM_REVIEW_DELEGATION_DEFAULT_TTL_SECONDS",
+        "ENGRAM_REVIEW_DELEGATION_MAX_TTL_SECONDS",
+    ):
+        assert setting in api_section
+        assert setting not in worker_section
+        assert setting in env
+    assert 'ENGRAM_REVIEW_DELEGATION_ENABLED: "true"' in ci_compose
+
+
 def test_ci_dockerfile_separates_dependencies_from_source_binding() -> None:
     dockerfile = (REPOSITORY_ROOT / "Dockerfile").read_text()
 

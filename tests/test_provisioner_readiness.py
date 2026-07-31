@@ -91,6 +91,8 @@ async def test_ready_rejects_any_invalid_provisioner_posture(monkeypatch, overri
     from engram.config import settings
 
     monkeypatch.setattr(settings, "service_provisioning_enabled", True)
+    monkeypatch.setattr(settings, "delegation_enabled", False)
+    monkeypatch.setattr(settings, "review_delegation_enabled", False)
     app = create_app()
     _override_normal_ready_session(app)
     _install_provisioner(monkeypatch, _role(**override))
@@ -107,6 +109,8 @@ async def test_ready_rejects_missing_provisioning_objects(monkeypatch, tables, f
     from engram.config import settings
 
     monkeypatch.setattr(settings, "service_provisioning_enabled", True)
+    monkeypatch.setattr(settings, "delegation_enabled", False)
+    monkeypatch.setattr(settings, "review_delegation_enabled", False)
     app = create_app()
     _override_normal_ready_session(app)
     _install_provisioner(monkeypatch, _role(), tables=tables, function=function)
@@ -122,6 +126,8 @@ async def test_ready_accepts_the_intended_provisioner_posture(monkeypatch) -> No
     from engram.config import settings
 
     monkeypatch.setattr(settings, "service_provisioning_enabled", True)
+    monkeypatch.setattr(settings, "delegation_enabled", False)
+    monkeypatch.setattr(settings, "review_delegation_enabled", False)
     app = create_app()
     _override_normal_ready_session(app)
     _install_provisioner(monkeypatch, _role())

@@ -1972,12 +1972,17 @@ async def _insert_item_event(
     reason: str | None,
     memory_context: ResolvedMemoryContext,
     on_behalf_of_principal_id: UUID | None = None,
+    delegated_review_token_id: UUID | None = None,
+    delegated_review_grant_id: UUID | None = None,
+    delegated_review_authority_class: str | None = None,
+    delegated_review_purpose: str | None = None,
 ) -> dict[str, Any]:
     """Write an ``item_events`` audit row. ``actor_principal_id`` is required —
     always the authenticated caller (see :func:`_resolve_actor_and_delegation`),
     never a caller-facing request model. Delegation, when present, is folded
-    into ``reason`` (see :func:`_encode_delegation_reason`); the returned dict
-    reflects the same encoding stored on the row.
+    into ``reason`` (see :func:`_encode_delegation_reason`). Purpose-bound
+    review attribution uses internal columns. The returned dict omits those
+    internal columns.
     """
     event = {
         "id": uuid.uuid4(),
@@ -1991,7 +1996,14 @@ async def _insert_item_event(
         "reason": _encode_delegation_reason(reason, on_behalf_of_principal_id),
         "created_at": _now_dt(),
     }
-    await session.execute(insert(ItemEvent).values(**event))
+    storage_event = {
+        **event,
+        "delegated_review_token_id": delegated_review_token_id,
+        "delegated_review_grant_id": delegated_review_grant_id,
+        "delegated_review_authority_class": delegated_review_authority_class,
+        "delegated_review_purpose": delegated_review_purpose,
+    }
+    await session.execute(insert(ItemEvent).values(**storage_event))
     return event
 
 

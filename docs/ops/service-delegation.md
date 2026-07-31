@@ -6,7 +6,7 @@ tenant, workspace, membership, API key, or memory profile.
 
 ## Credential domains
 
-Core has three deliberately separate bearer grammars:
+Core has four separate bearer grammars:
 
 - `eng_` is an ordinary tenant-principal API key with persisted scopes.
 - `engsvc_` authenticates a non-principal service client to narrow provisioning
@@ -15,6 +15,10 @@ Core has three deliberately separate bearer grammars:
   authenticates as one existing bound `type=user` principal with scope exactly
   `read` and audience `engram-core`. Its exact Bearer-compatible grammar is
   `engd_<22-character-base62-key-id>_<43-character-URL-safe-secret>`.
+- `engdr_` is an opaque, database-backed, single-use review credential. It
+  has scope exactly `review`. It is bound to one `review.queue` or
+  `review.transition` purpose. Its grammar is
+  `engdr_<22-character-base62-key-id>_<43-character-URL-safe-secret>`.
 
 An `engd_` credential is never a service credential or ordinary API key.
 Service routes accept only strict `engsvc_` credentials. Delegated material is
@@ -134,6 +138,46 @@ codes and SHA-256 external-reference digests, never raw references, raw
 idempotency keys, credentials, tokens, headers, bodies, URLs, database URLs, or
 exception text.
 
-Browser delivery, refresh tokens, token chaining, offline introspection, review
-authority, and Portal proxying are not part of this slice. Review delegation
-requires a later step-up design.
+## Purpose-bound review step-up
+
+Review delegation is disabled by default. Enable it only after migration 030:
+
+```text
+ENGRAM_REVIEW_DELEGATION_ENABLED=true
+ENGRAM_REVIEW_DELEGATION_DEFAULT_TTL_SECONDS=30
+ENGRAM_REVIEW_DELEGATION_MAX_TTL_SECONDS=60
+```
+
+Use a separate review broker when possible. Grant only
+`delegation.review.issue` to that client. Then create a review grant:
+
+```bash
+engram service-client set-permissions review-broker \
+  --permission delegation.review.issue
+
+engram delegation-grant create \
+  --issuer review-broker \
+  --binding-owner control-plane-provisioner \
+  --authority-class review \
+  --max-ttl-seconds 60
+```
+
+`POST /v1/service/review-delegations` accepts one fixed purpose. The
+`review.queue` purpose permits only `GET /v1/review/queue` with no query
+parameters. The `review.transition` purpose permits one exact request to
+activate or reject one proposed item. It binds the item ID, target state, and
+reason.
+
+Core consumes a matching token before route execution. A purpose mismatch
+revokes the token and returns the generic delegated `401`. A later `404` or
+`409` does not restore the token.
+
+The review event actor is always the bound human. Internal event columns record
+the review token, grant, authority class, and purpose. API responses do not
+expose those columns.
+
+Read and review grants are separate. `delegation.issue` cannot issue or revoke
+a review token. `delegation.review.issue` cannot issue or revoke a read token.
+
+Browser delivery, refresh tokens, token chaining, offline introspection, and
+Portal proxying are not part of this Core slice.

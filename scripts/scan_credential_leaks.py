@@ -13,12 +13,14 @@ import asyncpg
 from engram.migrations import normalize_asyncpg_url
 
 PATTERNS = (
+    re.compile(rb"engdr_[0-9A-Za-z]{22}_[A-Za-z0-9_-]{43}"),
     re.compile(rb"engd_[0-9A-Za-z]{22}_[A-Za-z0-9_-]{43}"),
     re.compile(rb"engsvc_[0-9A-Za-z]{22}_[A-Za-z0-9_-]{43}"),
     re.compile(rb"eng_[0-9A-Za-z]{22}_[A-Za-z0-9_-]{43}"),
 )
 POSTGRES_PATTERN = (
-    r"(engd_[0-9A-Za-z]{22}_[A-Za-z0-9_-]{43}|"
+    r"(engdr_[0-9A-Za-z]{22}_[A-Za-z0-9_-]{43}|"
+    r"engd_[0-9A-Za-z]{22}_[A-Za-z0-9_-]{43}|"
     r"engsvc_[0-9A-Za-z]{22}_[A-Za-z0-9_-]{43}|"
     r"eng_[0-9A-Za-z]{22}_[A-Za-z0-9_-]{43})"
 )

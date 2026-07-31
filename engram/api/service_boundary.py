@@ -14,7 +14,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 _SERVICE_PREFIX = "/v1/service/"
 _REQUEST_ID = re.compile(r"^[\x21-\x7e]{1,128}$")
 _AUTHORIZATION_HEADER = b"authorization"
-_DELEGATION_PREFIX = "engd_"
+_DELEGATION_PREFIXES = ("engd_", "engdr_")
 
 
 def is_service_request(request: Request) -> bool:
@@ -28,7 +28,11 @@ def is_delegated_request(request: Request) -> bool:
             continue
         value = raw_value.decode("latin-1")
         scheme, separator, credential = value.partition(" ")
-        if separator and scheme.lower() == "bearer" and credential.startswith(_DELEGATION_PREFIX):
+        if (
+            separator
+            and scheme.lower() == "bearer"
+            and credential.startswith(_DELEGATION_PREFIXES)
+        ):
             return True
     return False
 

@@ -112,6 +112,10 @@ CREATE_STATEMENTS = [
         old_value TEXT,
         new_value TEXT,
         actor_principal_id TEXT,
+        delegated_review_token_id TEXT,
+        delegated_review_grant_id TEXT,
+        delegated_review_authority_class TEXT,
+        delegated_review_purpose TEXT,
         reason TEXT,
         created_at TEXT NOT NULL
     )

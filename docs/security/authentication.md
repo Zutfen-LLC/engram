@@ -1,12 +1,13 @@
 # Authentication domains
 
-Engram uses three non-interchangeable bearer formats.
+Engram uses four non-interchangeable bearer formats.
 
 | Prefix | Identity | Authority | Persistence and caching |
 |---|---|---|---|
 | `eng_` | Tenant principal | Ordinary API scopes | Key ID plus digest for new keys; successful principals may use the short API-key cache |
-| `engsvc_` | Service client | Provisioning or `delegation.issue` permissions | Key ID plus digest; accepted only by service routes |
+| `engsvc_` | Service client | Provisioning or explicit delegation permissions | Key ID plus digest; accepted only by service routes |
 | `engd_` | Existing bound human principal | Exactly `read`, once | Key ID plus digest; never cached or refreshed |
+| `engdr_` | Existing bound human principal | Exactly `review`, once, for one purpose | Key ID plus digest and bounded purpose fields; never cached or refreshed |
 
 Delegated credentials use the Bearer-compatible grammar
 `engd_<22-character-base62-key-id>_<43-character-URL-safe-secret>`.
@@ -15,7 +16,7 @@ invalid ordinary credentials, but are never interpreted as legacy `eng_` keys.
 Service routes use the strict service parser and reject delegated credentials.
 
 Before authentication, the response boundary classifies only a Bearer attempt
-whose credential begins with the reserved `engd_` prefix. Classification does
+whose credential begins with the reserved `engd_` or `engdr_` prefix. Classification does
 not parse, validate, hash, persist, log, authenticate, or consume the
 credential. This means malformed delegated Bearer attempts receive the same
 private response contract as valid delegated requests:
