@@ -42,6 +42,7 @@ def _request(*headers: tuple[bytes, bytes]) -> StarletteRequest:
     "authorization",
     [
         b"Bearer engd_malformed",
+        b"Bearer engdr_malformed",
         b"bearer engd_malformed",
         b"BEARER engd_malformed",
     ],

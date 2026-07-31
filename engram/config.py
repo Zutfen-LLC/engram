@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     delegation_enabled: bool = False
     delegation_default_ttl_seconds: int = 60
     delegation_max_ttl_seconds: int = 300
+    review_delegation_enabled: bool = False
+    review_delegation_default_ttl_seconds: int = 30
+    review_delegation_max_ttl_seconds: int = 60
 
     # Read-oriented database URL (ENG-AUD-011 / F18). Optional: when unset,
     # read-heavy paths (currently: startup recall candidate selection) use
@@ -242,6 +245,24 @@ class Settings(BaseSettings):
         if self.delegation_enabled and not self.service_provisioning_enabled:
             raise ValueError(
                 "service_provisioning_enabled must be true when delegation_enabled=true"
+            )
+        if not 30 <= self.review_delegation_max_ttl_seconds <= 60:
+            raise ValueError(
+                "review_delegation_max_ttl_seconds must be between 30 and 60"
+            )
+        if not (
+            30
+            <= self.review_delegation_default_ttl_seconds
+            <= self.review_delegation_max_ttl_seconds
+        ):
+            raise ValueError(
+                "review_delegation_default_ttl_seconds must be between 30 and "
+                "review_delegation_max_ttl_seconds"
+            )
+        if self.review_delegation_enabled and not self.service_provisioning_enabled:
+            raise ValueError(
+                "service_provisioning_enabled must be true when "
+                "review_delegation_enabled=true"
             )
         return self
 

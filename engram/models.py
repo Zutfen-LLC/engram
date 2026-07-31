@@ -218,6 +218,7 @@ class ServiceDelegationGrant(Base):
     binding_owner_service_client_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), nullable=False
     )
+    authority_class: Mapped[str] = mapped_column(String(16), nullable=False, default="read")
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
     max_ttl_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -244,12 +245,17 @@ class ServiceDelegationToken(Base):
     principal_binding_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     principal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    authority_class: Mapped[str] = mapped_column(String(16), nullable=False, default="read")
     external_ref: Mapped[str] = mapped_column(String(255), nullable=False)
     key_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
     secret_digest: Mapped[str] = mapped_column(String(64), nullable=False)
     digest_algorithm: Mapped[str] = mapped_column(String(32), nullable=False, default="sha256")
     scopes: Mapped[list[str]] = mapped_column(ARRAY(String), nullable=False)
     audience: Mapped[str] = mapped_column(String(64), nullable=False)
+    purpose_name: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    purpose_digest: Mapped[bytes | None] = mapped_column(nullable=True)
+    target_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    target_review_status: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
     issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -295,6 +301,8 @@ class ServiceDelegationEvent(Base):
     )
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     principal_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    authority_class: Mapped[str] = mapped_column(String(16), nullable=False, default="read")
+    purpose_name: Mapped[str | None] = mapped_column(String(32), nullable=True)
     request_id: Mapped[str] = mapped_column(String(128), nullable=False)
     reason_code: Mapped[str] = mapped_column(String(64), nullable=False)
     external_tenant_ref_digest: Mapped[bytes | None] = mapped_column(nullable=True)
@@ -676,6 +684,18 @@ class ItemEvent(Base):
     new_value: Mapped[str | None] = mapped_column(Text, nullable=True)
     actor_principal_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
+    )
+    delegated_review_token_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    delegated_review_grant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    delegated_review_authority_class: Mapped[str | None] = mapped_column(
+        String(16), nullable=True
+    )
+    delegated_review_purpose: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
     )
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(

@@ -163,11 +163,12 @@ async def _resolve_tenant_id(session: AsyncSession) -> UUID:
     return UUID(str(tid_str))
 
 
-@router.get("/review/queue", response_model=None, dependencies=[Depends(REVIEW_SCOPE)])
+@router.get("/review/queue", response_model=None)
 async def review_queue(
     kind: str | None = None,
     workspace: str | None = None,
     limit: int = 50,
+    caller: Principal = Depends(REVIEW_SCOPE),  # noqa: B008
     session: AsyncSession = Depends(get_session),  # noqa: B008
     memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> list[dict[str, Any]]:
@@ -182,6 +183,10 @@ async def review_queue(
     tenant_id = memory_context.tenant_id
     if not memory_context.may_read_anything:
         return []
+    if caller.delegation_authority_class == "review":
+        kind = None
+        workspace = None
+        limit = 50
 
     stmt = (
         select(MemoryItem)
@@ -484,6 +489,9 @@ async def change_review_status(
     item = await _require_eligible_item(
         session, item_id, memory_context=memory_context, for_update=True
     )
+    delegated_review = caller.delegation_authority_class == "review"
+    if delegated_review and item["review_status"] != "proposed":
+        raise HTTPException(status_code=409, detail="review item is no longer proposed")
     is_author = UUID(str(item["principal_id"])) == principal_id
     required_scope = required_scope_for_review_transition(
         current_status=str(item["review_status"]),
@@ -526,6 +534,22 @@ async def change_review_status(
         on_behalf_of_principal_id=on_behalf_of,
         reason=req.reason,
         memory_context=memory_context,
+        delegated_review_token_id=(
+            UUID(caller.delegated_token_id)
+            if delegated_review and caller.delegated_token_id is not None
+            else None
+        ),
+        delegated_review_grant_id=(
+            UUID(caller.delegation_grant_id)
+            if delegated_review and caller.delegation_grant_id is not None
+            else None
+        ),
+        delegated_review_authority_class=(
+            caller.delegation_authority_class if delegated_review else None
+        ),
+        delegated_review_purpose=(
+            caller.delegation_purpose if delegated_review else None
+        ),
     )
     assignments = ["review_status = :review_status"]
     params: dict[str, Any] = {"review_status": req.review_status, "item_id": str(item_id)}

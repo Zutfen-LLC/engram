@@ -114,6 +114,9 @@ def main() -> None:
     delegation_grant_create = delegation_grant_sub.add_parser("create")
     delegation_grant_create.add_argument("--issuer", required=True)
     delegation_grant_create.add_argument("--binding-owner", required=True)
+    delegation_grant_create.add_argument(
+        "--authority-class", choices=["read", "review"], default="read"
+    )
     delegation_grant_create.add_argument("--max-ttl-seconds", required=True, type=int)
     delegation_grant_create.add_argument(
         "--reason",
@@ -131,6 +134,9 @@ def main() -> None:
     delegation_grant_revoke.add_argument("--issuer", required=True)
     delegation_grant_revoke.add_argument("--binding-owner", required=True)
     delegation_grant_revoke.add_argument(
+        "--authority-class", choices=["read", "review"], default="read"
+    )
+    delegation_grant_revoke.add_argument(
         "--reason",
         choices=[
             "operator_action",
@@ -144,6 +150,9 @@ def main() -> None:
     delegation_grant_revoke.add_argument("--json", action="store_true")
     delegation_grant_list = delegation_grant_sub.add_parser("list")
     delegation_grant_list.add_argument("--issuer", default=None)
+    delegation_grant_list.add_argument(
+        "--authority-class", choices=["read", "review"], default=None
+    )
     delegation_grant_list.add_argument("--json", action="store_true")
     bootstrap_parser.add_argument(
         "--scopes",
@@ -1186,9 +1195,12 @@ async def _run_delegation_grant(args: argparse.Namespace, database_url: str) -> 
             if hasattr(args, "binding_owner")
             else None
         )
+        authority_filter = getattr(args, "authority_class", None)
+        authority_class = authority_filter or "read"
+        maximum_ttl = 60 if authority_class == "review" else 300
         if (
             args.delegation_grant_command == "create"
-            and not 30 <= args.max_ttl_seconds <= 300
+            and not 30 <= args.max_ttl_seconds <= maximum_ttl
         ):
             raise ValueError("invalid TTL")
         if issuer_slug is not None and owner_slug is not None and issuer_slug == owner_slug:
@@ -1204,7 +1216,8 @@ async def _run_delegation_grant(args: argparse.Namespace, database_url: str) -> 
         if command == "list":
             rows = await conn.fetch(
                 "SELECT grant_row.id::text AS id,issuer.slug AS issuer_slug,"
-                "owner_client.slug AS binding_owner_slug,grant_row.status,"
+                "owner_client.slug AS binding_owner_slug,"
+                "grant_row.authority_class,grant_row.status,"
                 "grant_row.max_ttl_seconds,grant_row.created_at,grant_row.updated_at,"
                 "grant_row.revoked_at FROM service_delegation_grants grant_row "
                 "JOIN service_clients issuer "
@@ -1212,8 +1225,10 @@ async def _run_delegation_grant(args: argparse.Namespace, database_url: str) -> 
                 "JOIN service_clients owner_client "
                 "ON owner_client.id=grant_row.binding_owner_service_client_id "
                 "WHERE ($1::text IS NULL OR issuer.slug=$1) "
+                "AND ($2::text IS NULL OR grant_row.authority_class=$2) "
                 "ORDER BY grant_row.created_at,grant_row.id",
                 issuer_slug,
+                authority_filter,
             )
             list_payload = [dict(row) for row in rows]
             if args.json:
@@ -1223,6 +1238,7 @@ async def _run_delegation_grant(args: argparse.Namespace, database_url: str) -> 
                     print(
                         f"{row['id']} issuer={row['issuer_slug']} "
                         f"binding_owner={row['binding_owner_slug']} "
+                        f"authority_class={row['authority_class']} "
                         f"status={row['status']} max_ttl_seconds={row['max_ttl_seconds']}"
                     )
             return 0
@@ -1239,10 +1255,15 @@ async def _run_delegation_grant(args: argparse.Namespace, database_url: str) -> 
                 return 1
             issuer = by_slug[issuer_slug]
             owner = by_slug[owner_slug]
+            required_permission = (
+                "delegation.review.issue"
+                if authority_class == "review"
+                else "delegation.issue"
+            )
             if (
                 issuer["status"] != "active"
                 or owner["status"] != "active"
-                or "delegation.issue" not in issuer["permissions"]
+                or required_permission not in issuer["permissions"]
             ):
                 print("ERROR: delegation grant authority is invalid", file=sys.stderr)
                 return 1
@@ -1251,10 +1272,12 @@ async def _run_delegation_grant(args: argparse.Namespace, database_url: str) -> 
                 "SELECT id::text AS id,max_ttl_seconds,status,created_at,updated_at,"
                 "revoked_at FROM service_delegation_grants "
                 "WHERE issuer_service_client_id=$1::uuid "
-                "AND binding_owner_service_client_id=$2::uuid AND status='active' "
+                "AND binding_owner_service_client_id=$2::uuid "
+                "AND authority_class=$3 AND status='active' "
                 "FOR UPDATE",
                 issuer["id"],
                 owner["id"],
+                authority_class,
             )
             if command == "create":
                 if active is not None and active["max_ttl_seconds"] != args.max_ttl_seconds:
@@ -1269,25 +1292,29 @@ async def _run_delegation_grant(args: argparse.Namespace, database_url: str) -> 
                     row = await conn.fetchrow(
                         "INSERT INTO service_delegation_grants "
                         "(issuer_service_client_id,binding_owner_service_client_id,"
-                        "max_ttl_seconds) VALUES ($1::uuid,$2::uuid,$3) "
+                        "authority_class,max_ttl_seconds) "
+                        "VALUES ($1::uuid,$2::uuid,$3,$4) "
                         "RETURNING id::text AS id,max_ttl_seconds,status,created_at,"
                         "updated_at,revoked_at",
                         issuer["id"],
                         owner["id"],
+                        authority_class,
                         args.max_ttl_seconds,
                     )
                     await conn.execute(
                         "INSERT INTO service_delegation_events "
                         "(event_type,outcome,issuer_service_client_id,"
-                        "binding_owner_service_client_id,grant_id,request_id,"
+                        "binding_owner_service_client_id,grant_id,authority_class,"
+                        "request_id,"
                         "reason_code,details) VALUES "
                         "('delegation_grant.created','success',$1::uuid,$2::uuid,"
-                        "$3::uuid,'operator-cli',$4,"
+                        "$3::uuid,$4,'operator-cli',$5,"
                         "jsonb_build_object("
-                        "'ttl_seconds',$5::integer,'disposition','created'))",
+                        "'ttl_seconds',$6::integer,'disposition','created'))",
                         issuer["id"],
                         owner["id"],
                         row["id"],
+                        authority_class,
                         args.reason,
                         args.max_ttl_seconds,
                     )
@@ -1295,6 +1322,7 @@ async def _run_delegation_grant(args: argparse.Namespace, database_url: str) -> 
                     "id": row["id"],
                     "issuer_slug": issuer_slug,
                     "binding_owner_slug": owner_slug,
+                    "authority_class": authority_class,
                     "status": row["status"],
                     "max_ttl_seconds": row["max_ttl_seconds"],
                     "created_at": row["created_at"],
@@ -1309,9 +1337,11 @@ async def _run_delegation_grant(args: argparse.Namespace, database_url: str) -> 
                         "updated_at,revoked_at FROM service_delegation_grants "
                         "WHERE issuer_service_client_id=$1::uuid "
                         "AND binding_owner_service_client_id=$2::uuid "
+                        "AND authority_class=$3 "
                         "ORDER BY created_at DESC LIMIT 1",
                         issuer["id"],
                         owner["id"],
+                        authority_class,
                     )
                     if row is None:
                         print("ERROR: delegation grant not found", file=sys.stderr)
@@ -1330,20 +1360,23 @@ async def _run_delegation_grant(args: argparse.Namespace, database_url: str) -> 
                     await conn.execute(
                         "INSERT INTO service_delegation_events "
                         "(event_type,outcome,issuer_service_client_id,"
-                        "binding_owner_service_client_id,grant_id,request_id,"
+                        "binding_owner_service_client_id,grant_id,authority_class,"
+                        "request_id,"
                         "reason_code,details) VALUES "
                         "('delegation_grant.revoked','success',$1::uuid,$2::uuid,"
-                        "$3::uuid,'operator-cli',$4,"
+                        "$3::uuid,$4,'operator-cli',$5,"
                         "jsonb_build_object('disposition','revoked'))",
                         issuer["id"],
                         owner["id"],
                         row["id"],
+                        authority_class,
                         args.reason,
                     )
                 result_payload = {
                     "id": row["id"],
                     "issuer_slug": issuer_slug,
                     "binding_owner_slug": owner_slug,
+                    "authority_class": authority_class,
                     "status": row["status"],
                     "max_ttl_seconds": row["max_ttl_seconds"],
                     "created_at": row["created_at"],

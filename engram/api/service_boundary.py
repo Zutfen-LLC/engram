@@ -4,17 +4,24 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import Any
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+from starlette.types import Message, Receive, Scope, Send
 
 _SERVICE_PREFIX = "/v1/service/"
 _REQUEST_ID = re.compile(r"^[\x21-\x7e]{1,128}$")
 _AUTHORIZATION_HEADER = b"authorization"
-_DELEGATION_PREFIX = "engd_"
+_DELEGATION_PREFIXES = ("engd_", "engdr_")
+_REVIEW_DELEGATION_PREFIX = "engdr_"
+_MAX_REVIEW_BODY_BYTES = 4096
 
 
 def is_service_request(request: Request) -> bool:
@@ -28,9 +35,143 @@ def is_delegated_request(request: Request) -> bool:
             continue
         value = raw_value.decode("latin-1")
         scheme, separator, credential = value.partition(" ")
-        if separator and scheme.lower() == "bearer" and credential.startswith(_DELEGATION_PREFIX):
+        if (
+            separator
+            and scheme.lower() == "bearer"
+            and credential.startswith(_DELEGATION_PREFIXES)
+        ):
             return True
     return False
+
+
+@dataclass(frozen=True)
+class _ReviewDelegationAttempt:
+    credential: str | None
+    ambiguous: bool
+
+
+def _review_delegation_attempt(scope: Scope) -> _ReviewDelegationAttempt | None:
+    """Classify any review Bearer value without retaining raw headers."""
+    authorization_values = [
+        raw_value
+        for name, raw_value in scope.get("headers", ())
+        if name.lower() == _AUTHORIZATION_HEADER
+    ]
+    review_credentials: set[str] = set()
+    for raw_value in authorization_values:
+        if not isinstance(raw_value, bytes):
+            continue
+        value = raw_value.decode("latin-1")
+        scheme, separator, credential = value.partition(" ")
+        if (
+            separator
+            and scheme.lower() == "bearer"
+            and credential.startswith(_REVIEW_DELEGATION_PREFIX)
+        ):
+            review_credentials.add(credential)
+    if not review_credentials:
+        return None
+    selected_credential = (
+        next(iter(review_credentials)) if len(review_credentials) == 1 else None
+    )
+    return _ReviewDelegationAttempt(
+        credential=selected_credential,
+        ambiguous=len(authorization_values) != 1,
+    )
+
+
+async def _bounded_review_body(receive: Receive) -> bytes:
+    """Read only the bounded body needed for delegated review purpose checks."""
+    body = bytearray()
+    while True:
+        message = await receive()
+        if message["type"] == "http.disconnect":
+            return b"x" * (_MAX_REVIEW_BODY_BYTES + 1)
+        if message["type"] != "http.request":
+            continue
+        chunk = message.get("body", b"")
+        remaining = _MAX_REVIEW_BODY_BYTES + 1 - len(body)
+        body.extend(chunk[:remaining])
+        if len(body) > _MAX_REVIEW_BODY_BYTES:
+            return bytes(body)
+        if not message.get("more_body", False):
+            return bytes(body)
+
+
+def _replay_receive(body: bytes) -> Receive:
+    sent = False
+
+    async def receive() -> Message:
+        nonlocal sent
+        if sent:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        sent = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return receive
+
+
+class ReviewDelegationRequestMiddleware:
+    """Authenticate review tokens before framework request-body validation."""
+
+    def __init__(self, app: Callable[[Scope, Receive, Send], Awaitable[None]]) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        attempt = _review_delegation_attempt(scope)
+        if attempt is None:
+            await self.app(scope, receive, send)
+            return
+
+        from engram.config import settings
+
+        if not settings.auth_enabled:
+            await self.app(scope, receive, send)
+            return
+        if not settings.review_delegation_enabled:
+            response = JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid or revoked API key"},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            await response(scope, _replay_receive(b""), send)
+            return
+
+        body = await _bounded_review_body(receive)
+        if attempt.credential is None:
+            response = JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid or revoked API key"},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            await response(scope, _replay_receive(b""), send)
+            return
+
+        auth_request = StarletteRequest(scope, _replay_receive(body))
+        try:
+            from engram.delegation_auth import resolve_review_delegated_principal
+
+            principal = await resolve_review_delegated_principal(
+                attempt.credential,
+                request=auth_request,
+                request_id=request_id_for(auth_request),
+                force_purpose_mismatch=attempt.ambiguous,
+            )
+        except HTTPException as exc:
+            response = JSONResponse(
+                status_code=exc.status_code,
+                content={"detail": exc.detail},
+                headers=exc.headers,
+            )
+            await response(scope, _replay_receive(b""), send)
+            return
+
+        state: dict[str, Any] = scope.setdefault("state", {})
+        state["review_delegated_principal"] = principal
+        await self.app(scope, _replay_receive(body), send)
 
 
 def effective_request_id(candidate: str | None) -> str:

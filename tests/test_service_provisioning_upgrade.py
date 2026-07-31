@@ -820,7 +820,12 @@ async def test_persisted_migration_028_to_029_preserves_service_state_and_permis
         before_password = await admin.fetchval(
             "SELECT rolpassword FROM pg_authid WHERE rolname='engram_provisioner'"
         )
-        assert await _run_init_db(database_url) == 0
+        through_029 = tmp_path / "through-029-migrations"
+        through_029.mkdir()
+        for migration in discover_migrations():
+            if migration.name <= "029_service_delegation.sql":
+                (through_029 / migration.name).symlink_to(migration.resolve())
+        assert await _run_init_db(database_url, migrations_dir=through_029) == 0
         upgraded = await asyncpg.connect(normalize_asyncpg_url(database_url))
         try:
             assert await upgraded.fetchval(
@@ -891,6 +896,250 @@ async def test_persisted_migration_028_to_029_preserves_service_state_and_permis
         assert await admin.fetchval(
             "SELECT rolpassword FROM pg_authid WHERE rolname='engram_provisioner'"
         ) == before_password
+    finally:
+        if created_database:
+            await admin.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1",
+                database,
+            )
+            await admin.execute(f'DROP DATABASE "{database}"')
+        await _restore_role_state(admin, original_role)
+        await admin.close()
+
+
+async def test_persisted_migration_029_to_030_preserves_read_state_and_round_trips(
+    tmp_path: Path,
+) -> None:
+    """Migration 030 preserves read authority through upgrade and clean downgrade."""
+    import asyncpg
+
+    owner_url = _owner_url()
+    if owner_url is None:
+        pytest.skip("requires owner PostgreSQL URL for persisted review delegation upgrade")
+    database = f"review_delegation_upgrade_{uuid.uuid4().hex}"
+    admin = await asyncpg.connect(normalize_asyncpg_url(owner_url))
+    original_role = await _role_state(admin)
+    created_database = False
+    try:
+        await admin.execute(f'CREATE DATABASE "{database}"')
+        created_database = True
+        database_url = _with_database(owner_url, database)
+        through_029 = tmp_path / "review-through-029-migrations"
+        through_029.mkdir()
+        for migration in discover_migrations():
+            if migration.name <= "029_service_delegation.sql":
+                (through_029 / migration.name).symlink_to(migration.resolve())
+        assert await _run_init_db(database_url, migrations_dir=through_029) == 0
+
+        persisted = await asyncpg.connect(normalize_asyncpg_url(database_url))
+        broker_id, owner_id, credential_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+        tenant_id, principal_id = uuid.uuid4(), uuid.uuid4()
+        tenant_binding_id, principal_binding_id = uuid.uuid4(), uuid.uuid4()
+        grant_id, token_id = uuid.uuid4(), uuid.uuid4()
+        idempotency_id, event_id = uuid.uuid4(), uuid.uuid4()
+        try:
+            await persisted.execute(
+                "INSERT INTO service_clients (id,slug,display_name,permissions) "
+                "VALUES ($1,$2,'Persisted read broker',$3),"
+                "($4,$5,'Persisted read owner',$6)",
+                broker_id,
+                f"persisted-read-broker-{broker_id.hex[:10]}",
+                ["delegation.issue"],
+                owner_id,
+                f"persisted-read-owner-{owner_id.hex[:10]}",
+                [
+                    "tenant.provision",
+                    "principal.provision",
+                    "workspace.provision",
+                    "agent.provision",
+                    "api_key.provision",
+                ],
+            )
+            await persisted.execute(
+                "INSERT INTO service_client_credentials "
+                "(id,service_client_id,key_id,secret_digest,digest_algorithm) "
+                "VALUES ($1,$2,$3,$4,'sha256')",
+                credential_id,
+                broker_id,
+                f"r{credential_id.hex[:21]}",
+                "a" * 64,
+            )
+            await persisted.execute(
+                "INSERT INTO tenants (id,name,slug) VALUES ($1,'Persisted read tenant',$2)",
+                tenant_id,
+                f"persisted-read-{tenant_id.hex[:12]}",
+            )
+            await persisted.execute(
+                "INSERT INTO principals (id,tenant_id,name,type) "
+                "VALUES ($1,$2,'Persisted read human','user')",
+                principal_id,
+                tenant_id,
+            )
+            await persisted.execute(
+                "INSERT INTO tenant_provisioning_bindings "
+                "(id,service_client_id,external_ref,tenant_id) VALUES ($1,$2,$3,$4)",
+                tenant_binding_id,
+                owner_id,
+                "persisted-read-tenant-ref",
+                tenant_id,
+            )
+            await persisted.execute(
+                "INSERT INTO principal_provisioning_bindings "
+                "(id,service_client_id,tenant_binding_id,tenant_id,external_ref,principal_id) "
+                "VALUES ($1,$2,$3,$4,$5,$6)",
+                principal_binding_id,
+                owner_id,
+                tenant_binding_id,
+                tenant_id,
+                "persisted-read-principal-ref",
+                principal_id,
+            )
+            await persisted.execute(
+                "INSERT INTO service_delegation_grants "
+                "(id,issuer_service_client_id,binding_owner_service_client_id,"
+                "max_ttl_seconds) VALUES ($1,$2,$3,60)",
+                grant_id,
+                broker_id,
+                owner_id,
+            )
+            await persisted.execute(
+                "INSERT INTO service_delegation_tokens "
+                "(id,grant_id,issuer_service_client_id,issuer_credential_id,"
+                "binding_owner_service_client_id,tenant_binding_id,"
+                "principal_binding_id,tenant_id,principal_id,external_ref,key_id,"
+                "secret_digest,digest_algorithm,scopes,audience,status,issued_at,expires_at) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'sha256',"
+                "ARRAY['read'],'engram-core','active',now(),now()+interval '60 seconds')",
+                token_id,
+                grant_id,
+                broker_id,
+                credential_id,
+                owner_id,
+                tenant_binding_id,
+                principal_binding_id,
+                tenant_id,
+                principal_id,
+                "persisted-read-token",
+                f"t{token_id.hex[:21]}",
+                "b" * 64,
+            )
+            await persisted.execute(
+                "INSERT INTO service_delegation_idempotency "
+                "(id,issuer_service_client_id,key_digest,request_digest,"
+                "delegation_token_id) VALUES ($1,$2,$3,$4,$5)",
+                idempotency_id,
+                broker_id,
+                b"i" * 32,
+                b"r" * 32,
+                token_id,
+            )
+            await persisted.execute(
+                "INSERT INTO service_delegation_events "
+                "(id,event_type,outcome,issuer_service_client_id,"
+                "issuer_credential_id,binding_owner_service_client_id,grant_id,"
+                "delegation_token_id,tenant_id,principal_id,request_id,reason_code,"
+                "details) VALUES ($1,'delegation.issued','success',$2,$3,$4,$5,$6,"
+                "$7,$8,'persisted-read-event','created',"
+                "'{\"ttl_seconds\":60,\"scope_read\":true,"
+                "\"single_use\":true,\"disposition\":\"created\"}'::jsonb)",
+                event_id,
+                broker_id,
+                credential_id,
+                owner_id,
+                grant_id,
+                token_id,
+                tenant_id,
+                principal_id,
+            )
+        finally:
+            await persisted.close()
+
+        assert await _run_init_db(database_url) == 0
+        upgraded = await asyncpg.connect(normalize_asyncpg_url(database_url))
+        try:
+            assert await upgraded.fetchval(
+                "SELECT count(*) FROM schema_migrations "
+                "WHERE filename='030_service_review_delegation.sql'"
+            ) == 1
+            assert await upgraded.fetchval(
+                "SELECT permissions FROM service_clients WHERE id=$1",
+                broker_id,
+            ) == ["delegation.issue"]
+            assert tuple(
+                (
+                    await upgraded.fetchrow(
+                        "SELECT authority_class,status,max_ttl_seconds "
+                        "FROM service_delegation_grants WHERE id=$1",
+                        grant_id,
+                    )
+                ).values()
+            ) == ("read", "active", 60)
+            token = await upgraded.fetchrow(
+                "SELECT authority_class,scopes,purpose_name,purpose_digest,"
+                "target_item_id,target_review_status,status "
+                "FROM service_delegation_tokens WHERE id=$1",
+                token_id,
+            )
+            assert tuple(token.values()) == (
+                "read",
+                ["read"],
+                None,
+                None,
+                None,
+                None,
+                "active",
+            )
+            assert await upgraded.fetchval(
+                "SELECT authority_class FROM service_delegation_events WHERE id=$1",
+                event_id,
+            ) == "read"
+            assert await upgraded.fetchval(
+                "SELECT count(*) FROM service_delegation_idempotency WHERE id=$1",
+                idempotency_id,
+            ) == 1
+            assert await _run_init_db(database_url) == 0
+
+            downgrade_sql = (
+                Path(__file__).resolve().parents[1]
+                / "migrations"
+                / "downgrades"
+                / "030_service_review_delegation.sql"
+            ).read_text()
+            await upgraded.execute(downgrade_sql)
+            assert not await upgraded.fetchval(
+                "SELECT EXISTS ("
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name='service_delegation_tokens' "
+                "AND column_name='authority_class')"
+            )
+            assert await upgraded.fetchval(
+                "SELECT count(*) FROM service_delegation_tokens WHERE id=$1",
+                token_id,
+            ) == 1
+            assert await upgraded.fetchval(
+                "SELECT count(*) FROM service_delegation_events WHERE id=$1",
+                event_id,
+            ) == 1
+            await upgraded.execute(
+                "DELETE FROM schema_migrations "
+                "WHERE filename='030_service_review_delegation.sql'"
+            )
+        finally:
+            await upgraded.close()
+
+        assert await _run_init_db(database_url) == 0
+        reupgraded = await asyncpg.connect(normalize_asyncpg_url(database_url))
+        try:
+            assert await reupgraded.fetchval(
+                "SELECT authority_class FROM service_delegation_tokens WHERE id=$1",
+                token_id,
+            ) == "read"
+            assert await reupgraded.fetchval(
+                "SELECT count(*) FROM service_delegation_idempotency WHERE id=$1",
+                idempotency_id,
+            ) == 1
+        finally:
+            await reupgraded.close()
     finally:
         if created_database:
             await admin.execute(

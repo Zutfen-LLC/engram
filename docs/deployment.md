@@ -92,6 +92,13 @@ create an owner-controlled grant to the provisioning binding owner. Readiness
 checks the delegation tables and functions only when the feature is enabled.
 See `docs/ops/service-delegation.md` for the runbook and response-loss recovery.
 
+Migration 030 adds `delegation.review.issue`. It does not grant the permission
+to an existing client. It also does not create a review grant or token. To
+enable purpose-bound review, set `ENGRAM_REVIEW_DELEGATION_ENABLED=true`.
+Keep the default TTL at 30 seconds and the maximum at or below 60 seconds.
+Create an explicit review grant with `--authority-class review`. Use a separate
+review broker when possible.
+
 Optionally, `ENGRAM_READ_DATABASE_URL` (ENG-AUD-011) points startup recall's
 bounded candidate selection at a read replica instead of the primary. Unset
 (the default) falls back to `ENGRAM_DATABASE_URL` — there is no bundled

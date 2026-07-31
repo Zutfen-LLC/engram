@@ -190,6 +190,26 @@ async def readiness(
                                     "delegation": "misconfigured",
                                 },
                             )
+                    if settings.review_delegation_enabled:
+                        review_delegation_objects = await provisioner.scalar(
+                            text(
+                                "SELECT to_regprocedure("
+                                "'issue_service_review_delegation("
+                                "uuid,text,text,text,text,bytea,bytea,text,text,integer,"
+                                "text,text,bytea,uuid,text)') IS NOT NULL "
+                                "AND to_regprocedure("
+                                "'revoke_service_review_delegation("
+                                "uuid,text,text,text,text,text,text)') IS NOT NULL"
+                            )
+                        )
+                        if not review_delegation_objects:
+                            return JSONResponse(
+                                status_code=503,
+                                content={
+                                    "status": "not_ready",
+                                    "review_delegation": "misconfigured",
+                                },
+                            )
             except Exception:
                 return JSONResponse(
                     status_code=503,
