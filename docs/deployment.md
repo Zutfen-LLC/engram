@@ -99,6 +99,72 @@ Keep the default TTL at 30 seconds and the maximum at or below 60 seconds.
 Create an explicit review grant with `--authority-class review`. Use a separate
 review broker when possible.
 
+### Fixed Portal installation enrollment
+
+Migration 031 adds a fixed installation-enrollment endpoint. It does not add a
+general service-client administration API. Enrollment is disabled by default.
+The endpoint creates exactly one provisioning owner, one read broker, one review
+broker, and two 60-second grants. Core selects all slugs, permissions, authority
+classes, and TTL limits.
+
+An active enrollment has one credential generation. It has one current active
+credential for each fixed role. Portal can rotate all three credentials in one
+request at
+`POST /v1/service/portal-installation-enrollments/rotate-credentials`. The
+request must include the installation reference, expected generation, rotation
+reference, and three caller-generated key IDs and SHA-256 digests. It must also
+include the pairing authorization and an `Idempotency-Key` header. Do not send
+raw service credentials to Core. An exact replay returns the committed
+generation. A changed replay or stale generation returns a bounded conflict.
+
+Portal can reconcile the enrollment at
+`GET /v1/service/portal-installation-enrollments/{installation_external_ref}`.
+The response contains only the lifecycle status, credential generation, and
+three readiness values. It does not contain credential or authority details.
+
+Only a database owner can terminate enrolled authority. Termination is atomic
+and irreversible. It revokes all enrolled credentials and grants. It disables
+all three clients. It also invalidates active delegated tokens.
+
+```bash
+engram portal-enrollment terminate \
+  --installation <installation-uuid> \
+  --reason security_incident
+```
+
+The command accepts `operator_action`, `security_incident`, or
+`client_disabled`. A repeated command succeeds without a second terminal event.
+Generic service-client and delegation-grant mutation commands reject enrolled
+targets. Use the Portal enrollment termination command for these targets.
+
+For local development, create one high-entropy pairing credential in a file
+outside the repository. Do not print or copy the credential into `.env`.
+
+```bash
+install -m 600 /dev/null /absolute/path/to/portal-enrollment-secret
+python -c 'import secrets; p="/absolute/path/to/portal-enrollment-secret"; open(p,"w",encoding="ascii").write("engpair_"+secrets.token_urlsafe(32)+"\n")'
+chmod 600 /absolute/path/to/portal-enrollment-secret
+```
+
+Set this local development configuration:
+
+```dotenv
+ENGRAM_PORTAL_DEVELOPMENT_SETUP=true
+ENGRAM_PORTAL_ENROLLMENT_SECRET_FILE_HOST=/absolute/path/to/portal-enrollment-secret
+```
+
+Then run the normal stack. No service-client, permission, or grant command is
+required.
+
+```bash
+docker compose up --build --wait
+```
+
+Production must not use `ENGRAM_PORTAL_DEVELOPMENT_SETUP`. Enable each required
+feature explicitly. Keep `ENGRAM_PORTAL_ENROLLMENT_REQUIRE_HTTPS=true`. Mount an
+operator-managed mode-0600 secret file. Do not expose the Core owner database URL,
+database, or filesystem to Portal.
+
 Optionally, `ENGRAM_READ_DATABASE_URL` (ENG-AUD-011) points startup recall's
 bounded candidate selection at a read replica instead of the primary. Unset
 (the default) falls back to `ENGRAM_DATABASE_URL` — there is no bundled

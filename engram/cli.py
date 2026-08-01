@@ -154,6 +154,23 @@ def main() -> None:
         "--authority-class", choices=["read", "review"], default=None
     )
     delegation_grant_list.add_argument("--json", action="store_true")
+    portal_enrollment_parser = sub.add_parser(
+        "portal-enrollment",
+        help="Manage fixed Portal installation enrollment authority (owner DB only).",
+    )
+    portal_enrollment_sub = portal_enrollment_parser.add_subparsers(
+        dest="portal_enrollment_command", required=True
+    )
+    portal_enrollment_terminate = portal_enrollment_sub.add_parser(
+        "terminate", help="Irreversibly terminate one enrolled installation."
+    )
+    portal_enrollment_terminate.add_argument("--installation", required=True)
+    portal_enrollment_terminate.add_argument(
+        "--reason",
+        choices=["operator_action", "security_incident", "client_disabled"],
+        required=True,
+    )
+    portal_enrollment_terminate.add_argument("--json", action="store_true")
     bootstrap_parser.add_argument(
         "--scopes",
         default="read,write,admin,export",
@@ -499,6 +516,18 @@ def main() -> None:
             )
             raise SystemExit(2)
         raise SystemExit(asyncio.run(_run_delegation_grant(args, settings.owner_database_url)))
+    elif args.command == "portal-enrollment":
+        from engram.config import settings
+
+        if not settings.owner_database_url:
+            print(
+                "ERROR: ENGRAM_OWNER_DATABASE_URL is required for Portal enrollment management.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        raise SystemExit(
+            asyncio.run(_run_portal_enrollment(args, settings.owner_database_url))
+        )
     elif args.command == "promote-proposed":
         raise SystemExit(asyncio.run(_run_promotion(args.tenant, args.limit, dry_run=args.dry_run)))
     elif args.command == "backfill-embeddings":
@@ -983,6 +1012,52 @@ async def _run_bootstrap_key(
     return 0
 
 
+async def _run_portal_enrollment(args: argparse.Namespace, database_url: str) -> int:
+    """Terminate fixed Portal authority through the owner-only SQL function."""
+    import json
+
+    import asyncpg
+
+    from engram.migrations import normalize_asyncpg_url
+
+    try:
+        installation = uuid.UUID(args.installation)
+    except ValueError:
+        print("ERROR: invalid Portal installation reference", file=sys.stderr)
+        return 1
+
+    conn: asyncpg.Connection | None = None
+    try:
+        conn = await asyncpg.connect(normalize_asyncpg_url(database_url))
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT * FROM terminate_portal_installation_enrollment($1,$2,$3)",
+                installation,
+                args.reason,
+                "operator-cli",
+            )
+        if row is None or row["error_code"] is not None:
+            code = "TERMINATION_FAILED" if row is None else row["error_code"]
+            print(f"ERROR: Portal enrollment termination failed ({code})", file=sys.stderr)
+            return 1
+        payload = {
+            "status": row["enrollment_status"],
+            "credential_generation": row["credential_generation"],
+            "terminated": row["terminated"],
+        }
+        if args.json:
+            print(json.dumps(payload, sort_keys=True))
+        else:
+            print("terminated" if row["terminated"] else "already terminated")
+        return 0
+    except asyncpg.PostgresError:
+        print("ERROR: Portal enrollment termination failed", file=sys.stderr)
+        return 1
+    finally:
+        if conn is not None:
+            await conn.close()
+
+
 async def _run_service_client(args: argparse.Namespace, database_url: str) -> int:
     """Owner-only service-client management; stdout is the only secret sink."""
     import json
@@ -1063,6 +1138,29 @@ async def _run_service_client(args: argparse.Namespace, database_url: str) -> in
                 else:
                     print(f"service_client_id: {row['id']}\ncredential: {credential}")
                 return 0
+            portal_enrollment_available = await conn.fetchval(
+                "SELECT to_regclass('portal_installation_enrollment_clients') IS NOT NULL"
+            )
+            enrolled = False
+            if portal_enrollment_available:
+                enrolled = await conn.fetchval(
+                    "SELECT EXISTS ("
+                    "SELECT 1 FROM portal_installation_enrollment_clients enrolled "
+                    "JOIN service_client_credentials credential "
+                    "ON credential.service_client_id=enrolled.service_client_id "
+                    "WHERE (enrolled.service_client_id::text=$1 "
+                    "OR EXISTS (SELECT 1 FROM service_clients client "
+                    "WHERE client.id=enrolled.service_client_id AND client.slug=$1) "
+                    "OR credential.id::text=$1 OR credential.key_id=$1))",
+                    args.credential if command == "revoke-key" else args.client,
+                )
+            if enrolled:
+                print(
+                    "ERROR: enrolled Portal authority is immutable. Use "
+                    "`engram portal-enrollment terminate`.",
+                    file=sys.stderr,
+                )
+                return 1
             if command == "rotate-key":
                 row = await conn.fetchrow(
                     "SELECT id::text AS id FROM service_clients WHERE id::text = $1 OR slug = $1 FOR UPDATE",
@@ -1255,6 +1353,24 @@ async def _run_delegation_grant(args: argparse.Namespace, database_url: str) -> 
                 return 1
             issuer = by_slug[issuer_slug]
             owner = by_slug[owner_slug]
+            portal_enrollment_available = await conn.fetchval(
+                "SELECT to_regclass('portal_installation_enrollment_clients') IS NOT NULL"
+            )
+            enrolled = False
+            if portal_enrollment_available:
+                enrolled = await conn.fetchval(
+                    "SELECT EXISTS ("
+                    "SELECT 1 FROM portal_installation_enrollment_clients "
+                    "WHERE service_client_id=ANY($1::uuid[]))",
+                    [uuid.UUID(issuer["id"]), uuid.UUID(owner["id"])],
+                )
+            if enrolled:
+                print(
+                    "ERROR: enrolled Portal grants are immutable. Use "
+                    "`engram portal-enrollment terminate`.",
+                    file=sys.stderr,
+                )
+                return 1
             required_permission = (
                 "delegation.review.issue"
                 if authority_class == "review"

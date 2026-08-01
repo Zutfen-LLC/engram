@@ -114,6 +114,15 @@ EXPECTED_MATRIX: dict[tuple[str, str], dict] = {
     ("POST", "/v1/service/review-delegations/revoke"): {
         "service_permissions": ("delegation.review.issue",),
     },
+    ("POST", "/v1/service/portal-installation-enrollments"): {
+        "service_permissions": (),
+    },
+    ("POST", "/v1/service/portal-installation-enrollments/rotate-credentials"): {
+        "service_permissions": (),
+    },
+    ("GET", "/v1/service/portal-installation-enrollments/{installation_external_ref}"): {
+        "service_permissions": (),
+    },
 }
 
 

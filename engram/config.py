@@ -36,6 +36,12 @@ class Settings(BaseSettings):
     review_delegation_enabled: bool = False
     review_delegation_default_ttl_seconds: int = 30
     review_delegation_max_ttl_seconds: int = 60
+    # Fixed Portal installation enrollment. The credential itself is never an
+    # environment variable. It is read from this mode-0600 file when enabled.
+    portal_enrollment_enabled: bool = False
+    portal_enrollment_secret_file: str | None = None
+    portal_enrollment_require_https: bool = True
+    portal_development_setup: bool = False
 
     # Read-oriented database URL (ENG-AUD-011 / F18). Optional: when unset,
     # read-heavy paths (currently: startup recall candidate selection) use
@@ -264,6 +270,30 @@ class Settings(BaseSettings):
                 "service_provisioning_enabled must be true when "
                 "review_delegation_enabled=true"
             )
+        if self.portal_enrollment_enabled:
+            if not self.portal_enrollment_secret_file:
+                raise ValueError(
+                    "portal_enrollment_secret_file is required when "
+                    "portal_enrollment_enabled=true"
+                )
+            if not (
+                self.service_provisioning_enabled
+                and self.delegation_enabled
+                and self.review_delegation_enabled
+            ):
+                raise ValueError(
+                    "service provisioning, read delegation, and review delegation "
+                    "must be enabled when portal enrollment is enabled"
+                )
+            if self.delegation_max_ttl_seconds < 60:
+                raise ValueError(
+                    "delegation_max_ttl_seconds must be at least 60 when portal enrollment "
+                    "is enabled"
+                )
+            if not self.portal_enrollment_require_https and not self.portal_development_setup:
+                raise ValueError(
+                    "portal enrollment can use HTTP only when portal_development_setup=true"
+                )
         return self
 
     @model_validator(mode="after")
