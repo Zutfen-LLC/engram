@@ -449,6 +449,33 @@ async def test_diary_write_success() -> None:
     assert body["topic"] == "debugging"
 
 
+async def test_diary_write_accepts_string_representation_uuid() -> None:
+    rec = _Recorder(
+        status_code=201,
+        payload={
+            "id": ITEM_ID,
+            "status": "created",
+            "review_status": "proposed",
+            "principal_id": OTHER_ID,
+            "actor_principal_id": ITEM_ID,
+            "represented": True,
+            "attribution_status": "recorded",
+            "authority": 10,
+            "authority_label": "inferred",
+        },
+    )
+    async with _client(rec) as client:
+        await client.diary_write(
+            "represented entry",
+            on_behalf_of_principal_id=OTHER_ID,
+            reason="support handoff",
+        )
+
+    body = _body(rec.request)
+    assert body["on_behalf_of_principal_id"] == OTHER_ID
+    assert body["reason"] == "support handoff"
+
+
 # ---- error handling ----
 
 

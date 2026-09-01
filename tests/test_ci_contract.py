@@ -25,13 +25,19 @@ def test_trust_proof_files_are_unique_existing_root_suite_tests() -> None:
         assert resolved_path.is_file()
 
 
-def test_hosted_workflow_runs_supplemental_merge_ref_real_db_gate() -> None:
+def test_hosted_workflow_runs_one_real_db_gate() -> None:
     workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text()
+    workflow_dir = REPOSITORY_ROOT / ".github/workflows"
 
     assert "scripts/run_trust_proof.py" not in workflow
     assert "Run Canonical Trust Proof" not in workflow
     assert "Reset Trust-Proof Stack" not in workflow
     assert workflow.count("Run Compose Real-DB CI Stack") == 1
+    assert not (workflow_dir / "exact-head-ci.yml").exists()
+    assert sum(
+        path.read_text().count("Run Compose Real-DB CI Stack")
+        for path in workflow_dir.glob("*.yml")
+    ) == 1
 
     normalized_workflow = " ".join(workflow.split())
     assert (
@@ -41,30 +47,49 @@ def test_hosted_workflow_runs_supplemental_merge_ref_real_db_gate() -> None:
     assert "docker compose -f docker-compose.ci.yml up --build" not in normalized_workflow
     assert "if: always()" in workflow
     assert "down -v --remove-orphans" in normalized_workflow
-    assert re.search(r"^  compose-real-db-merge-ref:\s*$", workflow, re.MULTILINE)
-    assert re.search(r"^  compose-validate:\s*$", workflow, re.MULTILINE)
+    assert re.search(r"^  compose-real-db:\s*$", workflow, re.MULTILINE)
+    assert re.search(r"^  repository-safety:\s*$", workflow, re.MULTILINE)
+    assert "Validate Compose Config" not in workflow
+
+    # Documentation-only changes still scan for leaked credentials but skip the
+    # image/database/toolchain jobs. This avoids both ten-minute gates without
+    # creating a security blind spot through top-level paths-ignore filters.
+    assert "paths-ignore:" not in workflow
+    assert "python scripts/scan_credential_leaks.py" in workflow
+    assert "runtime_changed: ${{ steps.changes.outputs.runtime_changed }}" in workflow
+    assert "':(exclude,glob)**/*.md' ':(exclude,glob)docs/**'" in workflow
+    assert workflow.count("needs: repository-safety") == 3
+    assert workflow.count(
+        "if: needs.repository-safety.outputs.runtime_changed == 'true'"
+    ) == 3
 
 
-def test_hosted_workflow_runs_conformance_and_lock_drift_gates() -> None:
+def test_hosted_workflow_runs_one_pinned_conformance_and_lock_gate() -> None:
     workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text()
 
     # The parallel cross-language conformance job (ENG-CONTEXT-001): runs both
     # verifiers and the shared negative-fixture set against the same checked-in
     # artifacts. Kept off the Compose real-DB critical path.
     assert re.search(r"^  conformance-vectors:\s*$", workflow, re.MULTILINE)
-    assert "python scripts/verify_context_manifest_vectors.py" in workflow
+    assert ".venv/bin/python scripts/verify_context_manifest_vectors.py" in workflow
     assert "node conformance/context-manifest-v1/verify.mjs" in workflow
-    assert "python scripts/verify_context_manifest_negatives.py" in workflow
-    assert "node conformance/context-manifest-v1/verify_negatives.mjs" in workflow
+    assert ".venv/bin/python conformance/context-manifest-v1/run_cross_language.py" in workflow
+    # The driver owns both negative verifier executions; calling either directly
+    # here would run the same fixture set twice.
+    assert "scripts/verify_context_manifest_negatives.py" not in workflow
+    assert "node conformance/context-manifest-v1/verify_negatives.mjs" not in workflow
     # Node comes only from actions/setup-node here, never from the CI image.
     assert "actions/setup-node@v5" in workflow
 
-    # The parallel lock-drift gate: uv.lock must match pyproject.toml. Uses the
-    # pinned uv version and a non-rewriting check, so a drifted lock fails CI.
-    assert re.search(r"^  lock-drift:\s*$", workflow, re.MULTILINE)
+    # Lock drift and conformance share one setup instead of paying for a second
+    # runner and checkout. Dependencies come from the checked-in lock.
+    assert not re.search(r"^  lock-drift:\s*$", workflow, re.MULTILINE)
     assert "astral-sh/setup-uv@v6" in workflow
     assert "version: \"0.11.29\"" in workflow
     assert "uv lock --check" in workflow
+    assert "uv sync --frozen --extra dev" in workflow
+    conformance_job = workflow.split("  conformance-vectors:", 1)[1]
+    assert "pip install" not in conformance_job
     # The lock gate never rewrites the lockfile.
     assert "uv lock\n" not in workflow
 
@@ -88,40 +113,34 @@ def test_hosted_workflow_uses_read_only_github_hosted_runners() -> None:
     workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text()
 
     assert "runs-on: self-hosted" not in workflow
-    # Five read-only hosted jobs: compose-real-db-merge-ref, runtime-image-smoke
-    # (builds and boots the production `runtime` target), compose-validate, the
-    # parallel conformance-vectors cross-language job (ENG-CONTEXT-001), and
-    # the parallel lock-drift gate (uv.lock ↔ pyproject.toml consistency).
-    assert workflow.count("runs-on: ubuntu-24.04") == 5
+    # Four read-only hosted jobs: repository-safety/change classification,
+    # compose-real-db, runtime-image-smoke, and the parallel
+    # conformance-vectors + lock-consistency job (ENG-CONTEXT-001).
+    assert workflow.count("runs-on: ubuntu-24.04") == 4
     assert re.search(r"^permissions:\s*\n  contents: read\s*$", workflow, re.MULTILINE)
     assert not re.search(r"^\s+[a-z-]+: write\s*$", workflow, re.MULTILINE)
     assert "pull_request_target" not in workflow
-    assert workflow.count("uses: actions/checkout@v6") == 5
-    assert workflow.count("persist-credentials: false") == 5
+    assert workflow.count("uses: actions/checkout@v6") == 4
+    assert workflow.count("persist-credentials: false") == 4
 
 
 def test_hosted_workflow_builds_once_with_event_isolated_cache() -> None:
     workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text()
 
     assert "uses: docker/setup-buildx-action@v4" in workflow
-    # Three builds: the push-event and pull_request-event CI-image builds (only
-    # one of which ever runs, selected by the event guards below), plus the
-    # runtime-image-smoke build of the production target.
-    assert workflow.count("uses: docker/build-push-action@v7") == 3
-    assert "if: github.event_name == 'push'" in workflow
-    assert "if: github.event_name == 'pull_request'" in workflow
-    assert workflow.count("load: true") == 3
-    assert workflow.count("push: false") == 3
+    # Two builds: one CI target and one genuinely distinct runtime target.
+    assert workflow.count("uses: docker/build-push-action@v7") == 2
+    assert workflow.count("load: true") == 2
+    assert workflow.count("push: false") == 2
     assert "docker/login-action" not in workflow
     assert "pull_request_target" not in workflow
 
-    # The CI image is still built exactly once per event: two mutually
-    # exclusive `target: ci` builds sharing one tag and one cache scope.
-    assert workflow.count("target: ci") == 2
-    assert workflow.count("tags: ${{ env.ENGRAM_CI_IMAGE }}") == 2
-    assert workflow.count("cache-from: type=gha,scope=engram-ci") == 2
-    assert "cache-to: type=gha,mode=max,scope=engram-ci" in workflow
-    assert "cache-to: type=gha,mode=min,scope=engram-ci" in workflow
+    # One action invocation handles both event types; only the cache export mode
+    # differs, avoiding two almost-identical guarded YAML blocks.
+    assert workflow.count("target: ci") == 1
+    assert workflow.count("tags: ${{ env.ENGRAM_CI_IMAGE }}") == 1
+    assert workflow.count("cache-from: type=gha,scope=engram-ci") == 1
+    assert workflow.count("mode=${{ github.event_name == 'push' && 'max' || 'min' }}") == 2
     assert "ENGRAM_CI_IMAGE: engram-ci:${{ github.sha }}" in workflow
 
     # The runtime smoke build is a distinct image on its own cache scope, so it
@@ -130,14 +149,14 @@ def test_hosted_workflow_builds_once_with_event_isolated_cache() -> None:
     assert "ENGRAM_RUNTIME_IMAGE: engram-runtime:${{ github.sha }}" in workflow
     assert "tags: ${{ env.ENGRAM_RUNTIME_IMAGE }}" in workflow
     assert "cache-from: type=gha,scope=engram-runtime" in workflow
-    assert "cache-to: type=gha,mode=min,scope=engram-runtime" in workflow
+    assert "scope=engram-runtime" in workflow
 
 
 def test_hosted_workflow_smokes_the_production_runtime_image() -> None:
     """CI must build and boot the `runtime` target, not only the `ci` target.
 
-    Every other job builds `target: ci`, and compose-validate only runs
-    `docker compose config` (which never builds), so without this job a broken
+    Every other build uses `target: ci`, and repository-safety only resolves
+    the Compose contract, so without this job a broken
     non-editable `pip install .`, a dependency only the dev extras were
     providing, or a broken uvicorn entrypoint reaches main undetected.
     """
@@ -165,13 +184,12 @@ def test_hosted_workflow_smokes_the_production_runtime_image() -> None:
 
 
 def test_ci_compose_disables_durability_and_reports_results() -> None:
-    """The CI Postgres trades durability for throughput, and both real-DB
-    workflows export JUnit XML.
+    """The disposable CI database uses non-durable settings and reports results.
 
     The cluster is rebuilt from the bundled migrations on every run and
-    destroyed with `down -v`, so the write barriers only cost time — losing
-    these flags silently regresses the suite. The JUnit export must happen
-    before teardown, or a failing run (the case that matters) reports nothing.
+    destroyed with `down -v`; the settings are safe even though measurements
+    show no material speedup. JUnit export must happen before teardown so both
+    failures and successful timing baselines remain inspectable.
     """
     compose = (REPOSITORY_ROOT / "docker-compose.ci.yml").read_text()
 
@@ -180,28 +198,29 @@ def test_ci_compose_disables_durability_and_reports_results() -> None:
     assert "-c max_connections=200" in compose
     assert "/var/lib/postgresql/data:size=" in compose
 
-    for name in ("ci.yml", "exact-head-ci.yml"):
-        workflow = (REPOSITORY_ROOT / ".github/workflows" / name).read_text()
-        normalized = " ".join(workflow.split())
-        export = workflow.index("Export JUnit Test Results")
-        upload = workflow.index("Upload JUnit Test Results")
-        teardown = workflow.index("down -v --remove-orphans")
-        assert export < upload < teardown
-        assert "engram-test:/app/test-results/." in normalized
-        assert "uses: actions/upload-artifact@v7" in workflow
+    workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text()
+    normalized = " ".join(workflow.split())
+    export = workflow.index("Export JUnit Test Results")
+    upload = workflow.index("Upload JUnit Test Results")
+    teardown = workflow.index("down -v --remove-orphans")
+    assert export < upload < teardown
+    assert "engram-test:/app/test-results/." in normalized
+    assert "uses: actions/upload-artifact@v7" in workflow
+    assert workflow.count("if: always()") >= 4
 
 
-def test_exact_head_workflow_checks_out_and_tests_the_pr_head() -> None:
-    workflow = (REPOSITORY_ROOT / ".github/workflows/exact-head-ci.yml").read_text()
+def test_compose_validation_has_one_reusable_entrypoint() -> None:
+    workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text()
+    validator = (REPOSITORY_ROOT / "scripts/validate_compose_contract.sh").read_text()
+    makefile = (REPOSITORY_ROOT / "Makefile").read_text()
 
-    assert re.search(r"^  compose-real-db-exact-head:\s*$", workflow, re.MULTILINE)
-    assert "ref: ${{ github.event.pull_request.head.sha }}" in workflow
-    assert "ENGRAM_CI_IMAGE: engram-ci:${{ github.event.pull_request.head.sha }}" in workflow
-    assert 'ACTUAL_HEAD="$(git rev-parse HEAD)"' in workflow
-    assert 'test "$ACTUAL_HEAD" = "$EXPECTED_HEAD"' in workflow
-    assert workflow.count("Run Compose Real-DB CI Stack") == 1
-    assert "--exit-code-from engram-test" in workflow
-    assert "if: always()" in workflow
+    assert "bash scripts/validate_compose_contract.sh" in workflow
+    assert "bash scripts/validate_compose_contract.sh" in makefile
+    assert "docker compose config -q" not in workflow
+    assert "docker compose config --services" in validator
+    assert "docker compose config engram-service" in validator
+    assert "docker compose config engram-worker" in validator
+    assert "ENGRAM_JOB_MAX_ATTEMPTS" in validator
 
 
 def test_compose_supports_prebuilt_hosted_and_local_build_modes() -> None:
@@ -302,9 +321,9 @@ def test_ci_dockerfile_separates_dependencies_from_source_binding() -> None:
     # Local members are installed editable, never from the constraints file.
     assert "--no-emit-workspace" in dependency_block
     assert "pip install -c /tmp/ci-constraints.txt" in dependency_block
-    # `--frozen` never rewrites the lockfile, repeating the lock-drift gate.
+    # `--frozen` never rewrites the lockfile, repeating the contract-job check.
     assert "uv lock" not in dependency_block
-    # Pinned to the same uv the lock-drift job uses.
+    # Pinned to the same uv the contract job uses.
     assert 'pip install "uv==0.11.29"' in dependency_block
 
 
@@ -317,6 +336,24 @@ def test_ci_runner_selects_complete_root_suite_with_skip_and_timing_guards() -> 
     ) in runner
     assert '_run("python", "scripts/scan_credential_leaks.py")' in runner
     assert "run_trust_proof.py" not in runner
+
+    # All four shipped Python packages declare strict mypy settings and are
+    # checked. MYPYPATH exposes the typed sibling SDK source to both adapters.
+    for config, package in (
+        ("sdk/engram-client/pyproject.toml", "sdk/engram-client/engram_client"),
+        ("adapters/mcp-server/pyproject.toml", "adapters/mcp-server/engram_mcp"),
+        ("adapters/engram-hooks/pyproject.toml", "adapters/engram-hooks/engram_hooks"),
+    ):
+        assert config in runner
+        assert package in runner
+    assert 'workspace_env["MYPYPATH"] = "sdk/engram-client"' in runner
+
+    # Cheap failures surface before the expensive database suite begins.
+    assert runner.index("Credential Leak Scan") < runner.index("Root Service Tests")
+    assert runner.index("Type Check: engram-hooks Adapter") < runner.index("Root Service Tests")
+    assert runner.index("SDK Tests") < runner.index("Root Service Tests")
+    assert runner.index("MCP Adapter Tests") < runner.index("Root Service Tests")
+    assert runner.index("engram-hooks Tests") < runner.index("Root Service Tests")
 
     # Every suite carries the same timeout and JUnit reporting guards. The
     # timeout turns a deadlock (the concurrency suites are the realistic

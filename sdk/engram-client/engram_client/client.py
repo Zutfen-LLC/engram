@@ -493,15 +493,20 @@ class EngramClient:
         principal: str | None = None,
         *,
         topic: str | None = None,
-        on_behalf_of_principal_id: UUID | None = None,
+        on_behalf_of_principal_id: UUID | str | None = None,
         reason: str | None = None,
     ) -> DiaryWriteResponse:
         """Write the caller's diary, or explicitly represent another principal."""
+        represented_id = (
+            UUID(on_behalf_of_principal_id)
+            if isinstance(on_behalf_of_principal_id, str)
+            else on_behalf_of_principal_id
+        )
         req = DiaryWrite(
             entry=entry,
             principal=principal,
             topic=topic,
-            on_behalf_of_principal_id=on_behalf_of_principal_id,
+            on_behalf_of_principal_id=represented_id,
             reason=reason,
         )
         return await self._send(

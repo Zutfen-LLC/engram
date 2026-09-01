@@ -1,4 +1,4 @@
-.PHONY: lint typecheck test check setup-python-dev compose-ci compose-ci-down
+.PHONY: lint typecheck test check setup-python-dev compose-ci compose-ci-down compose-validate
 
 # Use virtual environment executables
 VENV_BIN = .venv/bin
@@ -8,6 +8,14 @@ lint:
 
 typecheck:
 	$(VENV_BIN)/mypy engram/
+	$(VENV_BIN)/mypy --config-file sdk/engram-client/pyproject.toml \
+		sdk/engram-client/engram_client
+	MYPYPATH=sdk/engram-client $(VENV_BIN)/mypy \
+		--config-file adapters/mcp-server/pyproject.toml \
+		adapters/mcp-server/engram_mcp
+	MYPYPATH=sdk/engram-client $(VENV_BIN)/mypy \
+		--config-file adapters/engram-hooks/pyproject.toml \
+		adapters/engram-hooks/engram_hooks
 
 test:
 	$(VENV_BIN)/pytest -q
@@ -17,6 +25,9 @@ check: lint typecheck test
 
 setup-python-dev:
 	bash scripts/setup-python-dev.sh
+
+compose-validate:
+	bash scripts/validate_compose_contract.sh
 
 # IDE and agent sessions can inherit a stale supplementary-group list even
 # when the current account is configured as a member of the docker group.

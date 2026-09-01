@@ -8,10 +8,6 @@ import re
 import subprocess
 from pathlib import Path
 
-import asyncpg
-
-from engram.migrations import normalize_asyncpg_url
-
 PATTERNS = (
     re.compile(rb"engpair_[A-Za-z0-9_-]{43}"),
     re.compile(rb"engdr_[0-9A-Za-z]{22}_[A-Za-z0-9_-]{43}"),
@@ -77,6 +73,12 @@ def scan_tracked_files(repository: Path) -> int:
 
 
 async def scan_database(url: str) -> int:
+    # Keep repository-only scans dependency-free so the lightweight workflow
+    # gate can inspect documentation changes without installing the application.
+    import asyncpg
+
+    from engram.migrations import normalize_asyncpg_url
+
     conn = await asyncpg.connect(normalize_asyncpg_url(url))
     try:
         columns = await conn.fetch(
