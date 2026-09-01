@@ -25,9 +25,15 @@ REST API (they never touch the DB directly). All importers default to
 **dry-run** mode — pass `--apply` to write. Dry-run reports counts, kind
 mapping, and duplicate detection without sending anything.
 
-Both importers are implemented and used against the CCA and MemPalace stores.
-The production `--apply` runs against the live instance are operational work
-tracked as post-MVP (see `docs/plans/engram-mvp-backlog.md`, BL-011).
+Both importers are implemented and their production `--apply` runs against the
+live instance are **done** (2026-09-01, see
+`docs/plans/engram-mvp-backlog.md`, BL-011 — closed). Notes from those runs:
+
+- Auth-enabled deployments: pass `--api-key` or export `ENGRAM_API_KEY`.
+  (`import_cca.py` gained auth support in PR #150; `import_mempalace.py` had it.)
+- The secret-scanner rejects content matching credential patterns with 422 —
+  one MemPalace drawer (`hosts/ssh-aliases`) was intentionally left unimported.
+  Sanitize such content before reattempting, or keep it out of the service.
 
 ## import_mempalace.py
 
