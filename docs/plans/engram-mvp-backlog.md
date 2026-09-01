@@ -133,10 +133,13 @@ deployment (BL-009); engram-hooks written but unverified (post-MVP, BL-012).
 
 ## BL-011: Production data migration runs (CCA + MemPalace apply-mode)
 
+- **Status:** ✅ complete (executed 2026-09-01 against `api.engram.zutfen.com`).
 - **Objective:** Execute `scripts/import_cca.py --apply` (~40 ledger entries) and `scripts/import_mempalace.py --apply` (~200–900 drawers + KG triples + tunnels) against the deployed instance; verify counts, dedup behavior, taxonomy shape, and export round-trip afterward.
-- **Why it matters:** This is the moment Engram becomes the system of record. It is operational work, not engineering — both importers are built, and MemPalace was dry-run-verified against a real palace.
-- **Affected files/components:** none (ops); import logs recorded.
-- **Verification requirement:** Post-import `GET /v1/review/stats` and `/v1/taxonomy` match dry-run predictions; `GET /v1/export/cca` returns the migrated ledger.
+- **Recorded result:** CCA: 39/39 imported (36 fact, 2 decision, 1 invariant), 0 duplicates, 0 errors. MemPalace: 329/331 drawers imported, 1 duplicate skipped, 1 rejected by the secret-scanner (422 — `hosts/ssh-aliases` drawer; SSH key paths/credential patterns — intentionally not sanitized and left in MemPalace); 29 KG triples + 22 tunnels imported. Post-import verification: `/v1/review/stats` = 586 items; `/v1/export/cca` = 40 entries (39 migrated + 1 pre-existing); taxonomy shows the migrated wings (hermes, engram, monomyth, hosts, etc.).
+- **Engineering note:** the CCA run surfaced that `import_cca.py` predated auth-enablement (BL-003) and sent unauthenticated requests — fixed in PR #150 (`--api-key` flag + `ENGRAM_API_KEY` env fallback + Bearer header) before the successful rerun.
+- **Why it mattered:** This is the moment Engram becomes the system of record. It is operational work, not engineering — both importers are built, and MemPalace was dry-run-verified against a real palace.
+- **Affected files/components:** none (ops); import logs recorded here.
+- **Verification requirement:** Post-import `GET /v1/review/stats` and `/v1/taxonomy` match dry-run predictions; `GET /v1/export/cca` returns the migrated ledger. ✅ met (see recorded result).
 - **Dependencies:** BL-009 (live instance), BL-006 (embeddings active so imports get vectors — or run backfill after).
 
 ## BL-012: engram-hooks verification and Hermes integration
