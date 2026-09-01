@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 from collections import Counter
 from pathlib import Path
@@ -54,10 +55,15 @@ def load_cca(path: Path) -> list[dict[str, Any]]:
     return []
 
 
-def fetch_existing_hashes(engram_url: str) -> set[str]:
+def fetch_existing_hashes(engram_url: str, api_key: str | None = None) -> set[str]:
     """Fetch content_hashes of existing CCA-eligible items from Engram."""
     try:
-        resp = httpx.get(f"{engram_url}/v1/export/cca", timeout=30.0)
+        headers: dict[str, str] = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        resp = httpx.get(
+            f"{engram_url}/v1/export/cca", headers=headers, timeout=30.0
+        )
         resp.raise_for_status()
         return {e["content_hash"] for e in resp.json().get("entries", [])}
     except Exception:
@@ -71,6 +77,11 @@ def main() -> int:
     parser.add_argument("--cca-file", required=True, help="Path to CCA lite JSON file")
     parser.add_argument(
         "--engram-url", default="http://localhost:8000", help="Engram API base URL"
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="Engram API key (Bearer token). Required for auth-enabled deployments.",
     )
     parser.add_argument(
         "--apply",
@@ -101,6 +112,9 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.api_key is None:
+        args.api_key = os.environ.get("ENGRAM_API_KEY")
+
     if args.visibility == "workspace" and not args.workspace:
         print(
             "ERROR: --visibility workspace requires --workspace (no request sent).",
@@ -114,7 +128,9 @@ def main() -> int:
         return 1
 
     entries = load_cca(cca_path)
-    existing_hashes = fetch_existing_hashes(args.engram_url) if args.apply else set()
+    existing_hashes = (
+        fetch_existing_hashes(args.engram_url, args.api_key) if args.apply else set()
+    )
     seen_hashes: set[str] = set()
 
     by_kind: Counter[str] = Counter()
@@ -174,7 +190,12 @@ def main() -> int:
 
     imported = 0
     errors = 0
-    with httpx.Client(base_url=args.engram_url, timeout=30.0) as client:
+    import_headers: dict[str, str] = {}
+    if args.api_key:
+        import_headers["Authorization"] = f"Bearer {args.api_key}"
+    with httpx.Client(
+        base_url=args.engram_url, headers=import_headers, timeout=30.0
+    ) as client:
         for item in to_import:
             try:
                 resp = client.post("/v1/remember", json=item)
