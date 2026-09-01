@@ -59,8 +59,8 @@ RUN mkdir -p \
 #
 # `--no-emit-workspace` drops the four local members; they are installed
 # editable below. `uv export --frozen` never rewrites uv.lock and fails if it
-# has drifted from pyproject.toml, so this repeats the lock-drift gate inside
-# the build. uv is pinned to the same version the lock-drift CI job uses.
+# has drifted from pyproject.toml, so this independently enforces the lock check
+# inside the build. uv is pinned to the same version the contract job uses.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install "uv==0.11.29" && \
     uv export \

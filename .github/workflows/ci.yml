@@ -14,7 +14,60 @@ permissions:
   contents: read
 
 jobs:
-  compose-real-db-merge-ref:
+  # Always runs, including for documentation-only changes. It keeps the
+  # credential scan universal while allowing runtime-independent changes to
+  # skip every image build, database boot, and language toolchain setup.
+  repository-safety:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      runtime_changed: ${{ steps.changes.outputs.runtime_changed }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scan repository for credential leaks
+        run: python scripts/scan_credential_leaks.py
+
+      - name: Detect runtime-relevant changes
+        id: changes
+        env:
+          CI_EVENT_NAME: ${{ github.event_name }}
+          CI_PUSH_BASE_SHA: ${{ github.event.before }}
+          CI_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CI_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CI_WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" == "pull_request" ]]; then
+            comparison_base=$CI_PR_BASE_SHA
+            comparison_head=$CI_PR_HEAD_SHA
+          else
+            comparison_base=$CI_PUSH_BASE_SHA
+            comparison_head=$CI_WORKFLOW_SHA
+          fi
+
+          if [[ -z "$comparison_base" || "$comparison_base" =~ ^0+$ ]]; then
+            runtime_changed=true
+          elif git diff --quiet "$comparison_base" "$comparison_head" -- \
+            . ':(exclude,glob)**/*.md' ':(exclude,glob)docs/**'; then
+            runtime_changed=false
+          else
+            runtime_changed=true
+          fi
+
+          echo "runtime_changed=$runtime_changed" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Validate deployment Compose contract
+        if: steps.changes.outputs.runtime_changed == 'true'
+        run: bash scripts/validate_compose_contract.sh
+
+  compose-real-db:
+    needs: repository-safety
+    if: needs.repository-safety.outputs.runtime_changed == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -25,7 +78,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Assert merge-ref checkout
+      - name: Assert workflow checkout
         env:
           EXPECTED_SHA: ${{ github.sha }}
         run: |
@@ -35,14 +88,10 @@ jobs:
           echo "Checked out SHA: $ACTUAL_SHA"
           test "$ACTUAL_SHA" = "$EXPECTED_SHA"
 
-      - name: Validate Compose Config
-        run: docker compose -f docker-compose.ci.yml config -q
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Build and load CI image with trusted main cache export
-        if: github.event_name == 'push'
+      - name: Build and load CI image
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -53,30 +102,18 @@ jobs:
           push: false
           tags: ${{ env.ENGRAM_CI_IMAGE }}
           cache-from: type=gha,scope=engram-ci
-          cache-to: type=gha,mode=max,scope=engram-ci
-          provenance: false
-
-      - name: Build and load CI image with isolated PR cache export
-        if: github.event_name == 'pull_request'
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: Dockerfile
-          target: ci
-          platforms: linux/amd64
-          load: true
-          push: false
-          tags: ${{ env.ENGRAM_CI_IMAGE }}
-          cache-from: type=gha,scope=engram-ci
-          cache-to: type=gha,mode=min,scope=engram-ci
+          # Main is trusted to populate the full shared cache. GitHub isolates
+          # pull-request cache writes to the PR ref; min mode keeps those writes
+          # small while still accelerating reruns of that PR.
+          cache-to: type=gha,mode=${{ github.event_name == 'push' && 'max' || 'min' }},scope=engram-ci
           provenance: false
 
       - name: Run Compose Real-DB CI Stack
         run: docker compose -f docker-compose.ci.yml up --no-build --abort-on-container-exit --exit-code-from engram-test
 
       # Must run before the stack is torn down. `docker compose cp` reads from
-      # the stopped container, so results survive a failing run — which is the
-      # case that matters.
+      # the stopped container, so results survive failures and retain successful
+      # timing data for future suite balancing work.
       - name: Export JUnit Test Results
         if: always()
         run: |
@@ -90,7 +127,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: junit-merge-ref-${{ github.run_id }}-${{ github.run_attempt }}
+          name: junit-compose-${{ github.run_id }}-${{ github.run_attempt }}
           path: test-results/
           if-no-files-found: warn
           retention-days: 14
@@ -108,6 +145,8 @@ jobs:
   # dependency that only the dev extras were providing, or a broken uvicorn
   # entrypoint reaches main undetected.
   runtime-image-smoke:
+    needs: repository-safety
+    if: needs.repository-safety.outputs.runtime_changed == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
@@ -132,7 +171,7 @@ jobs:
           push: false
           tags: ${{ env.ENGRAM_RUNTIME_IMAGE }}
           cache-from: type=gha,scope=engram-runtime
-          cache-to: type=gha,mode=min,scope=engram-runtime
+          cache-to: type=gha,mode=${{ github.event_name == 'push' && 'max' || 'min' }},scope=engram-runtime
           provenance: false
 
       - name: Verify the non-editable install imports and exposes its entrypoint
@@ -175,162 +214,12 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.ci.yml --profile smoke down -v --remove-orphans
 
-  compose-validate:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - name: Validate deployment compose syntax
-        run: docker compose config -q
-
-      - name: Validate deployment compose content
-        run: |
-          set -euo pipefail
-          SERVICES=$(docker compose config --services)
-          echo "Services: $SERVICES"
-
-          # The worker service must be part of the standard stack.
-          if ! echo "$SERVICES" | grep -qx 'engram-worker'; then
-            echo "ERROR: engram-worker service not found in resolved compose config"
-            exit 1
-          fi
-
-          # Resolve compose with sentinel values for representative shared and
-          # API-only settings, then verify the configuration contract:
-          #   - shared sentinels reach BOTH engram-service and engram-worker
-          #   - API-only sentinels reach engram-service ONLY
-          #   - worker command is 'engram worker' with no published ports
-          export ENGRAM_VOCAB_CACHE_TTL_SECONDS=999
-          export ENGRAM_VOCAB_CACHE_MAX_TENANTS=888
-          export ENGRAM_PROMOTION_CONFLICT_CANDIDATE_K=777
-          export ENGRAM_USAGE_TELEMETRY_ENABLED=true
-          export ENGRAM_API_KEY_CACHE_TTL_SECONDS=666
-          export ENGRAM_READ_DATABASE_URL='postgresql+asyncpg://sentinel-read'
-          export ENGRAM_RECALL_BYTE_BUDGET=555
-          export ENGRAM_STARTUP_PROMOTION_LIMIT=444
-
-          API_CONFIG=$(docker compose config engram-service)
-          WORKER_CONFIG=$(docker compose config engram-worker)
-
-          require_env() {
-            service=$1
-            config=$2
-            key=$3
-            expected=$4
-            if ! printf '%s\n' "$config" | awk -v key="$key" -v expected="$expected" '
-              $1 == key ":" {
-                value = substr($0, index($0, ":") + 1)
-                sub(/^[[:space:]]+/, "", value)
-                sub(/[[:space:]]+$/, "", value)
-                if ((substr(value, 1, 1) == "\"" && substr(value, length(value), 1) == "\"") ||
-                    (substr(value, 1, 1) == "\047" && substr(value, length(value), 1) == "\047")) {
-                  value = substr(value, 2, length(value) - 2)
-                }
-                found = (value == expected)
-              }
-              END { exit !found }
-            '; then
-              echo "ERROR: $key=$expected missing/wrong on $service"
-              exit 1
-            fi
-          }
-
-          reject_env() {
-            service=$1
-            config=$2
-            key=$3
-            if printf '%s\n' "$config" | awk -v key="$key" '$1 == key ":" { found = 1 } END { exit !found }'; then
-              echo "ERROR: $key should NOT be on $service"
-              exit 1
-            fi
-          }
-
-          # Compose emits command in block-list form; bound collection to the
-          # command field so unrelated YAML list items cannot satisfy it.
-          WORKER_COMMAND=$(printf '%s\n' "$WORKER_CONFIG" | awk '
-            /^[[:space:]]+command:[[:space:]]*$/ {
-              in_command = 1
-              command_indent = index($0, "c") - 1
-              next
-            }
-            in_command {
-              match($0, /^[[:space:]]*/)
-              if (RLENGTH <= command_indent) { exit }
-              if ($1 == "-") {
-                value = substr($0, index($0, "-") + 1)
-                sub(/^[[:space:]]+/, "", value)
-                gsub(/^[\047"]|[\047"]$/, "", value)
-                command = command (command ? " " : "") value
-              }
-            }
-            END { print command }
-          ')
-          if [ "$WORKER_COMMAND" != "engram worker" ]; then
-            echo "ERROR: expected worker command 'engram worker', got '$WORKER_COMMAND'"
-            exit 1
-          fi
-          echo "Worker command: $WORKER_COMMAND"
-
-          # Reject a ports key at the worker service's immediate child depth.
-          if printf '%s\n' "$WORKER_CONFIG" | awk '
-            /^[[:space:]]+engram-worker:[[:space:]]*$/ {
-              service_indent = index($0, "e") - 1
-              in_service = 1
-              next
-            }
-            in_service {
-              match($0, /^[[:space:]]*/)
-              if (NF && RLENGTH <= service_indent) { exit }
-              if (RLENGTH == service_indent + 2 && $1 == "ports:") { found = 1 }
-            }
-            END { exit !found }
-          '; then
-            echo "ERROR: engram-worker must not publish ports"
-            exit 1
-          fi
-          echo "Worker published ports: 0"
-
-          for entry in \
-            'ENGRAM_VOCAB_CACHE_TTL_SECONDS=999' \
-            'ENGRAM_VOCAB_CACHE_MAX_TENANTS=888' \
-            'ENGRAM_PROMOTION_CONFLICT_CANDIDATE_K=777' \
-            'ENGRAM_USAGE_TELEMETRY_ENABLED=true'; do
-            key=${entry%%=*}
-            expected=${entry#*=}
-            require_env engram-service "$API_CONFIG" "$key" "$expected"
-            require_env engram-worker "$WORKER_CONFIG" "$key" "$expected"
-          done
-          echo "Shared sentinel checks: 4 passed"
-
-          for entry in \
-            'ENGRAM_API_KEY_CACHE_TTL_SECONDS=666' \
-            'ENGRAM_READ_DATABASE_URL=postgresql+asyncpg://sentinel-read' \
-            'ENGRAM_RECALL_BYTE_BUDGET=555' \
-            'ENGRAM_STARTUP_PROMOTION_LIMIT=444'; do
-            key=${entry%%=*}
-            expected=${entry#*=}
-            require_env engram-service "$API_CONFIG" "$key" "$expected"
-            reject_env engram-worker "$WORKER_CONFIG" "$key"
-          done
-          echo "API-only sentinel checks: 4 passed"
-
-          require_env engram-service "$API_CONFIG" ENGRAM_JOB_MAX_ATTEMPTS 5
-          require_env engram-worker "$WORKER_CONFIG" ENGRAM_JOB_MAX_ATTEMPTS 5
-          echo "ENGRAM_JOB_MAX_ATTEMPTS present on both services"
-
-          echo "All compose content assertions passed."
-
-  # Lightweight, parallel cross-language conformance job for the ENG-CONTEXT-001
-  # context-manifest contract. Runs the Python verifier and the JavaScript
-  # verifier against the SAME checked-in golden vectors. Independent of the
-  # Docker Compose real-DB job (does not lengthen its critical path) and does
-  # NOT install Node in any production/CI Docker image — Node comes only from
-  # actions/setup-node here. No third-party JavaScript packages are used.
+  # Lightweight contract job: lock consistency plus cross-language conformance.
+  # It stays off the real-DB critical path and uses the checked-in lock rather
+  # than independently resolving the project's floating dependency floors.
   conformance-vectors:
+    needs: repository-safety
+    if: needs.repository-safety.outputs.runtime_changed == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
 
@@ -343,12 +232,16 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-          cache: pip
 
-      - name: Install engram with dev extras (jsonschema for the verifier)
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.29"
+
+      - name: Verify lock and install pinned verifier dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
+          uv lock --check
+          uv sync --frozen --extra dev
 
       - name: Set up Node
         uses: actions/setup-node@v5
@@ -356,37 +249,12 @@ jobs:
           node-version: "22"
 
       - name: Verify vectors (Python)
-        run: python scripts/verify_context_manifest_vectors.py
+        run: .venv/bin/python scripts/verify_context_manifest_vectors.py
 
       - name: Verify vectors (JavaScript, independent RFC 8785 + SHA-256)
         run: node conformance/context-manifest-v1/verify.mjs
 
-      - name: Verify negative conformance fixtures (Python)
-        run: python scripts/verify_context_manifest_negatives.py
-
-      - name: Verify negative conformance fixtures (JavaScript)
-        run: node conformance/context-manifest-v1/verify_negatives.mjs
-
-      - name: Verify vectors cross-language (Python runner drives JS negatives)
-        run: python conformance/context-manifest-v1/run_cross_language.py
-
-  # Lightweight lock-consistency gate. Fails if uv.lock has drifted from
-  # pyproject.toml. Kept off the Compose real-DB critical path (runs in this
-  # parallel job) and does not rewrite the lockfile.
-  lock-drift:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v6
-        with:
-          version: "0.11.29"
-          enable-cache: false
-
-      - name: Verify uv.lock matches pyproject.toml (no rewrite)
-        run: uv lock --check
+      # The driver invokes each negative verifier exactly once and checks that
+      # both languages reject the same non-empty fixture set.
+      - name: Verify negative fixtures cross-language
+        run: .venv/bin/python conformance/context-manifest-v1/run_cross_language.py

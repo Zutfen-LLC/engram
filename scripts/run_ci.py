@@ -139,23 +139,51 @@ async def _verify_database() -> None:
 def main() -> int:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    _section("Database Migration Verification")
-    asyncio.run(_verify_database())
+    # Run cheap repository-wide gates first so obvious failures do not wait for
+    # the database-heavy root suite.
+    _section("Credential Leak Scan")
+    _run("python", "scripts/scan_credential_leaks.py")
 
     _section("Lint")
     _run("ruff", "check", ".")
 
-    _section("Type Check")
+    _section("Type Check: Service")
     _run("mypy", "engram/")
 
-    _section("Root Service Tests")
+    _section("Type Check: SDK")
+    _run(
+        "mypy",
+        "--config-file",
+        "sdk/engram-client/pyproject.toml",
+        "sdk/engram-client/engram_client",
+    )
+
+    workspace_env = dict(os.environ)
+    workspace_env["MYPYPATH"] = "sdk/engram-client"
+
+    _section("Type Check: MCP Adapter")
+    _run(
+        "mypy",
+        "--config-file",
+        "adapters/mcp-server/pyproject.toml",
+        "adapters/mcp-server/engram_mcp",
+        env=workspace_env,
+    )
+
+    _section("Type Check: engram-hooks Adapter")
+    _run(
+        "mypy",
+        "--config-file",
+        "adapters/engram-hooks/pyproject.toml",
+        "adapters/engram-hooks/engram_hooks",
+        env=workspace_env,
+    )
+
+    _section("Database Migration Verification")
+    asyncio.run(_verify_database())
+
     env = dict(os.environ)
     env["ENGRAM_FAIL_ON_DB_SKIP"] = "1"
-    _run("pytest", "-q", "--durations=25", *_pytest_flags("root"), "tests", env=env)
-
-    # Hosted CI runs the complete root suite once. The canonical trust proof
-    # remains an explicit operator/local selector via ``make trust-proof`` and
-    # ``make compose-trust-proof`` and must not be rerun inside the hosted gate.
 
     _section("SDK Tests")
     _run(
@@ -178,8 +206,14 @@ def main() -> int:
     # derived from the pinned stock-Hermes revision.
     _run("pytest", "-q", *_pytest_flags("engram-hooks"), "adapters/engram-hooks/tests")
 
-    _section("Credential Leak Scan")
-    _run("python", "scripts/scan_credential_leaks.py")
+    # Leave the nine-minute root suite until last so failures in the much faster
+    # package suites surface without consuming the dominant part of the job.
+    _section("Root Service Tests")
+    _run("pytest", "-q", "--durations=25", *_pytest_flags("root"), "tests", env=env)
+
+    # Hosted CI runs the complete root suite once. The canonical trust proof
+    # remains an explicit operator/local selector via ``make trust-proof`` and
+    # ``make compose-trust-proof`` and must not be rerun inside the hosted gate.
 
     _section("CI Result")
     print("All Compose-backed CI checks passed.", flush=True)
