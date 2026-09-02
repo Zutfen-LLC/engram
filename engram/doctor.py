@@ -1294,9 +1294,12 @@ def _check_promotion_readiness(
     """Evaluate the bounded, content-free promotion-readiness aggregate.
 
     Warns when the first bounded startup-promotion window is dominated by
-    items that are terminal under current policy — permanently blocked rows
-    that the lazy sweep re-selects on every startup recall are evidence of
-    potential scan starvation for later proposals (ENG-PROMOTION-003A).
+    items that are terminal under current policy. Since ENG-PROMOTION-003B
+    the lazy sweep rotates a persisted cursor past rows it has already
+    examined (and skips kind-terminal rows outright), so these rows no
+    longer starve later proposals — the warning remains backlog health
+    evidence: permanently blocked proposals that only review, new evidence,
+    or a policy change can clear.
     """
     if tenant_unresolved:
         return _check(
@@ -1322,12 +1325,15 @@ def _check_promotion_readiness(
             "PROMOTION_SCAN_STARVATION",
             f"{window['terminal_under_current_policy']} of {window['size']} item(s) in "
             "the bounded startup-promotion window are terminal under current "
-            "policy; later proposals may be starved from bounded reconciliation.",
+            "policy. Fair rotation (ENG-PROMOTION-003B) passes over them "
+            "without starving later proposals, but they remain permanently "
+            "blocked backlog.",
             evidence=evidence,
             remediation=[
                 "Review or archive the permanently blocked oldest proposals "
-                "(see GET /v1/review/promotion-readiness/{item_id}), or raise "
-                "startup_promotion_limit."
+                "(see GET /v1/review/promotion-readiness/{item_id}); they "
+                "cannot auto-promote until policy, evidence, or review "
+                "changes."
             ],
         )
     return _check(

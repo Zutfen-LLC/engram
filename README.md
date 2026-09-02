@@ -178,9 +178,10 @@ content-free readiness aggregates — counts by source type, kind, blocker code,
 evidence state (`none` / `bound-qualified` / `bound-below-threshold` /
 `malformed/stale`), job state (`scheduled` / `missing` / `dead` / `overdue`),
 terminal-vs-time-dependent status, and age buckets — and warns when the bounded
-startup-promotion window is dominated by terminal blockers (scan starvation).
+startup-promotion window is dominated by terminal blockers (blocked backlog the
+lazy pass now rotates past rather than starves on).
 
-`POST /v1/recall` with `mode=startup` runs a bounded, tenant-scoped promotion pass automatically before building the working set (capped at `settings.startup_promotion_limit`, default 20 proposed items per call) — no separate trigger needed for day-to-day recall. For full sweeps of a large proposed backlog, wire the CLI to cron/systemd, or call the admin endpoint on demand:
+`POST /v1/recall` with `mode=startup` runs a bounded, tenant-scoped promotion pass automatically before building the working set (capped at `settings.startup_promotion_limit`, default 20 proposed items per call) — no separate trigger needed for day-to-day recall. The bounded pass scans fairly: a persisted per-tenant rotation cursor advances past the rows each pass examined (wrapping at the tail), and proposals whose memory kind can never auto-promote under current policy are excluded outright, so permanently blocked rows at the head of the queue cannot starve later proposals. For full sweeps of a large proposed backlog, wire the CLI to cron/systemd, or call the admin endpoint on demand:
 
 ```bash
 # All tenants. Runs as the owner role (bypasses RLS) via ENGRAM_OWNER_DATABASE_URL:
