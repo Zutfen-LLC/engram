@@ -89,30 +89,35 @@ async def _check_table() -> None:
 
 @pytest.fixture(autouse=True)
 async def _clean_receipts():
-    """Delete test-seeded tenants (cascades receipts, recall_logs, principals)."""
+    """Delete test-seeded rows before and after each test."""
     if not await _db_ok():
+        yield
         return
-    async with _test_engine.begin() as conn:
-        # Clean up test-created tenants first — cascades to principals,
-        # recall_logs, and context_receipts.
-        await conn.execute(
-            text("DELETE FROM tenants WHERE slug LIKE 'crtest-%'")
-        )
-        # Also remove any stray test receipts in the default tenant.
-        await conn.execute(
-            text(
-                "DELETE FROM context_receipts WHERE "
-                "recall_log_id IN ("
-                "  SELECT id FROM recall_logs WHERE "
-                "  principal_id IN ("
-                "    SELECT id FROM principals WHERE name LIKE 'crtest-%'"
-                "  )"
-                ")"
+
+    async def _delete_test_rows() -> None:
+        async with _test_engine.begin() as conn:
+            # Deleting a test tenant cascades to its principals, recall logs,
+            # and context receipts.
+            await conn.execute(text("DELETE FROM tenants WHERE slug LIKE 'crtest-%'"))
+            # Remove stray test receipts and principals in the default tenant.
+            await conn.execute(
+                text(
+                    "DELETE FROM context_receipts WHERE "
+                    "recall_log_id IN ("
+                    "  SELECT id FROM recall_logs WHERE "
+                    "  principal_id IN ("
+                    "    SELECT id FROM principals WHERE name LIKE 'crtest-%'"
+                    "  )"
+                    ")"
+                )
             )
-        )
-        await conn.execute(
-            text("DELETE FROM principals WHERE name LIKE 'crtest-%'")
-        )
+            await conn.execute(text("DELETE FROM principals WHERE name LIKE 'crtest-%'"))
+
+    await _delete_test_rows()
+    try:
+        yield
+    finally:
+        await _delete_test_rows()
 
 
 # ─── Seeding helpers ──────────────────────────────────────────────────

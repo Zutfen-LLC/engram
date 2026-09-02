@@ -25,17 +25,17 @@ def test_trust_proof_files_are_unique_existing_root_suite_tests() -> None:
         assert resolved_path.is_file()
 
 
-def test_hosted_workflow_runs_one_real_db_gate() -> None:
+def test_hosted_workflow_runs_isolated_real_db_shards() -> None:
     workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text()
     workflow_dir = REPOSITORY_ROOT / ".github/workflows"
 
     assert "scripts/run_trust_proof.py" not in workflow
     assert "Run Canonical Trust Proof" not in workflow
     assert "Reset Trust-Proof Stack" not in workflow
-    assert workflow.count("Run Compose Real-DB CI Stack") == 1
+    assert workflow.count("Run Compose Real-DB CI Shard") == 1
     assert not (workflow_dir / "exact-head-ci.yml").exists()
     assert sum(
-        path.read_text().count("Run Compose Real-DB CI Stack")
+        path.read_text().count("Run Compose Real-DB CI Shard")
         for path in workflow_dir.glob("*.yml")
     ) == 1
 
@@ -47,7 +47,17 @@ def test_hosted_workflow_runs_one_real_db_gate() -> None:
     assert "docker compose -f docker-compose.ci.yml up --build" not in normalized_workflow
     assert "if: always()" in workflow
     assert "down -v --remove-orphans" in normalized_workflow
+    assert re.search(r"^  compose-real-db-shard:\s*$", workflow, re.MULTILINE)
     assert re.search(r"^  compose-real-db:\s*$", workflow, re.MULTILINE)
+    assert "name: compose-real-db / shard ${{ matrix.shard_label }}" in workflow
+    assert "fail-fast: false" in workflow
+    assert "shard_index: 0" in workflow
+    assert "shard_index: 3" in workflow
+    assert 'ENGRAM_CI_MODE: "root-shard"' in workflow
+    assert "ENGRAM_CI_SHARD_INDEX: ${{ matrix.shard_index }}" in workflow
+    assert 'ENGRAM_CI_SHARD_COUNT: "4"' in workflow
+    assert "needs.compose-real-db-shard.result" in workflow
+    assert "needs.conformance-vectors.result" in workflow
     assert re.search(r"^  repository-safety:\s*$", workflow, re.MULTILINE)
     assert "Validate Compose Config" not in workflow
 
@@ -87,7 +97,7 @@ def test_hosted_workflow_runs_one_pinned_conformance_and_lock_gate() -> None:
     assert "astral-sh/setup-uv@v6" in workflow
     assert "version: \"0.11.29\"" in workflow
     assert "uv lock --check" in workflow
-    assert "uv sync --frozen --extra dev" in workflow
+    assert "uv sync --frozen --all-packages --all-extras" in workflow
     conformance_job = workflow.split("  conformance-vectors:", 1)[1]
     assert "pip install" not in conformance_job
     # The lock gate never rewrites the lockfile.
@@ -113,10 +123,9 @@ def test_hosted_workflow_uses_read_only_github_hosted_runners() -> None:
     workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text()
 
     assert "runs-on: self-hosted" not in workflow
-    # Four read-only hosted jobs: repository-safety/change classification,
-    # compose-real-db, runtime-image-smoke, and the parallel
-    # conformance-vectors + lock-consistency job (ENG-CONTEXT-001).
-    assert workflow.count("runs-on: ubuntu-24.04") == 4
+    # Five read-only hosted job definitions. The real-DB matrix expands its
+    # single definition into four isolated runners.
+    assert workflow.count("runs-on: ubuntu-24.04") == 5
     assert re.search(r"^permissions:\s*\n  contents: read\s*$", workflow, re.MULTILINE)
     assert not re.search(r"^\s+[a-z-]+: write\s*$", workflow, re.MULTILINE)
     assert "pull_request_target" not in workflow
@@ -124,11 +133,12 @@ def test_hosted_workflow_uses_read_only_github_hosted_runners() -> None:
     assert workflow.count("persist-credentials: false") == 4
 
 
-def test_hosted_workflow_builds_once_with_event_isolated_cache() -> None:
+def test_hosted_workflow_builds_each_isolated_shard_from_one_cache_scope() -> None:
     workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text()
 
     assert "uses: docker/setup-buildx-action@v4" in workflow
-    # Two builds: one CI target and one genuinely distinct runtime target.
+    # Two build definitions: the matrix expands the CI definition once per
+    # shard, and the runtime target remains a distinct build.
     assert workflow.count("uses: docker/build-push-action@v7") == 2
     assert workflow.count("load: true") == 2
     assert workflow.count("push: false") == 2
@@ -140,7 +150,8 @@ def test_hosted_workflow_builds_once_with_event_isolated_cache() -> None:
     assert workflow.count("target: ci") == 1
     assert workflow.count("tags: ${{ env.ENGRAM_CI_IMAGE }}") == 1
     assert workflow.count("cache-from: type=gha,scope=engram-ci") == 1
-    assert workflow.count("mode=${{ github.event_name == 'push' && 'max' || 'min' }}") == 2
+    assert "matrix.export_cache" in workflow
+    assert workflow.count("github.event_name == 'push' && 'max' || 'min'") == 2
     assert "ENGRAM_CI_IMAGE: engram-ci:${{ github.sha }}" in workflow
 
     # The runtime smoke build is a distinct image on its own cache scope, so it
@@ -233,6 +244,9 @@ def test_compose_supports_prebuilt_hosted_and_local_build_modes() -> None:
     assert re.search(
         r"depends_on:\s*\n\s+postgres:\s*\n\s+condition: service_healthy", compose
     )
+    assert "ENGRAM_CI_MODE: ${ENGRAM_CI_MODE:-full}" in compose
+    assert "ENGRAM_CI_SHARD_INDEX: ${ENGRAM_CI_SHARD_INDEX:-0}" in compose
+    assert "ENGRAM_CI_SHARD_COUNT: ${ENGRAM_CI_SHARD_COUNT:-1}" in compose
 
 
 def test_compose_propagates_context_receipt_dark_write_settings() -> None:
@@ -327,13 +341,17 @@ def test_ci_dockerfile_separates_dependencies_from_source_binding() -> None:
     assert 'pip install "uv==0.11.29"' in dependency_block
 
 
-def test_ci_runner_selects_complete_root_suite_with_skip_and_timing_guards() -> None:
+def test_ci_runner_supports_full_preflight_and_root_shard_modes() -> None:
     runner = (REPOSITORY_ROOT / "scripts/run_ci.py").read_text()
 
     assert 'env["ENGRAM_FAIL_ON_DB_SKIP"] = "1"' in runner
-    assert (
-        '_run("pytest", "-q", "--durations=25", *_pytest_flags("root"), "tests", env=env)'
-    ) in runner
+    assert 'choices=("full", "preflight", "root-shard")' in runner
+    assert 'default=os.environ.get("ENGRAM_CI_MODE", "full")' in runner
+    assert 'os.environ["ENGRAM_CI_SHARD_INDEX"]' in runner
+    assert 'os.environ["ENGRAM_CI_SHARD_COUNT"]' in runner
+    assert "select_root_test_shard(" in runner
+    assert 'f"root-shard-{shard_index + 1}-of-{shard_count}"' in runner
+    assert '"tests"' in runner
     assert '_run("python", "scripts/scan_credential_leaks.py")' in runner
     assert "run_trust_proof.py" not in runner
 
@@ -366,3 +384,11 @@ def test_ci_runner_selects_complete_root_suite_with_skip_and_timing_guards() -> 
     assert 'f"--junitxml={RESULTS_DIR / f\'{suite}.xml\'}"' in runner
     for suite in ("root", "sdk", "mcp-adapter", "engram-hooks"):
         assert f'_pytest_flags("{suite}")' in runner
+
+    # Static checks and DB-free package suites run once in the existing
+    # conformance job. The real-DB matrix runs only the DB verification, the
+    # MCP integration suite on shard zero, and one root-test shard.
+    workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text()
+    assert "Run Python preflight" in workflow
+    assert "scripts/run_ci.py --mode preflight" in workflow
+    assert "ENGRAM_CI_RESULTS_DIR: test-results" in workflow

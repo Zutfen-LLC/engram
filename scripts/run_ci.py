@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Final
 
 import asyncpg
+from ci_shards import select_root_test_shard
 
 # JUnit XML lands here so the workflow can copy it out of the stopped container
 # and upload it as an artifact. Failures are then readable as structured test
@@ -136,11 +139,8 @@ async def _verify_database() -> None:
         await conn.close()
 
 
-def main() -> int:
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Run cheap repository-wide gates first so obvious failures do not wait for
-    # the database-heavy root suite.
+def _run_preflight() -> None:
+    """Run checks that do not require PostgreSQL."""
     _section("Credential Leak Scan")
     _run("python", "scripts/scan_credential_leaks.py")
 
@@ -179,12 +179,6 @@ def main() -> int:
         env=workspace_env,
     )
 
-    _section("Database Migration Verification")
-    asyncio.run(_verify_database())
-
-    env = dict(os.environ)
-    env["ENGRAM_FAIL_ON_DB_SKIP"] = "1"
-
     _section("SDK Tests")
     _run(
         "pytest",
@@ -195,28 +189,100 @@ def main() -> int:
         "sdk/engram-client/tests",
     )
 
-    _section("MCP Adapter Tests")
-    # ENGRAM_FAIL_ON_DB_SKIP=1 makes a DB-backed integration skip fail the run,
-    # so API/SDK drift that breaks the MCP round trips fails CI instead of
-    # silently skipping. The DB is available in the CI Compose stack.
-    _run("pytest", "-q", *_pytest_flags("mcp-adapter"), "adapters/mcp-server/tests", env=env)
-
     _section("engram-hooks Tests")
     # No DB or network needed: the write-contract suite uses a hermetic fixture
     # derived from the pinned stock-Hermes revision.
     _run("pytest", "-q", *_pytest_flags("engram-hooks"), "adapters/engram-hooks/tests")
 
-    # Leave the nine-minute root suite until last so failures in the much faster
-    # package suites surface without consuming the dominant part of the job.
+
+def _database_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env["ENGRAM_FAIL_ON_DB_SKIP"] = "1"
+    return env
+
+
+def _run_database_verification() -> None:
+    _section("Database Migration Verification")
+    asyncio.run(_verify_database())
+
+
+def _run_mcp_adapter_tests(env: dict[str, str]) -> None:
+    _section("MCP Adapter Tests")
+    # A skipped DB integration test must fail the real-DB gate.
+    _run("pytest", "-q", *_pytest_flags("mcp-adapter"), "adapters/mcp-server/tests", env=env)
+
+
+def _run_complete_root_suite(env: dict[str, str]) -> None:
     _section("Root Service Tests")
     _run("pytest", "-q", "--durations=25", *_pytest_flags("root"), "tests", env=env)
 
-    # Hosted CI runs the complete root suite once. The canonical trust proof
-    # remains an explicit operator/local selector via ``make trust-proof`` and
-    # ``make compose-trust-proof`` and must not be rerun inside the hosted gate.
+
+def _run_root_shard(env: dict[str, str], *, shard_index: int, shard_count: int) -> None:
+    test_files = select_root_test_shard(
+        Path("tests"), shard_index=shard_index, shard_count=shard_count
+    )
+    suite = f"root-shard-{shard_index + 1}-of-{shard_count}"
+    total_bytes = sum(path.stat().st_size for path in test_files)
+
+    _section(f"Root Service Tests: Shard {shard_index + 1} of {shard_count}")
+    print(
+        f"Selected {len(test_files)} test files ({total_bytes} source bytes):",
+        flush=True,
+    )
+    for path in test_files:
+        print(f"  {path.as_posix()}", flush=True)
+    _run(
+        "pytest",
+        "-q",
+        "--durations=25",
+        *_pytest_flags(suite),
+        *(path.as_posix() for path in test_files),
+        env=env,
+    )
+
+
+def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--mode",
+        choices=("full", "preflight", "root-shard"),
+        default=os.environ.get("ENGRAM_CI_MODE", "full"),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parse_args(argv)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    if args.mode in {"full", "preflight"}:
+        _run_preflight()
+
+    if args.mode == "preflight":
+        _section("CI Result")
+        print("All DB-free CI preflight checks passed.", flush=True)
+        return 0
+
+    _run_database_verification()
+    env = _database_env()
+
+    if args.mode == "root-shard":
+        shard_index = int(os.environ["ENGRAM_CI_SHARD_INDEX"])
+        shard_count = int(os.environ["ENGRAM_CI_SHARD_COUNT"])
+        if shard_index == 0:
+            _run_mcp_adapter_tests(env)
+        _run_root_shard(env, shard_index=shard_index, shard_count=shard_count)
+    else:
+        _run_mcp_adapter_tests(env)
+        _run_complete_root_suite(env)
+
+    # Hosted CI partitions the complete root suite across isolated shards. The
+    # canonical trust proof remains an explicit operator/local selector via
+    # ``make trust-proof`` and ``make compose-trust-proof``. Do not rerun it in
+    # the hosted gate.
 
     _section("CI Result")
-    print("All Compose-backed CI checks passed.", flush=True)
+    print(f"All {args.mode} CI checks passed.", flush=True)
     return 0
 
 
