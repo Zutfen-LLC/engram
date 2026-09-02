@@ -19,6 +19,7 @@ _MEMORY_ITEM_READ_ROUTES = {
     ("GET", "/v1/review/conflicts"),
     ("GET", "/v1/review/stale"),
     ("GET", "/v1/review/stats"),
+    ("GET", "/v1/review/promotion-readiness/{item_id}"),
     ("GET", "/v1/diary/{principal}"),
     ("GET", "/v1/export/cca"),
     ("GET", "/v1/taxonomy"),

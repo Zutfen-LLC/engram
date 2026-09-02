@@ -159,7 +159,26 @@ written → proposed → active → disputed → resolved → superseded/archive
 Auto-promotion has independent legacy-confidence and server-attested retention-evidence lanes.
 The evidence lane uses `min(0.85, 0.20 * source_confidence_prior + 0.80 *
 retention_confidence)` for governed kinds only; it changes only `proposed → active`,
-never provenance, authority, confidence, or human-verification fields.
+never provenance, authority, confidence, or human-verification fields. The promotion
+decision itself is a deterministic *promotion assessment* over the currently available
+evidence: recalls and useful feedback do **not** accumulate promotion evidence, and
+Path B (usage-validated quorum) is deferred and unimplemented — useful feedback changes
+`importance` (and may reset a startup-recall counter) only.
+
+Per-item readiness is inspectable without re-running providers or the promotion-time
+conflict recheck via `GET /v1/review/promotion-readiness/{item_id}` (review/admin
+scope): it reports the bound receipt and its versions/model/provider, taxonomy and
+retention confidences, the computed evidence score and threshold, the minimum
+retention confidence required under the current formula and source prior (`unreachable`
+when a cap makes the threshold impossible), the selected lane or `none`, canonical
+blocker codes, cooling/eligibility clocks, the current promotion/classification job
+state, and whether the item can ever auto-promote under current policy without new
+evidence, configuration, or review. `engram doctor` additionally reports bounded,
+content-free readiness aggregates — counts by source type, kind, blocker code,
+evidence state (`none` / `bound-qualified` / `bound-below-threshold` /
+`malformed/stale`), job state (`scheduled` / `missing` / `dead` / `overdue`),
+terminal-vs-time-dependent status, and age buckets — and warns when the bounded
+startup-promotion window is dominated by terminal blockers (scan starvation).
 
 `POST /v1/recall` with `mode=startup` runs a bounded, tenant-scoped promotion pass automatically before building the working set (capped at `settings.startup_promotion_limit`, default 20 proposed items per call) — no separate trigger needed for day-to-day recall. For full sweeps of a large proposed backlog, wire the CLI to cron/systemd, or call the admin endpoint on demand:
 
@@ -218,15 +237,15 @@ auto_promote_min_age_hours
 Trust is not binary. Every memory carries:
 
 * **source_trust** — trust in where the memory came from
-* **source_confidence_prior** — immutable write-time confidence selected from source policy
-* **taxonomy_confidence** — confidence that kind/wing/room classification is correct
-* **retention_confidence** — positive evidence that content is atomic, faithful, and durable
+* **source_confidence_prior** — immutable write-time confidence selected from source policy; production classification never blends it afterwards
+* **taxonomy_confidence** — classifier confidence that kind/wing/room placement is correct
+* **retention_confidence** — the classifier's estimate that the content is durable and useful enough to keep; it is *not* epistemic or factual confidence (the retention receipt does not establish that the proposition is correct)
 * **authority** — immutable governance rank derived from provenance (inferred 10,
   untrusted agent 20, trusted agent 30, trusted import 40, explicit user 50)
 
 Source trust remains tenant-configurable and affects recall ranking. Authority is fixed by code and
 controls whether one memory may supersede another; tuning recall scores cannot invert that hierarchy.
-* **memory_confidence** — confidence that the memory is accurate
+* **memory_confidence** — legacy promotion-lane input; initialized from the source-policy prior at write time and left unchanged by later classification
 * **extraction_confidence** — confidence in the extraction process
 * **human_verified** — whether a human has confirmed it
 * **authority level** — explicit_user > trusted_import > trusted_agent > inferred
@@ -444,8 +463,9 @@ Taxonomy and retention confidences are separately clamped to `0.0–0.95`. Reten
 `retain` for atomic information useful beyond the current working moment; `transient` for session-local
 utility; `noise` for acknowledgements, status/process chatter, and repeated tool output; and `uncertain`
 when durable value cannot be judged safely. Retention confidence measures only the positive case for
-durable retention, so confidence that content is noise does not raise it. Retention evidence is not
-external-truth verification, does not affect recall ranking, and does not authorize a write.
+durable retention, so confidence that content is noise does not raise it. Retention evidence is the
+classifier recommending retention — it is not epistemic or factual confidence, does not establish that
+the proposition is correct, does not affect recall ranking, and does not authorize a write.
 
 The classifier's `suggested_visibility` is applied **downward only** — it may narrow the requested scope (e.g. `tenant` → `private`) but never widen it. Invalid or absent suggestions preserve the caller's requested visibility unchanged.
 

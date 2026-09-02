@@ -7,7 +7,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -31,6 +31,7 @@ from engram.memory_access import (
 from engram.memory_context import ResolvedMemoryContext, resolve_memory_context
 from engram.models import MemoryItem, TenantConfig
 from engram.promotion import _config_values, assess_promotion_candidate, load_promotion_support
+from engram.promotion_readiness import build_promotion_readiness
 from engram.review_policy import (
     TransitionOutcome,
     can_human_verify,
@@ -155,6 +156,99 @@ class ReviewStatsResponse(BaseModel):
     total: int
 
 
+class PromotionReadinessJob(BaseModel):
+    """One bounded, content-free diagnostic job fact (no payloads)."""
+
+    job_id: UUID
+    job_type: str
+    status: str
+    state: Literal["scheduled", "overdue", "dead"]
+    run_after: datetime
+    attempts: int
+    max_attempts: int
+
+
+class PromotionReadinessLastEvaluation(BaseModel):
+    """Best-available last-evaluation trigger, or an explicit unknown."""
+
+    trigger: str
+    at: datetime | None = None
+    policy_version: str | None = None
+    basis: str | None = None
+    detail: str
+
+
+class PromotionReadinessResponse(BaseModel):
+    """Per-item promotion readiness diagnostics (ENG-PROMOTION-003A).
+
+    Computed by the same pure promotion evaluator and canonical blocker
+    vocabulary used by the mutation paths. Terminology: ``source_confidence_prior``
+    is the immutable source-policy prior; ``taxonomy_confidence`` is classifier
+    confidence in kind/placement; ``retention_confidence`` is the classifier's
+    estimate that the candidate is durable/useful — it is NOT epistemic or
+    factual confidence (the retention receipt does not establish that the
+    proposition is correct). Positive feedback and recalls accumulate no
+    promotion evidence; Path B (usage quorum) is deferred and unimplemented.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: UUID
+    source_type: str
+    kind: str
+    review_status: str
+    created_at: datetime
+    age_seconds: float
+    is_promotion_candidate: bool
+
+    memory_confidence: float
+    source_confidence_prior: float | None
+    legacy_threshold: float
+    legacy_threshold_met: bool
+
+    evidence_enabled: bool
+    evidence_threshold: float
+    evidence_score: float | None
+    evidence_state: str
+    required_retention_confidence: float | None
+    required_retention_status: Literal[
+        "computable", "unreachable", "unknown_no_source_prior"
+    ]
+
+    classification_run_id: UUID | None
+    classification_version: str | None
+    retention_policy_version: str | None
+    classification_model: str | None
+    classification_provider: str | None
+    taxonomy_confidence: float | None
+    retention_confidence: float | None
+    retention_disposition: str | None
+    retention_evidence_at: datetime | None
+
+    selected_basis: str | None
+    promotion_policy_version: str | None
+    blockers: list[str]
+    readiness_state: str
+    terminal_under_current_policy: bool
+    can_auto_promote_without_new_evidence_or_review: bool
+
+    legacy_trust_qualified: bool
+    legacy_age_qualified: bool
+    legacy_eligible_at: datetime
+    evidence_trust_qualified: bool
+    evidence_age_qualified: bool
+    evidence_eligible_at: datetime | None
+    cooling_period_start: datetime | None
+    selected_eligible_at: datetime | None
+    remaining_cooling_seconds: float | None
+
+    promotion_job_state: str | None
+    jobs: list[PromotionReadinessJob]
+
+    conflict_recheck_status: Literal["not_run"]
+    last_evaluation: PromotionReadinessLastEvaluation
+
+
 async def _resolve_tenant_id(session: AsyncSession) -> UUID:
     row = await session.execute(text("SELECT current_setting('app.tenant_id', true)"))
     tid_str = row.scalar()
@@ -276,6 +370,59 @@ async def review_queue(
             }
         )
     return output
+
+
+@router.get(
+    "/review/promotion-readiness/{item_id}",
+    response_model=PromotionReadinessResponse,
+    dependencies=[Depends(REVIEW_SCOPE)],
+)
+async def promotion_readiness(
+    item_id: UUID,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
+) -> PromotionReadinessResponse:
+    """Explain one item's promotion readiness without mutating anything.
+
+    Re-runs no provider call and no promotion-time semantic conflict recheck
+    (``conflict_recheck_status`` is always ``not_run``). Every lane decision,
+    blocker code, score, and threshold comes from the shared pure evaluator
+    used by the mutation paths, so this preview can never drift from actual
+    promotion behavior. Inaccessible item ids 404 non-disclosingly, matching
+    the other review surfaces.
+    """
+    item = (
+        await session.execute(
+            select(MemoryItem)
+            .where(
+                MemoryItem.id == item_id,
+                read_eligibility_expression(memory_context),
+            )
+        )
+    ).scalar_one_or_none()
+    if item is None:
+        raise HTTPException(status_code=404, detail="Item not found")
+    readiness = await build_promotion_readiness(session, item, now=datetime.now(UTC))
+    data = readiness.as_dict()
+    data["jobs"] = [
+        PromotionReadinessJob(
+            job_id=UUID(job["job_id"]),
+            job_type=job["job_type"],
+            status=job["status"],
+            state=job["state"],
+            run_after=datetime.fromisoformat(job["run_after"]),
+            attempts=job["attempts"],
+            max_attempts=job["max_attempts"],
+        )
+        for job in data["jobs"]
+    ]
+    data["created_at"] = readiness.created_at
+    data["legacy_eligible_at"] = readiness.legacy_eligible_at
+    data["retention_evidence_at"] = readiness.retention_evidence_at
+    data["last_evaluation"] = PromotionReadinessLastEvaluation(
+        **data["last_evaluation"]
+    )
+    return PromotionReadinessResponse(**data)
 
 
 @router.get(

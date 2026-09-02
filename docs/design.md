@@ -396,17 +396,54 @@ the original audit gap.
 existing `skipped_confidence` / `skipped_age` / `skipped_conflict` /
 `skipped_disabled`, so promotion is auditable without log scraping.
 
-#### Path B — Usage-validated quorum
+#### Promotion evidence terminology (canonical)
+
+Every operator-facing surface uses these exact distinctions:
+
+* `source_confidence_prior` — the immutable source-policy prior written at capture
+  time. Production classification never blends it afterwards; the deprecated
+  `blend_memory_confidence` helper is unused by production paths.
+* `taxonomy_confidence` — the classifier's confidence in kind/placement.
+* `retention_confidence` — the classifier's estimate that the candidate is
+  durable/useful enough to keep.
+* **promotion assessment** — the deterministic, versioned policy decision over the
+  currently available evidence (the pure evaluator in `engram.promotion_policy` /
+  `engram.promotion.assess_promotion_candidate`).
+* **epistemic/factual confidence** — *not currently established by the retention
+  receipt.* A bound receipt records that a classifier recommended retention; it
+  does not record that the proposition is factually correct.
+* **Path B** — deferred/unimplemented until a linked issue lands. Recalls and
+  useful feedback do not accumulate retention or promotion evidence; positive
+  feedback changes `importance` (and may reset a startup-recall counter) only.
+
+Per-item readiness diagnostics (`GET /v1/review/promotion-readiness/{item_id}`,
+review/admin scope) and `engram doctor`'s bounded content-free
+`promotion.readiness` aggregate both reuse this vocabulary and the same pure
+evaluator as the mutation paths; neither ever runs the promotion-time conflict
+recheck, and both say so explicitly.
+
+#### Path B — Usage-validated quorum (deferred, unimplemented)
+
+> **Implementation status:** Path B is **not implemented** and no promotion lane
+> consumes feedback. The spec below is the *future* design only; nothing in the
+> system promotes on usage today. When implemented, its quorum must count
+> distinct non-author principals over current useful rows only.
 
 * `review_status = 'proposed'`
 * 2+ distinct non-author principals have a current useful verdict via `/v1/feedback`
 * No dispute events
 
-Usage-validated promotion means a memory that multiple agents independently found useful has earned activation — a stronger signal than aging quietly.
+Usage-validated promotion would mean a memory that multiple agents independently
+found useful has earned activation — a stronger signal than aging quietly.
 
-In single-agent deployments, Path A is the normal path. In multi-agent deployments, Path B allows fleet behavior to surface useful memories without requiring constant human review.
+In single-agent deployments, Path A is the normal path. In multi-agent
+deployments, the intent of Path B is to let fleet behavior surface useful
+memories without requiring constant human review; that intent is not realized
+today.
 
-A background job, scheduled CLI invocation, or lazy check on recall promotes eligible items to `active`. The promotion is logged in `item_events`.
+A background job, scheduled CLI invocation, or lazy check on recall promotes
+eligible items to `active` (Path A only). The promotion is logged in
+`item_events`.
 
 **Disputed high-stakes items:** When an item of a kind governed with `stays_in_recall_when_disputed=true` (built-in: `doctrine`, `invariant`) is disputed, it does not silently vanish from startup recall — it stays in startup recall with warnings such as `['disputed — pending resolution']` until resolved. Disputed items of other kinds are excluded from startup recall by default. This is a `memory_kinds` registry flag (ENG-AUD-010), not a hard-coded `doctrine`/`invariant` string check — a tenant can grant or withhold the same behavior on any kind, including custom ones.
 
@@ -672,11 +709,12 @@ same tenant and authenticated principal and its `item_ids` must contain the
 feedback item. Missing or foreign logs return non-disclosing `404`; an owned
 log that cannot establish item inclusion returns `422`.
 
-Path B remains unimplemented. Its future quorum must count distinct non-author
-principals only over current useful rows (`superseded_at IS NULL`); historical
-and superseded useful rows do not count, and rate limiting does not grant
-authority. Migration 011 canonicalizes duplicate history by `(created_at, id)`
-without recomputing historical importance.
+Path B remains unimplemented; positive feedback currently changes `importance` (and
+may reset a startup-recall counter) and is not promotion evidence. Its future quorum
+must count distinct non-author principals only over current useful rows
+(`superseded_at IS NULL`); historical and superseded useful rows do not count, and
+rate limiting does not grant authority. Migration 011 canonicalizes duplicate history
+by `(created_at, id)` without recomputing historical importance.
 
 ### Recall explanations
 

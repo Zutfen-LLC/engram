@@ -15,6 +15,7 @@ instead (see ``tests/conftest.py``).
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -1248,3 +1249,325 @@ async def test_database_url_one_shot_engine_disposed_exactly_once_on_success(
     assert recall_check.status == "pass"
     assert len(proxies) == 1
     assert proxies[0].dispose_calls == 1
+
+
+# --- promotion.readiness (ENG-PROMOTION-003A) ----------------------------------
+
+
+async def _insert_proposed_item(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    principal_id: uuid.UUID,
+    content: str,
+    kind: str = "fact",
+    memory_confidence: float = 0.4,
+    source_confidence_prior: float | None = None,
+    retention_confidence: float | None = None,
+    retention_disposition: str | None = None,
+    retention_evidence_at: datetime | None = None,
+    created_at: datetime | None = None,
+) -> uuid.UUID:
+    item_id = uuid.uuid4()
+    created = created_at or NOW - timedelta(hours=100)
+    await session.execute(
+        text(
+            "INSERT INTO memory_items (id, tenant_id, principal_id, content, content_hash, "
+            "kind, visibility, review_status, memory_confidence, source_trust, "
+            "source_confidence_prior, retention_confidence, retention_disposition, "
+            "retention_evidence_at, importance, source_type, created_at, valid_from) "
+            "VALUES (:id, :tid, :pid, :content, :chash, :kind, 'tenant', 'proposed', "
+            ":confidence, 0.5, :prior, :retention, :disposition, :evidence_at, 0.5, "
+            "'sync_turn', :created_at, :created_at)"
+        ),
+        {
+            "id": item_id,
+            "tid": tenant_id,
+            "pid": principal_id,
+            "content": content,
+            "chash": f"sha256:{uuid.uuid4().hex}",
+            "kind": kind,
+            "confidence": memory_confidence,
+            "prior": source_confidence_prior,
+            "retention": retention_confidence,
+            "disposition": retention_disposition,
+            "evidence_at": retention_evidence_at,
+            "created_at": created,
+        },
+    )
+    return item_id
+
+
+async def _bind_receipt(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    principal_id: uuid.UUID,
+    item_id: uuid.UUID,
+    retention_confidence: float,
+    retention_disposition: str,
+    taxonomy_confidence: float,
+    created_at: datetime,
+    classification_version: str = "classification-v2",
+) -> uuid.UUID:
+    # A consistent receipt must match the item row exactly; read the authoritative
+    # values instead of duplicating them at the call site.
+    item = (
+        (
+            await session.execute(
+                text(
+                    "SELECT content_hash, source_type, kind FROM memory_items "
+                    "WHERE id = :iid"
+                ),
+                {"iid": item_id},
+            )
+        )
+        .mappings()
+        .one()
+    )
+    content_hash = str(item["content_hash"])
+    source_type = str(item["source_type"])
+    kind = str(item["kind"])
+    run_id = uuid.uuid4()
+    await session.execute(
+        text(
+            "INSERT INTO classification_runs (id, tenant_id, principal_id, memory_item_id, "
+            "bound_at, content_hash, canonicalization_version, source_type, suggested_kind, "
+            "taxonomy_confidence, retention_confidence, retention_disposition, reason, "
+            "provenance, classification_version, retention_policy_version, created_at, "
+            "expires_at) VALUES (:id, :tid, :pid, :item_id, :created_at, :chash, "
+            "'canonical-v1', :source_type, :kind, :taxonomy, :retention, :disposition, "
+            "'doctor test', '{}', :cv, 'retention-v1', :created_at, :expires_at)"
+        ),
+        {
+            "id": run_id,
+            "tid": tenant_id,
+            "pid": principal_id,
+            "item_id": item_id,
+            "chash": content_hash,
+            "source_type": source_type,
+            "kind": kind,
+            "taxonomy": taxonomy_confidence,
+            "retention": retention_confidence,
+            "disposition": retention_disposition,
+            "cv": classification_version,
+            "created_at": created_at,
+            "expires_at": created_at + timedelta(hours=1),
+        },
+    )
+    return run_id
+
+
+async def _set_evidence_lane(
+    session: AsyncSession, *, tenant_id: uuid.UUID, enabled: bool
+) -> None:
+    await session.execute(
+        text(
+            "UPDATE tenant_config SET auto_promote_evidence_enabled = :enabled "
+            "WHERE tenant_id = :tid AND active = TRUE"
+        ),
+        {"enabled": enabled, "tid": tenant_id},
+    )
+
+
+async def test_promotion_readiness_starvation_warning_and_content_free() -> None:
+    """Terminal blockers dominating the bounded window must warn, content-free."""
+    if not await _db_ok():
+        pytest.skip(_DB_SKIP_REASON)
+    async with _test_session_factory() as session:
+        tenant_id, principal_id = await _seed_tenant(session, label="promo-starve")
+        # Three old, terminally kind-blocked proposals (doctrine cannot
+        # auto-promote) that the lazy sweep re-selects every startup recall...
+        for i in range(3):
+            await _insert_proposed_item(
+                session,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                content=f"STARVE-SECRET-{i} never leak",
+                kind="doctrine",
+                memory_confidence=0.9,
+                created_at=NOW - timedelta(hours=200 - i),
+            )
+        # ...plus one recent, merely-cooling item created later in the scan order.
+        await _insert_proposed_item(
+            session,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            content="COOL-SECRET never leak",
+            kind="fact",
+            memory_confidence=0.9,
+            created_at=NOW - timedelta(hours=1),
+        )
+        await session.commit()
+    report = await _run(tenant_id)
+    check = _check(report, "promotion.readiness")
+    assert check.status == "warn"
+    assert check.reason_code == "PROMOTION_SCAN_STARVATION"
+    window = check.evidence["startup_window"]
+    assert window["size"] == 4
+    assert window["terminal_under_current_policy"] == 3
+    assert window["time_dependent"] == 1
+    blocker_codes = {entry["code"] for entry in window["blocker_counts"]}
+    assert "kind_policy" in blocker_codes
+    # Content-free: neither memory content nor any seeded marker may leak.
+    dumped = json.dumps(check.evidence)
+    assert "STARVE-SECRET" not in dumped
+    assert "COOL-SECRET" not in dumped
+    assert "content" not in window
+
+
+async def test_promotion_readiness_healthy_window_passes() -> None:
+    if not await _db_ok():
+        pytest.skip(_DB_SKIP_REASON)
+    async with _test_session_factory() as session:
+        tenant_id, principal_id = await _seed_tenant(session, label="promo-healthy")
+        await _insert_proposed_item(
+            session,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            content="HEALTHY-SECRET never leak",
+            kind="fact",
+            memory_confidence=0.9,
+            created_at=NOW - timedelta(hours=1),
+        )
+        await session.commit()
+    report = await _run(tenant_id)
+    check = _check(report, "promotion.readiness")
+    assert check.status == "pass"
+    assert check.reason_code == "PROMOTION_READINESS_OBSERVED"
+    assert check.evidence["proposed_total"] == 1
+    assert check.evidence["by_source_type"] == {"sync_turn": 1}
+    assert check.evidence["by_kind"] == {"fact": 1}
+    assert check.evidence["age_buckets"] == {"lt_24h": 1}
+    assert check.evidence["startup_window"]["time_dependent"] == 1
+    assert check.evidence["startup_window"]["terminal_under_current_policy"] == 0
+    assert check.evidence["startup_window"]["evidence_states"] == {"none": 1}
+    assert check.evidence["startup_window"]["job_states"] == {"missing": 1}
+
+
+async def test_promotion_readiness_evidence_and_job_state_counts() -> None:
+    """Each evidence-state bucket and job state appears with exact counts."""
+    if not await _db_ok():
+        pytest.skip(_DB_SKIP_REASON)
+    async with _test_session_factory() as session:
+        tenant_id, principal_id = await _seed_tenant(session, label="promo-states")
+        await _set_evidence_lane(session, tenant_id=tenant_id, enabled=True)
+        old = NOW - timedelta(hours=100)
+
+        qualified = await _insert_proposed_item(
+            session, tenant_id=tenant_id, principal_id=principal_id,
+            content="qualified-SECRET", memory_confidence=0.4,
+            source_confidence_prior=0.4, retention_confidence=0.85,
+            retention_disposition="retain", retention_evidence_at=old,
+        )
+        await _bind_receipt(
+            session, tenant_id=tenant_id, principal_id=principal_id, item_id=qualified,
+            retention_confidence=0.85, retention_disposition="retain",
+            taxonomy_confidence=0.9, created_at=old,
+        )
+        below = await _insert_proposed_item(
+            session, tenant_id=tenant_id, principal_id=principal_id,
+            content="below-SECRET", memory_confidence=0.4,
+            source_confidence_prior=0.4, retention_confidence=0.5,
+            retention_disposition="retain", retention_evidence_at=old,
+        )
+        await _bind_receipt(
+            session, tenant_id=tenant_id, principal_id=principal_id, item_id=below,
+            retention_confidence=0.5, retention_disposition="retain",
+            taxonomy_confidence=0.9, created_at=old,
+        )
+        stale = await _insert_proposed_item(
+            session, tenant_id=tenant_id, principal_id=principal_id,
+            content="stale-SECRET", memory_confidence=0.4,
+            source_confidence_prior=0.4, retention_confidence=0.85,
+            retention_disposition="retain", retention_evidence_at=old,
+        )
+        await _bind_receipt(
+            session, tenant_id=tenant_id, principal_id=principal_id, item_id=stale,
+            retention_confidence=0.85, retention_disposition="retain",
+            taxonomy_confidence=0.9, created_at=old,
+            classification_version="classification-v1",
+        )
+        await _insert_proposed_item(
+            session, tenant_id=tenant_id, principal_id=principal_id,
+            content="missing-SECRET", memory_confidence=0.4,
+        )
+        await session.execute(
+            text(
+                "INSERT INTO jobs (id, tenant_id, job_type, status, run_after, attempts, "
+                "max_attempts, payload) VALUES (:id, :tid, 'promotion.path_a', 'pending', "
+                ":run_after, 0, 5, CAST(:payload AS jsonb))"
+            ),
+            {
+                "id": uuid.uuid4(),
+                "tid": tenant_id,
+                "run_after": NOW + timedelta(hours=10),
+                "payload": json.dumps(
+                    {
+                        "memory_item_id": str(qualified),
+                        "dedupe_key": f"promotion.path_a:{qualified}",
+                    }
+                ),
+            },
+        )
+        await session.commit()
+    report = await _run(tenant_id)
+    check = _check(report, "promotion.readiness")
+    window = check.evidence["startup_window"]
+    # Three of the four seeded items are terminal under current policy — a
+    # strict majority, so the starvation warning is the correct verdict here;
+    # this test's purpose is the exact evidence/job-state counts below.
+    assert check.status == "warn"
+    assert check.reason_code == "PROMOTION_SCAN_STARVATION"
+    assert window["evidence_states"] == {
+        "none": 1,
+        "bound-qualified": 1,
+        "bound-below-threshold": 1,
+        "malformed/stale": 1,
+    }
+    assert window["job_states"] == {"scheduled": 1, "missing": 3}
+
+
+async def test_promotion_readiness_is_read_only() -> None:
+    if not await _db_ok():
+        pytest.skip(_DB_SKIP_REASON)
+    async with _test_session_factory() as session:
+        tenant_id, principal_id = await _seed_tenant(session, label="promo-readonly")
+        item_id = await _insert_proposed_item(
+            session, tenant_id=tenant_id, principal_id=principal_id,
+            content="readonly-SECRET", kind="doctrine", memory_confidence=0.9,
+        )
+        await session.commit()
+    async with _test_session_factory() as session:
+        before = (
+            await session.execute(
+                text(
+                    "SELECT (SELECT count(*) FROM memory_items WHERE tenant_id = :tid), "
+                    "(SELECT count(*) FROM classification_runs WHERE tenant_id = :tid), "
+                    "(SELECT count(*) FROM jobs WHERE tenant_id = :tid), "
+                    "(SELECT count(*) FROM item_events WHERE tenant_id = :tid)"
+                ),
+                {"tid": tenant_id},
+            )
+        ).one()
+    await _run(tenant_id)
+    async with _test_session_factory() as session:
+        after = (
+            await session.execute(
+                text(
+                    "SELECT (SELECT count(*) FROM memory_items WHERE tenant_id = :tid), "
+                    "(SELECT count(*) FROM classification_runs WHERE tenant_id = :tid), "
+                    "(SELECT count(*) FROM jobs WHERE tenant_id = :tid), "
+                    "(SELECT count(*) FROM item_events WHERE tenant_id = :tid)"
+                ),
+                {"tid": tenant_id},
+            )
+        ).one()
+        status = (
+            await session.execute(
+                text("SELECT review_status FROM memory_items WHERE id = :iid"),
+                {"iid": item_id},
+            )
+        ).scalar_one()
+    assert before == after
+    assert status == "proposed"

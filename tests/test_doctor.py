@@ -735,7 +735,7 @@ def test_report_schema_field_serializes_as_schema():
     report = _make_full_report({})
     dumped = report.model_dump(by_alias=True)
     assert dumped["schema"] == "engram.doctor"
-    assert dumped["schema_version"] == "1.0"
+    assert dumped["schema_version"] == "1.1"
     assert "schema_" not in dumped
 
 
@@ -1090,7 +1090,7 @@ def test_full_report_json_dump_is_valid_json_and_stable_schema():
     dumped = report.model_dump_json(by_alias=True)
     parsed = json.loads(dumped)
     assert parsed["schema"] == "engram.doctor"
-    assert parsed["schema_version"] == "1.0"
+    assert parsed["schema_version"] == "1.1"
     assert parsed["profile"] == "automatic_memory_loop"
     assert [c["id"] for c in parsed["checks"]] == list(CHECK_ORDER)
     assert set(parsed.keys()) == {
@@ -2249,3 +2249,106 @@ def test_cli_rejects_invalid_tenant_argument(capsys: pytest.CaptureFixture[str])
         sys.argv = old_argv
     assert exc_info.value.code == 2
     assert "UUID" in capsys.readouterr().err
+
+
+# --- promotion.readiness (ENG-PROMOTION-003A) ----------------------------------
+
+
+def _promotion_evidence(
+    *,
+    proposed_total: int = 3,
+    terminal: int = 1,
+    time_dependent: int = 2,
+    size: int = 3,
+) -> dict[str, Any]:
+    return {
+        "auto_promote_enabled": True,
+        "evidence_lane_enabled": False,
+        "proposed_total": proposed_total,
+        "by_source_type": {"sync_turn": 2, "manual": 1},
+        "by_kind": {"fact": 3},
+        "age_buckets": {"lt_24h": 1, "gt_30d": 2},
+        "startup_window": {
+            "limit": 20,
+            "size": size,
+            "terminal_under_current_policy": terminal,
+            "time_dependent": time_dependent,
+            "blocker_counts": [{"code": "age", "count": time_dependent}],
+            "evidence_states": {"none": size},
+            "job_states": {"missing": size},
+        },
+        "starvation_risk": bool(size) and terminal * 2 > size,
+        "evidence_note": "retention_confidence is the classifier's durability estimate",
+    }
+
+
+def test_promotion_readiness_check_passes_when_not_starved():
+    from engram.doctor import _check_promotion_readiness
+
+    check = _check_promotion_readiness(
+        evidence=_promotion_evidence(), tenant_unresolved=False, db_error=None
+    )
+    assert check.id == "promotion.readiness"
+    assert check.status == "pass"
+    assert check.reason_code == "PROMOTION_READINESS_OBSERVED"
+    assert check.evidence["startup_window"]["terminal_under_current_policy"] == 1
+
+
+def test_promotion_readiness_check_warns_on_starvation():
+    from engram.doctor import _check_promotion_readiness
+
+    # 3 of 4 window items terminal — a strict majority.
+    check = _check_promotion_readiness(
+        evidence=_promotion_evidence(terminal=3, time_dependent=1, size=4),
+        tenant_unresolved=False,
+        db_error=None,
+    )
+    assert check.status == "warn"
+    assert check.reason_code == "PROMOTION_SCAN_STARVATION"
+    assert "starved" in check.summary
+    assert check.remediation, "starvation must carry remediation"
+
+
+def test_promotion_readiness_check_exact_half_is_not_starvation():
+    from engram.doctor import _check_promotion_readiness
+
+    # 2 of 4 — dominated requires a strict majority.
+    check = _check_promotion_readiness(
+        evidence=_promotion_evidence(terminal=2, time_dependent=2, size=4),
+        tenant_unresolved=False,
+        db_error=None,
+    )
+    assert check.status == "pass"
+
+
+def test_promotion_readiness_check_unknown_without_tenant_scope():
+    from engram.doctor import _check_promotion_readiness
+
+    check = _check_promotion_readiness(
+        evidence=None, tenant_unresolved=True, db_error=None
+    )
+    assert check.status == "unknown"
+    assert check.reason_code == "TENANT_SCOPE_UNRESOLVED"
+
+
+def test_promotion_readiness_check_unknown_when_evidence_unavailable():
+    from engram.doctor import _check_promotion_readiness
+
+    check = _check_promotion_readiness(
+        evidence=None, tenant_unresolved=False, db_error="OperationalError"
+    )
+    assert check.status == "unknown"
+    assert check.reason_code == "PROMOTION_EVIDENCE_UNAVAILABLE"
+    assert check.evidence == {"error_type": "OperationalError"}
+
+
+def test_promotion_readiness_check_empty_window_passes():
+    from engram.doctor import _check_promotion_readiness
+
+    check = _check_promotion_readiness(
+        evidence=_promotion_evidence(proposed_total=0, terminal=0, time_dependent=0, size=0),
+        tenant_unresolved=False,
+        db_error=None,
+    )
+    assert check.status == "pass"
+    assert check.evidence["startup_window"]["size"] == 0

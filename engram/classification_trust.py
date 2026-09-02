@@ -5,8 +5,10 @@ Pure functions — no DB or FastAPI dependencies. These decide how a
 auto-classified a memory. The blend helper remains import-compatible but production
 classification no longer calls it:
 
-* classifier ``confidence`` may **refine** ``memory_confidence``, but source
-  authority caps how far a low-trust automated source can self-promote;
+* classifier ``confidence`` historically could **refine** ``memory_confidence``,
+  with source authority capping how far a low-trust automated source could
+  self-promote — in production, ``memory_confidence`` now keeps the immutable
+  ``source_confidence_prior`` written at capture time and nothing blends it;
 * classifier ``suggested_visibility`` may only **narrow** the requested
   visibility, never widen it.
 

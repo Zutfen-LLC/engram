@@ -1483,12 +1483,20 @@ async def _guarded_field_update(
 
 
 async def handle_classification_refine(session: AsyncSession, job: Job) -> None:
-    """Refine kind/wing/room/confidence/visibility via an LLM, conservatively.
+    """Refine kind/wing/room/visibility via an LLM, conservatively, and bind a
+    server-attested retention receipt.
 
     Only the LLM path runs here (the request path uses rule-only classification).
-    May improve kind/wing/room above the confidence threshold, blend
-    memory_confidence (source-authority-capped, monotonic-up so it never
-    destabilizes), and NARROW visibility (never widen). Never mutates content.
+    It may improve kind/wing/room above the taxonomy-confidence threshold and
+    NARROW visibility (never widen). It never mutates content and never
+    modifies trust fields: ``memory_confidence`` keeps the immutable
+    source-policy prior written at capture time and production classification
+    does not blend classifier confidence into it
+    (``engram.classification_trust.blend_memory_confidence`` is a deprecated,
+    uncalled compatibility helper). The run's ``taxonomy_confidence`` and
+    ``retention_confidence`` are recorded on the bound receipt only — they are
+    the classifier's placement confidence and its durability/usefulness
+    estimate, not epistemic or factual confidence about the proposition.
     Idempotent: equal proposed values record provenance but change nothing.
 
     Serialization: the expensive LLM classification runs unlocked on a stale
