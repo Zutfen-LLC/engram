@@ -7,7 +7,8 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import exists, select, text, update
+from sqlalchemy import Exists, Select, and_, exists, or_, select, text, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.config import settings
@@ -30,6 +31,7 @@ from engram.models import (
     ItemEvent,
     MemoryItem,
     MemoryKind,
+    PromotionReconciliationState,
     TenantConfig,
 )
 from engram.promotion_policy import (
@@ -142,6 +144,7 @@ class PromotionResult:
     evidence_enabled: bool = False
     evidence_threshold: float = DEFAULT_EVIDENCE_THRESHOLD
     dry_run: bool = False
+    rotation_wrapped: bool = False
     scanned: int = 0
     promoted: int = 0
     promoted_legacy_confidence: int = 0
@@ -551,6 +554,102 @@ def _audit(
     return json.dumps(reason, sort_keys=True)
 
 
+def _kind_promotion_allowed() -> Exists:
+    """Correlated EXISTS mirroring the mutation UPDATE's kind guard.
+
+    A live proposal whose kind has no enabled ``auto_promote_from_inferred``
+    row in the tenant's registry can never be admitted under current policy,
+    so the rotating window never spends scan budget on it. A kind-policy
+    change immediately makes affected rows eligible for future rotation
+    windows again; it does not guarantee they are reached by the very next
+    pass — a row whose ``(created_at, id)`` is behind the persisted cursor
+    still waits until the rotation wraps around to it.
+    """
+    return exists(
+        select(MemoryKind.name).where(
+            MemoryKind.tenant_id == MemoryItem.tenant_id,
+            MemoryKind.name == MemoryItem.kind,
+            MemoryKind.enabled.is_(True),
+            MemoryKind.auto_promote_from_inferred.is_(True),
+        )
+    )
+
+
+def _rotation_window(
+    base_stmt: Select[tuple[MemoryItem]],
+    cursor: PromotionReconciliationState | None,
+    limit: int,
+) -> Select[tuple[MemoryItem]]:
+    """Bound one fair rotation window over live proposals (issue #155, first slice).
+
+    Applies the kind-policy exclusion, the strictly-after keyset predicate on
+    the persisted cursor (``cursor=None`` reads from the head of the queue —
+    the wrapped continuation reuses the same call), a deterministic
+    ``(created_at, id)`` order, the per-pass row limit, and FOR UPDATE SKIP
+    LOCKED so concurrent startup passes partition the window instead of
+    blocking each other, without raising the per-pass bound or loading the
+    whole backlog.
+
+    Eventual-evaluation bound: from an arbitrary persisted cursor position, a
+    rotation can begin partway through the live, kind-eligible set — a short
+    partial page to the tail, then wraparound pages covering the rest. So a
+    stable set of ``N`` live kind-eligible proposals is fully covered within
+    at most ``ceil(N / limit) + 1`` passes (one for the possible partial tail
+    page, plus a full rotation of the remainder), not the tighter
+    ``ceil(N / limit)`` a cursor starting at the head would give. This bound
+    holds only while the eligible set is stable during the rotation;
+    concurrent inserts or kind-policy changes can change the set mid-rotation
+    and are not counted against it.
+    """
+    stmt = base_stmt.where(_kind_promotion_allowed())
+    if cursor is not None:
+        stmt = stmt.where(
+            or_(
+                MemoryItem.created_at > cursor.cursor_created_at,
+                and_(
+                    MemoryItem.created_at == cursor.cursor_created_at,
+                    MemoryItem.id > cursor.cursor_item_id,
+                ),
+            )
+        )
+    return (
+        stmt.order_by(MemoryItem.created_at.asc(), MemoryItem.id.asc())
+        .limit(limit)
+        .with_for_update(skip_locked=True)
+    )
+
+
+async def _advance_reconciliation_cursor(
+    session: AsyncSession, tenant_id: str, item: MemoryItem, moment: datetime
+) -> None:
+    """Persist the rotation cursor to the last row this pass examined.
+
+    Writes are last-writer-wins: whichever pass commits last sets the
+    persisted position, so a slower concurrent pass can move the cursor
+    backwards relative to a faster one that started later. FOR UPDATE SKIP
+    LOCKED means two concurrent passes never examine the same row, so
+    neither pass's own write can regress past rows *it* already examined.
+    This first slice does not prove a general "never skips a row" guarantee
+    across arbitrary concurrent startup/admin/review/worker interleavings —
+    that full concurrency proof is deferred to later #155 work. What is
+    established here: any row a pass reads is re-reachable by a later
+    rotation (nothing is permanently excluded), because a backwards cursor
+    move only widens, never narrows, the next pass's keyset window.
+    """
+    values = {
+        "cursor_created_at": item.created_at,
+        "cursor_item_id": item.id,
+        "updated_at": moment,
+    }
+    await session.execute(
+        pg_insert(PromotionReconciliationState)
+        .values(tenant_id=uuid.UUID(tenant_id), **values)
+        .on_conflict_do_update(
+            index_elements=[PromotionReconciliationState.tenant_id], set_=values
+        )
+    )
+
+
 async def auto_promote_proposed_memories(
     session: AsyncSession,
     tenant_id: str | None = None,
@@ -562,7 +661,20 @@ async def auto_promote_proposed_memories(
     item_id: uuid.UUID | None = None,
     classification_run_id: uuid.UUID | None = None,
     memory_context: ResolvedMemoryContext | None = None,
+    rotation: bool = False,
 ) -> PromotionResult:
+    """Evaluate live proposals for Path A promotion.
+
+    ``rotation=True`` selects the scan window fairly instead of oldest-first:
+    the per-tenant reconciliation cursor records the last row examined, each
+    pass reads the next ``limit`` rows strictly after it (wrapping to the head
+    when the page is empty), and kind-terminal rows are excluded outright.
+    This keeps a bounded pass from re-selecting the same permanently blocked
+    rows indefinitely (issue #155) without raising the limit or loading the
+    full backlog. Only the enabled, non-preview, untargeted, bounded case
+    rotates — targeted jobs, CLI/admin/worker sweeps, and dry-run previews
+    keep their existing selection semantics.
+    """
     moment = now or datetime.now(UTC)
     if tenant_id is None:
         tenant_id = (
@@ -595,14 +707,46 @@ async def auto_promote_proposed_memories(
             "memory_context_version": INTERNAL_MEMORY_CONTEXT_VERSION,
         }
     )
+    is_postgres = session.bind is not None and session.bind.dialect.name == "postgresql"
+    # Fair rotation applies only to the enabled, non-preview, untargeted,
+    # bounded pass — i.e. the lazy startup-recall sweep whose callers pass
+    # rotation=True. Targeted jobs, CLI/admin/worker sweeps, and dry-run
+    # previews keep their existing selection semantics.
+    rotation_active = (
+        rotation
+        and enabled
+        and not dry_run
+        and item_id is None
+        and limit is not None
+        and is_postgres
+    )
+    cursor_state: PromotionReconciliationState | None = None
+    if rotation_active:
+        cursor_state = (
+            await session.execute(
+                select(PromotionReconciliationState).where(
+                    PromotionReconciliationState.tenant_id == uuid.UUID(str(tenant_id))
+                )
+            )
+        ).scalar_one_or_none()
+    # The ordinary targeted/untargeted selection shape is established first,
+    # independent of whether promotion is enabled, so a disabled tenant's
+    # targeted call still scans exactly the requested item and an untargeted
+    # call still respects the caller's existing ordering/limit — neither
+    # falls back to a tenant-wide scan. Rotation only ever replaces the
+    # untargeted shape, and only for the actual active rotation case
+    # (which itself requires enabled=True, so it can never apply here).
     if item_id is not None:
-        base_stmt = base_stmt.where(MemoryItem.id == item_id)
+        stmt = base_stmt.where(MemoryItem.id == item_id)
+    elif rotation_active:
+        assert limit is not None
+        stmt = _rotation_window(base_stmt, cursor_state, limit)
     else:
-        base_stmt = base_stmt.order_by(MemoryItem.created_at.asc())
+        stmt = base_stmt.order_by(MemoryItem.created_at.asc())
         if limit is not None:
-            base_stmt = base_stmt.limit(limit)
+            stmt = stmt.limit(limit)
     if not enabled:
-        items = list((await session.execute(base_stmt)).scalars())
+        items = list((await session.execute(stmt)).scalars())
         result.scanned = len(items)
         result.skipped_disabled = len(items)
         if dry_run:
@@ -610,10 +754,20 @@ async def auto_promote_proposed_memories(
         else:
             await session.commit()
         return result
-    stmt = base_stmt
-    if session.bind is not None and session.bind.dialect.name == "postgresql":
+    if is_postgres and not rotation_active:
+        # Rotation's own locking (FOR UPDATE SKIP LOCKED) is already baked
+        # into the statement _rotation_window() built above.
         stmt = stmt.with_for_update(skip_locked=item_id is None)
     items = list((await session.execute(stmt)).scalars())
+    if rotation_active and not items and cursor_state is not None:
+        # The keyset page after the cursor is empty: the rotation reached the
+        # tail of the live proposed set and wraps to the oldest rows still
+        # eligible under current kind policy, restarting coverage at the head.
+        result.rotation_wrapped = True
+        assert limit is not None
+        items = list(
+            (await session.execute(_rotation_window(base_stmt, None, limit))).scalars()
+        )
     result.scanned = len(items)
     support_map = await load_promotion_support(session, items)
     for item in items:
@@ -757,6 +911,8 @@ async def auto_promote_proposed_memories(
             result.promoted_retention_evidence += 1
         else:
             result.promoted_legacy_confidence += 1
+    if rotation_active and items:
+        await _advance_reconciliation_cursor(session, str(tenant_id), items[-1], moment)
     if not dry_run:
         await session.commit()
     else:
@@ -866,5 +1022,10 @@ async def maybe_auto_promote_for_startup_recall(
     session: AsyncSession, tenant_id: str, *, now: datetime | None = None
 ) -> PromotionResult:
     return await auto_promote_proposed_memories(
-        session, tenant_id, now=now, limit=settings.startup_promotion_limit, source="startup_recall"
+        session,
+        tenant_id,
+        now=now,
+        limit=settings.startup_promotion_limit,
+        source="startup_recall",
+        rotation=True,
     )

@@ -784,10 +784,14 @@ async def promotion_readiness_aggregate(
 ) -> dict[str, Any]:
     """Bounded, content-free promotion-readiness aggregate for one tenant.
 
-    ``window_limit`` mirrors the bounded startup-recall promotion scan
+    ``window_limit`` mirrors the bounded startup-recall promotion scan bound
     (``settings.startup_promotion_limit``): the first ``window_limit`` live
-    proposed items by ``created_at ASC`` — exactly the rows the lazy sweep
-    would examine — are assessed through the shared evaluator. The exact
+    proposed items by ``created_at ASC`` — the head of the proposed queue —
+    are assessed through the shared evaluator. Since ENG-PROMOTION-003B the
+    lazy sweep rotates a persisted cursor past rows it already examined and
+    excludes kind-terminal rows outright, so this head window is a
+    backlog-health diagnostic of the rows that dominated the old fixed
+    window, not the exact next page the sweep will read. The exact
     by-source-type / by-kind / age-bucket counts cover the full live proposed
     set because they are cheap categorical GROUP BYs. No content, prompt,
     provider credential, principal id, or cross-tenant row ever enters the

@@ -2305,7 +2305,10 @@ def test_promotion_readiness_check_warns_on_starvation():
     )
     assert check.status == "warn"
     assert check.reason_code == "PROMOTION_SCAN_STARVATION"
-    assert "starved" in check.summary
+    assert "terminal under current policy" in check.summary
+    # Since ENG-PROMOTION-003B the lazy pass rotates fairly, so the warning
+    # must state blocked backlog, not claim later proposals are starved.
+    assert "starving later proposals" in check.summary
     assert check.remediation, "starvation must carry remediation"
 
 

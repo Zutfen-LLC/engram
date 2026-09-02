@@ -1247,6 +1247,29 @@ class Job(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class PromotionReconciliationState(Base):
+    """Per-tenant fair-rotation cursor for the bounded promotion scan (#155).
+
+    One row per tenant pointing at the last live proposal the bounded startup
+    lazy pass examined. Each pass reads the next ``startup_promotion_limit``
+    proposals strictly after ``(cursor_created_at, cursor_item_id)`` and wraps
+    to the head of the queue when that page is empty, so permanently blocked
+    rows can no longer starve later proposals without raising the per-pass
+    bound. Internal scheduling state only — never memory content.
+    """
+
+    __tablename__ = "promotion_reconciliation_state"
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), primary_key=True
+    )
+    cursor_created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    cursor_item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
 class CandidateIngest(Base):
     """Immutable server-issued identity for one candidate entering the pipeline."""
 
