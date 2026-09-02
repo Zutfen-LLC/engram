@@ -13,12 +13,12 @@ services:
     # flat (slowest test 2.45s, top 25 ~7% of wall clock), so it is bound by
     # per-test fixed overhead, not by commit durability. They are kept because
     # they are free and correct for a disposable cluster, not as an
-    # optimization. Real wins have to come from the per-test overhead —
-    # sharding the suite across runners is the open item.
+    # optimization. The hosted workflow instead partitions the root suite
+    # across isolated runners. Each runner gets its own PostgreSQL instance, so
+    # file-level cleanup cannot interfere with another shard.
     #
-    # max_connections is raised for that future: each test process opens
-    # several pooled engines (runtime, owner, read, provisioner) and the
-    # default 100 leaves no headroom for running the suite in parallel.
+    # max_connections gives the concurrency tests headroom for their runtime,
+    # owner, read, and provisioner engines.
     command: >
       postgres
       -c fsync=off
@@ -72,6 +72,11 @@ services:
       ENGRAM_FAIL_ON_DB_SKIP: "1"
       ENGRAM_EMBEDDING_PROVIDER: none
       PYTHONUNBUFFERED: "1"
+      # The default keeps `make compose-ci` as one complete local run. Hosted
+      # CI overrides these values for each isolated root-suite shard.
+      ENGRAM_CI_MODE: ${ENGRAM_CI_MODE:-full}
+      ENGRAM_CI_SHARD_INDEX: ${ENGRAM_CI_SHARD_INDEX:-0}
+      ENGRAM_CI_SHARD_COUNT: ${ENGRAM_CI_SHARD_COUNT:-1}
     depends_on:
       postgres:
         condition: service_healthy

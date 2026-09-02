@@ -65,13 +65,36 @@ jobs:
         if: steps.changes.outputs.runtime_changed == 'true'
         run: bash scripts/validate_compose_contract.sh
 
-  compose-real-db:
+  # Each matrix entry runs on a separate hosted runner. This gives every shard
+  # an isolated PostgreSQL cluster and prevents file-level cleanup from racing
+  # cleanup in another shard.
+  compose-real-db-shard:
+    name: compose-real-db / shard ${{ matrix.shard_label }}
     needs: repository-safety
     if: needs.repository-safety.outputs.runtime_changed == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard_index: 0
+            shard_label: 1-of-4
+            export_cache: true
+          - shard_index: 1
+            shard_label: 2-of-4
+            export_cache: false
+          - shard_index: 2
+            shard_label: 3-of-4
+            export_cache: false
+          - shard_index: 3
+            shard_label: 4-of-4
+            export_cache: false
     env:
       ENGRAM_CI_IMAGE: engram-ci:${{ github.sha }}
+      ENGRAM_CI_MODE: "root-shard"
+      ENGRAM_CI_SHARD_INDEX: ${{ matrix.shard_index }}
+      ENGRAM_CI_SHARD_COUNT: "4"
 
     steps:
       - uses: actions/checkout@v6
@@ -102,13 +125,13 @@ jobs:
           push: false
           tags: ${{ env.ENGRAM_CI_IMAGE }}
           cache-from: type=gha,scope=engram-ci
-          # Main is trusted to populate the full shared cache. GitHub isolates
-          # pull-request cache writes to the PR ref; min mode keeps those writes
-          # small while still accelerating reruns of that PR.
-          cache-to: type=gha,mode=${{ github.event_name == 'push' && 'max' || 'min' }},scope=engram-ci
+          # All shards read one cache. Only shard zero exports it. Concurrent
+          # writes to the same scope waste time and can race. Main populates the
+          # full cache. GitHub isolates pull-request writes to the PR ref.
+          cache-to: ${{ matrix.export_cache && format('type=gha,mode={0},scope=engram-ci', github.event_name == 'push' && 'max' || 'min') || '' }}
           provenance: false
 
-      - name: Run Compose Real-DB CI Stack
+      - name: Run Compose Real-DB CI Shard
         run: docker compose -f docker-compose.ci.yml up --no-build --abort-on-container-exit --exit-code-from engram-test
 
       # Must run before the stack is torn down. `docker compose cp` reads from
@@ -127,7 +150,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: junit-compose-${{ github.run_id }}-${{ github.run_attempt }}
+          name: junit-compose-${{ matrix.shard_label }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: test-results/
           if-no-files-found: warn
           retention-days: 14
@@ -214,14 +237,15 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.ci.yml --profile smoke down -v --remove-orphans
 
-  # Lightweight contract job: lock consistency plus cross-language conformance.
-  # It stays off the real-DB critical path and uses the checked-in lock rather
-  # than independently resolving the project's floating dependency floors.
+  # DB-free Python checks share one environment with lock and conformance
+  # checks. This job runs in parallel with the real-DB shards.
   conformance-vectors:
     needs: repository-safety
     if: needs.repository-safety.outputs.runtime_changed == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    env:
+      ENGRAM_CI_RESULTS_DIR: test-results
 
     steps:
       - uses: actions/checkout@v6
@@ -241,7 +265,21 @@ jobs:
       - name: Verify lock and install pinned verifier dependencies
         run: |
           uv lock --check
-          uv sync --frozen --extra dev
+          uv sync --frozen --all-packages --all-extras
+
+      - name: Run Python preflight
+        run: |
+          export PATH="$PWD/.venv/bin:$PATH"
+          .venv/bin/python scripts/run_ci.py --mode preflight
+
+      - name: Upload preflight JUnit test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-preflight-${{ github.run_id }}-${{ github.run_attempt }}
+          path: test-results/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Set up Node
         uses: actions/setup-node@v5
@@ -258,3 +296,27 @@ jobs:
       # both languages reject the same non-empty fixture set.
       - name: Verify negative fixtures cross-language
         run: .venv/bin/python conformance/context-manifest-v1/run_cross_language.py
+
+  # Keep the existing required-check name stable. This job also ensures the
+  # DB-free checks remain part of the same merge gate as the real-DB shards.
+  compose-real-db:
+    name: compose-real-db
+    needs:
+      - repository-safety
+      - compose-real-db-shard
+      - conformance-vectors
+    if: always() && needs.repository-safety.outputs.runtime_changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Verify all Compose Real-DB shards and preflight checks
+        env:
+          SHARD_RESULT: ${{ needs.compose-real-db-shard.result }}
+          PREFLIGHT_RESULT: ${{ needs.conformance-vectors.result }}
+        run: |
+          set -euo pipefail
+          echo "Real-DB shards: $SHARD_RESULT"
+          echo "Preflight and conformance: $PREFLIGHT_RESULT"
+          test "$SHARD_RESULT" = "success"
+          test "$PREFLIGHT_RESULT" = "success"
