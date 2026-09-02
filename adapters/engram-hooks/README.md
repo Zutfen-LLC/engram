@@ -109,11 +109,14 @@ Rejected categories:
 
 ### Volatile store
 
-Candidates without sufficient durable-retention evidence (below
+Candidates whose classifier retention estimate does not clear the durable
+gate (disposition other than `retain`, or retention confidence below
 `ENGRAM_HOOKS_STORE_THRESHOLD`, default `0.65`)
 park in a local JSONL file instead of hitting Engram. Defaults: 14-day
 retention, 2000-entry cap, oldest evicted first. Recall is dumb substring
-search — embeddings are the service's job.
+search — embeddings are the service's job. Retention confidence is the
+classifier's durability/usefulness estimate, not epistemic or factual
+confidence in the candidate's content.
 
 ## Install
 

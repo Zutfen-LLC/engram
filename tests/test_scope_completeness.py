@@ -51,6 +51,7 @@ EXPECTED_MATRIX: dict[tuple[str, str], dict] = {
     ("GET", "/v1/review/conflicts"): {"all_of": ("review",)},
     ("GET", "/v1/review/stale"): {"all_of": ("review",)},
     ("GET", "/v1/review/stats"): {"all_of": ("review",)},
+    ("GET", "/v1/review/promotion-readiness/{item_id}"): {"all_of": ("review",)},
     ("POST", "/v1/items/{item_id}/review"): {"any_of": ("write", "review")},
     ("POST", "/v1/items/{item_id}/verify"): {"all_of": ("review",)},
     ("POST", "/v1/items/{item_id}/resolve-conflict"): {"all_of": ("review",)},

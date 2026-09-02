@@ -74,7 +74,7 @@ shell history and the process list.
 ```json
 {
   "schema": "engram.doctor",
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "profile": "automatic_memory_loop",
   "engram_version": "0.1.0",
   "generated_at": "2026-07-25T12:00:00+00:00",
@@ -96,7 +96,7 @@ shell history and the process list.
 }
 ```
 
-`checks` always contains exactly the 11 checks below, in this order, even
+`checks` always contains exactly the 12 checks below, in this order, even
 when a check could not run (it is emitted as `status="unknown"`, never
 omitted). `evidence` never contains memory content, job payloads, raw
 `last_error` values, receipt manifests, or credentials — only safe aggregate
@@ -117,6 +117,7 @@ counts, timestamps, status codes, and configuration-presence booleans.
 | 9 | `recall.activity` | `recall_logs` (read-only) | Warn when no recall activity in the window. | Does not prove recalled context reached a model prompt. |
 | 10 | `receipts.activity` | Local dark-write setting + `context_receipts`/`recall_logs` + repository verifier | Selects the latest receipt **within the requested window** (ties broken deterministically). Fails on an invalid receipt regardless of whether dark writes are currently disabled locally. Otherwise warns when disabled or a gap exists (writes are fail-open). Unknown when there is no startup recall to assess, or the latest receipt could not be verified. | Proves what was served, not factual truth or causality. |
 | 11 | `review.backlog` | `GET /v1/review/stats` + bounded `GET /v1/review/queue?limit=100` | Passes only when both stats and queue evidence are present and strictly well-typed — malformed or nonsensical evidence is never coerced into a pass. Unknown when the credential lacks review authority, the call fails, or evidence fails validation. | `conflict_recheck_not_run` is excluded from blocker ranking and reported as a known preview limitation; no conflict recheck runs. |
+| 12 | `promotion.readiness` | Bounded, content-free PostgreSQL aggregate over live proposed items (same pure promotion evaluator as the mutation paths; v1.1 / ENG-PROMOTION-003A) | Warn (`PROMOTION_SCAN_STARVATION`) when a strict majority of the first `startup_promotion_limit` (default 20) oldest live proposals — exactly the rows the lazy startup-recall sweep scans — are terminal under current policy, evidence of potential scan starvation for later proposals. Unknown when tenant scope is unresolved or the database is unreachable. Evidence: counts by source type, kind, age bucket, canonical blocker code, evidence state (`none`/`bound-qualified`/`bound-below-threshold`/`malformed/stale`), job state (`scheduled`/`overdue`/`dead`/`missing`), and terminal-vs-time-dependent. | No provider call, no promotion-time conflict recheck, no memory content or job payload in evidence; `retention_confidence` is the classifier's durability estimate, not epistemic/factual confidence. |
 
 ## Example outputs (sanitized)
 
@@ -136,6 +137,7 @@ engram doctor — overall_status=healthy exit_code=0
 [PASS   ] recall.activity          RECALL_ACTIVITY_RECENT           4 recall(s) observed in the window.
 [PASS   ] receipts.activity        RECEIPTS_HEALTHY                 Startup recalls have matching, valid Context Receipts.
 [PASS   ] review.backlog           REVIEW_BACKLOG_OBSERVED          2 current item(s) observed (2 active, 0 proposed, 0 disputed).
+[PASS   ] promotion.readiness      PROMOTION_READINESS_OBSERVED    0 live proposed item(s); startup window: 0 terminal, 0 time-dependent of 0.
 ```
 
 ### Degraded
@@ -196,7 +198,7 @@ and is rolled back on exit, never committed.
 ## FIX1 corrections (ENG-LOOP-001A-FIX1)
 
 A post-review hardening pass corrected seven truthfulness, redaction, and
-bounded-execution defects found in the initial implementation. The 11-check
+bounded-execution defects found in the initial implementation. The then-11-check
 report, its ordering, the `engram.doctor` v1.0 schema, exit-code mapping, and
 read-only guarantees are unchanged; only the semantics below were corrected.
 
@@ -273,7 +275,7 @@ live-dogfood slices; no `engram.doctor` schema version bump.
 ## FIX2 corrections (ENG-LOOP-001A-FIX2)
 
 A second hardening pass closed four remaining truthfulness/fail-safety
-defects found in review of the FIX1 head. The 11-check report, ordering,
+defects found in review of the FIX1 head. The then-11-check report, ordering,
 schema, exit-code mapping, and read-only guarantees remain unchanged.
 
 1. **Database-resource construction and disposal are now subordinate to the

@@ -73,7 +73,7 @@ T = TypeVar("T")
 # --- Report schema constants -------------------------------------------------
 
 DOCTOR_SCHEMA = "engram.doctor"
-DOCTOR_SCHEMA_VERSION = "1.0"
+DOCTOR_SCHEMA_VERSION = "1.1"
 DOCTOR_PROFILE = "automatic_memory_loop"
 
 Status = Literal["pass", "warn", "fail", "unknown"]
@@ -96,8 +96,10 @@ CHECK_CAPTURE_REMEMBER = "capture.remember"
 CHECK_RECALL_ACTIVITY = "recall.activity"
 CHECK_RECEIPTS_ACTIVITY = "receipts.activity"
 CHECK_REVIEW_BACKLOG = "review.backlog"
+CHECK_PROMOTION_READINESS = "promotion.readiness"
 
 # The required, stable, always-emitted ordering (report_contract.ordering).
+# v1.1 (ENG-PROMOTION-003A) appends promotion.readiness.
 CHECK_ORDER: tuple[str, ...] = (
     CHECK_SERVICE_HEALTH,
     CHECK_SERVICE_READINESS,
@@ -110,6 +112,7 @@ CHECK_ORDER: tuple[str, ...] = (
     CHECK_RECALL_ACTIVITY,
     CHECK_RECEIPTS_ACTIVITY,
     CHECK_REVIEW_BACKLOG,
+    CHECK_PROMOTION_READINESS,
 )
 
 # A tenant-scoped DB check whose evidence cannot be attributed to a specific
@@ -1040,6 +1043,32 @@ def _check_config_classification(settings_obj: Any) -> DoctorCheck:
 # --- Bounded, read-only PostgreSQL inspection --------------------------------
 
 
+async def _promotion_readiness_evidence(
+    session: AsyncSession,
+    *,
+    tenant_id: str | None,
+    now: datetime,
+    startup_promotion_limit: int,
+) -> dict[str, Any] | None:
+    """Bounded, content-free promotion-readiness aggregate (delegates fully).
+
+    A thin adapter over
+    :func:`engram.promotion_readiness.promotion_readiness_aggregate`, which
+    itself delegates every policy decision to the shared evaluator used by
+    the mutation paths — doctor implements no promotion policy of its own.
+    Returns ``None`` when tenant scope is unknown: a deployment-wide
+    promotion aggregate could mix tenants, so the check degrades to
+    ``unknown``/``TENANT_SCOPE_UNRESOLVED`` instead.
+    """
+    from engram.promotion_readiness import promotion_readiness_aggregate
+
+    if tenant_id is None:
+        return None
+    return await promotion_readiness_aggregate(
+        session, tenant_id=tenant_id, now=now, window_limit=startup_promotion_limit
+    )
+
+
 async def _isolated(session: AsyncSession, coro: Awaitable[T]) -> tuple[T | None, str | None]:
     """Run ``coro`` inside a SAVEPOINT so its failure cannot poison later queries.
 
@@ -1254,6 +1283,62 @@ async def _receipts_activity_evidence(
 
 
 # --- DB-backed checks (composed from snapshot + supplementary evidence) -----
+
+
+def _check_promotion_readiness(
+    *,
+    evidence: dict[str, Any] | None,
+    tenant_unresolved: bool,
+    db_error: str | None,
+) -> DoctorCheck:
+    """Evaluate the bounded, content-free promotion-readiness aggregate.
+
+    Warns when the first bounded startup-promotion window is dominated by
+    items that are terminal under current policy — permanently blocked rows
+    that the lazy sweep re-selects on every startup recall are evidence of
+    potential scan starvation for later proposals (ENG-PROMOTION-003A).
+    """
+    if tenant_unresolved:
+        return _check(
+            CHECK_PROMOTION_READINESS,
+            "unknown",
+            TENANT_SCOPE_UNRESOLVED,
+            "Tenant scope could not be resolved; promotion readiness cannot be scoped.",
+        )
+    if evidence is None:
+        return _check(
+            CHECK_PROMOTION_READINESS,
+            "unknown",
+            "PROMOTION_EVIDENCE_UNAVAILABLE",
+            "Promotion readiness evidence unavailable (database inspection failed).",
+            evidence={"error_type": db_error},
+        )
+    window = evidence["startup_window"]
+    starvation = bool(evidence["starvation_risk"])
+    if starvation:
+        return _check(
+            CHECK_PROMOTION_READINESS,
+            "warn",
+            "PROMOTION_SCAN_STARVATION",
+            f"{window['terminal_under_current_policy']} of {window['size']} item(s) in "
+            "the bounded startup-promotion window are terminal under current "
+            "policy; later proposals may be starved from bounded reconciliation.",
+            evidence=evidence,
+            remediation=[
+                "Review or archive the permanently blocked oldest proposals "
+                "(see GET /v1/review/promotion-readiness/{item_id}), or raise "
+                "startup_promotion_limit."
+            ],
+        )
+    return _check(
+        CHECK_PROMOTION_READINESS,
+        "pass",
+        "PROMOTION_READINESS_OBSERVED",
+        f"{evidence['proposed_total']} live proposed item(s); startup window: "
+        f"{window['terminal_under_current_policy']} terminal, "
+        f"{window['time_dependent']} time-dependent of {window['size']}.",
+        evidence=evidence,
+    )
 
 
 def _check_worker_queue(
@@ -1811,6 +1896,7 @@ class _DbEvidence:
     lifecycle_extra: dict[str, Any] | None
     recall_evidence: dict[str, Any] | None
     receipts_evidence: dict[str, Any] | None
+    promotion_evidence: dict[str, Any] | None
     error_type: str | None
 
 
@@ -1822,6 +1908,7 @@ async def _gather_db_evidence(
     until: datetime,
     now: datetime,
     lease_stale_after_seconds: int,
+    startup_promotion_limit: int,
     timeout_seconds: float,
 ) -> _DbEvidence:
     if session_factory is None:
@@ -1836,6 +1923,7 @@ async def _gather_db_evidence(
             lifecycle_extra=None,
             recall_evidence=None,
             receipts_evidence=None,
+            promotion_evidence=None,
             error_type=_DATABASE_RESOURCE_UNAVAILABLE,
         )
     try:
@@ -1886,14 +1974,24 @@ async def _gather_db_evidence(
                         session, tenant_id=tenant_id, since=since, until=until
                     ),
                 )
+                promotion_evidence, err6 = await _isolated(
+                    session,
+                    _promotion_readiness_evidence(
+                        session,
+                        tenant_id=tenant_id,
+                        now=now,
+                        startup_promotion_limit=startup_promotion_limit,
+                    ),
+                )
                 await session.rollback()
-        error_type = next((e for e in (err1, err2, err3, err4, err5) if e), None)
+        error_type = next((e for e in (err1, err2, err3, err4, err5, err6) if e), None)
         return _DbEvidence(
             snapshot=snapshot,
             job_health=job_health,
             lifecycle_extra=lifecycle_extra,
             recall_evidence=recall_evidence,
             receipts_evidence=receipts_evidence,
+            promotion_evidence=promotion_evidence,
             error_type=error_type,
         )
     except Exception as exc:  # noqa: BLE001 - DB inspection must never abort the report
@@ -1905,6 +2003,7 @@ async def _gather_db_evidence(
             lifecycle_extra=None,
             recall_evidence=None,
             receipts_evidence=None,
+            promotion_evidence=None,
             error_type=type(exc).__name__,
         )
 
@@ -1967,6 +2066,7 @@ async def run_doctor(
                 until=resolved_until,
                 now=now,
                 lease_stale_after_seconds=effective_settings.job_lease_stale_after_seconds,
+                startup_promotion_limit=effective_settings.startup_promotion_limit,
                 timeout_seconds=timeout_seconds,
             )
 
@@ -2016,6 +2116,13 @@ async def run_doctor(
                 )
             )
             checks.append(await _check_review_backlog(client))
+            checks.append(
+                _check_promotion_readiness(
+                    evidence=db_evidence.promotion_evidence,
+                    tenant_unresolved=tenant_unresolved,
+                    db_error=db_evidence.error_type,
+                )
+            )
 
         overall_status, exit_code = aggregate_status(checks)
         return DoctorReport(

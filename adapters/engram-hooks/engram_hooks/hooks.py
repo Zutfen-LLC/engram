@@ -398,7 +398,14 @@ class LifecycleHooks:
                 confidence=retention_confidence or None,
                 workspace=self.config.default_workspace,
                 reason=(
-                    "not durable retention evidence"
+                    # Canonical terminology (ENG-PROMOTION-003A): parking is a
+                    # classifier retention-estimate decision, never a factual
+                    # judgment about the candidate.
+                    (
+                        "retention confidence below store threshold"
+                        if retention_disposition == "retain"
+                        else "classifier retention disposition not retain"
+                    )
                     if client is not None
                     else "no engram client"
                 ),

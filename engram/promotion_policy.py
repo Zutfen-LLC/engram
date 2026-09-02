@@ -13,6 +13,11 @@ EVIDENCE_RETENTION_WEIGHT = 0.80
 EVIDENCE_SCORE_CEILING = 0.85
 EVIDENCE_TAXONOMY_MINIMUM = 0.70
 DEFAULT_EVIDENCE_THRESHOLD = 0.70
+# Upper bound of the classifier's retention_confidence output (the
+# ClassificationResult clamp). Distinct from the score ceiling: a threshold at
+# or below the ceiling can still be unreachable when the required retention
+# confidence exceeds what a classifier is allowed to emit.
+EVIDENCE_RETENTION_MAX = 0.95
 
 PromotionBasis = Literal["legacy_confidence", "retention_evidence"]
 
@@ -35,6 +40,35 @@ def evidence_score_v1(source_confidence_prior: float, retention_confidence: floa
         EVIDENCE_SOURCE_PRIOR_WEIGHT * source_confidence_prior
         + EVIDENCE_RETENTION_WEIGHT * retention_confidence,
     )
+
+
+def required_retention_confidence_v1(
+    source_confidence_prior: float, evidence_threshold: float
+) -> float | None:
+    """Minimum retention confidence for the v1 score to reach ``evidence_threshold``.
+
+    Solves ``min(EVIDENCE_SCORE_CEILING, w_prior * prior + w_ret * retention)
+    >= threshold`` for ``retention`` under the v1 weights. Returns ``None``
+    when the threshold is unreachable under the current formula: a threshold
+    above the score ceiling, or a required retention confidence above
+    ``EVIDENCE_RETENTION_MAX`` (the classifier clamp). A non-positive
+    requirement clamps to ``0.0``. Raises :class:`PromotionPolicyError` for
+    invalid inputs (non-finite prior / threshold), mirroring
+    :func:`evidence_score_v1` — callers must fail closed, never coerce.
+    """
+    _finite_in_range(source_confidence_prior, name="source_confidence_prior", upper=1.0)
+    if not math.isfinite(evidence_threshold):
+        raise PromotionPolicyError("evidence_threshold must be finite")
+    if evidence_threshold > EVIDENCE_SCORE_CEILING:
+        return None
+    required = (
+        evidence_threshold - EVIDENCE_SOURCE_PRIOR_WEIGHT * source_confidence_prior
+    ) / EVIDENCE_RETENTION_WEIGHT
+    if required <= 0.0:
+        return 0.0
+    if required > EVIDENCE_RETENTION_MAX:
+        return None
+    return required
 
 
 @dataclass(frozen=True)
