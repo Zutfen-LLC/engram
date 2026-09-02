@@ -14,8 +14,8 @@ actual field semantics:
 from __future__ import annotations
 
 import json
+import os
 import re
-import subprocess
 from pathlib import Path
 from typing import get_args
 
@@ -65,7 +65,22 @@ _STALE_PATH_B_PATTERNS = (
 )
 
 _SCANNED_SUFFIXES = {".py", ".md", ".json", ".yml", ".yaml", ".toml", ".txt", ".sql", ".sh"}
-_SCANNED_EXCLUDED_PARTS = {".venv", "build", "node_modules", "__pycache__", ".git"}
+# Directory names never descended into. The scan is a pure filesystem walk —
+# the CI test image has no `git` binary, so `git ls-files` is not an option —
+# which also means untracked scratch files are scanned; keeping the tree
+# clean is already the repo's convention.
+_SCANNED_PRUNED_DIRS = {
+    ".git",
+    ".venv",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "__pycache__",
+    "build",
+    "dist",
+    "node_modules",
+    "test-results",
+}
 
 
 def _path_b_is_implemented() -> bool:
@@ -80,20 +95,17 @@ def _path_b_is_implemented() -> bool:
 
 
 def _tracked_text_files() -> list[Path]:
-    output = subprocess.run(
-        ["git", "ls-files"], cwd=REPO_ROOT, capture_output=True, text=True, check=True
-    ).stdout
-    files = []
-    for line in output.splitlines():
-        path = REPO_ROOT / line
-        if not path.is_file() or path.suffix.lower() not in _SCANNED_SUFFIXES:
-            continue
-        if any(part in _SCANNED_EXCLUDED_PARTS for part in path.parts):
-            continue
-        if path == Path(__file__):
-            continue
-        files.append(path)
-    return files
+    files: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(REPO_ROOT):
+        dirnames[:] = [d for d in dirnames if d not in _SCANNED_PRUNED_DIRS]
+        for name in filenames:
+            path = Path(dirpath) / name
+            if path.suffix.lower() not in _SCANNED_SUFFIXES:
+                continue
+            if path == Path(__file__):
+                continue
+            files.append(path)
+    return sorted(files)
 
 
 def test_no_stale_path_b_claim_in_repository() -> None:
