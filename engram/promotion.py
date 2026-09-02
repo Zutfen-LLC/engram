@@ -560,7 +560,10 @@ def _kind_promotion_allowed() -> Exists:
     A live proposal whose kind has no enabled ``auto_promote_from_inferred``
     row in the tenant's registry can never be admitted under current policy,
     so the rotating window never spends scan budget on it. A kind-policy
-    change immediately re-includes affected rows in the next window.
+    change immediately makes affected rows eligible for future rotation
+    windows again; it does not guarantee they are reached by the very next
+    pass — a row whose ``(created_at, id)`` is behind the persisted cursor
+    still waits until the rotation wraps around to it.
     """
     return exists(
         select(MemoryKind.name).where(
@@ -584,9 +587,19 @@ def _rotation_window(
     the wrapped continuation reuses the same call), a deterministic
     ``(created_at, id)`` order, the per-pass row limit, and FOR UPDATE SKIP
     LOCKED so concurrent startup passes partition the window instead of
-    blocking each other. Every live, kind-eligible proposal is therefore
-    examined at least once per full rotation without raising the per-pass
-    bound or loading the whole backlog.
+    blocking each other, without raising the per-pass bound or loading the
+    whole backlog.
+
+    Eventual-evaluation bound: from an arbitrary persisted cursor position, a
+    rotation can begin partway through the live, kind-eligible set — a short
+    partial page to the tail, then wraparound pages covering the rest. So a
+    stable set of ``N`` live kind-eligible proposals is fully covered within
+    at most ``ceil(N / limit) + 1`` passes (one for the possible partial tail
+    page, plus a full rotation of the remainder), not the tighter
+    ``ceil(N / limit)`` a cursor starting at the head would give. This bound
+    holds only while the eligible set is stable during the rotation;
+    concurrent inserts or kind-policy changes can change the set mid-rotation
+    and are not counted against it.
     """
     stmt = base_stmt.where(_kind_promotion_allowed())
     if cursor is not None:
@@ -611,9 +624,17 @@ async def _advance_reconciliation_cursor(
 ) -> None:
     """Persist the rotation cursor to the last row this pass examined.
 
-    Last-writer-wins under concurrent passes: a slower pass can move the
-    cursor backwards, which only causes idempotent re-examination — never a
-    skipped row — because the next pass re-reads from the persisted position.
+    Writes are last-writer-wins: whichever pass commits last sets the
+    persisted position, so a slower concurrent pass can move the cursor
+    backwards relative to a faster one that started later. FOR UPDATE SKIP
+    LOCKED means two concurrent passes never examine the same row, so
+    neither pass's own write can regress past rows *it* already examined.
+    This first slice does not prove a general "never skips a row" guarantee
+    across arbitrary concurrent startup/admin/review/worker interleavings —
+    that full concurrency proof is deferred to later #155 work. What is
+    established here: any row a pass reads is re-reachable by a later
+    rotation (nothing is permanently excluded), because a backwards cursor
+    move only widens, never narrows, the next pass's keyset window.
     """
     values = {
         "cursor_created_at": item.created_at,
@@ -708,11 +729,24 @@ async def auto_promote_proposed_memories(
                 )
             )
         ).scalar_one_or_none()
-    if not enabled:
-        count_stmt = base_stmt.order_by(MemoryItem.created_at.asc())
+    # The ordinary targeted/untargeted selection shape is established first,
+    # independent of whether promotion is enabled, so a disabled tenant's
+    # targeted call still scans exactly the requested item and an untargeted
+    # call still respects the caller's existing ordering/limit — neither
+    # falls back to a tenant-wide scan. Rotation only ever replaces the
+    # untargeted shape, and only for the actual active rotation case
+    # (which itself requires enabled=True, so it can never apply here).
+    if item_id is not None:
+        stmt = base_stmt.where(MemoryItem.id == item_id)
+    elif rotation_active:
+        assert limit is not None
+        stmt = _rotation_window(base_stmt, cursor_state, limit)
+    else:
+        stmt = base_stmt.order_by(MemoryItem.created_at.asc())
         if limit is not None:
-            count_stmt = count_stmt.limit(limit)
-        items = list((await session.execute(count_stmt)).scalars())
+            stmt = stmt.limit(limit)
+    if not enabled:
+        items = list((await session.execute(stmt)).scalars())
         result.scanned = len(items)
         result.skipped_disabled = len(items)
         if dry_run:
@@ -720,20 +754,10 @@ async def auto_promote_proposed_memories(
         else:
             await session.commit()
         return result
-    if item_id is not None:
-        stmt = base_stmt.where(MemoryItem.id == item_id)
-        if is_postgres:
-            stmt = stmt.with_for_update()
-    elif rotation_active:
-        # rotation_active is only True for a bounded pass.
-        assert limit is not None
-        stmt = _rotation_window(base_stmt, cursor_state, limit)
-    else:
-        stmt = base_stmt.order_by(MemoryItem.created_at.asc())
-        if limit is not None:
-            stmt = stmt.limit(limit)
-        if is_postgres:
-            stmt = stmt.with_for_update(skip_locked=True)
+    if is_postgres and not rotation_active:
+        # Rotation's own locking (FOR UPDATE SKIP LOCKED) is already baked
+        # into the statement _rotation_window() built above.
+        stmt = stmt.with_for_update(skip_locked=item_id is None)
     items = list((await session.execute(stmt)).scalars())
     if rotation_active and not items and cursor_state is not None:
         # The keyset page after the cursor is empty: the rotation reached the

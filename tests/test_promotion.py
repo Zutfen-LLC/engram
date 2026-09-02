@@ -1029,6 +1029,222 @@ async def test_startup_rotation_advances_and_wraps_past_terminal_rows():
         assert await _status_of(item_id) == "proposed"
 
 
+# ---- disabled-targeted selection regression (PR #164 review finding) ----
+#
+# auto_promote_proposed_memories() must select exactly the requested item_id
+# even when auto-promotion is disabled tenant-wide: the disabled early return
+# must not fall back to a tenant-wide scan. These regressions exercise the
+# targeted path through auto_promote_item(), the same entry point the
+# promotion.path_a worker job uses, so the real worker-facing contract is
+# covered rather than just the internal helper.
+
+
+async def test_disabled_targeted_item_scans_exactly_one_row():
+    """A targeted worker call for one proposal must scan exactly that row
+    when auto-promotion is disabled, not the tenant's entire live proposed
+    backlog. Regression for the PR #164 review finding where the disabled
+    early return executed the tenant-wide base_stmt before the item_id
+    filter was applied."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    from engram.promotion import auto_promote_item
+
+    tenant_id, principal_id = await _default_tenant_principal()
+    old = _default_now() - timedelta(hours=100)
+    target_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="targeted disabled fact",
+        memory_confidence=0.9,
+        created_at=old,
+    )
+    other_ids = [
+        await _insert_item(
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            content=f"other disabled-tenant proposal {i}",
+            memory_confidence=0.9,
+            created_at=old + timedelta(minutes=i + 1),
+        )
+        for i in range(5)
+    ]
+    async with _test_session_factory() as session:
+        await session.execute(
+            text("UPDATE tenant_config SET auto_promote_enabled = FALSE WHERE tenant_id = :tid"),
+            {"tid": tenant_id},
+        )
+        await session.commit()
+
+    async with _test_session_factory() as session:
+        result = await auto_promote_item(
+            session, tenant_id, uuid.UUID(target_id), uuid.uuid4()
+        )
+
+    assert result.enabled is False
+    assert result.scanned == 1
+    assert result.skipped_disabled == 1
+    assert result.promoted == 0
+    assert await _status_of(target_id) == "proposed"
+    for other_id in other_ids:
+        assert await _status_of(other_id) == "proposed"
+
+
+async def test_disabled_targeted_unknown_id_scans_zero_rows():
+    """A targeted call for an item_id that does not exist scans zero rows,
+    even with other live proposals present for the tenant. This proves the
+    selection is a genuine ``WHERE id = :item_id`` filter rather than
+    tenant-wide counters computed to merely look targeted."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    from engram.promotion import auto_promote_item
+
+    tenant_id, principal_id = await _default_tenant_principal()
+    old = _default_now() - timedelta(hours=100)
+    other_ids = [
+        await _insert_item(
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            content=f"unrelated disabled-tenant proposal {i}",
+            memory_confidence=0.9,
+            created_at=old + timedelta(minutes=i),
+        )
+        for i in range(5)
+    ]
+    async with _test_session_factory() as session:
+        await session.execute(
+            text("UPDATE tenant_config SET auto_promote_enabled = FALSE WHERE tenant_id = :tid"),
+            {"tid": tenant_id},
+        )
+        await session.commit()
+
+    unknown_id = uuid.uuid4()
+    async with _test_session_factory() as session:
+        result = await auto_promote_item(session, tenant_id, unknown_id, uuid.uuid4())
+
+    assert result.enabled is False
+    assert result.scanned == 0
+    assert result.skipped_disabled == 0
+    assert result.promoted == 0
+    for other_id in other_ids:
+        assert await _status_of(other_id) == "proposed"
+
+
+async def test_disabled_untargeted_respects_caller_limit():
+    """An untargeted disabled-tenant call still honors the caller-provided
+    limit and oldest-first ordering: with 5 live proposals and limit=2, only
+    the 2 oldest are scanned."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    tenant_id, principal_id = await _default_tenant_principal()
+    old = _default_now() - timedelta(hours=100)
+    ids = [
+        await _insert_item(
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            content=f"disabled untargeted limited {i}",
+            memory_confidence=0.9,
+            created_at=old + timedelta(minutes=i),
+        )
+        for i in range(5)
+    ]
+    async with _test_session_factory() as session:
+        await session.execute(
+            text("UPDATE tenant_config SET auto_promote_enabled = FALSE WHERE tenant_id = :tid"),
+            {"tid": tenant_id},
+        )
+        await session.commit()
+
+    async with _test_session_factory() as session:
+        await session.execute(
+            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
+        )
+        result = await auto_promote_proposed_memories(session, limit=2)
+
+    assert result.enabled is False
+    assert result.scanned == 2
+    assert result.skipped_disabled == 2
+    for item_id in ids:
+        assert await _status_of(item_id) == "proposed"
+
+
+async def test_dry_run_never_activates_rotation():
+    """dry_run=True must never activate the rotation window, even when the
+    caller passes rotation=True: no reconciliation cursor row is written for
+    the tenant, and rotation_wrapped stays False."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    tenant_id, principal_id = await _default_tenant_principal()
+    old = _default_now() - timedelta(hours=200)
+    for i in range(3):
+        await _insert_item(
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            content=f"dry run rotation candidate {i}",
+            memory_confidence=0.9,
+            created_at=old + timedelta(minutes=i),
+        )
+
+    async with _test_session_factory() as session:
+        await session.execute(
+            text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": tenant_id}
+        )
+        result = await auto_promote_proposed_memories(
+            session, limit=1, dry_run=True, rotation=True
+        )
+
+    assert result.dry_run is True
+    assert result.rotation_wrapped is False
+    async with _test_session_factory() as session:
+        cursor = (
+            await session.execute(
+                text(
+                    "SELECT cursor_item_id FROM promotion_reconciliation_state "
+                    "WHERE tenant_id = :tid"
+                ),
+                {"tid": tenant_id},
+            )
+        ).scalar_one_or_none()
+    assert cursor is None
+
+
+async def test_targeted_worker_path_does_not_use_reconciliation_cursor():
+    """Targeted promotion.path_a worker jobs never read or advance the
+    persisted rotation cursor: rotation is limited to the enabled,
+    non-preview, untargeted, bounded startup-recall call."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    from engram.promotion import auto_promote_item
+
+    tenant_id, principal_id = await _default_tenant_principal()
+    target_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="targeted worker fact",
+        memory_confidence=0.9,
+        created_at=_default_now() - timedelta(hours=100),
+    )
+
+    async with _test_session_factory() as session:
+        result = await auto_promote_item(session, tenant_id, uuid.UUID(target_id), uuid.uuid4())
+
+    # The mismatched classification_run_id makes the candidate a no-op (no
+    # bound receipt matches it), but the row is still scanned — this test is
+    # about cursor isolation, not promotion outcome.
+    assert result.scanned == 1
+    assert result.promoted == 0
+    async with _test_session_factory() as session:
+        cursor = (
+            await session.execute(
+                text(
+                    "SELECT cursor_item_id FROM promotion_reconciliation_state "
+                    "WHERE tenant_id = :tid"
+                ),
+                {"tid": tenant_id},
+            )
+        ).scalar_one_or_none()
+    assert cursor is None
+
+
 async def test_semantic_recall_does_not_trigger_lazy_promotion(client):
     """mode='semantic' does not invoke the lazy promotion pass in this slice —
     an eligible proposed item stays proposed after a semantic recall call."""
