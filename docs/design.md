@@ -360,8 +360,12 @@ bulk-loaded in a bounded number of queries. The review queue reuses that evaluat
 conflict checks and reports the conflict recheck as `not_run`.
 
 Qualifying bound evidence enqueues a deduplicated `promotion.path_a` job for the evidence eligibility
-time. Worker-created evidence reloads the locked item after guarded classification mutations and
-schedules only from that mutation-authoritative row and its currently bound receipt.
+time (or, behind `ENGRAM_PROMOTION_EVALUATE_JOBS_ENABLED`, the canonical `promotion.evaluate` job at
+the identical due time — see README.md's "Canonical `promotion.evaluate` job" section for the full
+contract). Worker-created evidence reloads the locked item after guarded classification mutations and
+schedules only from that mutation-authoritative row and its currently bound receipt. The canonical job
+re-derives that same current-state row at execution time instead of trusting the enqueue-time receipt,
+which is the material difference between the two contracts (issue #155).
 
 **Lazy startup-recall promotion** (F11): every `POST /v1/recall` call with
 `mode=startup` runs `engram.promotion.maybe_auto_promote_for_startup_recall`

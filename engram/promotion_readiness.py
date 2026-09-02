@@ -161,9 +161,12 @@ _POLICY_BLOCKERS: frozenset[str] = frozenset(
 LAST_EVALUATION_UNKNOWN = "unknown"
 
 # Job types whose presence/absence explains a proposed item's reconciliation
-# state: the delayed targeted promotion job and the async classification job
+# state: the legacy delayed targeted promotion job, the canonical current-
+# state promotion.evaluate job (issue #155, ENG-PROMOTION-003B2 — both remain
+# recognized during mixed-version rollout), and the async classification job
 # that produces retention evidence.
-_DIAGNOSTIC_JOB_TYPES: tuple[str, ...] = ("promotion.path_a", "classification.refine")
+_PROMOTION_JOB_TYPES: tuple[str, ...] = ("promotion.path_a", "promotion.evaluate")
+_DIAGNOSTIC_JOB_TYPES: tuple[str, ...] = (*_PROMOTION_JOB_TYPES, "classification.refine")
 
 # Hard bound on rows examined per job lookup so a pathological job history can
 # never make a "bounded" diagnostic unbounded. Deterministic order keeps the
@@ -304,10 +307,10 @@ async def active_jobs_for_items(
 ) -> dict[uuid.UUID, list[JobObservation]]:
     """Bounded, deterministic, tenant-scoped lookup of diagnostic jobs.
 
-    Returns pending/running/dead ``promotion.path_a`` / ``classification.refine``
-    jobs for the given items, ordered by ``(created_at, id)`` and capped at
-    ``_MAX_JOB_ROWS`` rows total. Job payloads (which reference item ids only)
-    are never returned.
+    Returns pending/running/dead ``promotion.path_a`` / ``promotion.evaluate``
+    / ``classification.refine`` jobs for the given items, ordered by
+    ``(created_at, id)`` and capped at ``_MAX_JOB_ROWS`` rows total. Job
+    payloads (which reference item ids only) are never returned.
     """
     if not item_ids:
         return {}
@@ -683,7 +686,7 @@ async def build_promotion_readiness(
             session, tenant_id=item.tenant_id, item_ids=[item.id], now=now
         )
     ).get(item.id, [])
-    promotion_jobs = [job for job in jobs if job.job_type == "promotion.path_a"]
+    promotion_jobs = [job for job in jobs if job.job_type in _PROMOTION_JOB_TYPES]
     is_candidate = (
         item.review_status == "proposed"
         and item.valid_to is None
