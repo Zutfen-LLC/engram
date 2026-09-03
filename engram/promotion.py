@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from sqlalchemy import Exists, Select, and_, exists, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -1386,6 +1388,116 @@ async def enqueue_promotion_evaluation(
         payload=payload,
         run_after=run_after,
         dedupe_key=str(payload["dedupe_key"]),
+    )
+
+
+def _item_state_field(item: MemoryItem | Mapping[str, Any], name: str) -> Any:
+    if isinstance(item, Mapping):
+        return item.get(name)
+    return getattr(item, name, None)
+
+
+def is_live_proposal(item: MemoryItem | Mapping[str, Any]) -> bool:
+    """Whether this item state is still a promotion candidate right now.
+
+    Tolerates both ORM rows and the ``SELECT *`` mappings the API routes
+    hold, so every producer can gate on the same in-transaction state. An
+    item that is expired, superseded, or no longer ``proposed`` can only be
+    a guaranteed no-op for the evaluator, so producers skip it.
+    """
+    return (
+        _item_state_field(item, "review_status") == "proposed"
+        and _item_state_field(item, "valid_to") is None
+        and _item_state_field(item, "superseded_by") is None
+    )
+
+
+async def maybe_enqueue_promotion_evaluation(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID | str,
+    item: MemoryItem | Mapping[str, Any],
+    trigger_type: str,
+    trigger_id: str,
+    requested_policy_version: str = EVIDENCE_PROMOTION_POLICY_VERSION,
+    ingest_id: uuid.UUID | None = None,
+    correlation_id: uuid.UUID | None = None,
+    run_after: datetime | None = None,
+) -> uuid.UUID | None:
+    """Gate and canonically enqueue one evaluation for a committed event.
+
+    The producer-side half of issue #155's trigger coverage. Every wired
+    producer calls this with the item's in-transaction state and the stable
+    id of the event that just committed (or will commit in the same
+    transaction — enqueue uses ``enqueue_job_in_transaction``, so the job
+    row exists iff the event does). The gates, in order:
+
+    * ``ENGRAM_PROMOTION_EVALUATE_JOBS_ENABLED`` off → no job (rollout
+      flag; default false, so all producers are inert by default);
+    * the item is not a live proposal → no job (evaluation would be a
+      guaranteed no-op);
+    * the tenant's ``auto_promote_enabled`` is off → no job (the evaluator
+      would only record ``skipped_disabled``; re-coverage after a policy
+      re-enable belongs to the reconciliation backstop, not to producers).
+
+    ``TRIGGER_ITEM_CREATED`` is the one purely time-dependent trigger: with
+    no caller-supplied ``run_after`` it schedules at the exact legacy
+    cooling boundary (``created_at + auto_promote_min_age_hours``) instead
+    of immediately. Every other wired trigger runs immediately — the
+    committed event itself is the reevaluation reason, and the evaluator
+    no-ops safely if the item is still cooling.
+
+    Trigger matrix for the producers wired through this helper (issue #155
+    §2 requires each trigger to document its decision effect):
+
+    * ``item_created`` — can newly admit (legacy lane at the cooling
+      boundary); the baseline future path for explicit-kind writes and
+      below-threshold receipts that bind no classification job.
+    * ``feedback`` — can block (a new external ``noise`` verdict) or newly
+      admit (a replacement verdict lifting an existing noise block). A
+      first-time ``useful`` verdict is consumed by no current gate and so
+      merely refreshes diagnostics; it is enqueued anyway because the
+      transition is cheap, flag-gated, and forward-compatible with future
+      usefulness lanes. Importance changes are *not* promotion evidence and
+      are not read by the evaluator.
+    * ``conflict_changed`` — can newly admit (resolution clears
+      ``conflict_resolution_status='unresolved'``). Conflict *creation* is
+      intentionally not a producer: a new conflict can only block, and the
+      blocked state is re-derived from current state by any later
+      evaluation rather than needing one scheduled at creation time.
+    * ``review_changed`` — refreshes diagnostics only today: human
+      verification does not feed any current promotion gate, and no
+      committed review transition can land an item back on ``proposed``.
+    * ``manual`` — can newly admit or block; runs the exact same evaluator
+      as every other path, under explicit admin authority.
+    """
+    if not settings.promotion_evaluate_jobs_enabled:
+        return None
+    if not is_live_proposal(item):
+        return None
+    config = await _config(session, str(tenant_id))
+    enabled, _, min_age_hours, _, _ = _config_values(config)
+    if not enabled:
+        return None
+    item_id = _require_uuid(_item_state_field(item, "id"), field="memory_item_id")
+    effective_run_after = run_after
+    if effective_run_after is None and trigger_type == TRIGGER_ITEM_CREATED:
+        created_at = _item_state_field(item, "created_at")
+        if not isinstance(created_at, datetime):
+            raise PromotionEvaluateContractError(
+                f"item_created trigger requires a datetime created_at, got {created_at!r}"
+            )
+        effective_run_after = created_at + timedelta(hours=min_age_hours)
+    return await enqueue_promotion_evaluation(
+        session,
+        tenant_id=tenant_id,
+        memory_item_id=item_id,
+        trigger_type=trigger_type,
+        trigger_id=trigger_id,
+        requested_policy_version=requested_policy_version,
+        ingest_id=ingest_id,
+        correlation_id=correlation_id,
+        run_after=effective_run_after,
     )
 
 

@@ -223,7 +223,7 @@ skipped_evidence_inconsistent
 skipped_review_policy
 ```
 
-**Canonical `promotion.evaluate` job (issue #155, ENG-PROMOTION-003B2 — partial).**
+**Canonical `promotion.evaluate` job (issue #155, ENG-PROMOTION-003B2/B3 — partial).**
 Alongside the legacy targeted `promotion.path_a` job, Engram now has one canonical,
 item-scoped, *current-state* promotion-evaluation job contract:
 `promotion.evaluate` (`engram.promotion.enqueue_promotion_evaluation`,
@@ -258,20 +258,58 @@ audit events additionally carry `evaluation_id`, `job_id`, `job_contract_version
 through `promotion.evaluate` — the legacy `promotion.path_a` audit-event JSON
 shape is unchanged.
 
-This slice is intentionally partial. The canonical job is behind
-`ENGRAM_PROMOTION_EVALUATE_JOBS_ENABLED` (default `false`); only the existing
-classification-bound scheduling point (`classification.refine`'s delayed
-evidence-promotion job) can opt into it, and only when the flag is set — every
-other trigger in the vocabulary above (item creation, feedback, conflict/review/
-kind/policy changes, provider recovery, reconciliation, manual requests) has no
-producer wired yet. `engram doctor` and the per-item readiness endpoint recognize
-both job types. Startup recall's bounded rotating promotion pass (described
+This slice is intentionally partial, in two stages. The canonical job is behind
+`ENGRAM_PROMOTION_EVALUATE_JOBS_ENABLED` (default `false`). With the flag set,
+these producers now enqueue canonical evaluations
+(`engram.promotion.maybe_enqueue_promotion_evaluation` gates every one of them
+on the flag, on the item still being a live proposal, and on the tenant's
+`auto_promote_enabled`):
+
+- `classification_bound` — `classification.refine`'s delayed evidence-promotion
+  schedule (the original producer); can newly admit at the evidence cooling
+  boundary.
+- `item_created` — `/v1/remember` for every proposed item, scheduled at the
+  *exact* legacy cooling boundary (`created_at + auto_promote_min_age_hours`);
+  can newly admit via the legacy lane. This is the reassessment path for
+  explicit-kind writes and below-threshold receipts, which previously had no
+  future evaluation at all.
+- `feedback` — the `/v1/feedback` route after a committed verdict transition
+  (`recorded`/`updated`; `unchanged` never enqueues). Can block (a new external
+  `noise` verdict) or newly admit (a replacement lifting an existing noise
+  block); a first-time `useful` verdict is consumed by no current gate and so
+  merely refreshes diagnostics (enqueued anyway: cheap, flag-gated,
+  forward-compatible with future usefulness lanes). Feedback *effects*
+  (importance) remain promotion-blind — `engram/feedback.py` contains no
+  promotion coupling by design; only the route-level orchestration schedules
+  reevaluation.
+- `conflict_changed` — `/v1/items/{id}/resolve-conflict` after a committed
+  resolution on a live proposal; can newly admit (clears the conflict block).
+  Conflict *creation* is deliberately not a producer: creation can only block,
+  and any later evaluation re-derives the block from current state (disputes
+  raised through the review route end the item's proposal, so they need no
+  trigger either).
+- `review_changed` — `/v1/items/{id}/verify` on a live proposal; refreshes
+  diagnostics only (verification feeds no current promotion gate, and no
+  committed review transition can land an item back on `proposed` — that is
+  why the review-status route itself has no producer).
+- `manual` — `POST /v1/admin/items/{item_id}/evaluate` enqueues one immediate
+  evaluation under admin authority; the item must be a live proposal (409
+  otherwise). Repeats enqueue independently; the evaluator stays idempotent.
+
+Still unwired in this slice: `classification_reassessed` (awaiting #157's
+versioned reassessment), `kind_changed`/`provenance_changed` (no
+kind/source-provenance correction path exists in the API today), and
+`policy_changed`/`provider_recovery`/`reconcile`, which need bounded fan-out and
+belong to the reconciliation-backstop slice. `engram doctor` and the per-item
+readiness endpoint recognize both job types. Startup recall's bounded rotating
+promotion pass (described
 above) is unchanged by this slice, still mutates directly rather than going
 through either job contract, and is not yet read-only. Durable, persisted
 promotion-assessment state remains future work (issue #159) — `evaluation_id`
 exists only within an audit event's `reason` JSON when a mutation or conflict
 block actually occurs, not as its own row. See the code comments in
-`engram/promotion.py` for the full contract and dedupe-key construction.
+`engram/promotion.py` for the full contract, dedupe-key construction, and the
+per-trigger decision-effect matrix.
 
 Thresholds come from `tenant_config`:
 

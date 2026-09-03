@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Literal, cast
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
@@ -37,7 +37,7 @@ from engram.memory_kinds import (
     invalidate_memory_kind_cache,
 )
 from engram.memory_profiles import ProfileNotFoundError
-from engram.models import MemoryKind, Tenant, Workspace
+from engram.models import MemoryItem, MemoryKind, Tenant, Workspace
 from engram.models import Principal as PrincipalModel
 from engram.promotion import auto_promote_proposed_memories, summarize
 from engram.tenant_initialization import initialize_tenant
@@ -239,6 +239,17 @@ class PromotionResponse(BaseModel):
     would_promote_ids: list[uuid.UUID] = Field(default_factory=list)
     candidates: list[PromotionCandidateResponse] = Field(default_factory=list)
     summary: str
+
+
+class ItemEvaluateResponse(BaseModel):
+    """Result of requesting one canonical item-scoped evaluation (issue #155)."""
+
+    item_id: uuid.UUID
+    job_id: uuid.UUID | None = None
+    trigger_type: Literal["manual"]
+    # "enqueued" — a promotion.evaluate job was queued; "not_enqueued" — the
+    # rollout flag or tenant promotion config suppressed it.
+    status: Literal["enqueued", "not_enqueued"]
 
 
 # --- Endpoints ---------------------------------------------------------------
@@ -523,6 +534,68 @@ async def update_memory_kind(
     invalidate_memory_kind_cache(tenant_id)
     invalidate_vocab_cache(tenant_id)
     return _kind_to_out(kind)
+
+
+@router.post(
+    "/admin/items/{item_id}/evaluate",
+    response_model=ItemEvaluateResponse,
+    dependencies=[Depends(ADMIN_SCOPE)],
+)
+async def evaluate_item(
+    item_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> ItemEvaluateResponse:
+    """Enqueue one canonical ``promotion.evaluate`` job for a live proposal.
+
+    The explicit admin-request trigger from issue #155's trigger matrix. The
+    enqueued job runs the exact same evaluator and mutation machinery as
+    every other evaluation path — this endpoint only adds queue work and
+    audit provenance (``trigger_type='manual'``), never decision authority.
+    Repeated requests enqueue independently (each gets a fresh trigger id),
+    and the evaluator itself is idempotent, so replays are safe.
+
+    Returns ``status='not_enqueued'`` when the rollout flag
+    (``ENGRAM_PROMOTION_EVALUATE_JOBS_ENABLED``) or the tenant's
+    ``auto_promote_enabled`` config suppressed the enqueue. An item that is
+    not a live proposal is a guaranteed evaluation no-op and is rejected
+    with 409 instead of silently enqueued.
+    """
+    from engram.promotion import (
+        TRIGGER_MANUAL,
+        is_live_proposal,
+        maybe_enqueue_promotion_evaluation,
+    )
+
+    tenant_id = await _resolve_tenant_id(session)
+    item = (
+        await session.execute(
+            select(MemoryItem).where(
+                MemoryItem.id == item_id, MemoryItem.tenant_id == uuid.UUID(tenant_id)
+            )
+        )
+    ).scalar_one_or_none()
+    if item is None:
+        raise HTTPException(status_code=404, detail="Item not found")
+    if not is_live_proposal(item):
+        raise HTTPException(
+            status_code=409,
+            detail="Only a live proposed item can be queued for promotion evaluation",
+        )
+    job_id = await maybe_enqueue_promotion_evaluation(
+        session,
+        tenant_id=tenant_id,
+        item=item,
+        trigger_type=TRIGGER_MANUAL,
+        trigger_id=str(uuid.uuid4()),
+    )
+    await session.commit()
+    return ItemEvaluateResponse(
+        item_id=item_id,
+        job_id=job_id,
+        # TRIGGER_MANUAL is the closed-vocabulary constant for "manual".
+        trigger_type=cast(Literal["manual"], TRIGGER_MANUAL),
+        status="enqueued" if job_id is not None else "not_enqueued",
+    )
 
 
 @router.post(

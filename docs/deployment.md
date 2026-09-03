@@ -567,6 +567,14 @@ promotion-evaluation job — see README.md), `retention.sweep`, and
 workers claim with `FOR UPDATE SKIP LOCKED`, retry failures with exponential
 backoff, and dead-letter after `ENGRAM_JOB_MAX_ATTEMPTS`.
 
+`promotion.evaluate` producers are gated on
+`ENGRAM_PROMOTION_EVALUATE_JOBS_ENABLED` (default `false`): classification-bound
+scheduling, `/v1/remember`'s item-created evaluation at the exact cooling
+boundary, feedback verdict transitions, conflict resolution, human verification,
+and the manual admin trigger (`POST /v1/admin/items/{item_id}/evaluate`). With
+the flag off, none of these enqueue and only the legacy paths run — flipping
+the flag back off is the rollback.
+
 Worker logs are visible with:
 
 ```bash
