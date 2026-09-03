@@ -1138,6 +1138,26 @@ PROMOTION_EVALUATE_TRIGGER_TYPES: frozenset[str] = frozenset(
     }
 )
 
+# The exact, closed field set of a ``promotion-evaluate-v1`` payload. Every
+# field is identifier/provenance-only: no mutable decision state (e.g.
+# ``retention_confidence``, ``review_status``), no memory content, and no
+# credentials ever belong in this contract. A generic ``metadata``/``extra``
+# bag is deliberately not offered — an unrecognized field always fails
+# closed (see ``parse_promotion_evaluate_payload``) rather than being
+# silently tolerated or namespaced away.
+PROMOTION_EVALUATE_ALLOWED_FIELDS: frozenset[str] = frozenset(
+    {
+        "contract_version",
+        "memory_item_id",
+        "trigger_type",
+        "trigger_id",
+        "requested_policy_version",
+        "ingest_id",
+        "correlation_id",
+        "dedupe_key",
+    }
+)
+
 
 class PromotionEvaluateContractError(ValueError):
     """A ``promotion.evaluate`` payload is malformed, or carries an unknown/
@@ -1209,15 +1229,84 @@ def _require_nonempty_str(value: object, *, field: str) -> str:
     return value
 
 
+def build_promotion_evaluate_payload(
+    *,
+    memory_item_id: uuid.UUID | str,
+    trigger_type: str,
+    trigger_id: str,
+    requested_policy_version: str = EVIDENCE_PROMOTION_POLICY_VERSION,
+    ingest_id: uuid.UUID | str | None = None,
+    correlation_id: uuid.UUID | str | None = None,
+) -> dict[str, object]:
+    """Construct one canonical, exact-field ``promotion-evaluate-v1`` payload.
+
+    This is the single producer-side half of the contract: it runs the same
+    runtime validation :func:`parse_promotion_evaluate_payload` re-verifies on
+    the worker side (never trusting Python type annotations alone) —
+    ``memory_item_id`` is a real UUID, ``trigger_type`` is in the closed
+    vocabulary, ``trigger_id`` / ``requested_policy_version`` are non-empty
+    strings, and optional ``ingest_id`` / ``correlation_id`` are valid UUIDs
+    when supplied — and it always computes the dedupe key itself from the
+    validated identity fields. Callers can never supply their own
+    ``dedupe_key``, so enqueue-time construction and worker parse-time
+    validation cannot drift apart. The returned dict contains exactly
+    :data:`PROMOTION_EVALUATE_ALLOWED_FIELDS`, nothing more.
+    """
+    item_id = _require_uuid(memory_item_id, field="memory_item_id")
+    if trigger_type not in PROMOTION_EVALUATE_TRIGGER_TYPES:
+        raise PromotionEvaluateContractError(
+            f"unknown promotion.evaluate trigger_type: {trigger_type!r}"
+        )
+    validated_trigger_id = _require_nonempty_str(trigger_id, field="trigger_id")
+    validated_policy_version = _require_nonempty_str(
+        requested_policy_version, field="requested_policy_version"
+    )
+    resolved_ingest_id = _optional_uuid(ingest_id, field="ingest_id")
+    resolved_correlation_id = _optional_uuid(correlation_id, field="correlation_id")
+    return {
+        "contract_version": PROMOTION_EVALUATE_CONTRACT_VERSION,
+        "memory_item_id": str(item_id),
+        "trigger_type": trigger_type,
+        "trigger_id": validated_trigger_id,
+        "requested_policy_version": validated_policy_version,
+        "ingest_id": str(resolved_ingest_id) if resolved_ingest_id is not None else None,
+        "correlation_id": (
+            str(resolved_correlation_id) if resolved_correlation_id is not None else None
+        ),
+        "dedupe_key": promotion_evaluate_dedupe_key(item_id, trigger_type, validated_trigger_id),
+    }
+
+
 def parse_promotion_evaluate_payload(payload: dict[str, object]) -> PromotionEvaluatePayload:
     """Parse and validate a ``promotion.evaluate`` job payload (v1 contract).
 
-    Fails closed: an unknown/missing ``contract_version`` or an unrecognized
-    ``trigger_type`` raises :class:`PromotionEvaluateContractError` rather
-    than guessing at a compatible interpretation. Structurally malformed
-    fields (missing/wrong-typed ``memory_item_id``, ``trigger_id``, etc.)
-    raise the same error.
+    Fails closed on every axis that would let a malformed or dishonest
+    payload masquerade as a canonical evaluation job:
+
+    * any field outside :data:`PROMOTION_EVALUATE_ALLOWED_FIELDS` (unknown
+      mutable decision state, memory content, credentials, or anything else)
+      is rejected outright — the v1 envelope is exact/closed, not a bag with
+      tolerated extras;
+    * an unknown/missing ``contract_version`` or an unrecognized
+      ``trigger_type`` raises :class:`PromotionEvaluateContractError` rather
+      than guessing at a compatible interpretation;
+    * structurally malformed fields (missing/wrong-typed ``memory_item_id``,
+      ``trigger_id``, etc.) raise the same error;
+    * the stored ``dedupe_key`` must equal the canonical key recomputed from
+      the parsed ``(memory_item_id, trigger_type, trigger_id)`` identity — a
+      wrong-but-nonempty ``dedupe_key`` is rejected exactly like an
+      unsupported contract version, so the payload's claimed identity is
+      independently verified rather than trusted from a generic queue
+      producer or the database's unique-index behavior alone.
     """
+    if not isinstance(payload, dict):
+        raise PromotionEvaluateContractError("promotion.evaluate payload must be an object")
+    unknown_fields = set(payload) - PROMOTION_EVALUATE_ALLOWED_FIELDS
+    if unknown_fields:
+        raise PromotionEvaluateContractError(
+            "promotion.evaluate payload carries unsupported field(s): "
+            f"{sorted(unknown_fields)!r}"
+        )
     contract_version = payload.get("contract_version")
     if contract_version != PROMOTION_EVALUATE_CONTRACT_VERSION:
         raise PromotionEvaluateContractError(
@@ -1235,6 +1324,12 @@ def parse_promotion_evaluate_payload(payload: dict[str, object]) -> PromotionEva
         payload.get("requested_policy_version"), field="requested_policy_version"
     )
     dedupe_key = _require_nonempty_str(payload.get("dedupe_key"), field="dedupe_key")
+    expected_dedupe_key = promotion_evaluate_dedupe_key(memory_item_id, trigger_type, trigger_id)
+    if dedupe_key != expected_dedupe_key:
+        raise PromotionEvaluateContractError(
+            f"promotion.evaluate dedupe_key {dedupe_key!r} does not match the canonical "
+            f"identity key {expected_dedupe_key!r}"
+        )
     return PromotionEvaluatePayload(
         contract_version=contract_version,
         memory_item_id=memory_item_id,
@@ -1261,44 +1356,36 @@ async def enqueue_promotion_evaluation(
 ) -> uuid.UUID:
     """Canonically enqueue one ``promotion.evaluate`` job (issue #155).
 
-    Validates ``trigger_type`` against the closed vocabulary (fails closed on
-    an unknown value) and computes the dedupe key centrally — callers cannot
-    override it. Uses :func:`engram.jobs.enqueue_job_in_transaction`, so this
-    preserves the caller's outer transaction (e.g. a classification-binding
-    transaction) rather than committing it prematurely; the caller commits.
-    Idempotent: enqueuing the same ``(item, trigger_type, trigger_id)``
-    identity again while a pending/running job exists returns that job's id
-    instead of creating a duplicate. A different ``trigger_id`` always
-    produces a distinct job, even for the same item.
+    Delegates all field validation and dedupe-key construction to
+    :func:`build_promotion_evaluate_payload` — the exact same rules the
+    worker re-verifies at parse time — so enqueue-time construction and
+    execution-time validation cannot independently drift. Callers cannot
+    supply their own ``dedupe_key``. Uses
+    :func:`engram.jobs.enqueue_job_in_transaction`, so this preserves the
+    caller's outer transaction (e.g. a classification-binding transaction)
+    rather than committing it prematurely; the caller commits. Idempotent:
+    enqueuing the same ``(item, trigger_type, trigger_id)`` identity again
+    while a pending/running job exists returns that job's id instead of
+    creating a duplicate. A different ``trigger_id`` always produces a
+    distinct job, even for the same item.
     """
-    if trigger_type not in PROMOTION_EVALUATE_TRIGGER_TYPES:
-        raise PromotionEvaluateContractError(
-            f"unknown promotion.evaluate trigger_type: {trigger_type!r}"
-        )
-    if not trigger_id:
-        raise PromotionEvaluateContractError("trigger_id is required")
-    if not requested_policy_version:
-        raise PromotionEvaluateContractError("requested_policy_version is required")
-
     from engram.jobs import enqueue_job_in_transaction
 
-    dedupe_key = promotion_evaluate_dedupe_key(memory_item_id, trigger_type, trigger_id)
-    payload: dict[str, object] = {
-        "contract_version": PROMOTION_EVALUATE_CONTRACT_VERSION,
-        "memory_item_id": str(memory_item_id),
-        "trigger_type": trigger_type,
-        "trigger_id": trigger_id,
-        "requested_policy_version": requested_policy_version,
-        "ingest_id": str(ingest_id) if ingest_id is not None else None,
-        "correlation_id": str(correlation_id) if correlation_id is not None else None,
-    }
+    payload = build_promotion_evaluate_payload(
+        memory_item_id=memory_item_id,
+        trigger_type=trigger_type,
+        trigger_id=trigger_id,
+        requested_policy_version=requested_policy_version,
+        ingest_id=ingest_id,
+        correlation_id=correlation_id,
+    )
     return await enqueue_job_in_transaction(
         session,
         tenant_id=tenant_id,
         job_type=PROMOTION_EVALUATE_JOB_TYPE,
         payload=payload,
         run_after=run_after,
-        dedupe_key=dedupe_key,
+        dedupe_key=str(payload["dedupe_key"]),
     )
 
 

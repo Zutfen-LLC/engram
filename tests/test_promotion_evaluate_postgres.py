@@ -35,6 +35,7 @@ from engram.promotion import (
     TRIGGER_MANUAL,
     enqueue_promotion_evaluation,
     evaluate_promotion_item_current_state,
+    promotion_evaluate_dedupe_key,
 )
 from engram.worker import handle_promotion_evaluate, process_one_job
 
@@ -148,6 +149,7 @@ async def _insert_item(
     retention_disposition: str | None = None,
     retention_evidence_at: datetime | None = None,
     review_status: str = "proposed",
+    visibility: str = "tenant",
 ) -> str:
     item_id = str(uuid.uuid4())
     if created_at is None:
@@ -162,7 +164,7 @@ async def _insert_item(
                 "retention_evidence_at, importance, source_type, created_at, valid_from"
                 ") VALUES ("
                 ":id, :tenant_id, :principal_id, :content, :content_hash, :kind, "
-                "'tenant', :review_status, :memory_confidence, 0.5, "
+                ":visibility, :review_status, :memory_confidence, 0.5, "
                 ":source_confidence_prior, :retention_confidence, :retention_disposition, "
                 ":retention_evidence_at, 0.5, :source_type, :created_at, :created_at"
                 ")"
@@ -174,6 +176,7 @@ async def _insert_item(
                 "content": content,
                 "content_hash": f"sha256:{uuid.uuid4().hex}",
                 "kind": kind,
+                "visibility": visibility,
                 "review_status": review_status,
                 "memory_confidence": memory_confidence,
                 "source_type": source_type,
@@ -1362,3 +1365,482 @@ async def test_cross_tenant_forged_item_id_cannot_mutate():
             })
         await owner.dispose()
         await app.dispose()
+
+
+# ===========================================================================
+# 10. Worker retry/dead-letter proof for an invalid canonical envelope
+#     (correction pass: parser must be self-validating, not merely tolerant)
+# ===========================================================================
+
+
+async def test_mismatched_dedupe_key_envelope_fails_closed_through_retry_path():
+    """A generic queue producer could insert a promotion.evaluate payload with
+    correct identity fields but a self-consistent, non-canonical dedupe_key
+    (never going through enqueue_promotion_evaluation at all). The worker
+    must not trust that stored key: the job fails and retries (attempts
+    incremented, not silently succeeded), the target item is untouched, and
+    no audit mutation is ever emitted."""
+    if not await _db_ok():
+        _require_db()
+    tenant_id, principal_id = await _default_tenant_principal()
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="mismatched dedupe key target",
+        memory_confidence=0.9,
+        created_at=FIXED_NOW - timedelta(hours=200),
+    )
+    bad_payload = {
+        "contract_version": PROMOTION_EVALUATE_CONTRACT_VERSION,
+        "memory_item_id": item_id,
+        "trigger_type": TRIGGER_MANUAL,
+        "trigger_id": "trigger-1",
+        "requested_policy_version": "promotion-legacy-v1",
+        "ingest_id": None,
+        "correlation_id": None,
+        # Same item, same trigger_type, but a different trigger_id than the
+        # payload actually declares — structurally plausible, not a prefix
+        # mismatch, and never produced by enqueue_promotion_evaluation.
+        "dedupe_key": f"promotion.evaluate:{item_id}:manual:a-different-trigger",
+    }
+    async with _test_session_factory() as session:
+        await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
+        await enqueue_job(
+            session, tenant_id=tenant_id, job_type="promotion.evaluate", payload=bad_payload
+        )
+        await session.commit()
+
+    await process_one_job(
+        worker_id="test",
+        session_factory=_test_session_factory,
+        app_session_factory=_test_session_factory,
+        job_types=["promotion.evaluate"],
+    )
+
+    async with _test_session_factory() as session:
+        job = (
+            await session.execute(
+                text("SELECT status, attempts FROM jobs WHERE tenant_id = :tid"),
+                {"tid": tenant_id},
+            )
+        ).mappings().one()
+    assert job["status"] == STATUS_PENDING
+    assert job["attempts"] == 1
+
+    item = await _fetch_item(item_id)
+    assert item["review_status"] == "proposed"
+    assert await _events_for(item_id) == []
+
+
+async def test_unknown_field_envelope_fails_closed_through_retry_path():
+    """A payload with an otherwise-valid v1 shape plus one unrecognized field
+    (enqueue-time decision state that must never belong in this contract)
+    must fail the exact same way — retried, not silently accepted with the
+    extra field ignored."""
+    if not await _db_ok():
+        _require_db()
+    tenant_id, principal_id = await _default_tenant_principal()
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="unknown field target",
+        memory_confidence=0.9,
+        created_at=FIXED_NOW - timedelta(hours=200),
+    )
+    bad_payload = {
+        "contract_version": PROMOTION_EVALUATE_CONTRACT_VERSION,
+        "memory_item_id": item_id,
+        "trigger_type": TRIGGER_MANUAL,
+        "trigger_id": "trigger-1",
+        "requested_policy_version": "promotion-legacy-v1",
+        "ingest_id": None,
+        "correlation_id": None,
+        "dedupe_key": promotion_evaluate_dedupe_key(
+            uuid.UUID(item_id), TRIGGER_MANUAL, "trigger-1"
+        ),
+        "retention_confidence": 0.99,
+    }
+    async with _test_session_factory() as session:
+        await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
+        await enqueue_job(
+            session, tenant_id=tenant_id, job_type="promotion.evaluate", payload=bad_payload
+        )
+        await session.commit()
+
+    await process_one_job(
+        worker_id="test",
+        session_factory=_test_session_factory,
+        app_session_factory=_test_session_factory,
+        job_types=["promotion.evaluate"],
+    )
+
+    async with _test_session_factory() as session:
+        job = (
+            await session.execute(
+                text("SELECT status, attempts FROM jobs WHERE tenant_id = :tid"),
+                {"tid": tenant_id},
+            )
+        ).mappings().one()
+    assert job["status"] == STATUS_PENDING
+    assert job["attempts"] == 1
+
+    item = await _fetch_item(item_id)
+    assert item["review_status"] == "proposed"
+    assert await _events_for(item_id) == []
+
+
+# ===========================================================================
+# 11. Canonical execution-authority proof (missing / corrupt v2 authority)
+# ===========================================================================
+
+
+async def _insert_v2_ingest(
+    tenant_id: str,
+    principal_id: str,
+    *,
+    with_execution: bool,
+    execution_context_version: str = "memory-context-v2",
+    memory_profile_id: str | None = None,
+    memory_profile_revision_id: str | None = None,
+) -> str:
+    """Insert a memory-context-v2 candidate_ingests row, optionally with its
+    durable candidate_ingest_executions row -- mirroring the direct-SQL
+    execution-context fixture pattern used by
+    tests/test_worker_audit_provenance_postgres.py, without a full
+    /v1/remember round trip."""
+    ingest_id = str(uuid.uuid4())
+    async with _test_session_factory() as session:
+        await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
+        await session.execute(
+            text(
+                "INSERT INTO candidate_ingests (id, tenant_id, principal_id, "
+                "source_type, content_hash, memory_context_version) "
+                "VALUES (:id, :tid, :pid, 'manual', :hash, 'memory-context-v2')"
+            ),
+            {
+                "id": ingest_id,
+                "tid": tenant_id,
+                "pid": principal_id,
+                "hash": f"sha256:{uuid.uuid4().hex}",
+            },
+        )
+        if with_execution:
+            await session.execute(
+                text(
+                    "INSERT INTO candidate_ingest_executions (ingest_id, tenant_id, "
+                    "memory_profile_id, memory_profile_revision_id, memory_context_version) "
+                    "VALUES (:iid, :tid, :profile_id, :revision_id, :ctx)"
+                ),
+                {
+                    "iid": ingest_id,
+                    "tid": tenant_id,
+                    "profile_id": memory_profile_id,
+                    "revision_id": memory_profile_revision_id,
+                    "ctx": execution_context_version,
+                },
+            )
+        await session.commit()
+    return ingest_id
+
+
+async def test_missing_v2_execution_authority_fails_closed_not_broader_fallback():
+    """A memory-context-v2 candidate ingest whose durable execution row is
+    absent must never let evaluation proceed under broader fallback/origin
+    authority. Even though the target is otherwise promotable (legacy lane
+    qualifies), it must remain proposed, no promotion event may be emitted,
+    and the job must not be marked succeeded -- it goes through the ordinary
+    retry/dead-letter path. This is deliberately unlike legacy
+    promotion.path_a's pre-025 carve-out: for canonical promotion.evaluate,
+    unreconstructable execution authority is an operational failure that
+    must stay visible, not a silent no-op."""
+    if not await _db_ok():
+        _require_db()
+    tenant_id, principal_id = await _default_tenant_principal()
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="missing execution authority target",
+        memory_confidence=0.9,
+        created_at=FIXED_NOW - timedelta(hours=200),
+    )
+    ingest_id = await _insert_v2_ingest(tenant_id, principal_id, with_execution=False)
+
+    async with _test_session_factory() as session:
+        await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
+        await enqueue_promotion_evaluation(
+            session,
+            tenant_id=tenant_id,
+            memory_item_id=uuid.UUID(item_id),
+            trigger_type=TRIGGER_MANUAL,
+            trigger_id="missing-authority",
+            ingest_id=uuid.UUID(ingest_id),
+        )
+        await session.commit()
+
+    await process_one_job(
+        worker_id="test",
+        session_factory=_test_session_factory,
+        app_session_factory=_test_session_factory,
+        job_types=["promotion.evaluate"],
+    )
+
+    item = await _fetch_item(item_id)
+    assert item["review_status"] == "proposed"
+    events = await _events_for(item_id)
+    assert not any(e["event_type"] in ("review_change", "conflict_resolution") for e in events)
+
+    async with _test_session_factory() as session:
+        job = (
+            await session.execute(
+                text("SELECT status, attempts FROM jobs WHERE tenant_id = :tid"),
+                {"tid": tenant_id},
+            )
+        ).mappings().one()
+    assert job["status"] == STATUS_PENDING
+    assert job["attempts"] == 1
+
+
+async def test_corrupt_v2_execution_authority_fails_closed():
+    """An execution row that is present but carries an unsupported/corrupt
+    context version (memory_context_from_ingest raises) must fail exactly
+    like a missing row: no evaluation-authorized mutation, ordinary worker
+    failure semantics."""
+    if not await _db_ok():
+        _require_db()
+    tenant_id, principal_id = await _default_tenant_principal()
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="corrupt execution authority target",
+        memory_confidence=0.9,
+        created_at=FIXED_NOW - timedelta(hours=200),
+    )
+    ingest_id = await _insert_v2_ingest(
+        tenant_id,
+        principal_id,
+        with_execution=True,
+        execution_context_version="unsupported-v99",
+    )
+
+    async with _test_session_factory() as session:
+        await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
+        await enqueue_promotion_evaluation(
+            session,
+            tenant_id=tenant_id,
+            memory_item_id=uuid.UUID(item_id),
+            trigger_type=TRIGGER_MANUAL,
+            trigger_id="corrupt-authority",
+            ingest_id=uuid.UUID(ingest_id),
+        )
+        await session.commit()
+
+    await process_one_job(
+        worker_id="test",
+        session_factory=_test_session_factory,
+        app_session_factory=_test_session_factory,
+        job_types=["promotion.evaluate"],
+    )
+
+    item = await _fetch_item(item_id)
+    assert item["review_status"] == "proposed"
+    events = await _events_for(item_id)
+    assert not any(e["event_type"] in ("review_change", "conflict_resolution") for e in events)
+
+    async with _test_session_factory() as session:
+        job = (
+            await session.execute(
+                text("SELECT status, attempts FROM jobs WHERE tenant_id = :tid"),
+                {"tid": tenant_id},
+            )
+        ).mappings().one()
+    assert job["status"] == STATUS_PENDING
+    assert job["attempts"] == 1
+
+
+# ===========================================================================
+# 12. Profile-bound write eligibility governs canonical evaluation
+# ===========================================================================
+
+
+async def _insert_profile_revision(
+    tenant_id: str,
+    *,
+    slug: str,
+    include_private: bool = True,
+    include_tenant: bool = False,
+    include_public: bool = False,
+    allow_tenant_write: bool = False,
+    allow_public_write: bool = False,
+) -> tuple[str, str]:
+    """Insert one memory_profiles + memory_profile_revisions row directly,
+    mirroring the profile-authorization fixture shape used elsewhere (see
+    tests/test_profile_authorization_regressions_postgres.py) without the
+    full HTTP API round trip. Returns ``(profile_id, revision_id)``."""
+    profile_id = str(uuid.uuid4())
+    revision_id = str(uuid.uuid4())
+    async with _test_session_factory() as session:
+        await session.execute(
+            text(
+                "INSERT INTO memory_profiles (id, tenant_id, name, slug) "
+                "VALUES (:id, :tid, :slug, :slug)"
+            ),
+            {"id": profile_id, "tid": tenant_id, "slug": slug},
+        )
+        await session.execute(
+            text(
+                "INSERT INTO memory_profile_revisions (id, tenant_id, profile_id, version, "
+                "include_private, include_tenant, include_public, allow_tenant_write, "
+                "allow_public_write, default_write_visibility, reason) "
+                "VALUES (:id, :tid, :pid, 1, :inc_priv, :inc_ten, :inc_pub, :atw, :apw, "
+                "'private', 'promotion-evaluate profile-bound proof')"
+            ),
+            {
+                "id": revision_id,
+                "tid": tenant_id,
+                "pid": profile_id,
+                "inc_priv": include_private,
+                "inc_ten": include_tenant,
+                "inc_pub": include_public,
+                "atw": allow_tenant_write,
+                "apw": allow_public_write,
+            },
+        )
+        await session.commit()
+    return profile_id, revision_id
+
+
+async def test_profile_bound_write_ineligible_item_stays_proposed_as_legitimate_noop():
+    """A restrictive profile (tenant-visibility readable but NOT writable)
+    carried as the job's execution authority must keep an otherwise-eligible
+    proposed item out of promotion. The handler runs under the correct
+    tenant, the execution context reconstructs successfully, but the target
+    is outside write eligibility -- so it must stay proposed with no
+    promotion audit event, and the job itself completes as a legitimate
+    no-op (not a failure)."""
+    if not await _db_ok():
+        _require_db()
+    tenant_id, principal_id = await _default_tenant_principal()
+    profile_id, revision_id = await _insert_profile_revision(
+        tenant_id,
+        slug=f"restrictive-{uuid.uuid4().hex[:10]}",
+        include_private=True,
+        include_tenant=True,
+        allow_tenant_write=False,
+    )
+    ingest_id = await _insert_v2_ingest(
+        tenant_id,
+        principal_id,
+        with_execution=True,
+        memory_profile_id=profile_id,
+        memory_profile_revision_id=revision_id,
+    )
+
+    # Tenant-visibility item: readable under this profile (include_tenant),
+    # otherwise promotable (legacy lane), but NOT writable
+    # (allow_tenant_write=False) -- write_eligibility_expression must
+    # exclude it from the scan entirely.
+    blocked_item = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="profile write-ineligible target",
+        memory_confidence=0.9,
+        created_at=FIXED_NOW - timedelta(hours=200),
+        visibility="tenant",
+    )
+
+    async with _test_session_factory() as session:
+        await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
+        await enqueue_promotion_evaluation(
+            session,
+            tenant_id=tenant_id,
+            memory_item_id=uuid.UUID(blocked_item),
+            trigger_type=TRIGGER_MANUAL,
+            trigger_id="profile-write-ineligible",
+            ingest_id=uuid.UUID(ingest_id),
+        )
+        await session.commit()
+
+    processed = await process_one_job(
+        worker_id="test",
+        session_factory=_test_session_factory,
+        app_session_factory=_test_session_factory,
+        job_types=["promotion.evaluate"],
+    )
+    assert processed is True
+
+    item = await _fetch_item(blocked_item)
+    assert item["review_status"] == "proposed"
+    events = await _events_for(blocked_item)
+    assert not any(e["event_type"] == "review_change" for e in events)
+
+    async with _test_session_factory() as session:
+        job = (
+            await session.execute(
+                text(
+                    "SELECT status FROM jobs WHERE tenant_id = :tid "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ),
+                {"tid": tenant_id},
+            )
+        ).mappings().one()
+    # A legitimate no-op job succeeds -- it is not treated as a failure.
+    assert job["status"] == "succeeded"
+
+
+async def test_profile_bound_write_eligible_item_promotes_under_same_profile():
+    """Companion to the restrictive case above, under the exact same
+    profile: a private item owned by the execution principal is always
+    write-eligible (profile_write_scope_expression permits private
+    visibility unconditionally), so it promotes -- proving
+    write_eligibility_expression narrows rather than blanket-blocking all
+    mutation for a profile-bound canonical evaluation."""
+    if not await _db_ok():
+        _require_db()
+    tenant_id, principal_id = await _default_tenant_principal()
+    profile_id, revision_id = await _insert_profile_revision(
+        tenant_id,
+        slug=f"restrictive-{uuid.uuid4().hex[:10]}",
+        include_private=True,
+        include_tenant=True,
+        allow_tenant_write=False,
+    )
+    ingest_id = await _insert_v2_ingest(
+        tenant_id,
+        principal_id,
+        with_execution=True,
+        memory_profile_id=profile_id,
+        memory_profile_revision_id=revision_id,
+    )
+
+    allowed_item = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="profile write-eligible target",
+        memory_confidence=0.9,
+        created_at=FIXED_NOW - timedelta(hours=200),
+        visibility="private",
+    )
+
+    async with _test_session_factory() as session:
+        await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
+        await enqueue_promotion_evaluation(
+            session,
+            tenant_id=tenant_id,
+            memory_item_id=uuid.UUID(allowed_item),
+            trigger_type=TRIGGER_MANUAL,
+            trigger_id="profile-write-eligible",
+            ingest_id=uuid.UUID(ingest_id),
+        )
+        await session.commit()
+
+    await process_one_job(
+        worker_id="test",
+        session_factory=_test_session_factory,
+        app_session_factory=_test_session_factory,
+        job_types=["promotion.evaluate"],
+    )
+
+    item = await _fetch_item(allowed_item)
+    assert item["review_status"] == "active"
+    events = await _events_for(allowed_item)
+    assert any(e["event_type"] == "review_change" for e in events)

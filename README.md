@@ -233,7 +233,19 @@ carries a stable `memory_item_id`, a closed `trigger_type`/`trigger_id` audit-
 provenance pair (`item_created`, `classification_bound`, `classification_reassessed`,
 `feedback`, `conflict_changed`, `review_changed`, `provenance_changed`,
 `kind_changed`, `policy_changed`, `provider_recovery`, `reconcile`, `manual`), and
-a `requested_policy_version` that is descriptive only. Unlike `promotion.path_a`'s
+a `requested_policy_version` that is descriptive only. The v1 envelope is exact
+and closed: `parse_promotion_evaluate_payload()` rejects any field outside
+`{contract_version, memory_item_id, trigger_type, trigger_id,
+requested_policy_version, ingest_id, correlation_id, dedupe_key}` (no
+`metadata`/`extra` bag), and independently recomputes `dedupe_key` from the
+parsed `(memory_item_id, trigger_type, trigger_id)` identity — a stored key
+that does not match the canonical one fails closed exactly like an
+unsupported contract version, rather than being trusted from the payload or
+the queue's unique-index behavior alone. `enqueue_promotion_evaluation()`
+builds payloads through the same `build_promotion_evaluate_payload()` rules
+the worker enforces at parse time, so enqueue-time construction and
+execution-time validation cannot drift apart; callers cannot supply their
+own `dedupe_key`. Unlike `promotion.path_a`'s
 classification-run-targeted binding, the handler always evaluates whatever state
 is authoritative in the database *at execution time* — a trigger enqueued for a
 since-superseded observation is audit provenance only, never a filter and never
