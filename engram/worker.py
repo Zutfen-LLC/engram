@@ -2,7 +2,17 @@
 
 Polls the ``jobs`` table and runs handlers off the request path:
 ``embedding.generate``, ``conflict.check``, ``classification.refine``,
-``promotion.path_a``, and ``retention.sweep``.
+``promotion.path_a``, ``promotion.evaluate``, and ``retention.sweep``.
+
+``promotion.evaluate`` (issue #155, ENG-PROMOTION-003B2) is the canonical,
+item-scoped, current-state promotion-evaluation job contract. Unlike
+``promotion.path_a``'s classification-run-targeted binding, it always
+evaluates whatever state is authoritative in the database at execution
+time — see ``engram.promotion.evaluate_promotion_item_current_state``. Both
+job types remain registered and fully functional: a mixed-version deployment
+can have pending/running jobs of either type, and both converge on the same
+shared evaluator/mutation machinery, so at most one of a legacy-vs-canonical
+race for the same item ever performs the lifecycle mutation.
 
 RLS posture (hybrid, per ENG-AUD-008):
 
@@ -1799,6 +1809,91 @@ async def handle_promotion_path_a(session: AsyncSession, job: Job) -> None:
     )
 
 
+async def handle_promotion_evaluate(session: AsyncSession, job: Job) -> None:
+    """Canonical, item-scoped, current-state promotion evaluation (issue #155).
+
+    Unlike ``promotion.path_a``'s classification-run-targeted binding, the
+    enqueue-time trigger (``trigger_type`` / ``trigger_id``) is audit
+    provenance only here — never a filter and never authorization. The
+    handler always evaluates whatever state is authoritative in the database
+    at execution time, via the same shared evaluator and mutation machinery
+    every other promotion path uses
+    (``engram.promotion.evaluate_promotion_item_current_state``).
+
+    Malformed/unknown contract payloads, a tenant-mismatched target, and
+    genuine database/runtime failures propagate and go through the ordinary
+    retry/dead-letter machinery. Deliberately unlike ``promotion.path_a``'s
+    historical pre-025-job carve-out: an unreconstructable execution
+    authority here also propagates (issue #155 §10), rather than silently
+    succeeding as a no-op, so a real operational problem stays visible
+    (dead-lettered, inspectable via diagnostics) instead of disappearing. A
+    target that no longer exists, is no longer ``proposed``, is blocked,
+    cooling, or has insufficient evidence is a legitimate evaluation outcome
+    and succeeds as an idempotent no-op — these are not worker failures.
+    """
+    from engram.promotion import (
+        PromotionEvaluateContractError,
+        evaluate_promotion_item_current_state,
+        parse_promotion_evaluate_payload,
+    )
+
+    try:
+        contract = parse_promotion_evaluate_payload(job.payload)
+    except PromotionEvaluateContractError as exc:
+        raise ValueError(f"promotion.evaluate malformed contract: {exc}") from exc
+
+    # Reload + verify visibility within the routed tenant before doing any
+    # further work. The job's tenant_id is routing context, not proof: the
+    # app-role session is already RLS-scoped to job.tenant_id, so a forged
+    # cross-tenant memory_item_id simply is not found here (safe no-op); the
+    # explicit tenant_id comparison below is defense-in-depth, matching every
+    # other handler in this module.
+    item = await _reload_item(session, contract.memory_item_id)
+    if item is None:
+        logger.info(
+            "promotion.evaluate item=%s trigger=%s/%s skipped: not visible in tenant %s",
+            contract.memory_item_id,
+            contract.trigger_type,
+            contract.trigger_id,
+            job.tenant_id,
+        )
+        return
+    if str(item.tenant_id) != str(job.tenant_id):
+        raise RuntimeError(f"job tenant {job.tenant_id} != item tenant {item.tenant_id}")
+
+    # Execution-authority reconstruction: same v2 candidate-origin provenance
+    # rules as promotion.path_a, but a reconstruction failure is not caught
+    # here (see docstring) — it propagates to the retry/dead-letter path.
+    memory_context = await _job_memory_context(session, job)
+
+    evaluation_id = uuid.uuid4()
+    evaluation_context: dict[str, object] = {
+        "evaluation_id": str(evaluation_id),
+        "job_id": str(job.id),
+        "job_contract_version": contract.contract_version,
+        "trigger_type": contract.trigger_type,
+        "trigger_id": contract.trigger_id,
+        "requested_policy_version": contract.requested_policy_version,
+    }
+
+    result = await evaluate_promotion_item_current_state(
+        session,
+        str(job.tenant_id),
+        contract.memory_item_id,
+        evaluation_context=evaluation_context,
+        memory_context=memory_context,
+    )
+    logger.info(
+        "promotion.evaluate item=%s evaluation_id=%s trigger=%s/%s scanned=%s promoted=%s",
+        contract.memory_item_id,
+        evaluation_id,
+        contract.trigger_type,
+        contract.trigger_id,
+        result.scanned,
+        result.promoted,
+    )
+
+
 async def handle_retention_sweep(session: AsyncSession, job: Job) -> None:
     """Boundedly remove expired, unbound classification receipts."""
     from engram.classification_evidence import cleanup_expired_unbound_runs
@@ -1899,6 +1994,7 @@ JOB_HANDLERS: dict[str, JobHandler] = {
     "conflict.check": handle_conflict_check,
     "classification.refine": handle_classification_refine,
     "promotion.path_a": handle_promotion_path_a,
+    "promotion.evaluate": handle_promotion_evaluate,
     "retention.sweep": handle_retention_sweep,
     "recall.telemetry": handle_recall_telemetry,
 }

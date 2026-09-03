@@ -223,6 +223,56 @@ skipped_evidence_inconsistent
 skipped_review_policy
 ```
 
+**Canonical `promotion.evaluate` job (issue #155, ENG-PROMOTION-003B2 — partial).**
+Alongside the legacy targeted `promotion.path_a` job, Engram now has one canonical,
+item-scoped, *current-state* promotion-evaluation job contract:
+`promotion.evaluate` (`engram.promotion.enqueue_promotion_evaluation`,
+`engram.promotion.evaluate_promotion_item_current_state`,
+`engram.worker.handle_promotion_evaluate`). Its payload (`promotion-evaluate-v1`)
+carries a stable `memory_item_id`, a closed `trigger_type`/`trigger_id` audit-
+provenance pair (`item_created`, `classification_bound`, `classification_reassessed`,
+`feedback`, `conflict_changed`, `review_changed`, `provenance_changed`,
+`kind_changed`, `policy_changed`, `provider_recovery`, `reconcile`, `manual`), and
+a `requested_policy_version` that is descriptive only. The v1 envelope is exact
+and closed: `parse_promotion_evaluate_payload()` rejects any field outside
+`{contract_version, memory_item_id, trigger_type, trigger_id,
+requested_policy_version, ingest_id, correlation_id, dedupe_key}` (no
+`metadata`/`extra` bag), and independently recomputes `dedupe_key` from the
+parsed `(memory_item_id, trigger_type, trigger_id)` identity — a stored key
+that does not match the canonical one fails closed exactly like an
+unsupported contract version, rather than being trusted from the payload or
+the queue's unique-index behavior alone. `enqueue_promotion_evaluation()`
+builds payloads through the same `build_promotion_evaluate_payload()` rules
+the worker enforces at parse time, so enqueue-time construction and
+execution-time validation cannot drift apart; callers cannot supply their
+own `dedupe_key`. Unlike `promotion.path_a`'s
+classification-run-targeted binding, the handler always evaluates whatever state
+is authoritative in the database *at execution time* — a trigger enqueued for a
+since-superseded observation is audit provenance only, never a filter and never
+forced back into the decision. Both job types run through the identical shared
+evaluator and mutation machinery (no second policy implementation), so a
+canonical-vs-legacy race for the same item yields at most one lifecycle
+transition and one audit event; the loser is an idempotent no-op. State-changing
+audit events additionally carry `evaluation_id`, `job_id`, `job_contract_version`,
+`trigger_type`, `trigger_id`, and `requested_policy_version` when triggered
+through `promotion.evaluate` — the legacy `promotion.path_a` audit-event JSON
+shape is unchanged.
+
+This slice is intentionally partial. The canonical job is behind
+`ENGRAM_PROMOTION_EVALUATE_JOBS_ENABLED` (default `false`); only the existing
+classification-bound scheduling point (`classification.refine`'s delayed
+evidence-promotion job) can opt into it, and only when the flag is set — every
+other trigger in the vocabulary above (item creation, feedback, conflict/review/
+kind/policy changes, provider recovery, reconciliation, manual requests) has no
+producer wired yet. `engram doctor` and the per-item readiness endpoint recognize
+both job types. Startup recall's bounded rotating promotion pass (described
+above) is unchanged by this slice, still mutates directly rather than going
+through either job contract, and is not yet read-only. Durable, persisted
+promotion-assessment state remains future work (issue #159) — `evaluation_id`
+exists only within an audit event's `reason` JSON when a mutation or conflict
+block actually occurs, not as its own row. See the code comments in
+`engram/promotion.py` for the full contract and dedupe-key construction.
+
 Thresholds come from `tenant_config`:
 
 ```text

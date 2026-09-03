@@ -296,10 +296,10 @@ def main() -> None:
         "worker",
         help="Run the background job worker. Polls the jobs table and processes "
         "embedding.generate / conflict.check / classification.refine / "
-        "promotion.path_a / retention.sweep jobs off the request path. The "
-        "service still works without a worker; semantic recall, LLM "
-        "classification refinement, and semantic conflict detection lag until "
-        "jobs are processed.",
+        "promotion.path_a / promotion.evaluate / retention.sweep jobs off the "
+        "request path. The service still works without a worker; semantic "
+        "recall, LLM classification refinement, and semantic conflict "
+        "detection lag until jobs are processed.",
     )
     worker_parser.add_argument(
         "--once",

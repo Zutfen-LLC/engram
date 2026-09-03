@@ -501,7 +501,13 @@ def assess_promotion_candidate(
 
 
 def _audit(
-    item: MemoryItem, candidate: PromotionCandidate, source: str, now: datetime, min_age_hours: int
+    item: MemoryItem,
+    candidate: PromotionCandidate,
+    source: str,
+    now: datetime,
+    min_age_hours: int,
+    *,
+    evaluation_context: dict[str, object] | None = None,
 ) -> str:
     basis = candidate.selected_basis
     assert basis is not None
@@ -551,6 +557,12 @@ def _audit(
                 "retention_confidence": EVIDENCE_RETENTION_WEIGHT,
             },
         )
+    # Optional invocation/audit context (evaluation_id, job_id, contract
+    # version, trigger provenance): populated only by the canonical
+    # promotion.evaluate handler (issue #155). Legacy callers pass None, so
+    # their existing audit-event JSON shape is byte-for-byte unchanged.
+    if evaluation_context is not None:
+        reason.update(evaluation_context)
     return json.dumps(reason, sort_keys=True)
 
 
@@ -662,6 +674,7 @@ async def auto_promote_proposed_memories(
     classification_run_id: uuid.UUID | None = None,
     memory_context: ResolvedMemoryContext | None = None,
     rotation: bool = False,
+    evaluation_context: dict[str, object] | None = None,
 ) -> PromotionResult:
     """Evaluate live proposals for Path A promotion.
 
@@ -674,6 +687,14 @@ async def auto_promote_proposed_memories(
     full backlog. Only the enabled, non-preview, untargeted, bounded case
     rotates — targeted jobs, CLI/admin/worker sweeps, and dry-run previews
     keep their existing selection semantics.
+
+    ``evaluation_context``, when provided, is merged into state-changing
+    audit-event reasons only (successful promotions and conflict-recheck
+    blocks) — issue #155's canonical ``promotion.evaluate`` handler is the
+    only caller that passes it, carrying ``evaluation_id``, ``job_id``,
+    ``job_contract_version``, and trigger provenance. ``None`` (the default,
+    used by every legacy caller) leaves the existing audit-event JSON shape
+    byte-for-byte unchanged.
     """
     moment = now or datetime.now(UTC)
     if tenant_id is None:
@@ -855,6 +876,7 @@ async def auto_promote_proposed_memories(
                                     "legacy_confidence": candidate.legacy_confidence,
                                     "evidence_threshold": candidate.evidence_threshold,
                                     "legacy_threshold": candidate.legacy_threshold,
+                                    **(evaluation_context or {}),
                                 },
                                 sort_keys=True,
                             ),
@@ -902,7 +924,9 @@ async def auto_promote_proposed_memories(
                 old_value="proposed",
                 new_value="active",
                 actor_principal_id=actor,
-                reason=_audit(item, candidate, source, moment, min_age),
+                reason=_audit(
+                    item, candidate, source, moment, min_age, evaluation_context=evaluation_context
+                ),
             )
         )
         result.promoted += 1
@@ -997,22 +1021,43 @@ async def schedule_evidence_promotion_if_qualified(
     if item.retention_disposition != "retain":
         blocked("retention_disposition")
         return None
-    from engram.jobs import enqueue_job_in_transaction
-
     assert item.retention_evidence_at is not None
+    # The scheduling boundary (run_after) is identical regardless of which job
+    # contract is scheduled — issue #155 requires this slice not to change
+    # when an otherwise-equivalent delayed evaluation becomes due.
     run_after = max(item.created_at, item.retention_evidence_at) + timedelta(hours=min_age)
-    job_id = await enqueue_job_in_transaction(
-        session,
-        tenant_id=item.tenant_id,
-        job_type="promotion.path_a",
-        payload={
-            "memory_item_id": str(item.id),
-            "classification_run_id": str(run.id),
-            **({"ingest_id": str(run.ingest_id)} if run.ingest_id is not None else {}),
-        },
-        run_after=run_after,
-        dedupe_key=f"promotion.path_a:{item.id}:{run.id}",
-    )
+
+    if settings.promotion_evaluate_jobs_enabled:
+        # Rollout-flag path (ENG-PROMOTION-003B2): schedule the canonical,
+        # current-state promotion.evaluate job instead of a new legacy
+        # promotion.path_a job. Already-queued legacy jobs remain valid and
+        # executable (mixed-version coexistence) — this branch only changes
+        # what *new* schedule events from this producer create.
+        job_id = await enqueue_promotion_evaluation(
+            session,
+            tenant_id=item.tenant_id,
+            memory_item_id=item.id,
+            trigger_type=TRIGGER_CLASSIFICATION_BOUND,
+            trigger_id=str(run.id),
+            requested_policy_version=EVIDENCE_PROMOTION_POLICY_VERSION,
+            ingest_id=run.ingest_id,
+            run_after=run_after,
+        )
+    else:
+        from engram.jobs import enqueue_job_in_transaction
+
+        job_id = await enqueue_job_in_transaction(
+            session,
+            tenant_id=item.tenant_id,
+            job_type="promotion.path_a",
+            payload={
+                "memory_item_id": str(item.id),
+                "classification_run_id": str(run.id),
+                **({"ingest_id": str(run.ingest_id)} if run.ingest_id is not None else {}),
+            },
+            run_after=run_after,
+            dedupe_key=f"promotion.path_a:{item.id}:{run.id}",
+        )
     if diagnostics is not None:
         diagnostics["status"] = "scheduled"
     return job_id
@@ -1028,4 +1073,353 @@ async def maybe_auto_promote_for_startup_recall(
         limit=settings.startup_promotion_limit,
         source="startup_recall",
         rotation=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Canonical promotion.evaluate job contract (issue #155, ENG-PROMOTION-003B2)
+#
+# One versioned, item-scoped evaluation contract that always evaluates the
+# item's *current* authoritative state at execution time — never the
+# enqueue-time observation that triggered it. This is a fundamental
+# difference from the legacy promotion.path_a classification-run binding
+# (auto_promote_item / handle_promotion_path_a), which filters to a specific
+# classification_run_id and treats a mismatch as "nothing to do". The
+# canonical contract carries trigger_type/trigger_id as audit provenance
+# only — never as a filter, never as authorization, never as decision input.
+#
+# This slice wires exactly one producer (classification.refine's delayed
+# evidence-promotion schedule, behind ENGRAM_PROMOTION_EVALUATE_JOBS_ENABLED)
+# and proves the contract is safe alongside the legacy job path. Full trigger
+# coverage (item_created, feedback, conflict_changed, review_changed,
+# provenance_changed, kind_changed, policy_changed, provider_recovery,
+# reconcile, manual) remains #155 follow-up work — the vocabulary below is
+# declared now, closed and versioned, so later slices only need to start
+# calling enqueue_promotion_evaluation from new call sites, never redefine
+# the contract.
+# ---------------------------------------------------------------------------
+
+PROMOTION_EVALUATE_JOB_TYPE = "promotion.evaluate"
+PROMOTION_EVALUATE_CONTRACT_VERSION = "promotion-evaluate-v1"
+
+TRIGGER_ITEM_CREATED = "item_created"
+TRIGGER_CLASSIFICATION_BOUND = "classification_bound"
+TRIGGER_CLASSIFICATION_REASSESSED = "classification_reassessed"
+TRIGGER_FEEDBACK = "feedback"
+TRIGGER_CONFLICT_CHANGED = "conflict_changed"
+TRIGGER_REVIEW_CHANGED = "review_changed"
+TRIGGER_PROVENANCE_CHANGED = "provenance_changed"
+TRIGGER_KIND_CHANGED = "kind_changed"
+TRIGGER_POLICY_CHANGED = "policy_changed"
+TRIGGER_PROVIDER_RECOVERY = "provider_recovery"
+TRIGGER_RECONCILE = "reconcile"
+TRIGGER_MANUAL = "manual"
+
+# The closed, versioned trigger vocabulary. Sized for the full #155
+# destination (every lifecycle event that should eventually be able to
+# schedule an evaluation), even though only TRIGGER_CLASSIFICATION_BOUND has
+# a wired producer in this slice. An unrecognized trigger_type fails closed
+# (see parse_promotion_evaluate_payload / enqueue_promotion_evaluation)
+# rather than being silently accepted as a no-op label.
+PROMOTION_EVALUATE_TRIGGER_TYPES: frozenset[str] = frozenset(
+    {
+        TRIGGER_ITEM_CREATED,
+        TRIGGER_CLASSIFICATION_BOUND,
+        TRIGGER_CLASSIFICATION_REASSESSED,
+        TRIGGER_FEEDBACK,
+        TRIGGER_CONFLICT_CHANGED,
+        TRIGGER_REVIEW_CHANGED,
+        TRIGGER_PROVENANCE_CHANGED,
+        TRIGGER_KIND_CHANGED,
+        TRIGGER_POLICY_CHANGED,
+        TRIGGER_PROVIDER_RECOVERY,
+        TRIGGER_RECONCILE,
+        TRIGGER_MANUAL,
+    }
+)
+
+# The exact, closed field set of a ``promotion-evaluate-v1`` payload. Every
+# field is identifier/provenance-only: no mutable decision state (e.g.
+# ``retention_confidence``, ``review_status``), no memory content, and no
+# credentials ever belong in this contract. A generic ``metadata``/``extra``
+# bag is deliberately not offered — an unrecognized field always fails
+# closed (see ``parse_promotion_evaluate_payload``) rather than being
+# silently tolerated or namespaced away.
+PROMOTION_EVALUATE_ALLOWED_FIELDS: frozenset[str] = frozenset(
+    {
+        "contract_version",
+        "memory_item_id",
+        "trigger_type",
+        "trigger_id",
+        "requested_policy_version",
+        "ingest_id",
+        "correlation_id",
+        "dedupe_key",
+    }
+)
+
+
+class PromotionEvaluateContractError(ValueError):
+    """A ``promotion.evaluate`` payload is malformed, or carries an unknown/
+    unsupported contract version or trigger type.
+
+    Deliberately a ``ValueError`` subclass so it participates in the worker's
+    ordinary retry/dead-letter machinery (issue #155 §10: malformed
+    contracts fail/retry like any other unrecoverable job error) rather than
+    being swallowed as a silent no-op.
+    """
+
+
+@dataclass(frozen=True)
+class PromotionEvaluatePayload:
+    """A parsed, validated ``promotion-evaluate-v1`` job payload.
+
+    ``memory_item_id`` is the stable evaluation target. ``trigger_type`` /
+    ``trigger_id`` are audit provenance only. ``requested_policy_version`` is
+    what the producer expected/requested at enqueue time — descriptive, never
+    mutation authority (the evaluator always applies whatever policy is
+    currently configured). ``ingest_id`` is consumed only to reconstruct
+    execution authority identically to the legacy worker paths.
+    """
+
+    contract_version: str
+    memory_item_id: uuid.UUID
+    trigger_type: str
+    trigger_id: str
+    requested_policy_version: str
+    ingest_id: uuid.UUID | None
+    correlation_id: uuid.UUID | None
+    dedupe_key: str
+
+
+def promotion_evaluate_dedupe_key(
+    memory_item_id: uuid.UUID | str, trigger_type: str, trigger_id: str
+) -> str:
+    """The canonical dedupe key for one (item, trigger identity) evaluation.
+
+    Computed centrally — never accepted verbatim from a caller — so at most
+    one pending/running job can ever exist for the same
+    ``(tenant_id, memory_item_id, trigger_type, trigger_id)`` identity, while
+    a different ``trigger_id`` (even for the same item and trigger_type)
+    remains an independently representable, distinct evaluation.
+    """
+    return f"{PROMOTION_EVALUATE_JOB_TYPE}:{memory_item_id}:{trigger_type}:{trigger_id}"
+
+
+def _require_uuid(value: object, *, field: str) -> uuid.UUID:
+    if isinstance(value, uuid.UUID):
+        return value
+    if isinstance(value, str):
+        try:
+            return uuid.UUID(value)
+        except ValueError as exc:
+            raise PromotionEvaluateContractError(f"invalid {field}: {value!r}") from exc
+    raise PromotionEvaluateContractError(f"invalid {field}: {value!r}")
+
+
+def _optional_uuid(value: object, *, field: str) -> uuid.UUID | None:
+    if value is None:
+        return None
+    return _require_uuid(value, field=field)
+
+
+def _require_nonempty_str(value: object, *, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise PromotionEvaluateContractError(f"promotion.evaluate payload missing {field}")
+    return value
+
+
+def build_promotion_evaluate_payload(
+    *,
+    memory_item_id: uuid.UUID | str,
+    trigger_type: str,
+    trigger_id: str,
+    requested_policy_version: str = EVIDENCE_PROMOTION_POLICY_VERSION,
+    ingest_id: uuid.UUID | str | None = None,
+    correlation_id: uuid.UUID | str | None = None,
+) -> dict[str, object]:
+    """Construct one canonical, exact-field ``promotion-evaluate-v1`` payload.
+
+    This is the single producer-side half of the contract: it runs the same
+    runtime validation :func:`parse_promotion_evaluate_payload` re-verifies on
+    the worker side (never trusting Python type annotations alone) —
+    ``memory_item_id`` is a real UUID, ``trigger_type`` is in the closed
+    vocabulary, ``trigger_id`` / ``requested_policy_version`` are non-empty
+    strings, and optional ``ingest_id`` / ``correlation_id`` are valid UUIDs
+    when supplied — and it always computes the dedupe key itself from the
+    validated identity fields. Callers can never supply their own
+    ``dedupe_key``, so enqueue-time construction and worker parse-time
+    validation cannot drift apart. The returned dict contains exactly
+    :data:`PROMOTION_EVALUATE_ALLOWED_FIELDS`, nothing more.
+    """
+    item_id = _require_uuid(memory_item_id, field="memory_item_id")
+    if trigger_type not in PROMOTION_EVALUATE_TRIGGER_TYPES:
+        raise PromotionEvaluateContractError(
+            f"unknown promotion.evaluate trigger_type: {trigger_type!r}"
+        )
+    validated_trigger_id = _require_nonempty_str(trigger_id, field="trigger_id")
+    validated_policy_version = _require_nonempty_str(
+        requested_policy_version, field="requested_policy_version"
+    )
+    resolved_ingest_id = _optional_uuid(ingest_id, field="ingest_id")
+    resolved_correlation_id = _optional_uuid(correlation_id, field="correlation_id")
+    return {
+        "contract_version": PROMOTION_EVALUATE_CONTRACT_VERSION,
+        "memory_item_id": str(item_id),
+        "trigger_type": trigger_type,
+        "trigger_id": validated_trigger_id,
+        "requested_policy_version": validated_policy_version,
+        "ingest_id": str(resolved_ingest_id) if resolved_ingest_id is not None else None,
+        "correlation_id": (
+            str(resolved_correlation_id) if resolved_correlation_id is not None else None
+        ),
+        "dedupe_key": promotion_evaluate_dedupe_key(item_id, trigger_type, validated_trigger_id),
+    }
+
+
+def parse_promotion_evaluate_payload(payload: dict[str, object]) -> PromotionEvaluatePayload:
+    """Parse and validate a ``promotion.evaluate`` job payload (v1 contract).
+
+    Fails closed on every axis that would let a malformed or dishonest
+    payload masquerade as a canonical evaluation job:
+
+    * any field outside :data:`PROMOTION_EVALUATE_ALLOWED_FIELDS` (unknown
+      mutable decision state, memory content, credentials, or anything else)
+      is rejected outright — the v1 envelope is exact/closed, not a bag with
+      tolerated extras;
+    * an unknown/missing ``contract_version`` or an unrecognized
+      ``trigger_type`` raises :class:`PromotionEvaluateContractError` rather
+      than guessing at a compatible interpretation;
+    * structurally malformed fields (missing/wrong-typed ``memory_item_id``,
+      ``trigger_id``, etc.) raise the same error;
+    * the stored ``dedupe_key`` must equal the canonical key recomputed from
+      the parsed ``(memory_item_id, trigger_type, trigger_id)`` identity — a
+      wrong-but-nonempty ``dedupe_key`` is rejected exactly like an
+      unsupported contract version, so the payload's claimed identity is
+      independently verified rather than trusted from a generic queue
+      producer or the database's unique-index behavior alone.
+    """
+    if not isinstance(payload, dict):
+        raise PromotionEvaluateContractError("promotion.evaluate payload must be an object")
+    unknown_fields = set(payload) - PROMOTION_EVALUATE_ALLOWED_FIELDS
+    if unknown_fields:
+        raise PromotionEvaluateContractError(
+            "promotion.evaluate payload carries unsupported field(s): "
+            f"{sorted(unknown_fields)!r}"
+        )
+    contract_version = payload.get("contract_version")
+    if contract_version != PROMOTION_EVALUATE_CONTRACT_VERSION:
+        raise PromotionEvaluateContractError(
+            f"unsupported promotion.evaluate contract_version: {contract_version!r}"
+        )
+    memory_item_id = _require_uuid(payload.get("memory_item_id"), field="memory_item_id")
+    trigger_type = payload.get("trigger_type")
+    if trigger_type not in PROMOTION_EVALUATE_TRIGGER_TYPES:
+        raise PromotionEvaluateContractError(
+            f"unknown promotion.evaluate trigger_type: {trigger_type!r}"
+        )
+    assert isinstance(trigger_type, str)
+    trigger_id = _require_nonempty_str(payload.get("trigger_id"), field="trigger_id")
+    requested_policy_version = _require_nonempty_str(
+        payload.get("requested_policy_version"), field="requested_policy_version"
+    )
+    dedupe_key = _require_nonempty_str(payload.get("dedupe_key"), field="dedupe_key")
+    expected_dedupe_key = promotion_evaluate_dedupe_key(memory_item_id, trigger_type, trigger_id)
+    if dedupe_key != expected_dedupe_key:
+        raise PromotionEvaluateContractError(
+            f"promotion.evaluate dedupe_key {dedupe_key!r} does not match the canonical "
+            f"identity key {expected_dedupe_key!r}"
+        )
+    return PromotionEvaluatePayload(
+        contract_version=contract_version,
+        memory_item_id=memory_item_id,
+        trigger_type=trigger_type,
+        trigger_id=trigger_id,
+        requested_policy_version=requested_policy_version,
+        ingest_id=_optional_uuid(payload.get("ingest_id"), field="ingest_id"),
+        correlation_id=_optional_uuid(payload.get("correlation_id"), field="correlation_id"),
+        dedupe_key=dedupe_key,
+    )
+
+
+async def enqueue_promotion_evaluation(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID | str,
+    memory_item_id: uuid.UUID,
+    trigger_type: str,
+    trigger_id: str,
+    requested_policy_version: str = EVIDENCE_PROMOTION_POLICY_VERSION,
+    ingest_id: uuid.UUID | None = None,
+    correlation_id: uuid.UUID | None = None,
+    run_after: datetime | None = None,
+) -> uuid.UUID:
+    """Canonically enqueue one ``promotion.evaluate`` job (issue #155).
+
+    Delegates all field validation and dedupe-key construction to
+    :func:`build_promotion_evaluate_payload` — the exact same rules the
+    worker re-verifies at parse time — so enqueue-time construction and
+    execution-time validation cannot independently drift. Callers cannot
+    supply their own ``dedupe_key``. Uses
+    :func:`engram.jobs.enqueue_job_in_transaction`, so this preserves the
+    caller's outer transaction (e.g. a classification-binding transaction)
+    rather than committing it prematurely; the caller commits. Idempotent:
+    enqueuing the same ``(item, trigger_type, trigger_id)`` identity again
+    while a pending/running job exists returns that job's id instead of
+    creating a duplicate. A different ``trigger_id`` always produces a
+    distinct job, even for the same item.
+    """
+    from engram.jobs import enqueue_job_in_transaction
+
+    payload = build_promotion_evaluate_payload(
+        memory_item_id=memory_item_id,
+        trigger_type=trigger_type,
+        trigger_id=trigger_id,
+        requested_policy_version=requested_policy_version,
+        ingest_id=ingest_id,
+        correlation_id=correlation_id,
+    )
+    return await enqueue_job_in_transaction(
+        session,
+        tenant_id=tenant_id,
+        job_type=PROMOTION_EVALUATE_JOB_TYPE,
+        payload=payload,
+        run_after=run_after,
+        dedupe_key=str(payload["dedupe_key"]),
+    )
+
+
+async def evaluate_promotion_item_current_state(
+    session: AsyncSession,
+    tenant_id: str,
+    item_id: uuid.UUID,
+    *,
+    evaluation_context: dict[str, object],
+    now: datetime | None = None,
+    memory_context: ResolvedMemoryContext | None = None,
+) -> PromotionResult:
+    """Evaluate one item's *current* authoritative state (canonical handler).
+
+    Reuses the exact shared evaluator and mutation machinery every other
+    promotion path uses (:func:`auto_promote_proposed_memories`), targeted at
+    a single item and with no ``classification_run_id`` filter — so whatever
+    classification run is *currently* bound to the item (if any) governs the
+    evidence lane, never whichever run the enqueue-time trigger named. A
+    trigger enqueued for a since-superseded observation is not an error and
+    is not forced back into the decision: the item's current row is
+    authoritative.
+
+    No promotion policy differs from :func:`auto_promote_item` (legacy
+    ``promotion.path_a``) — same thresholds, same evidence weights, same
+    conflict recheck, same review-policy gate. Only the selection semantics
+    (current state vs. a specific bound run) differ.
+    """
+    return await auto_promote_proposed_memories(
+        session,
+        tenant_id,
+        now=now,
+        source=PROMOTION_EVALUATE_JOB_TYPE,
+        item_id=item_id,
+        memory_context=memory_context,
+        evaluation_context=evaluation_context,
     )

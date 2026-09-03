@@ -215,6 +215,13 @@ class Settings(BaseSettings):
     # Top-k plausible active-item candidates considered by the promotion-time
     # conflict recheck (engram.conflicts.find_promotion_conflict_candidates).
     promotion_conflict_candidate_k: int = 5
+    # Rollout flag for the canonical promotion.evaluate job contract (issue
+    # #155, ENG-PROMOTION-003B2). Default false preserves the existing
+    # promotion.path_a scheduling behavior at the one producer wired in this
+    # slice (classification.refine's delayed evidence-promotion schedule).
+    # Legacy promotion.path_a jobs remain supported and executable regardless
+    # of this flag's value.
+    promotion_evaluate_jobs_enabled: bool = False
 
     @model_validator(mode="after")
     def _clamp_startup_recall_candidate_limit(self) -> Settings:

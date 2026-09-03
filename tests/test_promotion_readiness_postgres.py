@@ -549,6 +549,95 @@ async def test_promotion_job_states_scheduled_overdue_dead():
     }
 
 
+async def test_promotion_job_states_recognize_canonical_evaluate_job():
+    """Issue #155 (ENG-PROMOTION-003B2): diagnostics must recognize the new
+    canonical ``promotion.evaluate`` job type exactly like the legacy
+    ``promotion.path_a`` type — alone, alongside the legacy type, and across
+    every job state (scheduled/overdue/dead) — without changing the response
+    schema or disclosing payload contents."""
+    if not await _db_ok():
+        _require_db()
+    tenant_id, principal_id = await _default_tenant_principal()
+    base = dict(tenant_id=tenant_id, principal_id=principal_id, memory_confidence=0.9)
+
+    only_evaluate_item = await _insert_item(content="only promotion.evaluate", **base)
+    only_path_a_item = await _insert_item(content="only promotion.path_a", **base)
+    both_types_item = await _insert_item(content="both job types", **base)
+    dead_evaluate_item = await _insert_item(content="dead canonical job", **base)
+    overdue_evaluate_item = await _insert_item(content="overdue canonical job", **base)
+
+    await _insert_job(
+        tenant_id=tenant_id,
+        item_id=only_evaluate_item,
+        job_type="promotion.evaluate",
+        run_after=FIXED_NOW + timedelta(hours=10),
+    )
+    await _insert_job(
+        tenant_id=tenant_id,
+        item_id=only_path_a_item,
+        job_type="promotion.path_a",
+        run_after=FIXED_NOW + timedelta(hours=10),
+    )
+    await _insert_job(
+        tenant_id=tenant_id,
+        item_id=both_types_item,
+        job_type="promotion.path_a",
+        run_after=FIXED_NOW + timedelta(hours=10),
+    )
+    await _insert_job(
+        tenant_id=tenant_id,
+        item_id=both_types_item,
+        job_type="promotion.evaluate",
+        run_after=FIXED_NOW + timedelta(hours=5),
+        dedupe_suffix="-evaluate",
+    )
+    await _insert_job(
+        tenant_id=tenant_id,
+        item_id=dead_evaluate_item,
+        job_type="promotion.evaluate",
+        status="dead",
+        run_after=FIXED_NOW - timedelta(hours=10),
+    )
+    await _insert_job(
+        tenant_id=tenant_id,
+        item_id=overdue_evaluate_item,
+        job_type="promotion.evaluate",
+        run_after=FIXED_NOW - timedelta(hours=10),
+    )
+
+    async with _make_client(tenant_id, principal_id) as client:
+        only_evaluate = await _fetch_readiness(client, only_evaluate_item)
+        only_path_a = await _fetch_readiness(client, only_path_a_item)
+        both_types = await _fetch_readiness(client, both_types_item)
+        dead_evaluate = await _fetch_readiness(client, dead_evaluate_item)
+        overdue_evaluate = await _fetch_readiness(client, overdue_evaluate_item)
+
+    assert only_evaluate["promotion_job_state"] == "scheduled"
+    assert {job["job_type"] for job in only_evaluate["jobs"]} == {"promotion.evaluate"}
+    assert only_path_a["promotion_job_state"] == "scheduled"
+    assert {job["job_type"] for job in only_path_a["jobs"]} == {"promotion.path_a"}
+    assert both_types["promotion_job_state"] == "scheduled"
+    assert {job["job_type"] for job in both_types["jobs"]} == {
+        "promotion.path_a",
+        "promotion.evaluate",
+    }
+    assert dead_evaluate["promotion_job_state"] == "dead"
+    assert overdue_evaluate["promotion_job_state"] == "overdue"
+    # Schema is unchanged: the same fields as the legacy-only response, and
+    # payload contents (trigger_type, contract_version, etc.) never appear.
+    assert set(only_evaluate.keys()) == set(only_path_a.keys())
+    for job in only_evaluate["jobs"]:
+        assert set(job.keys()) == {
+            "job_id",
+            "job_type",
+            "status",
+            "state",
+            "run_after",
+            "attempts",
+            "max_attempts",
+        }
+
+
 async def test_last_evaluation_explicit_unknown_and_classification_trigger():
     if not await _db_ok():
         _require_db()

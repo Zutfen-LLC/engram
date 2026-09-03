@@ -561,10 +561,11 @@ The standard Docker Compose stack (`docker compose up -d`) starts a dedicated
 `engram-worker` container alongside Postgres and the API. The worker drains the
 `jobs` table and runs the off-request-path work: `embedding.generate`,
 `conflict.check`, `classification.refine`, `promotion.path_a`,
-`retention.sweep`, and (ENG-AUD-011) `recall.telemetry`. It is Postgres-only
-(no Redis/Celery/SQS): workers claim with `FOR UPDATE SKIP LOCKED`, retry
-failures with exponential backoff, and dead-letter after
-`ENGRAM_JOB_MAX_ATTEMPTS`.
+`promotion.evaluate` (issue #155's canonical, item-scoped, current-state
+promotion-evaluation job — see README.md), `retention.sweep`, and
+(ENG-AUD-011) `recall.telemetry`. It is Postgres-only (no Redis/Celery/SQS):
+workers claim with `FOR UPDATE SKIP LOCKED`, retry failures with exponential
+backoff, and dead-letter after `ENGRAM_JOB_MAX_ATTEMPTS`.
 
 Worker logs are visible with:
 
