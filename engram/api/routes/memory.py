@@ -2456,8 +2456,12 @@ async def supersede_item(
     # proposal restarts its cooling window and gets the same baseline
     # boundary evaluation the remember path schedules. The replacement
     # event's id is the stable creation-event identity here (no ingest
-    # exists for a direct supersede). Inert unless the rollout flag is on.
+    # exists for a direct supersede). Like /v1/remember's item-created
+    # producer, this schedules at the legacy cooling boundary, so the audit
+    # provenance reports the legacy requested policy version. Inert unless
+    # the rollout flag is on.
     from engram.promotion import TRIGGER_ITEM_CREATED, maybe_enqueue_promotion_evaluation
+    from engram.promotion_policy import LEGACY_PROMOTION_POLICY_VERSION
 
     await maybe_enqueue_promotion_evaluation(
         session,
@@ -2465,6 +2469,7 @@ async def supersede_item(
         item=new_item,
         trigger_type=TRIGGER_ITEM_CREATED,
         trigger_id=str(replacement_event["id"]),
+        requested_policy_version=LEGACY_PROMOTION_POLICY_VERSION,
     )
     await session.commit()
     return {

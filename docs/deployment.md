@@ -571,9 +571,13 @@ backoff, and dead-letter after `ENGRAM_JOB_MAX_ATTEMPTS`.
 `ENGRAM_PROMOTION_EVALUATE_JOBS_ENABLED` (default `false`): classification-bound
 scheduling, `/v1/remember`'s item-created evaluation at the exact cooling
 boundary, feedback verdict transitions, conflict resolution, human verification,
-and the manual admin trigger (`POST /v1/admin/items/{item_id}/evaluate`). With
-the flag off, none of these enqueue and only the legacy paths run — flipping
-the flag back off is the rollback.
+and the manual admin trigger (`POST /v1/admin/items/{item_id}/evaluate`). The
+manual trigger honors the caller's memory-profile boundary at request time and,
+for a profile-bound key, pins that boundary in a durable
+`job_execution_contexts` row referenced by the `promotion-evaluate-v2` payload,
+so the worker applies the same boundary asynchronously (fail-closed, no broader
+fallback). With the flag off, none of these enqueue and only the legacy paths
+run — flipping the flag back off is the rollback.
 
 Worker logs are visible with:
 

@@ -17,7 +17,9 @@ import pytest
 
 from engram.promotion import (
     PROMOTION_EVALUATE_ALLOWED_FIELDS,
+    PROMOTION_EVALUATE_ALLOWED_FIELDS_V2,
     PROMOTION_EVALUATE_CONTRACT_VERSION,
+    PROMOTION_EVALUATE_CONTRACT_VERSION_V2,
     PROMOTION_EVALUATE_JOB_TYPE,
     PROMOTION_EVALUATE_TRIGGER_TYPES,
     TRIGGER_CLASSIFICATION_BOUND,
@@ -117,7 +119,9 @@ def test_valid_payload_with_ingest_and_correlation_ids() -> None:
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"contract_version": "promotion-evaluate-v2"},
+        # v2 is a real contract version now (see the v2 section below) — an
+        # unknown version must stay beyond the latest known one.
+        {"contract_version": "promotion-evaluate-v3"},
         {"contract_version": None},
         {"contract_version": "promotion.evaluate.v1"},
     ],
@@ -361,3 +365,155 @@ def test_build_canonical_payload_does_not_accept_a_caller_dedupe_key() -> None:
 
     params = inspect.signature(build_promotion_evaluate_payload).parameters
     assert "dedupe_key" not in params
+
+
+# ===========================================================================
+# v2: non-ingest execution-authority reference (manual trigger correction)
+# ===========================================================================
+
+
+def _valid_v2_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "contract_version": PROMOTION_EVALUATE_CONTRACT_VERSION_V2,
+        "memory_item_id": str(_ITEM_ID),
+        "trigger_type": TRIGGER_MANUAL,
+        "trigger_id": _RUN_ID,
+        "requested_policy_version": "promotion-evidence-v1",
+        "ingest_id": None,
+        "correlation_id": None,
+        "execution_context_id": "33333333-3333-3333-3333-333333333333",
+        "dedupe_key": promotion_evaluate_dedupe_key(_ITEM_ID, TRIGGER_MANUAL, _RUN_ID),
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_v2_allowed_field_set_is_v1_plus_exactly_one_reference() -> None:
+    """v2 extends the closed v1 set by exactly the execution-authority
+    reference — no metadata bag, no other escape hatch."""
+    v2_extra = PROMOTION_EVALUATE_ALLOWED_FIELDS_V2 - PROMOTION_EVALUATE_ALLOWED_FIELDS
+    assert v2_extra == {"execution_context_id"}
+    assert "metadata" not in PROMOTION_EVALUATE_ALLOWED_FIELDS_V2
+    assert "extra" not in PROMOTION_EVALUATE_ALLOWED_FIELDS_V2
+
+
+def test_valid_v2_payload_parses() -> None:
+    contract = parse_promotion_evaluate_payload(_valid_v2_payload())
+    assert contract.contract_version == PROMOTION_EVALUATE_CONTRACT_VERSION_V2
+    assert contract.memory_item_id == _ITEM_ID
+    assert contract.trigger_type == TRIGGER_MANUAL
+    assert contract.ingest_id is None
+    assert contract.execution_context_id == uuid.UUID(
+        "33333333-3333-3333-3333-333333333333"
+    )
+
+
+def test_v2_payload_without_execution_context_id_parses() -> None:
+    """The v2 field is optional within v2 — but the builder never emits that
+    shape (see test_build_emits_v2_only_with_execution_context_id)."""
+    contract = parse_promotion_evaluate_payload(
+        _valid_v2_payload(execution_context_id=None)
+    )
+    assert contract.execution_context_id is None
+
+
+def test_v1_payload_carrying_execution_context_id_fails_closed() -> None:
+    """v1's field set stays exactly v1: the new reference cannot be smuggled
+    onto a v1 envelope."""
+    with pytest.raises(PromotionEvaluateContractError, match="unsupported field"):
+        parse_promotion_evaluate_payload(
+            _valid_payload(execution_context_id="33333333-3333-3333-3333-333333333333")
+        )
+
+
+def test_v2_rejects_ingest_and_execution_context_together() -> None:
+    """A job has exactly one execution-authority source; ambiguity fails
+    closed rather than being resolved by preference order."""
+    ingest_id = uuid.uuid4()
+    with pytest.raises(PromotionEvaluateContractError, match="exactly one"):
+        parse_promotion_evaluate_payload(
+            _valid_v2_payload(ingest_id=str(ingest_id))
+        )
+    with pytest.raises(PromotionEvaluateContractError, match="exactly one"):
+        build_promotion_evaluate_payload(
+            memory_item_id=_ITEM_ID,
+            trigger_type=TRIGGER_MANUAL,
+            trigger_id=_RUN_ID,
+            ingest_id=ingest_id,
+            execution_context_id=uuid.uuid4(),
+        )
+
+
+def test_v2_malformed_execution_context_id_fails_closed() -> None:
+    with pytest.raises(PromotionEvaluateContractError, match="execution_context_id"):
+        parse_promotion_evaluate_payload(
+            _valid_v2_payload(execution_context_id="not-a-uuid")
+        )
+    with pytest.raises(PromotionEvaluateContractError):
+        parse_promotion_evaluate_payload(_valid_v2_payload(execution_context_id=12345))
+
+
+def test_v2_unknown_fields_still_fail_closed() -> None:
+    """The v2 envelope stays exact/closed — unknown mutable decision state,
+    memory content, and credentials are all rejected on v2 exactly as on v1."""
+    for overrides in (
+        {"retention_confidence": 0.99},
+        {"review_status": "active"},
+        {"content": "memory content must not belong in this contract"},
+        {"provider_api_key": "secret"},
+        {"memory_profile_id": "44444444-4444-4444-4444-444444444444"},
+        {"scopes": ["admin"]},
+    ):
+        with pytest.raises(PromotionEvaluateContractError, match="unsupported field"):
+            parse_promotion_evaluate_payload(_valid_v2_payload(**overrides))
+
+
+def test_v2_wrong_dedupe_key_still_fails_closed() -> None:
+    """The dedupe identity check is version-independent: a v2 payload with a
+    mismatched key is rejected exactly like v1."""
+    with pytest.raises(PromotionEvaluateContractError, match="dedupe_key"):
+        parse_promotion_evaluate_payload(
+            _valid_v2_payload(dedupe_key=promotion_evaluate_dedupe_key(
+                _ITEM_ID, TRIGGER_MANUAL, "DIFFERENT-TRIGGER"
+            ))
+        )
+
+
+def test_v1_jobs_remain_parseable_alongside_v2() -> None:
+    """Mixed-version rollout: a canonical v1 payload (as queued by every
+    pre-v2 producer, byte-for-byte) still parses with v1 semantics and no
+    execution authority reference."""
+    v1 = _valid_payload(ingest_id=str(uuid.uuid4()))
+    contract = parse_promotion_evaluate_payload(v1)
+    assert contract.contract_version == PROMOTION_EVALUATE_CONTRACT_VERSION
+    assert contract.execution_context_id is None
+
+
+def test_build_emits_v2_only_with_execution_context_id() -> None:
+    """Without an authority reference the builder emits v1 exactly (every
+    existing producer's payload is unchanged); with one it emits v2 with the
+    exact v2 field set."""
+    v1_shape = build_promotion_evaluate_payload(
+        memory_item_id=_ITEM_ID,
+        trigger_type=TRIGGER_MANUAL,
+        trigger_id=_RUN_ID,
+    )
+    assert set(v1_shape) == PROMOTION_EVALUATE_ALLOWED_FIELDS
+    assert v1_shape["contract_version"] == PROMOTION_EVALUATE_CONTRACT_VERSION
+
+    execution_context_id = uuid.uuid4()
+    v2_shape = build_promotion_evaluate_payload(
+        memory_item_id=_ITEM_ID,
+        trigger_type=TRIGGER_MANUAL,
+        trigger_id=_RUN_ID,
+        execution_context_id=execution_context_id,
+    )
+    assert set(v2_shape) == PROMOTION_EVALUATE_ALLOWED_FIELDS_V2
+    assert v2_shape["contract_version"] == PROMOTION_EVALUATE_CONTRACT_VERSION_V2
+    assert v2_shape["execution_context_id"] == str(execution_context_id)
+    assert v2_shape["dedupe_key"] == promotion_evaluate_dedupe_key(
+        _ITEM_ID, TRIGGER_MANUAL, _RUN_ID
+    )
+    # And it round-trips through the worker-side parser.
+    contract = parse_promotion_evaluate_payload(v2_shape)
+    assert contract.execution_context_id == execution_context_id

@@ -228,16 +228,19 @@ Alongside the legacy targeted `promotion.path_a` job, Engram now has one canonic
 item-scoped, *current-state* promotion-evaluation job contract:
 `promotion.evaluate` (`engram.promotion.enqueue_promotion_evaluation`,
 `engram.promotion.evaluate_promotion_item_current_state`,
-`engram.worker.handle_promotion_evaluate`). Its payload (`promotion-evaluate-v1`)
+`engram.worker.handle_promotion_evaluate`). Its payload (`promotion-evaluate-v1`;
+`promotion-evaluate-v2` adds exactly one optional field — see below)
 carries a stable `memory_item_id`, a closed `trigger_type`/`trigger_id` audit-
 provenance pair (`item_created`, `classification_bound`, `classification_reassessed`,
 `feedback`, `conflict_changed`, `review_changed`, `provenance_changed`,
 `kind_changed`, `policy_changed`, `provider_recovery`, `reconcile`, `manual`), and
-a `requested_policy_version` that is descriptive only. The v1 envelope is exact
-and closed: `parse_promotion_evaluate_payload()` rejects any field outside
-`{contract_version, memory_item_id, trigger_type, trigger_id,
-requested_policy_version, ingest_id, correlation_id, dedupe_key}` (no
-`metadata`/`extra` bag), and independently recomputes `dedupe_key` from the
+a `requested_policy_version` that is descriptive only. Each version's envelope is
+exact and closed: `parse_promotion_evaluate_payload()` rejects any field outside
+its version's set — v1 is exactly `{contract_version, memory_item_id, trigger_type,
+trigger_id, requested_policy_version, ingest_id, correlation_id, dedupe_key}`;
+v2 adds only `execution_context_id`, the durable execution-authority reference
+for non-ingest producers (mutually exclusive with `ingest_id`; no
+`metadata`/`extra` bag) — and independently recomputes `dedupe_key` from the
 parsed `(memory_item_id, trigger_type, trigger_id)` identity — a stored key
 that does not match the canonical one fails closed exactly like an
 unsupported contract version, rather than being trusted from the payload or
@@ -295,6 +298,15 @@ on the flag, on the item still being a live proposal, and on the tenant's
 - `manual` — `POST /v1/admin/items/{item_id}/evaluate` enqueues one immediate
   evaluation under admin authority; the item must be a live proposal (409
   otherwise). Repeats enqueue independently; the evaluator stays idempotent.
+  The admin scope is not a bypass of a bound memory profile: the target is
+  resolved through the caller's existing-item write eligibility (out-of-boundary
+  is the mutation API's non-disclosing 404), and a profile-bound caller's job
+  carries a durable `job_execution_contexts` reference (`promotion-evaluate-v2`)
+  so the worker reconstructs and applies the same pinned profile boundary at
+  execution time — a missing/corrupt/unreconstructable authority reference
+  fails closed through the ordinary retry/dead-letter path, never falling back
+  to broader tenant-level authority. Unprofiled callers keep the v1 payload and
+  the established compatibility behavior.
 
 Still unwired in this slice: `classification_reassessed` (awaiting #157's
 versioned reassessment), `kind_changed`/`provenance_changed` (no

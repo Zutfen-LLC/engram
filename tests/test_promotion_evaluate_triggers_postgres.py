@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -33,6 +35,7 @@ from engram.db import _DEFAULT_PRINCIPAL_NAME, _DEFAULT_TENANT_SLUG, apply_rls_c
 from engram.jobs import STATUS_PENDING
 from engram.promotion import (
     PROMOTION_EVALUATE_CONTRACT_VERSION,
+    PROMOTION_EVALUATE_CONTRACT_VERSION_V2,
     TRIGGER_CONFLICT_CHANGED,
     TRIGGER_FEEDBACK,
     TRIGGER_ITEM_CREATED,
@@ -41,6 +44,7 @@ from engram.promotion import (
     maybe_enqueue_promotion_evaluation,
     parse_promotion_evaluate_payload,
 )
+from engram.promotion_policy import LEGACY_PROMOTION_POLICY_VERSION
 from engram.worker import process_one_job
 
 pytestmark = pytest.mark.asyncio
@@ -516,6 +520,9 @@ async def test_remember_proposed_item_enqueues_evaluation_at_exact_cooling_bound
     payload = parse_promotion_evaluate_payload(jobs[0]["payload"])
     assert payload.trigger_type == TRIGGER_ITEM_CREATED
     assert payload.trigger_id == str(body["ingest_id"])
+    # The item_created lane schedules at the legacy cooling boundary, so its
+    # audit provenance reports the legacy requested policy version.
+    assert payload.requested_policy_version == LEGACY_PROMOTION_POLICY_VERSION
     # Exact-boundary scheduling for the time-dependent assessment: the job is
     # due precisely at the legacy cooling boundary, not "immediately" and not
     # at an arbitrary delay.
@@ -576,6 +583,11 @@ async def test_supersede_enqueues_item_created_for_replacement_proposal(
     payload = parse_promotion_evaluate_payload(jobs[0]["payload"])
     assert payload.trigger_type == TRIGGER_ITEM_CREATED
     assert payload.memory_item_id == uuid.UUID(replacement_id)
+    # The supersede producer intentionally uses the legacy cooling boundary,
+    # so its requested-policy provenance must be the legacy version — the
+    # same as /v1/remember's item_created producer — not the evidence-policy
+    # default.
+    assert payload.requested_policy_version == LEGACY_PROMOTION_POLICY_VERSION
     # The replacement's cooling window restarts at its own creation time.
     assert jobs[0]["run_after"] == row["created_at"] + timedelta(hours=72)
     assert jobs[0]["run_after"] >= before + timedelta(hours=71)
@@ -723,6 +735,11 @@ async def test_admin_evaluate_enqueues_manual_job(monkeypatch, client):
     assert str(jobs[0]["id"]) == body["job_id"]
     payload = parse_promotion_evaluate_payload(jobs[0]["payload"])
     assert payload.trigger_type == TRIGGER_MANUAL
+    # Unprofiled compatibility: no boundary to preserve, so the payload stays
+    # v1 with no execution-authority reference and no authority row exists.
+    assert payload.contract_version == PROMOTION_EVALUATE_CONTRACT_VERSION
+    assert payload.execution_context_id is None
+    assert await _execution_context_rows(tenant_id) == []
     assert await _process_one()
     assert (await _fetch_item(item_id))["review_status"] == "active"
 
@@ -762,6 +779,350 @@ async def test_admin_evaluate_noop_when_flag_disabled(monkeypatch, client):
     response = await client.post(f"/v1/admin/items/{item_id}/evaluate")
     assert response.status_code == 200, response.text
     assert await _jobs_for_tenant(tenant_id) == []
+
+
+# ===========================================================================
+# 6b. manual producer under a profile-bound admin key — the authorization
+#     boundary must hold at request time AND survive the queue delay
+#     (correction for the review finding: ADMIN_SCOPE is not a bypass of a
+#     bound memory profile)
+# ===========================================================================
+
+
+@dataclass
+class _BoundKeyAuth:
+    headers: dict[str, str]
+    api_key_id: str
+    profile_id: str
+    revision_id: str
+
+
+@asynccontextmanager
+async def _profile_bound_admin_key(
+    client: AsyncClient, *, allow_tenant_write: bool
+) -> AsyncIterator[_BoundKeyAuth]:
+    """Create an admin-scope API key bound to a memory profile (tenant
+    readable, tenant write per ``allow_tenant_write``), over the auth-disabled
+    admin API, then enable auth for the caller's Bearer requests — the
+    fixture pattern of tests/test_profile_authorization_regressions_postgres.py.
+
+    The key's principal is the default admin, so the target items below are
+    principal-eligible and the profile read/write intersection is the only
+    variable under test."""
+    from engram.auth import reset_principal_cache
+    from engram.db import owner_session_factory
+
+    settings.auth_enabled = False
+    reset_principal_cache()
+    slug = f"manual-eval-{uuid.uuid4().hex[:10]}"
+    tenant_id, principal_id = await _default_tenant_principal()
+    profile_id: str | None = None
+    key_id: str | None = None
+    try:
+        profile_response = await client.post(
+            "/v1/memory-profiles",
+            json={
+                "name": slug,
+                "slug": slug,
+                "reason": "manual evaluate authorization proof",
+                "policy": {
+                    "include_private": True,
+                    "include_tenant": True,
+                    "include_public": False,
+                    "allow_tenant_write": allow_tenant_write,
+                    "allow_public_write": False,
+                },
+            },
+        )
+        assert profile_response.status_code == 201, profile_response.text
+        profile_id = profile_response.json()["id"]
+        key_response = await client.post(
+            "/v1/admin/api-keys",
+            json={
+                "tenant_id": tenant_id,
+                "principal_id": principal_id,
+                "scopes": ["admin"],
+                "label": slug,
+                "memory_profile_id": profile_id,
+            },
+        )
+        assert key_response.status_code == 201, key_response.text
+        key_id = key_response.json()["id"]
+        settings.auth_enabled = True
+        reset_principal_cache()
+        yield _BoundKeyAuth(
+            headers={"Authorization": f"Bearer {key_response.json()['key']}"},
+            api_key_id=key_id,
+            profile_id=profile_id,
+            revision_id=profile_response.json()["active_revision_id"],
+        )
+    finally:
+        settings.auth_enabled = False
+        reset_principal_cache()
+        if profile_id is not None:
+            async with owner_session_factory() as session:
+                await session.execute(
+                    text("DELETE FROM job_execution_contexts WHERE memory_profile_id = :pid"),
+                    {"pid": profile_id},
+                )
+                # A worker run under this boundary records the pinned revision
+                # on its audit events; dropping those rows first keeps the
+                # profile delete (revisions cascade) FK-clean.
+                await session.execute(
+                    text("DELETE FROM item_events WHERE memory_profile_id = :pid"),
+                    {"pid": profile_id},
+                )
+                if key_id is not None:
+                    await session.execute(
+                        text("DELETE FROM api_keys WHERE id = :kid"), {"kid": key_id}
+                    )
+                await session.execute(
+                    text("DELETE FROM memory_profiles WHERE id = :pid"), {"pid": profile_id}
+                )
+                await session.commit()
+
+
+async def _execution_context_rows(tenant_id: str) -> list[dict[str, Any]]:
+    async with _test_session_factory() as session:
+        rows = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT id::text, api_key_id::text, memory_profile_id::text, "
+                        "memory_profile_revision_id::text, memory_context_version "
+                        "FROM job_execution_contexts WHERE tenant_id = :tid"
+                    ),
+                    {"tid": tenant_id},
+                )
+            )
+            .mappings()
+            .all()
+        )
+    return [dict(row) for row in rows]
+
+
+async def test_manual_evaluate_profile_bound_write_ineligible_404s_and_enqueues_nothing(
+    monkeypatch, client
+):
+    """A profile-bound admin key (tenant readable, NOT tenant writable) must
+    not even learn that the write-ineligible proposed item exists: the manual
+    endpoint resolves the target through the caller's existing-item write
+    eligibility, so the response is the mutation API's non-disclosing 404 —
+    byte-identical to an unknown item — and nothing is enqueued."""
+    monkeypatch.setattr(settings, "promotion_evaluate_jobs_enabled", True)
+    if not await _db_ok():
+        _require_db()
+    tenant_id, principal_id = await _default_tenant_principal()
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="profile write-ineligible manual target",
+        memory_confidence=0.9,
+        visibility="tenant",
+    )
+    async with _profile_bound_admin_key(client, allow_tenant_write=False) as auth:
+        denied = await client.post(f"/v1/admin/items/{item_id}/evaluate", headers=auth.headers)
+        assert denied.status_code == 404
+        unknown = await client.post(
+            f"/v1/admin/items/{uuid.uuid4()}/evaluate", headers=auth.headers
+        )
+        assert unknown.status_code == 404
+        # Non-disclosing: the two cases are indistinguishable.
+        assert denied.json() == unknown.json() == {"detail": "Item not found"}
+        # Gates suppressed (flag off) behaves the same at the boundary and
+        # leaves no orphaned execution-authority row behind.
+        monkeypatch.setattr(settings, "promotion_evaluate_jobs_enabled", False)
+        suppressed = await client.post(
+            f"/v1/admin/items/{item_id}/evaluate", headers=auth.headers
+        )
+        assert suppressed.status_code == 404
+        monkeypatch.setattr(settings, "promotion_evaluate_jobs_enabled", True)
+    assert await _jobs_for_tenant(tenant_id) == []
+    assert (await _fetch_item(item_id))["review_status"] == "proposed"
+    assert await _promotion_events_for(item_id) == []
+    assert await _execution_context_rows(tenant_id) == []
+
+
+async def test_manual_evaluate_profile_bound_authorized_enqueues_executes_and_promotes(
+    monkeypatch, client
+):
+    """The authorized counterpart: an otherwise comparable profile that DOES
+    allow tenant writes enqueues exactly one v2 manual job whose durable
+    execution-authority reference reconstructs the same profile boundary at
+    worker time (proven by the promotion audit event's provenance columns) —
+    never an unrestricted fallback."""
+    monkeypatch.setattr(settings, "promotion_evaluate_jobs_enabled", True)
+    if not await _db_ok():
+        _require_db()
+    tenant_id, principal_id = await _default_tenant_principal()
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="profile write-eligible manual target",
+        memory_confidence=0.9,
+        visibility="tenant",
+    )
+    async with _profile_bound_admin_key(client, allow_tenant_write=True) as auth:
+        response = await client.post(
+            f"/v1/admin/items/{item_id}/evaluate", headers=auth.headers
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["status"] == "enqueued"
+        assert body["trigger_type"] == TRIGGER_MANUAL
+
+        jobs = await _jobs_for_tenant(tenant_id)
+        assert len(jobs) == 1
+        assert str(jobs[0]["id"]) == body["job_id"]
+        payload = parse_promotion_evaluate_payload(jobs[0]["payload"])
+        assert payload.trigger_type == TRIGGER_MANUAL
+        assert payload.contract_version == PROMOTION_EVALUATE_CONTRACT_VERSION_V2
+        assert payload.execution_context_id is not None
+        assert payload.ingest_id is None
+        # The authority row pins exactly the caller's resolved identity.
+        contexts = await _execution_context_rows(tenant_id)
+        assert len(contexts) == 1
+        assert contexts[0]["id"] == str(payload.execution_context_id)
+        assert contexts[0]["memory_profile_id"] == auth.profile_id
+        assert contexts[0]["memory_profile_revision_id"] == auth.revision_id
+        assert contexts[0]["api_key_id"] == auth.api_key_id
+
+        assert await _process_one()
+        # Assert on the promotion event BEFORE the fixture cleanup removes
+        # the profile-referencing rows (required to keep the profile delete
+        # FK-clean).
+        async with _test_session_factory() as session:
+            event = (
+                (
+                    await session.execute(
+                        text(
+                            "SELECT reason, api_key_id::text, memory_profile_id::text, "
+                            "memory_profile_revision_id::text, memory_context_version "
+                            "FROM item_events WHERE item_id = :id "
+                            "AND event_type = 'review_change' AND new_value = 'active'"
+                        ),
+                        {"id": item_id},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+        reason = json.loads(event["reason"])
+        assert reason["trigger_type"] == TRIGGER_MANUAL
+        assert reason["trigger_id"] == payload.trigger_id
+        # Worker-time provenance is the reconstructed profile boundary itself —
+        # not the internal-system fallback an unscoped execution would record.
+        assert event["memory_profile_id"] == auth.profile_id
+        assert event["memory_profile_revision_id"] == auth.revision_id
+        assert event["api_key_id"] == auth.api_key_id
+        assert event["memory_context_version"] == "memory-context-v2"
+    assert (await _fetch_item(item_id))["review_status"] == "active"
+
+
+async def test_manual_evaluate_worker_fails_closed_when_authority_row_missing(
+    monkeypatch, client
+):
+    """If the durable execution-authority reference cannot be reconstructed
+    (here: the row vanished before execution — under RLS a cross-tenant row is
+    exactly this case, invisible), the job must NOT mutate the item, must NOT
+    fall back to broader/unprofiled authority (the item would otherwise
+    promote), and must enter the ordinary retry semantics."""
+    from engram.db import owner_session_factory
+
+    monkeypatch.setattr(settings, "promotion_evaluate_jobs_enabled", True)
+    if not await _db_ok():
+        _require_db()
+    tenant_id, principal_id = await _default_tenant_principal()
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="missing authority manual target",
+        memory_confidence=0.9,
+        visibility="tenant",
+    )
+    async with _profile_bound_admin_key(client, allow_tenant_write=True) as auth:
+        response = await client.post(
+            f"/v1/admin/items/{item_id}/evaluate", headers=auth.headers
+        )
+        assert response.status_code == 200, response.text
+        jobs = await _jobs_for_tenant(tenant_id)
+        assert len(jobs) == 1
+        payload = parse_promotion_evaluate_payload(jobs[0]["payload"])
+        assert payload.execution_context_id is not None
+        async with owner_session_factory() as session:
+            await session.execute(
+                text("DELETE FROM job_execution_contexts WHERE id = :id"),
+                {"id": str(payload.execution_context_id)},
+            )
+            await session.commit()
+        assert await _process_one()
+    assert (await _fetch_item(item_id))["review_status"] == "proposed"
+    assert await _promotion_events_for(item_id) == []
+    async with _test_session_factory() as session:
+        job = (
+            await session.execute(
+                text(
+                    "SELECT status, attempts FROM jobs WHERE tenant_id = :tid "
+                    "AND job_type = 'promotion.evaluate'"
+                ),
+                {"tid": tenant_id},
+            )
+        ).mappings().one()
+    assert job["status"] == STATUS_PENDING
+    assert job["attempts"] == 1
+
+
+async def test_manual_evaluate_worker_fails_closed_on_unsupported_authority_version(
+    monkeypatch, client
+):
+    """A present-but-corrupt authority row (unsupported context version) fails
+    closed exactly like a missing one: no mutation, no broader fallback,
+    ordinary failure semantics."""
+    from engram.db import owner_session_factory
+
+    monkeypatch.setattr(settings, "promotion_evaluate_jobs_enabled", True)
+    if not await _db_ok():
+        _require_db()
+    tenant_id, principal_id = await _default_tenant_principal()
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="corrupt authority manual target",
+        memory_confidence=0.9,
+        visibility="tenant",
+    )
+    async with _profile_bound_admin_key(client, allow_tenant_write=True) as auth:
+        response = await client.post(
+            f"/v1/admin/items/{item_id}/evaluate", headers=auth.headers
+        )
+        assert response.status_code == 200, response.text
+        jobs = await _jobs_for_tenant(tenant_id)
+        assert len(jobs) == 1
+        payload = parse_promotion_evaluate_payload(jobs[0]["payload"])
+        async with owner_session_factory() as session:
+            await session.execute(
+                text(
+                    "UPDATE job_execution_contexts SET memory_context_version = 'unsupported-v99' "
+                    "WHERE id = :id"
+                ),
+                {"id": str(payload.execution_context_id)},
+            )
+            await session.commit()
+        assert await _process_one()
+    assert (await _fetch_item(item_id))["review_status"] == "proposed"
+    assert await _promotion_events_for(item_id) == []
+    async with _test_session_factory() as session:
+        job = (
+            await session.execute(
+                text(
+                    "SELECT status, attempts FROM jobs WHERE tenant_id = :tid "
+                    "AND job_type = 'promotion.evaluate'"
+                ),
+                {"tid": tenant_id},
+            )
+        ).mappings().one()
+    assert job["status"] == STATUS_PENDING
+    assert job["attempts"] == 1
 
 
 # ===========================================================================

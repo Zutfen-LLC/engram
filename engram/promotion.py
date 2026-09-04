@@ -1103,6 +1103,11 @@ async def maybe_auto_promote_for_startup_recall(
 
 PROMOTION_EVALUATE_JOB_TYPE = "promotion.evaluate"
 PROMOTION_EVALUATE_CONTRACT_VERSION = "promotion-evaluate-v1"
+# v2 (issue #155 correction): adds exactly one optional field,
+# ``execution_context_id`` — the durable job_execution_contexts row that pins
+# the non-ingest producer request's execution authority (the manual admin
+# trigger). v1 payloads remain fully supported during mixed-version rollout.
+PROMOTION_EVALUATE_CONTRACT_VERSION_V2 = "promotion-evaluate-v2"
 
 TRIGGER_ITEM_CREATED = "item_created"
 TRIGGER_CLASSIFICATION_BOUND = "classification_bound"
@@ -1160,6 +1165,16 @@ PROMOTION_EVALUATE_ALLOWED_FIELDS: frozenset[str] = frozenset(
     }
 )
 
+# v2 extends the closed set by exactly one optional identifier field:
+# ``execution_context_id`` references the immutable ``job_execution_contexts``
+# row recording the pinned execution authority of the producer request (a
+# reference to durable authorization state, never a copy of it). Everything
+# else about the v1 envelope — exact field set, closed vocabulary, centrally
+# computed dedupe key — is unchanged.
+PROMOTION_EVALUATE_ALLOWED_FIELDS_V2: frozenset[str] = PROMOTION_EVALUATE_ALLOWED_FIELDS | {
+    "execution_context_id"
+}
+
 
 class PromotionEvaluateContractError(ValueError):
     """A ``promotion.evaluate`` payload is malformed, or carries an unknown/
@@ -1174,7 +1189,7 @@ class PromotionEvaluateContractError(ValueError):
 
 @dataclass(frozen=True)
 class PromotionEvaluatePayload:
-    """A parsed, validated ``promotion-evaluate-v1`` job payload.
+    """A parsed, validated ``promotion-evaluate-v1``/``-v2`` job payload.
 
     ``memory_item_id`` is the stable evaluation target. ``trigger_type`` /
     ``trigger_id`` are audit provenance only. ``requested_policy_version`` is
@@ -1182,6 +1197,9 @@ class PromotionEvaluatePayload:
     mutation authority (the evaluator always applies whatever policy is
     currently configured). ``ingest_id`` is consumed only to reconstruct
     execution authority identically to the legacy worker paths.
+    ``execution_context_id`` (v2 only) references the durable
+    ``job_execution_contexts`` row pinning a non-ingest producer request's
+    execution authority; it is mutually exclusive with ``ingest_id``.
     """
 
     contract_version: str
@@ -1192,6 +1210,7 @@ class PromotionEvaluatePayload:
     ingest_id: uuid.UUID | None
     correlation_id: uuid.UUID | None
     dedupe_key: str
+    execution_context_id: uuid.UUID | None = None
 
 
 def promotion_evaluate_dedupe_key(
@@ -1239,20 +1258,23 @@ def build_promotion_evaluate_payload(
     requested_policy_version: str = EVIDENCE_PROMOTION_POLICY_VERSION,
     ingest_id: uuid.UUID | str | None = None,
     correlation_id: uuid.UUID | str | None = None,
+    execution_context_id: uuid.UUID | str | None = None,
 ) -> dict[str, object]:
-    """Construct one canonical, exact-field ``promotion-evaluate-v1`` payload.
+    """Construct one canonical, exact-field promotion-evaluate payload.
 
     This is the single producer-side half of the contract: it runs the same
     runtime validation :func:`parse_promotion_evaluate_payload` re-verifies on
     the worker side (never trusting Python type annotations alone) —
     ``memory_item_id`` is a real UUID, ``trigger_type`` is in the closed
     vocabulary, ``trigger_id`` / ``requested_policy_version`` are non-empty
-    strings, and optional ``ingest_id`` / ``correlation_id`` are valid UUIDs
-    when supplied — and it always computes the dedupe key itself from the
-    validated identity fields. Callers can never supply their own
-    ``dedupe_key``, so enqueue-time construction and worker parse-time
-    validation cannot drift apart. The returned dict contains exactly
-    :data:`PROMOTION_EVALUATE_ALLOWED_FIELDS`, nothing more.
+    strings, and optional ``ingest_id`` / ``correlation_id`` /
+    ``execution_context_id`` are valid UUIDs when supplied — and it always
+    computes the dedupe key itself from the validated identity fields. Callers
+    can never supply their own ``dedupe_key``, so enqueue-time construction
+    and worker parse-time validation cannot drift apart. The returned dict
+    contains exactly the closed field set of its contract version (v1, or v2
+    when ``execution_context_id`` pins non-ingest execution authority),
+    nothing more.
     """
     item_id = _require_uuid(memory_item_id, field="memory_item_id")
     if trigger_type not in PROMOTION_EVALUATE_TRIGGER_TYPES:
@@ -1265,7 +1287,15 @@ def build_promotion_evaluate_payload(
     )
     resolved_ingest_id = _optional_uuid(ingest_id, field="ingest_id")
     resolved_correlation_id = _optional_uuid(correlation_id, field="correlation_id")
-    return {
+    resolved_execution_context_id = _optional_uuid(
+        execution_context_id, field="execution_context_id"
+    )
+    if resolved_ingest_id is not None and resolved_execution_context_id is not None:
+        raise PromotionEvaluateContractError(
+            "promotion.evaluate payload cannot carry both ingest_id and "
+            "execution_context_id: a job has exactly one execution-authority source"
+        )
+    payload: dict[str, object] = {
         "contract_version": PROMOTION_EVALUATE_CONTRACT_VERSION,
         "memory_item_id": str(item_id),
         "trigger_type": trigger_type,
@@ -1277,23 +1307,32 @@ def build_promotion_evaluate_payload(
         ),
         "dedupe_key": promotion_evaluate_dedupe_key(item_id, trigger_type, validated_trigger_id),
     }
+    if resolved_execution_context_id is not None:
+        payload["contract_version"] = PROMOTION_EVALUATE_CONTRACT_VERSION_V2
+        payload["execution_context_id"] = str(resolved_execution_context_id)
+    return payload
 
 
 def parse_promotion_evaluate_payload(payload: dict[str, object]) -> PromotionEvaluatePayload:
-    """Parse and validate a ``promotion.evaluate`` job payload (v1 contract).
+    """Parse and validate a ``promotion.evaluate`` job payload (v1/v2 contracts).
 
     Fails closed on every axis that would let a malformed or dishonest
     payload masquerade as a canonical evaluation job:
 
-    * any field outside :data:`PROMOTION_EVALUATE_ALLOWED_FIELDS` (unknown
-      mutable decision state, memory content, credentials, or anything else)
-      is rejected outright — the v1 envelope is exact/closed, not a bag with
-      tolerated extras;
+    * any field outside the closed set of the payload's declared
+      ``contract_version`` (v1: :data:`PROMOTION_EVALUATE_ALLOWED_FIELDS`;
+      v2: :data:`PROMOTION_EVALUATE_ALLOWED_FIELDS_V2`) — unknown mutable
+      decision state, memory content, credentials, or anything else — is
+      rejected outright: the envelope stays exact/closed per version, not a
+      bag with tolerated extras;
     * an unknown/missing ``contract_version`` or an unrecognized
       ``trigger_type`` raises :class:`PromotionEvaluateContractError` rather
       than guessing at a compatible interpretation;
     * structurally malformed fields (missing/wrong-typed ``memory_item_id``,
       ``trigger_id``, etc.) raise the same error;
+    * a v2 payload may not carry both ``ingest_id`` and
+      ``execution_context_id``: a job has exactly one execution-authority
+      source, and an ambiguous one is rejected rather than guessed;
     * the stored ``dedupe_key`` must equal the canonical key recomputed from
       the parsed ``(memory_item_id, trigger_type, trigger_id)`` identity — a
       wrong-but-nonempty ``dedupe_key`` is rejected exactly like an
@@ -1303,16 +1342,20 @@ def parse_promotion_evaluate_payload(payload: dict[str, object]) -> PromotionEva
     """
     if not isinstance(payload, dict):
         raise PromotionEvaluateContractError("promotion.evaluate payload must be an object")
-    unknown_fields = set(payload) - PROMOTION_EVALUATE_ALLOWED_FIELDS
+    contract_version = payload.get("contract_version")
+    if contract_version == PROMOTION_EVALUATE_CONTRACT_VERSION:
+        allowed_fields = PROMOTION_EVALUATE_ALLOWED_FIELDS
+    elif contract_version == PROMOTION_EVALUATE_CONTRACT_VERSION_V2:
+        allowed_fields = PROMOTION_EVALUATE_ALLOWED_FIELDS_V2
+    else:
+        raise PromotionEvaluateContractError(
+            f"unsupported promotion.evaluate contract_version: {contract_version!r}"
+        )
+    unknown_fields = set(payload) - allowed_fields
     if unknown_fields:
         raise PromotionEvaluateContractError(
             "promotion.evaluate payload carries unsupported field(s): "
             f"{sorted(unknown_fields)!r}"
-        )
-    contract_version = payload.get("contract_version")
-    if contract_version != PROMOTION_EVALUATE_CONTRACT_VERSION:
-        raise PromotionEvaluateContractError(
-            f"unsupported promotion.evaluate contract_version: {contract_version!r}"
         )
     memory_item_id = _require_uuid(payload.get("memory_item_id"), field="memory_item_id")
     trigger_type = payload.get("trigger_type")
@@ -1325,6 +1368,15 @@ def parse_promotion_evaluate_payload(payload: dict[str, object]) -> PromotionEva
     requested_policy_version = _require_nonempty_str(
         payload.get("requested_policy_version"), field="requested_policy_version"
     )
+    ingest_id = _optional_uuid(payload.get("ingest_id"), field="ingest_id")
+    execution_context_id = _optional_uuid(
+        payload.get("execution_context_id"), field="execution_context_id"
+    )
+    if ingest_id is not None and execution_context_id is not None:
+        raise PromotionEvaluateContractError(
+            "promotion.evaluate payload cannot carry both ingest_id and "
+            "execution_context_id: a job has exactly one execution-authority source"
+        )
     dedupe_key = _require_nonempty_str(payload.get("dedupe_key"), field="dedupe_key")
     expected_dedupe_key = promotion_evaluate_dedupe_key(memory_item_id, trigger_type, trigger_id)
     if dedupe_key != expected_dedupe_key:
@@ -1338,9 +1390,10 @@ def parse_promotion_evaluate_payload(payload: dict[str, object]) -> PromotionEva
         trigger_type=trigger_type,
         trigger_id=trigger_id,
         requested_policy_version=requested_policy_version,
-        ingest_id=_optional_uuid(payload.get("ingest_id"), field="ingest_id"),
+        ingest_id=ingest_id,
         correlation_id=_optional_uuid(payload.get("correlation_id"), field="correlation_id"),
         dedupe_key=dedupe_key,
+        execution_context_id=execution_context_id,
     )
 
 
@@ -1354,6 +1407,7 @@ async def enqueue_promotion_evaluation(
     requested_policy_version: str = EVIDENCE_PROMOTION_POLICY_VERSION,
     ingest_id: uuid.UUID | None = None,
     correlation_id: uuid.UUID | None = None,
+    execution_context_id: uuid.UUID | None = None,
     run_after: datetime | None = None,
 ) -> uuid.UUID:
     """Canonically enqueue one ``promotion.evaluate`` job (issue #155).
@@ -1362,7 +1416,10 @@ async def enqueue_promotion_evaluation(
     :func:`build_promotion_evaluate_payload` — the exact same rules the
     worker re-verifies at parse time — so enqueue-time construction and
     execution-time validation cannot independently drift. Callers cannot
-    supply their own ``dedupe_key``. Uses
+    supply their own ``dedupe_key``. ``execution_context_id`` (when supplied)
+    references the durable ``job_execution_contexts`` row pinning a
+    non-ingest producer request's execution authority, and selects the v2
+    contract. Uses
     :func:`engram.jobs.enqueue_job_in_transaction`, so this preserves the
     caller's outer transaction (e.g. a classification-binding transaction)
     rather than committing it prematurely; the caller commits. Idempotent:
@@ -1380,6 +1437,7 @@ async def enqueue_promotion_evaluation(
         requested_policy_version=requested_policy_version,
         ingest_id=ingest_id,
         correlation_id=correlation_id,
+        execution_context_id=execution_context_id,
     )
     return await enqueue_job_in_transaction(
         session,
@@ -1422,6 +1480,7 @@ async def maybe_enqueue_promotion_evaluation(
     requested_policy_version: str = EVIDENCE_PROMOTION_POLICY_VERSION,
     ingest_id: uuid.UUID | None = None,
     correlation_id: uuid.UUID | None = None,
+    execution_context_id: uuid.UUID | None = None,
     run_after: datetime | None = None,
 ) -> uuid.UUID | None:
     """Gate and canonically enqueue one evaluation for a committed event.
@@ -1497,6 +1556,7 @@ async def maybe_enqueue_promotion_evaluation(
         requested_policy_version=requested_policy_version,
         ingest_id=ingest_id,
         correlation_id=correlation_id,
+        execution_context_id=execution_context_id,
         run_after=effective_run_after,
     )
 

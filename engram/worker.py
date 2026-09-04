@@ -232,6 +232,19 @@ def _payload_item_id(job: Job) -> UUID:
 async def _job_memory_context(
     session: AsyncSession, job: Job
 ) -> ResolvedMemoryContext | None:
+    # A job's durable execution authority is exactly one source: the
+    # non-ingest ``job_execution_contexts`` reference (promotion-evaluate-v2,
+    # e.g. the manual admin trigger) or the candidate-ingest execution row
+    # (every ingest-bound producer). No authority reference at all is the
+    # established unprofiled compatibility state (``None``), never a fallback
+    # for a reference that exists but cannot be reconstructed — that raises.
+    raw_execution_context_id = job.payload.get("execution_context_id")
+    if raw_execution_context_id is not None:
+        from engram.memory_context import memory_context_from_execution_context
+
+        return await memory_context_from_execution_context(
+            session, _parse_uuid(raw_execution_context_id), tenant_id=job.tenant_id
+        )
     raw_ingest_id = job.payload.get("ingest_id")
     if raw_ingest_id is None:
         return None
@@ -1861,9 +1874,13 @@ async def handle_promotion_evaluate(session: AsyncSession, job: Job) -> None:
     if str(item.tenant_id) != str(job.tenant_id):
         raise RuntimeError(f"job tenant {job.tenant_id} != item tenant {item.tenant_id}")
 
-    # Execution-authority reconstruction: same v2 candidate-origin provenance
-    # rules as promotion.path_a, but a reconstruction failure is not caught
-    # here (see docstring) — it propagates to the retry/dead-letter path.
+    # Execution-authority reconstruction: the payload's single authority
+    # reference — an ingest execution row (ingest-bound producers, same v2
+    # candidate-origin provenance rules as promotion.path_a) or a
+    # job_execution_contexts row (non-ingest producers like the manual admin
+    # trigger). A reconstruction failure is not caught here (see docstring) —
+    # it propagates to the retry/dead-letter path; there is no broader
+    # fallback.
     memory_context = await _job_memory_context(session, job)
 
     evaluation_id = uuid.uuid4()

@@ -30,7 +30,12 @@ from engram.auth import (
 from engram.auth import Principal as AuthPrincipal
 from engram.classification import invalidate_vocab_cache
 from engram.db import get_session
-from engram.memory_context import ResolvedMemoryContext, resolve_memory_context
+from engram.memory_access import apply_write_eligibility
+from engram.memory_context import (
+    ResolvedMemoryContext,
+    record_job_execution_context,
+    resolve_memory_context,
+)
 from engram.memory_kinds import (
     BUILTIN_KIND_NAMES,
     NAME_PATTERN,
@@ -544,6 +549,7 @@ async def update_memory_kind(
 async def evaluate_item(
     item_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> ItemEvaluateResponse:
     """Enqueue one canonical ``promotion.evaluate`` job for a live proposal.
 
@@ -553,6 +559,18 @@ async def evaluate_item(
     audit provenance (``trigger_type='manual'``), never decision authority.
     Repeated requests enqueue independently (each gets a fresh trigger id),
     and the evaluator itself is idempotent, so replays are safe.
+
+    Authorization follows the mutation API's non-disclosing boundary, not a
+    tenant-wide admin bypass: the target is resolved through the caller's
+    existing-item write eligibility (``apply_write_eligibility``), so an item
+    outside the caller's memory profile is indistinguishable from a missing
+    one (404). API scopes and memory-profile boundaries are separate controls
+    — ``admin`` never silently bypasses a bound profile. For a profile-bound
+    caller the request additionally records its pinned execution authority
+    durably (``job_execution_contexts``, referenced by the v2 job payload),
+    so the worker that later runs the job reconstructs and applies the same
+    profile boundary rather than broader tenant-level authority; an
+    unprofiled caller keeps the established compatibility behavior.
 
     Returns ``status='not_enqueued'`` when the rollout flag
     (``ENGRAM_PROMOTION_EVALUATE_JOBS_ENABLED``) or the tenant's
@@ -569,8 +587,8 @@ async def evaluate_item(
     tenant_id = await _resolve_tenant_id(session)
     item = (
         await session.execute(
-            select(MemoryItem).where(
-                MemoryItem.id == item_id, MemoryItem.tenant_id == uuid.UUID(tenant_id)
+            apply_write_eligibility(
+                select(MemoryItem).where(MemoryItem.id == item_id), memory_context
             )
         )
     ).scalar_one_or_none()
@@ -581,20 +599,40 @@ async def evaluate_item(
             status_code=409,
             detail="Only a live proposed item can be queued for promotion evaluation",
         )
+    # Only a profile-bound caller has a boundary worth preserving across the
+    # queue delay; recording it in the same transaction makes the authority
+    # row exist iff the job does.
+    execution_context_id = (
+        await record_job_execution_context(session, memory_context)
+        if memory_context.is_profile_bound
+        else None
+    )
     job_id = await maybe_enqueue_promotion_evaluation(
         session,
         tenant_id=tenant_id,
         item=item,
         trigger_type=TRIGGER_MANUAL,
         trigger_id=str(uuid.uuid4()),
+        execution_context_id=execution_context_id,
     )
+    if job_id is None:
+        if execution_context_id is not None:
+            # Gates suppressed the enqueue: discard the authority row with the
+            # rest of the uncommitted work instead of leaving an orphan.
+            await session.rollback()
+        return ItemEvaluateResponse(
+            item_id=item_id,
+            job_id=None,
+            trigger_type=cast(Literal["manual"], TRIGGER_MANUAL),
+            status="not_enqueued",
+        )
     await session.commit()
     return ItemEvaluateResponse(
         item_id=item_id,
         job_id=job_id,
         # TRIGGER_MANUAL is the closed-vocabulary constant for "manual".
         trigger_type=cast(Literal["manual"], TRIGGER_MANUAL),
-        status="enqueued" if job_id is not None else "not_enqueued",
+        status="enqueued",
     )
 
 
