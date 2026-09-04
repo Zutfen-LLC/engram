@@ -367,14 +367,41 @@ schedules only from that mutation-authoritative row and its currently bound rece
 re-derives that same current-state row at execution time instead of trusting the enqueue-time receipt,
 which is the material difference between the two contracts (issue #155).
 
-**Lazy startup-recall promotion** (F11): every `POST /v1/recall` call with
-`mode=startup` runs `engram.promotion.maybe_auto_promote_for_startup_recall`
-before `_fetch_active_items`, bounded by `settings.startup_promotion_limit`
-(default 20 proposed items scanned per call) so recall latency stays
-predictable regardless of how large a tenant's proposed backlog grows. A
-disabled tenant (`auto_promote_enabled=false`) pays only a single `COUNT`
-query. Semantic recall (`mode=semantic`) does **not** trigger this pass in
-this slice — that remains a deliberate scope boundary, not an oversight.
+**Startup-recall promotion compatibility path** (F11/B5):
+`ENGRAM_STARTUP_PROMOTION_MUTATION_ENABLED=true` (the default) retains the
+legacy bounded `maybe_auto_promote_for_startup_recall` pass before candidate
+selection, capped by `settings.startup_promotion_limit` (default 20). It is
+explicitly deprecated but retained as a one-flag rollback path. When the flag
+is `false`, startup recall is lifecycle-read-only: it does not mutate
+`MemoryItem.review_status` or create promotion audit events, and only sees
+lifecycle state already committed by canonical `promotion.evaluate` work.
+That configuration fails closed unless both canonical evaluation and bounded
+reconciliation are enabled. During compatibility mode, the content-free shadow
+observer receives the exact bounded window selected by the legacy `FOR UPDATE
+SKIP LOCKED` query, before its lifecycle mutation; it does not reconstruct the
+window or advance any cursor. After cutover, its separate bounded diagnostic
+cursor compares the shared evaluator's current obligation with canonical queue
+coverage while the legacy cursor remains frozen for rollback. It never locks
+memory rows, writes promotion evidence, or advances the legacy cursor. Recall
+provenance and asynchronous recall telemetry remain allowed writes. Semantic
+recall (`mode=semantic`) never triggers either legacy startup mutation or the
+shadow observer.
+
+Compatibility observations do not advance `cursor_created_at` or
+`cursor_item_id`. Each exact authoritative window increments
+`compatibility_windows_observed`. The legacy pass supplies its wrap fact
+before mutation. Each true wrap increments `compatibility_rotations_completed`
+and sets `last_compatibility_wrapped` to true. A non-wrapping pass sets that
+last-window field to false. These fields persist atomically with parity
+counters. They remain tenant-scoped, content-free diagnostics and cannot
+authorize promotion. The separate `rotation` and `last_wrapped` fields
+describe only the independent post-cutover diagnostic cursor.
+
+Production cutover still requires live/canary certification under #170.
+Record a baseline and prove at least one complete authoritative rotation per
+enabled tenant during the accepted run. Record tenants with no live proposals
+explicitly. Deterministic tests do not replace live parity coverage or startup
+latency evidence.
 
 **Conflict candidate selection is top-k, not top-1** (F13): both the recheck
 above and `find_promotion_conflict_candidates` scope candidates to the same
@@ -628,10 +655,13 @@ as two stages:
    only SQL-computable columns (it is candidate retrieval, not the final
    score). This runs over a read-oriented session
    (`ENGRAM_READ_DATABASE_URL`, falling back to the primary database when
-   unset) — the only write in this stage is the lazy promotion pass, and it
-   always uses the primary session; when that pass actually promotes a row,
-   candidate selection for *this* recall reads from the primary too
-   (replication lag would otherwise hide the row it was invoked to surface).
+   unset). Before this read, startup may use the primary session for the
+   compatibility promotion pass and its bounded, content-free parity-state
+   observation. With lifecycle mutation disabled, no promotion write occurs
+   and candidate selection always uses the read-oriented session. When the
+   compatibility pass actually promotes a row, candidate selection for *this*
+   recall reads from the primary too (replication lag would otherwise hide the
+   row it was invoked to surface).
 2. **Detailed Python scoring** — the formula below runs only over the
    bounded candidate set, producing the same reasons, warnings, and budget
    packing as before. The SQL score is never returned to callers.

@@ -618,9 +618,38 @@ Committed admission-affecting memory-kind changes (PATCH
 `/admin/memory-kinds/{name}` altering `enabled` or `auto_promote_from_inferred`)
 schedule one bounded `policy_change` chain automatically. Flipping the
 reconciliation flag back off stops new backstop work and leaves the periodic
-chains to die out as no-op passes, without disturbing startup-recall promotion
-or either targeted job type. Startup recall's lazy promotion pass is unchanged
-in this slice; its removal behind shadow parity is the next #155 slice (B5).
+chains to die out as no-op passes, without disturbing either targeted job type.
+
+**Startup lifecycle-read-only cutover** (ENG-PROMOTION-003B5 / issue #170) is
+controlled by `ENGRAM_STARTUP_PROMOTION_MUTATION_ENABLED` (default `true`).
+`true` retains the deprecated bounded lazy pass as the rollback mechanism.
+`false` removes startup's promotion mutation/audit path and uses the normal
+read-session candidate path; configuration rejects it unless both
+`ENGRAM_PROMOTION_EVALUATE_JOBS_ENABLED` and
+`ENGRAM_PROMOTION_RECONCILIATION_ENABLED` are true. While those prerequisites
+are on, `ENGRAM_STARTUP_PROMOTION_SHADOW_ENABLED` (default `true`) records
+bounded, content-free parity. In compatibility mode it observes the exact
+window the legacy `FOR UPDATE SKIP LOCKED` pass selected; after cutover it uses
+a separate diagnostic cursor because the legacy cursor is frozen for rollback.
+It uses the shared evaluator and exact current-obligation lookup only; it is
+not promotion evidence and never locks memory rows or advances the legacy
+cursor.
+
+Compatibility observations do not advance `cursor_created_at` or
+`cursor_item_id`. Each exact authoritative window increments
+`compatibility_windows_observed`. The legacy pass supplies its wrap fact
+before mutation. Each true wrap increments `compatibility_rotations_completed`
+and sets `last_compatibility_wrapped` to true. A non-wrapping pass sets that
+last-window field to false. These fields persist atomically with parity
+counters. They remain tenant-scoped, content-free diagnostics and cannot
+authorize promotion. The separate `rotation` and `last_wrapped` fields
+describe only the independent post-cutover diagnostic cursor.
+
+Production cutover still requires live/canary certification under #170.
+Record a baseline and prove at least one complete authoritative rotation per
+enabled tenant during the accepted run. Record tenants with no live proposals
+explicitly. Deterministic tests do not replace live parity coverage or startup
+latency evidence.
 
 A pending/running promotion job is considered healthy only when it covers the
 current evaluator-produced due-time obligation. Cooling jobs must match the

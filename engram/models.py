@@ -1270,6 +1270,53 @@ class PromotionReconciliationState(Base):
     )
 
 
+class PromotionStartupShadowState(Base):
+    """Non-authoritative, content-free parity coverage for B5 startup cutover.
+
+    This cursor is intentionally distinct from ``PromotionReconciliationState``:
+    observing parity must neither lock nor advance the legacy rollback cursor.
+    It stores only a bounded keyset position and outcome counters, never a
+    promotion decision, memory content, or evidence that can authorize a
+    lifecycle change.
+    """
+
+    __tablename__ = "promotion_startup_shadow_state"
+
+    # Compatibility coverage is independent of the post-cutover cursor.
+    compatibility_windows_observed: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    compatibility_rotations_completed: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    last_compatibility_wrapped: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), primary_key=True
+    )
+    cursor_created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cursor_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    rotation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_observed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_window_size: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_wrapped: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    parity_no_action: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    parity_already_committed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    parity_durably_scheduled: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    mismatch_missing_obligation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    mismatch_state: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    unknown: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
 class PromotionReconcileState(Base):
     """Per-tenant state for the bounded promotion reconciliation backstop (#155).
 

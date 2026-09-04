@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -173,6 +173,21 @@ class PromotionResult:
     promoted_ids: list[uuid.UUID] = field(default_factory=list)
     would_promote_ids: list[uuid.UUID] = field(default_factory=list)
     candidates: list[PromotionCandidate] = field(default_factory=list)
+
+
+# The startup compatibility caller may inspect the exact rows that its
+# ``FOR UPDATE SKIP LOCKED`` query acquired before this function performs any
+# lifecycle mutation.  This is deliberately a window hand-off, not a second
+# evaluator or an authority hook.
+@dataclass(frozen=True)
+class PromotionObservedWindow:
+    """Exact locked selection and wrap fact from the authoritative pass."""
+
+    items: Sequence[MemoryItem]
+    rotation_wrapped: bool
+
+
+PromotionWindowObserver = Callable[[PromotionObservedWindow], Awaitable[None]]
 
 
 def summarize(result: PromotionResult) -> str:
@@ -677,6 +692,7 @@ async def auto_promote_proposed_memories(
     memory_context: ResolvedMemoryContext | None = None,
     rotation: bool = False,
     evaluation_context: dict[str, object] | None = None,
+    selected_window_observer: PromotionWindowObserver | None = None,
 ) -> PromotionResult:
     """Evaluate live proposals for Path A promotion.
 
@@ -790,6 +806,15 @@ async def auto_promote_proposed_memories(
         assert limit is not None
         items = list(
             (await session.execute(_rotation_window(base_stmt, None, limit))).scalars()
+        )
+    # The compatibility observer must see the exact window selected by the
+    # authoritative locked query.  In particular, it cannot reconstruct this
+    # window from the cursor: another transaction may have made SKIP LOCKED
+    # advance this pass into later rows.  Invoke the caller's diagnostic hook
+    # before any compatibility mutation, in this same transaction.
+    if selected_window_observer is not None:
+        await selected_window_observer(
+            PromotionObservedWindow(tuple(items), result.rotation_wrapped)
         )
     result.scanned = len(items)
     support_map = await load_promotion_support(session, items)
@@ -1066,7 +1091,11 @@ async def schedule_evidence_promotion_if_qualified(
 
 
 async def maybe_auto_promote_for_startup_recall(
-    session: AsyncSession, tenant_id: str, *, now: datetime | None = None
+    session: AsyncSession,
+    tenant_id: str,
+    *,
+    now: datetime | None = None,
+    selected_window_observer: PromotionWindowObserver | None = None,
 ) -> PromotionResult:
     return await auto_promote_proposed_memories(
         session,
@@ -1075,6 +1104,7 @@ async def maybe_auto_promote_for_startup_recall(
         limit=settings.startup_promotion_limit,
         source="startup_recall",
         rotation=True,
+        selected_window_observer=selected_window_observer,
     )
 
 

@@ -42,7 +42,12 @@ from engram.memory_access import read_eligibility_expression, resolve_workspace_
 from engram.memory_context import ResolvedMemoryContext
 from engram.memory_kinds import get_disputed_stay_kind_names
 from engram.models import MemoryItem, RecallLog, TenantConfig
-from engram.promotion import maybe_auto_promote_for_startup_recall
+from engram.promotion import (
+    PromotionObservedWindow,
+    PromotionResult,
+    maybe_auto_promote_for_startup_recall,
+)
+from engram.promotion_startup_shadow import observe_startup_promotion_parity
 from engram.relationship_recall import RECALL_SCORING_VERSION, expand_recall_candidates
 
 logger = logging.getLogger(__name__)
@@ -592,9 +597,10 @@ async def execute_startup_recall(
     """Execute startup recall and return the response dict.
 
     Two-stage pipeline (ENG-AUD-011 / F18 — see module docstring):
-    0. Lazy, bounded promotion pass (write session).
-    1. Bounded SQL candidate selection (read session, unless this call's
-       promotion pass actually promoted rows — see step 1 below).
+    0. Optional, bounded legacy promotion compatibility pass (write session).
+       The B5 shadow observer remains lifecycle-read-only in either mode.
+    1. Bounded SQL candidate selection (read session, unless the explicitly
+       enabled compatibility pass actually promoted rows — see step 1 below).
     2. Separate pinned (bypass, capped) from scored candidates.
     3. Score remaining candidates by the detailed formula, sort descending.
     4. Enforce budget.
@@ -624,21 +630,63 @@ async def execute_startup_recall(
         session, memory_context=memory_context, workspace=workspace
     )
 
-    # 0. Lazy, bounded, tenant-scoped Path A promotion pass (design.md §3,
-    #    ENG-AUD-007 F11) — runs before candidates are selected so an item
-    #    that becomes eligible between recalls can appear in this working set
-    #    rather than waiting for the next CLI/admin sweep. Honors
-    #    tenant_config.auto_promote_enabled and settings.startup_promotion_limit
-    #    internally; a disabled tenant pays only a single count query. This is
-    #    a write and always runs on the primary session.
-    promotion_result = await maybe_auto_promote_for_startup_recall(session, tenant_id, now=now)
+    # 0. The legacy bounded lazy pass stays available strictly as the explicit
+    # compatibility/rollback path. When shadow is on, its callback receives
+    # the exact locked SKIP LOCKED window after selection and before any
+    # lifecycle mutation. When compatibility mutation is off, the observer
+    # instead uses its own bounded cursor; the legacy cursor stays frozen for
+    # rollback. In both modes it is diagnostic-only.
+    shadow_enabled = (
+        settings.startup_promotion_shadow_enabled
+        and settings.startup_promotion_shadow_prerequisites_enabled
+    )
+    if settings.startup_promotion_mutation_enabled:
+        if shadow_enabled:
+
+            async def observe_authoritative_window(window: PromotionObservedWindow) -> None:
+                shadow_result = await observe_startup_promotion_parity(
+                    session, tenant_id, now=now, authoritative_window=window
+                )
+                logger.info(
+                    "startup_promotion_shadow tenant=%s window=%s wrapped=%s outcomes=%s "
+                    "request_id=%s",
+                    tenant_id,
+                    shadow_result.window_size,
+                    shadow_result.wrapped,
+                    dict(shadow_result.outcomes),
+                    request_id,
+                )
+
+            promotion_result = await maybe_auto_promote_for_startup_recall(
+                session,
+                tenant_id,
+                now=now,
+                selected_window_observer=observe_authoritative_window,
+            )
+        else:
+            promotion_result = await maybe_auto_promote_for_startup_recall(
+                session, tenant_id, now=now
+            )
+    else:
+        if shadow_enabled:
+            shadow_result = await observe_startup_promotion_parity(session, tenant_id, now=now)
+            logger.info(
+                "startup_promotion_shadow tenant=%s window=%s wrapped=%s outcomes=%s request_id=%s",
+                tenant_id,
+                shadow_result.window_size,
+                shadow_result.wrapped,
+                dict(shadow_result.outcomes),
+                request_id,
+            )
+        promotion_result = PromotionResult(tenant_id, False, 0.0, 0)
 
     # 1. Bounded SQL candidate selection. Promotion consistency policy
     #    (requirement 12, "preferred conservative behavior"): when this
     #    recall's own lazy promotion pass actually promoted rows, read
     #    candidates from the primary/write session so the just-promoted rows
     #    are guaranteed visible in this recall — a read replica could lag
-    #    behind the promotion write. Otherwise use the read-oriented session
+    #    behind the promotion write. With B5 mutation disabled this branch is
+    #    impossible, so the normal read-oriented session is always used.
     #    (a configured replica via ENGRAM_READ_DATABASE_URL, or the primary
     #    when unset — see engram.db.read_session_factory).
     candidate_limit = min(
