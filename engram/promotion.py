@@ -1103,10 +1103,13 @@ async def maybe_auto_promote_for_startup_recall(
 
 PROMOTION_EVALUATE_JOB_TYPE = "promotion.evaluate"
 PROMOTION_EVALUATE_CONTRACT_VERSION = "promotion-evaluate-v1"
-# v2 (issue #155 correction): adds exactly one optional field,
-# ``execution_context_id`` — the durable job_execution_contexts row that pins
-# the non-ingest producer request's execution authority (the manual admin
-# trigger). v1 payloads remain fully supported during mixed-version rollout.
+# v2 (issue #155 correction) exists ONLY for the non-ingest pinned
+# execution-authority form: a valid v2 payload always carries
+# ``execution_context_id`` — the durable job_execution_contexts row pinning
+# the producer request's execution authority (e.g. the manual admin trigger)
+# — and never ``ingest_id``. v1 remains the contract for both pre-v2
+# authority forms (ingest-bound via ``ingest_id``, unprofiled compatibility
+# via neither field) and stays fully supported during mixed-version rollout.
 PROMOTION_EVALUATE_CONTRACT_VERSION_V2 = "promotion-evaluate-v2"
 
 TRIGGER_ITEM_CREATED = "item_created"
@@ -1165,11 +1168,13 @@ PROMOTION_EVALUATE_ALLOWED_FIELDS: frozenset[str] = frozenset(
     }
 )
 
-# v2 extends the closed set by exactly one optional identifier field:
+# v2 extends the closed set by exactly one mandatory identifier field:
 # ``execution_context_id`` references the immutable ``job_execution_contexts``
 # row recording the pinned execution authority of the producer request (a
-# reference to durable authorization state, never a copy of it). Everything
-# else about the v1 envelope — exact field set, closed vocabulary, centrally
+# reference to durable authorization state, never a copy of it). The field is
+# what v2 *is* — a v2 payload without it is damaged and fails closed — and it
+# is mutually exclusive with ``ingest_id`` by construction. Everything else
+# about the v1 envelope — exact field set, closed vocabulary, centrally
 # computed dedupe key — is unchanged.
 PROMOTION_EVALUATE_ALLOWED_FIELDS_V2: frozenset[str] = PROMOTION_EVALUATE_ALLOWED_FIELDS | {
     "execution_context_id"
@@ -1195,11 +1200,15 @@ class PromotionEvaluatePayload:
     ``trigger_id`` are audit provenance only. ``requested_policy_version`` is
     what the producer expected/requested at enqueue time — descriptive, never
     mutation authority (the evaluator always applies whatever policy is
-    currently configured). ``ingest_id`` is consumed only to reconstruct
-    execution authority identically to the legacy worker paths.
-    ``execution_context_id`` (v2 only) references the durable
-    ``job_execution_contexts`` row pinning a non-ingest producer request's
-    execution authority; it is mutually exclusive with ``ingest_id``.
+    currently configured). The execution-authority representation is named by
+    the contract version itself: v1 carries either ``ingest_id`` (ingest-bound
+    authority, consumed only to reconstruct execution authority identically
+    to the legacy worker paths) or neither field (established unprofiled
+    compatibility); v2 always carries a non-null ``execution_context_id``
+    referencing the durable ``job_execution_contexts`` row pinning a
+    non-ingest producer request's execution authority, and never
+    ``ingest_id``. A successfully parsed v2 therefore can never resolve to
+    the unprofiled ``memory_context=None`` path.
     """
 
     contract_version: str
@@ -1272,9 +1281,11 @@ def build_promotion_evaluate_payload(
     computes the dedupe key itself from the validated identity fields. Callers
     can never supply their own ``dedupe_key``, so enqueue-time construction
     and worker parse-time validation cannot drift apart. The returned dict
-    contains exactly the closed field set of its contract version (v1, or v2
-    when ``execution_context_id`` pins non-ingest execution authority),
-    nothing more.
+    contains exactly the closed field set of its contract version, nothing
+    more: v1 without ``execution_context_id`` (covering both legacy authority
+    forms — ingest-bound and unprofiled compatibility), v2 with one (the
+    non-ingest pinned execution-authority form, which may never also carry
+    ``ingest_id``).
     """
     item_id = _require_uuid(memory_item_id, field="memory_item_id")
     if trigger_type not in PROMOTION_EVALUATE_TRIGGER_TYPES:
@@ -1324,15 +1335,21 @@ def parse_promotion_evaluate_payload(payload: dict[str, object]) -> PromotionEva
       v2: :data:`PROMOTION_EVALUATE_ALLOWED_FIELDS_V2`) — unknown mutable
       decision state, memory content, credentials, or anything else — is
       rejected outright: the envelope stays exact/closed per version, not a
-      bag with tolerated extras;
+      bag with tolerated extras. This includes a v1 payload carrying
+      ``execution_context_id``, which v1's field set does not know;
     * an unknown/missing ``contract_version`` or an unrecognized
       ``trigger_type`` raises :class:`PromotionEvaluateContractError` rather
       than guessing at a compatible interpretation;
     * structurally malformed fields (missing/wrong-typed ``memory_item_id``,
       ``trigger_id``, etc.) raise the same error;
-    * a v2 payload may not carry both ``ingest_id`` and
-      ``execution_context_id``: a job has exactly one execution-authority
-      source, and an ambiguous one is rejected rather than guessed;
+    * the contract version names the mandatory execution-authority
+      representation: a v2 payload must carry a valid, non-null
+      ``execution_context_id`` and must NOT carry ``ingest_id``. An
+      authority-less v2 (the reference missing, null, or malformed) or an
+      ingest-authorized v2 is damaged — unprofiled compatibility and
+      ingest-bound authority are both v1's job — and fails closed here, so a
+      successfully parsed v2 can never be executed under the unprofiled
+      ``memory_context=None`` compatibility path;
     * the stored ``dedupe_key`` must equal the canonical key recomputed from
       the parsed ``(memory_item_id, trigger_type, trigger_id)`` identity — a
       wrong-but-nonempty ``dedupe_key`` is rejected exactly like an
@@ -1369,14 +1386,29 @@ def parse_promotion_evaluate_payload(payload: dict[str, object]) -> PromotionEva
         payload.get("requested_policy_version"), field="requested_policy_version"
     )
     ingest_id = _optional_uuid(payload.get("ingest_id"), field="ingest_id")
-    execution_context_id = _optional_uuid(
-        payload.get("execution_context_id"), field="execution_context_id"
-    )
-    if ingest_id is not None and execution_context_id is not None:
-        raise PromotionEvaluateContractError(
-            "promotion.evaluate payload cannot carry both ingest_id and "
-            "execution_context_id: a job has exactly one execution-authority source"
+    execution_context_id: uuid.UUID | None = None
+    if contract_version == PROMOTION_EVALUATE_CONTRACT_VERSION_V2:
+        # The version itself names the mandatory authority representation. A
+        # v2 envelope whose reference is missing/null/malformed is damaged —
+        # never a valid "unprofiled" v2 (that compatibility form is v1's) —
+        # and one carrying an ingest_id is equally invalid (ingest-bound
+        # authority is also v1's). Both fail closed here so the worker can
+        # never resolve a parsed v2 to the unprofiled memory_context=None
+        # path; the canonical producer never emits either shape, but worker
+        # validation must not rely on producer correctness alone.
+        execution_context_id = _optional_uuid(
+            payload.get("execution_context_id"), field="execution_context_id"
         )
+        if execution_context_id is None:
+            raise PromotionEvaluateContractError(
+                "promotion-evaluate-v2 requires a non-null execution_context_id "
+                "(unprofiled compatibility is the v1 contract)"
+            )
+        if ingest_id is not None:
+            raise PromotionEvaluateContractError(
+                "promotion-evaluate-v2 cannot carry ingest_id "
+                "(ingest-bound authority is the v1 contract)"
+            )
     dedupe_key = _require_nonempty_str(payload.get("dedupe_key"), field="dedupe_key")
     expected_dedupe_key = promotion_evaluate_dedupe_key(memory_item_id, trigger_type, trigger_id)
     if dedupe_key != expected_dedupe_key:

@@ -408,13 +408,23 @@ def test_valid_v2_payload_parses() -> None:
     )
 
 
-def test_v2_payload_without_execution_context_id_parses() -> None:
-    """The v2 field is optional within v2 — but the builder never emits that
-    shape (see test_build_emits_v2_only_with_execution_context_id)."""
-    contract = parse_promotion_evaluate_payload(
-        _valid_v2_payload(execution_context_id=None)
-    )
-    assert contract.execution_context_id is None
+def test_v2_with_null_execution_context_id_fails_closed() -> None:
+    """v2 exists only for the pinned non-ingest authority form: an
+    authority-less v2 envelope is damaged, not a valid "unprofiled" v2 (that
+    compatibility form is v1's). Failing closed here is what makes it
+    structurally impossible for the worker to execute a parsed v2 under the
+    unprofiled memory_context=None path."""
+    with pytest.raises(PromotionEvaluateContractError, match="execution_context_id"):
+        parse_promotion_evaluate_payload(_valid_v2_payload(execution_context_id=None))
+
+
+def test_v2_with_execution_context_id_omitted_entirely_fails_closed() -> None:
+    """Omitting the field entirely is the same damaged shape as an explicit
+    null and must fail identically."""
+    payload = _valid_v2_payload()
+    del payload["execution_context_id"]
+    with pytest.raises(PromotionEvaluateContractError, match="execution_context_id"):
+        parse_promotion_evaluate_payload(payload)
 
 
 def test_v1_payload_carrying_execution_context_id_fails_closed() -> None:
@@ -426,14 +436,22 @@ def test_v1_payload_carrying_execution_context_id_fails_closed() -> None:
         )
 
 
-def test_v2_rejects_ingest_and_execution_context_together() -> None:
-    """A job has exactly one execution-authority source; ambiguity fails
-    closed rather than being resolved by preference order."""
+def test_v2_rejects_ingest_id_with_or_without_execution_context() -> None:
+    """Ingest-bound authority is v1's job: a v2 envelope carrying an
+    ingest_id fails closed whether or not a valid execution_context_id is
+    also present. A job has exactly one execution-authority source, and the
+    contract version — not worker-side preference order — names it."""
     ingest_id = uuid.uuid4()
-    with pytest.raises(PromotionEvaluateContractError, match="exactly one"):
-        parse_promotion_evaluate_payload(
-            _valid_v2_payload(ingest_id=str(ingest_id))
-        )
+    # Valid execution context + ingest_id: ambiguous/ingest-authorized v2.
+    with pytest.raises(PromotionEvaluateContractError, match="ingest_id"):
+        parse_promotion_evaluate_payload(_valid_v2_payload(ingest_id=str(ingest_id)))
+    # ingest_id with the execution-context reference omitted entirely.
+    payload = _valid_v2_payload(ingest_id=str(ingest_id))
+    del payload["execution_context_id"]
+    with pytest.raises(PromotionEvaluateContractError):
+        parse_promotion_evaluate_payload(payload)
+    # The builder refuses the same combination at enqueue time, so the
+    # canonical producer can never emit it either.
     with pytest.raises(PromotionEvaluateContractError, match="exactly one"):
         build_promotion_evaluate_payload(
             memory_item_id=_ITEM_ID,
@@ -517,3 +535,36 @@ def test_build_emits_v2_only_with_execution_context_id() -> None:
     # And it round-trips through the worker-side parser.
     contract = parse_promotion_evaluate_payload(v2_shape)
     assert contract.execution_context_id == execution_context_id
+
+
+def test_every_parsed_v2_payload_pins_execution_context_and_never_ingest() -> None:
+    """The invariant this correction exists for, asserted directly: every
+    successfully parsed promotion-evaluate-v2 payload has a non-null
+    execution_context_id and a null ingest_id. Worker authority resolution
+    for v2 therefore always takes the reconstruct-or-raise branch and can
+    never fall back to the unprofiled memory_context=None compatibility path
+    (a v1-only form)."""
+    contexts = [
+        parse_promotion_evaluate_payload(_valid_v2_payload()),
+        parse_promotion_evaluate_payload(
+            _valid_v2_payload(execution_context_id=str(uuid.uuid4()))
+        ),
+        parse_promotion_evaluate_payload(
+            _valid_v2_payload(correlation_id=str(uuid.uuid4()))
+        ),
+        # The canonical builder's v2 output round-trips through the same
+        # invariant.
+        parse_promotion_evaluate_payload(
+            build_promotion_evaluate_payload(
+                memory_item_id=_ITEM_ID,
+                trigger_type=TRIGGER_MANUAL,
+                trigger_id=_RUN_ID,
+                execution_context_id=uuid.uuid4(),
+            )
+        ),
+    ]
+    assert contexts
+    for contract in contexts:
+        assert contract.contract_version == PROMOTION_EVALUATE_CONTRACT_VERSION_V2
+        assert contract.execution_context_id is not None
+        assert contract.ingest_id is None
