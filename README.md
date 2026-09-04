@@ -350,8 +350,11 @@ reason vocabulary (`backstop`, `policy_change`, `provider_recovery`,
 through ordinary retry/dead-letter. No thresholds, scores, decision state,
 credentials, or content ever enter the payload, and there is no metadata bag.
 
-Topology — no separate scheduler daemon, everything through the existing
-PostgreSQL job queue, one bounded job per tenant at a time:
+Topology — no separate scheduler daemon; all chains use the existing
+PostgreSQL job queue. Each chain executes bounded passes: the periodic
+backstop has one active per-tenant chain, while finite requests retain
+independent durable progress and may safely overlap without sharing cursor
+coverage:
 
 - **Periodic backstop chain** (`reason=backstop`): each pass self-schedules
   the next at `ENGRAM_PROMOTION_RECONCILIATION_INTERVAL_SECONDS` (default
@@ -450,11 +453,14 @@ Policy changes:
   changes: `POST /v1/admin/promotion/reconcile` (admin scope, tenant-scoped,
   content-free response, idempotent per `(reason, request_id)`) or
   `engram reconcile-promotion [--tenant <id>] [--reason
-  operator_request|provider_recovery] [--request-id <stable-id>]`. The request
-  with `--tenant` enqueues that tenant's bounded chain. Without `--tenant`, it
-  advances one persisted tenant page (default 100) and prints the stable
-  `--request-id` to repeat until `complete=true`; it never synchronously
-  materializes every tenant.
+  operator_request|provider_recovery] [--request-id <stable-id>]`. A
+  tenant-scoped request id is durable: its replay reports `active` while the
+  chain runs or `completed` after it finishes without enqueuing duplicate
+  work. A `failed` request id is terminal and must be retried with a fresh
+  `--request-id` (the CLI exits 1 to require operator action). Without
+  `--tenant`, the command advances one persisted tenant page (default 100) and
+  prints the stable `--request-id` to repeat until `complete=true`; it never
+  synchronously materializes every tenant.
 
 Execution authority and safety: reconciliation runs under the worker's routed
 tenant app-role RLS context; its item evaluations are v1-unprofiled

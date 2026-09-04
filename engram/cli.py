@@ -248,7 +248,8 @@ def main() -> None:
     reconcile_parser.add_argument(
         "--request-id",
         default=None,
-        help="Stable identity for idempotent replay of the same explicit request.",
+        help="Stable identity for a durable tenant request. Replays report active or "
+        "completed; a failed identity requires a fresh --request-id.",
     )
 
     backfill_parser = sub.add_parser(
@@ -1653,8 +1654,10 @@ async def _run_reconciliation_request(
     Connecting as the table-owning role (default) bypasses RLS for the
     content-free tenant enumeration and queue insert; every item-level
     discovery/evaluation runs later in the worker under the normal app-role
-    tenant context. Returns 0 on success, 3 when the reconciliation rollout
-    flag is off (the request was a documented no-op).
+    tenant context. Returns 0 for accepted or completed idempotent replays, 1
+    when a durable request identity previously failed (the operator must use a
+    fresh ``--request-id``), and 3 when the reconciliation rollout flag is off
+    (the request was a documented no-op).
     """
     import uuid as _uuid
 
@@ -1662,7 +1665,7 @@ async def _run_reconciliation_request(
     from engram.db import owner_session_factory as _default_factory
     from engram.promotion_reconciliation import (
         request_global_reconciliation_window,
-        request_reconciliation_chain,
+        request_reconciliation_chain_result,
     )
 
     factory = session_factory if session_factory is not None else _default_factory
@@ -1671,41 +1674,52 @@ async def _run_reconciliation_request(
         if not settings.promotion_reconciliation_enabled:
             print(
                 "promotion reconciliation is disabled "
-                "(ENGRAM_PROMOTION_RECONCILIATION_ENABLED=false): no work requested."
+                "(ENGRAM_PROMOTION_RECONCILIATION_ENABLED=false): "
+                "status=not_enqueued; no work requested."
             )
             return 3
 
         trigger_id = request_id if request_id else f"request:{_uuid.uuid4()}"
         if tenant_id is None:
-            result = await request_global_reconciliation_window(
+            window = await request_global_reconciliation_window(
                 session,
                 reason=reason,
                 trigger_id=trigger_id,
             )
             print(
-                f"reason={reason} request_id={trigger_id} inspected={result.inspected} "
-                f"enqueued={result.enqueued} complete={result.completed}"
+                f"reason={reason} request_id={trigger_id} inspected={window.inspected} "
+                f"enqueued={window.enqueued} complete={window.completed}"
             )
-            if not result.completed:
+            if not window.completed:
                 print(
                     "Continuation required: rerun with "
                     f"--reason {reason} --request-id {trigger_id}"
                 )
             return 0
-        job_id = await request_reconciliation_chain(
+        result = await request_reconciliation_chain_result(
             session,
             tenant_id=tenant_id,
             reason=reason,
             trigger_id=trigger_id,
         )
         await session.commit()
-        if job_id is None:
-            print(f"tenant={tenant_id} reason={reason} status=not_enqueued")
+        if result.status == "failed":
+            print(
+                f"tenant={tenant_id} reason={reason} request_id={trigger_id} "
+                "status=failed"
+            )
+            print("This reconciliation request previously failed. Retry with a fresh --request-id.")
+            return 1
+        if result.status in {"completed", "not_enqueued"}:
+            print(
+                f"tenant={tenant_id} reason={reason} request_id={trigger_id} "
+                f"status={result.status}"
+            )
             return 0
         print(
-            f"tenant={tenant_id} reason={reason} trigger_id={trigger_id} job_id={job_id}"
+            f"tenant={tenant_id} reason={reason} request_id={trigger_id} "
+            f"status={result.status} job_id={result.job_id}"
         )
-        print("\nTotal: reconciliation chains enqueued=1")
         return 0
 
 

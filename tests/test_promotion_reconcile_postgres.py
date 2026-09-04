@@ -384,6 +384,23 @@ async def _pending_reconcile(tenant_id: str) -> list[dict[str, Any]]:
     return await _jobs(tenant_id, job_type=PROMOTION_RECONCILE_JOB_TYPE, status=STATUS_PENDING)
 
 
+async def _reconcile_chain(
+    tenant_id: str, *, reason: str, trigger_id: str
+) -> dict[str, Any]:
+    async with _test_session_factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT status, cursor_created_at, cursor_item_id, completed_at, updated_at "
+                    "FROM promotion_reconcile_chains WHERE tenant_id = :tenant_id "
+                    "AND reason = :reason AND trigger_id = :trigger_id"
+                ),
+                {"tenant_id": tenant_id, "reason": reason, "trigger_id": trigger_id},
+            )
+        ).mappings().one()
+    return dict(row)
+
+
 async def _process_one(worker: str = "reconcile-test") -> bool:
     return await process_one_job(
         worker_id=worker,
@@ -433,6 +450,41 @@ async def _run_request_chain(
         assert job_id is not None
         await session.commit()
     await _drain_queue()
+
+
+async def _dead_letter_reconciliation_request(
+    tenant_id: str, *, trigger_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Force a valid finite request through worker retry and dead-letter."""
+    from engram import worker
+
+    async def _failing_handler(_session: AsyncSession, _job: Any) -> None:
+        raise RuntimeError("injected reconciliation failure")
+
+    monkeypatch.setitem(worker.JOB_HANDLERS, PROMOTION_RECONCILE_JOB_TYPE, _failing_handler)
+    async with _test_session_factory() as session:
+        await session.execute(
+            text(
+                "UPDATE jobs SET max_attempts = 2 WHERE tenant_id = :tenant_id "
+                "AND job_type = 'promotion.reconcile' "
+                "AND payload->>'trigger_id' = :trigger_id"
+            ),
+            {"tenant_id": tenant_id, "trigger_id": trigger_id},
+        )
+        await session.commit()
+
+    assert await _process_one()
+    async with _test_session_factory() as session:
+        await session.execute(
+            text(
+                "UPDATE jobs SET run_after = now() WHERE tenant_id = :tenant_id "
+                "AND job_type = 'promotion.reconcile' "
+                "AND payload->>'trigger_id' = :trigger_id"
+            ),
+            {"tenant_id": tenant_id, "trigger_id": trigger_id},
+        )
+        await session.commit()
+    assert await _process_one()
 
 
 def _flags(
@@ -1893,6 +1945,165 @@ async def test_global_operator_request_uses_bounded_continuation(monkeypatch):
         completed = result.completed
     assert all(count <= 2 for count in inspected)
     assert sum(inspected) == 4  # seeded default + three created tenants
+
+
+# ===========================================================================
+# CLI request lifecycle: durable tenant request results
+# ===========================================================================
+
+
+async def test_cli_reconciliation_active_replay_reports_existing_chain(monkeypatch, capsys):
+    _flags(monkeypatch)
+    if not await _db_ok():
+        _require_db()
+    from engram.cli import _run_reconciliation_request
+
+    tenant_id, _principal_id = await _default_tenant_principal()
+    trigger_id = "cli-active-replay"
+    async with _test_session_factory() as session:
+        job_id = await request_reconciliation_chain(
+            session,
+            tenant_id=tenant_id,
+            reason=RECONCILE_REASON_OPERATOR_REQUEST,
+            trigger_id=trigger_id,
+        )
+        await session.commit()
+    assert job_id is not None
+
+    rc = await _run_reconciliation_request(
+        tenant_id,
+        reason=RECONCILE_REASON_OPERATOR_REQUEST,
+        request_id=trigger_id,
+        session_factory=_test_session_factory,
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert f"request_id={trigger_id}" in out
+    assert "status=active" in out
+    assert f"job_id={job_id}" in out
+    assert len(await _jobs(tenant_id, job_type=PROMOTION_RECONCILE_JOB_TYPE)) == 1
+    assert (await _reconcile_chain(
+        tenant_id, reason=RECONCILE_REASON_OPERATOR_REQUEST, trigger_id=trigger_id
+    ))["status"] == "requested"
+
+
+async def test_cli_reconciliation_completed_replay_preserves_durable_progress(monkeypatch, capsys):
+    _flags(monkeypatch)
+    if not await _db_ok():
+        _require_db()
+    from engram.cli import _run_reconciliation_request
+
+    tenant_id, _principal_id = await _default_tenant_principal()
+    trigger_id = "cli-completed-replay"
+    async with _test_session_factory() as session:
+        job_id = await request_reconciliation_chain(
+            session,
+            tenant_id=tenant_id,
+            reason=RECONCILE_REASON_OPERATOR_REQUEST,
+            trigger_id=trigger_id,
+        )
+        await session.commit()
+    assert job_id is not None
+    await _drain_queue()
+    chain_before = await _reconcile_chain(
+        tenant_id, reason=RECONCILE_REASON_OPERATOR_REQUEST, trigger_id=trigger_id
+    )
+    async with _test_session_factory() as session:
+        epoch_before = (
+            await session.execute(
+                text(
+                    "SELECT cursor_epoch FROM promotion_reconcile_state "
+                    "WHERE tenant_id = :tenant_id"
+                ),
+                {"tenant_id": tenant_id},
+            )
+        ).scalar_one()
+
+    rc = await _run_reconciliation_request(
+        tenant_id,
+        reason=RECONCILE_REASON_OPERATOR_REQUEST,
+        request_id=trigger_id,
+        session_factory=_test_session_factory,
+    )
+    out = capsys.readouterr().out
+    chain_after = await _reconcile_chain(
+        tenant_id, reason=RECONCILE_REASON_OPERATOR_REQUEST, trigger_id=trigger_id
+    )
+    async with _test_session_factory() as session:
+        epoch_after = (
+            await session.execute(
+                text(
+                    "SELECT cursor_epoch FROM promotion_reconcile_state "
+                    "WHERE tenant_id = :tenant_id"
+                ),
+                {"tenant_id": tenant_id},
+            )
+        ).scalar_one()
+
+    assert rc == 0
+    assert "status=completed" in out
+    assert len(await _jobs(tenant_id, job_type=PROMOTION_RECONCILE_JOB_TYPE)) == 1
+    assert chain_before == chain_after
+    assert epoch_before == epoch_after
+
+
+async def test_cli_reconciliation_failed_replay_requires_fresh_request_id(monkeypatch, capsys):
+    _flags(monkeypatch)
+    if not await _db_ok():
+        _require_db()
+    from engram.cli import _run_reconciliation_request
+
+    tenant_id, _principal_id = await _default_tenant_principal()
+    failed_id = "cli-failed-replay"
+    async with _test_session_factory() as session:
+        job_id = await request_reconciliation_chain(
+            session,
+            tenant_id=tenant_id,
+            reason=RECONCILE_REASON_OPERATOR_REQUEST,
+            trigger_id=failed_id,
+        )
+        await session.commit()
+    assert job_id is not None
+    await _dead_letter_reconciliation_request(
+        tenant_id, trigger_id=failed_id, monkeypatch=monkeypatch
+    )
+
+    rc = await _run_reconciliation_request(
+        tenant_id,
+        reason=RECONCILE_REASON_OPERATOR_REQUEST,
+        request_id=failed_id,
+        session_factory=_test_session_factory,
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "status=failed" in out
+    assert "fresh --request-id" in out
+    assert len(await _jobs(tenant_id, job_type=PROMOTION_RECONCILE_JOB_TYPE)) == 1
+    assert (await _reconcile_chain(
+        tenant_id, reason=RECONCILE_REASON_OPERATOR_REQUEST, trigger_id=failed_id
+    ))["status"] == "failed"
+
+    new_id = "cli-new-after-failure"
+    rc = await _run_reconciliation_request(
+        tenant_id,
+        reason=RECONCILE_REASON_OPERATOR_REQUEST,
+        request_id=new_id,
+        session_factory=_test_session_factory,
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert f"request_id={new_id}" in out
+    assert "status=enqueued" in out
+    assert len(await _jobs(tenant_id, job_type=PROMOTION_RECONCILE_JOB_TYPE)) == 2
+    assert (await _reconcile_chain(
+        tenant_id, reason=RECONCILE_REASON_OPERATOR_REQUEST, trigger_id=failed_id
+    ))["status"] == "failed"
+    assert (await _reconcile_chain(
+        tenant_id, reason=RECONCILE_REASON_OPERATOR_REQUEST, trigger_id=new_id
+    ))["status"] == "requested"
 
 
 # ===========================================================================

@@ -605,9 +605,15 @@ than substituting any broader/legacy mechanism. Explicit requests (after
 direct-SQL `tenant_config` promotion changes, or for provider recovery once the
 provider is back): `POST /v1/admin/promotion/reconcile` or
 `engram reconcile-promotion --tenant <id> [--reason operator_request|provider_recovery]`.
-Without `--tenant`, the CLI advances one durable tenant page and prints a
-stable `--request-id`; repeat that command with the printed id until it reports
-`complete=true`. This keeps operator-triggered all-tenant work bounded too.
+For a tenant-scoped CLI request, supply a stable `--request-id`: replaying it
+reports `active` while work remains or `completed` after it finishes, without
+enqueuing duplicate work. A `failed` durable identity is terminal; the CLI
+reports it and exits 1, so retry with a fresh `--request-id`. When the rollout
+flag is off, the CLI reports `status=not_enqueued` and keeps its documented
+exit code 3. Without `--tenant`, the CLI advances one durable tenant page and
+prints a stable `--request-id`; repeat that command with the printed id until
+it reports `complete=true`. This keeps operator-triggered all-tenant work
+bounded too.
 Committed admission-affecting memory-kind changes (PATCH
 `/admin/memory-kinds/{name}` altering `enabled` or `auto_promote_from_inferred`)
 schedule one bounded `policy_change` chain automatically. Flipping the
