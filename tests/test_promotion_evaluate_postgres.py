@@ -31,6 +31,7 @@ from engram.jobs import STATUS_PENDING, enqueue_job
 from engram.models import ClassificationRun, Job, MemoryItem
 from engram.promotion import (
     PROMOTION_EVALUATE_CONTRACT_VERSION,
+    PROMOTION_EVALUATE_CONTRACT_VERSION_V2,
     TRIGGER_CLASSIFICATION_BOUND,
     TRIGGER_MANUAL,
     enqueue_promotion_evaluation,
@@ -1487,6 +1488,84 @@ async def test_unknown_field_envelope_fails_closed_through_retry_path():
     item = await _fetch_item(item_id)
     assert item["review_status"] == "proposed"
     assert await _events_for(item_id) == []
+
+
+@pytest.mark.parametrize(
+    "malformed_shape",
+    [
+        # A v2 envelope whose execution-authority reference is explicitly
+        # null: authority-less, which only v1's unprofiled compatibility
+        # form legitimately represents.
+        pytest.param({"execution_context_id": None, "ingest_id": None}, id="authorityless"),
+        # A v2 envelope carrying an ingest_id with no execution context at
+        # all: ingest-bound authority, which is v1's form.
+        pytest.param(
+            {"execution_context_id": None, "ingest_id": str(uuid.uuid4())},
+            id="ingest_bound",
+        ),
+    ],
+)
+async def test_malformed_v2_envelope_fails_closed_through_retry_path(malformed_shape):
+    """A damaged promotion-evaluate-v2 envelope inserted directly by a
+    generic queue producer (never through enqueue_promotion_evaluation) must
+    fail closed at worker parse time. The identity fields and dedupe_key are
+    entirely canonical here, so the authority defect is the only thing being
+    rejected — and the target item would promote under unrestricted
+    authority, so the unprofiled (memory_context=None) compatibility path
+    must never execute it: the item stays proposed, no promotion/review
+    audit event is written, and the job goes through the ordinary
+    retry/dead-letter semantics (pending, attempts incremented, not
+    succeeded)."""
+    if not await _db_ok():
+        _require_db()
+    tenant_id, principal_id = await _default_tenant_principal()
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="malformed v2 envelope target",
+        memory_confidence=0.9,
+        created_at=FIXED_NOW - timedelta(hours=200),
+    )
+    bad_payload: dict[str, object] = {
+        "contract_version": PROMOTION_EVALUATE_CONTRACT_VERSION_V2,
+        "memory_item_id": item_id,
+        "trigger_type": TRIGGER_MANUAL,
+        "trigger_id": "trigger-1",
+        "requested_policy_version": "promotion-legacy-v1",
+        "correlation_id": None,
+        "dedupe_key": promotion_evaluate_dedupe_key(
+            uuid.UUID(item_id), TRIGGER_MANUAL, "trigger-1"
+        ),
+        **malformed_shape,
+    }
+    async with _test_session_factory() as session:
+        await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
+        await enqueue_job(
+            session, tenant_id=tenant_id, job_type="promotion.evaluate", payload=bad_payload
+        )
+        await session.commit()
+
+    await process_one_job(
+        worker_id="test",
+        session_factory=_test_session_factory,
+        app_session_factory=_test_session_factory,
+        job_types=["promotion.evaluate"],
+    )
+
+    item = await _fetch_item(item_id)
+    assert item["review_status"] == "proposed"
+    events = await _events_for(item_id)
+    assert not any(e["event_type"] in ("review_change", "conflict_resolution") for e in events)
+
+    async with _test_session_factory() as session:
+        job = (
+            await session.execute(
+                text("SELECT status, attempts FROM jobs WHERE tenant_id = :tid"),
+                {"tid": tenant_id},
+            )
+        ).mappings().one()
+    assert job["status"] == STATUS_PENDING
+    assert job["attempts"] == 1
 
 
 # ===========================================================================

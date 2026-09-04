@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Literal, cast
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
@@ -30,14 +30,19 @@ from engram.auth import (
 from engram.auth import Principal as AuthPrincipal
 from engram.classification import invalidate_vocab_cache
 from engram.db import get_session
-from engram.memory_context import ResolvedMemoryContext, resolve_memory_context
+from engram.memory_access import apply_write_eligibility
+from engram.memory_context import (
+    ResolvedMemoryContext,
+    record_job_execution_context,
+    resolve_memory_context,
+)
 from engram.memory_kinds import (
     BUILTIN_KIND_NAMES,
     NAME_PATTERN,
     invalidate_memory_kind_cache,
 )
 from engram.memory_profiles import ProfileNotFoundError
-from engram.models import MemoryKind, Tenant, Workspace
+from engram.models import MemoryItem, MemoryKind, Tenant, Workspace
 from engram.models import Principal as PrincipalModel
 from engram.promotion import auto_promote_proposed_memories, summarize
 from engram.tenant_initialization import initialize_tenant
@@ -239,6 +244,17 @@ class PromotionResponse(BaseModel):
     would_promote_ids: list[uuid.UUID] = Field(default_factory=list)
     candidates: list[PromotionCandidateResponse] = Field(default_factory=list)
     summary: str
+
+
+class ItemEvaluateResponse(BaseModel):
+    """Result of requesting one canonical item-scoped evaluation (issue #155)."""
+
+    item_id: uuid.UUID
+    job_id: uuid.UUID | None = None
+    trigger_type: Literal["manual"]
+    # "enqueued" — a promotion.evaluate job was queued; "not_enqueued" — the
+    # rollout flag or tenant promotion config suppressed it.
+    status: Literal["enqueued", "not_enqueued"]
 
 
 # --- Endpoints ---------------------------------------------------------------
@@ -523,6 +539,101 @@ async def update_memory_kind(
     invalidate_memory_kind_cache(tenant_id)
     invalidate_vocab_cache(tenant_id)
     return _kind_to_out(kind)
+
+
+@router.post(
+    "/admin/items/{item_id}/evaluate",
+    response_model=ItemEvaluateResponse,
+    dependencies=[Depends(ADMIN_SCOPE)],
+)
+async def evaluate_item(
+    item_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+    memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
+) -> ItemEvaluateResponse:
+    """Enqueue one canonical ``promotion.evaluate`` job for a live proposal.
+
+    The explicit admin-request trigger from issue #155's trigger matrix. The
+    enqueued job runs the exact same evaluator and mutation machinery as
+    every other evaluation path — this endpoint only adds queue work and
+    audit provenance (``trigger_type='manual'``), never decision authority.
+    Repeated requests enqueue independently (each gets a fresh trigger id),
+    and the evaluator itself is idempotent, so replays are safe.
+
+    Authorization follows the mutation API's non-disclosing boundary, not a
+    tenant-wide admin bypass: the target is resolved through the caller's
+    existing-item write eligibility (``apply_write_eligibility``), so an item
+    outside the caller's memory profile is indistinguishable from a missing
+    one (404). API scopes and memory-profile boundaries are separate controls
+    — ``admin`` never silently bypasses a bound profile. For a profile-bound
+    caller the request additionally records its pinned execution authority
+    durably (``job_execution_contexts``, referenced by the v2 job payload),
+    so the worker that later runs the job reconstructs and applies the same
+    profile boundary rather than broader tenant-level authority; an
+    unprofiled caller keeps the established compatibility behavior.
+
+    Returns ``status='not_enqueued'`` when the rollout flag
+    (``ENGRAM_PROMOTION_EVALUATE_JOBS_ENABLED``) or the tenant's
+    ``auto_promote_enabled`` config suppressed the enqueue. An item that is
+    not a live proposal is a guaranteed evaluation no-op and is rejected
+    with 409 instead of silently enqueued.
+    """
+    from engram.promotion import (
+        TRIGGER_MANUAL,
+        is_live_proposal,
+        maybe_enqueue_promotion_evaluation,
+    )
+
+    tenant_id = await _resolve_tenant_id(session)
+    item = (
+        await session.execute(
+            apply_write_eligibility(
+                select(MemoryItem).where(MemoryItem.id == item_id), memory_context
+            )
+        )
+    ).scalar_one_or_none()
+    if item is None:
+        raise HTTPException(status_code=404, detail="Item not found")
+    if not is_live_proposal(item):
+        raise HTTPException(
+            status_code=409,
+            detail="Only a live proposed item can be queued for promotion evaluation",
+        )
+    # Only a profile-bound caller has a boundary worth preserving across the
+    # queue delay; recording it in the same transaction makes the authority
+    # row exist iff the job does.
+    execution_context_id = (
+        await record_job_execution_context(session, memory_context)
+        if memory_context.is_profile_bound
+        else None
+    )
+    job_id = await maybe_enqueue_promotion_evaluation(
+        session,
+        tenant_id=tenant_id,
+        item=item,
+        trigger_type=TRIGGER_MANUAL,
+        trigger_id=str(uuid.uuid4()),
+        execution_context_id=execution_context_id,
+    )
+    if job_id is None:
+        if execution_context_id is not None:
+            # Gates suppressed the enqueue: discard the authority row with the
+            # rest of the uncommitted work instead of leaving an orphan.
+            await session.rollback()
+        return ItemEvaluateResponse(
+            item_id=item_id,
+            job_id=None,
+            trigger_type=cast(Literal["manual"], TRIGGER_MANUAL),
+            status="not_enqueued",
+        )
+    await session.commit()
+    return ItemEvaluateResponse(
+        item_id=item_id,
+        job_id=job_id,
+        # TRIGGER_MANUAL is the closed-vocabulary constant for "manual".
+        trigger_type=cast(Literal["manual"], TRIGGER_MANUAL),
+        status="enqueued",
+    )
 
 
 @router.post(

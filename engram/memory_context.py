@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import Depends, HTTPException, status
 from sqlalchemy import select, text
@@ -19,7 +19,7 @@ from engram.config import settings
 from engram.db import get_session
 
 if TYPE_CHECKING:
-    from engram.models import CandidateIngest, CandidateIngestExecution
+    from engram.models import CandidateIngest
 
 MEMORY_CONTEXT_VERSION = "memory-context-v2"
 LEGACY_MEMORY_CONTEXT_VERSION = "legacy-unprofiled-v0"
@@ -313,6 +313,140 @@ async def resolve_memory_context(
     )
 
 
+async def _reconstruct_pinned_context(
+    session: AsyncSession,
+    *,
+    tenant_id: UUID,
+    principal_id: UUID,
+    api_key_id: UUID | None,
+    memory_profile_id: UUID | None,
+    memory_profile_revision_id: UUID | None,
+) -> ResolvedMemoryContext:
+    """Rebuild one request-time boundary from its pinned provenance columns.
+
+    Shared by every durable execution-authority reconstruction (ingest
+    execution rows and job execution contexts alike) so all worker paths apply
+    the exact same rules: the pinned revision is re-loaded from its immutable
+    row (never "current active policy"), the admin workspace-membership bypass
+    is re-derived from the surviving API-key row only, and any unavailable or
+    incoherent provenance raises ``ValueError`` (fail closed — never a broader
+    fallback).
+    """
+    # API-key deletion truthfully nulls the historical key reference.  Without
+    # durable evidence of an admin scope, worker reconstruction must not infer
+    # the membership bypass from that NULL and accidentally widen cross-item
+    # effects.
+    admin_workspace_bypass = False
+    if api_key_id is not None:
+        scopes = await session.scalar(
+            text(
+                "SELECT scopes FROM api_keys WHERE tenant_id = :tenant_id "
+                "AND id = :api_key_id"
+            ),
+            {"tenant_id": str(tenant_id), "api_key_id": str(api_key_id)},
+        )
+        admin_workspace_bypass = scopes is not None and "admin" in scopes
+    if memory_profile_id is None:
+        if memory_profile_revision_id is not None:
+            raise ValueError("pinned memory profile provenance is incoherent")
+        return ResolvedMemoryContext(
+            version=MEMORY_CONTEXT_VERSION,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            api_key_id=api_key_id,
+            memory_profile_id=None,
+            memory_profile_revision_id=None,
+            memory_profile_slug=None,
+            memory_profile_version=None,
+            include_private=True,
+            include_tenant=True,
+            include_public=True,
+            readable_workspace_ids=None,
+            allow_tenant_write=True,
+            allow_public_write=True,
+            default_write_visibility="private",
+            default_write_workspace_id=None,
+            writable_workspace_ids=None,
+            admin_workspace_bypass=admin_workspace_bypass,
+        )
+    if memory_profile_revision_id is None:
+        raise ValueError("pinned memory profile provenance is incoherent")
+    row = (
+        await session.execute(
+            text(
+                "SELECT p.slug, r.version, r.include_private, r.include_tenant, "
+                "r.include_public, r.allow_tenant_write, r.allow_public_write, "
+                "r.default_write_visibility, r.default_write_workspace_id, "
+                "COALESCE(array_agg(g.workspace_id) FILTER (WHERE g.can_read), "
+                "ARRAY[]::uuid[]) AS readable_workspace_ids, "
+                "COALESCE(array_agg(g.workspace_id) FILTER (WHERE g.can_write), "
+                "ARRAY[]::uuid[]) AS writable_workspace_ids "
+                "FROM memory_profiles p JOIN memory_profile_revisions r "
+                "ON r.tenant_id = p.tenant_id AND r.profile_id = p.id "
+                "LEFT JOIN memory_profile_workspace_grants g "
+                "ON g.tenant_id = r.tenant_id AND g.revision_id = r.id "
+                "WHERE p.tenant_id = :tenant_id AND p.id = :profile_id "
+                "AND r.id = :revision_id "
+                "GROUP BY p.slug, r.version, r.include_private, r.include_tenant, "
+                "r.include_public, r.allow_tenant_write, r.allow_public_write, "
+                "r.default_write_visibility, r.default_write_workspace_id"
+            ),
+            {
+                "tenant_id": str(tenant_id),
+                "profile_id": str(memory_profile_id),
+                "revision_id": str(memory_profile_revision_id),
+            },
+        )
+    ).mappings().first()
+    if row is None:
+        raise ValueError("pinned memory profile revision is unavailable")
+    readable = frozenset(UUID(str(value)) for value in row["readable_workspace_ids"])
+    writable = frozenset(UUID(str(value)) for value in row["writable_workspace_ids"])
+    default_visibility = str(row["default_write_visibility"])
+    default_workspace = (
+        UUID(str(row["default_write_workspace_id"]))
+        if row["default_write_workspace_id"] is not None
+        else None
+    )
+    context = ResolvedMemoryContext(
+        version=MEMORY_CONTEXT_VERSION,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        api_key_id=api_key_id,
+        memory_profile_id=memory_profile_id,
+        memory_profile_revision_id=memory_profile_revision_id,
+        memory_profile_slug=str(row["slug"]),
+        memory_profile_version=int(row["version"]),
+        include_private=bool(row["include_private"]),
+        include_tenant=bool(row["include_tenant"]),
+        include_public=bool(row["include_public"]),
+        readable_workspace_ids=readable,
+        allow_tenant_write=bool(row["allow_tenant_write"]),
+        allow_public_write=bool(row["allow_public_write"]),
+        default_write_visibility=cast(WriteVisibility, default_visibility),
+        default_write_workspace_id=default_workspace,
+        writable_workspace_ids=writable,
+        admin_workspace_bypass=admin_workspace_bypass,
+    )
+    coherent_default = (
+        (default_visibility == "private" and default_workspace is None)
+        or (
+            default_visibility == "workspace"
+            and default_workspace is not None
+            and default_workspace in writable
+        )
+        or (default_visibility == "tenant" and context.allow_tenant_write)
+        or (default_visibility == "public" and context.allow_public_write)
+    )
+    if (
+        default_visibility not in _VALID_VISIBILITIES
+        or not writable.issubset(readable)
+        or not coherent_default
+    ):
+        raise ValueError("pinned memory profile revision is incoherent")
+    return context
+
+
 async def memory_context_from_ingest(
     session: AsyncSession, ingest: CandidateIngest
 ) -> ResolvedMemoryContext | None:
@@ -355,124 +489,85 @@ async def memory_context_from_ingest(
             "execution-context row; refusing to reconstruct a profiled worker "
             "boundary from candidate origin alone"
         )
-    context_source: CandidateIngest | CandidateIngestExecution = execution
-    if context_source.memory_context_version == LEGACY_MEMORY_CONTEXT_VERSION:
+    if execution.memory_context_version == LEGACY_MEMORY_CONTEXT_VERSION:
         return None
-    if context_source.memory_context_version != MEMORY_CONTEXT_VERSION:
+    if execution.memory_context_version != MEMORY_CONTEXT_VERSION:
         raise ValueError("unsupported candidate memory context")
-    # API-key deletion truthfully nulls the historical key reference.  Without
-    # durable evidence of an admin scope, worker reconstruction must not infer
-    # the membership bypass from that NULL and accidentally widen cross-item
-    # effects.
-    admin_workspace_bypass = False
-    if context_source.api_key_id is not None:
-        scopes = await session.scalar(
-            text(
-                "SELECT scopes FROM api_keys WHERE tenant_id = :tenant_id "
-                "AND id = :api_key_id"
-            ),
-            {
-                "tenant_id": str(ingest.tenant_id),
-                "api_key_id": str(context_source.api_key_id),
-            },
-        )
-        admin_workspace_bypass = scopes is not None and "admin" in scopes
-    if context_source.memory_profile_id is None:
-        if context_source.memory_profile_revision_id is not None:
-            raise ValueError("candidate memory profile provenance is incoherent")
-        return ResolvedMemoryContext(
-            version=MEMORY_CONTEXT_VERSION,
-            tenant_id=ingest.tenant_id,
-            principal_id=ingest.principal_id,
-            api_key_id=context_source.api_key_id,
-            memory_profile_id=None,
-            memory_profile_revision_id=None,
-            memory_profile_slug=None,
-            memory_profile_version=None,
-            include_private=True,
-            include_tenant=True,
-            include_public=True,
-            readable_workspace_ids=None,
-            allow_tenant_write=True,
-            allow_public_write=True,
-            default_write_visibility="private",
-            default_write_workspace_id=None,
-            writable_workspace_ids=None,
-            admin_workspace_bypass=admin_workspace_bypass,
-        )
-    if context_source.memory_profile_revision_id is None:
-        raise ValueError("candidate memory profile provenance is incoherent")
-    row = (
-        await session.execute(
-            text(
-                "SELECT p.slug, r.version, r.include_private, r.include_tenant, "
-                "r.include_public, r.allow_tenant_write, r.allow_public_write, "
-                "r.default_write_visibility, r.default_write_workspace_id, "
-                "COALESCE(array_agg(g.workspace_id) FILTER (WHERE g.can_read), "
-                "ARRAY[]::uuid[]) AS readable_workspace_ids, "
-                "COALESCE(array_agg(g.workspace_id) FILTER (WHERE g.can_write), "
-                "ARRAY[]::uuid[]) AS writable_workspace_ids "
-                "FROM memory_profiles p JOIN memory_profile_revisions r "
-                "ON r.tenant_id = p.tenant_id AND r.profile_id = p.id "
-                "LEFT JOIN memory_profile_workspace_grants g "
-                "ON g.tenant_id = r.tenant_id AND g.revision_id = r.id "
-                "WHERE p.tenant_id = :tenant_id AND p.id = :profile_id "
-                "AND r.id = :revision_id "
-                "GROUP BY p.slug, r.version, r.include_private, r.include_tenant, "
-                "r.include_public, r.allow_tenant_write, r.allow_public_write, "
-                "r.default_write_visibility, r.default_write_workspace_id"
-            ),
-            {
-                "tenant_id": str(ingest.tenant_id),
-                "profile_id": str(context_source.memory_profile_id),
-                "revision_id": str(context_source.memory_profile_revision_id),
-            },
-        )
-    ).mappings().first()
-    if row is None:
-        raise ValueError("candidate memory profile revision is unavailable")
-    readable = frozenset(UUID(str(value)) for value in row["readable_workspace_ids"])
-    writable = frozenset(UUID(str(value)) for value in row["writable_workspace_ids"])
-    default_visibility = str(row["default_write_visibility"])
-    default_workspace = (
-        UUID(str(row["default_write_workspace_id"]))
-        if row["default_write_workspace_id"] is not None
-        else None
-    )
-    context = ResolvedMemoryContext(
-        version=MEMORY_CONTEXT_VERSION,
+    return await _reconstruct_pinned_context(
+        session,
         tenant_id=ingest.tenant_id,
         principal_id=ingest.principal_id,
-        api_key_id=context_source.api_key_id,
-        memory_profile_id=context_source.memory_profile_id,
-        memory_profile_revision_id=context_source.memory_profile_revision_id,
-        memory_profile_slug=str(row["slug"]),
-        memory_profile_version=int(row["version"]),
-        include_private=bool(row["include_private"]),
-        include_tenant=bool(row["include_tenant"]),
-        include_public=bool(row["include_public"]),
-        readable_workspace_ids=readable,
-        allow_tenant_write=bool(row["allow_tenant_write"]),
-        allow_public_write=bool(row["allow_public_write"]),
-        default_write_visibility=cast(WriteVisibility, default_visibility),
-        default_write_workspace_id=default_workspace,
-        writable_workspace_ids=writable,
-        admin_workspace_bypass=admin_workspace_bypass,
+        api_key_id=execution.api_key_id,
+        memory_profile_id=execution.memory_profile_id,
+        memory_profile_revision_id=execution.memory_profile_revision_id,
     )
-    coherent_default = (
-        (default_visibility == "private" and default_workspace is None)
-        or (
-            default_visibility == "workspace"
-            and default_workspace is not None
-            and default_workspace in writable
+
+
+async def record_job_execution_context(
+    session: AsyncSession, memory_context: ResolvedMemoryContext
+) -> UUID:
+    """Durably record one profile-bound request's execution authority (#155).
+
+    The non-ingest analog of the remember path writing a
+    ``candidate_ingest_executions`` row: the row pins the exact identity the
+    authenticated request resolved (principal, API key, profile revision), so
+    the job it authorizes can later reconstruct the same boundary. Insert with
+    the caller's transaction so the authority row exists iff the job does.
+    Only meaningful for a profile-bound context — an unprofiled caller has no
+    narrowing boundary to preserve, and its compatibility behavior is to not
+    record one.
+    """
+    from engram.models import JobExecutionContext
+
+    if not memory_context.is_profile_bound:
+        raise ValueError("job execution contexts record profile-bound authority only")
+    if memory_context.memory_profile_revision_id is None:
+        raise ValueError("profile-bound context is missing its pinned revision")
+    context_id = uuid4()
+    session.add(
+        JobExecutionContext(
+            id=context_id,
+            tenant_id=memory_context.tenant_id,
+            principal_id=memory_context.principal_id,
+            api_key_id=memory_context.api_key_id,
+            memory_profile_id=memory_context.memory_profile_id,
+            memory_profile_revision_id=memory_context.memory_profile_revision_id,
+            memory_context_version=memory_context.version,
         )
-        or (default_visibility == "tenant" and context.allow_tenant_write)
-        or (default_visibility == "public" and context.allow_public_write)
     )
-    if (
-        default_visibility not in _VALID_VISIBILITIES
-        or not writable.issubset(readable)
-        or not coherent_default
-    ):
-        raise ValueError("candidate memory profile revision is incoherent")
-    return context
+    return context_id
+
+
+async def memory_context_from_execution_context(
+    session: AsyncSession, execution_context_id: UUID, *, tenant_id: UUID
+) -> ResolvedMemoryContext:
+    """Reconstruct a non-ingest producer request's execution authority.
+
+    Loads the durable ``job_execution_contexts`` row and rebuilds the exact
+    pinned boundary through the same shared rules as ingest execution rows
+    (see :func:`_reconstruct_pinned_context`). The row is the only accepted
+    source — a missing row, a row from another tenant, an unsupported context
+    version, or an unavailable/incoherent pinned revision raises ``ValueError``
+    so callers fail closed; there is never a broader/unprofiled fallback, and
+    ``None`` is never returned (unlike the ingest path, this table has no
+    legacy-unprofiled history).
+    """
+    from engram.models import JobExecutionContext
+
+    row = await session.scalar(
+        select(JobExecutionContext).where(JobExecutionContext.id == execution_context_id)
+    )
+    if row is None:
+        raise ValueError("job execution context is unavailable")
+    if row.tenant_id != tenant_id:
+        raise ValueError("job execution context belongs to another tenant")
+    if row.memory_context_version != MEMORY_CONTEXT_VERSION:
+        raise ValueError("unsupported job execution context version")
+    return await _reconstruct_pinned_context(
+        session,
+        tenant_id=row.tenant_id,
+        principal_id=row.principal_id,
+        api_key_id=row.api_key_id,
+        memory_profile_id=row.memory_profile_id,
+        memory_profile_revision_id=row.memory_profile_revision_id,
+    )

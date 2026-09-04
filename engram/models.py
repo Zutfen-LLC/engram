@@ -1385,6 +1385,69 @@ class CandidateIngestExecution(Base):
     )
 
 
+class JobExecutionContext(Base):
+    """Immutable execution authority that authorized a non-ingest producer request.
+
+    Generic analog of :class:`CandidateIngestExecution` (migration 025) for job
+    producers with no candidate ingest to hang authority on — starting with the
+    manual ``promotion.evaluate`` trigger. One row records the pinned
+    memory-context identity (principal, API key, profile revision) under which
+    the request passed its write-eligibility boundary, so queued work can later
+    reconstruct the same profile boundary instead of falling back to broader
+    authority. A reference to pinned state only: revisions are append-only, and
+    workers re-load the pinned revision at execution time.
+    """
+
+    __tablename__ = "job_execution_contexts"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id"],
+            ["tenants.id"],
+            ondelete="CASCADE",
+            name="fk_job_execution_contexts_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "principal_id"],
+            ["principals.tenant_id", "principals.id"],
+            ondelete="CASCADE",
+            name="fk_job_execution_contexts_principal",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "api_key_id"],
+            ["api_keys.tenant_id", "api_keys.id"],
+            ondelete="SET NULL",
+            deferrable=True,
+            initially="DEFERRED",
+            name="fk_job_execution_contexts_api_key",
+        ),
+        ForeignKeyConstraint(
+            ["memory_profile_revision_id", "memory_profile_id", "tenant_id"],
+            [
+                "memory_profile_revisions.id",
+                "memory_profile_revisions.profile_id",
+                "memory_profile_revisions.tenant_id",
+            ],
+            ondelete="NO ACTION",
+            deferrable=True,
+            initially="DEFERRED",
+            name="fk_job_execution_contexts_profile_revision",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    principal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    api_key_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    memory_profile_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    memory_profile_revision_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    memory_context_version: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
 class UsageEvent(Base):
     """Append-only metering/usage telemetry ledger (ENG-METER-001).
 

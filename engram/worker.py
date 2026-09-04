@@ -232,6 +232,22 @@ def _payload_item_id(job: Job) -> UUID:
 async def _job_memory_context(
     session: AsyncSession, job: Job
 ) -> ResolvedMemoryContext | None:
+    # A job's durable execution authority is exactly one source: the
+    # non-ingest ``job_execution_contexts`` reference (promotion-evaluate-v2,
+    # e.g. the manual admin trigger — the v2 contract parser guarantees this
+    # reference is present, so a parsed v2 always takes this branch, which
+    # reconstructs or raises, never returns None) or the candidate-ingest
+    # execution row (every ingest-bound producer). No authority reference at
+    # all is the established unprofiled compatibility state (``None``) — a
+    # v1-only form — never a fallback for a reference that exists but cannot
+    # be reconstructed; that raises.
+    raw_execution_context_id = job.payload.get("execution_context_id")
+    if raw_execution_context_id is not None:
+        from engram.memory_context import memory_context_from_execution_context
+
+        return await memory_context_from_execution_context(
+            session, _parse_uuid(raw_execution_context_id), tenant_id=job.tenant_id
+        )
     raw_ingest_id = job.payload.get("ingest_id")
     if raw_ingest_id is None:
         return None
@@ -1832,6 +1848,7 @@ async def handle_promotion_evaluate(session: AsyncSession, job: Job) -> None:
     and succeeds as an idempotent no-op — these are not worker failures.
     """
     from engram.promotion import (
+        PROMOTION_EVALUATE_CONTRACT_VERSION_V2,
         PromotionEvaluateContractError,
         evaluate_promotion_item_current_state,
         parse_promotion_evaluate_payload,
@@ -1841,6 +1858,15 @@ async def handle_promotion_evaluate(session: AsyncSession, job: Job) -> None:
         contract = parse_promotion_evaluate_payload(job.payload)
     except PromotionEvaluateContractError as exc:
         raise ValueError(f"promotion.evaluate malformed contract: {exc}") from exc
+    if contract.contract_version == PROMOTION_EVALUATE_CONTRACT_VERSION_V2 and (
+        contract.execution_context_id is None or contract.ingest_id is not None
+    ):
+        # Defense-in-depth for the parser's structural invariant (unreachable
+        # today): a parsed v2 always pins execution_context_id and never
+        # carries ingest_id, so authority resolution below can only
+        # reconstruct-or-raise — never fall through to the unprofiled
+        # memory_context=None path, which is v1's compatibility form alone.
+        raise ValueError("promotion.evaluate v2 contract lost its pinned execution authority")
 
     # Reload + verify visibility within the routed tenant before doing any
     # further work. The job's tenant_id is routing context, not proof: the
@@ -1861,9 +1887,13 @@ async def handle_promotion_evaluate(session: AsyncSession, job: Job) -> None:
     if str(item.tenant_id) != str(job.tenant_id):
         raise RuntimeError(f"job tenant {job.tenant_id} != item tenant {item.tenant_id}")
 
-    # Execution-authority reconstruction: same v2 candidate-origin provenance
-    # rules as promotion.path_a, but a reconstruction failure is not caught
-    # here (see docstring) — it propagates to the retry/dead-letter path.
+    # Execution-authority reconstruction: the payload's single authority
+    # reference — an ingest execution row (ingest-bound producers, same v2
+    # candidate-origin provenance rules as promotion.path_a) or a
+    # job_execution_contexts row (non-ingest producers like the manual admin
+    # trigger). A reconstruction failure is not caught here (see docstring) —
+    # it propagates to the retry/dead-letter path; there is no broader
+    # fallback.
     memory_context = await _job_memory_context(session, job)
 
     evaluation_id = uuid.uuid4()

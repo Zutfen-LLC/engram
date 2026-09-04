@@ -30,7 +30,14 @@ from engram.memory_access import (
 )
 from engram.memory_context import ResolvedMemoryContext, resolve_memory_context
 from engram.models import MemoryItem, TenantConfig
-from engram.promotion import _config_values, assess_promotion_candidate, load_promotion_support
+from engram.promotion import (
+    TRIGGER_CONFLICT_CHANGED,
+    TRIGGER_REVIEW_CHANGED,
+    _config_values,
+    assess_promotion_candidate,
+    load_promotion_support,
+    maybe_enqueue_promotion_evaluation,
+)
 from engram.promotion_readiness import build_promotion_readiness
 from engram.review_policy import (
     TransitionOutcome,
@@ -769,6 +776,18 @@ async def verify_item(
             "item_id": str(item_id),
         },
     )
+    # Canonical promotion-evaluation trigger (issue #155): a committed human
+    # verification change on a live proposal refreshes its evaluation
+    # diagnostics. Verification is not admission evidence for any current
+    # gate, so the enqueued evaluation is a safe no-op unless policy later
+    # consumes it. Inert unless the rollout flag is on.
+    await maybe_enqueue_promotion_evaluation(
+        session,
+        tenant_id=str(tenant_id),
+        item=item,
+        trigger_type=TRIGGER_REVIEW_CHANGED,
+        trigger_id=str(event["id"]),
+    )
     updated = await _require_eligible_item(
         session, item_id, memory_context=memory_context
     )
@@ -896,6 +915,17 @@ async def resolve_conflict(
         on_behalf_of_principal_id=on_behalf_of,
         reason=req.reason,
         memory_context=memory_context,
+    )
+    # Canonical promotion-evaluation trigger (issue #155): a resolved
+    # conflict clears the promotion conflict block, so a live proposal that
+    # was otherwise admissible can now be admitted by the enqueued
+    # evaluation. Inert unless the rollout flag is on.
+    await maybe_enqueue_promotion_evaluation(
+        session,
+        tenant_id=str(tenant_id),
+        item=target,
+        trigger_type=TRIGGER_CONFLICT_CHANGED,
+        trigger_id=str(event["id"]),
     )
     await session.commit()
     return ConflictResolutionResponse(

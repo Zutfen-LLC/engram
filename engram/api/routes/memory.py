@@ -1189,6 +1189,26 @@ async def _remember_impl(
             dedupe_key=f"classification.refine:{item.id}",
         )
 
+    # Canonical promotion-evaluation trigger (issue #155): every live
+    # proposal gets a baseline evaluation at its exact legacy cooling
+    # boundary. This is the future reassessment path for explicit-kind
+    # writes and below-threshold receipts, which otherwise schedule no
+    # classification-bound job. Inert unless the rollout flag is on.
+    if review_status == "proposed":
+        from engram.promotion import TRIGGER_ITEM_CREATED, maybe_enqueue_promotion_evaluation
+        from engram.promotion_policy import LEGACY_PROMOTION_POLICY_VERSION
+
+        await maybe_enqueue_promotion_evaluation(
+            session,
+            tenant_id=tenant_id,
+            item=item,
+            trigger_type=TRIGGER_ITEM_CREATED,
+            trigger_id=str(ingest.id),
+            requested_policy_version=LEGACY_PROMOTION_POLICY_VERSION,
+            ingest_id=ingest.id,
+            correlation_id=correlation_id,
+        )
+
     # 9. Embeddings are generated OFF the request path (ENG-AUD-008 / F20).
     # Create the pending placeholder synchronously so the row exists, then
     # enqueue an embedding.generate job. The provider is never called inline,
@@ -1679,6 +1699,28 @@ async def feedback(
         )
     if result.status != "recorded":
         response.status_code = 200
+    # Canonical promotion-evaluation trigger (issue #155): a committed verdict
+    # transition can block (new external noise) or unblock (replacement
+    # lifting a noise block) a live proposal. Feedback effects themselves are
+    # NOT promotion evidence (importance never feeds the evaluator) — only
+    # the committed transition schedules reevaluation, and the evaluator
+    # reads promotion state, not feedback-derived scores. Enqueued after the
+    # feedback commit, so a crash between the two commits loses this one
+    # trigger: today's recovery is the item_created baseline job (for items
+    # created while the flag was on) and the startup rotation sweep; the
+    # reconciliation backstop is the durable fix and remains future work.
+    # Inert unless the rollout flag is on.
+    if result.status != "unchanged":
+        from engram.promotion import TRIGGER_FEEDBACK, maybe_enqueue_promotion_evaluation
+
+        await maybe_enqueue_promotion_evaluation(
+            session,
+            tenant_id=tenant_id,
+            item=item,
+            trigger_type=TRIGGER_FEEDBACK,
+            trigger_id=str(result.feedback_event_id),
+        )
+        await session.commit()
     return FeedbackResponse(**result.__dict__)
 
 
@@ -2408,6 +2450,26 @@ async def supersede_item(
     )
     new_item = await _require_eligible_item(
         session, new_id, memory_context=memory_context
+    )
+    # Canonical promotion-evaluation trigger (issue #155): a supersession's
+    # replacement is the dedup-material-update path's item creation — a live
+    # proposal restarts its cooling window and gets the same baseline
+    # boundary evaluation the remember path schedules. The replacement
+    # event's id is the stable creation-event identity here (no ingest
+    # exists for a direct supersede). Like /v1/remember's item-created
+    # producer, this schedules at the legacy cooling boundary, so the audit
+    # provenance reports the legacy requested policy version. Inert unless
+    # the rollout flag is on.
+    from engram.promotion import TRIGGER_ITEM_CREATED, maybe_enqueue_promotion_evaluation
+    from engram.promotion_policy import LEGACY_PROMOTION_POLICY_VERSION
+
+    await maybe_enqueue_promotion_evaluation(
+        session,
+        tenant_id=tenant_id,
+        item=new_item,
+        trigger_type=TRIGGER_ITEM_CREATED,
+        trigger_id=str(replacement_event["id"]),
+        requested_policy_version=LEGACY_PROMOTION_POLICY_VERSION,
     )
     await session.commit()
     return {
