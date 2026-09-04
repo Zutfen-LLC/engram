@@ -562,10 +562,12 @@ The standard Docker Compose stack (`docker compose up -d`) starts a dedicated
 `jobs` table and runs the off-request-path work: `embedding.generate`,
 `conflict.check`, `classification.refine`, `promotion.path_a`,
 `promotion.evaluate` (issue #155's canonical, item-scoped, current-state
-promotion-evaluation job — see README.md), `retention.sweep`, and
-(ENG-AUD-011) `recall.telemetry`. It is Postgres-only (no Redis/Celery/SQS):
-workers claim with `FOR UPDATE SKIP LOCKED`, retry failures with exponential
-backoff, and dead-letter after `ENGRAM_JOB_MAX_ATTEMPTS`.
+promotion-evaluation job — see README.md), `promotion.reconcile` (the bounded
+promotion reconciliation backstop, ENG-PROMOTION-003B4 — see below),
+`retention.sweep`, and (ENG-AUD-011) `recall.telemetry`. It is Postgres-only
+(no Redis/Celery/SQS): workers claim with `FOR UPDATE SKIP LOCKED`, retry
+failures with exponential backoff, and dead-letter after
+`ENGRAM_JOB_MAX_ATTEMPTS`.
 
 `promotion.evaluate` producers are gated on
 `ENGRAM_PROMOTION_EVALUATE_JOBS_ENABLED` (default `false`): classification-bound
@@ -578,6 +580,30 @@ for a profile-bound key, pins that boundary in a durable
 so the worker applies the same boundary asynchronously (fail-closed, no broader
 fallback). With the flag off, none of these enqueue and only the legacy paths
 run — flipping the flag back off is the rollback.
+
+**Promotion reconciliation backstop** (ENG-PROMOTION-003B4 / issue #155) is
+gated on `ENGRAM_PROMOTION_RECONCILIATION_ENABLED` (default `false`),
+independent of the evaluate flag above. When enabled, the worker loop
+additionally bootstraps (and heals, after crashes or dead chain jobs) one
+per-tenant periodic `promotion.reconcile` chain that repairs missing/dead
+targeted promotion evaluation work — bounded to
+`ENGRAM_PROMOTION_RECONCILIATION_PASS_LIMIT` (default 20) items per pass, at
+`ENGRAM_PROMOTION_RECONCILIATION_INTERVAL_SECONDS` (default 3600) per pass.
+Reconciliation never promotes anything itself: it only enqueues canonical
+`promotion.evaluate` jobs (or re-enqueues the async classification contract for
+provider recovery), which run the ordinary shared evaluator. When the evaluate
+flag is off, reconciliation passes record discovered work as suppressed rather
+than substituting any broader/legacy mechanism. Explicit requests (after
+direct-SQL `tenant_config` promotion changes, or for provider recovery once the
+provider is back): `POST /v1/admin/promotion/reconcile` or
+`engram reconcile-promotion --tenant <id> [--reason operator_request|provider_recovery]`.
+Committed admission-affecting memory-kind changes (PATCH
+`/admin/memory-kinds/{name}` altering `enabled` or `auto_promote_from_inferred`)
+schedule one bounded `policy_change` chain automatically. Flipping the
+reconciliation flag back off stops new backstop work and leaves the periodic
+chains to die out as no-op passes, without disturbing startup-recall promotion
+or either targeted job type. Startup recall's lazy promotion pass is unchanged
+in this slice; its removal behind shadow parity is the next #155 slice (B5).
 
 Worker logs are visible with:
 

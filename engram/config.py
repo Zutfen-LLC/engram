@@ -222,6 +222,25 @@ class Settings(BaseSettings):
     # Legacy promotion.path_a jobs remain supported and executable regardless
     # of this flag's value.
     promotion_evaluate_jobs_enabled: bool = False
+    # Rollout flag for the bounded promotion reconciliation backstop (issue
+    # #155, ENG-PROMOTION-003B4). Default false: no promotion.reconcile work
+    # is created, the worker chain bootstrap is inert, and startup recall's
+    # lazy promotion pass is untouched. Turning the flag off again stops new
+    # reconciliation work without disabling legacy startup promotion or
+    # already-queued promotion.evaluate / promotion.path_a jobs. Independent
+    # of promotion_evaluate_jobs_enabled: when this flag is on but the
+    # evaluate flag is off, reconciliation runs its bounded passes but
+    # suppresses (and records) promotion.evaluate repairs rather than
+    # substituting any broader/legacy mutation mechanism.
+    promotion_reconciliation_enabled: bool = False
+    # Period between bounded backstop reconciliation passes per tenant (the
+    # self-rescheduling promotion.reconcile chain's interval). Each pass is
+    # bounded by promotion_reconciliation_pass_limit regardless.
+    promotion_reconciliation_interval_seconds: int = 3600
+    # Hard per-pass bound: rows inspected (and at most that many repair jobs
+    # emitted) by one promotion.reconcile pass. Deployment-level cap, not part
+    # of any public API.
+    promotion_reconciliation_pass_limit: int = 20
 
     @model_validator(mode="after")
     def _clamp_startup_recall_candidate_limit(self) -> Settings:
@@ -301,6 +320,22 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "portal enrollment can use HTTP only when portal_development_setup=true"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_promotion_reconciliation(self) -> Settings:
+        """Keep the backstop strictly bounded and honestly periodic.
+
+        A non-positive pass limit or interval is invalid configuration, not a
+        request to disable the feature (the dedicated
+        ``promotion_reconciliation_enabled`` flag owns that). Surfaces at
+        settings load rather than silently producing an unbounded or hot-loop
+        reconciliation pass.
+        """
+        if self.promotion_reconciliation_pass_limit < 1:
+            raise ValueError("promotion_reconciliation_pass_limit must be >= 1")
+        if self.promotion_reconciliation_interval_seconds < 1:
+            raise ValueError("promotion_reconciliation_interval_seconds must be >= 1")
         return self
 
     @model_validator(mode="after")

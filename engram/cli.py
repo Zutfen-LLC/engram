@@ -218,6 +218,35 @@ def main() -> None:
         help="Evaluate both promotion lanes without writing state or audit events.",
     )
 
+    reconcile_parser = sub.add_parser(
+        "reconcile-promotion",
+        help="Request bounded promotion reconciliation (issue #155 backstop) for "
+        "one tenant (--tenant) or every tenant: enqueues the tenant-scoped "
+        "promotion.reconcile chain that repairs missing/dead targeted "
+        "evaluation work. Never a synchronous scan or bulk promotion.",
+    )
+    reconcile_parser.add_argument(
+        "--tenant",
+        default=None,
+        help="Restrict the reconciliation request to a single tenant id. Default: every tenant.",
+    )
+    reconcile_parser.add_argument(
+        "--reason",
+        choices=["operator_request", "provider_recovery"],
+        default="operator_request",
+        help="operator_request: promotion policy/config changed; reconcile this "
+        "tenant (the honest path for tenant_config changes made by direct SQL, "
+        "which the service cannot observe). provider_recovery: additionally "
+        "re-enqueue the async classification contract for live proposals whose "
+        "evidence never bound — request only after the provider is available "
+        "again; no provider call happens inline.",
+    )
+    reconcile_parser.add_argument(
+        "--request-id",
+        default=None,
+        help="Stable identity for idempotent replay of the same explicit request.",
+    )
+
     backfill_parser = sub.add_parser(
         "backfill-embeddings",
         help="Populate pending/missing memory_embeddings for the configured "
@@ -530,6 +559,14 @@ def main() -> None:
         )
     elif args.command == "promote-proposed":
         raise SystemExit(asyncio.run(_run_promotion(args.tenant, args.limit, dry_run=args.dry_run)))
+    elif args.command == "reconcile-promotion":
+        raise SystemExit(
+            asyncio.run(
+                _run_reconciliation_request(
+                    args.tenant, reason=args.reason, request_id=args.request_id
+                )
+            )
+        )
     elif args.command == "backfill-embeddings":
         from engram.embeddings import MAX_PROVIDER_BATCH_SIZE
 
@@ -1594,6 +1631,70 @@ async def _run_promotion(
 
         action = "would_promote" if dry_run else "promoted"
         print(f"\nTotal: scanned={total_scanned} {action}={total_promoted}")
+        return 0
+
+
+async def _run_reconciliation_request(
+    tenant_id: str | None,
+    *,
+    reason: str = "operator_request",
+    request_id: str | None = None,
+    session_factory: Any | None = None,
+) -> int:
+    """Request bounded promotion reconciliation and print a content-free summary.
+
+    Enqueues exactly one ``promotion.reconcile`` chain job per tenant (never a
+    synchronous scan, never item fan-out) and prints only queue/status facts.
+    Connecting as the table-owning role (default) bypasses RLS for the
+    content-free tenant enumeration and queue insert; every item-level
+    discovery/evaluation runs later in the worker under the normal app-role
+    tenant context. Returns 0 on success, 3 when the reconciliation rollout
+    flag is off (the request was a documented no-op).
+    """
+    import uuid as _uuid
+
+    from sqlalchemy import select
+
+    from engram.config import settings
+    from engram.db import owner_session_factory as _default_factory
+    from engram.models import Tenant
+    from engram.promotion_reconciliation import request_reconciliation_chain
+
+    factory = session_factory if session_factory is not None else _default_factory
+
+    async with factory() as session:
+        if tenant_id is not None:
+            tenant_ids: list[str] = [tenant_id]
+        else:
+            tenant_rows = await session.execute(select(Tenant.id))
+            tenant_ids = [str(tid) for tid in tenant_rows.scalars().all()]
+
+        if not tenant_ids:
+            print("No tenants to process.")
+            return 0
+        if not settings.promotion_reconciliation_enabled:
+            print(
+                "promotion reconciliation is disabled "
+                "(ENGRAM_PROMOTION_RECONCILIATION_ENABLED=false): no work requested."
+            )
+            return 3
+
+        trigger_id = request_id if request_id else f"request:{_uuid.uuid4()}"
+        enqueued = 0
+        for tid in tenant_ids:
+            job_id = await request_reconciliation_chain(
+                session,
+                tenant_id=tid,
+                reason=reason,
+                trigger_id=trigger_id,
+            )
+            if job_id is None:
+                print(f"tenant={tid} reason={reason} status=not_enqueued")
+                continue
+            print(f"tenant={tid} reason={reason} trigger_id={trigger_id} job_id={job_id}")
+            enqueued += 1
+        await session.commit()
+        print(f"\nTotal: reconciliation chains enqueued={enqueued}")
         return 0
 
 

@@ -309,10 +309,10 @@ on the flag, on the item still being a live proposal, and on the tenant's
   the established compatibility behavior.
 
 Still unwired in this slice: `classification_reassessed` (awaiting #157's
-versioned reassessment), `kind_changed`/`provenance_changed` (no
-kind/source-provenance correction path exists in the API today), and
-`policy_changed`/`provider_recovery`/`reconcile`, which need bounded fan-out and
-belong to the reconciliation-backstop slice. `engram doctor` and the per-item
+versioned reassessment) and `kind_changed`/`provenance_changed` (no
+kind/source-provenance correction path exists in the API today).
+`policy_changed`/`provider_recovery`/`reconcile` are now wired through the
+bounded reconciliation backstop (see below). `engram doctor` and the per-item
 readiness endpoint recognize both job types. Startup recall's bounded rotating
 promotion pass (described
 above) is unchanged by this slice, still mutates directly rather than going
@@ -320,8 +320,139 @@ through either job contract, and is not yet read-only. Durable, persisted
 promotion-assessment state remains future work (issue #159) — `evaluation_id`
 exists only within an audit event's `reason` JSON when a mutation or conflict
 block actually occurs, not as its own row. See the code comments in
-`engram/promotion.py` for the full contract, dedupe-key construction, and the
+`engram/promotion.py` for the full contract, dedupe-key construction, and
 per-trigger decision-effect matrix.
+
+#### Bounded promotion reconciliation backstop (ENG-PROMOTION-003B4)
+
+Targeted triggers cover events the service observes itself; the backstop makes
+promotion reevaluation *self-healing and independent of agent startup* for the
+events it can miss — a lost targeted job, a dead cooling-boundary job, a
+policy change, a provider that recovered after classification failures.
+
+```text
+targeted event -> promotion.evaluate
+                     ^
+                     |
+bounded promotion reconciliation backstop
+```
+
+The backstop is **orchestration, not a second promotion implementation**
+(`engram/promotion_reconciliation.py`). It discovers live proposals
+(`review_status='proposed' AND valid_to IS NULL AND superseded_by IS NULL`,
+kind-policy-eligible) needing repair and enqueues canonical work; every
+lifecycle decision still flows through the shared evaluator behind
+`promotion.evaluate`. Its own job contract, `promotion.reconcile`
+(`promotion-reconcile-v1`), is a versioned, exact/closed, identifier-only
+envelope — `{contract_version, reason, trigger_id, dedupe_key}` with a closed
+reason vocabulary (`backstop`, `policy_change`, `provider_recovery`,
+`operator_request`) — that fails closed on unknown fields/reasons/versions
+through ordinary retry/dead-letter. No thresholds, scores, decision state,
+credentials, or content ever enter the payload, and there is no metadata bag.
+
+Topology — no separate scheduler daemon, everything through the existing
+PostgreSQL job queue, one bounded job per tenant at a time:
+
+- **Periodic backstop chain** (`reason=backstop`): each pass self-schedules
+  the next at `ENGRAM_PROMOTION_RECONCILIATION_INTERVAL_SECONDS` (default
+  3600). The worker loop bootstraps/heals each tenant's chain (bounded,
+  content-free owner-role bookkeeping), so restarts and dead chain jobs
+  self-repair.
+- **Request chains** (`policy_change` / `provider_recovery` /
+  `operator_request`): a committed policy change or an explicit authorized
+  request resets the tenant's rotation cursor (coverage from the head) and
+  runs immediately-due continuation passes until the rotation reaches the
+  tail, then stops — bounded per pass with durable continuation.
+
+Candidate discovery is a keyset rotation over `(created_at, id)` persisted in
+`promotion_reconcile_state` (migration 034; deliberately separate from #164's
+startup-rotation cursor — this one is nullable for clean policy resets,
+epoch-guarded so stale concurrent passes cannot undo a reset, and carries the
+tenant's `kind_policy_revision` plus content-free last-pass diagnostics).
+Terminal-under-current-policy rows are visited at most once per rotation and
+never receive repair jobs, so they cannot hot-loop or starve later actionable
+rows: a stable set of `N` kind-eligible proposals is fully covered within
+`ceil(N / pass_limit) + 1` passes (`ENGRAM_PROMOTION_RECONCILIATION_PASS_LIMIT`,
+default 20, rows inspected and repairs emitted per pass). The keyset scan is
+served directly by `(tenant_id, created_at, id)` partial indexes
+(`idx_memitems_proposed_rotation`, or the existing `idx_memitems_backfill`)
+— an index bound, not a LIMIT over a sort of the backlog.
+
+What one pass repairs, per item, using the shared evaluator's own assessment:
+
+- **Time-dependent** (a lane is trust-qualified, cooling): if a healthy
+  pending/running targeted job exists (canonical or legacy `promotion.path_a`
+  during mixed-version operation), leave it alone; otherwise enqueue a
+  canonical `promotion.evaluate` (`trigger_type='reconcile'`) with `run_after`
+  equal to the *exact* authoritative eligibility boundary — never earlier.
+  A dead targeted job is simply not healthy, so dead work repairs the same
+  way; already-queued legacy jobs are never rewritten or deleted.
+- **Eligible now**: same repair, due immediately.
+- **Terminal under current policy** (blocked without new evidence, review,
+  or policy change): no repair — reconsideration arrives through that
+  evidence's own producer, a policy-change chain (cursor reset), or provider
+  recovery.
+- **Provider recovery** (`reason=provider_recovery` only): live proposals
+  with no bound classification receipt and no healthy `classification.refine`
+  job get the existing async classification contract re-enqueued — never a
+  provider call inline, never a re-classification of already-bound evidence,
+  and suppressed (recorded in diagnostics) while
+  `ENGRAM_CLASSIFICATION_PROVIDER=none`. Request it only after the provider is
+  available again; successful recovered classification follows the normal
+  binding path and schedules promotion evaluation through the ordinary
+  `classification_bound` producer. This is recovery of *current* failed
+  classification work, not #157's future model/prompt/version reassessment.
+
+What reconciliation deliberately does **not** repair: startup-recall promotion
+mutation stays in place (removal is the next #155 slice, B5, after shadow
+parity); #156 structured extraction, #157 reassessment, #159 durable
+assessment history; bound-but-fallback classification receipts (that is
+reassessment, not recovery); direct-SQL `tenant_config` changes, which the
+service cannot observe.
+
+Policy changes:
+
+- **Memory-kind policy**: a committed PATCH to `/admin/memory-kinds/{name}`
+  that materially changes `enabled` or `auto_promote_from_inferred` (the two
+  fields existing proposals' eligibility depends on) bumps the tenant's
+  `kind_policy_revision` and schedules *one* bounded `policy_change` chain —
+  never synchronous item fan-out. Item evaluations reached because of that
+  revision carry `trigger_type='policy_changed'` with the revision in their
+  trigger identity. Non-admission changes (description, display name,
+  `requires_review` — which governs only new writes' initial review status)
+  schedule nothing.
+- **Tenant promotion configuration** has no product mutation surface today
+  (only direct SQL). After changing `tenant_config` promotion columns,
+  explicitly request reconciliation — the honest path for unobservable
+  changes: `POST /v1/admin/promotion/reconcile` (admin scope, tenant-scoped,
+  content-free response, idempotent per `(reason, request_id)`) or
+  `engram reconcile-promotion [--tenant <id>] [--reason
+  operator_request|provider_recovery] [--request-id <stable-id>]`. The request
+  enqueues exactly one bounded chain job, never a synchronous scan or bulk
+  promotion.
+
+Execution authority and safety: reconciliation runs under the worker's routed
+tenant app-role RLS context; its item evaluations are v1-unprofiled
+`promotion.evaluate` jobs under internal worker provenance (no fabricated
+`CandidateIngest`, no `job_execution_contexts` abuse, manual/profile-bound
+evaluation from #167 unchanged). Repairs, cursor advance, and chain
+continuation commit in one transaction — a crash before commit replays from
+the unchanged cursor, a crash after leaves durable work; repair identity is
+stable per observation so replays dedupe. Concurrent
+reconciliation/targeted/legacy/startup paths converge on one mutation and one
+authoritative `review_change` event (the shared evaluator's guarded update
+already guarantees this).
+
+Rollout: `ENGRAM_PROMOTION_RECONCILIATION_ENABLED` (default `false`) is
+independent of `ENGRAM_PROMOTION_EVALUATE_JOBS_ENABLED`. Flag off: no
+backstop work is created, requests are fail-safe no-ops, and startup recall
+plus both targeted job types behave exactly as before. Reconciliation on with
+evaluate off: passes run and *record* (suppressed) discovered work rather than
+substituting any broader/legacy mutation mechanism — surfaced by `engram
+doctor`'s `promotion.reconciliation` check (v1.2), which reports the rollout
+flags, cursor/epoch/due state, last-pass counts (evaluations enqueued,
+dead/missing found, provider-recovery work scheduled, terminal/healthy
+skipped, suppressed), and pending/dead reconciliation chains — content-free.
 
 Thresholds come from `tenant_config`:
 

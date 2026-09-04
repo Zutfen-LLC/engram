@@ -74,7 +74,7 @@ shell history and the process list.
 ```json
 {
   "schema": "engram.doctor",
-  "schema_version": "1.1",
+  "schema_version": "1.2",
   "profile": "automatic_memory_loop",
   "engram_version": "0.1.0",
   "generated_at": "2026-07-25T12:00:00+00:00",
@@ -96,7 +96,7 @@ shell history and the process list.
 }
 ```
 
-`checks` always contains exactly the 12 checks below, in this order, even
+`checks` always contains exactly the 13 checks below, in this order, even
 when a check could not run (it is emitted as `status="unknown"`, never
 omitted). `evidence` never contains memory content, job payloads, raw
 `last_error` values, receipt manifests, or credentials — only safe aggregate
@@ -118,6 +118,7 @@ counts, timestamps, status codes, and configuration-presence booleans.
 | 10 | `receipts.activity` | Local dark-write setting + `context_receipts`/`recall_logs` + repository verifier | Selects the latest receipt **within the requested window** (ties broken deterministically). Fails on an invalid receipt regardless of whether dark writes are currently disabled locally. Otherwise warns when disabled or a gap exists (writes are fail-open). Unknown when there is no startup recall to assess, or the latest receipt could not be verified. | Proves what was served, not factual truth or causality. |
 | 11 | `review.backlog` | `GET /v1/review/stats` + bounded `GET /v1/review/queue?limit=100` | Passes only when both stats and queue evidence are present and strictly well-typed — malformed or nonsensical evidence is never coerced into a pass. Unknown when the credential lacks review authority, the call fails, or evidence fails validation. | `conflict_recheck_not_run` is excluded from blocker ranking and reported as a known preview limitation; no conflict recheck runs. |
 | 12 | `promotion.readiness` | Bounded, content-free PostgreSQL aggregate over live proposed items (same pure promotion evaluator as the mutation paths; v1.1 / ENG-PROMOTION-003A) | Warn (`PROMOTION_SCAN_STARVATION`) when a strict majority of the first `startup_promotion_limit` (default 20) oldest live proposals — exactly the rows the lazy startup-recall sweep scans — are terminal under current policy, evidence of potential scan starvation for later proposals. Unknown when tenant scope is unresolved or the database is unreachable. Evidence: counts by source type, kind, age bucket, canonical blocker code, evidence state (`none`/`bound-qualified`/`bound-below-threshold`/`malformed/stale`), job state (`scheduled`/`overdue`/`dead`/`missing`), and terminal-vs-time-dependent. | No provider call, no promotion-time conflict recheck, no memory content or job payload in evidence; `retention_confidence` is the classifier's durability estimate, not epistemic/factual confidence. |
+| 13 | `promotion.reconciliation` | Persisted `promotion_reconcile_state` (cursor epoch/position, kind-policy revision, last-pass counts) + pending/dead `promotion.reconcile` chain counts (v1.2 / ENG-PROMOTION-003B4) | Pass (`RECONCILIATION_DISABLED`) when the rollout flag is off. When enabled: warn on dead reconciliation jobs (`RECONCILIATION_DEAD_JOBS`), on the evaluate rollout flag being off so discovered repairs are suppressed (`RECONCILIATION_EVALUATE_SUPPRESSED`), or on no pass ever having run with no chain pending — no worker with the flag on (`RECONCILIATION_CHAIN_NOT_BOOTSTRAPPED`); otherwise pass with the last bounded pass's content-free counts (window size, evaluations enqueued, dead/missing found, provider-recovery work scheduled, terminal/healthy skipped, suppressed). Unknown when tenant scope is unresolved or the database is unreachable. | Presents persisted scheduler bookkeeping only; it recomputes no promotion policy and inspects no memory content. |
 
 ## Example outputs (sanitized)
 

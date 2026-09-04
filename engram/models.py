@@ -1270,6 +1270,51 @@ class PromotionReconciliationState(Base):
     )
 
 
+class PromotionReconcileState(Base):
+    """Per-tenant state for the bounded promotion reconciliation backstop (#155).
+
+    Orchestration bookkeeping only — never an authoritative promotion
+    assessment (that is #159's durable promotion_assessments design) and never
+    memory content. The keyset cursor is deliberately *nullable*, unlike
+    #164's startup-rotation cursor: ``NULL`` means "the next pass reads from
+    the head of the live proposed set", which is what a policy-change or
+    operator request reset needs to express without sentinel values.
+    ``cursor_epoch`` is bumped on every reset so a stale in-flight pass cannot
+    advance a cursor position it read before the reset (its conditional
+    advance simply no-ops). ``kind_policy_revision`` is the tenant's stable
+    monotonically increasing revision identity for admission-affecting
+    memory-kind changes, driving policy-change dedupe/replay provenance. The
+    ``last_*`` columns are content-free counts for diagnostics.
+    """
+
+    __tablename__ = "promotion_reconcile_state"
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), primary_key=True
+    )
+    cursor_created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cursor_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    cursor_epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    kind_policy_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_pass_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_pass_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_pass_trigger_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_window_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_wrapped: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    last_evaluations_enqueued: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_dead_found: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_missing_found: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_recovery_enqueued: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_terminal_skipped: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_healthy_skipped: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_suppressed: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
 class CandidateIngest(Base):
     """Immutable server-issued identity for one candidate entering the pipeline."""
 
