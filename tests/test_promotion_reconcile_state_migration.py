@@ -1,5 +1,6 @@
 """Real-PostgreSQL migration, RLS, privilege, and downgrade proof for
-``promotion_reconcile_state`` + ``idx_memitems_proposed_rotation``
+``promotion_reconcile_state``, terminal suppression, global tenant scheduling,
+and their bounded indexes
 (migration 034, ENG-PROMOTION-003B4 / issue #155).
 
 These tests connect as the non-owner ``engram_app`` role to prove, against
@@ -112,6 +113,13 @@ async def test_rls_enabled_and_forced() -> None:
             "AND policyname = 'tenant_isolation_promotion_reconcile_state'"
         )
         assert policy == 1
+        terminal = await owner.fetchrow(
+            "SELECT relrowsecurity, relforcerowsecurity FROM pg_class "
+            "WHERE relname = 'promotion_reconcile_terminal'"
+        )
+        assert terminal is not None
+        assert terminal["relrowsecurity"] is True
+        assert terminal["relforcerowsecurity"] is True
     finally:
         await owner.close()
 
@@ -128,6 +136,13 @@ async def test_rotation_index_present() -> None:
         assert "memory_items" in definition
         assert "created_at" in definition
         assert "proposed" in definition
+        job_index = await owner.fetchval(
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE indexname = 'idx_jobs_reconcile_item_state'"
+        )
+        assert job_index is not None
+        assert "memory_item_id" in job_index
+        assert "run_after" in job_index
     finally:
         await owner.close()
 
@@ -189,6 +204,14 @@ async def test_app_role_privileges_least_privilege() -> None:
                 "DELETE FROM promotion_reconcile_state WHERE tenant_id = $1", tenant_id
             )
         assert _denied(excinfo.value)
+        assert await owner.fetchval(
+            "SELECT has_table_privilege('engram_app', "
+            "'promotion_reconcile_scheduler_state', 'SELECT')"
+        ) is False
+        assert await owner.fetchval(
+            "SELECT has_table_privilege('engram_app', "
+            "'promotion_reconcile_scheduler_state', 'INSERT')"
+        ) is False
     finally:
         await owner.execute("DELETE FROM tenants WHERE id = $1", tenant_id)
         await owner.close()

@@ -23,5 +23,14 @@ BEGIN
 END
 $$;
 
+DROP TRIGGER IF EXISTS trg_promotion_reconcile_item_state ON memory_items;
+DROP TRIGGER IF EXISTS trg_promotion_reconcile_classification ON classification_runs;
+DROP TRIGGER IF EXISTS trg_promotion_reconcile_feedback ON feedback_events;
+DROP TRIGGER IF EXISTS trg_promotion_reconcile_item_event ON item_events;
+DROP FUNCTION IF EXISTS invalidate_promotion_reconcile_terminal_item();
+DROP FUNCTION IF EXISTS invalidate_promotion_reconcile_terminal();
+DROP TABLE IF EXISTS promotion_reconcile_terminal;
+DROP TABLE IF EXISTS promotion_reconcile_scheduler_state;
 DROP TABLE IF EXISTS promotion_reconcile_state;
+DROP INDEX IF EXISTS idx_jobs_reconcile_item_state;
 DROP INDEX IF EXISTS idx_memitems_proposed_rotation;

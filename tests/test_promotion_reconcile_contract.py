@@ -196,6 +196,8 @@ def test_settings_reject_non_positive_reconciliation_bounds() -> None:
         Settings(promotion_reconciliation_pass_limit=0)
     with pytest.raises(ValueError, match="interval_seconds"):
         Settings(promotion_reconciliation_interval_seconds=0)
+    with pytest.raises(ValueError, match="tenant_batch_limit"):
+        Settings(promotion_reconciliation_tenant_batch_limit=0)
 
 
 def test_settings_default_flags_off() -> None:
@@ -204,6 +206,7 @@ def test_settings_default_flags_off() -> None:
     assert s.promotion_evaluate_jobs_enabled is False
     assert s.promotion_reconciliation_pass_limit == 20
     assert s.promotion_reconciliation_interval_seconds == 3600
+    assert s.promotion_reconciliation_tenant_batch_limit == 100
 
 
 # --- Pure repair classification -------------------------------------------------

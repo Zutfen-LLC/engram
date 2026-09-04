@@ -355,9 +355,11 @@ PostgreSQL job queue, one bounded job per tenant at a time:
 
 - **Periodic backstop chain** (`reason=backstop`): each pass self-schedules
   the next at `ENGRAM_PROMOTION_RECONCILIATION_INTERVAL_SECONDS` (default
-  3600). The worker loop bootstraps/heals each tenant's chain (bounded,
-  content-free owner-role bookkeeping), so restarts and dead chain jobs
-  self-repair.
+  3600). The worker loop bootstraps/heals at most
+  `ENGRAM_PROMOTION_RECONCILIATION_TENANT_BATCH_LIMIT` tenants per ensure pass
+  (default 100), using an owner-only, content-free, persisted `(created_at,
+  id)` cursor. It wraps fairly and resumes after restart, so no worker-loop
+  iteration enumerates every tenant.
 - **Request chains** (`policy_change` / `provider_recovery` /
   `operator_request`): a committed policy change or an explicit authorized
   request resets the tenant's rotation cursor (coverage from the head) and
@@ -369,11 +371,18 @@ Candidate discovery is a keyset rotation over `(created_at, id)` persisted in
 startup-rotation cursor — this one is nullable for clean policy resets,
 epoch-guarded so stale concurrent passes cannot undo a reset, and carries the
 tenant's `kind_policy_revision` plus content-free last-pass diagnostics).
-Terminal-under-current-policy rows are visited at most once per rotation and
-never receive repair jobs, so they cannot hot-loop or starve later actionable
-rows: a stable set of `N` kind-eligible proposals is fully covered within
-`ceil(N / pass_limit) + 1` passes (`ENGRAM_PROMOTION_RECONCILIATION_PASS_LIMIT`,
-default 20, rows inspected and repairs emitted per pass). The keyset scan is
+“Terminal under current policy” means the item was evaluated under a known
+reconciliation cursor epoch and is excluded from ordinary periodic selection
+until that epoch or relevant item/evidence state changes. The lightweight
+`promotion_reconcile_terminal` row stores only `(tenant, item, epoch,
+observed_at)`—no blocker, threshold, score, or decision. Relevant item,
+classification, feedback, and audit events invalidate it; policy, operator,
+and provider-recovery requests advance the epoch. Stable terminal rows are
+therefore assessed once, not once per periodic rotation, while later
+actionable rows continue through the bounded keyset window.
+
+Each item pass inspects at most
+`ENGRAM_PROMOTION_RECONCILIATION_PASS_LIMIT` rows (default 20). The keyset scan is
 served directly by `(tenant_id, created_at, id)` partial indexes
 (`idx_memitems_proposed_rotation`, or the existing `idx_memitems_backfill`)
 — an index bound, not a LIMIT over a sort of the backlog.
@@ -381,12 +390,18 @@ served directly by `(tenant_id, created_at, id)` partial indexes
 What one pass repairs, per item, using the shared evaluator's own assessment:
 
 - **Time-dependent** (a lane is trust-qualified, cooling): if a healthy
-  pending/running targeted job exists (canonical or legacy `promotion.path_a`
-  during mixed-version operation), leave it alone; otherwise enqueue a
+  targeted job exists, leave it alone; otherwise enqueue a
   canonical `promotion.evaluate` (`trigger_type='reconcile'`) with `run_after`
   equal to the *exact* authoritative eligibility boundary — never earlier.
-  A dead targeted job is simply not healthy, so dead work repairs the same
-  way; already-queued legacy jobs are never rewritten or deleted.
+  “Healthy” means pending/running *and covering the current obligation*, not
+  merely having a live status. A cooling canonical job must be due at the
+  exact evaluator-produced boundary; an already-due obligation accepts a
+  due/overdue canonical job but not a future one. Legacy `promotion.path_a`
+  must meet the same due-time rule and name the currently bound
+  `classification_run_id`. Stale or incompatible legacy work remains
+  untouched while canonical repair is enqueued. Indexed per-window EXISTS
+  probes replace the former global 1,000-row history cap, so unrelated history
+  cannot hide a healthy job.
 - **Eligible now**: same repair, due immediately.
 - **Terminal under current policy** (blocked without new evidence, review,
   or policy change): no repair — reconsideration arrives through that
@@ -394,7 +409,11 @@ What one pass repairs, per item, using the shared evaluator's own assessment:
   recovery.
 - **Provider recovery** (`reason=provider_recovery` only): live proposals
   with no bound classification receipt and no healthy `classification.refine`
-  job get the existing async classification contract re-enqueued — never a
+  job are repaired only when the immutable initial classification event proves
+  the remember path selected `source=auto_classified`. Explicit-kind items
+  (`source=explicit_kind`) and legacy rows with unknown intent are excluded.
+  This restores previously intended async classification; it does not create
+  new classification intent. Recovery is never a
   provider call inline, never a re-classification of already-bound evidence,
   and suppressed (recorded in diagnostics) while
   `ENGRAM_CLASSIFICATION_PROVIDER=none`. Request it only after the provider is
@@ -428,8 +447,10 @@ Policy changes:
   content-free response, idempotent per `(reason, request_id)`) or
   `engram reconcile-promotion [--tenant <id>] [--reason
   operator_request|provider_recovery] [--request-id <stable-id>]`. The request
-  enqueues exactly one bounded chain job, never a synchronous scan or bulk
-  promotion.
+  with `--tenant` enqueues that tenant's bounded chain. Without `--tenant`, it
+  advances one persisted tenant page (default 100) and prints the stable
+  `--request-id` to repeat until `complete=true`; it never synchronously
+  materializes every tenant.
 
 Execution authority and safety: reconciliation runs under the worker's routed
 tenant app-role RLS context; its item evaluations are v1-unprofiled

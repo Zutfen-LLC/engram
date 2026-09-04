@@ -221,14 +221,18 @@ def main() -> None:
     reconcile_parser = sub.add_parser(
         "reconcile-promotion",
         help="Request bounded promotion reconciliation (issue #155 backstop) for "
-        "one tenant (--tenant) or every tenant: enqueues the tenant-scoped "
+        "one tenant (--tenant) or one bounded all-tenant continuation page: "
+        "enqueues the tenant-scoped "
         "promotion.reconcile chain that repairs missing/dead targeted "
-        "evaluation work. Never a synchronous scan or bulk promotion.",
+        "evaluation work. The all-tenant form advances one durable bounded "
+        "tenant page; repeat with the printed --request-id until complete. "
+        "Never a synchronous scan or bulk promotion.",
     )
     reconcile_parser.add_argument(
         "--tenant",
         default=None,
-        help="Restrict the reconciliation request to a single tenant id. Default: every tenant.",
+        help="Restrict the request to one tenant. Without it, process one bounded "
+        "restart-safe tenant page.",
     )
     reconcile_parser.add_argument(
         "--reason",
@@ -1643,8 +1647,9 @@ async def _run_reconciliation_request(
 ) -> int:
     """Request bounded promotion reconciliation and print a content-free summary.
 
-    Enqueues exactly one ``promotion.reconcile`` chain job per tenant (never a
-    synchronous scan, never item fan-out) and prints only queue/status facts.
+    With ``--tenant``, enqueues exactly one ``promotion.reconcile`` chain.
+    Without it, advances one durable bounded tenant page and prints the stable
+    continuation id (never a synchronous global scan or item fan-out).
     Connecting as the table-owning role (default) bypasses RLS for the
     content-free tenant enumeration and queue insert; every item-level
     discovery/evaluation runs later in the worker under the normal app-role
@@ -1653,25 +1658,16 @@ async def _run_reconciliation_request(
     """
     import uuid as _uuid
 
-    from sqlalchemy import select
-
     from engram.config import settings
     from engram.db import owner_session_factory as _default_factory
-    from engram.models import Tenant
-    from engram.promotion_reconciliation import request_reconciliation_chain
+    from engram.promotion_reconciliation import (
+        request_global_reconciliation_window,
+        request_reconciliation_chain,
+    )
 
     factory = session_factory if session_factory is not None else _default_factory
 
     async with factory() as session:
-        if tenant_id is not None:
-            tenant_ids: list[str] = [tenant_id]
-        else:
-            tenant_rows = await session.execute(select(Tenant.id))
-            tenant_ids = [str(tid) for tid in tenant_rows.scalars().all()]
-
-        if not tenant_ids:
-            print("No tenants to process.")
-            return 0
         if not settings.promotion_reconciliation_enabled:
             print(
                 "promotion reconciliation is disabled "
@@ -1680,21 +1676,36 @@ async def _run_reconciliation_request(
             return 3
 
         trigger_id = request_id if request_id else f"request:{_uuid.uuid4()}"
-        enqueued = 0
-        for tid in tenant_ids:
-            job_id = await request_reconciliation_chain(
+        if tenant_id is None:
+            result = await request_global_reconciliation_window(
                 session,
-                tenant_id=tid,
                 reason=reason,
                 trigger_id=trigger_id,
             )
-            if job_id is None:
-                print(f"tenant={tid} reason={reason} status=not_enqueued")
-                continue
-            print(f"tenant={tid} reason={reason} trigger_id={trigger_id} job_id={job_id}")
-            enqueued += 1
+            print(
+                f"reason={reason} request_id={trigger_id} inspected={result.inspected} "
+                f"enqueued={result.enqueued} complete={result.completed}"
+            )
+            if not result.completed:
+                print(
+                    "Continuation required: rerun with "
+                    f"--reason {reason} --request-id {trigger_id}"
+                )
+            return 0
+        job_id = await request_reconciliation_chain(
+            session,
+            tenant_id=tenant_id,
+            reason=reason,
+            trigger_id=trigger_id,
+        )
         await session.commit()
-        print(f"\nTotal: reconciliation chains enqueued={enqueued}")
+        if job_id is None:
+            print(f"tenant={tenant_id} reason={reason} status=not_enqueued")
+            return 0
+        print(
+            f"tenant={tenant_id} reason={reason} trigger_id={trigger_id} job_id={job_id}"
+        )
+        print("\nTotal: reconciliation chains enqueued=1")
         return 0
 
 

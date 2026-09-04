@@ -589,6 +589,10 @@ per-tenant periodic `promotion.reconcile` chain that repairs missing/dead
 targeted promotion evaluation work — bounded to
 `ENGRAM_PROMOTION_RECONCILIATION_PASS_LIMIT` (default 20) items per pass, at
 `ENGRAM_PROMOTION_RECONCILIATION_INTERVAL_SECONDS` (default 3600) per pass.
+The owner-side bootstrap/heal loop independently inspects at most
+`ENGRAM_PROMOTION_RECONCILIATION_TENANT_BATCH_LIMIT` tenants per call (default
+100), advancing a durable content-free keyset cursor and wrapping fairly after
+restart. It never materializes the complete tenant table.
 Reconciliation never promotes anything itself: it only enqueues canonical
 `promotion.evaluate` jobs (or re-enqueues the async classification contract for
 provider recovery), which run the ordinary shared evaluator. When the evaluate
@@ -597,6 +601,9 @@ than substituting any broader/legacy mechanism. Explicit requests (after
 direct-SQL `tenant_config` promotion changes, or for provider recovery once the
 provider is back): `POST /v1/admin/promotion/reconcile` or
 `engram reconcile-promotion --tenant <id> [--reason operator_request|provider_recovery]`.
+Without `--tenant`, the CLI advances one durable tenant page and prints a
+stable `--request-id`; repeat that command with the printed id until it reports
+`complete=true`. This keeps operator-triggered all-tenant work bounded too.
 Committed admission-affecting memory-kind changes (PATCH
 `/admin/memory-kinds/{name}` altering `enabled` or `auto_promote_from_inferred`)
 schedule one bounded `policy_change` chain automatically. Flipping the
@@ -604,6 +611,16 @@ reconciliation flag back off stops new backstop work and leaves the periodic
 chains to die out as no-op passes, without disturbing startup-recall promotion
 or either targeted job type. Startup recall's lazy promotion pass is unchanged
 in this slice; its removal behind shadow parity is the next #155 slice (B5).
+
+A pending/running promotion job is considered healthy only when it covers the
+current evaluator-produced due-time obligation. Cooling jobs must match the
+exact boundary; due items require a due/overdue job. Legacy `promotion.path_a`
+also has to reference the currently bound classification run. Stable terminal
+items are recorded only as `(tenant, item, reconciliation epoch, observed_at)`
+and suppressed from later periodic selection until policy/reset generation or
+relevant item/evidence state changes. Provider recovery likewise restores only
+classification intent proven by the initial `auto_classified` audit event;
+explicit-kind and unknown legacy items are not classified by the backstop.
 
 Worker logs are visible with:
 

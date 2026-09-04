@@ -68,6 +68,7 @@ from engram.promotion_reconciliation import (
     RECONCILE_REASON_PROVIDER_RECOVERY,
     ensure_periodic_reconciliation_chains,
     reconciliation_status,
+    request_global_reconciliation_window,
     request_reconciliation_chain,
     run_reconciliation_pass,
 )
@@ -118,6 +119,7 @@ async def _clean_db():
         await conn.execute(text("DELETE FROM classification_runs"))
         await conn.execute(text("DELETE FROM memory_items"))
         await conn.execute(text("DELETE FROM promotion_reconcile_state"))
+        await conn.execute(text("DELETE FROM promotion_reconcile_scheduler_state"))
         await conn.execute(text("DELETE FROM promotion_reconciliation_state"))
         # Keep the seeded default admin; drop every principal this suite added.
         await conn.execute(
@@ -316,6 +318,27 @@ async def _insert_bound_run(
         )
         await session.commit()
     return run_id
+
+
+async def _mark_classification_origin(
+    item_id: str, principal_id: str, *, source: str = "auto_classified"
+) -> None:
+    """Record the immutable initial classification provenance from remember."""
+    async with _test_session_factory() as session:
+        await session.execute(
+            text(
+                "INSERT INTO item_events (item_id, event_type, field_name, old_value, "
+                "new_value, actor_principal_id, reason) VALUES ("
+                ":item_id, 'classification', 'kind', NULL, "
+                "CAST(:payload AS text), :principal_id, 'rule classification')"
+            ),
+            {
+                "item_id": item_id,
+                "principal_id": principal_id,
+                "payload": json.dumps({"source": source, "kind": "fact"}),
+            },
+        )
+        await session.commit()
 
 
 async def _item_row(item_id: str) -> dict[str, Any]:
@@ -565,8 +588,248 @@ async def test_healthy_scheduled_job_not_duplicated(monkeypatch):
     assert (await _item_row(item_id))["review_status"] == "proposed"
 
 
+async def _enqueue_test_promotion_job(
+    *,
+    tenant_id: str,
+    item_id: str,
+    run_after: datetime,
+    suffix: str,
+    job_type: str = "promotion.evaluate",
+    classification_run_id: str | None = None,
+) -> None:
+    dedupe = f"{job_type}:{item_id}:{suffix}"
+    payload: dict[str, Any]
+    if job_type == "promotion.path_a":
+        assert classification_run_id is not None
+        payload = {
+            "memory_item_id": item_id,
+            "classification_run_id": classification_run_id,
+        }
+    else:
+        payload = {
+            "contract_version": "promotion-evaluate-v1",
+            "memory_item_id": item_id,
+            "trigger_type": "item_created",
+            "trigger_id": suffix,
+            "requested_policy_version": "promotion-legacy-v1",
+            "ingest_id": None,
+            "correlation_id": None,
+            "dedupe_key": dedupe,
+        }
+    async with _test_session_factory() as session:
+        await enqueue_job(
+            session,
+            tenant_id=tenant_id,
+            job_type=job_type,
+            payload=payload,
+            run_after=run_after,
+            dedupe_key=dedupe,
+        )
+        await session.commit()
+
+
+@pytest.mark.parametrize(
+    ("old_age", "new_age"),
+    [(72, 24), (24, 72)],
+    ids=["boundary-moved-earlier", "boundary-moved-later"],
+)
+async def test_old_boundary_job_does_not_cover_current_obligation(
+    monkeypatch, old_age: int, new_age: int
+):
+    _flags(monkeypatch)
+    if not await _db_ok():
+        _require_db()
+    tenant_id, principal_id = await _default_tenant_principal()
+    created_at = FIXED_NOW - timedelta(hours=10)
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content=f"boundary moved {old_age} to {new_age}",
+        memory_confidence=0.9,
+        created_at=created_at,
+    )
+    await _enqueue_test_promotion_job(
+        tenant_id=tenant_id,
+        item_id=item_id,
+        run_after=created_at + timedelta(hours=old_age),
+        suffix=f"old-{old_age}",
+    )
+    async with _test_session_factory() as session:
+        await session.execute(
+            text(
+                "UPDATE tenant_config SET auto_promote_min_age_hours = :age "
+                "WHERE tenant_id = :tenant_id"
+            ),
+            {"age": new_age, "tenant_id": tenant_id},
+        )
+        await session.commit()
+
+    await _run_request_chain(tenant_id, trigger_id=f"boundary-{new_age}")
+
+    pending = [job for job in await _jobs(tenant_id) if job["status"] == STATUS_PENDING]
+    assert len(pending) == 2
+    assert sorted(job["run_after"] for job in pending) == sorted(
+        [
+            (created_at + timedelta(hours=old_age)).replace(tzinfo=UTC),
+            (created_at + timedelta(hours=new_age)).replace(tzinfo=UTC),
+        ]
+    )
+
+
+async def test_stale_legacy_binding_does_not_cover_current_obligation(monkeypatch):
+    _flags(monkeypatch)
+    if not await _db_ok():
+        _require_db()
+    tenant_id, principal_id = await _default_tenant_principal()
+    created_at = FIXED_NOW - timedelta(hours=10)
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="stale legacy binding",
+        memory_confidence=0.8,
+        created_at=created_at,
+    )
+    async with _test_session_factory() as session:
+        await session.execute(
+            text(
+                "UPDATE tenant_config SET auto_promote_evidence_enabled = TRUE, "
+                "auto_promote_confidence_threshold = 0.95 "
+                "WHERE tenant_id = :tenant_id"
+            ),
+            {"tenant_id": tenant_id},
+        )
+        await session.commit()
+    current_run_id = await _insert_bound_run(
+        item_id, created_at=created_at + timedelta(hours=1)
+    )
+    stale_run_id = str(uuid.uuid4())
+    boundary = created_at + timedelta(hours=73)
+    await _enqueue_test_promotion_job(
+        tenant_id=tenant_id,
+        item_id=item_id,
+        run_after=boundary,
+        suffix="stale-binding",
+        job_type="promotion.path_a",
+        classification_run_id=stale_run_id,
+    )
+
+    await _run_request_chain(tenant_id, trigger_id="stale-binding")
+
+    legacy = await _jobs(tenant_id, job_type="promotion.path_a")
+    assert len(legacy) == 1
+    assert legacy[0]["payload"]["classification_run_id"] == stale_run_id
+    canonical = await _jobs(tenant_id)
+    assert len(canonical) == 1
+    assert canonical[0]["run_after"] == boundary.replace(tzinfo=UTC)
+    assert current_run_id != stale_run_id
+
+
+async def test_current_legacy_binding_at_exact_boundary_covers_obligation(monkeypatch):
+    _flags(monkeypatch)
+    if not await _db_ok():
+        _require_db()
+    tenant_id, principal_id = await _default_tenant_principal()
+    created_at = FIXED_NOW - timedelta(hours=10)
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="current legacy binding",
+        memory_confidence=0.8,
+        created_at=created_at,
+    )
+    async with _test_session_factory() as session:
+        await session.execute(
+            text(
+                "UPDATE tenant_config SET auto_promote_evidence_enabled = TRUE, "
+                "auto_promote_confidence_threshold = 0.95 "
+                "WHERE tenant_id = :tenant_id"
+            ),
+            {"tenant_id": tenant_id},
+        )
+        await session.commit()
+    run_id = await _insert_bound_run(item_id, created_at=created_at + timedelta(hours=1))
+    await _enqueue_test_promotion_job(
+        tenant_id=tenant_id,
+        item_id=item_id,
+        run_after=created_at + timedelta(hours=73),
+        suffix="current-binding",
+        job_type="promotion.path_a",
+        classification_run_id=run_id,
+    )
+
+    await _run_request_chain(tenant_id, trigger_id="current-binding")
+
+    assert len(await _jobs(tenant_id, job_type="promotion.path_a")) == 1
+    assert await _jobs(tenant_id) == []
+
+
+async def test_large_unrelated_history_cannot_hide_current_healthy_job(monkeypatch):
+    _flags(monkeypatch)
+    if not await _db_ok():
+        _require_db()
+    tenant_id, principal_id = await _default_tenant_principal()
+    created_at = FIXED_NOW - timedelta(hours=10)
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="healthy job after large history",
+        memory_confidence=0.9,
+        created_at=created_at,
+    )
+    async with _test_session_factory() as session:
+        await session.execute(
+            text(
+                "INSERT INTO jobs (tenant_id, job_type, status, payload, run_after) "
+                "SELECT CAST(:tenant_id AS uuid), 'promotion.evaluate', 'dead', "
+                "jsonb_build_object('memory_item_id', gen_random_uuid()::text), now() "
+                "FROM generate_series(1, 1100)"
+            ),
+            {"tenant_id": tenant_id},
+        )
+        await session.commit()
+    await _enqueue_test_promotion_job(
+        tenant_id=tenant_id,
+        item_id=item_id,
+        run_after=created_at + timedelta(hours=72),
+        suffix="healthy-after-history",
+    )
+    async with _test_session_factory() as session:
+        await session.execute(text("SET LOCAL enable_seqscan = off"))
+        plan_rows = (
+            await session.execute(
+                text(
+                    "EXPLAIN SELECT 1 FROM jobs WHERE tenant_id = :tenant_id "
+                    "AND payload->>'memory_item_id' = :item_id "
+                    "AND job_type = 'promotion.evaluate' "
+                    "AND status IN ('pending', 'running') AND run_after = :boundary LIMIT 1"
+                ),
+                {
+                    "tenant_id": tenant_id,
+                    "item_id": item_id,
+                    "boundary": created_at + timedelta(hours=72),
+                },
+            )
+        ).scalars().all()
+    plan = "\n".join(plan_rows)
+    assert "Index Scan" in plan
+    assert (
+        "idx_jobs_reconcile_item_state" in plan
+        or "idx_jobs_tenant_type_status" in plan
+    )
+
+    await _run_request_chain(tenant_id, trigger_id="history-bound")
+
+    targeted = [
+        job
+        for job in await _jobs(tenant_id)
+        if job["payload"].get("memory_item_id") == item_id
+    ]
+    assert len(targeted) == 1
+    assert targeted[0]["payload"]["trigger_id"] == "healthy-after-history"
+
+
 # ===========================================================================
-# 4. Terminal-blocker fairness: documented rotation bound, no hot loop
+# 4. Terminal-blocker fairness and persisted selection suppression
 # ===========================================================================
 
 
@@ -600,7 +863,7 @@ async def test_terminal_blockers_cannot_starve_later_actionable_row(monkeypatch)
     # Documented bound: ceil(26 / 5) + 1 = 7 passes at most cover the stable
     # set; the chain terminates once the rotation reaches the tail.
     assert (await _item_row(target_id))["review_status"] == "active"
-    # No hot loop: terminal rows never received evaluation jobs.
+    # Terminal rows never received evaluation jobs.
     evaluate_jobs = await _jobs(tenant_id)
     terminal_repairs = [
         j
@@ -641,8 +904,8 @@ async def test_periodic_backstop_wraps_instead_of_terminating(monkeypatch):
     assert len(pending) == 1
     assert pending[0]["payload"]["reason"] == RECONCILE_REASON_BACKSTOP
     assert pending[0]["payload"]["trigger_id"] == BACKSTOP_TRIGGER_ID
-    # ... and wraps: a second pass from the advanced cursor reads the tail
-    # page, a third observes the empty page and wraps back to the head.
+    # ... and wraps: a second pass reads the tail.  The third wraps but does
+    # not select the same stable terminal rows again in this epoch.
     async with _test_session_factory() as session:
         await run_reconciliation_pass(
             session, tenant_id, reason=RECONCILE_REASON_BACKSTOP, trigger_id=BACKSTOP_TRIGGER_ID
@@ -651,7 +914,157 @@ async def test_periodic_backstop_wraps_instead_of_terminating(monkeypatch):
             session, tenant_id, reason=RECONCILE_REASON_BACKSTOP, trigger_id=BACKSTOP_TRIGGER_ID
         )
     assert result3.wrapped is True
-    assert result3.window_size == 2
+    assert result3.window_size == 0
+    async with _test_session_factory() as session:
+        suppressed = (
+            await session.execute(
+                text(
+                    "SELECT count(*) FROM promotion_reconcile_terminal "
+                    "WHERE tenant_id = :tenant_id"
+                ),
+                {"tenant_id": tenant_id},
+            )
+        ).scalar_one()
+    assert suppressed == 3
+
+
+async def test_terminal_suppression_survives_restart_and_later_rows_progress(monkeypatch):
+    global _test_engine, _test_session_factory
+    _flags(monkeypatch, pass_limit=1)
+    if not await _db_ok():
+        _require_db()
+    tenant_id, principal_id = await _default_tenant_principal()
+    terminal_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="persistently terminal",
+        memory_confidence=0.1,
+        created_at=FIXED_NOW - timedelta(hours=200),
+    )
+    async with _test_session_factory() as session:
+        first = await run_reconciliation_pass(
+            session,
+            tenant_id,
+            reason=RECONCILE_REASON_BACKSTOP,
+            trigger_id=BACKSTOP_TRIGGER_ID,
+        )
+    assert first.window_size == 1 and first.terminal_skipped == 1
+
+    await _test_engine.dispose()
+    _test_engine = create_async_engine(settings.database_url, poolclass=NullPool)
+    _test_session_factory = async_sessionmaker(
+        _test_engine, class_=AsyncSession, expire_on_commit=False
+    )
+    actionable_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="later actionable after restart",
+        memory_confidence=0.95,
+        created_at=FIXED_NOW - timedelta(hours=100),
+    )
+    async with _test_session_factory() as session:
+        second = await run_reconciliation_pass(
+            session,
+            tenant_id,
+            reason=RECONCILE_REASON_BACKSTOP,
+            trigger_id=BACKSTOP_TRIGGER_ID,
+        )
+    assert second.window_size == 1
+    await _drain_queue()
+    assert (await _item_row(actionable_id))["review_status"] == "active"
+    assert (await _item_row(terminal_id))["review_status"] == "proposed"
+
+
+async def test_policy_reset_reconsiders_terminal_item(monkeypatch):
+    _flags(monkeypatch)
+    if not await _db_ok():
+        _require_db()
+    tenant_id, principal_id = await _default_tenant_principal()
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="terminal reconsidered by reset",
+        memory_confidence=0.1,
+    )
+    async with _test_session_factory() as session:
+        first = await run_reconciliation_pass(
+            session,
+            tenant_id,
+            reason=RECONCILE_REASON_BACKSTOP,
+            trigger_id=BACKSTOP_TRIGGER_ID,
+        )
+    assert first.window_size == 1
+    async with _test_session_factory() as session:
+        await request_reconciliation_chain(
+            session,
+            tenant_id=tenant_id,
+            reason=RECONCILE_REASON_OPERATOR_REQUEST,
+            trigger_id="terminal-reset",
+        )
+        await session.commit()
+    await _drain_queue()
+    async with _test_session_factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT cursor_epoch FROM promotion_reconcile_terminal "
+                    "WHERE item_id = :item_id"
+                ),
+                {"item_id": item_id},
+            )
+        ).scalar_one()
+    assert row == 1
+
+
+async def test_evidence_change_invalidates_terminal_suppression(monkeypatch):
+    _flags(monkeypatch)
+    if not await _db_ok():
+        _require_db()
+    tenant_id, principal_id = await _default_tenant_principal()
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="terminal invalidated by evidence",
+        memory_confidence=0.1,
+    )
+    async with _test_session_factory() as session:
+        await run_reconciliation_pass(
+            session,
+            tenant_id,
+            reason=RECONCILE_REASON_BACKSTOP,
+            trigger_id=BACKSTOP_TRIGGER_ID,
+        )
+    async with _test_session_factory() as session:
+        assert (
+            await session.execute(
+                text(
+                    "SELECT count(*) FROM promotion_reconcile_terminal "
+                    "WHERE item_id = :item_id"
+                ),
+                {"item_id": item_id},
+            )
+        ).scalar_one() == 1
+    await _insert_bound_run(item_id)
+    async with _test_session_factory() as session:
+        assert (
+            await session.execute(
+                text(
+                    "SELECT count(*) FROM promotion_reconcile_terminal "
+                    "WHERE item_id = :item_id"
+                ),
+                {"item_id": item_id},
+            )
+        ).scalar_one() == 0
+    async with _test_session_factory() as session:
+        reconsidered = await run_reconciliation_pass(
+            session,
+            tenant_id,
+            reason=RECONCILE_REASON_BACKSTOP,
+            trigger_id=BACKSTOP_TRIGGER_ID,
+        )
+    assert reconsidered.wrapped is True
+    assert reconsidered.window_size == 1
+    assert reconsidered.terminal_skipped == 1
 
 
 # ===========================================================================
@@ -730,6 +1143,50 @@ async def test_kind_policy_change_schedules_bounded_chain_and_promotes(monkeypat
     reason = json.loads(events[0]["reason"])
     assert reason["trigger_type"] == "policy_changed"
     assert reason["trigger_id"].startswith("kind-policy:1:boundary:")
+
+
+async def test_kind_policy_revision_reconsiders_suppressed_terminal(monkeypatch, client):
+    _flags(monkeypatch)
+    if not await _db_ok():
+        _require_db()
+    tenant_id, principal_id = await _default_tenant_principal()
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="terminal reconsidered by kind revision",
+        memory_confidence=0.1,
+    )
+    async with _test_session_factory() as session:
+        await run_reconciliation_pass(
+            session,
+            tenant_id,
+            reason=RECONCILE_REASON_BACKSTOP,
+            trigger_id=BACKSTOP_TRIGGER_ID,
+        )
+    response = await client.patch(
+        "/v1/admin/memory-kinds/fact", json={"auto_promote_from_inferred": False}
+    )
+    assert response.status_code == 200, response.text
+    await _drain_queue()
+    response = await client.patch(
+        "/v1/admin/memory-kinds/fact", json={"auto_promote_from_inferred": True}
+    )
+    assert response.status_code == 200, response.text
+    await _drain_queue()
+    async with _test_session_factory() as session:
+        terminal_epoch, cursor_epoch, revision = (
+            await session.execute(
+                text(
+                    "SELECT t.cursor_epoch, s.cursor_epoch, s.kind_policy_revision "
+                    "FROM promotion_reconcile_terminal t "
+                    "JOIN promotion_reconcile_state s USING (tenant_id) "
+                    "WHERE t.item_id = :item_id"
+                ),
+                {"item_id": item_id},
+            )
+        ).one()
+    assert terminal_epoch == cursor_epoch == 2
+    assert revision == 2
 
 
 async def test_kind_policy_non_admission_change_schedules_nothing(monkeypatch, client):
@@ -828,7 +1285,7 @@ def _fake_classify_qualifying():
     return fake_classify
 
 
-async def test_provider_recovery_reenqueues_classification_async(monkeypatch):
+async def test_provider_recovery_reenqueues_classification_async(monkeypatch, client):
     _flags(monkeypatch)
     monkeypatch.setattr(settings, "classification_provider", "openai")
     if not await _db_ok():
@@ -844,14 +1301,30 @@ async def test_provider_recovery_reenqueues_classification_async(monkeypatch):
             {"tid": tenant_id},
         )
         await session.commit()
-    # An evidence-less, below-legacy-threshold proposal: written while the
-    # provider was unavailable, so no classification ever bound.
-    item_id = await _insert_item(
-        tenant_id=tenant_id,
-        principal_id=principal_id,
-        content="provider recovery target",
-        memory_confidence=0.6,
+    # A real remember-time auto-classification establishes durable intent and
+    # originally creates refine work.  Simulate loss of that job before a
+    # receipt binds; recovery must reconstruct intent from the immutable
+    # classification audit, not from the absence of evidence.
+    monkeypatch.setattr(settings, "promotion_evaluate_jobs_enabled", False)
+    remembered = await client.post(
+        "/v1/remember",
+        json={
+            "content": f"provider recovery target {uuid.uuid4()}",
+            "source_type": "sync_turn",
+        },
     )
+    assert remembered.status_code == 201, remembered.text
+    item_id = remembered.json()["id"]
+    async with _test_session_factory() as session:
+        await session.execute(
+            text(
+                "DELETE FROM jobs WHERE job_type = 'classification.refine' "
+                "AND payload->>'memory_item_id' = :item_id"
+            ),
+            {"item_id": item_id},
+        )
+        await session.commit()
+    monkeypatch.setattr(settings, "promotion_evaluate_jobs_enabled", True)
 
     async with _test_session_factory() as session:
         job_id = await request_reconciliation_chain(
@@ -951,17 +1424,82 @@ async def test_provider_recovery_does_not_reclassify_bound_evidence(monkeypatch)
     assert await _jobs(tenant_id, job_type="classification.refine") == []
 
 
-async def test_provider_recovery_suppressed_while_provider_unavailable(monkeypatch):
-    _flags(monkeypatch)  # classification_provider stays "none"
+async def test_provider_recovery_preserves_explicit_kind_semantics(monkeypatch):
+    _flags(monkeypatch)
+    monkeypatch.setattr(settings, "classification_provider", "openai")
+    if not await _db_ok():
+        _require_db()
+    tenant_id, principal_id = await _default_tenant_principal()
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="explicit kind must stay explicit",
+        memory_confidence=0.1,
+        kind="procedure",
+    )
+    await _mark_classification_origin(item_id, principal_id, source="explicit_kind")
+
+    await _run_request_chain(
+        tenant_id,
+        reason=RECONCILE_REASON_PROVIDER_RECOVERY,
+        trigger_id="explicit-kind-recovery",
+    )
+
+    assert await _jobs(tenant_id, job_type="classification.refine") == []
+    async with _test_session_factory() as session:
+        row = (
+            await session.execute(
+                text("SELECT kind FROM memory_items WHERE id = :item_id"),
+                {"item_id": item_id},
+            )
+        ).scalar_one()
+        classification_events = (
+            await session.execute(
+                text(
+                    "SELECT count(*) FROM item_events WHERE item_id = :item_id "
+                    "AND event_type = 'classification'"
+                ),
+                {"item_id": item_id},
+            )
+        ).scalar_one()
+    assert row == "procedure"
+    assert classification_events == 1
+
+
+async def test_provider_recovery_unknown_legacy_intent_fails_conservative(monkeypatch):
+    _flags(monkeypatch)
+    monkeypatch.setattr(settings, "classification_provider", "openai")
     if not await _db_ok():
         _require_db()
     tenant_id, principal_id = await _default_tenant_principal()
     await _insert_item(
         tenant_id=tenant_id,
         principal_id=principal_id,
+        content="legacy row with unknown classification intent",
+        memory_confidence=0.1,
+    )
+
+    await _run_request_chain(
+        tenant_id,
+        reason=RECONCILE_REASON_PROVIDER_RECOVERY,
+        trigger_id="unknown-intent-recovery",
+    )
+
+    assert await _jobs(tenant_id, job_type="classification.refine") == []
+
+
+async def test_provider_recovery_suppressed_while_provider_unavailable(monkeypatch):
+    _flags(monkeypatch)  # classification_provider stays "none"
+    if not await _db_ok():
+        _require_db()
+    tenant_id, principal_id = await _default_tenant_principal()
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
         content="suppressed recovery target",
         memory_confidence=0.1,
     )
+    await _mark_classification_origin(item_id, principal_id)
     async with _test_session_factory() as session:
         status_before = await reconciliation_status(
             session, tenant_id=tenant_id, now=datetime.now(UTC)
@@ -1132,6 +1670,107 @@ async def test_large_tenant_backlog_cannot_starve_small_tenant(monkeypatch):
             assert pending[0]["payload"]["reason"] == RECONCILE_REASON_BACKSTOP
 
 
+async def test_periodic_tenant_bootstrap_is_bounded_fair_and_restart_safe(monkeypatch):
+    global _test_engine, _test_session_factory
+    _flags(monkeypatch)
+    monkeypatch.setattr(settings, "promotion_reconciliation_tenant_batch_limit", 2)
+    if not await _db_ok():
+        _require_db()
+    for index in range(4):
+        await _make_tenant(f"tenant-window-{index}")
+
+    async with _test_session_factory() as session:
+        first_enqueued = await ensure_periodic_reconciliation_chains(session)
+    assert first_enqueued <= 2
+    async with _test_session_factory() as session:
+        first_tenants = set(
+            (
+                await session.execute(
+                    text(
+                        "SELECT DISTINCT tenant_id FROM jobs WHERE job_type = "
+                        "'promotion.reconcile' AND status = 'pending'"
+                    )
+                )
+            ).scalars()
+        )
+    assert len(first_tenants) <= 2
+
+    # Recreate the process/session factory between pages: the next call must
+    # continue from the durable global cursor, not enumerate from the head.
+    await _test_engine.dispose()
+    _test_engine = create_async_engine(settings.database_url, poolclass=NullPool)
+    _test_session_factory = async_sessionmaker(
+        _test_engine, class_=AsyncSession, expire_on_commit=False
+    )
+    for _ in range(4):
+        async with _test_session_factory() as session:
+            assert await ensure_periodic_reconciliation_chains(session) <= 2
+
+    async with _test_session_factory() as session:
+        covered = set(
+            (
+                await session.execute(
+                    text(
+                        "SELECT DISTINCT tenant_id FROM jobs WHERE job_type = "
+                        "'promotion.reconcile'"
+                    )
+                )
+            ).scalars()
+        )
+        all_tenants = set((await session.execute(text("SELECT id FROM tenants"))).scalars())
+    assert covered == all_tenants
+
+    # Kill one chain.  Repeated bounded pages wrap and heal it when its keyset
+    # turn arrives; no call expands beyond the configured bound.
+    victim = next(iter(all_tenants))
+    async with _test_session_factory() as session:
+        await session.execute(
+            text(
+                "UPDATE jobs SET status = 'dead' WHERE tenant_id = :tenant_id "
+                "AND job_type = 'promotion.reconcile' AND status = 'pending'"
+            ),
+            {"tenant_id": victim},
+        )
+        await session.commit()
+    for _ in range(4):
+        async with _test_session_factory() as session:
+            assert await ensure_periodic_reconciliation_chains(session) <= 2
+    async with _test_session_factory() as session:
+        healed = (
+            await session.execute(
+                text(
+                    "SELECT count(*) FROM jobs WHERE tenant_id = :tenant_id "
+                    "AND job_type = 'promotion.reconcile' AND status = 'pending'"
+                ),
+                {"tenant_id": victim},
+            )
+        ).scalar_one()
+    assert healed == 1
+
+
+async def test_global_operator_request_uses_bounded_continuation(monkeypatch):
+    _flags(monkeypatch)
+    monkeypatch.setattr(settings, "promotion_reconciliation_tenant_batch_limit", 2)
+    if not await _db_ok():
+        _require_db()
+    for index in range(3):
+        await _make_tenant(f"global-request-{index}")
+    trigger_id = "bounded-cli-request"
+    inspected: list[int] = []
+    completed = False
+    while not completed:
+        async with _test_session_factory() as session:
+            result = await request_global_reconciliation_window(
+                session,
+                reason=RECONCILE_REASON_OPERATOR_REQUEST,
+                trigger_id=trigger_id,
+            )
+        inspected.append(result.inspected)
+        completed = result.completed
+    assert all(count <= 2 for count in inspected)
+    assert sum(inspected) == 4  # seeded default + three created tenants
+
+
 # ===========================================================================
 # 10. RLS under the non-owner engram_app role
 # ===========================================================================
@@ -1174,6 +1813,20 @@ async def test_rls_tenant_isolation_of_reconcile_state(monkeypatch):
         )
         await session.commit()
 
+    terminal_id = await _insert_item(
+        tenant_id=tenant_b,
+        principal_id=principal_b,
+        content="tenant B terminal suppression row",
+        memory_confidence=0.1,
+    )
+    async with _test_session_factory() as session:
+        await run_reconciliation_pass(
+            session,
+            tenant_b,
+            reason=RECONCILE_REASON_BACKSTOP,
+            trigger_id=BACKSTOP_TRIGGER_ID,
+        )
+
     # Tenant A's app-role session can neither read nor move B's state.
     session_a = await _app_session(tenant_a, principal_a)
     try:
@@ -1187,6 +1840,12 @@ async def test_rls_tenant_isolation_of_reconcile_state(monkeypatch):
             .all()
         )
         assert rows == []
+        terminal_rows = (
+            await session_a.execute(
+                text("SELECT item_id FROM promotion_reconcile_terminal")
+            )
+        ).scalars().all()
+        assert terminal_rows == []
         await session_a.execute(
             text(
                 "UPDATE promotion_reconcile_state SET cursor_epoch = 99 "
@@ -1208,6 +1867,43 @@ async def test_rls_tenant_isolation_of_reconcile_state(monkeypatch):
             )
         ).scalar_one()
     assert epoch == 1  # untouched
+    session_b = await _app_session(tenant_b, principal_b)
+    try:
+        visible_terminal = (
+            await session_b.execute(
+                text(
+                    "SELECT item_id FROM promotion_reconcile_terminal "
+                    "WHERE item_id = :item_id"
+                ),
+                {"item_id": terminal_id},
+            )
+        ).scalar_one()
+        assert str(visible_terminal) == terminal_id
+        await session_b.execute(
+            text(
+                "INSERT INTO item_events (item_id, event_type, field_name, old_value, "
+                "new_value, actor_principal_id, reason) VALUES ("
+                ":item_id, 'classification', 'kind', NULL, :new_value, "
+                ":principal_id, 'RLS invalidation proof')"
+            ),
+            {
+                "item_id": terminal_id,
+                "new_value": json.dumps({"source": "explicit_kind", "kind": "fact"}),
+                "principal_id": principal_b,
+            },
+        )
+        await session_b.commit()
+        assert (
+            await session_b.execute(
+                text(
+                    "SELECT count(*) FROM promotion_reconcile_terminal "
+                    "WHERE item_id = :item_id"
+                ),
+                {"item_id": terminal_id},
+            )
+        ).scalar_one() == 0
+    finally:
+        await session_b.close()
 
 
 async def test_rls_forged_cross_tenant_enqueue_rejected(monkeypatch):
@@ -1261,6 +1957,42 @@ async def test_reconcile_handler_runs_under_routed_tenant_context(monkeypatch):
 # ===========================================================================
 # 11. Concurrency: one mutation, one authoritative event
 # ===========================================================================
+
+
+async def test_two_same_epoch_passes_cannot_create_forward_hole(monkeypatch):
+    _flags(monkeypatch, pass_limit=2)
+    if not await _db_ok():
+        _require_db()
+    tenant_id, principal_id = await _default_tenant_principal()
+    item_ids = [
+        await _insert_item(
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            content=f"same epoch coverage {index}",
+            memory_confidence=0.95,
+            created_at=FIXED_NOW - timedelta(hours=200, minutes=index),
+        )
+        for index in range(5)
+    ]
+
+    async def ordinary_pass() -> None:
+        async with _test_session_factory() as session:
+            await run_reconciliation_pass(
+                session,
+                tenant_id,
+                reason=RECONCILE_REASON_BACKSTOP,
+                trigger_id=BACKSTOP_TRIGGER_ID,
+            )
+
+    await asyncio.gather(ordinary_pass(), ordinary_pass())
+    # Last-writer-wins may move the cursor backward and cause rework, but two
+    # more bounded pages must cover every remaining row—none can be skipped
+    # ahead of both passes.
+    await ordinary_pass()
+    await ordinary_pass()
+    jobs = await _jobs(tenant_id)
+    covered = {job["payload"]["memory_item_id"] for job in jobs}
+    assert covered == set(item_ids)
 
 
 async def test_concurrent_paths_produce_single_mutation_and_event(monkeypatch):

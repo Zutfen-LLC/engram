@@ -241,6 +241,10 @@ class Settings(BaseSettings):
     # emitted) by one promotion.reconcile pass. Deployment-level cap, not part
     # of any public API.
     promotion_reconciliation_pass_limit: int = 20
+    # Hard owner-side bound on tenant ids inspected by one periodic bootstrap
+    # or one all-tenant CLI continuation.  Progress is persisted in a global,
+    # content-free keyset cursor, so restart does not expand this bound.
+    promotion_reconciliation_tenant_batch_limit: int = 100
 
     @model_validator(mode="after")
     def _clamp_startup_recall_candidate_limit(self) -> Settings:
@@ -336,6 +340,8 @@ class Settings(BaseSettings):
             raise ValueError("promotion_reconciliation_pass_limit must be >= 1")
         if self.promotion_reconciliation_interval_seconds < 1:
             raise ValueError("promotion_reconciliation_interval_seconds must be >= 1")
+        if self.promotion_reconciliation_tenant_batch_limit < 1:
+            raise ValueError("promotion_reconciliation_tenant_batch_limit must be >= 1")
         return self
 
     @model_validator(mode="after")

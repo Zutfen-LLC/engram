@@ -1315,6 +1315,49 @@ class PromotionReconcileState(Base):
     )
 
 
+class PromotionReconcileTerminal(Base):
+    """Per-item scheduler suppression for a terminal reconciliation result.
+
+    This records only that the bounded backstop observed the item under one
+    reconciliation cursor epoch.  It deliberately stores no score, blocker,
+    threshold, or other promotion assessment.  Relevant item/evidence events
+    delete the row, while tenant-wide resets advance the epoch.
+    """
+
+    __tablename__ = "promotion_reconcile_terminal"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "item_id"],
+            ["memory_items.tenant_id", "memory_items.id"],
+            name="fk_promotion_reconcile_terminal_item",
+            ondelete="CASCADE",
+        ),
+    )
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), primary_key=True
+    )
+    item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    cursor_epoch: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class PromotionReconcileSchedulerState(Base):
+    """Owner-only global cursor for bounded, content-free tenant scheduling."""
+
+    __tablename__ = "promotion_reconcile_scheduler_state"
+
+    scheduler_key: Mapped[str] = mapped_column(Text, primary_key=True)
+    cursor_created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cursor_tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    completed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
 class CandidateIngest(Base):
     """Immutable server-issued identity for one candidate entering the pipeline."""
 

@@ -25,8 +25,9 @@ PostgreSQL job queue):
   pass at ``now + promotion_reconciliation_interval_seconds`` under a fixed
   per-tenant dedupe key, so at most one pending backstop pass per tenant
   exists and the queue stays globally fair across tenants. The worker loop
-  bootstraps/heals chains (``ensure_periodic_reconciliation_chains``) —
-  bounded, content-free bookkeeping only.
+  bootstraps/heals chains (``ensure_periodic_reconciliation_chains``) through
+  a durable owner-only tenant keyset cursor — bounded, content-free
+  bookkeeping only, never an all-tenant materialization.
 * **Request chains** (``policy_change`` / ``provider_recovery`` /
   ``operator_request``): a committed policy change or an explicit authorized
   request resets the tenant's rotation cursor and enqueues one bounded pass;
@@ -39,9 +40,10 @@ Candidate discovery is a bounded keyset rotation over live proposals
 kind-policy-eligible only, ``ORDER BY (created_at, id) LIMIT n`` strictly
 after the persisted cursor in ``promotion_reconcile_state``), served by the
 partial index ``idx_memitems_proposed_rotation``. Terminal-under-current-policy
-rows are visited at most once per rotation, so they can never permanently
-occupy the front of every pass, while a relevant policy change (cursor reset)
-or new evidence (its own targeted producer) makes them reconsiderable.
+rows get a scheduler-only suppression marker for the current cursor epoch and
+are excluded from later ordinary periodic selection. Relevant item/evidence
+events invalidate the marker; policy/operator/provider resets advance the
+epoch. No promotion decision state is persisted.
 
 Restart/crash safety: repairs, cursor advance, and chain continuation commit
 in ONE transaction — a crash before commit replays safely (repairs are
@@ -70,9 +72,15 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.config import settings
-from engram.models import Job, MemoryItem, PromotionReconcileState, Tenant
+from engram.models import (
+    Job,
+    MemoryItem,
+    PromotionReconcileSchedulerState,
+    PromotionReconcileState,
+    PromotionReconcileTerminal,
+    Tenant,
+)
 from engram.promotion import (
-    PROMOTION_EVALUATE_JOB_TYPE,
     TRIGGER_POLICY_CHANGED,
     TRIGGER_RECONCILE,
     _config,
@@ -101,6 +109,7 @@ __all__ = [
     "RECONCILE_REASON_POLICY_CHANGE",
     "RECONCILE_REASON_PROVIDER_RECOVERY",
     "ReconciliationPassResult",
+    "TenantSchedulingResult",
     "BACKSTOP_TRIGGER_ID",
     "build_promotion_reconcile_payload",
     "bump_kind_policy_revision",
@@ -109,6 +118,7 @@ __all__ = [
     "promotion_reconcile_continuation_key",
     "promotion_reconcile_dedupe_key",
     "reconciliation_status",
+    "request_global_reconciliation_window",
     "request_reconciliation_chain",
     "run_reconciliation_pass",
 ]
@@ -155,17 +165,12 @@ PROMOTION_RECONCILE_ALLOWED_FIELDS: frozenset[str] = frozenset(
     {"contract_version", "reason", "trigger_id", "dedupe_key"}
 )
 
-# Hard bound on job rows examined per window lookup so a pathological job
-# history can never make a "bounded" pass unbounded. Deterministic order
-# keeps the bound repeatable. The enqueue-side dedupe (partial unique index
-# idx_jobs_dedupe) remains the hard one-pending-job-per-identity guarantee
-# even if this diagnostic bound truncates a lookup — a missed healthy job can
-# at worst cause a redundant repair enqueue that the unique index collapses.
-_MAX_WINDOW_JOB_ROWS = 1000
+# Diagnostics return only a compact sample of queue history.  Correctness
+# lookups do not use this cap: they use one indexed EXISTS probe per item in
+# the already-bounded reconciliation window.
+_MAX_DIAGNOSTIC_JOB_ROWS = 1000
 
-_LEGACY_PROMOTION_JOB_TYPE = "promotion.path_a"
 _CLASSIFICATION_REFINE_JOB_TYPE = "classification.refine"
-_PROMOTION_JOB_TYPES: tuple[str, ...] = (PROMOTION_EVALUATE_JOB_TYPE, _LEGACY_PROMOTION_JOB_TYPE)
 
 
 class PromotionReconcileContractError(ValueError):
@@ -342,6 +347,16 @@ class ReconciliationPassResult:
         )
 
 
+@dataclass(frozen=True)
+class TenantSchedulingResult:
+    """Content-free result of one bounded owner-side tenant window."""
+
+    inspected: int
+    enqueued: int
+    wrapped: bool = False
+    completed: bool = False
+
+
 # Repair classification of one candidate, derived exclusively from the shared
 # evaluator's PromotionCandidate (never a second policy).
 _REPAIR_ELIGIBLE_NOW = "eligible_now"
@@ -427,71 +442,104 @@ def _repair_trigger(
 
 @dataclass
 class _ItemJobState:
-    healthy_promotion: bool = False
+    canonical_covers_obligation: bool = False
+    legacy_covers_obligation: bool = False
     healthy_refine: bool = False
-    dead_promotion: int = 0
+    dead_promotion: bool = False
+    classification_intended: bool = False
+
+    @property
+    def promotion_covers_obligation(self) -> bool:
+        return self.canonical_covers_obligation or self.legacy_covers_obligation
+
+
+@dataclass(frozen=True)
+class _ItemObligation:
+    boundary: datetime | None
+    classification_run_id: uuid.UUID | None
 
 
 async def _window_job_states(
     session: AsyncSession,
     *,
     tenant_id: str,
-    item_ids: list[uuid.UUID],
+    obligations: dict[uuid.UUID, _ItemObligation],
+    now: datetime,
 ) -> dict[uuid.UUID, _ItemJobState]:
-    """Bounded, deterministic lookup of window items' relevant queue state.
+    """Resolve current queue coverage with indexed probes per window item.
 
-    Healthy means pending/running — a scheduled or in-flight targeted job the
-    reconciler must not duplicate (a merely-overdue pending job is still the
-    queue's own work, claimed in run_after order). Dead jobs are counted for
-    diagnostics; repair decisions key off healthy presence, and the enqueue
-    side's unique dedupe index is the hard duplicate guarantee.
+    For a cooling obligation only the exact evaluator-produced boundary
+    covers it.  For an already-due obligation, a due/overdue pending or
+    running canonical job covers it; a future job does not.  Legacy Path A
+    additionally has to name the currently bound classification run.  The
+    VALUES relation has at most ``promotion_reconciliation_pass_limit`` rows,
+    and every EXISTS probe is served by ``idx_jobs_reconcile_item_state``;
+    unrelated history is neither materialized nor globally capped.
     """
-    result: dict[uuid.UUID, _ItemJobState] = {item_id: _ItemJobState() for item_id in item_ids}
-    if not item_ids:
+    result = {item_id: _ItemJobState() for item_id in obligations}
+    if not obligations:
         return result
-    param_names = [f"recon_item_{i}" for i in range(len(item_ids))]
-    params = {name: str(item_id) for name, item_id in zip(param_names, item_ids, strict=True)}
-    rows = (
-        (
-            await session.execute(
-                select(Job)
-                .where(
-                    Job.tenant_id == str(tenant_id),
-                    Job.job_type.in_(_PROMOTION_JOB_TYPES + (_CLASSIFICATION_REFINE_JOB_TYPE,)),
-                    Job.status.in_(("pending", "running", "dead")),
-                    text(
-                        "payload->>'memory_item_id' IN ("
-                        + ", ".join(f":{name}" for name in param_names)
-                        + ")"
-                    ),
-                )
-                .order_by(Job.created_at.asc(), Job.id.asc())
-                .limit(_MAX_WINDOW_JOB_ROWS)
-                .params(**params)
-            )
+    value_rows: list[str] = []
+    params: dict[str, object] = {"tenant_id": str(tenant_id), "moment": now}
+    for index, (item_id, obligation) in enumerate(obligations.items()):
+        value_rows.append(
+            f"(CAST(:item_{index} AS uuid), CAST(:boundary_{index} AS timestamptz), "
+            f"CAST(:run_{index} AS uuid))"
         )
-        .scalars()
-        .all()
-    )
-    for job in rows:
-        payload_item = job.payload.get("memory_item_id") if job.payload else None
-        if payload_item is None:
-            continue
-        try:
-            item_id = uuid.UUID(str(payload_item))
-        except ValueError:
-            continue
-        state = result.get(item_id)
-        if state is None:
-            continue
-        is_promotion = job.job_type in _PROMOTION_JOB_TYPES
-        if job.status in ("pending", "running"):
-            if is_promotion:
-                state.healthy_promotion = True
-            elif job.job_type == _CLASSIFICATION_REFINE_JOB_TYPE:
-                state.healthy_refine = True
-        elif job.status == "dead" and is_promotion:
-            state.dead_promotion += 1
+        params[f"item_{index}"] = str(item_id)
+        params[f"boundary_{index}"] = obligation.boundary
+        params[f"run_{index}"] = (
+            str(obligation.classification_run_id)
+            if obligation.classification_run_id is not None
+            else None
+        )
+    rows = (
+        await session.execute(
+            text(
+                "WITH obligation(item_id, boundary, classification_run_id) AS (VALUES "
+                + ", ".join(value_rows)
+                + ") SELECT o.item_id, "
+                "EXISTS (SELECT 1 FROM jobs j WHERE j.tenant_id = CAST(:tenant_id AS uuid) "
+                "AND j.payload->>'memory_item_id' = o.item_id::text "
+                "AND j.job_type = 'promotion.evaluate' "
+                "AND j.status IN ('pending', 'running') AND o.boundary IS NOT NULL "
+                "AND ((o.boundary > CAST(:moment AS timestamptz) AND j.run_after = o.boundary) "
+                "OR (o.boundary <= CAST(:moment AS timestamptz) "
+                "AND j.run_after <= CAST(:moment AS timestamptz)))) AS canonical_covers, "
+                "EXISTS (SELECT 1 FROM jobs j WHERE j.tenant_id = CAST(:tenant_id AS uuid) "
+                "AND j.payload->>'memory_item_id' = o.item_id::text "
+                "AND j.job_type = 'promotion.path_a' "
+                "AND j.status IN ('pending', 'running') AND o.boundary IS NOT NULL "
+                "AND o.classification_run_id IS NOT NULL "
+                "AND j.payload->>'classification_run_id' = o.classification_run_id::text "
+                "AND ((o.boundary > CAST(:moment AS timestamptz) AND j.run_after = o.boundary) "
+                "OR (o.boundary <= CAST(:moment AS timestamptz) "
+                "AND j.run_after <= CAST(:moment AS timestamptz)))) AS legacy_covers, "
+                "EXISTS (SELECT 1 FROM jobs j WHERE j.tenant_id = CAST(:tenant_id AS uuid) "
+                "AND j.payload->>'memory_item_id' = o.item_id::text "
+                "AND j.job_type = 'classification.refine' "
+                "AND j.status IN ('pending', 'running')) AS healthy_refine, "
+                "EXISTS (SELECT 1 FROM jobs j WHERE j.tenant_id = CAST(:tenant_id AS uuid) "
+                "AND j.payload->>'memory_item_id' = o.item_id::text "
+                "AND j.job_type IN ('promotion.evaluate', 'promotion.path_a') "
+                "AND j.status = 'dead') AS dead_promotion, "
+                "EXISTS (SELECT 1 FROM item_events e WHERE e.item_id = o.item_id "
+                "AND e.event_type = 'classification' AND e.field_name = 'kind' "
+                "AND e.new_value::jsonb->>'source' = 'auto_classified') "
+                "AS classification_intended FROM obligation o"
+            ),
+            params,
+        )
+    ).mappings()
+    for row in rows:
+        item_id = row["item_id"]
+        result[item_id] = _ItemJobState(
+            canonical_covers_obligation=bool(row["canonical_covers"]),
+            legacy_covers_obligation=bool(row["legacy_covers"]),
+            healthy_refine=bool(row["healthy_refine"]),
+            dead_promotion=bool(row["dead_promotion"]),
+            classification_intended=bool(row["classification_intended"]),
+        )
     return result
 
 
@@ -541,7 +589,16 @@ def _window_stmt(
         MemoryItem.tenant_id == tenant_id,
         MemoryItem.review_status == "proposed",
         MemoryItem.valid_to.is_(None),
+        MemoryItem.superseded_by.is_(None),
         _kind_promotion_allowed(),
+        ~select(PromotionReconcileTerminal.item_id)
+        .where(
+            PromotionReconcileTerminal.tenant_id == MemoryItem.tenant_id,
+            PromotionReconcileTerminal.item_id == MemoryItem.id,
+            PromotionReconcileTerminal.cursor_epoch
+            == (cursor.cursor_epoch if cursor is not None else 0),
+        )
+        .exists(),
     )
     if cursor is not None and cursor.cursor_created_at is not None:
         stmt = stmt.where(
@@ -553,7 +610,11 @@ def _window_stmt(
                 ),
             )
         )
-    return stmt.order_by(MemoryItem.created_at.asc(), MemoryItem.id.asc()).limit(limit)
+    return (
+        stmt.order_by(MemoryItem.created_at.asc(), MemoryItem.id.asc())
+        .limit(limit)
+        .with_for_update(of=MemoryItem)
+    )
 
 
 async def run_reconciliation_pass(
@@ -618,16 +679,10 @@ async def run_reconciliation_pass(
     config = await _config(session, str(tenant_id))
     enabled, threshold, min_age, evidence_enabled, evidence_threshold = _config_values(config)
     support_map = await load_promotion_support(session, items)
-    job_states = await _window_job_states(
-        session, tenant_id=tenant_id, item_ids=[item.id for item in items]
-    )
-    classification_available = settings.classification_provider != "none"
-
+    candidates: dict[uuid.UUID, Any] = {}
+    repair_classes: dict[uuid.UUID, str] = {}
+    obligations: dict[uuid.UUID, _ItemObligation] = {}
     for item in items:
-        if item.superseded_by is not None:
-            # Same liveness skip the mutation sweep applies.
-            result.terminal_skipped += 1
-            continue
         candidate = assess_promotion_candidate(
             item,
             support_map[item.id],
@@ -638,17 +693,43 @@ async def run_reconciliation_pass(
             now=moment,
         )
         repair_class = _classify_repair(candidate)
+        candidates[item.id] = candidate
+        repair_classes[item.id] = repair_class
+        boundary = (
+            _next_boundary(candidate, moment)[0]
+            if repair_class != _REPAIR_TERMINAL
+            else None
+        )
+        obligations[item.id] = _ItemObligation(
+            boundary=boundary,
+            classification_run_id=candidate.classification_run_id,
+        )
+    job_states = await _window_job_states(
+        session,
+        tenant_id=tenant_id,
+        obligations=obligations,
+        now=moment,
+    )
+    classification_available = settings.classification_provider != "none"
 
-        # Provider recovery: re-enqueue the existing async classification
-        # contract for evidence-less live proposals (no bound receipt, no
-        # healthy refine job). Never inline, never a re-classification of
-        # already-bound evidence, and suppressed (counted) while the provider
-        # is still unavailable — recovery is requested only after the
-        # provider is restored.
+    for item in items:
+        if item.superseded_by is not None:
+            # Same liveness skip the mutation sweep applies.
+            result.terminal_skipped += 1
+            continue
+        candidate = candidates[item.id]
+        repair_class = repair_classes[item.id]
+
+        # Provider recovery restores only remember-time classification intent
+        # proven by the immutable initial auto_classified audit event.  Lack
+        # of a receipt alone is not proof: explicit-kind and unknown legacy
+        # rows stay excluded.  Work remains async and already-bound evidence
+        # is never reclassified.
         if (
             reason == RECONCILE_REASON_PROVIDER_RECOVERY
             and support_map[item.id].classification_run is None
             and not job_states[item.id].healthy_refine
+            and job_states[item.id].classification_intended
         ):
             if classification_available and enabled:
                 await enqueue_job_in_transaction(
@@ -663,15 +744,34 @@ async def run_reconciliation_pass(
                 result.suppressed += 1
 
         if repair_class == _REPAIR_TERMINAL:
-            # Cannot auto-promote under current policy without new evidence,
-            # review, or a policy change. Visited at most once per rotation —
-            # no repair is enqueued, so terminal rows cannot hot-loop.
+            # Persist only scheduler-level suppression for this epoch.  Any
+            # relevant item/evidence/feedback event deletes it; a full reset
+            # advances the epoch.  No promotion decision data is retained.
+            await session.execute(
+                pg_insert(PromotionReconcileTerminal)
+                .values(
+                    tenant_id=uuid.UUID(str(tenant_id)),
+                    item_id=item.id,
+                    cursor_epoch=state.cursor_epoch if state is not None else 0,
+                    observed_at=moment,
+                )
+                .on_conflict_do_update(
+                    index_elements=[
+                        PromotionReconcileTerminal.tenant_id,
+                        PromotionReconcileTerminal.item_id,
+                    ],
+                    set_={
+                        "cursor_epoch": state.cursor_epoch if state is not None else 0,
+                        "observed_at": moment,
+                    },
+                )
+            )
             result.terminal_skipped += 1
             continue
-        if job_states[item.id].healthy_promotion:
-            # A valid scheduled/in-flight targeted evaluation (canonical or,
-            # during mixed-version operation, legacy promotion.path_a) must
-            # not get a duplicate.
+        if job_states[item.id].promotion_covers_obligation:
+            # Status alone is insufficient: this job's due time (and, for
+            # legacy work, classification binding) covers the evaluator's
+            # current authoritative obligation.
             result.healthy_skipped += 1
             continue
         if job_states[item.id].dead_promotion:
@@ -890,58 +990,162 @@ async def request_reconciliation_chain(
     )
 
 
-async def ensure_periodic_reconciliation_chains(owner_session: AsyncSession) -> int:
-    """Bootstrap/heal every tenant's perpetual backstop chain.
+async def _locked_tenant_scheduler_state(
+    owner_session: AsyncSession, scheduler_key: str
+) -> PromotionReconcileSchedulerState:
+    await owner_session.execute(
+        pg_insert(PromotionReconcileSchedulerState)
+        .values(scheduler_key=scheduler_key, completed=False)
+        .on_conflict_do_nothing(index_elements=[PromotionReconcileSchedulerState.scheduler_key])
+    )
+    return (
+        await owner_session.execute(
+            select(PromotionReconcileSchedulerState)
+            .where(PromotionReconcileSchedulerState.scheduler_key == scheduler_key)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
 
-    Returns the number of missing chains created. Idempotent: any
-    pending/running backstop link (first link or continuation) absorbs the
-    bootstrap attempt for its tenant, so this only ever (re)creates a missing
-    chain — the crash/dead-job repair for the periodic topology. Runs through
-    the owner session because enumerating tenant ids is content-free
-    cross-tenant bookkeeping (no item data). Inert unless the rollout flag
-    is on.
-    """
-    from engram.jobs import enqueue_job_in_transaction
 
-    if not settings.promotion_reconciliation_enabled:
-        return 0
-    tenant_ids = list(
-        (
-            await owner_session.execute(
-                select(Tenant.id).order_by(Tenant.created_at.asc(), Tenant.id.asc())
+def _tenant_window_stmt(
+    state: PromotionReconcileSchedulerState,
+    limit: int,
+) -> Select[tuple[uuid.UUID]]:
+    stmt = select(Tenant.id)
+    if state.cursor_created_at is not None:
+        stmt = stmt.where(
+            or_(
+                Tenant.created_at > state.cursor_created_at,
+                and_(
+                    Tenant.created_at == state.cursor_created_at,
+                    Tenant.id > state.cursor_tenant_id,
+                ),
             )
         )
-        .scalars()
-        .all()
-    )
+    return stmt.order_by(Tenant.created_at.asc(), Tenant.id.asc()).limit(limit)
+
+
+async def _schedule_tenant_window(
+    owner_session: AsyncSession,
+    *,
+    scheduler_key: str,
+    reason: str,
+    trigger_id: str,
+    periodic: bool,
+) -> TenantSchedulingResult:
+    """Inspect one locked, restart-safe tenant keyset window."""
+    from engram.jobs import enqueue_job_in_transaction
+
+    state = await _locked_tenant_scheduler_state(owner_session, scheduler_key)
+    if state.completed and not periodic:
+        return TenantSchedulingResult(inspected=0, enqueued=0, completed=True)
+    limit = settings.promotion_reconciliation_tenant_batch_limit
+    tenant_rows = (await owner_session.execute(_tenant_window_stmt(state, limit))).all()
+    wrapped = False
+    if not tenant_rows and state.cursor_created_at is not None:
+        if periodic:
+            wrapped = True
+            state.cursor_created_at = None
+            state.cursor_tenant_id = None
+            tenant_rows = (
+                await owner_session.execute(_tenant_window_stmt(state, limit))
+            ).all()
+        else:
+            state.completed = True
+            state.updated_at = datetime.now(UTC)
+            return TenantSchedulingResult(inspected=0, enqueued=0, completed=True)
     enqueued = 0
     moment = datetime.now(UTC)
-    for tenant_id in tenant_ids:
-        # Heal only a genuinely missing chain: any pending/running backstop
-        # link (first link or continuation) absorbs this bootstrap attempt.
+    for (tenant_id,) in tenant_rows:
         active = await _active_chain_job(
             owner_session,
             tenant_id=str(tenant_id),
-            reason=RECONCILE_REASON_BACKSTOP,
-            trigger_id=BACKSTOP_TRIGGER_ID,
+            reason=reason,
+            trigger_id=trigger_id,
         )
         if active is not None:
             continue
-        await enqueue_job_in_transaction(
-            owner_session,
-            tenant_id=str(tenant_id),
-            job_type=PROMOTION_RECONCILE_JOB_TYPE,
-            payload=build_promotion_reconcile_payload(
-                reason=RECONCILE_REASON_BACKSTOP, trigger_id=BACKSTOP_TRIGGER_ID
-            ),
-            run_after=moment,
-            dedupe_key=promotion_reconcile_dedupe_key(
-                RECONCILE_REASON_BACKSTOP, BACKSTOP_TRIGGER_ID
-            ),
-        )
+        if periodic:
+            await enqueue_job_in_transaction(
+                owner_session,
+                tenant_id=str(tenant_id),
+                job_type=PROMOTION_RECONCILE_JOB_TYPE,
+                payload=build_promotion_reconcile_payload(
+                    reason=reason, trigger_id=trigger_id
+                ),
+                run_after=moment,
+                dedupe_key=promotion_reconcile_dedupe_key(reason, trigger_id),
+            )
+        else:
+            await request_reconciliation_chain(
+                owner_session,
+                tenant_id=str(tenant_id),
+                reason=reason,
+                trigger_id=trigger_id,
+                now=moment,
+            )
         enqueued += 1
+    if tenant_rows:
+        last_tenant_id = tenant_rows[-1][0]
+        last_created_at = (
+            await owner_session.execute(
+                select(Tenant.created_at).where(Tenant.id == last_tenant_id)
+            )
+        ).scalar_one()
+        state.cursor_created_at = last_created_at
+        state.cursor_tenant_id = last_tenant_id
+    if not periodic and len(tenant_rows) < limit:
+        state.completed = True
+    state.updated_at = moment
+    return TenantSchedulingResult(
+        inspected=len(tenant_rows),
+        enqueued=enqueued,
+        wrapped=wrapped,
+        completed=state.completed,
+    )
+
+
+async def ensure_periodic_reconciliation_chains(owner_session: AsyncSession) -> int:
+    """Bootstrap/heal one bounded tenant window of backstop chains.
+
+    The owner-only cursor is committed atomically with queue inserts.  Each
+    call inspects at most ``promotion_reconciliation_tenant_batch_limit``
+    tenant ids, wraps fairly, and resumes after process restart.
+    """
+    if not settings.promotion_reconciliation_enabled:
+        return 0
+    result = await _schedule_tenant_window(
+        owner_session,
+        scheduler_key="periodic-backstop-v1",
+        reason=RECONCILE_REASON_BACKSTOP,
+        trigger_id=BACKSTOP_TRIGGER_ID,
+        periodic=True,
+    )
     await owner_session.commit()
-    return enqueued
+    return result.enqueued
+
+
+async def request_global_reconciliation_window(
+    owner_session: AsyncSession,
+    *,
+    reason: str,
+    trigger_id: str,
+) -> TenantSchedulingResult:
+    """Request one restart-safe bounded all-tenant CLI continuation page."""
+    if reason not in _REQUEST_REASONS:
+        raise PromotionReconcileContractError(f"invalid global request reason: {reason!r}")
+    if not settings.promotion_reconciliation_enabled:
+        return TenantSchedulingResult(inspected=0, enqueued=0, completed=True)
+    result = await _schedule_tenant_window(
+        owner_session,
+        scheduler_key=f"explicit-request-v1:{reason}:{trigger_id}",
+        reason=reason,
+        trigger_id=trigger_id,
+        periodic=False,
+    )
+    await owner_session.commit()
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -978,7 +1182,7 @@ async def reconciliation_status(
                     Job.status.in_(("pending", "running", "dead")),
                 )
                 .order_by(Job.created_at.asc(), Job.id.asc())
-                .limit(_MAX_WINDOW_JOB_ROWS)
+                .limit(_MAX_DIAGNOSTIC_JOB_ROWS)
             )
         )
         .all()

@@ -11,7 +11,7 @@
 -- slice (removal is B5, after shadow parity).
 --
 -- This migration adds the smallest durable scheduler-only state the backstop
--- needs, plus the partial index that makes every bounded keyset rotation
+-- needs, plus indexes that make bounded item and queue lookups deterministic
 -- over live proposals (this backstop *and* #164's startup rotation) a truly
 -- index-bounded scan instead of a filter+sort behind a LIMIT:
 --
@@ -26,10 +26,17 @@
 --   dedupe/replay, and content-free last-pass counts for diagnostics. This
 --   is orchestration bookkeeping, never an authoritative promotion
 --   assessment (#159 owns that) and never memory content.
+-- * `promotion_reconcile_terminal` — one identifier/generation marker per
+--   terminal item, invalidated by relevant state/evidence events and ignored
+--   after a reset epoch. It stores no assessment or policy result.
+-- * `promotion_reconcile_scheduler_state` — owner-only, content-free keyset
+--   cursors that bound automatic and CLI tenant enumeration across restarts.
 -- * `idx_memitems_proposed_rotation` — partial index on
 --   (tenant_id, created_at, id) WHERE review_status='proposed' AND
 --   valid_to IS NULL, serving the strictly-after keyset predicate with
 --   ORDER BY created_at, id ... LIMIT n directly from the index.
+-- * `idx_jobs_reconcile_item_state` — targeted queue-state probes keyed by
+--   each item in that bounded window; unrelated history cannot hide coverage.
 --
 -- Additive only: rolling application code back leaves an unused table and an
 -- unused index. FORCE RLS from the first migration for this tenant-scoped
@@ -68,6 +75,31 @@ CREATE TABLE IF NOT EXISTS promotion_reconcile_state (
     updated_at             TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- A row means only "the backstop observed this item as terminal in this
+-- cursor epoch".  It is scheduler suppression, not a durable promotion
+-- assessment: no blocker, score, threshold, content, or decision is stored.
+CREATE TABLE IF NOT EXISTS promotion_reconcile_terminal (
+    tenant_id      UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    item_id        UUID NOT NULL,
+    cursor_epoch   BIGINT NOT NULL,
+    observed_at    TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (tenant_id, item_id),
+    CONSTRAINT fk_promotion_reconcile_terminal_item
+        FOREIGN KEY (tenant_id, item_id)
+        REFERENCES memory_items(tenant_id, id) ON DELETE CASCADE
+);
+
+-- Cross-tenant, owner-only, content-free scheduling position.  Separate keys
+-- let the perpetual bootstrap and explicit paginated CLI requests resume
+-- independently after restart without enumerating the tenant table.
+CREATE TABLE IF NOT EXISTS promotion_reconcile_scheduler_state (
+    scheduler_key       TEXT PRIMARY KEY,
+    cursor_created_at   TIMESTAMPTZ,
+    cursor_tenant_id    UUID,
+    completed           BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- ============ 2. Row Level Security ============
 -- FORCE RLS: the table owner (migration role) is also subject to the policy.
 -- Tenant-scoped only — the backstop reconciles the tenant's proposed set as
@@ -78,6 +110,8 @@ CREATE TABLE IF NOT EXISTS promotion_reconcile_state (
 
 ALTER TABLE promotion_reconcile_state ENABLE ROW LEVEL SECURITY;
 ALTER TABLE promotion_reconcile_state FORCE ROW LEVEL SECURITY;
+ALTER TABLE promotion_reconcile_terminal ENABLE ROW LEVEL SECURITY;
+ALTER TABLE promotion_reconcile_terminal FORCE ROW LEVEL SECURITY;
 
 DO $$
 BEGIN
@@ -95,6 +129,22 @@ BEGIN
 END
 $$;
 
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'promotion_reconcile_terminal'
+          AND policyname = 'tenant_isolation_promotion_reconcile_terminal'
+    ) THEN
+        CREATE POLICY tenant_isolation_promotion_reconcile_terminal
+            ON promotion_reconcile_terminal
+            USING (tenant_id::text = current_setting('app.tenant_id', true))
+            WITH CHECK (tenant_id::text = current_setting('app.tenant_id', true));
+    END IF;
+END
+$$;
+
 -- ============ 3. Grants ============
 -- The app role reads and advances its own tenant's backstop state
 -- (SELECT/INSERT/UPDATE under the RLS policy above). The state is internal
@@ -105,6 +155,14 @@ $$;
 
 GRANT SELECT, INSERT, UPDATE ON promotion_reconcile_state TO engram_app;
 REVOKE DELETE ON promotion_reconcile_state FROM engram_app;
+GRANT SELECT, INSERT, UPDATE ON promotion_reconcile_terminal TO engram_app;
+REVOKE DELETE ON promotion_reconcile_terminal FROM engram_app;
+
+-- Global scheduler state is intentionally not tenant-RLS data: it contains
+-- only a scheduler key and tenant keyset position, and is used solely by the
+-- owner-side queue coordinator.  Revoke migration-003 default privileges so
+-- item-level app sessions cannot inspect or mutate global coordination.
+REVOKE ALL ON promotion_reconcile_scheduler_state FROM engram_app;
 
 -- ============ 4. Rotation index ============
 -- Serves the bounded keyset rotation over live proposals (tenant_id = :t AND
@@ -121,3 +179,89 @@ REVOKE DELETE ON promotion_reconcile_state FROM engram_app;
 CREATE INDEX IF NOT EXISTS idx_memitems_proposed_rotation
     ON memory_items (tenant_id, created_at, id)
     WHERE review_status = 'proposed' AND valid_to IS NULL;
+
+-- Each bounded reconciliation item uses indexed EXISTS probes for current
+-- queue coverage.  Historical volume for unrelated items therefore cannot
+-- hide a qualifying job or turn a pass into a history scan.
+CREATE INDEX IF NOT EXISTS idx_jobs_reconcile_item_state
+    ON jobs (
+        tenant_id,
+        (payload->>'memory_item_id'),
+        job_type,
+        status,
+        run_after,
+        (payload->>'classification_run_id')
+    )
+    WHERE job_type IN ('promotion.evaluate', 'promotion.path_a', 'classification.refine')
+      AND status IN ('pending', 'running', 'dead');
+
+-- Relevant state changes make a prior terminal observation stale.  Database
+-- triggers keep invalidation atomic even when a targeted producer crashes
+-- before its queue enqueue, or an operator performs a supported direct SQL
+-- change.  The bounded pass locks its selected memory rows while assessing,
+-- closing insert-after-invalidation races for FK-backed event/evidence rows.
+CREATE OR REPLACE FUNCTION invalidate_promotion_reconcile_terminal()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+    affected_tenant UUID;
+    affected_item UUID;
+BEGIN
+    affected_tenant := NEW.tenant_id;
+    IF TG_TABLE_NAME = 'classification_runs' THEN
+        affected_item := NEW.memory_item_id;
+        IF affected_item IS NULL AND TG_OP = 'UPDATE' THEN
+            affected_item := OLD.memory_item_id;
+        END IF;
+    ELSE
+        affected_item := NEW.item_id;
+    END IF;
+    IF affected_tenant IS NOT NULL AND affected_item IS NOT NULL THEN
+        DELETE FROM promotion_reconcile_terminal
+        WHERE tenant_id = affected_tenant AND item_id = affected_item;
+    END IF;
+    RETURN NEW;
+END
+$$;
+REVOKE ALL ON FUNCTION invalidate_promotion_reconcile_terminal() FROM PUBLIC, engram_app;
+
+DROP TRIGGER IF EXISTS trg_promotion_reconcile_item_event ON item_events;
+CREATE TRIGGER trg_promotion_reconcile_item_event
+AFTER INSERT ON item_events
+FOR EACH ROW EXECUTE FUNCTION invalidate_promotion_reconcile_terminal();
+
+DROP TRIGGER IF EXISTS trg_promotion_reconcile_feedback ON feedback_events;
+CREATE TRIGGER trg_promotion_reconcile_feedback
+AFTER INSERT ON feedback_events
+FOR EACH ROW EXECUTE FUNCTION invalidate_promotion_reconcile_terminal();
+
+DROP TRIGGER IF EXISTS trg_promotion_reconcile_classification ON classification_runs;
+CREATE TRIGGER trg_promotion_reconcile_classification
+AFTER INSERT OR UPDATE OF memory_item_id, bound_at ON classification_runs
+FOR EACH ROW EXECUTE FUNCTION invalidate_promotion_reconcile_terminal();
+
+CREATE OR REPLACE FUNCTION invalidate_promotion_reconcile_terminal_item()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+    DELETE FROM promotion_reconcile_terminal
+    WHERE tenant_id = NEW.tenant_id AND item_id = NEW.id;
+    RETURN NEW;
+END
+$$;
+REVOKE ALL ON FUNCTION invalidate_promotion_reconcile_terminal_item() FROM PUBLIC, engram_app;
+
+DROP TRIGGER IF EXISTS trg_promotion_reconcile_item_state ON memory_items;
+CREATE TRIGGER trg_promotion_reconcile_item_state
+AFTER UPDATE OF review_status, valid_to, superseded_by, kind, memory_confidence,
+    source_trust, source_confidence_prior, retention_confidence,
+    retention_disposition, retention_evidence_at, conflict_resolution_status,
+    human_verified
+ON memory_items
+FOR EACH ROW EXECUTE FUNCTION invalidate_promotion_reconcile_terminal_item();
