@@ -66,6 +66,7 @@ from engram.promotion_reconciliation import (
     RECONCILE_REASON_OPERATOR_REQUEST,
     RECONCILE_REASON_POLICY_CHANGE,
     RECONCILE_REASON_PROVIDER_RECOVERY,
+    build_promotion_reconcile_payload,
     ensure_periodic_reconciliation_chains,
     reconciliation_status,
     request_global_reconciliation_window,
@@ -118,6 +119,7 @@ async def _clean_db():
         await conn.execute(text("DELETE FROM recall_logs"))
         await conn.execute(text("DELETE FROM classification_runs"))
         await conn.execute(text("DELETE FROM memory_items"))
+        await conn.execute(text("DELETE FROM promotion_reconcile_chains"))
         await conn.execute(text("DELETE FROM promotion_reconcile_state"))
         await conn.execute(text("DELETE FROM promotion_reconcile_scheduler_state"))
         await conn.execute(text("DELETE FROM promotion_reconciliation_state"))
@@ -1266,6 +1268,35 @@ async def test_admin_reconcile_endpoint_content_free_and_idempotent(monkeypatch,
     assert response2.status_code == 200
     assert response2.json()["job_id"] == body["job_id"]
 
+    # The accepted identity remains durable after its finite chain completes:
+    # this is not merely queue deduplication while a link is pending/running.
+    await _drain_queue()
+    async with _test_session_factory() as session:
+        before = await session.execute(
+            text(
+                "SELECT cursor_epoch, cursor_created_at FROM promotion_reconcile_state "
+                "WHERE tenant_id = :tenant_id"
+            ),
+            {"tenant_id": tenant_id},
+        )
+        state_before = before.mappings().one()
+    response3 = await client.post(
+        "/v1/admin/promotion/reconcile", json={"request_id": body["trigger_id"]}
+    )
+    assert response3.status_code == 200
+    assert response3.json()["status"] == "completed"
+    assert response3.json()["job_id"] is None
+    assert await _pending_reconcile(tenant_id) == []
+    async with _test_session_factory() as session:
+        after = await session.execute(
+            text(
+                "SELECT cursor_epoch, cursor_created_at FROM promotion_reconcile_state "
+                "WHERE tenant_id = :tenant_id"
+            ),
+            {"tenant_id": tenant_id},
+        )
+        assert after.mappings().one() == state_before
+
 
 # ===========================================================================
 # 7. Provider recovery
@@ -1395,6 +1426,99 @@ async def test_provider_recovery_reenqueues_classification_async(monkeypatch, cl
     events = await _review_change_events(item_id)
     assert len(events) == 1
     assert json.loads(events[0]["reason"])["trigger_type"] == "classification_bound"
+
+
+async def test_provider_recovery_coverage_survives_intervening_backstop(monkeypatch):
+    """A periodic pass cannot advance a provider request's private cursor.
+
+    This forces the historical dangerous ordering: provider recovery covers
+    page A, an already-rotated periodic backstop covers page B, then the
+    provider continuation resumes.  Every auto-classified proposal must still
+    receive its own asynchronous recovery job, including page B.
+    """
+    _flags(monkeypatch, pass_limit=2)
+    monkeypatch.setattr(settings, "classification_provider", "openai")
+    if not await _db_ok():
+        _require_db()
+    tenant_id, principal_id = await _default_tenant_principal()
+    item_ids = [
+        await _insert_item(
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            content=f"cross-reason recovery {index}",
+            memory_confidence=0.1,
+            created_at=FIXED_NOW - timedelta(hours=200) + timedelta(minutes=index),
+        )
+        for index in range(5)
+    ]
+    for item_id in item_ids:
+        await _mark_classification_origin(item_id, principal_id)
+
+    async with _test_session_factory() as session:
+        requested = await request_reconciliation_chain(
+            session,
+            tenant_id=tenant_id,
+            reason=RECONCILE_REASON_PROVIDER_RECOVERY,
+            trigger_id="provider-cross-reason",
+        )
+        assert requested is not None
+        await session.commit()
+
+    # Page A: the provider request establishes its own chain cursor.
+    assert await _process_one("provider-page-a")
+
+    # Model a normal periodic rotation already positioned at page A, then run
+    # its next page at higher queue priority between provider continuations.
+    async with _test_session_factory() as session:
+        await session.execute(
+            text(
+                "UPDATE promotion_reconcile_state SET cursor_created_at = :created_at, "
+                "cursor_item_id = CAST(:item_id AS uuid) WHERE tenant_id = :tenant_id"
+            ),
+            {
+                "created_at": FIXED_NOW - timedelta(hours=200) + timedelta(minutes=1),
+                "item_id": item_ids[1],
+                "tenant_id": tenant_id,
+            },
+        )
+        await enqueue_job(
+            session,
+            tenant_id=tenant_id,
+            job_type=PROMOTION_RECONCILE_JOB_TYPE,
+            payload=build_promotion_reconcile_payload(
+                reason=RECONCILE_REASON_BACKSTOP, trigger_id=BACKSTOP_TRIGGER_ID
+            ),
+            priority=0,
+            dedupe_key="test:intervening-backstop",
+        )
+
+    assert await _process_one("intervening-backstop")
+
+    # Drain only reconciliation work.  The recovered refine jobs deliberately
+    # remain queued: this asserts repair discovery, not provider behavior.
+    while await process_one_job(
+        worker_id="provider-continuation",
+        session_factory=_test_session_factory,
+        app_session_factory=_test_session_factory,
+        job_types=[PROMOTION_RECONCILE_JOB_TYPE],
+    ):
+        pass
+
+    refine_jobs = await _jobs(tenant_id, job_type="classification.refine")
+    assert {job["payload"]["memory_item_id"] for job in refine_jobs} == set(item_ids)
+    async with _test_session_factory() as session:
+        status = await session.execute(
+            text(
+                "SELECT status FROM promotion_reconcile_chains WHERE tenant_id = :tenant_id "
+                "AND reason = :reason AND trigger_id = :trigger_id"
+            ),
+            {
+                "tenant_id": tenant_id,
+                "reason": RECONCILE_REASON_PROVIDER_RECOVERY,
+                "trigger_id": "provider-cross-reason",
+            },
+        )
+        assert status.scalar_one() == "completed"
 
 
 async def test_provider_recovery_does_not_reclassify_bound_evidence(monkeypatch):

@@ -2146,7 +2146,18 @@ async def process_one_job(
             _truncate_error(exc),
         )
         async with session_factory() as owner:
-            await mark_job_failed_or_retry(owner, job.id, exc)
+            resulting_status = await mark_job_failed_or_retry(owner, job.id, exc)
+        if resulting_status == "dead" and job.job_type == "promotion.reconcile":
+            # The finite request identity, unlike queue dedupe, survives a
+            # dead letter.  Mark it through the tenant-scoped app session so
+            # FORCE RLS continues to apply to the bookkeeping row.
+            async with app_session_factory() as app:
+                await apply_rls_context(app, tenant_id=tenant_id, principal_id=principal_id)
+                from engram.promotion_reconciliation import mark_reconciliation_chain_failed
+
+                await mark_reconciliation_chain_failed(
+                    app, tenant_id=tenant_id, payload=job.payload
+                )
         return True
 
     async with session_factory() as owner:
@@ -2205,7 +2216,7 @@ async def run_worker(
     # next-ensure deadline starts at zero so a restarted worker bootstraps
     # immediately; afterwards it runs at most once per reconciliation
     # interval, and any error is logged and deferred, never fatal.
-    reconcile_interval = max(1, settings.promotion_reconciliation_interval_seconds)
+    reconcile_interval = max(1, settings.promotion_reconciliation_scheduler_interval_seconds)
     next_reconcile_ensure = 0.0
 
     processed = 0

@@ -589,6 +589,10 @@ per-tenant periodic `promotion.reconcile` chain that repairs missing/dead
 targeted promotion evaluation work — bounded to
 `ENGRAM_PROMOTION_RECONCILIATION_PASS_LIMIT` (default 20) items per pass, at
 `ENGRAM_PROMOTION_RECONCILIATION_INTERVAL_SECONDS` (default 3600) per pass.
+Tenant bootstrap/healing is separately bounded by
+`ENGRAM_PROMOTION_RECONCILIATION_TENANT_BATCH_LIMIT` and runs every
+`ENGRAM_PROMOTION_RECONCILIATION_SCHEDULER_INTERVAL_SECONDS` (default 60), so
+discovery throughput is not coupled to the per-tenant reconciliation cadence.
 The owner-side bootstrap/heal loop independently inspects at most
 `ENGRAM_PROMOTION_RECONCILIATION_TENANT_BATCH_LIMIT` tenants per call (default
 100), advancing a durable content-free keyset cursor and wrapping fairly after

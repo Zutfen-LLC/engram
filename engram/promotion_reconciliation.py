@@ -75,6 +75,7 @@ from engram.config import settings
 from engram.models import (
     Job,
     MemoryItem,
+    PromotionReconcileChain,
     PromotionReconcileSchedulerState,
     PromotionReconcileState,
     PromotionReconcileTerminal,
@@ -109,6 +110,7 @@ __all__ = [
     "RECONCILE_REASON_POLICY_CHANGE",
     "RECONCILE_REASON_PROVIDER_RECOVERY",
     "ReconciliationPassResult",
+    "ReconciliationRequestResult",
     "TenantSchedulingResult",
     "BACKSTOP_TRIGGER_ID",
     "build_promotion_reconcile_payload",
@@ -120,6 +122,8 @@ __all__ = [
     "reconciliation_status",
     "request_global_reconciliation_window",
     "request_reconciliation_chain",
+    "request_reconciliation_chain_result",
+    "mark_reconciliation_chain_failed",
     "run_reconciliation_pass",
 ]
 
@@ -357,6 +361,14 @@ class TenantSchedulingResult:
     completed: bool = False
 
 
+@dataclass(frozen=True)
+class ReconciliationRequestResult:
+    """Content-free result of accepting or replaying a finite request."""
+
+    job_id: uuid.UUID | None
+    status: str  # enqueued | active | completed | failed | not_enqueued
+
+
 # Repair classification of one candidate, derived exclusively from the shared
 # evaluator's PromotionCandidate (never a second policy).
 _REPAIR_ELIGIBLE_NOW = "eligible_now"
@@ -582,8 +594,10 @@ async def _active_chain_job(
 
 def _window_stmt(
     tenant_id: str,
-    cursor: PromotionReconcileState | None,
+    cursor: Any | None,
     limit: int,
+    *,
+    use_terminal_suppression: bool,
 ) -> Select[tuple[MemoryItem]]:
     stmt = select(MemoryItem).where(
         MemoryItem.tenant_id == tenant_id,
@@ -591,15 +605,18 @@ def _window_stmt(
         MemoryItem.valid_to.is_(None),
         MemoryItem.superseded_by.is_(None),
         _kind_promotion_allowed(),
-        ~select(PromotionReconcileTerminal.item_id)
-        .where(
-            PromotionReconcileTerminal.tenant_id == MemoryItem.tenant_id,
-            PromotionReconcileTerminal.item_id == MemoryItem.id,
-            PromotionReconcileTerminal.cursor_epoch
-            == (cursor.cursor_epoch if cursor is not None else 0),
-        )
-        .exists(),
     )
+    if use_terminal_suppression:
+        stmt = stmt.where(
+            ~select(PromotionReconcileTerminal.item_id)
+            .where(
+                PromotionReconcileTerminal.tenant_id == MemoryItem.tenant_id,
+                PromotionReconcileTerminal.item_id == MemoryItem.id,
+                PromotionReconcileTerminal.cursor_epoch
+                == (cursor.cursor_epoch if cursor is not None else 0),
+            )
+            .exists()
+        )
     if cursor is not None and cursor.cursor_created_at is not None:
         stmt = stmt.where(
             or_(
@@ -660,10 +677,54 @@ async def run_reconciliation_pass(
         )
     ).scalar_one_or_none()
 
+    request_chain: PromotionReconcileChain | None = None
+    if reason != RECONCILE_REASON_BACKSTOP:
+        request_chain = (
+            await session.execute(
+                select(PromotionReconcileChain)
+                .where(
+                    PromotionReconcileChain.tenant_id == uuid.UUID(str(tenant_id)),
+                    PromotionReconcileChain.reason == reason,
+                    PromotionReconcileChain.trigger_id == trigger_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if request_chain is not None and request_chain.status in {"completed", "failed"}:
+            # A stale duplicate job must not reopen a completed request nor
+            # revive a failed identity.  New intent requires a new request id.
+            await session.commit()
+            return result
+        if request_chain is not None:
+            request_chain.status = "running"
+
+    cursor: Any | None = state if reason == RECONCILE_REASON_BACKSTOP else request_chain
     limit = settings.promotion_reconciliation_pass_limit
-    items = list((await session.execute(_window_stmt(tenant_id, state, limit))).scalars())
+    items = list(
+        (
+            await session.execute(
+                _window_stmt(
+                    tenant_id,
+                    cursor,
+                    limit,
+                    use_terminal_suppression=reason == RECONCILE_REASON_BACKSTOP,
+                )
+            )
+        ).scalars()
+    )
     rotation_completed = False
-    if not items and state is not None and state.cursor_created_at is not None:
+    if (
+        reason != RECONCILE_REASON_BACKSTOP
+        and request_chain is not None
+        and not items
+        and request_chain.cursor_created_at is None
+    ):
+        # An empty request is still a completed full rotation.  Without this
+        # explicit terminal transition its durable identity would remain
+        # "running" forever because no first continuation is needed.
+        rotation_completed = True
+    if not items and cursor is not None and cursor.cursor_created_at is not None:
         # The keyset page after the cursor is empty: this chain reached the
         # tail of the live proposed set. The perpetual backstop wraps to the
         # head and keeps rotating; a request chain has completed its
@@ -672,7 +733,13 @@ async def run_reconciliation_pass(
         rotation_completed = True
         if reason == RECONCILE_REASON_BACKSTOP:
             items = list(
-                (await session.execute(_window_stmt(tenant_id, None, limit))).scalars()
+                (
+                    await session.execute(
+                        _window_stmt(
+                            tenant_id, None, limit, use_terminal_suppression=True
+                        )
+                    )
+                ).scalars()
             )
     result.window_size = len(items)
 
@@ -818,7 +885,7 @@ async def run_reconciliation_pass(
         "updated_at": moment,
     }
     read_epoch = state.cursor_epoch if state is not None else 0
-    if items:
+    if (reason == RECONCILE_REASON_BACKSTOP or request_chain is None) and items:
         values.update(
             {
                 "cursor_created_at": items[-1].created_at,
@@ -838,6 +905,15 @@ async def run_reconciliation_pass(
             where=PromotionReconcileState.cursor_epoch == read_epoch,
         )
     )
+
+    if request_chain is not None:
+        if items:
+            request_chain.cursor_created_at = items[-1].created_at
+            request_chain.cursor_item_id = items[-1].id
+        if rotation_completed:
+            request_chain.status = "completed"
+            request_chain.completed_at = moment
+        request_chain.updated_at = moment
 
     if reason == RECONCILE_REASON_BACKSTOP:
         continuation_key = (
@@ -931,16 +1007,37 @@ async def request_reconciliation_chain(
     trigger_id: str,
     now: datetime | None = None,
 ) -> uuid.UUID | None:
-    """Reset the tenant's rotation cursor and enqueue a reconciliation chain.
+    """Compatibility wrapper returning the accepted chain job, if any.
 
-    The bounded, non-synchronous answer to "promotion policy/config changed;
-    reconcile this tenant now": exactly one ``promotion.reconcile`` job is
-    enqueued (never thousands of item jobs), and the chain's durable
-    continuation provides bounded full-rotation coverage. The cursor reset
-    (cursor → NULL, epoch + 1) commits atomically with the enqueue, so a
-    crash between the two cannot leave a request that silently skips the
-    head of the backlog. Returns the job id, or ``None`` when the rollout
-    flag is off (fail-safe no-op, no state change).
+    New callers that need truthful replay state should use
+    :func:`request_reconciliation_chain_result`.
+    """
+    return (
+        await request_reconciliation_chain_result(
+            session,
+            tenant_id=tenant_id,
+            reason=reason,
+            trigger_id=trigger_id,
+            now=now,
+        )
+    ).job_id
+
+
+async def request_reconciliation_chain_result(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    reason: str,
+    trigger_id: str,
+    now: datetime | None = None,
+) -> ReconciliationRequestResult:
+    """Accept one finite reconciliation request with durable idempotency.
+
+    Request cursor ownership is keyed by ``(tenant, reason, trigger_id)``;
+    neither the periodic backstop nor another request can move it.  The row
+    remains after completion, so replaying an explicit request id is a true
+    no-op. Failed identities are terminal and return ``failed``; retrying a
+    failed operational request requires a fresh request id.
     """
     from engram.jobs import enqueue_job_in_transaction
 
@@ -950,37 +1047,71 @@ async def request_reconciliation_chain(
             f"(policy_change/provider_recovery/operator_request), got {reason!r}"
         )
     if not settings.promotion_reconciliation_enabled:
-        return None
+        return ReconciliationRequestResult(job_id=None, status="not_enqueued")
     moment = now or datetime.now(UTC)
-    # Idempotent for the same explicit request identity: if any link of this
-    # chain is still pending/running, return it instead of creating a
-    # parallel chain (the first link's canonical key already enforces this
-    # while it is the active link; this extends the guarantee across the
-    # whole chain).
+    inserted = (
+        await session.execute(
+            pg_insert(PromotionReconcileChain)
+            .values(
+                tenant_id=uuid.UUID(str(tenant_id)),
+                reason=reason,
+                trigger_id=trigger_id,
+                status="requested",
+                created_at=moment,
+                updated_at=moment,
+            )
+            .on_conflict_do_nothing(
+                index_elements=[
+                    PromotionReconcileChain.tenant_id,
+                    PromotionReconcileChain.reason,
+                    PromotionReconcileChain.trigger_id,
+                ]
+            )
+            .returning(PromotionReconcileChain.tenant_id)
+        )
+    ).scalar_one_or_none()
+    chain = (
+        await session.execute(
+            select(PromotionReconcileChain)
+            .where(
+                PromotionReconcileChain.tenant_id == uuid.UUID(str(tenant_id)),
+                PromotionReconcileChain.reason == reason,
+                PromotionReconcileChain.trigger_id == trigger_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    if chain.status == "completed":
+        return ReconciliationRequestResult(job_id=None, status="completed")
+    if chain.status == "failed":
+        return ReconciliationRequestResult(job_id=None, status="failed")
     active = await _active_chain_job(
         session, tenant_id=str(tenant_id), reason=reason, trigger_id=trigger_id
     )
     if active is not None:
-        return active
-    await session.execute(
-        pg_insert(PromotionReconcileState)
-        .values(
-            tenant_id=uuid.UUID(str(tenant_id)),
-            cursor_epoch=1,
-            kind_policy_revision=0,
-            last_wrapped=False,
+        return ReconciliationRequestResult(job_id=active, status="active")
+    if inserted is not None:
+        # A new finite request invalidates only the periodic terminal marker
+        # generation.  It does *not* move the periodic cursor: that cursor is
+        # no longer request progress, so no cross-chain coverage is possible.
+        await session.execute(
+            pg_insert(PromotionReconcileState)
+            .values(
+                tenant_id=uuid.UUID(str(tenant_id)),
+                cursor_epoch=1,
+                kind_policy_revision=0,
+                last_wrapped=False,
+            )
+            .on_conflict_do_update(
+                index_elements=[PromotionReconcileState.tenant_id],
+                set_={
+                    "cursor_epoch": PromotionReconcileState.cursor_epoch + 1,
+                    "updated_at": moment,
+                },
+            )
         )
-        .on_conflict_do_update(
-            index_elements=[PromotionReconcileState.tenant_id],
-            set_={
-                "cursor_created_at": None,
-                "cursor_item_id": None,
-                "cursor_epoch": PromotionReconcileState.cursor_epoch + 1,
-                "updated_at": moment,
-            },
-        )
-    )
-    return await enqueue_job_in_transaction(
+    job_id = await enqueue_job_in_transaction(
         session,
         tenant_id=tenant_id,
         job_type=PROMOTION_RECONCILE_JOB_TYPE,
@@ -988,6 +1119,32 @@ async def request_reconciliation_chain(
         run_after=moment,
         dedupe_key=promotion_reconcile_dedupe_key(reason, trigger_id),
     )
+    return ReconciliationRequestResult(job_id=job_id, status="enqueued")
+
+
+async def mark_reconciliation_chain_failed(
+    session: AsyncSession, *, tenant_id: str, payload: dict[str, object]
+) -> None:
+    """Persist the terminal failure outcome after a reconcile job dead-letters."""
+    try:
+        contract = parse_promotion_reconcile_payload(payload)
+    except PromotionReconcileContractError:
+        return
+    if contract.reason == RECONCILE_REASON_BACKSTOP:
+        return
+    await session.execute(
+        text(
+            "UPDATE promotion_reconcile_chains SET status = 'failed', updated_at = now() "
+            "WHERE tenant_id = CAST(:tenant_id AS uuid) AND reason = :reason "
+            "AND trigger_id = :trigger_id AND status IN ('requested', 'running')"
+        ),
+        {
+            "tenant_id": str(tenant_id),
+            "reason": contract.reason,
+            "trigger_id": contract.trigger_id,
+        },
+    )
+    await session.commit()
 
 
 async def _locked_tenant_scheduler_state(

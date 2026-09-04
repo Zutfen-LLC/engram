@@ -285,9 +285,9 @@ class PromotionReconcileResponse(BaseModel):
     reason: Literal["operator_request", "provider_recovery"]
     trigger_id: str
     job_id: uuid.UUID | None = None
-    # "enqueued" — the bounded chain's first pass was queued; "not_enqueued" —
-    # the reconciliation rollout flag is off (fail-safe no-op, no state change).
-    status: Literal["enqueued", "not_enqueued"]
+    # Explicit request ids remain durable after completion.  A failed identity
+    # is terminal; retry it with a fresh request id.
+    status: Literal["enqueued", "active", "completed", "failed", "not_enqueued"]
 
 
 # --- Endpoints ---------------------------------------------------------------
@@ -712,13 +712,15 @@ async def request_promotion_reconciliation(
     live proposed backlog) — never a synchronous scan, never item fan-out,
     and never a bulk promotion: the chain only discovers and repairs missing
     targeted evaluation work; lifecycle authority stays with the shared
-    evaluator behind ``promotion.evaluate``. Idempotent for the same
-    ``(reason, request_id)`` identity through the chain's dedupe key. The
-    response is content-free (no item ids, no counts of tenant content).
+    evaluator behind ``promotion.evaluate``. An explicit ``request_id`` is
+    durably idempotent: replay reports ``active`` or ``completed`` instead of
+    resetting coverage. A dead-lettered request reports ``failed`` and must be
+    retried with a fresh identity. The response is content-free (no item ids,
+    no counts of tenant content).
     Returns ``status='not_enqueued'`` when the reconciliation rollout flag
     (``ENGRAM_PROMOTION_RECONCILIATION_ENABLED``) is off.
     """
-    from engram.promotion_reconciliation import request_reconciliation_chain
+    from engram.promotion_reconciliation import request_reconciliation_chain_result
 
     tenant_id = uuid.UUID(await _resolve_tenant_id(session))
     reason: Literal["operator_request", "provider_recovery"] = (
@@ -726,27 +728,22 @@ async def request_promotion_reconciliation(
     )
     request_id = body.request_id if body is not None else None
     trigger_id = request_id if request_id else f"request:{uuid.uuid4()}"
-    job_id = await request_reconciliation_chain(
+    result = await request_reconciliation_chain_result(
         session,
         tenant_id=str(tenant_id),
         reason=reason,
         trigger_id=trigger_id,
     )
-    if job_id is None:
-        return PromotionReconcileResponse(
-            tenant_id=tenant_id,
-            reason=reason,
-            trigger_id=trigger_id,
-            job_id=None,
-            status="not_enqueued",
-        )
     await session.commit()
     return PromotionReconcileResponse(
         tenant_id=tenant_id,
         reason=reason,
         trigger_id=trigger_id,
-        job_id=job_id,
-        status="enqueued",
+        job_id=result.job_id,
+        status=cast(
+            Literal["enqueued", "active", "completed", "failed", "not_enqueued"],
+            result.status,
+        ),
     )
 
 

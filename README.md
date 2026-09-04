@@ -361,16 +361,20 @@ PostgreSQL job queue, one bounded job per tenant at a time:
   id)` cursor. It wraps fairly and resumes after restart, so no worker-loop
   iteration enumerates every tenant.
 - **Request chains** (`policy_change` / `provider_recovery` /
-  `operator_request`): a committed policy change or an explicit authorized
-  request resets the tenant's rotation cursor (coverage from the head) and
-  runs immediately-due continuation passes until the rotation reaches the
-  tail, then stops — bounded per pass with durable continuation.
+  `operator_request`): each finite request has its own durable `(tenant,
+  reason, trigger_id)` cursor (coverage from the head), so overlapping reasons
+  cannot advance one another's coverage. Explicit request ids remain
+  idempotent after completion; a failed identity is terminal and requires a
+  fresh request id. Each chain runs immediately-due continuation passes until
+  its rotation reaches the tail, then stops — bounded per pass with durable
+  continuation.
 
-Candidate discovery is a keyset rotation over `(created_at, id)` persisted in
-`promotion_reconcile_state` (migration 034; deliberately separate from #164's
-startup-rotation cursor — this one is nullable for clean policy resets,
-epoch-guarded so stale concurrent passes cannot undo a reset, and carries the
-tenant's `kind_policy_revision` plus content-free last-pass diagnostics).
+Candidate discovery is a keyset rotation over `(created_at, id)`. Periodic
+progress is persisted in `promotion_reconcile_state`; finite request progress
+is persisted independently in `promotion_reconcile_chains` (migration 034).
+The periodic cursor is deliberately separate from #164's startup-rotation
+cursor and carries the tenant's `kind_policy_revision` plus content-free
+last-pass diagnostics.
 “Terminal under current policy” means the item was evaluated under a known
 reconciliation cursor epoch and is excluded from ordinary periodic selection
 until that epoch or relevant item/evidence state changes. The lightweight

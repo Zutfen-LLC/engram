@@ -1315,6 +1315,39 @@ class PromotionReconcileState(Base):
     )
 
 
+class PromotionReconcileChain(Base):
+    """One finite reconciliation request's progress and durable outcome.
+
+    This is deliberately separate from :class:`PromotionReconcileState`:
+    the latter is the perpetual periodic backstop's tenant rotation, whereas
+    this table lets an overlapping request retain its own keyset coverage.
+    It contains only orchestration identity, position, and lifecycle state;
+    it is not a promotion assessment or a copy of any item decision.
+    """
+
+    __tablename__ = "promotion_reconcile_chains"
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), primary_key=True
+    )
+    reason: Mapped[str] = mapped_column(Text, primary_key=True)
+    trigger_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    cursor_created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cursor_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    # requested | running | completed | failed.  A failed identity is
+    # deliberately terminal: operators retry with a fresh request id.
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="requested")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class PromotionReconcileTerminal(Base):
     """Per-item scheduler suppression for a terminal reconciliation result.
 

@@ -75,6 +75,25 @@ CREATE TABLE IF NOT EXISTS promotion_reconcile_state (
     updated_at             TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Finite request chains have independent cursor progress.  In particular a
+-- provider-recovery request cannot lose its reason-specific inspection work
+-- because the periodic backstop (or another request) advanced a tenant-wide
+-- cursor.  The durable terminal row also makes an explicit request_id honest:
+-- completed and failed identities remain observable after queue history ages.
+CREATE TABLE IF NOT EXISTS promotion_reconcile_chains (
+    tenant_id          UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    reason             TEXT NOT NULL,
+    trigger_id         TEXT NOT NULL,
+    cursor_created_at  TIMESTAMPTZ,
+    cursor_item_id     UUID,
+    status             TEXT NOT NULL DEFAULT 'requested'
+                       CHECK (status IN ('requested', 'running', 'completed', 'failed')),
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at       TIMESTAMPTZ,
+    PRIMARY KEY (tenant_id, reason, trigger_id)
+);
+
 -- A row means only "the backstop observed this item as terminal in this
 -- cursor epoch".  It is scheduler suppression, not a durable promotion
 -- assessment: no blocker, score, threshold, content, or decision is stored.
@@ -110,6 +129,8 @@ CREATE TABLE IF NOT EXISTS promotion_reconcile_scheduler_state (
 
 ALTER TABLE promotion_reconcile_state ENABLE ROW LEVEL SECURITY;
 ALTER TABLE promotion_reconcile_state FORCE ROW LEVEL SECURITY;
+ALTER TABLE promotion_reconcile_chains ENABLE ROW LEVEL SECURITY;
+ALTER TABLE promotion_reconcile_chains FORCE ROW LEVEL SECURITY;
 ALTER TABLE promotion_reconcile_terminal ENABLE ROW LEVEL SECURITY;
 ALTER TABLE promotion_reconcile_terminal FORCE ROW LEVEL SECURITY;
 
@@ -123,6 +144,22 @@ BEGIN
     ) THEN
         CREATE POLICY tenant_isolation_promotion_reconcile_state
             ON promotion_reconcile_state
+            USING (tenant_id::text = current_setting('app.tenant_id', true))
+            WITH CHECK (tenant_id::text = current_setting('app.tenant_id', true));
+    END IF;
+END
+$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'promotion_reconcile_chains'
+          AND policyname = 'tenant_isolation_promotion_reconcile_chains'
+    ) THEN
+        CREATE POLICY tenant_isolation_promotion_reconcile_chains
+            ON promotion_reconcile_chains
             USING (tenant_id::text = current_setting('app.tenant_id', true))
             WITH CHECK (tenant_id::text = current_setting('app.tenant_id', true));
     END IF;
@@ -155,6 +192,8 @@ $$;
 
 GRANT SELECT, INSERT, UPDATE ON promotion_reconcile_state TO engram_app;
 REVOKE DELETE ON promotion_reconcile_state FROM engram_app;
+GRANT SELECT, INSERT, UPDATE ON promotion_reconcile_chains TO engram_app;
+REVOKE DELETE ON promotion_reconcile_chains FROM engram_app;
 GRANT SELECT, INSERT, UPDATE ON promotion_reconcile_terminal TO engram_app;
 REVOKE DELETE ON promotion_reconcile_terminal FROM engram_app;
 

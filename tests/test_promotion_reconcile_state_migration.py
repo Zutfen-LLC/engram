@@ -172,6 +172,37 @@ async def test_cursor_columns_nullable_for_clean_resets() -> None:
         await owner.close()
 
 
+async def test_request_chain_state_is_tenant_scoped_and_content_free() -> None:
+    owner = await _owner_with_034()
+    try:
+        tenant_id = uuid.uuid4()
+        await _seed_tenant(owner, tenant_id=tenant_id, label="RequestChain")
+        await owner.execute(
+            "INSERT INTO promotion_reconcile_chains "
+            "(tenant_id, reason, trigger_id, status) VALUES ($1, $2, $3, 'completed')",
+            tenant_id,
+            "provider_recovery",
+            "request-1",
+        )
+        row = await owner.fetchrow(
+            "SELECT cursor_created_at, cursor_item_id, status FROM promotion_reconcile_chains "
+            "WHERE tenant_id = $1 AND reason = $2 AND trigger_id = $3",
+            tenant_id,
+            "provider_recovery",
+            "request-1",
+        )
+        assert row["cursor_created_at"] is None
+        assert row["cursor_item_id"] is None
+        assert row["status"] == "completed"
+        assert await owner.fetchval(
+            "SELECT relforcerowsecurity FROM pg_class "
+            "WHERE relname = 'promotion_reconcile_chains'"
+        ) is True
+        await owner.execute("DELETE FROM tenants WHERE id = $1", tenant_id)
+    finally:
+        await owner.close()
+
+
 async def test_app_role_privileges_least_privilege() -> None:
     owner = await _owner_with_034()
     app = await _connect(_app_dsn())  # type: ignore[arg-type]

@@ -30,6 +30,7 @@ DROP TRIGGER IF EXISTS trg_promotion_reconcile_item_event ON item_events;
 DROP FUNCTION IF EXISTS invalidate_promotion_reconcile_terminal_item();
 DROP FUNCTION IF EXISTS invalidate_promotion_reconcile_terminal();
 DROP TABLE IF EXISTS promotion_reconcile_terminal;
+DROP TABLE IF EXISTS promotion_reconcile_chains;
 DROP TABLE IF EXISTS promotion_reconcile_scheduler_state;
 DROP TABLE IF EXISTS promotion_reconcile_state;
 DROP INDEX IF EXISTS idx_jobs_reconcile_item_state;

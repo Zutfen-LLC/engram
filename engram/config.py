@@ -237,6 +237,11 @@ class Settings(BaseSettings):
     # self-rescheduling promotion.reconcile chain's interval). Each pass is
     # bounded by promotion_reconciliation_pass_limit regardless.
     promotion_reconciliation_interval_seconds: int = 3600
+    # Owner-side cadence for discovering/healing tenants that lack their
+    # periodic chain.  Deliberately independent from the per-tenant pass
+    # interval: a 100-tenant bounded bootstrap page should not wait an hour
+    # merely because each healthy tenant reconciles hourly.
+    promotion_reconciliation_scheduler_interval_seconds: int = 60
     # Hard per-pass bound: rows inspected (and at most that many repair jobs
     # emitted) by one promotion.reconcile pass. Deployment-level cap, not part
     # of any public API.
@@ -340,6 +345,8 @@ class Settings(BaseSettings):
             raise ValueError("promotion_reconciliation_pass_limit must be >= 1")
         if self.promotion_reconciliation_interval_seconds < 1:
             raise ValueError("promotion_reconciliation_interval_seconds must be >= 1")
+        if self.promotion_reconciliation_scheduler_interval_seconds < 1:
+            raise ValueError("promotion_reconciliation_scheduler_interval_seconds must be >= 1")
         if self.promotion_reconciliation_tenant_batch_limit < 1:
             raise ValueError("promotion_reconciliation_tenant_batch_limit must be >= 1")
         return self
