@@ -1707,8 +1707,9 @@ async def feedback(
     # reads promotion state, not feedback-derived scores. Enqueued after the
     # feedback commit, so a crash between the two commits loses this one
     # trigger: today's recovery is the item_created baseline job (for items
-    # created while the flag was on) and the startup rotation sweep; the
-    # reconciliation backstop is the durable fix and remains future work.
+    # created while the flag was on), the startup rotation sweep, and the
+    # bounded promotion reconciliation backstop (ENG-PROMOTION-003B4) when
+    # ENGRAM_PROMOTION_RECONCILIATION_ENABLED is on.
     # Inert unless the rollout flag is on.
     if result.status != "unchanged":
         from engram.promotion import TRIGGER_FEEDBACK, maybe_enqueue_promotion_evaluation

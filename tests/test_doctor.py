@@ -735,7 +735,7 @@ def test_report_schema_field_serializes_as_schema():
     report = _make_full_report({})
     dumped = report.model_dump(by_alias=True)
     assert dumped["schema"] == "engram.doctor"
-    assert dumped["schema_version"] == "1.1"
+    assert dumped["schema_version"] == "1.2"
     assert "schema_" not in dumped
 
 
@@ -1090,7 +1090,7 @@ def test_full_report_json_dump_is_valid_json_and_stable_schema():
     dumped = report.model_dump_json(by_alias=True)
     parsed = json.loads(dumped)
     assert parsed["schema"] == "engram.doctor"
-    assert parsed["schema_version"] == "1.1"
+    assert parsed["schema_version"] == "1.2"
     assert parsed["profile"] == "automatic_memory_loop"
     assert [c["id"] for c in parsed["checks"]] == list(CHECK_ORDER)
     assert set(parsed.keys()) == {

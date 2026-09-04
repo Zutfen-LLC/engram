@@ -1270,6 +1270,127 @@ class PromotionReconciliationState(Base):
     )
 
 
+class PromotionReconcileState(Base):
+    """Per-tenant state for the bounded promotion reconciliation backstop (#155).
+
+    Orchestration bookkeeping only — never an authoritative promotion
+    assessment (that is #159's durable promotion_assessments design) and never
+    memory content. The keyset cursor is deliberately *nullable*, unlike
+    #164's startup-rotation cursor: ``NULL`` means "the next pass reads from
+    the head of the live proposed set", which is what a policy-change or
+    operator request reset needs to express without sentinel values.
+    ``cursor_epoch`` is bumped on every reset so a stale in-flight pass cannot
+    advance a cursor position it read before the reset (its conditional
+    advance simply no-ops). ``kind_policy_revision`` is the tenant's stable
+    monotonically increasing revision identity for admission-affecting
+    memory-kind changes, driving policy-change dedupe/replay provenance. The
+    ``last_*`` columns are content-free counts for diagnostics.
+    """
+
+    __tablename__ = "promotion_reconcile_state"
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), primary_key=True
+    )
+    cursor_created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cursor_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    cursor_epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    kind_policy_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_pass_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_pass_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_pass_trigger_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_window_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_wrapped: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    last_evaluations_enqueued: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_dead_found: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_missing_found: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_recovery_enqueued: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_terminal_skipped: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_healthy_skipped: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_suppressed: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class PromotionReconcileChain(Base):
+    """One finite reconciliation request's progress and durable outcome.
+
+    This is deliberately separate from :class:`PromotionReconcileState`:
+    the latter is the perpetual periodic backstop's tenant rotation, whereas
+    this table lets an overlapping request retain its own keyset coverage.
+    It contains only orchestration identity, position, and lifecycle state;
+    it is not a promotion assessment or a copy of any item decision.
+    """
+
+    __tablename__ = "promotion_reconcile_chains"
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), primary_key=True
+    )
+    reason: Mapped[str] = mapped_column(Text, primary_key=True)
+    trigger_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    cursor_created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cursor_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    # requested | running | completed | failed.  A failed identity is
+    # deliberately terminal: operators retry with a fresh request id.
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="requested")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class PromotionReconcileTerminal(Base):
+    """Per-item scheduler suppression for a terminal reconciliation result.
+
+    This records only that the bounded backstop observed the item under one
+    reconciliation cursor epoch.  It deliberately stores no score, blocker,
+    threshold, or other promotion assessment.  Relevant item/evidence events
+    delete the row, while tenant-wide resets advance the epoch.
+    """
+
+    __tablename__ = "promotion_reconcile_terminal"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "item_id"],
+            ["memory_items.tenant_id", "memory_items.id"],
+            name="fk_promotion_reconcile_terminal_item",
+            ondelete="CASCADE",
+        ),
+    )
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), primary_key=True
+    )
+    item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    cursor_epoch: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class PromotionReconcileSchedulerState(Base):
+    """Owner-only global cursor for bounded, content-free tenant scheduling."""
+
+    __tablename__ = "promotion_reconcile_scheduler_state"
+
+    scheduler_key: Mapped[str] = mapped_column(Text, primary_key=True)
+    cursor_created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cursor_tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    completed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
 class CandidateIngest(Base):
     """Immutable server-issued identity for one candidate entering the pipeline."""
 

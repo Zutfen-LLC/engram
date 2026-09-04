@@ -29,6 +29,7 @@ from engram.auth import (
 )
 from engram.auth import Principal as AuthPrincipal
 from engram.classification import invalidate_vocab_cache
+from engram.config import settings
 from engram.db import get_session
 from engram.memory_access import apply_write_eligibility
 from engram.memory_context import (
@@ -255,6 +256,38 @@ class ItemEvaluateResponse(BaseModel):
     # "enqueued" — a promotion.evaluate job was queued; "not_enqueued" — the
     # rollout flag or tenant promotion config suppressed it.
     status: Literal["enqueued", "not_enqueued"]
+
+
+class PromotionReconcileRequest(BaseModel):
+    """Explicit authorized request for bounded promotion reconciliation (#155).
+
+    ``reason`` selects what the chain repairs and the truthful provenance its
+    work carries: ``operator_request`` is the ordinary "promotion
+    policy/config changed; reconcile this tenant" trigger (the honest path
+    for tenant_config changes made through operational/database means, which
+    the service cannot observe); ``provider_recovery`` additionally
+    re-enqueues the existing async classification contract for live
+    proposals whose evidence never bound — request it only after the
+    provider is available again. The request itself enqueues exactly one
+    bounded ``promotion.reconcile`` job, never item fan-out.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    reason: Literal["operator_request", "provider_recovery"] = "operator_request"
+    # Stable identity for idempotent replay of the same explicit request
+    # (e.g. an operator runbook id). A fresh UUID when omitted.
+    request_id: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class PromotionReconcileResponse(BaseModel):
+    tenant_id: uuid.UUID
+    reason: Literal["operator_request", "provider_recovery"]
+    trigger_id: str
+    job_id: uuid.UUID | None = None
+    # Explicit request ids remain durable after completion.  A failed identity
+    # is terminal; retry it with a fresh request id.
+    status: Literal["enqueued", "active", "completed", "failed", "not_enqueued"]
 
 
 # --- Endpoints ---------------------------------------------------------------
@@ -531,9 +564,36 @@ async def update_memory_kind(
         raise HTTPException(status_code=404, detail=f"kind {name!r} not found")
 
     updates = body.model_dump(exclude_unset=True)
+    # Admission-affecting memory-kind changes (issue #155): promotion
+    # eligibility of existing proposals depends on exactly these two flags
+    # (the shared evaluator gates on enabled + auto_promote_from_inferred;
+    # requires_review governs only the initial review status of new writes).
+    # A committed material change schedules ONE bounded reconciliation chain
+    # — never synchronous tenant-wide item fan-out — whose eventual item
+    # evaluations carry truthful policy_changed provenance keyed to the
+    # bumped kind-policy revision. Inert unless the reconciliation rollout
+    # flag is on.
+    admission_material_change = ("enabled" in updates and updates["enabled"] != kind.enabled) or (
+        "auto_promote_from_inferred" in updates
+        and updates["auto_promote_from_inferred"] != kind.auto_promote_from_inferred
+    )
     for field, value in updates.items():
         setattr(kind, field, value)
     kind.updated_at = datetime.now(UTC)
+
+    if admission_material_change and settings.promotion_reconciliation_enabled:
+        from engram.promotion_reconciliation import (
+            bump_kind_policy_revision,
+            request_reconciliation_chain,
+        )
+
+        revision = await bump_kind_policy_revision(session, str(tenant_id))
+        await request_reconciliation_chain(
+            session,
+            tenant_id=str(tenant_id),
+            reason="policy_change",
+            trigger_id=f"kind-policy:{revision}",
+        )
 
     await session.commit()
     invalidate_memory_kind_cache(tenant_id)
@@ -633,6 +693,57 @@ async def evaluate_item(
         # TRIGGER_MANUAL is the closed-vocabulary constant for "manual".
         trigger_type=cast(Literal["manual"], TRIGGER_MANUAL),
         status="enqueued",
+    )
+
+
+@router.post(
+    "/admin/promotion/reconcile",
+    response_model=PromotionReconcileResponse,
+    dependencies=[Depends(ADMIN_SCOPE)],
+)
+async def request_promotion_reconciliation(
+    body: PromotionReconcileRequest | None = None,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> PromotionReconcileResponse:
+    """Request bounded promotion reconciliation for the caller's tenant (#155).
+
+    Enqueues exactly one tenant-scoped ``promotion.reconcile`` job (resetting
+    the reconciliation rotation cursor so coverage starts at the head of the
+    live proposed backlog) — never a synchronous scan, never item fan-out,
+    and never a bulk promotion: the chain only discovers and repairs missing
+    targeted evaluation work; lifecycle authority stays with the shared
+    evaluator behind ``promotion.evaluate``. An explicit ``request_id`` is
+    durably idempotent: replay reports ``active`` or ``completed`` instead of
+    resetting coverage. A dead-lettered request reports ``failed`` and must be
+    retried with a fresh identity. The response is content-free (no item ids,
+    no counts of tenant content).
+    Returns ``status='not_enqueued'`` when the reconciliation rollout flag
+    (``ENGRAM_PROMOTION_RECONCILIATION_ENABLED``) is off.
+    """
+    from engram.promotion_reconciliation import request_reconciliation_chain_result
+
+    tenant_id = uuid.UUID(await _resolve_tenant_id(session))
+    reason: Literal["operator_request", "provider_recovery"] = (
+        body.reason if body is not None else "operator_request"
+    )
+    request_id = body.request_id if body is not None else None
+    trigger_id = request_id if request_id else f"request:{uuid.uuid4()}"
+    result = await request_reconciliation_chain_result(
+        session,
+        tenant_id=str(tenant_id),
+        reason=reason,
+        trigger_id=trigger_id,
+    )
+    await session.commit()
+    return PromotionReconcileResponse(
+        tenant_id=tenant_id,
+        reason=reason,
+        trigger_id=trigger_id,
+        job_id=result.job_id,
+        status=cast(
+            Literal["enqueued", "active", "completed", "failed", "not_enqueued"],
+            result.status,
+        ),
     )
 
 

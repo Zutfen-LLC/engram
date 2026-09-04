@@ -73,7 +73,7 @@ T = TypeVar("T")
 # --- Report schema constants -------------------------------------------------
 
 DOCTOR_SCHEMA = "engram.doctor"
-DOCTOR_SCHEMA_VERSION = "1.1"
+DOCTOR_SCHEMA_VERSION = "1.2"
 DOCTOR_PROFILE = "automatic_memory_loop"
 
 Status = Literal["pass", "warn", "fail", "unknown"]
@@ -97,9 +97,11 @@ CHECK_RECALL_ACTIVITY = "recall.activity"
 CHECK_RECEIPTS_ACTIVITY = "receipts.activity"
 CHECK_REVIEW_BACKLOG = "review.backlog"
 CHECK_PROMOTION_READINESS = "promotion.readiness"
+CHECK_PROMOTION_RECONCILIATION = "promotion.reconciliation"
 
 # The required, stable, always-emitted ordering (report_contract.ordering).
 # v1.1 (ENG-PROMOTION-003A) appends promotion.readiness.
+# v1.2 (ENG-PROMOTION-003B4) appends promotion.reconciliation.
 CHECK_ORDER: tuple[str, ...] = (
     CHECK_SERVICE_HEALTH,
     CHECK_SERVICE_READINESS,
@@ -113,6 +115,7 @@ CHECK_ORDER: tuple[str, ...] = (
     CHECK_RECEIPTS_ACTIVITY,
     CHECK_REVIEW_BACKLOG,
     CHECK_PROMOTION_READINESS,
+    CHECK_PROMOTION_RECONCILIATION,
 )
 
 # A tenant-scoped DB check whose evidence cannot be attributed to a specific
@@ -1069,6 +1072,28 @@ async def _promotion_readiness_evidence(
     )
 
 
+async def _promotion_reconciliation_evidence(
+    session: AsyncSession,
+    *,
+    tenant_id: str | None,
+    now: datetime,
+) -> dict[str, Any] | None:
+    """Bounded, content-free promotion reconciliation status (delegates fully).
+
+    A thin adapter over
+    :func:`engram.promotion_reconciliation.reconciliation_status`, which
+    itself reads only persisted cursor/due state and the canonical job-state
+    vocabulary — doctor implements no promotion or scheduling policy of its
+    own. Returns ``None`` when tenant scope is unknown (a deployment-wide
+    reconciliation aggregate could mix tenants).
+    """
+    from engram.promotion_reconciliation import reconciliation_status
+
+    if tenant_id is None:
+        return None
+    return await reconciliation_status(session, tenant_id=tenant_id, now=now)
+
+
 async def _isolated(session: AsyncSession, coro: Awaitable[T]) -> tuple[T | None, str | None]:
     """Run ``coro`` inside a SAVEPOINT so its failure cannot poison later queries.
 
@@ -1343,6 +1368,120 @@ def _check_promotion_readiness(
         f"{evidence['proposed_total']} live proposed item(s); startup window: "
         f"{window['terminal_under_current_policy']} terminal, "
         f"{window['time_dependent']} time-dependent of {window['size']}.",
+        evidence=evidence,
+    )
+
+
+def _check_promotion_reconciliation(
+    *,
+    evidence: dict[str, Any] | None,
+    tenant_unresolved: bool,
+    db_error: str | None,
+) -> DoctorCheck:
+    """Evaluate the content-free promotion reconciliation backstop status.
+
+    Presents the persisted cursor/due state and the last bounded pass's
+    counts (canonical job-state vocabulary, no item content, no policy
+    recomputation). Warns on operationally meaningful conditions: dead
+    reconciliation jobs, an enabled backstop whose canonical
+    promotion.evaluate repairs are suppressed by the evaluate rollout flag,
+    or an enabled backstop with neither a last pass nor a pending chain
+    (bootstrap never ran / chain died).
+    """
+    if tenant_unresolved:
+        return _check(
+            CHECK_PROMOTION_RECONCILIATION,
+            "unknown",
+            TENANT_SCOPE_UNRESOLVED,
+            "Tenant scope could not be resolved; reconciliation status cannot be scoped.",
+        )
+    if evidence is None:
+        return _check(
+            CHECK_PROMOTION_RECONCILIATION,
+            "unknown",
+            "RECONCILIATION_EVIDENCE_UNAVAILABLE",
+            "Promotion reconciliation evidence unavailable (database inspection failed).",
+            evidence={"error_type": db_error},
+        )
+    if not evidence.get("enabled"):
+        return _check(
+            CHECK_PROMOTION_RECONCILIATION,
+            "pass",
+            "RECONCILIATION_DISABLED",
+            "Promotion reconciliation is disabled (rollout flag off); targeted "
+            "promotion.evaluate jobs and startup-recall promotion are "
+            "unaffected.",
+            evidence=evidence,
+        )
+    dead_jobs = int(evidence.get("chains", {}).get("dead_jobs", 0))
+    if dead_jobs:
+        return _check(
+            CHECK_PROMOTION_RECONCILIATION,
+            "warn",
+            "RECONCILIATION_DEAD_JOBS",
+            f"{dead_jobs} dead promotion.reconcile job(s); the periodic chain "
+            "bootstrap will re-create the backstop chain, but request chains "
+            "that died before completing their rotation need a fresh explicit "
+            "request.",
+            evidence=evidence,
+            remediation=[
+                "Inspect the dead job's last_error, then re-request "
+                "reconciliation (POST /v1/admin/promotion/reconcile or "
+                "`engram reconcile-promotion`)."
+            ],
+        )
+    if not evidence.get("evaluate_jobs_enabled"):
+        return _check(
+            CHECK_PROMOTION_RECONCILIATION,
+            "warn",
+            "RECONCILIATION_EVALUATE_SUPPRESSED",
+            "Reconciliation passes are running with the canonical "
+            "promotion.evaluate rollout flag off: discovered missing/dead "
+            "targeted work is recorded (suppressed) and NOT repaired — by "
+            "design, no broader/legacy mutation is substituted.",
+            evidence=evidence,
+            remediation=[
+                "Enable ENGRAM_PROMOTION_EVALUATE_JOBS_ENABLED to let "
+                "reconciliation repair targeted evaluation work."
+            ],
+        )
+    last_pass = evidence.get("last_pass")
+    pending = evidence.get("chains", {}).get("pending_by_reason", {})
+    if last_pass is None and not pending:
+        return _check(
+            CHECK_PROMOTION_RECONCILIATION,
+            "warn",
+            "RECONCILIATION_CHAIN_NOT_BOOTSTRAPPED",
+            "Reconciliation is enabled but no pass has run and no chain is "
+            "pending. The worker bootstrap creates the periodic chain on its "
+            "next loop iteration; if this persists, no worker with "
+            "ENGRAM_PROMOTION_RECONCILIATION_ENABLED=true is running.",
+            evidence=evidence,
+            remediation=[
+                "Run a worker with ENGRAM_PROMOTION_RECONCILIATION_ENABLED=true, "
+                "or request reconciliation explicitly "
+                "(`engram reconcile-promotion --tenant <id>`)."
+            ],
+        )
+    if last_pass is not None:
+        return _check(
+            CHECK_PROMOTION_RECONCILIATION,
+            "pass",
+            "RECONCILIATION_OBSERVED",
+            f"Last bounded pass ({last_pass.get('reason')}): window="
+            f"{last_pass.get('window_size')}, evaluations_enqueued="
+            f"{last_pass.get('evaluations_enqueued')}, dead_found="
+            f"{last_pass.get('dead_found')}, missing_found="
+            f"{last_pass.get('missing_found')}, recovery_enqueued="
+            f"{last_pass.get('recovery_enqueued')}, terminal_skipped="
+            f"{last_pass.get('terminal_skipped')}.",
+            evidence=evidence,
+        )
+    return _check(
+        CHECK_PROMOTION_RECONCILIATION,
+        "pass",
+        "RECONCILIATION_PENDING",
+        "Reconciliation chain(s) pending; no pass has completed yet.",
         evidence=evidence,
     )
 
@@ -1903,6 +2042,7 @@ class _DbEvidence:
     recall_evidence: dict[str, Any] | None
     receipts_evidence: dict[str, Any] | None
     promotion_evidence: dict[str, Any] | None
+    reconciliation_evidence: dict[str, Any] | None
     error_type: str | None
 
 
@@ -1930,6 +2070,7 @@ async def _gather_db_evidence(
             recall_evidence=None,
             receipts_evidence=None,
             promotion_evidence=None,
+            reconciliation_evidence=None,
             error_type=_DATABASE_RESOURCE_UNAVAILABLE,
         )
     try:
@@ -1989,8 +2130,16 @@ async def _gather_db_evidence(
                         startup_promotion_limit=startup_promotion_limit,
                     ),
                 )
+                reconciliation_evidence, err7 = await _isolated(
+                    session,
+                    _promotion_reconciliation_evidence(
+                        session,
+                        tenant_id=tenant_id,
+                        now=now,
+                    ),
+                )
                 await session.rollback()
-        error_type = next((e for e in (err1, err2, err3, err4, err5, err6) if e), None)
+        error_type = next((e for e in (err1, err2, err3, err4, err5, err6, err7) if e), None)
         return _DbEvidence(
             snapshot=snapshot,
             job_health=job_health,
@@ -1998,6 +2147,7 @@ async def _gather_db_evidence(
             recall_evidence=recall_evidence,
             receipts_evidence=receipts_evidence,
             promotion_evidence=promotion_evidence,
+            reconciliation_evidence=reconciliation_evidence,
             error_type=error_type,
         )
     except Exception as exc:  # noqa: BLE001 - DB inspection must never abort the report
@@ -2010,6 +2160,7 @@ async def _gather_db_evidence(
             recall_evidence=None,
             receipts_evidence=None,
             promotion_evidence=None,
+            reconciliation_evidence=None,
             error_type=type(exc).__name__,
         )
 
@@ -2125,6 +2276,13 @@ async def run_doctor(
             checks.append(
                 _check_promotion_readiness(
                     evidence=db_evidence.promotion_evidence,
+                    tenant_unresolved=tenant_unresolved,
+                    db_error=db_evidence.error_type,
+                )
+            )
+            checks.append(
+                _check_promotion_reconciliation(
+                    evidence=db_evidence.reconciliation_evidence,
                     tenant_unresolved=tenant_unresolved,
                     db_error=db_evidence.error_type,
                 )

@@ -2,7 +2,8 @@
 
 Polls the ``jobs`` table and runs handlers off the request path:
 ``embedding.generate``, ``conflict.check``, ``classification.refine``,
-``promotion.path_a``, ``promotion.evaluate``, and ``retention.sweep``.
+``promotion.path_a``, ``promotion.evaluate``, ``promotion.reconcile``, and
+``retention.sweep``.
 
 ``promotion.evaluate`` (issue #155, ENG-PROMOTION-003B2) is the canonical,
 item-scoped, current-state promotion-evaluation job contract. Unlike
@@ -38,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -1924,6 +1926,63 @@ async def handle_promotion_evaluate(session: AsyncSession, job: Job) -> None:
     )
 
 
+async def handle_promotion_reconcile(session: AsyncSession, job: Job) -> None:
+    """Run one bounded promotion reconciliation backstop pass (issue #155).
+
+    Parses the closed ``promotion-reconcile-v1`` contract (malformed payloads
+    fail closed into retry/dead-letter), then delegates entirely to
+    :func:`engram.promotion_reconciliation.run_reconciliation_pass`: bounded
+    candidate discovery, targeted-job repair via canonical
+    ``promotion.evaluate`` enqueue, provider-recovery re-enqueue of the
+    existing ``classification.refine`` contract, atomic cursor/state advance,
+    and chain continuation. This handler never evaluates or mutates an item
+    itself — lifecycle authority stays with the shared evaluator behind
+    ``promotion.evaluate``.
+
+    When the rollout flag (``ENGRAM_PROMOTION_RECONCILIATION_ENABLED``) is
+    off, the pass is a truthful no-op and the chain is NOT continued, so
+    turning the flag off stops new reconciliation work without disturbing
+    any other job type.
+    """
+    from engram.promotion_reconciliation import (
+        PromotionReconcileContractError,
+        parse_promotion_reconcile_payload,
+        run_reconciliation_pass,
+    )
+
+    try:
+        contract = parse_promotion_reconcile_payload(job.payload)
+    except PromotionReconcileContractError as exc:
+        raise ValueError(f"promotion.reconcile malformed contract: {exc}") from exc
+    if not settings.promotion_reconciliation_enabled:
+        logger.info(
+            "promotion.reconcile tenant=%s trigger=%s/%s skipped: rollout flag off "
+            "(chain not continued)",
+            job.tenant_id,
+            contract.reason,
+            contract.trigger_id,
+        )
+        return
+    result = await run_reconciliation_pass(
+        session,
+        str(job.tenant_id),
+        reason=contract.reason,
+        trigger_id=contract.trigger_id,
+        self_job_id=job.id,
+    )
+    logger.info(
+        "promotion.reconcile tenant=%s reason=%s trigger=%s window=%s "
+        "evaluations=%s recovery=%s continued=%s",
+        job.tenant_id,
+        contract.reason,
+        contract.trigger_id,
+        result.window_size,
+        result.evaluations_enqueued,
+        result.recovery_enqueued,
+        result.chain_continued,
+    )
+
+
 async def handle_retention_sweep(session: AsyncSession, job: Job) -> None:
     """Boundedly remove expired, unbound classification receipts."""
     from engram.classification_evidence import cleanup_expired_unbound_runs
@@ -2025,6 +2084,7 @@ JOB_HANDLERS: dict[str, JobHandler] = {
     "classification.refine": handle_classification_refine,
     "promotion.path_a": handle_promotion_path_a,
     "promotion.evaluate": handle_promotion_evaluate,
+    "promotion.reconcile": handle_promotion_reconcile,
     "retention.sweep": handle_retention_sweep,
     "recall.telemetry": handle_recall_telemetry,
 }
@@ -2086,7 +2146,18 @@ async def process_one_job(
             _truncate_error(exc),
         )
         async with session_factory() as owner:
-            await mark_job_failed_or_retry(owner, job.id, exc)
+            resulting_status = await mark_job_failed_or_retry(owner, job.id, exc)
+        if resulting_status == "dead" and job.job_type == "promotion.reconcile":
+            # The finite request identity, unlike queue dedupe, survives a
+            # dead letter.  Mark it through the tenant-scoped app session so
+            # FORCE RLS continues to apply to the bookkeeping row.
+            async with app_session_factory() as app:
+                await apply_rls_context(app, tenant_id=tenant_id, principal_id=principal_id)
+                from engram.promotion_reconciliation import mark_reconciliation_chain_failed
+
+                await mark_reconciliation_chain_failed(
+                    app, tenant_id=tenant_id, payload=job.payload
+                )
         return True
 
     async with session_factory() as owner:
@@ -2137,8 +2208,34 @@ async def run_worker(
         job_types or "(all)",
     )
 
+    # Periodic reconciliation chain bootstrap/heal (issue #155): bounded,
+    # content-free, idempotent owner-role bookkeeping that (re)creates a
+    # tenant's perpetual promotion.reconcile chain when none is pending
+    # (first enable, worker restart, or a dead chain job). Not a separate
+    # scheduler daemon — it reuses this loop and the existing queue. The
+    # next-ensure deadline starts at zero so a restarted worker bootstraps
+    # immediately; afterwards it runs at most once per reconciliation
+    # interval, and any error is logged and deferred, never fatal.
+    reconcile_interval = max(1, settings.promotion_reconciliation_scheduler_interval_seconds)
+    next_reconcile_ensure = 0.0
+
     processed = 0
     while True:
+        if settings.promotion_reconciliation_enabled and not job_types:
+            now_mono = time.monotonic()
+            if now_mono >= next_reconcile_ensure:
+                next_reconcile_ensure = now_mono + reconcile_interval
+                try:
+                    async with session_factory() as owner:
+                        from engram.promotion_reconciliation import (
+                            ensure_periodic_reconciliation_chains,
+                        )
+
+                        await ensure_periodic_reconciliation_chains(owner)
+                except Exception:  # noqa: BLE001 — bootstrap must never kill the loop
+                    logger.exception(
+                        "worker=%s periodic reconciliation chain bootstrap failed", worker_id
+                    )
         try:
             did = await process_one_job(
                 worker_id=worker_id,

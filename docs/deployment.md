@@ -562,10 +562,12 @@ The standard Docker Compose stack (`docker compose up -d`) starts a dedicated
 `jobs` table and runs the off-request-path work: `embedding.generate`,
 `conflict.check`, `classification.refine`, `promotion.path_a`,
 `promotion.evaluate` (issue #155's canonical, item-scoped, current-state
-promotion-evaluation job — see README.md), `retention.sweep`, and
-(ENG-AUD-011) `recall.telemetry`. It is Postgres-only (no Redis/Celery/SQS):
-workers claim with `FOR UPDATE SKIP LOCKED`, retry failures with exponential
-backoff, and dead-letter after `ENGRAM_JOB_MAX_ATTEMPTS`.
+promotion-evaluation job — see README.md), `promotion.reconcile` (the bounded
+promotion reconciliation backstop, ENG-PROMOTION-003B4 — see below),
+`retention.sweep`, and (ENG-AUD-011) `recall.telemetry`. It is Postgres-only
+(no Redis/Celery/SQS): workers claim with `FOR UPDATE SKIP LOCKED`, retry
+failures with exponential backoff, and dead-letter after
+`ENGRAM_JOB_MAX_ATTEMPTS`.
 
 `promotion.evaluate` producers are gated on
 `ENGRAM_PROMOTION_EVALUATE_JOBS_ENABLED` (default `false`): classification-bound
@@ -578,6 +580,57 @@ for a profile-bound key, pins that boundary in a durable
 so the worker applies the same boundary asynchronously (fail-closed, no broader
 fallback). With the flag off, none of these enqueue and only the legacy paths
 run — flipping the flag back off is the rollback.
+
+**Promotion reconciliation backstop** (ENG-PROMOTION-003B4 / issue #155) is
+gated on `ENGRAM_PROMOTION_RECONCILIATION_ENABLED` (default `false`),
+independent of the evaluate flag above. When enabled, the worker loop
+additionally bootstraps (and heals, after crashes or dead chain jobs) one
+per-tenant periodic `promotion.reconcile` chain that repairs missing/dead
+targeted promotion evaluation work — bounded to
+`ENGRAM_PROMOTION_RECONCILIATION_PASS_LIMIT` (default 20) items per pass, at
+`ENGRAM_PROMOTION_RECONCILIATION_INTERVAL_SECONDS` (default 3600) per pass.
+Tenant bootstrap/healing is separately bounded by
+`ENGRAM_PROMOTION_RECONCILIATION_TENANT_BATCH_LIMIT` and runs every
+`ENGRAM_PROMOTION_RECONCILIATION_SCHEDULER_INTERVAL_SECONDS` (default 60), so
+discovery throughput is not coupled to the per-tenant reconciliation cadence.
+The owner-side bootstrap/heal loop independently inspects at most
+`ENGRAM_PROMOTION_RECONCILIATION_TENANT_BATCH_LIMIT` tenants per call (default
+100), advancing a durable content-free keyset cursor and wrapping fairly after
+restart. It never materializes the complete tenant table.
+Reconciliation never promotes anything itself: it only enqueues canonical
+`promotion.evaluate` jobs (or re-enqueues the async classification contract for
+provider recovery), which run the ordinary shared evaluator. When the evaluate
+flag is off, reconciliation passes record discovered work as suppressed rather
+than substituting any broader/legacy mechanism. Explicit requests (after
+direct-SQL `tenant_config` promotion changes, or for provider recovery once the
+provider is back): `POST /v1/admin/promotion/reconcile` or
+`engram reconcile-promotion --tenant <id> [--reason operator_request|provider_recovery]`.
+For a tenant-scoped CLI request, supply a stable `--request-id`: replaying it
+reports `active` while work remains or `completed` after it finishes, without
+enqueuing duplicate work. A `failed` durable identity is terminal; the CLI
+reports it and exits 1, so retry with a fresh `--request-id`. When the rollout
+flag is off, the CLI reports `status=not_enqueued` and keeps its documented
+exit code 3. Without `--tenant`, the CLI advances one durable tenant page and
+prints a stable `--request-id`; repeat that command with the printed id until
+it reports `complete=true`. This keeps operator-triggered all-tenant work
+bounded too.
+Committed admission-affecting memory-kind changes (PATCH
+`/admin/memory-kinds/{name}` altering `enabled` or `auto_promote_from_inferred`)
+schedule one bounded `policy_change` chain automatically. Flipping the
+reconciliation flag back off stops new backstop work and leaves the periodic
+chains to die out as no-op passes, without disturbing startup-recall promotion
+or either targeted job type. Startup recall's lazy promotion pass is unchanged
+in this slice; its removal behind shadow parity is the next #155 slice (B5).
+
+A pending/running promotion job is considered healthy only when it covers the
+current evaluator-produced due-time obligation. Cooling jobs must match the
+exact boundary; due items require a due/overdue job. Legacy `promotion.path_a`
+also has to reference the currently bound classification run. Stable terminal
+items are recorded only as `(tenant, item, reconciliation epoch, observed_at)`
+and suppressed from later periodic selection until policy/reset generation or
+relevant item/evidence state changes. Provider recovery likewise restores only
+classification intent proven by the initial `auto_classified` audit event;
+explicit-kind and unknown legacy items are not classified by the backstop.
 
 Worker logs are visible with:
 

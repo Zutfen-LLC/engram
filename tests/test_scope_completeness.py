@@ -91,6 +91,9 @@ EXPECTED_MATRIX: dict[tuple[str, str], dict] = {
     ("POST", "/v1/admin/promote"): {"all_of": ("admin",)},
     # Issue #155 trigger matrix: explicit admin-request promotion evaluation.
     ("POST", "/v1/admin/items/{item_id}/evaluate"): {"all_of": ("admin",)},
+    # Issue #155 (ENG-PROMOTION-003B4): explicit admin-request bounded
+    # promotion reconciliation.
+    ("POST", "/v1/admin/promotion/reconcile"): {"all_of": ("admin",)},
     ("POST", "/v1/telemetry/lifecycle"): {"all_of": ("write",)},
     # ENG-CONTEXT-003A: read-only receipt inspection and verification.
     ("GET", "/v1/context-receipts"): {"all_of": ("read",)},
