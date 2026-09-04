@@ -618,9 +618,19 @@ Committed admission-affecting memory-kind changes (PATCH
 `/admin/memory-kinds/{name}` altering `enabled` or `auto_promote_from_inferred`)
 schedule one bounded `policy_change` chain automatically. Flipping the
 reconciliation flag back off stops new backstop work and leaves the periodic
-chains to die out as no-op passes, without disturbing startup-recall promotion
-or either targeted job type. Startup recall's lazy promotion pass is unchanged
-in this slice; its removal behind shadow parity is the next #155 slice (B5).
+chains to die out as no-op passes, without disturbing either targeted job type.
+
+**Startup lifecycle-read-only cutover** (ENG-PROMOTION-003B5 / issue #170) is
+controlled by `ENGRAM_STARTUP_PROMOTION_MUTATION_ENABLED` (default `true`).
+`true` retains the deprecated bounded lazy pass as the rollback mechanism.
+`false` removes startup's promotion mutation/audit path and uses the normal
+read-session candidate path; configuration rejects it unless both
+`ENGRAM_PROMOTION_EVALUATE_JOBS_ENABLED` and
+`ENGRAM_PROMOTION_RECONCILIATION_ENABLED` are true. While those prerequisites
+are on, `ENGRAM_STARTUP_PROMOTION_SHADOW_ENABLED` (default `true`) records a
+bounded, content-free parity window using a separate diagnostic cursor. It
+uses the shared evaluator and exact current-obligation lookup only; it is not
+promotion evidence and never locks memory rows or advances the legacy cursor.
 
 A pending/running promotion job is considered healthy only when it covers the
 current evaluator-produced due-time obligation. Cooling jobs must match the

@@ -206,10 +206,35 @@ def test_settings_default_flags_off() -> None:
     s = Settings()
     assert s.promotion_reconciliation_enabled is False
     assert s.promotion_evaluate_jobs_enabled is False
+    assert s.startup_promotion_mutation_enabled is True
     assert s.promotion_reconciliation_pass_limit == 20
     assert s.promotion_reconciliation_interval_seconds == 3600
     assert s.promotion_reconciliation_scheduler_interval_seconds == 60
     assert s.promotion_reconciliation_tenant_batch_limit == 100
+
+
+@pytest.mark.parametrize(
+    "settings_kwargs",
+    [
+        {"promotion_evaluate_jobs_enabled": False, "promotion_reconciliation_enabled": True},
+        {"promotion_evaluate_jobs_enabled": True, "promotion_reconciliation_enabled": False},
+        {"promotion_evaluate_jobs_enabled": False, "promotion_reconciliation_enabled": False},
+    ],
+)
+def test_startup_mutation_cutover_fails_closed_without_both_backstops(
+    settings_kwargs: dict[str, bool],
+) -> None:
+    with pytest.raises(ValueError, match="startup_promotion_mutation_enabled"):
+        Settings(startup_promotion_mutation_enabled=False, **settings_kwargs)
+
+
+def test_startup_mutation_cutover_accepts_both_backstops() -> None:
+    settings = Settings(
+        startup_promotion_mutation_enabled=False,
+        promotion_evaluate_jobs_enabled=True,
+        promotion_reconciliation_enabled=True,
+    )
+    assert settings.startup_promotion_mutation_enabled is False
 
 
 # --- Pure repair classification -------------------------------------------------

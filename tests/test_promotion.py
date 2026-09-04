@@ -155,6 +155,7 @@ async def _clean_db():
     # test) has an item with an event.
     async with _test_engine.begin() as conn:
         await conn.execute(text("DELETE FROM jobs"))
+        await conn.execute(text("DELETE FROM promotion_startup_shadow_state"))
         await conn.execute(text("DELETE FROM promotion_reconciliation_state"))
         await conn.execute(text("DELETE FROM feedback_events"))
         await conn.execute(text("DELETE FROM item_events"))
@@ -901,6 +902,74 @@ async def test_startup_recall_promotion_respects_limit(client, monkeypatch):
     statuses = {await _status_of(item_a), await _status_of(item_b)}
     # Exactly one promoted, one still proposed — never both under limit=1.
     assert statuses == {"active", "proposed"}
+
+
+async def test_startup_recall_cutover_is_lifecycle_read_only(client, monkeypatch):
+    """B5: disabling the compatibility flag never invokes lazy promotion.
+
+    Canonical flags are deliberately enabled to exercise the only accepted
+    cutover configuration. Shadow is disabled here because this regression is
+    about lifecycle writes, not its separately tested diagnostic table.
+    """
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    monkeypatch.setattr(settings, "promotion_evaluate_jobs_enabled", True)
+    monkeypatch.setattr(settings, "promotion_reconciliation_enabled", True)
+    monkeypatch.setattr(settings, "startup_promotion_mutation_enabled", False)
+    monkeypatch.setattr(settings, "startup_promotion_shadow_enabled", False)
+    tenant_id, principal_id = await _default_tenant_principal()
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="eligible only after canonical evaluation",
+        memory_confidence=0.9,
+        created_at=_default_now() - timedelta(hours=100),
+    )
+
+    response = await client.post("/v1/recall", json={"mode": "startup"})
+    assert response.status_code == 200, response.text
+    assert item_id not in {item["id"] for item in response.json()["items"]}
+    assert await _status_of(item_id) == "proposed"
+    async with _test_session_factory() as session:
+        promotion_events = await session.scalar(
+            text(
+                "SELECT count(*) FROM item_events WHERE item_id = :item_id "
+                "AND event_type = 'review_change' AND new_value = 'active'"
+            ),
+            {"item_id": item_id},
+        )
+    assert promotion_events == 0
+
+
+async def test_startup_shadow_reports_missing_canonical_obligation(client, monkeypatch):
+    """Shadow diagnostics classify a missing current obligation without repair."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    monkeypatch.setattr(settings, "promotion_evaluate_jobs_enabled", True)
+    monkeypatch.setattr(settings, "promotion_reconciliation_enabled", True)
+    monkeypatch.setattr(settings, "startup_promotion_mutation_enabled", False)
+    monkeypatch.setattr(settings, "startup_promotion_shadow_enabled", True)
+    tenant_id, principal_id = await _default_tenant_principal()
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="shadow must not repair this missing obligation",
+        memory_confidence=0.9,
+        created_at=_default_now() - timedelta(hours=100),
+    )
+
+    response = await client.post("/v1/recall", json={"mode": "startup"})
+    assert response.status_code == 200, response.text
+    assert await _status_of(item_id) == "proposed"
+    async with _test_session_factory() as session:
+        mismatch_count = await session.scalar(
+            text(
+                "SELECT mismatch_missing_obligation FROM promotion_startup_shadow_state "
+                "WHERE tenant_id = :tenant_id"
+            ),
+            {"tenant_id": tenant_id},
+        )
+    assert mismatch_count == 1
 
 
 async def test_startup_rotation_skips_kind_terminal_head_rows():

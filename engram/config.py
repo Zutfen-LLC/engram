@@ -212,6 +212,18 @@ class Settings(BaseSettings):
     # of how large a tenant's proposed backlog grows. The explicit CLI/admin
     # promotion paths pass their own limit (or None for unbounded).
     startup_promotion_limit: int = 20
+    # Transitional compatibility switch for ENG-PROMOTION-003B5.  ``True``
+    # preserves the legacy bounded lazy pass, including its lifecycle writes.
+    # It may only be disabled after both canonical evaluation and its bounded
+    # reconciliation repair backstop are enabled; see the validator below.
+    # The legacy code and rotation state deliberately remain available for a
+    # one-flag rollback during the deprecation period.
+    startup_promotion_mutation_enabled: bool = True
+    # The parity observer is diagnostic-only.  It is intentionally inert
+    # until both event-driven prerequisites are on, which keeps the default
+    # deployment behavior unchanged while making shadow coverage automatic
+    # during the canary rollout.
+    startup_promotion_shadow_enabled: bool = True
     # Top-k plausible active-item candidates considered by the promotion-time
     # conflict recheck (engram.conflicts.find_promotion_conflict_candidates).
     promotion_conflict_candidate_k: int = 5
@@ -250,6 +262,11 @@ class Settings(BaseSettings):
     # or one all-tenant CLI continuation.  Progress is persisted in a global,
     # content-free keyset cursor, so restart does not expand this bound.
     promotion_reconciliation_tenant_batch_limit: int = 100
+
+    @property
+    def startup_promotion_shadow_prerequisites_enabled(self) -> bool:
+        """Whether canonical work can authoritatively cover a shadow window."""
+        return self.promotion_evaluate_jobs_enabled and self.promotion_reconciliation_enabled
 
     @model_validator(mode="after")
     def _clamp_startup_recall_candidate_limit(self) -> Settings:
@@ -349,6 +366,15 @@ class Settings(BaseSettings):
             raise ValueError("promotion_reconciliation_scheduler_interval_seconds must be >= 1")
         if self.promotion_reconciliation_tenant_batch_limit < 1:
             raise ValueError("promotion_reconciliation_tenant_batch_limit must be >= 1")
+        if (
+            not self.startup_promotion_mutation_enabled
+            and not self.startup_promotion_shadow_prerequisites_enabled
+        ):
+            raise ValueError(
+                "startup_promotion_mutation_enabled=false requires both "
+                "promotion_evaluate_jobs_enabled=true and "
+                "promotion_reconciliation_enabled=true"
+            )
         return self
 
     @model_validator(mode="after")

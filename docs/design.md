@@ -367,14 +367,21 @@ schedules only from that mutation-authoritative row and its currently bound rece
 re-derives that same current-state row at execution time instead of trusting the enqueue-time receipt,
 which is the material difference between the two contracts (issue #155).
 
-**Lazy startup-recall promotion** (F11): every `POST /v1/recall` call with
-`mode=startup` runs `engram.promotion.maybe_auto_promote_for_startup_recall`
-before `_fetch_active_items`, bounded by `settings.startup_promotion_limit`
-(default 20 proposed items scanned per call) so recall latency stays
-predictable regardless of how large a tenant's proposed backlog grows. A
-disabled tenant (`auto_promote_enabled=false`) pays only a single `COUNT`
-query. Semantic recall (`mode=semantic`) does **not** trigger this pass in
-this slice — that remains a deliberate scope boundary, not an oversight.
+**Startup-recall promotion compatibility path** (F11/B5):
+`ENGRAM_STARTUP_PROMOTION_MUTATION_ENABLED=true` (the default) retains the
+legacy bounded `maybe_auto_promote_for_startup_recall` pass before candidate
+selection, capped by `settings.startup_promotion_limit` (default 20). It is
+explicitly deprecated but retained as a one-flag rollback path. When the flag
+is `false`, startup recall is lifecycle-read-only: it does not mutate
+`MemoryItem.review_status` or create promotion audit events, and only sees
+lifecycle state already committed by canonical `promotion.evaluate` work.
+That configuration fails closed unless both canonical evaluation and bounded
+reconciliation are enabled. A separate bounded, content-free shadow cursor
+compares the shared evaluator's current obligation with canonical queue
+coverage; it never locks memory rows, writes promotion evidence, or advances
+the legacy cursor. Recall provenance and asynchronous recall telemetry remain
+allowed writes. Semantic recall (`mode=semantic`) never triggers either legacy
+startup mutation or the shadow observer.
 
 **Conflict candidate selection is top-k, not top-1** (F13): both the recheck
 above and `find_promotion_conflict_candidates` scope candidates to the same

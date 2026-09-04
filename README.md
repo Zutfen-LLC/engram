@@ -181,7 +181,15 @@ terminal-vs-time-dependent status, and age buckets — and warns when the bounde
 startup-promotion window is dominated by terminal blockers (blocked backlog the
 lazy pass now rotates past rather than starves on).
 
-`POST /v1/recall` with `mode=startup` runs a bounded, tenant-scoped promotion pass automatically before building the working set (capped at `settings.startup_promotion_limit`, default 20 proposed items per call) — no separate trigger needed for day-to-day recall. The bounded pass scans fairly: a persisted per-tenant rotation cursor advances past the rows each pass examined (wrapping at the tail), and proposals whose memory kind can never auto-promote under current policy are excluded outright, so permanently blocked rows at the head of the queue cannot starve later proposals. For full sweeps of a large proposed backlog, wire the CLI to cron/systemd, or call the admin endpoint on demand:
+`POST /v1/recall` with `mode=startup` retains its bounded, tenant-scoped lazy
+promotion pass only while `ENGRAM_STARTUP_PROMOTION_MUTATION_ENABLED=true`
+(the default, and the explicit rollback switch). It is capped at
+`settings.startup_promotion_limit` (default 20) and scans fairly through its
+persisted cursor. With the switch `false`, startup is lifecycle-read-only and
+sees only promotion state already committed by canonical worker/reconciliation
+processing; configuration fails closed unless both canonical rollout flags are
+enabled. For full sweeps of a large proposed backlog, wire the CLI to
+cron/systemd, or call the admin endpoint on demand:
 
 ```bash
 # All tenants. Runs as the owner role (bypasses RLS) via ENGRAM_OWNER_DATABASE_URL:
@@ -198,7 +206,9 @@ engram promote-proposed --dry-run
 POST /v1/admin/promote
 ```
 
-All three entry points (lazy startup recall, CLI, admin endpoint) share one promotion service function and the same gates — none can drift from the others.
+The compatibility startup pass, CLI, and admin endpoint share one promotion
+service function and the same gates. Once the startup compatibility switch is
+off, canonical `promotion.evaluate` owns lifecycle mutation instead.
 
 Promotion returns per-reason counts:
 
@@ -429,9 +439,7 @@ What one pass repairs, per item, using the shared evaluator's own assessment:
   `classification_bound` producer. This is recovery of *current* failed
   classification work, not #157's future model/prompt/version reassessment.
 
-What reconciliation deliberately does **not** repair: startup-recall promotion
-mutation stays in place (removal is the next #155 slice, B5, after shadow
-parity); #156 structured extraction, #157 reassessment, #159 durable
+What reconciliation deliberately does **not** repair: #156 structured extraction, #157 reassessment, #159 durable
 assessment history; bound-but-fallback classification receipts (that is
 reassessment, not recovery); direct-SQL `tenant_config` changes, which the
 service cannot observe.
