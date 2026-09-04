@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import uuid
 from collections import Counter
-from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Literal
@@ -28,6 +27,7 @@ from engram.models import (
 )
 from engram.promotion import (
     PromotionCandidate,
+    PromotionObservedWindow,
     _config,
     _config_values,
     _kind_promotion_allowed,
@@ -146,7 +146,7 @@ async def observe_startup_promotion_parity(
     tenant_id: str,
     *,
     now: datetime | None = None,
-    authoritative_window: Sequence[MemoryItem] | None = None,
+    authoritative_window: PromotionObservedWindow | None = None,
 ) -> StartupPromotionShadowResult:
     """Observe one bounded, non-authoritative parity window.
 
@@ -173,8 +173,8 @@ async def observe_startup_promotion_parity(
     # locking query. Never query a reconstructed equivalent window here:
     # SKIP LOCKED may have selected a different page under concurrency.
     if authoritative_window is not None:
-        items = list(authoritative_window)
-        wrapped = False
+        items = list(authoritative_window.items)
+        wrapped = authoritative_window.rotation_wrapped
     else:
         limit = settings.startup_promotion_limit
         items = list((await session.execute(_shadow_window(tenant_id, state, limit))).scalars())
@@ -238,7 +238,9 @@ async def observe_startup_promotion_parity(
             tenant_id=uuid.UUID(tenant_id),
             last_observed_at=moment,
             last_window_size=result.window_size,
-            last_wrapped=False,
+            compatibility_windows_observed=1,
+            compatibility_rotations_completed=int(wrapped),
+            last_compatibility_wrapped=wrapped,
             updated_at=moment,
             **counters,
         )
@@ -249,7 +251,12 @@ async def observe_startup_promotion_parity(
                 set_={
                     "last_observed_at": excluded.last_observed_at,
                     "last_window_size": excluded.last_window_size,
-                    "last_wrapped": excluded.last_wrapped,
+                    "compatibility_windows_observed":
+                        PromotionStartupShadowState.compatibility_windows_observed + 1,
+                    "compatibility_rotations_completed":
+                        PromotionStartupShadowState.compatibility_rotations_completed
+                        + excluded.compatibility_rotations_completed,
+                    "last_compatibility_wrapped": excluded.last_compatibility_wrapped,
                     "updated_at": excluded.updated_at,
                     **{
                         outcome: getattr(PromotionStartupShadowState, outcome)

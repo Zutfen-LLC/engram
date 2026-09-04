@@ -1282,6 +1282,17 @@ class PromotionStartupShadowState(Base):
 
     __tablename__ = "promotion_startup_shadow_state"
 
+    # Compatibility coverage is independent of the post-cutover cursor.
+    compatibility_windows_observed: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    compatibility_rotations_completed: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    last_compatibility_wrapped: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), primary_key=True
     )

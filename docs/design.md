@@ -387,6 +387,22 @@ provenance and asynchronous recall telemetry remain allowed writes. Semantic
 recall (`mode=semantic`) never triggers either legacy startup mutation or the
 shadow observer.
 
+Compatibility observations do not advance `cursor_created_at` or
+`cursor_item_id`. Each exact authoritative window increments
+`compatibility_windows_observed`. The legacy pass supplies its wrap fact
+before mutation. Each true wrap increments `compatibility_rotations_completed`
+and sets `last_compatibility_wrapped` to true. A non-wrapping pass sets that
+last-window field to false. These fields persist atomically with parity
+counters. They remain tenant-scoped, content-free diagnostics and cannot
+authorize promotion. The separate `rotation` and `last_wrapped` fields
+describe only the independent post-cutover diagnostic cursor.
+
+Production cutover still requires live/canary certification under #170.
+Record a baseline and prove at least one complete authoritative rotation per
+enabled tenant during the accepted run. Record tenants with no live proposals
+explicitly. Deterministic tests do not replace live parity coverage or startup
+latency evidence.
+
 **Conflict candidate selection is top-k, not top-1** (F13): both the recheck
 above and `find_promotion_conflict_candidates` scope candidates to the same
 tenant/kind, same workspace when the item is workspace-scoped (tenant-wide

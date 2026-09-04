@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -34,7 +33,11 @@ from engram.config import settings
 from engram.db import get_session
 from engram.jobs import enqueue_job
 from engram.models import MemoryItem
-from engram.promotion import PromotionResult, auto_promote_proposed_memories
+from engram.promotion import (
+    PromotionObservedWindow,
+    PromotionResult,
+    auto_promote_proposed_memories,
+)
 
 # Module-global engine/factory, recreated per test by the ``_fresh_engine`` autouse
 # fixture. pytest-asyncio runs each test on its own event loop; asyncpg binds a
@@ -1085,7 +1088,10 @@ async def test_reconciliation_repair_changes_shadow_from_missing_to_scheduled(mo
         item = await session.get(MemoryItem, uuid.UUID(item_id))
         assert item is not None
         before = await observe_startup_promotion_parity(
-            session, tenant_id, now=moment, authoritative_window=[item]
+            session,
+            tenant_id,
+            now=moment,
+            authoritative_window=PromotionObservedWindow([item], False)
         )
         assert before.outcomes["mismatch_missing_obligation"] == 1
         assert await session.scalar(text("SELECT count(*) FROM jobs")) == 0
@@ -1107,7 +1113,10 @@ async def test_reconciliation_repair_changes_shadow_from_missing_to_scheduled(mo
         item = await session.get(MemoryItem, uuid.UUID(item_id))
         assert item is not None
         after = await observe_startup_promotion_parity(
-            session, tenant_id, now=moment, authoritative_window=[item]
+            session,
+            tenant_id,
+            now=moment,
+            authoritative_window=PromotionObservedWindow([item], False)
         )
         assert after.outcomes["parity_durably_scheduled"] == 1
         await session.commit()
@@ -1165,7 +1174,7 @@ async def test_shadow_uses_the_canonical_cooling_boundary(monkeypatch):
                 session,
                 tenant_id,
                 now=observation_time,
-                authoritative_window=[item],
+                authoritative_window=PromotionObservedWindow([item], False),
             )
             assert result.outcomes["parity_durably_scheduled"] == 1
             await session.commit()
@@ -1236,12 +1245,13 @@ async def test_startup_shadow_accounts_for_each_skip_locked_authoritative_window
         async with _test_session_factory() as session:
             await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
 
-            async def observe_a(items: Sequence[MemoryItem]) -> None:
-                selected_by_a.extend(str(item.id) for item in items)
+            async def observe_a(window: PromotionObservedWindow) -> None:
+                selected_by_a.extend(str(item.id) for item in window.items)
+                assert window.rotation_wrapped is False
                 first_window_locked.set()
                 await allow_first_to_continue.wait()
                 await observe_startup_promotion_parity(
-                    session, tenant_id, authoritative_window=items
+                    session, tenant_id, authoritative_window=window
                 )
 
             return await maybe_auto_promote_for_startup_recall(
@@ -1253,10 +1263,11 @@ async def test_startup_shadow_accounts_for_each_skip_locked_authoritative_window
         async with _test_session_factory() as session:
             await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
 
-            async def observe_b(items: Sequence[MemoryItem]) -> None:
-                selected_by_b.extend(str(item.id) for item in items)
+            async def observe_b(window: PromotionObservedWindow) -> None:
+                selected_by_b.extend(str(item.id) for item in window.items)
+                assert window.rotation_wrapped is False
                 await observe_startup_promotion_parity(
-                    session, tenant_id, authoritative_window=items
+                    session, tenant_id, authoritative_window=window
                 )
 
             return await maybe_auto_promote_for_startup_recall(
@@ -1296,6 +1307,105 @@ async def test_startup_shadow_accounts_for_each_skip_locked_authoritative_window
     assert missing_count == 1
     assert scheduled_count == 1
     assert promotion_events == 2
+    assert result_a.rotation_wrapped is result_b.rotation_wrapped is False
+    async with _test_session_factory() as session:
+        coverage = (await session.execute(text(
+            "SELECT compatibility_windows_observed, compatibility_rotations_completed, "
+            "last_compatibility_wrapped, cursor_created_at, cursor_item_id, rotation "
+            "FROM promotion_startup_shadow_state WHERE tenant_id = :tenant_id"
+        ), {"tenant_id": tenant_id})).one()
+    assert tuple(coverage) == (2, 0, False, None, None, 0)
+
+
+@pytest.mark.parametrize("diagnostic_first", [False, True])
+async def test_compatibility_rotation_coverage_survives_new_sessions(monkeypatch, diagnostic_first):
+    """Persist real legacy wrap evidence without moving the diagnostic cursor."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    from collections import Counter
+
+    from engram.db import apply_rls_context
+    from engram.models import PromotionStartupShadowState
+    from engram.promotion import maybe_auto_promote_for_startup_recall
+    from engram.promotion_startup_shadow import PARITY_OUTCOMES, observe_startup_promotion_parity
+
+    monkeypatch.setattr(settings, "startup_promotion_limit", 2)
+    monkeypatch.setattr(settings, "promotion_evaluate_jobs_enabled", True)
+    monkeypatch.setattr(settings, "promotion_reconciliation_enabled", True)
+    tenant_id, principal_id = await _default_tenant_principal()
+    moment = _default_now()
+    item_ids = [
+        await _insert_item(
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            content=f"compatibility rotation coverage {index}",
+            memory_confidence=0.9,
+            created_at=moment - timedelta(hours=100 - index if index < 4 else 1),
+        )
+        for index in range(5)
+    ]
+    totals = Counter()
+    diagnostic_cursor = (None, None, 0, False)
+    if diagnostic_first:
+        async with _test_session_factory() as session:
+            await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
+            diagnostic = await observe_startup_promotion_parity(session, tenant_id, now=moment)
+            totals.update(diagnostic.outcomes)
+            await session.commit()
+        async with _test_session_factory() as session:
+            state = await session.get(PromotionStartupShadowState, uuid.UUID(tenant_id))
+            diagnostic_cursor = (
+                state.cursor_created_at, state.cursor_item_id, state.rotation, state.last_wrapped
+            )
+
+    selected = []
+    wraps = []
+    promoted = 0
+    for pass_index in range(4):
+        async with _test_session_factory() as session:
+            await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
+
+            async def observe(window: PromotionObservedWindow) -> None:
+                selected.append([str(item.id) for item in window.items])
+                wraps.append(window.rotation_wrapped)
+                assert all(item.review_status == "proposed" for item in window.items)
+                shadow = await observe_startup_promotion_parity(
+                    session, tenant_id, now=moment, authoritative_window=window
+                )
+                assert shadow.wrapped == window.rotation_wrapped
+                assert not shadow.concurrent_skipped
+                assert sum(shadow.outcomes.values()) == len(window.items)
+                totals.update(shadow.outcomes)
+
+            result = await maybe_auto_promote_for_startup_recall(
+                session, tenant_id, now=moment, selected_window_observer=observe
+            )
+            assert result.rotation_wrapped == wraps[-1]
+            promoted += result.promoted
+
+        # Reopen after each committed pass. No ORM state crosses this boundary.
+        async with _test_session_factory() as session:
+            state = await session.get(PromotionStartupShadowState, uuid.UUID(tenant_id))
+            assert state.compatibility_windows_observed == pass_index + 1
+            assert state.compatibility_rotations_completed == int(pass_index == 3)
+            assert state.last_compatibility_wrapped == (pass_index == 3)
+            assert (
+                state.cursor_created_at, state.cursor_item_id, state.rotation, state.last_wrapped
+            ) == diagnostic_cursor
+            assert {outcome: getattr(state, outcome) for outcome in PARITY_OUTCOMES} == {
+                outcome: totals[outcome] for outcome in PARITY_OUTCOMES
+            }
+            assert await session.scalar(text(
+                "SELECT count(*) FROM item_events WHERE event_type = 'review_change' "
+                "AND new_value = 'active'"
+            )) == promoted
+            assert await session.scalar(text("SELECT count(*) FROM jobs")) == 0
+
+    assert selected == [item_ids[:2], item_ids[2:4], item_ids[4:], item_ids[4:]]
+    assert wraps == [False, False, False, True]
+    assert promoted == 4
+    assert totals["mismatch_missing_obligation"] == 6 + (2 if diagnostic_first else 0)
+    assert await _status_of(item_ids[-1]) == "proposed"
 
 
 async def test_startup_rotation_skips_kind_terminal_head_rows():

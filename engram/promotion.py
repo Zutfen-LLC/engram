@@ -179,7 +179,15 @@ class PromotionResult:
 # ``FOR UPDATE SKIP LOCKED`` query acquired before this function performs any
 # lifecycle mutation.  This is deliberately a window hand-off, not a second
 # evaluator or an authority hook.
-PromotionWindowObserver = Callable[[Sequence[MemoryItem]], Awaitable[None]]
+@dataclass(frozen=True)
+class PromotionObservedWindow:
+    """Exact locked selection and wrap fact from the authoritative pass."""
+
+    items: Sequence[MemoryItem]
+    rotation_wrapped: bool
+
+
+PromotionWindowObserver = Callable[[PromotionObservedWindow], Awaitable[None]]
 
 
 def summarize(result: PromotionResult) -> str:
@@ -805,7 +813,9 @@ async def auto_promote_proposed_memories(
     # advance this pass into later rows.  Invoke the caller's diagnostic hook
     # before any compatibility mutation, in this same transaction.
     if selected_window_observer is not None:
-        await selected_window_observer(items)
+        await selected_window_observer(
+            PromotionObservedWindow(tuple(items), result.rotation_wrapped)
+        )
     result.scanned = len(items)
     support_map = await load_promotion_support(session, items)
     for item in items:

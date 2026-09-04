@@ -26,7 +26,6 @@ telemetry-write failure never fails the read.
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -43,7 +42,11 @@ from engram.memory_access import read_eligibility_expression, resolve_workspace_
 from engram.memory_context import ResolvedMemoryContext
 from engram.memory_kinds import get_disputed_stay_kind_names
 from engram.models import MemoryItem, RecallLog, TenantConfig
-from engram.promotion import PromotionResult, maybe_auto_promote_for_startup_recall
+from engram.promotion import (
+    PromotionObservedWindow,
+    PromotionResult,
+    maybe_auto_promote_for_startup_recall,
+)
 from engram.promotion_startup_shadow import observe_startup_promotion_parity
 from engram.relationship_recall import RECALL_SCORING_VERSION, expand_recall_candidates
 
@@ -640,9 +643,9 @@ async def execute_startup_recall(
     if settings.startup_promotion_mutation_enabled:
         if shadow_enabled:
 
-            async def observe_authoritative_window(items: Sequence[MemoryItem]) -> None:
+            async def observe_authoritative_window(window: PromotionObservedWindow) -> None:
                 shadow_result = await observe_startup_promotion_parity(
-                    session, tenant_id, now=now, authoritative_window=items
+                    session, tenant_id, now=now, authoritative_window=window
                 )
                 logger.info(
                     "startup_promotion_shadow tenant=%s window=%s wrapped=%s outcomes=%s "

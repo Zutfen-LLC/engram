@@ -635,6 +635,22 @@ It uses the shared evaluator and exact current-obligation lookup only; it is
 not promotion evidence and never locks memory rows or advances the legacy
 cursor.
 
+Compatibility observations do not advance `cursor_created_at` or
+`cursor_item_id`. Each exact authoritative window increments
+`compatibility_windows_observed`. The legacy pass supplies its wrap fact
+before mutation. Each true wrap increments `compatibility_rotations_completed`
+and sets `last_compatibility_wrapped` to true. A non-wrapping pass sets that
+last-window field to false. These fields persist atomically with parity
+counters. They remain tenant-scoped, content-free diagnostics and cannot
+authorize promotion. The separate `rotation` and `last_wrapped` fields
+describe only the independent post-cutover diagnostic cursor.
+
+Production cutover still requires live/canary certification under #170.
+Record a baseline and prove at least one complete authoritative rotation per
+enabled tenant during the accepted run. Record tenants with no live proposals
+explicitly. Deterministic tests do not replace live parity coverage or startup
+latency evidence.
+
 A pending/running promotion job is considered healthy only when it covers the
 current evaluator-produced due-time obligation. Cooling jobs must match the
 exact boundary; due items require a due/overdue job. Legacy `promotion.path_a`
