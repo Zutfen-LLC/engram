@@ -627,10 +627,13 @@ controlled by `ENGRAM_STARTUP_PROMOTION_MUTATION_ENABLED` (default `true`).
 read-session candidate path; configuration rejects it unless both
 `ENGRAM_PROMOTION_EVALUATE_JOBS_ENABLED` and
 `ENGRAM_PROMOTION_RECONCILIATION_ENABLED` are true. While those prerequisites
-are on, `ENGRAM_STARTUP_PROMOTION_SHADOW_ENABLED` (default `true`) records a
-bounded, content-free parity window using a separate diagnostic cursor. It
-uses the shared evaluator and exact current-obligation lookup only; it is not
-promotion evidence and never locks memory rows or advances the legacy cursor.
+are on, `ENGRAM_STARTUP_PROMOTION_SHADOW_ENABLED` (default `true`) records
+bounded, content-free parity. In compatibility mode it observes the exact
+window the legacy `FOR UPDATE SKIP LOCKED` pass selected; after cutover it uses
+a separate diagnostic cursor because the legacy cursor is frozen for rollback.
+It uses the shared evaluator and exact current-obligation lookup only; it is
+not promotion evidence and never locks memory rows or advances the legacy
+cursor.
 
 A pending/running promotion job is considered healthy only when it covers the
 current evaluator-produced due-time obligation. Cooling jobs must match the

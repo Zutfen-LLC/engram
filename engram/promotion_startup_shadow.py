@@ -1,16 +1,18 @@
 """Read-only startup-promotion parity observation for ENG-PROMOTION-003B5.
 
-The observer is deliberately not a promotion path.  It walks its own bounded,
-content-free keyset cursor, asks the existing shared evaluator what the legacy
-startup pass would do, and compares that answer with the reconciliation
-backstop's *current* obligation lookup.  It never locks memory rows, enqueues
-work, writes item events, or changes a memory lifecycle field.
+The observer is deliberately not a promotion path. During compatibility mode
+it receives the exact bounded window the authoritative legacy pass selected
+with ``FOR UPDATE SKIP LOCKED``. After cutover it uses its own bounded,
+content-free cursor to inspect canonical coverage while the legacy cursor stays
+frozen for rollback. It never locks memory rows, enqueues work, writes item
+events, or changes a memory lifecycle field.
 """
 
 from __future__ import annotations
 
 import uuid
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Literal
@@ -22,7 +24,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from engram.config import settings
 from engram.models import (
     MemoryItem,
-    PromotionReconciliationState,
     PromotionStartupShadowState,
 )
 from engram.promotion import (
@@ -106,10 +107,10 @@ def classify_startup_promotion_parity(
 
 def _shadow_window(
     tenant_id: str,
-    cursor: PromotionStartupShadowState | PromotionReconciliationState | None,
+    cursor: PromotionStartupShadowState | None,
     limit: int,
 ) -> Select[tuple[MemoryItem]]:
-    """The legacy rotation topology without a row lock.
+    """The post-cutover diagnostic rotation topology without a row lock.
 
     Shadow observation must remain capable of running alongside startup,
     worker, and review activity without becoming a second mutation authority.
@@ -145,7 +146,7 @@ async def observe_startup_promotion_parity(
     tenant_id: str,
     *,
     now: datetime | None = None,
-    follow_legacy_rotation: bool = False,
+    authoritative_window: Sequence[MemoryItem] | None = None,
 ) -> StartupPromotionShadowResult:
     """Observe one bounded, non-authoritative parity window.
 
@@ -168,26 +169,19 @@ async def observe_startup_promotion_parity(
             )
         )
     ).scalar_one_or_none()
-    # During compatibility mode the exact question is what the legacy pass is
-    # about to inspect, so observe from its cursor without touching or locking
-    # it. Once lifecycle mutation is disabled, that cursor is deliberately
-    # frozen for rollback and the independent diagnostic cursor completes
-    # continued bounded coverage instead.
-    source_cursor: PromotionStartupShadowState | PromotionReconciliationState | None = state
-    if follow_legacy_rotation:
-        source_cursor = (
-            await session.execute(
-                select(PromotionReconciliationState).where(
-                    PromotionReconciliationState.tenant_id == uuid.UUID(tenant_id)
-                )
-            )
-        ).scalar_one_or_none()
-    limit = settings.startup_promotion_limit
-    items = list((await session.execute(_shadow_window(tenant_id, source_cursor, limit))).scalars())
-    wrapped = False
-    if not items and source_cursor is not None and source_cursor.cursor_created_at is not None:
-        items = list((await session.execute(_shadow_window(tenant_id, None, limit))).scalars())
-        wrapped = bool(items)
+    # Compatibility callers hand off the exact rows selected by the legacy
+    # locking query. Never query a reconstructed equivalent window here:
+    # SKIP LOCKED may have selected a different page under concurrency.
+    if authoritative_window is not None:
+        items = list(authoritative_window)
+        wrapped = False
+    else:
+        limit = settings.startup_promotion_limit
+        items = list((await session.execute(_shadow_window(tenant_id, state, limit))).scalars())
+        wrapped = False
+        if not items and state is not None and state.cursor_created_at is not None:
+            items = list((await session.execute(_shadow_window(tenant_id, None, limit))).scalars())
+            wrapped = bool(items)
 
     result.window_size = len(items)
     result.wrapped = wrapped
@@ -235,6 +229,38 @@ async def observe_startup_promotion_parity(
         result.outcomes[outcome] += 1
 
     counters = {outcome: result.outcomes[outcome] for outcome in PARITY_OUTCOMES}
+    if authoritative_window is not None:
+        # Aggregate every compatibility window atomically. Unlike the
+        # independent post-cutover cursor, dropping a concurrent observation
+        # here would omit an authoritative SKIP LOCKED window from parity
+        # accounting. This never moves the post-cutover diagnostic cursor.
+        insert_stmt = pg_insert(PromotionStartupShadowState).values(
+            tenant_id=uuid.UUID(tenant_id),
+            last_observed_at=moment,
+            last_window_size=result.window_size,
+            last_wrapped=False,
+            updated_at=moment,
+            **counters,
+        )
+        excluded = insert_stmt.excluded
+        await session.execute(
+            insert_stmt.on_conflict_do_update(
+                index_elements=[PromotionStartupShadowState.tenant_id],
+                set_={
+                    "last_observed_at": excluded.last_observed_at,
+                    "last_window_size": excluded.last_window_size,
+                    "last_wrapped": excluded.last_wrapped,
+                    "updated_at": excluded.updated_at,
+                    **{
+                        outcome: getattr(PromotionStartupShadowState, outcome)
+                        + getattr(excluded, outcome)
+                        for outcome in PARITY_OUTCOMES
+                    },
+                },
+            )
+        )
+        return result
+
     if state is None:
         inserted = await session.scalar(
             pg_insert(PromotionStartupShadowState)

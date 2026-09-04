@@ -376,12 +376,16 @@ is `false`, startup recall is lifecycle-read-only: it does not mutate
 `MemoryItem.review_status` or create promotion audit events, and only sees
 lifecycle state already committed by canonical `promotion.evaluate` work.
 That configuration fails closed unless both canonical evaluation and bounded
-reconciliation are enabled. A separate bounded, content-free shadow cursor
-compares the shared evaluator's current obligation with canonical queue
-coverage; it never locks memory rows, writes promotion evidence, or advances
-the legacy cursor. Recall provenance and asynchronous recall telemetry remain
-allowed writes. Semantic recall (`mode=semantic`) never triggers either legacy
-startup mutation or the shadow observer.
+reconciliation are enabled. During compatibility mode, the content-free shadow
+observer receives the exact bounded window selected by the legacy `FOR UPDATE
+SKIP LOCKED` query, before its lifecycle mutation; it does not reconstruct the
+window or advance any cursor. After cutover, its separate bounded diagnostic
+cursor compares the shared evaluator's current obligation with canonical queue
+coverage while the legacy cursor remains frozen for rollback. It never locks
+memory rows, writes promotion evidence, or advances the legacy cursor. Recall
+provenance and asynchronous recall telemetry remain allowed writes. Semantic
+recall (`mode=semantic`) never triggers either legacy startup mutation or the
+shadow observer.
 
 **Conflict candidate selection is top-k, not top-1** (F13): both the recheck
 above and `find_promotion_conflict_candidates` scope candidates to the same
@@ -635,10 +639,13 @@ as two stages:
    only SQL-computable columns (it is candidate retrieval, not the final
    score). This runs over a read-oriented session
    (`ENGRAM_READ_DATABASE_URL`, falling back to the primary database when
-   unset) — the only write in this stage is the lazy promotion pass, and it
-   always uses the primary session; when that pass actually promotes a row,
-   candidate selection for *this* recall reads from the primary too
-   (replication lag would otherwise hide the row it was invoked to surface).
+   unset). Before this read, startup may use the primary session for the
+   compatibility promotion pass and its bounded, content-free parity-state
+   observation. With lifecycle mutation disabled, no promotion write occurs
+   and candidate selection always uses the read-oriented session. When the
+   compatibility pass actually promotes a row, candidate selection for *this*
+   recall reads from the primary too (replication lag would otherwise hide the
+   row it was invoked to surface).
 2. **Detailed Python scoring** — the formula below runs only over the
    bounded candidate set, producing the same reasons, warnings, and budget
    packing as before. The SQL score is never returned to callers.

@@ -17,7 +17,9 @@ and assert on the resulting review_status + audit rows.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -30,7 +32,9 @@ from sqlalchemy.pool import NullPool
 from engram.api.app import create_app
 from engram.config import settings
 from engram.db import get_session
-from engram.promotion import auto_promote_proposed_memories
+from engram.jobs import enqueue_job
+from engram.models import MemoryItem
+from engram.promotion import PromotionResult, auto_promote_proposed_memories
 
 # Module-global engine/factory, recreated per test by the ``_fresh_engine`` autouse
 # fixture. pytest-asyncio runs each test on its own event loop; asyncpg binds a
@@ -941,6 +945,86 @@ async def test_startup_recall_cutover_is_lifecycle_read_only(client, monkeypatch
     assert promotion_events == 0
 
 
+async def test_read_only_cutover_uses_read_session_factory(client, monkeypatch):
+    """B5 cutover never takes the compatibility primary-read branch."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    import engram.db as db_module
+
+    monkeypatch.setattr(settings, "promotion_evaluate_jobs_enabled", True)
+    monkeypatch.setattr(settings, "promotion_reconciliation_enabled", True)
+    monkeypatch.setattr(settings, "startup_promotion_mutation_enabled", False)
+    monkeypatch.setattr(settings, "startup_promotion_shadow_enabled", False)
+    read_sessions_opened = 0
+
+    def recording_read_session() -> AsyncSession:
+        nonlocal read_sessions_opened
+        read_sessions_opened += 1
+        return _test_session_factory()
+
+    original_read_session_factory = db_module.read_session_factory
+    db_module.read_session_factory = recording_read_session
+    try:
+        response = await client.post("/v1/recall", json={"mode": "startup"})
+    finally:
+        db_module.read_session_factory = original_read_session_factory
+    assert response.status_code == 200, response.text
+    assert read_sessions_opened == 1
+
+
+async def test_startup_mutation_rollback_reuses_legacy_rotation_state(client, monkeypatch):
+    """B5's true → false → true rollback preserves the legacy cursor."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    monkeypatch.setattr(settings, "startup_promotion_limit", 1)
+    monkeypatch.setattr(settings, "startup_promotion_shadow_enabled", False)
+    tenant_id, principal_id = await _default_tenant_principal()
+    first_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="rollback first compatibility window",
+        memory_confidence=0.9,
+        created_at=_default_now() - timedelta(hours=100),
+    )
+    second_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="rollback second compatibility window",
+        memory_confidence=0.9,
+        created_at=_default_now() - timedelta(hours=99),
+    )
+    assert (await client.post("/v1/recall", json={"mode": "startup"})).status_code == 200
+    assert await _status_of(first_id) == "active"
+    async with _test_session_factory() as session:
+        cursor_before_cutover = await session.scalar(
+            text(
+                "SELECT cursor_item_id::text FROM promotion_reconciliation_state "
+                "WHERE tenant_id = :tenant_id"
+            ),
+            {"tenant_id": tenant_id},
+        )
+    assert cursor_before_cutover == first_id
+
+    monkeypatch.setattr(settings, "promotion_evaluate_jobs_enabled", True)
+    monkeypatch.setattr(settings, "promotion_reconciliation_enabled", True)
+    monkeypatch.setattr(settings, "startup_promotion_mutation_enabled", False)
+    assert (await client.post("/v1/recall", json={"mode": "startup"})).status_code == 200
+    assert await _status_of(second_id) == "proposed"
+    async with _test_session_factory() as session:
+        cursor_during_cutover = await session.scalar(
+            text(
+                "SELECT cursor_item_id::text FROM promotion_reconciliation_state "
+                "WHERE tenant_id = :tenant_id"
+            ),
+            {"tenant_id": tenant_id},
+        )
+    assert cursor_during_cutover == first_id
+
+    monkeypatch.setattr(settings, "startup_promotion_mutation_enabled", True)
+    assert (await client.post("/v1/recall", json={"mode": "startup"})).status_code == 200
+    assert await _status_of(second_id) == "active"
+
+
 async def test_startup_shadow_reports_missing_canonical_obligation(client, monkeypatch):
     """Shadow diagnostics classify a missing current obligation without repair."""
     if not await _db_ok():
@@ -970,6 +1054,248 @@ async def test_startup_shadow_reports_missing_canonical_obligation(client, monke
             {"tenant_id": tenant_id},
         )
     assert mismatch_count == 1
+
+
+async def test_reconciliation_repair_changes_shadow_from_missing_to_scheduled(monkeypatch):
+    """Shadow observes repair; it never creates the repaired obligation itself."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    from engram.db import apply_rls_context
+    from engram.promotion_reconciliation import (
+        BACKSTOP_TRIGGER_ID,
+        RECONCILE_REASON_BACKSTOP,
+        run_reconciliation_pass,
+    )
+    from engram.promotion_startup_shadow import observe_startup_promotion_parity
+
+    monkeypatch.setattr(settings, "promotion_evaluate_jobs_enabled", True)
+    monkeypatch.setattr(settings, "promotion_reconciliation_enabled", True)
+    tenant_id, principal_id = await _default_tenant_principal()
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="reconciliation must repair missing shadow obligation",
+        memory_confidence=0.9,
+        created_at=_default_now() - timedelta(hours=100),
+    )
+    moment = _default_now()
+
+    async with _test_session_factory() as session:
+        await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
+        item = await session.get(MemoryItem, uuid.UUID(item_id))
+        assert item is not None
+        before = await observe_startup_promotion_parity(
+            session, tenant_id, now=moment, authoritative_window=[item]
+        )
+        assert before.outcomes["mismatch_missing_obligation"] == 1
+        assert await session.scalar(text("SELECT count(*) FROM jobs")) == 0
+        await session.commit()
+
+    async with _test_session_factory() as session:
+        await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
+        repaired = await run_reconciliation_pass(
+            session,
+            tenant_id,
+            reason=RECONCILE_REASON_BACKSTOP,
+            trigger_id=BACKSTOP_TRIGGER_ID,
+            now=moment,
+        )
+    assert repaired.evaluations_enqueued == 1
+
+    async with _test_session_factory() as session:
+        await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
+        item = await session.get(MemoryItem, uuid.UUID(item_id))
+        assert item is not None
+        after = await observe_startup_promotion_parity(
+            session, tenant_id, now=moment, authoritative_window=[item]
+        )
+        assert after.outcomes["parity_durably_scheduled"] == 1
+        await session.commit()
+
+
+async def test_shadow_uses_the_canonical_cooling_boundary(monkeypatch):
+    """Parity uses evaluator/obligation time at before, at, and after boundary."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    from engram.db import apply_rls_context
+    from engram.promotion_startup_shadow import observe_startup_promotion_parity
+
+    monkeypatch.setattr(settings, "promotion_evaluate_jobs_enabled", True)
+    monkeypatch.setattr(settings, "promotion_reconciliation_enabled", True)
+    tenant_id, principal_id = await _default_tenant_principal()
+    boundary = _default_now()
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="shadow canonical cooling boundary",
+        memory_confidence=0.9,
+        created_at=boundary - timedelta(hours=72),
+    )
+    dedupe_key = f"promotion.evaluate:{item_id}:item_created:shadow-boundary"
+    async with _test_session_factory() as session:
+        await enqueue_job(
+            session,
+            tenant_id=tenant_id,
+            job_type="promotion.evaluate",
+            payload={
+                "contract_version": "promotion-evaluate-v1",
+                "memory_item_id": item_id,
+                "trigger_type": "item_created",
+                "trigger_id": "shadow-boundary",
+                "requested_policy_version": "promotion-legacy-v1",
+                "ingest_id": None,
+                "correlation_id": None,
+                "dedupe_key": dedupe_key,
+            },
+            run_after=boundary,
+            dedupe_key=dedupe_key,
+        )
+        await session.commit()
+
+    for observation_time in (
+        boundary - timedelta(microseconds=1),
+        boundary,
+        boundary + timedelta(microseconds=1),
+    ):
+        async with _test_session_factory() as session:
+            await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
+            item = await session.get(MemoryItem, uuid.UUID(item_id))
+            assert item is not None
+            result = await observe_startup_promotion_parity(
+                session,
+                tenant_id,
+                now=observation_time,
+                authoritative_window=[item],
+            )
+            assert result.outcomes["parity_durably_scheduled"] == 1
+            await session.commit()
+
+
+async def test_startup_shadow_accounts_for_each_skip_locked_authoritative_window(monkeypatch):
+    """B5 concurrency proof: parity receives the actual locked windows.
+
+    Transaction A holds the first legacy startup window in its observer
+    callback. Transaction B then performs the same startup path and PostgreSQL
+    must skip that lock into the second window. Both callbacks pass their
+    authoritative selections directly to shadow accounting, so the aggregate
+    includes both windows rather than an unlocked head pre-read twice.
+    """
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    from engram.db import apply_rls_context
+    from engram.promotion import maybe_auto_promote_for_startup_recall
+    from engram.promotion_startup_shadow import observe_startup_promotion_parity
+
+    monkeypatch.setattr(settings, "startup_promotion_limit", 1)
+    monkeypatch.setattr(settings, "promotion_evaluate_jobs_enabled", True)
+    monkeypatch.setattr(settings, "promotion_reconciliation_enabled", True)
+    tenant_id, principal_id = await _default_tenant_principal()
+    first_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="first skip locked authoritative window",
+        memory_confidence=0.9,
+        created_at=_default_now() - timedelta(hours=100),
+    )
+    second_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content="second skip locked authoritative window",
+        memory_confidence=0.9,
+        created_at=_default_now() - timedelta(hours=99),
+    )
+    # Only B's later row has a current canonical obligation. This makes the
+    # aggregate distinguish a true SKIP LOCKED hand-off from two unlocked
+    # observations of the head window.
+    second_boundary = _default_now() - timedelta(hours=27)
+    async with _test_session_factory() as session:
+        await enqueue_job(
+            session,
+            tenant_id=tenant_id,
+            job_type="promotion.evaluate",
+            payload={
+                "contract_version": "promotion-evaluate-v1",
+                "memory_item_id": second_id,
+                "trigger_type": "item_created",
+                "trigger_id": "skip-locked-parity",
+                "requested_policy_version": "promotion-legacy-v1",
+                "ingest_id": None,
+                "correlation_id": None,
+                "dedupe_key": f"promotion.evaluate:{second_id}:item_created:skip-locked-parity",
+            },
+            run_after=second_boundary,
+            dedupe_key=f"promotion.evaluate:{second_id}:item_created:skip-locked-parity",
+        )
+        await session.commit()
+    first_window_locked = asyncio.Event()
+    allow_first_to_continue = asyncio.Event()
+    selected_by_a: list[str] = []
+    selected_by_b: list[str] = []
+
+    async def run_a() -> PromotionResult:
+        async with _test_session_factory() as session:
+            await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
+
+            async def observe_a(items: Sequence[MemoryItem]) -> None:
+                selected_by_a.extend(str(item.id) for item in items)
+                first_window_locked.set()
+                await allow_first_to_continue.wait()
+                await observe_startup_promotion_parity(
+                    session, tenant_id, authoritative_window=items
+                )
+
+            return await maybe_auto_promote_for_startup_recall(
+                session, tenant_id, selected_window_observer=observe_a
+            )
+
+    async def run_b() -> PromotionResult:
+        await first_window_locked.wait()
+        async with _test_session_factory() as session:
+            await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
+
+            async def observe_b(items: Sequence[MemoryItem]) -> None:
+                selected_by_b.extend(str(item.id) for item in items)
+                await observe_startup_promotion_parity(
+                    session, tenant_id, authoritative_window=items
+                )
+
+            return await maybe_auto_promote_for_startup_recall(
+                session, tenant_id, selected_window_observer=observe_b
+            )
+
+    task_a = asyncio.create_task(run_a())
+    await first_window_locked.wait()
+    result_b = await run_b()
+    allow_first_to_continue.set()
+    result_a = await task_a
+
+    assert selected_by_a == [first_id]
+    assert selected_by_b == [second_id]
+    assert result_a.promoted == result_b.promoted == 1
+    async with _test_session_factory() as session:
+        missing_count = await session.scalar(
+            text(
+                "SELECT mismatch_missing_obligation FROM promotion_startup_shadow_state "
+                "WHERE tenant_id = :tenant_id"
+            ),
+            {"tenant_id": tenant_id},
+        )
+        scheduled_count = await session.scalar(
+            text(
+                "SELECT parity_durably_scheduled FROM promotion_startup_shadow_state "
+                "WHERE tenant_id = :tenant_id"
+            ),
+            {"tenant_id": tenant_id},
+        )
+        promotion_events = await session.scalar(
+            text(
+                "SELECT count(*) FROM item_events WHERE event_type = 'review_change' "
+                "AND new_value = 'active'"
+            )
+        )
+    assert missing_count == 1
+    assert scheduled_count == 1
+    assert promotion_events == 2
 
 
 async def test_startup_rotation_skips_kind_terminal_head_rows():

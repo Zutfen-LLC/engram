@@ -26,6 +26,7 @@ telemetry-write failure never fails the read.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -626,37 +627,54 @@ async def execute_startup_recall(
         session, memory_context=memory_context, workspace=workspace
     )
 
-    # 0. B5 shadow parity is a bounded diagnostic observer, not promotion
-    #    authority. It reads the shared evaluator plus reconciliation's exact
-    #    current-obligation probe and advances only its own content-free
-    #    cursor. With the canonical rollout flags off it is inert, preserving
-    #    existing production behavior while a canary can collect parity.
-    if (
+    # 0. The legacy bounded lazy pass stays available strictly as the explicit
+    # compatibility/rollback path. When shadow is on, its callback receives
+    # the exact locked SKIP LOCKED window after selection and before any
+    # lifecycle mutation. When compatibility mutation is off, the observer
+    # instead uses its own bounded cursor; the legacy cursor stays frozen for
+    # rollback. In both modes it is diagnostic-only.
+    shadow_enabled = (
         settings.startup_promotion_shadow_enabled
         and settings.startup_promotion_shadow_prerequisites_enabled
-    ):
-        shadow_result = await observe_startup_promotion_parity(
-            session,
-            tenant_id,
-            now=now,
-            follow_legacy_rotation=settings.startup_promotion_mutation_enabled,
-        )
-        logger.info(
-            "startup_promotion_shadow tenant=%s window=%s wrapped=%s outcomes=%s request_id=%s",
-            tenant_id,
-            shadow_result.window_size,
-            shadow_result.wrapped,
-            dict(shadow_result.outcomes),
-            request_id,
-        )
-
-    # The legacy bounded lazy pass stays available strictly as the explicit
-    # compatibility/rollback path. When disabled, startup recall never calls
-    # a lifecycle mutation function or writes promotion audit events; canonical
-    # evaluation and reconciliation already own any later lifecycle change.
+    )
     if settings.startup_promotion_mutation_enabled:
-        promotion_result = await maybe_auto_promote_for_startup_recall(session, tenant_id, now=now)
+        if shadow_enabled:
+
+            async def observe_authoritative_window(items: Sequence[MemoryItem]) -> None:
+                shadow_result = await observe_startup_promotion_parity(
+                    session, tenant_id, now=now, authoritative_window=items
+                )
+                logger.info(
+                    "startup_promotion_shadow tenant=%s window=%s wrapped=%s outcomes=%s "
+                    "request_id=%s",
+                    tenant_id,
+                    shadow_result.window_size,
+                    shadow_result.wrapped,
+                    dict(shadow_result.outcomes),
+                    request_id,
+                )
+
+            promotion_result = await maybe_auto_promote_for_startup_recall(
+                session,
+                tenant_id,
+                now=now,
+                selected_window_observer=observe_authoritative_window,
+            )
+        else:
+            promotion_result = await maybe_auto_promote_for_startup_recall(
+                session, tenant_id, now=now
+            )
     else:
+        if shadow_enabled:
+            shadow_result = await observe_startup_promotion_parity(session, tenant_id, now=now)
+            logger.info(
+                "startup_promotion_shadow tenant=%s window=%s wrapped=%s outcomes=%s request_id=%s",
+                tenant_id,
+                shadow_result.window_size,
+                shadow_result.wrapped,
+                dict(shadow_result.outcomes),
+                request_id,
+            )
         promotion_result = PromotionResult(tenant_id, False, 0.0, 0)
 
     # 1. Bounded SQL candidate selection. Promotion consistency policy
