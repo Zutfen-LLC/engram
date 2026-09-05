@@ -66,6 +66,8 @@ EXPECTED_MATRIX: dict[tuple[str, str], dict] = {
     ("POST", "/v1/diary"): {"all_of": ("write",)},
     ("GET", "/v1/diary/{principal}"): {"all_of": ("read",)},
     ("POST", "/v1/classify"): {"all_of": ("read",)},
+    ("POST", "/v1/extract"): {"all_of": ("write",)},
+    ("GET", "/v1/extract/{run_id}"): {"all_of": ("read",)},
     ("GET", "/v1/classification/rules"): {"all_of": ("admin",)},
     ("POST", "/v1/classification/rules"): {"all_of": ("admin",)},
     ("DELETE", "/v1/classification/rules/{rule_id}"): {"all_of": ("admin",)},

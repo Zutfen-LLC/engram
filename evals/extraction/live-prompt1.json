@@ -1,0 +1,1989 @@
+{
+  "schema_version": "engram.extraction-evaluation.v1",
+  "mode": "live_provider_api",
+  "golden_sha256": "96c4731fa8dd581fd666426109b8b44efe498a70f2936d5215eb889d9066a681",
+  "schema_version_evaluated": "engram.extraction.v1",
+  "prompt_version": "engram.extract.1",
+  "measurement": "Frozen lexical criteria; attribution, kind, retention and spans separate.",
+  "limitations": [
+    "Small synthetic set; no production certification.",
+    "Lexical matching can reject valid paraphrases.",
+    "Unknown provider cost remains null; tokens are measured separately."
+  ],
+  "metrics": {
+    "cases": 19,
+    "status_failures": 0,
+    "candidate_precision": 0.8571428571428571,
+    "candidate_recall": 0.9473684210526315,
+    "attribution_accuracy": 1.0,
+    "kind_accuracy": 0.7777777777777778,
+    "retention_label_accuracy": 0.8333333333333334,
+    "evidence_span_validity": 1.0,
+    "evidence_coverage": 0.9444444444444444,
+    "explicit_cue_coverage": 0.8333333333333334,
+    "duplicate_rate": 0.0,
+    "abstention_rate": 0.15789473684210525,
+    "latency_ms_median": 6138.0,
+    "latency_ms_max": 10973,
+    "input_tokens": 23646,
+    "output_tokens": 3166,
+    "reported_cost_usd": 0.0017026920000000002,
+    "cost_reporting_coverage": 1.0
+  },
+  "cases": [
+    {
+      "case_id": "preference",
+      "status_ok": true,
+      "expected": 1,
+      "emitted": 1,
+      "matched": 1,
+      "attribution_correct": 1,
+      "kind_correct": 1,
+      "retention_correct": 1,
+      "evidence_coverage_correct": 1,
+      "cue_coverage_correct": 1,
+      "spans": 1,
+      "valid_spans": 1,
+      "duplicate_candidates": 0,
+      "abstained": false,
+      "latency_ms": 5882,
+      "input_tokens": 1297,
+      "output_tokens": 118,
+      "provider_cost_usd": 4.581e-05,
+      "provider": "openai",
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+      "response": {
+        "receipt": {
+          "schema_version": "engram.extraction.v1",
+          "prompt_version": "engram.extract.1",
+          "run_id": "241d2913-d4b0-421e-b9a9-1f8509ac5736",
+          "tenant_id": "47cfe6e2-bbfb-48fc-b565-138599362f4c",
+          "principal_id": "f2d1956b-04c7-40b6-bd8d-44faa0f7fdaa",
+          "workspace_id": null,
+          "memory_profile_revision_id": null,
+          "source_type": "extraction",
+          "visibility": "private",
+          "mode": "preview",
+          "input_hash": "sha256:5e2b5267037997ed0d45e052bd4b6dbb39a843d61b76e2c9bcc748f856212485",
+          "evidence_root": "sha256:e312b51a77d1a612db66160454ef234b0bb03641c6df3f45d8df5522f123bb78",
+          "messages": [
+            {
+              "message_id": "0",
+              "role": "user",
+              "input_hash": "sha256:5d2a06830b9797b517f5286ca3575845df6304b7acf5a175b66cf38ce4ec272f",
+              "character_count": 44,
+              "created_at": null,
+              "tool_name": null,
+              "source_uri": null
+            }
+          ],
+          "provider": "openai",
+          "model": "deepseek-ai/DeepSeek-V4-Flash",
+          "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+          "input_tokens": 1297,
+          "output_tokens": 118,
+          "provider_cost_usd": 4.581e-05,
+          "latency_ms": 5882,
+          "reason_codes": [],
+          "candidates": [
+            {
+              "content": "The user prefers concise answers that include code examples.",
+              "suggested_kind": "preference",
+              "suggested_wing": null,
+              "suggested_room": null,
+              "subject": null,
+              "taxonomy_confidence": 0.95,
+              "retention_confidence": 0.95,
+              "retention_disposition": "retain",
+              "assertion_mode": "direct_statement",
+              "evidence": [
+                {
+                  "message_id": "0",
+                  "start": 0,
+                  "end": 44
+                }
+              ],
+              "source_cues": [],
+              "reason_codes": [],
+              "candidate_id": "bacca334-9421-4910-b590-58a2d1127edf",
+              "asserting_role": "user",
+              "asserting_principal_id": null,
+              "asserting_tool": null,
+              "attribution_basis": "caller_supplied_roles",
+              "evidence_root": "sha256:e312b51a77d1a612db66160454ef234b0bb03641c6df3f45d8df5522f123bb78",
+              "evidence_root_basis": "input_batch",
+              "outcome": "preview",
+              "outcome_reason": null,
+              "memory_item_id": null,
+              "ingest_id": null
+            }
+          ]
+        },
+        "receipt_hash": "sha256:57b8e1bafcd8396d6f2255746256c3221370817cab6154f8b0ba4305152b17b2"
+      }
+    },
+    {
+      "case_id": "correction",
+      "status_ok": true,
+      "expected": 1,
+      "emitted": 2,
+      "matched": 0,
+      "attribution_correct": 0,
+      "kind_correct": 0,
+      "retention_correct": 0,
+      "evidence_coverage_correct": 0,
+      "cue_coverage_correct": 0,
+      "spans": 2,
+      "valid_spans": 2,
+      "duplicate_candidates": 0,
+      "abstained": false,
+      "latency_ms": 10973,
+      "input_tokens": 1306,
+      "output_tokens": 327,
+      "provider_cost_usd": 8.423999999999999e-05,
+      "provider": "openai",
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+      "response": {
+        "receipt": {
+          "schema_version": "engram.extraction.v1",
+          "prompt_version": "engram.extract.1",
+          "run_id": "e0beaa91-e208-4a88-af62-213f5fcec29e",
+          "tenant_id": "47cfe6e2-bbfb-48fc-b565-138599362f4c",
+          "principal_id": "f2d1956b-04c7-40b6-bd8d-44faa0f7fdaa",
+          "workspace_id": null,
+          "memory_profile_revision_id": null,
+          "source_type": "extraction",
+          "visibility": "private",
+          "mode": "preview",
+          "input_hash": "sha256:4aece4509a17192d1c2c13dc69d20d2dc134c804870a7f76e06ccbca1c195fe7",
+          "evidence_root": "sha256:736aa0a40a7dd2508d4f80bf4bfe4323585b5925aa7b4ce9aece6f507eeeb037",
+          "messages": [
+            {
+              "message_id": "0",
+              "role": "user",
+              "input_hash": "sha256:18ba99830fb9ce3d2cc2d68f98cc68d082247a7f64bd9c19cac08a3ec9ef7544",
+              "character_count": 69,
+              "created_at": null,
+              "tool_name": null,
+              "source_uri": null
+            }
+          ],
+          "provider": "openai",
+          "model": "deepseek-ai/DeepSeek-V4-Flash",
+          "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+          "input_tokens": 1306,
+          "output_tokens": 327,
+          "provider_cost_usd": 8.423999999999999e-05,
+          "latency_ms": 10973,
+          "reason_codes": [],
+          "candidates": [
+            {
+              "content": "User no longer prefers dark mode.",
+              "suggested_kind": "preference",
+              "suggested_wing": null,
+              "suggested_room": null,
+              "subject": "user",
+              "taxonomy_confidence": 0.95,
+              "retention_confidence": 0.95,
+              "retention_disposition": "retain",
+              "assertion_mode": "direct_statement",
+              "evidence": [
+                {
+                  "message_id": "0",
+                  "start": 0,
+                  "end": 69
+                }
+              ],
+              "source_cues": [
+                {
+                  "cue_type": "negation",
+                  "evidence": {
+                    "message_id": "0",
+                    "start": 0,
+                    "end": 69
+                  },
+                  "value": "Correction: I no longer prefer dark mode. Use light mode from now on."
+                }
+              ],
+              "reason_codes": [],
+              "candidate_id": "b3f8a374-b700-4f0d-b73e-0f3ecc7efc92",
+              "asserting_role": "user",
+              "asserting_principal_id": null,
+              "asserting_tool": null,
+              "attribution_basis": "caller_supplied_roles",
+              "evidence_root": "sha256:736aa0a40a7dd2508d4f80bf4bfe4323585b5925aa7b4ce9aece6f507eeeb037",
+              "evidence_root_basis": "input_batch",
+              "outcome": "preview",
+              "outcome_reason": null,
+              "memory_item_id": null,
+              "ingest_id": null
+            },
+            {
+              "content": "User prefers light mode from now on.",
+              "suggested_kind": "preference",
+              "suggested_wing": null,
+              "suggested_room": null,
+              "subject": "user",
+              "taxonomy_confidence": 0.95,
+              "retention_confidence": 0.95,
+              "retention_disposition": "retain",
+              "assertion_mode": "direct_statement",
+              "evidence": [
+                {
+                  "message_id": "0",
+                  "start": 0,
+                  "end": 69
+                }
+              ],
+              "source_cues": [
+                {
+                  "cue_type": "temporal",
+                  "evidence": {
+                    "message_id": "0",
+                    "start": 0,
+                    "end": 69
+                  },
+                  "value": "Correction: I no longer prefer dark mode. Use light mode from now on."
+                }
+              ],
+              "reason_codes": [],
+              "candidate_id": "dd49ce12-2224-4c49-8625-513d6a3cd47b",
+              "asserting_role": "user",
+              "asserting_principal_id": null,
+              "asserting_tool": null,
+              "attribution_basis": "caller_supplied_roles",
+              "evidence_root": "sha256:736aa0a40a7dd2508d4f80bf4bfe4323585b5925aa7b4ce9aece6f507eeeb037",
+              "evidence_root_basis": "input_batch",
+              "outcome": "preview",
+              "outcome_reason": null,
+              "memory_item_id": null,
+              "ingest_id": null
+            }
+          ]
+        },
+        "receipt_hash": "sha256:30336f60a116c159ad2bb45ac4a646ffa1cb4aa04bf04b2611dc51f461e526aa"
+      }
+    },
+    {
+      "case_id": "decision_rationale",
+      "status_ok": true,
+      "expected": 1,
+      "emitted": 1,
+      "matched": 1,
+      "attribution_correct": 1,
+      "kind_correct": 1,
+      "retention_correct": 1,
+      "evidence_coverage_correct": 1,
+      "cue_coverage_correct": 1,
+      "spans": 1,
+      "valid_spans": 1,
+      "duplicate_candidates": 0,
+      "abstained": false,
+      "latency_ms": 3982,
+      "input_tokens": 1301,
+      "output_tokens": 112,
+      "provider_cost_usd": 4.509e-05,
+      "provider": "openai",
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+      "response": {
+        "receipt": {
+          "schema_version": "engram.extraction.v1",
+          "prompt_version": "engram.extract.1",
+          "run_id": "f91c3afa-0e42-4f4e-86d9-7676b554d989",
+          "tenant_id": "47cfe6e2-bbfb-48fc-b565-138599362f4c",
+          "principal_id": "f2d1956b-04c7-40b6-bd8d-44faa0f7fdaa",
+          "workspace_id": null,
+          "memory_profile_revision_id": null,
+          "source_type": "extraction",
+          "visibility": "private",
+          "mode": "preview",
+          "input_hash": "sha256:19658bcceeac9c4f6ff64a0fcb82bb0c8ec9688698ba8dde8fc41493ccf08f66",
+          "evidence_root": "sha256:161a313a98921fba29119252aabe4f9a30c318ee814ff1472c97106c07060a35",
+          "messages": [
+            {
+              "message_id": "0",
+              "role": "user",
+              "input_hash": "sha256:7ac464e88fcc8d7e45768db8decb4a5b23a4d08fe96fcecd6c4bbafc33cad3f8",
+              "character_count": 72,
+              "created_at": null,
+              "tool_name": null,
+              "source_uri": null
+            }
+          ],
+          "provider": "openai",
+          "model": "deepseek-ai/DeepSeek-V4-Flash",
+          "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+          "input_tokens": 1301,
+          "output_tokens": 112,
+          "provider_cost_usd": 4.509e-05,
+          "latency_ms": 3982,
+          "reason_codes": [],
+          "candidates": [
+            {
+              "content": "We chose PostgreSQL for the ledger because we need transactional writes.",
+              "suggested_kind": "decision",
+              "suggested_wing": null,
+              "suggested_room": null,
+              "subject": null,
+              "taxonomy_confidence": 0.95,
+              "retention_confidence": 0.95,
+              "retention_disposition": "retain",
+              "assertion_mode": "direct_statement",
+              "evidence": [
+                {
+                  "message_id": "0",
+                  "start": 0,
+                  "end": 72
+                }
+              ],
+              "source_cues": [],
+              "reason_codes": [],
+              "candidate_id": "8b97e3c1-02ea-4912-8a51-a312c942a799",
+              "asserting_role": "user",
+              "asserting_principal_id": null,
+              "asserting_tool": null,
+              "attribution_basis": "caller_supplied_roles",
+              "evidence_root": "sha256:161a313a98921fba29119252aabe4f9a30c318ee814ff1472c97106c07060a35",
+              "evidence_root_basis": "input_batch",
+              "outcome": "preview",
+              "outcome_reason": null,
+              "memory_item_id": null,
+              "ingest_id": null
+            }
+          ]
+        },
+        "receipt_hash": "sha256:400c9a4f61ba421b551f01a825148885cc2f62c8c11822187d278503a3c7c823"
+      }
+    },
+    {
+      "case_id": "tentative",
+      "status_ok": true,
+      "expected": 1,
+      "emitted": 1,
+      "matched": 1,
+      "attribution_correct": 1,
+      "kind_correct": 1,
+      "retention_correct": 1,
+      "evidence_coverage_correct": 1,
+      "cue_coverage_correct": 1,
+      "spans": 1,
+      "valid_spans": 1,
+      "duplicate_candidates": 0,
+      "abstained": false,
+      "latency_ms": 10915,
+      "input_tokens": 1303,
+      "output_tokens": 220,
+      "provider_cost_usd": 6.471e-05,
+      "provider": "openai",
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+      "response": {
+        "receipt": {
+          "schema_version": "engram.extraction.v1",
+          "prompt_version": "engram.extract.1",
+          "run_id": "09230c45-d345-400d-b025-3c9e762d37bb",
+          "tenant_id": "47cfe6e2-bbfb-48fc-b565-138599362f4c",
+          "principal_id": "f2d1956b-04c7-40b6-bd8d-44faa0f7fdaa",
+          "workspace_id": null,
+          "memory_profile_revision_id": null,
+          "source_type": "extraction",
+          "visibility": "private",
+          "mode": "preview",
+          "input_hash": "sha256:66843745b664473ca31c4daab69000c03fb93449202ccf1ae0af8ca3ad27e59b",
+          "evidence_root": "sha256:babf5b59419bfc09ab7c505e15e605d3595a223434549e10fbd942419f83d861",
+          "messages": [
+            {
+              "message_id": "0",
+              "role": "user",
+              "input_hash": "sha256:3be019f8f7696ba17d7fdfd3a7343e518b5edec24c255516122df8a6e825d95d",
+              "character_count": 54,
+              "created_at": null,
+              "tool_name": null,
+              "source_uri": null
+            }
+          ],
+          "provider": "openai",
+          "model": "deepseek-ai/DeepSeek-V4-Flash",
+          "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+          "input_tokens": 1303,
+          "output_tokens": 220,
+          "provider_cost_usd": 6.471e-05,
+          "latency_ms": 10915,
+          "reason_codes": [],
+          "candidates": [
+            {
+              "content": "User might switch to Neovim if the remote debugger works.",
+              "suggested_kind": "preference",
+              "suggested_wing": null,
+              "suggested_room": null,
+              "subject": "User",
+              "taxonomy_confidence": 0.85,
+              "retention_confidence": 0.6,
+              "retention_disposition": "uncertain",
+              "assertion_mode": "direct_statement",
+              "evidence": [
+                {
+                  "message_id": "0",
+                  "start": 0,
+                  "end": 54
+                }
+              ],
+              "source_cues": [
+                {
+                  "cue_type": "qualification",
+                  "evidence": {
+                    "message_id": "0",
+                    "start": 2,
+                    "end": 7
+                  },
+                  "value": "might"
+                },
+                {
+                  "cue_type": "qualification",
+                  "evidence": {
+                    "message_id": "0",
+                    "start": 28,
+                    "end": 34
+                  },
+                  "value": "the re"
+                }
+              ],
+              "reason_codes": [
+                "uncertain"
+              ],
+              "candidate_id": "5bab756f-ccaa-451f-ae24-b800ea526259",
+              "asserting_role": "user",
+              "asserting_principal_id": null,
+              "asserting_tool": null,
+              "attribution_basis": "caller_supplied_roles",
+              "evidence_root": "sha256:babf5b59419bfc09ab7c505e15e605d3595a223434549e10fbd942419f83d861",
+              "evidence_root_basis": "input_batch",
+              "outcome": "volatile_recommended",
+              "outcome_reason": "uncertain",
+              "memory_item_id": null,
+              "ingest_id": null
+            }
+          ]
+        },
+        "receipt_hash": "sha256:0ecdbd9fb517c98f407d3f0ab6b9b7f3e09eeb0b1fba5063d89c96ab1350ed4c"
+      }
+    },
+    {
+      "case_id": "negation",
+      "status_ok": true,
+      "expected": 1,
+      "emitted": 1,
+      "matched": 1,
+      "attribution_correct": 1,
+      "kind_correct": 0,
+      "retention_correct": 1,
+      "evidence_coverage_correct": 1,
+      "cue_coverage_correct": 0,
+      "spans": 1,
+      "valid_spans": 1,
+      "duplicate_candidates": 0,
+      "abstained": false,
+      "latency_ms": 3067,
+      "input_tokens": 1299,
+      "output_tokens": 150,
+      "provider_cost_usd": 5.175000000000001e-05,
+      "provider": "openai",
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+      "response": {
+        "receipt": {
+          "schema_version": "engram.extraction.v1",
+          "prompt_version": "engram.extract.1",
+          "run_id": "ae985b07-baea-4454-95d1-ca989727f148",
+          "tenant_id": "47cfe6e2-bbfb-48fc-b565-138599362f4c",
+          "principal_id": "f2d1956b-04c7-40b6-bd8d-44faa0f7fdaa",
+          "workspace_id": null,
+          "memory_profile_revision_id": null,
+          "source_type": "extraction",
+          "visibility": "private",
+          "mode": "preview",
+          "input_hash": "sha256:83e374a42e7976801228cfe1cdeccdbb4e80ad71b41482b953fda623bc838cb5",
+          "evidence_root": "sha256:cbfede7e4dbab65949441fc8b1309f866c1afa7f0e69d4fb9f811c46c19a30ae",
+          "messages": [
+            {
+              "message_id": "0",
+              "role": "user",
+              "input_hash": "sha256:701e28c3f0e30e8c4c1aa14e2803ee520cc73fc9fa0f6ba83dd9d7c455f13559",
+              "character_count": 48,
+              "created_at": null,
+              "tool_name": null,
+              "source_uri": null
+            }
+          ],
+          "provider": "openai",
+          "model": "deepseek-ai/DeepSeek-V4-Flash",
+          "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+          "input_tokens": 1299,
+          "output_tokens": 150,
+          "provider_cost_usd": 5.175000000000001e-05,
+          "latency_ms": 3067,
+          "reason_codes": [],
+          "candidates": [
+            {
+              "content": "The user does not permit customer records in public logs.",
+              "suggested_kind": "doctrine",
+              "suggested_wing": null,
+              "suggested_room": null,
+              "subject": null,
+              "taxonomy_confidence": 0.95,
+              "retention_confidence": 0.95,
+              "retention_disposition": "retain",
+              "assertion_mode": "direct_statement",
+              "evidence": [
+                {
+                  "message_id": "0",
+                  "start": 0,
+                  "end": 48
+                }
+              ],
+              "source_cues": [
+                {
+                  "cue_type": "negation",
+                  "evidence": {
+                    "message_id": "0",
+                    "start": 7,
+                    "end": 10
+                  },
+                  "value": "t p"
+                }
+              ],
+              "reason_codes": [],
+              "candidate_id": "917ac25d-a0cb-4a2f-8693-70d612c6fa12",
+              "asserting_role": "user",
+              "asserting_principal_id": null,
+              "asserting_tool": null,
+              "attribution_basis": "caller_supplied_roles",
+              "evidence_root": "sha256:cbfede7e4dbab65949441fc8b1309f866c1afa7f0e69d4fb9f811c46c19a30ae",
+              "evidence_root_basis": "input_batch",
+              "outcome": "preview",
+              "outcome_reason": null,
+              "memory_item_id": null,
+              "ingest_id": null
+            }
+          ]
+        },
+        "receipt_hash": "sha256:3ac629fd37c3418bd4c01eb80bf7d362793718f361cf1c36f3ff37a7001e02d5"
+      }
+    },
+    {
+      "case_id": "changed_mind",
+      "status_ok": true,
+      "expected": 1,
+      "emitted": 1,
+      "matched": 1,
+      "attribution_correct": 1,
+      "kind_correct": 1,
+      "retention_correct": 1,
+      "evidence_coverage_correct": 1,
+      "cue_coverage_correct": 1,
+      "spans": 1,
+      "valid_spans": 1,
+      "duplicate_candidates": 0,
+      "abstained": false,
+      "latency_ms": 7670,
+      "input_tokens": 1304,
+      "output_tokens": 174,
+      "provider_cost_usd": 5.652000000000001e-05,
+      "provider": "openai",
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+      "response": {
+        "receipt": {
+          "schema_version": "engram.extraction.v1",
+          "prompt_version": "engram.extract.1",
+          "run_id": "9969753f-0e95-4a39-b4da-3ff1c6556f48",
+          "tenant_id": "47cfe6e2-bbfb-48fc-b565-138599362f4c",
+          "principal_id": "f2d1956b-04c7-40b6-bd8d-44faa0f7fdaa",
+          "workspace_id": null,
+          "memory_profile_revision_id": null,
+          "source_type": "extraction",
+          "visibility": "private",
+          "mode": "preview",
+          "input_hash": "sha256:ecf321cf5cbc0842d6b7479bfa167ab759bf68b1e0739bce588e4919fb8d3c4c",
+          "evidence_root": "sha256:19e3dd114e90f0b53e4933c463caefcb17a4b0dcf8b17b49c21172843721cda0",
+          "messages": [
+            {
+              "message_id": "0",
+              "role": "user",
+              "input_hash": "sha256:f01b2b3bdb2b40338cfcfda139b334a584353a554f422025b041888e1fa0107c",
+              "character_count": 77,
+              "created_at": null,
+              "tool_name": null,
+              "source_uri": null
+            }
+          ],
+          "provider": "openai",
+          "model": "deepseek-ai/DeepSeek-V4-Flash",
+          "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+          "input_tokens": 1304,
+          "output_tokens": 174,
+          "provider_cost_usd": 5.652000000000001e-05,
+          "latency_ms": 7670,
+          "reason_codes": [],
+          "candidates": [
+            {
+              "content": "We previously chose Redis, but now we will use PostgreSQL for durable queues.",
+              "suggested_kind": "decision",
+              "suggested_wing": null,
+              "suggested_room": null,
+              "subject": null,
+              "taxonomy_confidence": 0.95,
+              "retention_confidence": 0.95,
+              "retention_disposition": "retain",
+              "assertion_mode": "direct_statement",
+              "evidence": [
+                {
+                  "message_id": "0",
+                  "start": 0,
+                  "end": 77
+                }
+              ],
+              "source_cues": [
+                {
+                  "cue_type": "temporal",
+                  "evidence": {
+                    "message_id": "0",
+                    "start": 0,
+                    "end": 77
+                  },
+                  "value": "We previously chose Redis, but now we will use PostgreSQL for durable queues."
+                }
+              ],
+              "reason_codes": [],
+              "candidate_id": "d0969a5d-ba80-43b4-82be-0e82f6503a8d",
+              "asserting_role": "user",
+              "asserting_principal_id": null,
+              "asserting_tool": null,
+              "attribution_basis": "caller_supplied_roles",
+              "evidence_root": "sha256:19e3dd114e90f0b53e4933c463caefcb17a4b0dcf8b17b49c21172843721cda0",
+              "evidence_root_basis": "input_batch",
+              "outcome": "preview",
+              "outcome_reason": null,
+              "memory_item_id": null,
+              "ingest_id": null
+            }
+          ]
+        },
+        "receipt_hash": "sha256:461014421994d305eb7c219ce2727715bf4d989abef4bc598f2d04fac6c3b655"
+      }
+    },
+    {
+      "case_id": "pronouns",
+      "status_ok": true,
+      "expected": 2,
+      "emitted": 2,
+      "matched": 2,
+      "attribution_correct": 2,
+      "kind_correct": 1,
+      "retention_correct": 2,
+      "evidence_coverage_correct": 1,
+      "cue_coverage_correct": 1,
+      "spans": 2,
+      "valid_spans": 2,
+      "duplicate_candidates": 0,
+      "abstained": false,
+      "latency_ms": 8432,
+      "input_tokens": 1352,
+      "output_tokens": 303,
+      "provider_cost_usd": 8.406e-05,
+      "provider": "openai",
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+      "response": {
+        "receipt": {
+          "schema_version": "engram.extraction.v1",
+          "prompt_version": "engram.extract.1",
+          "run_id": "a573c526-bac0-43ee-9cec-b07cd46d77ca",
+          "tenant_id": "47cfe6e2-bbfb-48fc-b565-138599362f4c",
+          "principal_id": "f2d1956b-04c7-40b6-bd8d-44faa0f7fdaa",
+          "workspace_id": null,
+          "memory_profile_revision_id": null,
+          "source_type": "extraction",
+          "visibility": "private",
+          "mode": "preview",
+          "input_hash": "sha256:27f1d40289925b6a4787334483a93f08b7f9abe65d9b5253873b01b1f261a351",
+          "evidence_root": "sha256:9be6229c4394ee447461ccf9b6b3ffceba6e0d2c76ba5b3ce4e4d6d835b04d9a",
+          "messages": [
+            {
+              "message_id": "0",
+              "role": "user",
+              "input_hash": "sha256:1f327025a80164f5b8ed50adf80c2be935533cfe23c1a584bfc8c261aae71bc1",
+              "character_count": 37,
+              "created_at": null,
+              "tool_name": null,
+              "source_uri": null
+            },
+            {
+              "message_id": "1",
+              "role": "user",
+              "input_hash": "sha256:e53037b0717b9114ded767e1cc40726a55fcb2c3d6fd85b8a8137b9b67733c07",
+              "character_count": 71,
+              "created_at": null,
+              "tool_name": null,
+              "source_uri": null
+            }
+          ],
+          "provider": "openai",
+          "model": "deepseek-ai/DeepSeek-V4-Flash",
+          "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+          "input_tokens": 1352,
+          "output_tokens": 303,
+          "provider_cost_usd": 8.406e-05,
+          "latency_ms": 8432,
+          "reason_codes": [],
+          "candidates": [
+            {
+              "content": "The indexing service is called Atlas.",
+              "suggested_kind": "fact",
+              "suggested_wing": null,
+              "suggested_room": null,
+              "subject": "indexing service",
+              "taxonomy_confidence": 0.95,
+              "retention_confidence": 0.95,
+              "retention_disposition": "retain",
+              "assertion_mode": "direct_statement",
+              "evidence": [
+                {
+                  "message_id": "0",
+                  "start": 0,
+                  "end": 37
+                }
+              ],
+              "source_cues": [],
+              "reason_codes": [],
+              "candidate_id": "23bb8fd9-c9f0-4348-8015-46a1ab45700d",
+              "asserting_role": "user",
+              "asserting_principal_id": null,
+              "asserting_tool": null,
+              "attribution_basis": "caller_supplied_roles",
+              "evidence_root": "sha256:9be6229c4394ee447461ccf9b6b3ffceba6e0d2c76ba5b3ce4e4d6d835b04d9a",
+              "evidence_root_basis": "input_batch",
+              "outcome": "preview",
+              "outcome_reason": null,
+              "memory_item_id": null,
+              "ingest_id": null
+            },
+            {
+              "content": "The indexing service must stay in the private network because it stores customer records.",
+              "suggested_kind": "doctrine",
+              "suggested_wing": null,
+              "suggested_room": null,
+              "subject": "indexing service",
+              "taxonomy_confidence": 0.9,
+              "retention_confidence": 0.9,
+              "retention_disposition": "retain",
+              "assertion_mode": "direct_statement",
+              "evidence": [
+                {
+                  "message_id": "1",
+                  "start": 0,
+                  "end": 71
+                }
+              ],
+              "source_cues": [
+                {
+                  "cue_type": "security",
+                  "evidence": {
+                    "message_id": "1",
+                    "start": 0,
+                    "end": 71
+                  },
+                  "value": "It must stay in the private network because it stores customer records."
+                }
+              ],
+              "reason_codes": [],
+              "candidate_id": "49d8fa42-1cb5-4d37-9596-d5176aef18db",
+              "asserting_role": "user",
+              "asserting_principal_id": null,
+              "asserting_tool": null,
+              "attribution_basis": "caller_supplied_roles",
+              "evidence_root": "sha256:9be6229c4394ee447461ccf9b6b3ffceba6e0d2c76ba5b3ce4e4d6d835b04d9a",
+              "evidence_root_basis": "input_batch",
+              "outcome": "preview",
+              "outcome_reason": null,
+              "memory_item_id": null,
+              "ingest_id": null
+            }
+          ]
+        },
+        "receipt_hash": "sha256:aef90b87dcf51ad1540d71466fcd5797eb1420dcaf1a5104fbf57e87d6468b53"
+      }
+    },
+    {
+      "case_id": "tool_interpretation",
+      "status_ok": true,
+      "expected": 2,
+      "emitted": 2,
+      "matched": 2,
+      "attribution_correct": 2,
+      "kind_correct": 1,
+      "retention_correct": 0,
+      "evidence_coverage_correct": 2,
+      "cue_coverage_correct": 2,
+      "spans": 3,
+      "valid_spans": 3,
+      "duplicate_candidates": 0,
+      "abstained": false,
+      "latency_ms": 10017,
+      "input_tokens": 1353,
+      "output_tokens": 323,
+      "provider_cost_usd": 0.000161478,
+      "provider": "openai",
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+      "response": {
+        "receipt": {
+          "schema_version": "engram.extraction.v1",
+          "prompt_version": "engram.extract.1",
+          "run_id": "49c75319-74c0-4dfa-926b-64dce21b1b3d",
+          "tenant_id": "47cfe6e2-bbfb-48fc-b565-138599362f4c",
+          "principal_id": "f2d1956b-04c7-40b6-bd8d-44faa0f7fdaa",
+          "workspace_id": null,
+          "memory_profile_revision_id": null,
+          "source_type": "extraction",
+          "visibility": "private",
+          "mode": "preview",
+          "input_hash": "sha256:e7d9048ce7653182765a1b02fbf3ec2086290c0b63ffdbcae7e50918a3842c86",
+          "evidence_root": "sha256:b2967f411829fa20a81bc28e6a26b29d890661c2f9c6f033624416920f6b030b",
+          "messages": [
+            {
+              "message_id": "0",
+              "role": "tool",
+              "input_hash": "sha256:0b524ad2567dfcc544ecc92b84931a3f055d953251de303aa21f13f557e50693",
+              "character_count": 26,
+              "created_at": null,
+              "tool_name": "ci",
+              "source_uri": null
+            },
+            {
+              "message_id": "1",
+              "role": "assistant",
+              "input_hash": "sha256:b84e0ee8a469f4b03b28546bb95a5282ec00646bd201bdc06b2a45fddcba157a",
+              "character_count": 61,
+              "created_at": null,
+              "tool_name": null,
+              "source_uri": null
+            }
+          ],
+          "provider": "openai",
+          "model": "deepseek-ai/DeepSeek-V4-Flash",
+          "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+          "input_tokens": 1353,
+          "output_tokens": 323,
+          "provider_cost_usd": 0.000161478,
+          "latency_ms": 10017,
+          "reason_codes": [],
+          "candidates": [
+            {
+              "content": "The build passed 42 tests.",
+              "suggested_kind": "observation",
+              "suggested_wing": null,
+              "suggested_room": null,
+              "subject": "build",
+              "taxonomy_confidence": 0.95,
+              "retention_confidence": 0.95,
+              "retention_disposition": "retain",
+              "assertion_mode": "tool_observation",
+              "evidence": [
+                {
+                  "message_id": "0",
+                  "start": 0,
+                  "end": 26
+                }
+              ],
+              "source_cues": [],
+              "reason_codes": [],
+              "candidate_id": "fb5f2ea5-1940-4cb1-8d1d-923b76aa1989",
+              "asserting_role": "tool",
+              "asserting_principal_id": null,
+              "asserting_tool": "ci",
+              "attribution_basis": "caller_supplied_roles",
+              "evidence_root": "sha256:b2967f411829fa20a81bc28e6a26b29d890661c2f9c6f033624416920f6b030b",
+              "evidence_root_basis": "input_batch",
+              "outcome": "preview",
+              "outcome_reason": null,
+              "memory_item_id": null,
+              "ingest_id": null
+            },
+            {
+              "content": "The assistant infers that the release is ready because those tests passed.",
+              "suggested_kind": "summary",
+              "suggested_wing": null,
+              "suggested_room": null,
+              "subject": "release",
+              "taxonomy_confidence": 0.9,
+              "retention_confidence": 0.9,
+              "retention_disposition": "retain",
+              "assertion_mode": "inference",
+              "evidence": [
+                {
+                  "message_id": "1",
+                  "start": 0,
+                  "end": 61
+                },
+                {
+                  "message_id": "0",
+                  "start": 0,
+                  "end": 26
+                }
+              ],
+              "source_cues": [
+                {
+                  "cue_type": "qualification",
+                  "evidence": {
+                    "message_id": "1",
+                    "start": 2,
+                    "end": 9
+                  },
+                  "value": "infer t"
+                }
+              ],
+              "reason_codes": [],
+              "candidate_id": "6a759b96-2c70-4410-964a-8f2d5fb596c9",
+              "asserting_role": "assistant",
+              "asserting_principal_id": null,
+              "asserting_tool": null,
+              "attribution_basis": "caller_supplied_roles",
+              "evidence_root": "sha256:b2967f411829fa20a81bc28e6a26b29d890661c2f9c6f033624416920f6b030b",
+              "evidence_root_basis": "input_batch",
+              "outcome": "preview",
+              "outcome_reason": null,
+              "memory_item_id": null,
+              "ingest_id": null
+            }
+          ]
+        },
+        "receipt_hash": "sha256:6d4bcdcd56082681413936c874da0995e0e62a564bdf42fcb5c98165639dd4b1"
+      }
+    },
+    {
+      "case_id": "weather",
+      "status_ok": true,
+      "expected": 1,
+      "emitted": 1,
+      "matched": 1,
+      "attribution_correct": 1,
+      "kind_correct": 1,
+      "retention_correct": 1,
+      "evidence_coverage_correct": 1,
+      "cue_coverage_correct": 1,
+      "spans": 1,
+      "valid_spans": 1,
+      "duplicate_candidates": 0,
+      "abstained": false,
+      "latency_ms": 7354,
+      "input_tokens": 1299,
+      "output_tokens": 149,
+      "provider_cost_usd": 5.157e-05,
+      "provider": "openai",
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+      "response": {
+        "receipt": {
+          "schema_version": "engram.extraction.v1",
+          "prompt_version": "engram.extract.1",
+          "run_id": "36527a48-d8c0-4293-a6ff-04f06ec6c43d",
+          "tenant_id": "47cfe6e2-bbfb-48fc-b565-138599362f4c",
+          "principal_id": "f2d1956b-04c7-40b6-bd8d-44faa0f7fdaa",
+          "workspace_id": null,
+          "memory_profile_revision_id": null,
+          "source_type": "extraction",
+          "visibility": "private",
+          "mode": "preview",
+          "input_hash": "sha256:929581933cc1e5b448fff17efed17c00da862ef5d38592b1f59942c77440d7ff",
+          "evidence_root": "sha256:d421b988f801eea4474432bf6351d5878de097b7576bc93de17cdc559dbc678a",
+          "messages": [
+            {
+              "message_id": "0",
+              "role": "tool",
+              "input_hash": "sha256:b4040f374afad549cee983b58518c18c280bf48a325d2bf0b0718b40cd24eac7",
+              "character_count": 37,
+              "created_at": null,
+              "tool_name": "weather",
+              "source_uri": null
+            }
+          ],
+          "provider": "openai",
+          "model": "deepseek-ai/DeepSeek-V4-Flash",
+          "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+          "input_tokens": 1299,
+          "output_tokens": 149,
+          "provider_cost_usd": 5.157e-05,
+          "latency_ms": 7354,
+          "reason_codes": [],
+          "candidates": [
+            {
+              "content": "Current weather: rain and 12 degrees.",
+              "suggested_kind": "observation",
+              "suggested_wing": null,
+              "suggested_room": null,
+              "subject": null,
+              "taxonomy_confidence": 0.95,
+              "retention_confidence": 0.3,
+              "retention_disposition": "transient",
+              "assertion_mode": "tool_observation",
+              "evidence": [
+                {
+                  "message_id": "0",
+                  "start": 0,
+                  "end": 37
+                }
+              ],
+              "source_cues": [
+                {
+                  "cue_type": "temporal",
+                  "evidence": {
+                    "message_id": "0",
+                    "start": 0,
+                    "end": 37
+                  },
+                  "value": "Current weather: rain and 12 degrees."
+                }
+              ],
+              "reason_codes": [
+                "ephemeral"
+              ],
+              "candidate_id": "ba214470-5a4e-4ee4-b148-eafb69f94104",
+              "asserting_role": "tool",
+              "asserting_principal_id": null,
+              "asserting_tool": "weather",
+              "attribution_basis": "caller_supplied_roles",
+              "evidence_root": "sha256:d421b988f801eea4474432bf6351d5878de097b7576bc93de17cdc559dbc678a",
+              "evidence_root_basis": "input_batch",
+              "outcome": "volatile_recommended",
+              "outcome_reason": "transient",
+              "memory_item_id": null,
+              "ingest_id": null
+            }
+          ]
+        },
+        "receipt_hash": "sha256:a467db6af0584cb0a35203466346e81a867fa4f48f2b98eece7f2ac33bca0a03"
+      }
+    },
+    {
+      "case_id": "schedule",
+      "status_ok": true,
+      "expected": 1,
+      "emitted": 1,
+      "matched": 1,
+      "attribution_correct": 1,
+      "kind_correct": 1,
+      "retention_correct": 1,
+      "evidence_coverage_correct": 1,
+      "cue_coverage_correct": 1,
+      "spans": 1,
+      "valid_spans": 1,
+      "duplicate_candidates": 0,
+      "abstained": false,
+      "latency_ms": 5485,
+      "input_tokens": 1297,
+      "output_tokens": 150,
+      "provider_cost_usd": 5.157e-05,
+      "provider": "openai",
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+      "response": {
+        "receipt": {
+          "schema_version": "engram.extraction.v1",
+          "prompt_version": "engram.extract.1",
+          "run_id": "1da15549-086e-4ecf-965a-bea1b4659b4d",
+          "tenant_id": "47cfe6e2-bbfb-48fc-b565-138599362f4c",
+          "principal_id": "f2d1956b-04c7-40b6-bd8d-44faa0f7fdaa",
+          "workspace_id": null,
+          "memory_profile_revision_id": null,
+          "source_type": "extraction",
+          "visibility": "private",
+          "mode": "preview",
+          "input_hash": "sha256:a261b7c0a39bc16f99ce07d185ba6e700f333f3ac32072a40eea9a601768818e",
+          "evidence_root": "sha256:93d2f6fad1b0b526fc3f798613062a5962c3bfcb22d17eb874e31d3f23da6aba",
+          "messages": [
+            {
+              "message_id": "0",
+              "role": "user",
+              "input_hash": "sha256:6cad4e92fa700ae00c569c3a2cb711880ea7d15b7116e73d3516067083e46b7e",
+              "character_count": 37,
+              "created_at": null,
+              "tool_name": null,
+              "source_uri": null
+            }
+          ],
+          "provider": "openai",
+          "model": "deepseek-ai/DeepSeek-V4-Flash",
+          "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+          "input_tokens": 1297,
+          "output_tokens": 150,
+          "provider_cost_usd": 5.157e-05,
+          "latency_ms": 5485,
+          "reason_codes": [],
+          "candidates": [
+            {
+              "content": "The taxi will arrive in five minutes.",
+              "suggested_kind": "observation",
+              "suggested_wing": null,
+              "suggested_room": null,
+              "subject": null,
+              "taxonomy_confidence": 0.9,
+              "retention_confidence": 0.5,
+              "retention_disposition": "transient",
+              "assertion_mode": "direct_statement",
+              "evidence": [
+                {
+                  "message_id": "0",
+                  "start": 0,
+                  "end": 37
+                }
+              ],
+              "source_cues": [
+                {
+                  "cue_type": "temporal",
+                  "evidence": {
+                    "message_id": "0",
+                    "start": 24,
+                    "end": 37
+                  },
+                  "value": "five minutes."
+                }
+              ],
+              "reason_codes": [
+                "ephemeral"
+              ],
+              "candidate_id": "254b739c-5864-4d1a-95ba-caa12a9be7da",
+              "asserting_role": "user",
+              "asserting_principal_id": null,
+              "asserting_tool": null,
+              "attribution_basis": "caller_supplied_roles",
+              "evidence_root": "sha256:93d2f6fad1b0b526fc3f798613062a5962c3bfcb22d17eb874e31d3f23da6aba",
+              "evidence_root_basis": "input_batch",
+              "outcome": "volatile_recommended",
+              "outcome_reason": "transient",
+              "memory_item_id": null,
+              "ingest_id": null
+            }
+          ]
+        },
+        "receipt_hash": "sha256:558e059bd239ba2bc50a7372e97988cc87ae3c32b4688a2696577c9ca4d57d42"
+      }
+    },
+    {
+      "case_id": "summary",
+      "status_ok": true,
+      "expected": 2,
+      "emitted": 2,
+      "matched": 2,
+      "attribution_correct": 2,
+      "kind_correct": 2,
+      "retention_correct": 2,
+      "evidence_coverage_correct": 2,
+      "cue_coverage_correct": 2,
+      "spans": 2,
+      "valid_spans": 2,
+      "duplicate_candidates": 0,
+      "abstained": false,
+      "latency_ms": 9260,
+      "input_tokens": 1306,
+      "output_tokens": 265,
+      "provider_cost_usd": 0.000146808,
+      "provider": "openai",
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+      "response": {
+        "receipt": {
+          "schema_version": "engram.extraction.v1",
+          "prompt_version": "engram.extract.1",
+          "run_id": "918af1e6-10f1-4b2b-95ae-9cc153b7b5b8",
+          "tenant_id": "47cfe6e2-bbfb-48fc-b565-138599362f4c",
+          "principal_id": "f2d1956b-04c7-40b6-bd8d-44faa0f7fdaa",
+          "workspace_id": null,
+          "memory_profile_revision_id": null,
+          "source_type": "extraction",
+          "visibility": "private",
+          "mode": "preview",
+          "input_hash": "sha256:47c0887916547238d80ffb59d96e2451d616f8d17152d1c175f71a4b9c6069a0",
+          "evidence_root": "sha256:fede65df238c935e735dbd63bac6980cbb8f021d8e04e652514a62c5e16696fe",
+          "messages": [
+            {
+              "message_id": "0",
+              "role": "assistant",
+              "input_hash": "sha256:c781e4983964dff6461038e68617682edb5a435a7060b10e9e88e061616ca427",
+              "character_count": 82,
+              "created_at": null,
+              "tool_name": null,
+              "source_uri": null
+            }
+          ],
+          "provider": "openai",
+          "model": "deepseek-ai/DeepSeek-V4-Flash",
+          "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+          "input_tokens": 1306,
+          "output_tokens": 265,
+          "provider_cost_usd": 0.000146808,
+          "latency_ms": 9260,
+          "reason_codes": [],
+          "candidates": [
+            {
+              "content": "The user prefers short answers.",
+              "suggested_kind": "preference",
+              "suggested_wing": null,
+              "suggested_room": null,
+              "subject": "user",
+              "taxonomy_confidence": 0.9,
+              "retention_confidence": 0.9,
+              "retention_disposition": "retain",
+              "assertion_mode": "derived_summary",
+              "evidence": [
+                {
+                  "message_id": "0",
+                  "start": 0,
+                  "end": 82
+                }
+              ],
+              "source_cues": [],
+              "reason_codes": [],
+              "candidate_id": "c80ff874-c342-4b10-a379-9298f563ef85",
+              "asserting_role": "assistant",
+              "asserting_principal_id": null,
+              "asserting_tool": null,
+              "attribution_basis": "caller_supplied_roles",
+              "evidence_root": "sha256:fede65df238c935e735dbd63bac6980cbb8f021d8e04e652514a62c5e16696fe",
+              "evidence_root_basis": "input_batch",
+              "outcome": "preview",
+              "outcome_reason": null,
+              "memory_item_id": null,
+              "ingest_id": null
+            },
+            {
+              "content": "The team chose PostgreSQL for the ledger.",
+              "suggested_kind": "decision",
+              "suggested_wing": null,
+              "suggested_room": null,
+              "subject": "team",
+              "taxonomy_confidence": 0.9,
+              "retention_confidence": 0.9,
+              "retention_disposition": "retain",
+              "assertion_mode": "derived_summary",
+              "evidence": [
+                {
+                  "message_id": "0",
+                  "start": 0,
+                  "end": 82
+                }
+              ],
+              "source_cues": [],
+              "reason_codes": [],
+              "candidate_id": "5d2b0af9-22de-4574-b426-fd402cc14ce2",
+              "asserting_role": "assistant",
+              "asserting_principal_id": null,
+              "asserting_tool": null,
+              "attribution_basis": "caller_supplied_roles",
+              "evidence_root": "sha256:fede65df238c935e735dbd63bac6980cbb8f021d8e04e652514a62c5e16696fe",
+              "evidence_root_basis": "input_batch",
+              "outcome": "preview",
+              "outcome_reason": null,
+              "memory_item_id": null,
+              "ingest_id": null
+            }
+          ]
+        },
+        "receipt_hash": "sha256:b34c2df3de6ef3424506f556709890175ae90b610c68ec244524e5fd2c9b4e0d"
+      }
+    },
+    {
+      "case_id": "injection",
+      "status_ok": true,
+      "expected": 0,
+      "emitted": 0,
+      "matched": 0,
+      "attribution_correct": 0,
+      "kind_correct": 0,
+      "retention_correct": 0,
+      "evidence_coverage_correct": 0,
+      "cue_coverage_correct": 0,
+      "spans": 0,
+      "valid_spans": 0,
+      "duplicate_candidates": 0,
+      "abstained": true,
+      "latency_ms": 3893,
+      "input_tokens": 1306,
+      "output_tokens": 17,
+      "provider_cost_usd": 0.00010216800000000002,
+      "provider": "openai",
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+      "response": {
+        "receipt": {
+          "schema_version": "engram.extraction.v1",
+          "prompt_version": "engram.extract.1",
+          "run_id": "4c93f20f-c162-464f-989b-63fbc9ec7104",
+          "tenant_id": "47cfe6e2-bbfb-48fc-b565-138599362f4c",
+          "principal_id": "f2d1956b-04c7-40b6-bd8d-44faa0f7fdaa",
+          "workspace_id": null,
+          "memory_profile_revision_id": null,
+          "source_type": "extraction",
+          "visibility": "private",
+          "mode": "preview",
+          "input_hash": "sha256:c4a8081cefdb2b07a04a7350cf10ddb7bfb5d0a0dc7b24a3fbc35ddb13fa1587",
+          "evidence_root": "sha256:9dda963e844c56ff18d6356c29bd5b7786cbe73e8b0f93fecb37b95313019892",
+          "messages": [
+            {
+              "message_id": "0",
+              "role": "tool",
+              "input_hash": "sha256:8dee679e934ade7205c57c952b30e29591da1dedd8392c0d93ad55504b2070a7",
+              "character_count": 81,
+              "created_at": null,
+              "tool_name": "browser",
+              "source_uri": null
+            }
+          ],
+          "provider": "openai",
+          "model": "deepseek-ai/DeepSeek-V4-Flash",
+          "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+          "input_tokens": 1306,
+          "output_tokens": 17,
+          "provider_cost_usd": 0.00010216800000000002,
+          "latency_ms": 3893,
+          "reason_codes": [
+            "no_memory"
+          ],
+          "candidates": []
+        },
+        "receipt_hash": "sha256:e348316c24dc9c7d18b70377a23b71699f42b930ff4708330e16b12f7cc7df33"
+      }
+    },
+    {
+      "case_id": "privacy",
+      "status_ok": true,
+      "expected": 1,
+      "emitted": 1,
+      "matched": 1,
+      "attribution_correct": 1,
+      "kind_correct": 1,
+      "retention_correct": 1,
+      "evidence_coverage_correct": 1,
+      "cue_coverage_correct": 1,
+      "spans": 1,
+      "valid_spans": 1,
+      "duplicate_candidates": 0,
+      "abstained": false,
+      "latency_ms": 5599,
+      "input_tokens": 1301,
+      "output_tokens": 170,
+      "provider_cost_usd": 0.00012925800000000002,
+      "provider": "openai",
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+      "response": {
+        "receipt": {
+          "schema_version": "engram.extraction.v1",
+          "prompt_version": "engram.extract.1",
+          "run_id": "4c8c61d5-6856-4e8c-af3c-b3c17b4acdd1",
+          "tenant_id": "47cfe6e2-bbfb-48fc-b565-138599362f4c",
+          "principal_id": "f2d1956b-04c7-40b6-bd8d-44faa0f7fdaa",
+          "workspace_id": null,
+          "memory_profile_revision_id": null,
+          "source_type": "extraction",
+          "visibility": "private",
+          "mode": "preview",
+          "input_hash": "sha256:33dbf38cd593a9b6c52933b01a817e1bc116077e75706061ded66b06c0699f89",
+          "evidence_root": "sha256:7a7eda96b26a0282085b37cd31eae88d6568c7a4bad0a4967e349e0af79fdc4c",
+          "messages": [
+            {
+              "message_id": "0",
+              "role": "user",
+              "input_hash": "sha256:80f72e8f69ac19ad6396510acf5031e92a397b26b6a146ffa47308d7cb7859e1",
+              "character_count": 59,
+              "created_at": null,
+              "tool_name": null,
+              "source_uri": null
+            }
+          ],
+          "provider": "openai",
+          "model": "deepseek-ai/DeepSeek-V4-Flash",
+          "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+          "input_tokens": 1301,
+          "output_tokens": 170,
+          "provider_cost_usd": 0.00012925800000000002,
+          "latency_ms": 5599,
+          "reason_codes": [],
+          "candidates": [
+            {
+              "content": "My emergency contact is my sister Alice.",
+              "suggested_kind": "fact",
+              "suggested_wing": null,
+              "suggested_room": null,
+              "subject": "user",
+              "taxonomy_confidence": 0.95,
+              "retention_confidence": 0.95,
+              "retention_disposition": "retain",
+              "assertion_mode": "direct_statement",
+              "evidence": [
+                {
+                  "message_id": "0",
+                  "start": 0,
+                  "end": 59
+                }
+              ],
+              "source_cues": [
+                {
+                  "cue_type": "security",
+                  "evidence": {
+                    "message_id": "0",
+                    "start": 0,
+                    "end": 12
+                  },
+                  "value": "Keep this pr"
+                }
+              ],
+              "reason_codes": [
+                "durable"
+              ],
+              "candidate_id": "555a20e5-8013-4eaa-86ae-871882c86540",
+              "asserting_role": "user",
+              "asserting_principal_id": null,
+              "asserting_tool": null,
+              "attribution_basis": "caller_supplied_roles",
+              "evidence_root": "sha256:7a7eda96b26a0282085b37cd31eae88d6568c7a4bad0a4967e349e0af79fdc4c",
+              "evidence_root_basis": "input_batch",
+              "outcome": "preview",
+              "outcome_reason": null,
+              "memory_item_id": null,
+              "ingest_id": null
+            }
+          ]
+        },
+        "receipt_hash": "sha256:6ef53153252edbc348a9d41dcbe10f6927d0edabe7439ecdb8b70d7d1bc9acac"
+      }
+    },
+    {
+      "case_id": "duplicate",
+      "status_ok": true,
+      "expected": 1,
+      "emitted": 1,
+      "matched": 1,
+      "attribution_correct": 1,
+      "kind_correct": 1,
+      "retention_correct": 1,
+      "evidence_coverage_correct": 1,
+      "cue_coverage_correct": 1,
+      "spans": 1,
+      "valid_spans": 1,
+      "duplicate_candidates": 0,
+      "abstained": false,
+      "latency_ms": 6014,
+      "input_tokens": 1342,
+      "output_tokens": 114,
+      "provider_cost_usd": 0.00012286800000000002,
+      "provider": "openai",
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+      "response": {
+        "receipt": {
+          "schema_version": "engram.extraction.v1",
+          "prompt_version": "engram.extract.1",
+          "run_id": "f361a059-a27c-4fdf-808f-f427a74abed6",
+          "tenant_id": "47cfe6e2-bbfb-48fc-b565-138599362f4c",
+          "principal_id": "f2d1956b-04c7-40b6-bd8d-44faa0f7fdaa",
+          "workspace_id": null,
+          "memory_profile_revision_id": null,
+          "source_type": "extraction",
+          "visibility": "private",
+          "mode": "preview",
+          "input_hash": "sha256:c5e5a714cb9558b7de2eec41b4bb728040911b1a1e3540811d6b2d70c4bd4dd3",
+          "evidence_root": "sha256:7fc5bb779d25d81f8d31da5b8a590ad22590e36ea35f79c12fd59ee7c75df5a3",
+          "messages": [
+            {
+              "message_id": "0",
+              "role": "user",
+              "input_hash": "sha256:0cd60571369420a1682aafe1e61ace17dbc9b7a08a5de7394c1e63d59ba52474",
+              "character_count": 25,
+              "created_at": null,
+              "tool_name": null,
+              "source_uri": null
+            },
+            {
+              "message_id": "1",
+              "role": "user",
+              "input_hash": "sha256:0cd60571369420a1682aafe1e61ace17dbc9b7a08a5de7394c1e63d59ba52474",
+              "character_count": 25,
+              "created_at": null,
+              "tool_name": null,
+              "source_uri": null
+            }
+          ],
+          "provider": "openai",
+          "model": "deepseek-ai/DeepSeek-V4-Flash",
+          "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+          "input_tokens": 1342,
+          "output_tokens": 114,
+          "provider_cost_usd": 0.00012286800000000002,
+          "latency_ms": 6014,
+          "reason_codes": [],
+          "candidates": [
+            {
+              "content": "The user prefers concise answers.",
+              "suggested_kind": "preference",
+              "suggested_wing": null,
+              "suggested_room": null,
+              "subject": null,
+              "taxonomy_confidence": 0.95,
+              "retention_confidence": 0.9,
+              "retention_disposition": "retain",
+              "assertion_mode": "direct_statement",
+              "evidence": [
+                {
+                  "message_id": "0",
+                  "start": 0,
+                  "end": 25
+                }
+              ],
+              "source_cues": [],
+              "reason_codes": [],
+              "candidate_id": "edf85042-971f-4b5f-9a10-5e677f3846a0",
+              "asserting_role": "user",
+              "asserting_principal_id": null,
+              "asserting_tool": null,
+              "attribution_basis": "caller_supplied_roles",
+              "evidence_root": "sha256:7fc5bb779d25d81f8d31da5b8a590ad22590e36ea35f79c12fd59ee7c75df5a3",
+              "evidence_root_basis": "input_batch",
+              "outcome": "preview",
+              "outcome_reason": null,
+              "memory_item_id": null,
+              "ingest_id": null
+            }
+          ]
+        },
+        "receipt_hash": "sha256:bb0b6078bdc3f451c43d7476f17c153df05dfeb3383cec99bf37a4b3f488c2c1"
+      }
+    },
+    {
+      "case_id": "paraphrase",
+      "status_ok": true,
+      "expected": 1,
+      "emitted": 2,
+      "matched": 1,
+      "attribution_correct": 1,
+      "kind_correct": 1,
+      "retention_correct": 1,
+      "evidence_coverage_correct": 1,
+      "cue_coverage_correct": 1,
+      "spans": 2,
+      "valid_spans": 2,
+      "duplicate_candidates": 0,
+      "abstained": false,
+      "latency_ms": 7578,
+      "input_tokens": 1342,
+      "output_tokens": 263,
+      "provider_cost_usd": 0.000149688,
+      "provider": "openai",
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+      "response": {
+        "receipt": {
+          "schema_version": "engram.extraction.v1",
+          "prompt_version": "engram.extract.1",
+          "run_id": "f9106566-7474-488b-b60b-d26655b6a136",
+          "tenant_id": "47cfe6e2-bbfb-48fc-b565-138599362f4c",
+          "principal_id": "f2d1956b-04c7-40b6-bd8d-44faa0f7fdaa",
+          "workspace_id": null,
+          "memory_profile_revision_id": null,
+          "source_type": "extraction",
+          "visibility": "private",
+          "mode": "preview",
+          "input_hash": "sha256:ba6298522f95bdf6eb3e04c235afb499f9e7d93789ca8c9e408e7cd18f31fd5a",
+          "evidence_root": "sha256:2052e410952c721ae777b075d8795caa00809d2bf6c886f517d01e4f8cfc16d7",
+          "messages": [
+            {
+              "message_id": "0",
+              "role": "user",
+              "input_hash": "sha256:0cd60571369420a1682aafe1e61ace17dbc9b7a08a5de7394c1e63d59ba52474",
+              "character_count": 25,
+              "created_at": null,
+              "tool_name": null,
+              "source_uri": null
+            },
+            {
+              "message_id": "1",
+              "role": "user",
+              "input_hash": "sha256:3b58bbc13b2a8f8eecabfcaa32344138a0282b425eeba93ee89da114461be1bb",
+              "character_count": 28,
+              "created_at": null,
+              "tool_name": null,
+              "source_uri": null
+            }
+          ],
+          "provider": "openai",
+          "model": "deepseek-ai/DeepSeek-V4-Flash",
+          "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+          "input_tokens": 1342,
+          "output_tokens": 263,
+          "provider_cost_usd": 0.000149688,
+          "latency_ms": 7578,
+          "reason_codes": [],
+          "candidates": [
+            {
+              "content": "The user prefers concise answers.",
+              "suggested_kind": "preference",
+              "suggested_wing": null,
+              "suggested_room": null,
+              "subject": "user",
+              "taxonomy_confidence": 0.9,
+              "retention_confidence": 0.9,
+              "retention_disposition": "retain",
+              "assertion_mode": "direct_statement",
+              "evidence": [
+                {
+                  "message_id": "0",
+                  "start": 0,
+                  "end": 25
+                }
+              ],
+              "source_cues": [],
+              "reason_codes": [],
+              "candidate_id": "d0c53cf2-df2f-44ae-bec8-f1144b83c7fd",
+              "asserting_role": "user",
+              "asserting_principal_id": null,
+              "asserting_tool": null,
+              "attribution_basis": "caller_supplied_roles",
+              "evidence_root": "sha256:2052e410952c721ae777b075d8795caa00809d2bf6c886f517d01e4f8cfc16d7",
+              "evidence_root_basis": "input_batch",
+              "outcome": "preview",
+              "outcome_reason": null,
+              "memory_item_id": null,
+              "ingest_id": null
+            },
+            {
+              "content": "The user wants responses kept brief.",
+              "suggested_kind": "preference",
+              "suggested_wing": null,
+              "suggested_room": null,
+              "subject": "user",
+              "taxonomy_confidence": 0.9,
+              "retention_confidence": 0.9,
+              "retention_disposition": "retain",
+              "assertion_mode": "direct_statement",
+              "evidence": [
+                {
+                  "message_id": "1",
+                  "start": 0,
+                  "end": 28
+                }
+              ],
+              "source_cues": [],
+              "reason_codes": [],
+              "candidate_id": "a86c48b9-3d37-4b44-85e3-19b130039412",
+              "asserting_role": "user",
+              "asserting_principal_id": null,
+              "asserting_tool": null,
+              "attribution_basis": "caller_supplied_roles",
+              "evidence_root": "sha256:2052e410952c721ae777b075d8795caa00809d2bf6c886f517d01e4f8cfc16d7",
+              "evidence_root_basis": "input_batch",
+              "outcome": "preview",
+              "outcome_reason": null,
+              "memory_item_id": null,
+              "ingest_id": null
+            }
+          ]
+        },
+        "receipt_hash": "sha256:faaab913d74ed753b0119c6ea5c30d4790d7ac98ba18f31c7e3b54ac61b1b622"
+      }
+    },
+    {
+      "case_id": "no_memory",
+      "status_ok": true,
+      "expected": 0,
+      "emitted": 0,
+      "matched": 0,
+      "attribution_correct": 0,
+      "kind_correct": 0,
+      "retention_correct": 0,
+      "evidence_coverage_correct": 0,
+      "cue_coverage_correct": 0,
+      "spans": 0,
+      "valid_spans": 0,
+      "duplicate_candidates": 0,
+      "abstained": true,
+      "latency_ms": 1376,
+      "input_tokens": 1339,
+      "output_tokens": 17,
+      "provider_cost_usd": 0.00010513800000000002,
+      "provider": "openai",
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+      "response": {
+        "receipt": {
+          "schema_version": "engram.extraction.v1",
+          "prompt_version": "engram.extract.1",
+          "run_id": "dbd09295-49d4-454e-9eef-1a446e93ce61",
+          "tenant_id": "47cfe6e2-bbfb-48fc-b565-138599362f4c",
+          "principal_id": "f2d1956b-04c7-40b6-bd8d-44faa0f7fdaa",
+          "workspace_id": null,
+          "memory_profile_revision_id": null,
+          "source_type": "extraction",
+          "visibility": "private",
+          "mode": "preview",
+          "input_hash": "sha256:e6a07f1416cf4e36ab301ea7f3d99ea4bbf66eae6cf2bb79e35f66ead27cc7a4",
+          "evidence_root": "sha256:17e327ce8e28d0c756c76bce4515ab502abbe216ed24a5c5967e9a56773284c2",
+          "messages": [
+            {
+              "message_id": "0",
+              "role": "user",
+              "input_hash": "sha256:1aa7b1c1d5fb1fd6d299eae251a665c7898baeb43d48fb6b8a5b76da6c6ef739",
+              "character_count": 7,
+              "created_at": null,
+              "tool_name": null,
+              "source_uri": null
+            },
+            {
+              "message_id": "1",
+              "role": "assistant",
+              "input_hash": "sha256:ea50b2f75179dbffe00b263839764dcac996703f18cfe2d9d19f9917f605414a",
+              "character_count": 16,
+              "created_at": null,
+              "tool_name": null,
+              "source_uri": null
+            }
+          ],
+          "provider": "openai",
+          "model": "deepseek-ai/DeepSeek-V4-Flash",
+          "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+          "input_tokens": 1339,
+          "output_tokens": 17,
+          "provider_cost_usd": 0.00010513800000000002,
+          "latency_ms": 1376,
+          "reason_codes": [
+            "no_memory"
+          ],
+          "candidates": []
+        },
+        "receipt_hash": "sha256:266be3149466db106265414dd9d43fba848ef83a144533ce343ea1597b3a2cfe"
+      }
+    },
+    {
+      "case_id": "unknown",
+      "status_ok": true,
+      "expected": 1,
+      "emitted": 1,
+      "matched": 1,
+      "attribution_correct": 1,
+      "kind_correct": 1,
+      "retention_correct": 1,
+      "evidence_coverage_correct": 1,
+      "cue_coverage_correct": 1,
+      "spans": 1,
+      "valid_spans": 1,
+      "duplicate_candidates": 0,
+      "abstained": false,
+      "latency_ms": 3715,
+      "input_tokens": 1296,
+      "output_tokens": 115,
+      "provider_cost_usd": 0.00011890800000000002,
+      "provider": "openai",
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+      "response": {
+        "receipt": {
+          "schema_version": "engram.extraction.v1",
+          "prompt_version": "engram.extract.1",
+          "run_id": "f73e471c-00f9-46fa-b020-27469786ea56",
+          "tenant_id": "47cfe6e2-bbfb-48fc-b565-138599362f4c",
+          "principal_id": "f2d1956b-04c7-40b6-bd8d-44faa0f7fdaa",
+          "workspace_id": null,
+          "memory_profile_revision_id": null,
+          "source_type": "extraction",
+          "visibility": "private",
+          "mode": "preview",
+          "input_hash": "sha256:e2bfbea9428f25c232285847a4cd20375db5854d90ce51c2ec2f2db83598feee",
+          "evidence_root": "sha256:c584f46bf020f3f3d55871d50e3eea11acf2478db4699317f516d876c1e5910d",
+          "messages": [
+            {
+              "message_id": "0",
+              "role": "unknown",
+              "input_hash": "sha256:baf09b03e3b7570f0640e20d56afe6c778bb9284bcd311b2a904c319154bb140",
+              "character_count": 30,
+              "created_at": null,
+              "tool_name": null,
+              "source_uri": null
+            }
+          ],
+          "provider": "openai",
+          "model": "deepseek-ai/DeepSeek-V4-Flash",
+          "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+          "input_tokens": 1296,
+          "output_tokens": 115,
+          "provider_cost_usd": 0.00011890800000000002,
+          "latency_ms": 3715,
+          "reason_codes": [],
+          "candidates": [
+            {
+              "content": "I prefer text files for notes.",
+              "suggested_kind": "preference",
+              "suggested_wing": null,
+              "suggested_room": null,
+              "subject": null,
+              "taxonomy_confidence": 0.95,
+              "retention_confidence": 0.95,
+              "retention_disposition": "retain",
+              "assertion_mode": "unknown",
+              "evidence": [
+                {
+                  "message_id": "0",
+                  "start": 0,
+                  "end": 30
+                }
+              ],
+              "source_cues": [],
+              "reason_codes": [],
+              "candidate_id": "38218e1f-91b6-4084-9d29-3342239c08dc",
+              "asserting_role": "unknown",
+              "asserting_principal_id": null,
+              "asserting_tool": null,
+              "attribution_basis": "caller_supplied_roles",
+              "evidence_root": "sha256:c584f46bf020f3f3d55871d50e3eea11acf2478db4699317f516d876c1e5910d",
+              "evidence_root_basis": "input_batch",
+              "outcome": "preview",
+              "outcome_reason": null,
+              "memory_item_id": null,
+              "ingest_id": null
+            }
+          ]
+        },
+        "receipt_hash": "sha256:310fcff8a3c8f5d71f8455c2a47df2a89a045ba1d0684e767f9a9154eff2663a"
+      }
+    },
+    {
+      "case_id": "162d_ordinary_kind",
+      "status_ok": true,
+      "expected": 1,
+      "emitted": 1,
+      "matched": 1,
+      "attribution_correct": 1,
+      "kind_correct": 0,
+      "retention_correct": 0,
+      "evidence_coverage_correct": 1,
+      "cue_coverage_correct": 0,
+      "spans": 1,
+      "valid_spans": 1,
+      "duplicate_candidates": 0,
+      "abstained": false,
+      "latency_ms": 6262,
+      "input_tokens": 1303,
+      "output_tokens": 179,
+      "provider_cost_usd": 0.000131058,
+      "provider": "openai",
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+      "response": {
+        "receipt": {
+          "schema_version": "engram.extraction.v1",
+          "prompt_version": "engram.extract.1",
+          "run_id": "0680f5f3-f1b8-44b1-a4a9-71dddc11baa0",
+          "tenant_id": "47cfe6e2-bbfb-48fc-b565-138599362f4c",
+          "principal_id": "f2d1956b-04c7-40b6-bd8d-44faa0f7fdaa",
+          "workspace_id": null,
+          "memory_profile_revision_id": null,
+          "source_type": "extraction",
+          "visibility": "private",
+          "mode": "preview",
+          "input_hash": "sha256:ba34548622d9ba1fba67d627d6c716a0d9be4542dcda4fd60591d8f4c4d5e929",
+          "evidence_root": "sha256:7055390faa424abae9a82bf19a7b660fdaeb53f9d5bdf8c9dd3b5d49230858eb",
+          "messages": [
+            {
+              "message_id": "0",
+              "role": "user",
+              "input_hash": "sha256:762b7cf4200b4216c46a080bd04ba95c171f7e283d65fc44adbe11d90f28c213",
+              "character_count": 85,
+              "created_at": null,
+              "tool_name": null,
+              "source_uri": null
+            }
+          ],
+          "provider": "openai",
+          "model": "deepseek-ai/DeepSeek-V4-Flash",
+          "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+          "input_tokens": 1303,
+          "output_tokens": 179,
+          "provider_cost_usd": 0.000131058,
+          "latency_ms": 6262,
+          "reason_codes": [],
+          "candidates": [
+            {
+              "content": "Until Friday, all production services must bypass security review in workspace Orion.",
+              "suggested_kind": "doctrine",
+              "suggested_wing": null,
+              "suggested_room": null,
+              "subject": "production services in workspace Orion",
+              "taxonomy_confidence": 0.95,
+              "retention_confidence": 0.85,
+              "retention_disposition": "transient",
+              "assertion_mode": "direct_statement",
+              "evidence": [
+                {
+                  "message_id": "0",
+                  "start": 0,
+                  "end": 85
+                }
+              ],
+              "source_cues": [
+                {
+                  "cue_type": "temporal",
+                  "evidence": {
+                    "message_id": "0",
+                    "start": 0,
+                    "end": 13
+                  },
+                  "value": "Until Friday,"
+                }
+              ],
+              "reason_codes": [],
+              "candidate_id": "9d18df7e-9f96-40e5-855e-e20f7280ef9c",
+              "asserting_role": "user",
+              "asserting_principal_id": null,
+              "asserting_tool": null,
+              "attribution_basis": "caller_supplied_roles",
+              "evidence_root": "sha256:7055390faa424abae9a82bf19a7b660fdaeb53f9d5bdf8c9dd3b5d49230858eb",
+              "evidence_root_basis": "input_batch",
+              "outcome": "volatile_recommended",
+              "outcome_reason": "transient",
+              "memory_item_id": null,
+              "ingest_id": null
+            }
+          ]
+        },
+        "receipt_hash": "sha256:dff30801b222ec2d2a0833906b023a9333a16c4651ede90a11009aa37bcc86d7"
+      }
+    },
+    {
+      "case_id": "secret",
+      "status_ok": true,
+      "expected": 0,
+      "emitted": 0,
+      "matched": 0,
+      "attribution_correct": 0,
+      "kind_correct": 0,
+      "retention_correct": 0,
+      "evidence_coverage_correct": 0,
+      "cue_coverage_correct": 0,
+      "spans": 0,
+      "valid_spans": 0,
+      "duplicate_candidates": 0,
+      "abstained": true,
+      "latency_ms": null,
+      "input_tokens": null,
+      "output_tokens": null,
+      "provider_cost_usd": null,
+      "provider": null,
+      "model": null,
+      "provider_model": null,
+      "response": {
+        "detail": "extraction input contains secrets/credentials"
+      }
+    }
+  ]
+}

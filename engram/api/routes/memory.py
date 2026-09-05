@@ -479,7 +479,9 @@ def _rrf_fuse(
 # ---- Endpoints ----
 
 
-async def _commit_remember_success(session: AsyncSession) -> None:
+async def _commit_remember_success(
+    session: AsyncSession, *, defer_commit: bool = False,
+) -> None:
     """Single commit boundary for every successful ``/v1/remember`` terminal path.
 
     The request session (``get_session``) never auto-commits, and
@@ -494,7 +496,10 @@ async def _commit_remember_success(session: AsyncSession) -> None:
     start of the new transaction this commit opens, so RLS context survives the
     commit (already relied on by the created/dedup-with-receipt paths).
     """
-    await session.commit()
+    if defer_commit:
+        await session.flush()
+    else:
+        await session.commit()
 
 
 @router.post(
@@ -581,6 +586,7 @@ async def _remember_impl(
     attempt_id: UUID,
     caller_has_admin_scope: bool,
     memory_context: ResolvedMemoryContext,
+    extraction_transaction: bool = False,
 ) -> RememberResponse:
     """The actual write logic. See :func:`remember` for the telemetry wrapper.
 
@@ -656,7 +662,7 @@ async def _remember_impl(
         )
         session.add(ingest)
         receipt.ingest_id = ingest.id
-        await session.commit()
+        await session.flush() if extraction_transaction else await session.commit()
         receipt = await lock_run(session, receipt.id)
         if receipt is None:
             raise HTTPException(status_code=404, detail="classification run not found")
@@ -697,7 +703,7 @@ async def _remember_impl(
         )
         session.add(ingest)
         # Authoritative identity must be durable before the rest of remember.
-        await session.commit()
+        await session.flush() if extraction_transaction else await session.commit()
 
     if ingest is None:
         raise HTTPException(status_code=404, detail="candidate ingest not found")
@@ -721,15 +727,16 @@ async def _remember_impl(
             detail="candidate ingest was already consumed under a different memory context",
         ) from exc
 
-    await record_candidate_once(
-        tenant_id=tenant_id,
-        principal_id=principal_id,
-        workspace_id=workspace_id,
-        correlation_id=correlation_id,
-        ingest_id=ingest.id,
-        candidate_utf8_bytes=len(req.content.encode("utf-8")),
-        source_type=req.source_type,
-    )
+    if not extraction_transaction:
+        await record_candidate_once(
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            workspace_id=workspace_id,
+            correlation_id=correlation_id,
+            ingest_id=ingest.id,
+            candidate_utf8_bytes=len(req.content.encode("utf-8")),
+            source_type=req.source_type,
+        )
 
     if receipt is not None:
         if receipt.bound_at is None and receipt.memory_item_id is not None:
@@ -766,7 +773,7 @@ async def _remember_impl(
             # The bound item/receipt were persisted by the original binding
             # request; this commit persists only the execution-context pin so
             # the replay cannot later be re-pinned under a different authority.
-            await _commit_remember_success(session)
+            await _commit_remember_success(session, defer_commit=extraction_transaction)
             return RememberResponse(
                 id=bound_item.id,
                 status="deduped",
@@ -818,7 +825,7 @@ async def _remember_impl(
     # proposed — regardless of whether the kind came from an explicit request
     # or the classifier (generalizes the old classifier-only
     # suggested_kind == "decision" special case, ENG-AUD-010 / F17).
-    if kind_row.requires_review:
+    if kind_row.requires_review or extraction_transaction:
         review_status = "proposed"
 
     # Taxonomy confidence never mutates overall memory confidence. Classification
@@ -1046,7 +1053,7 @@ async def _remember_impl(
         # Commit covers BOTH the receipt-dedup binding/narrowing above and the
         # ordinary-dedup path (receipt is None): the execution-context pin must
         # become durable on every successful dedup, not only receipt-backed ones.
-        await _commit_remember_success(session)
+        await _commit_remember_success(session, defer_commit=extraction_transaction)
         outcome_ctx["final_kind"] = existing.kind
         outcome_ctx["final_review_status"] = existing.review_status
         outcome_ctx["final_visibility"] = existing.visibility
@@ -1241,7 +1248,7 @@ async def _remember_impl(
                 dedupe_key=f"embedding.generate:{item.id}:{profile.id}",
             )
 
-    await _commit_remember_success(session)
+    await _commit_remember_success(session, defer_commit=extraction_transaction)
 
     outcome_ctx["final_kind"] = kind
     outcome_ctx["final_review_status"] = review_status

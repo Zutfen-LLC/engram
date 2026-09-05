@@ -1842,3 +1842,43 @@ class ContextReceipt(Base):
     recall_log: Mapped[RecallLog] = relationship(
         back_populates="context_receipt", uselist=False
     )
+
+
+class ExtractionRun(Base):
+    """Immutable extraction response and retry identity."""
+
+    __tablename__ = "extraction_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenants.id"))
+    principal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("principals.id"))
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workspaces.id"), nullable=True,
+    )
+    idempotency_key: Mapped[str] = mapped_column(Text)
+    request_hash: Mapped[str] = mapped_column(Text)
+    receipt: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    receipt_hash: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"),
+    )
+
+
+class ExtractionItemLink(Base):
+    """Scope-checked link from one extraction candidate to a memory item."""
+
+    __tablename__ = "extraction_item_links"
+
+    candidate_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("extraction_runs.id"))
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenants.id"))
+    principal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("principals.id"))
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workspaces.id"), nullable=True,
+    )
+    memory_item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("memory_items.id"),
+    )
+    ingest_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("candidate_ingests.id"),
+    )

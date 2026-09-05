@@ -22,6 +22,7 @@ from uuid import UUID
 import httpx
 from pydantic import BaseModel
 
+from .extraction import ExtractRequest, ExtractResponse
 from .models import (
     AgentCreated,
     AgentCreateRequest,
@@ -361,6 +362,17 @@ class EngramClient:
         )
 
     # ---- /v1/classify ----
+
+    async def get_extraction(self, run_id: UUID) -> ExtractResponse:
+        """Read an immutable extraction receipt under current authorization."""
+        return await self._send("GET", f"/v1/extract/{run_id}", ExtractResponse)
+
+    async def extract(self, request: ExtractRequest) -> ExtractResponse:
+        """Extract structured provenance and optionally write proposed memories."""
+        return await self._send(
+            "POST", "/v1/extract", ExtractResponse,
+            json_body=request.model_dump(mode="json", exclude_none=True),
+        )
 
     async def classify(
         self,

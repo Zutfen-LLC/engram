@@ -178,3 +178,20 @@ def is_allowed(verdict: dict[str, Any] | GuardVerdict | None) -> bool:
     """
     return bool(verdict is not None and verdict.get("handled") is True
                 and verdict.get("action") == "allow")
+
+
+# Structured fallback stores input locally. Apply the service denylist before that boundary.
+_EXTRACTION_SECRET_PATTERNS = (
+    re.compile("AKIA[0-9A-Z]{16}"),
+    re.compile("aws_secret_access_key\\s*[=:]\\s*['\\\"]?[A-Za-z0-9/+=]{40}"),
+    re.compile("gh[pousr]_[A-Za-z0-9]{36,}"),
+    re.compile("(?i)api[_-]?key\\s*[=:]\\s*['\\\"]?[A-Za-z0-9]{32,}"),
+    re.compile("(?i)password\\s*[=:]\\s*['\\\"]?[^\\s'\\\"]{8,}"),
+    re.compile("-----BEGIN (RSA |EC |OPENSSH |)PRIVATE KEY-----"),
+    re.compile("xox[baprs]-[A-Za-z0-9-]+"),
+)
+
+
+def has_extraction_secrets(value: str) -> bool:
+    """Reject credentials before structured submission or volatile fallback."""
+    return any(pattern.search(value) for pattern in _EXTRACTION_SECRET_PATTERNS)

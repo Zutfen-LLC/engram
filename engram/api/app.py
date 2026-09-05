@@ -70,6 +70,7 @@ def create_app() -> FastAPI:
         context_receipts,
         diary,
         export,
+        extract,
         health,
         kg,
         memory,
@@ -87,6 +88,7 @@ def create_app() -> FastAPI:
     app.include_router(memory.router, prefix="/v1", tags=["memory"])
     app.include_router(agents.router, prefix="/v1", tags=["agents"])
     app.include_router(memory_profiles.router, prefix="/v1", tags=["memory-profiles"])
+    app.include_router(extract.router, prefix="/v1", tags=["extraction"])
     app.include_router(classify.router, prefix="/v1", tags=["classification"])
     app.include_router(review.router, prefix="/v1", tags=["review"])
     app.include_router(kg.router, prefix="/v1", tags=["knowledge-graph"])
