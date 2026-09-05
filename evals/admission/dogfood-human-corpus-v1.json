@@ -1,0 +1,115 @@
+{
+  "adjudication_digest": "2d417e6dd74529ca3a023575c8ad5feb9c3e36fb3ff2084952237a51cdc29996",
+  "artifact_schema_version": "engram-final-human-corpus-aggregate-v1",
+  "final_corpus_digest": "4876d3bb1857fcf761f1bb3566d9d7cf76bb21cd2b5acbc8365123d8de527f8a",
+  "inter_rater": {
+    "conflict_expected": {
+      "agreed": 0,
+      "compared": 9
+    },
+    "consequence": {
+      "agreed": 8,
+      "compared": 9
+    },
+    "epistemic_state": {
+      "agreed": 5,
+      "compared": 9
+    },
+    "expected_governed_semantic_eligibility": {
+      "agreed": 5,
+      "compared": 9
+    },
+    "expected_kind": {
+      "agreed": 6,
+      "compared": 9
+    },
+    "expected_startup_eligibility": {
+      "agreed": 6,
+      "compared": 9
+    },
+    "expected_storage_disposition": {
+      "agreed": 4,
+      "compared": 9
+    },
+    "human_review_required": {
+      "agreed": 8,
+      "compared": 9
+    },
+    "retention_value": {
+      "agreed": 7,
+      "compared": 9
+    },
+    "supersession_expected": {
+      "agreed": 1,
+      "compared": 9
+    },
+    "temporal_validity_issue": {
+      "agreed": 4,
+      "compared": 9
+    }
+  },
+  "privacy": "aggregate_only_no_raw_membership_or_content",
+  "reviewer_a_frozen_digest": "618a75139bc35681b4efcb3535d9d56d7bfa4ba6ff90606d39bf8ea28e6e86d9",
+  "reviewer_b_digest": "93ea2f3d4eb88928faf77dd9caf0df7c99ba7446b55a02405bd5ea958e4fde5f",
+  "summary": {
+    "case_count": 50,
+    "disagreement_count": 9,
+    "final_distributions": {
+      "conflict_expected": {
+        "no": 44,
+        "yes": 6
+      },
+      "consequence": {
+        "high": 9,
+        "low": 22,
+        "medium": 19
+      },
+      "expected_governed_semantic_eligibility": {
+        "no": 27,
+        "yes": 23
+      },
+      "expected_kind": {
+        "decision": 5,
+        "doctrine": 6,
+        "fact": 11,
+        "invariant": 1,
+        "observation": 2,
+        "preference": 4,
+        "procedure": 7,
+        "summary": 7,
+        "unknown": 7
+      },
+      "expected_startup_eligibility": {
+        "no": 35,
+        "yes": 15
+      },
+      "expected_storage_disposition": {
+        "defer": 9,
+        "reject": 10,
+        "retain": 31
+      },
+      "human_review_required": {
+        "no": 37,
+        "yes": 13
+      },
+      "retention_value": {
+        "do_not_retain": 10,
+        "retain": 40
+      },
+      "supersession_expected": {
+        "no": 48,
+        "yes": 2
+      },
+      "temporal_validity_issue": {
+        "no": 8,
+        "yes": 42
+      }
+    },
+    "final_valid_label_count": 50,
+    "high_consequence_without_b_count": 0,
+    "resolved_disagreement_count": 9,
+    "reviewer_a_count": 50,
+    "reviewer_b_count": 9,
+    "unresolved_disagreement_count": 0
+  }
+}

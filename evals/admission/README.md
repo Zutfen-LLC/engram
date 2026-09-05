@@ -64,6 +64,51 @@ Preserve the private artifact to reproduce the baseline. A second live capture
 has a new timestamp and can have a different population. Replaying the saved
 artifact uses its fixed timestamp and configuration.
 
+## Blind human-review packet (#173 first handoff)
+
+`evals.admission.blind_review` creates only the pre-adjudication artifacts:
+deterministic protected membership, a blind JSON/Markdown packet, and empty
+resumable review state. It never invokes the promotion evaluator and the packet
+serializer rejects current-policy fields.
+
+Run it only on an authorized host. Keep every output except the generated
+content-free public manifest outside the repository. The directory is created
+mode `0700`; every private file is exclusive-created mode `0600`.
+
+```bash
+python -m evals.admission.blind_review select \
+  --snapshot /protected/162a/dogfood-snapshot.json \
+  --snapshot-key-file /protected/162a/.snapshot-key \
+  --seed eng-calibration-001b-dogfood-20260905-v1 \
+  --target-count 50 \
+  --code-sha "$REVIEW_TOOL_SHA" \
+  --private-output /protected/162b/tranche-private.json \
+  --public-output /tmp/blind-tranche-public.json
+```
+
+```bash
+python -m evals.admission.blind_review packet \
+  --snapshot /protected/162a/dogfood-snapshot.json \
+  --tranche /protected/162b/tranche-private.json \
+  --snapshot-key-file /protected/162a/.snapshot-key \
+  --tenant "$EVAL_TENANT_ID" \
+  --principal "$EVAL_PRINCIPAL_ID" \
+  --json-output /protected/162b/blind-packet.json \
+  --markdown-output /protected/162b/blind-packet.md \
+  --state-output /protected/162b/review-state.json \
+  --proof-output /protected/162b/read-only-proof.json
+```
+
+Content recovery sets a repeatable-read `READ ONLY` transaction and RLS context,
+queries only selected snapshot content hashes, then verifies each returned row
+by recomputing its HMAC identity from the protected snapshot key. It also checks
+the captured content hash. It never joins by text. Secret-bearing content is
+replaced with a fixed redaction marker before either packet is written.
+
+The review state intentionally has no Reviewer A/B judgments, frozen timestamp,
+or policy reveal. Do not add labels or reveal/compare current policy until a
+human reviewer has frozen the applicable judgment.
+
 ## Fresh dogfood baseline (2026-09-05)
 
 Captured on `engram01` against the live dogfood database (deployed policy
@@ -122,3 +167,21 @@ from these observations.
 Existing classification and recall corpora remain unchanged. The admission
 loader rejects them because they do not carry the new contract. Existing recall
 golden entries never become factual labels through this package.
+
+## Human corpus freeze and comparison (#173)
+
+`human_corpus.finalize_human_corpus()` is the private, policy-blind finalization
+step. It rejects policy fields in the Reviewer B and adjudication artifacts,
+preserves both reviewers, validates each final `engram-admission-label-v1`
+record, and fails closed unless every high-consequence label has Reviewer B and
+all disagreements are resolved. `human_comparison.compare_frozen_corpus()`
+first verifies that frozen digest/gate, then evaluates only the captured
+snapshot policy inputs; it never reads or mutates live memories.
+
+The checked-in `dogfood-human-corpus-v1.json`, `dogfood-human-comparison-v1.json`,
+`dogfood-human-comparison-v1.md`, and `dogfood-human-incident-seed-v1.json` are aggregate-only
+reports. `incident_seed.build_incident_seed()` creates the private `0600` incident artifact from
+the final frozen corpus and comparison, keeping review-case IDs and decision-time/later-outcome
+records out of Git. Private labels, private membership, source snapshot, and per-case policy output
+remain outside Git under restricted permissions. A zero automatic-admission count is reported with PPV
+`null`/undefined, never as 100% precision.

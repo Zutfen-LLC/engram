@@ -18,9 +18,7 @@ Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 # (engram/api/routes/kg.py) emits ``kg-auto-<32hex>``. Capture must accept every
 # shape production stores, so this validates structure without asserting a
 # single algorithm. The value is identity/audit only; no evaluator path parses it.
-ContentHash = Annotated[
-    str, Field(pattern=r"^(sha256:)?[0-9a-f]{64}$|^kg-auto-[0-9a-f]{32}$")
-]
+ContentHash = Annotated[str, Field(pattern=r"^(sha256:)?[0-9a-f]{64}$|^kg-auto-[0-9a-f]{32}$")]
 Judgment = Literal["yes", "no", "unknown"]
 Quality = Literal["adequate", "inadequate", "unknown", "unavailable", "not_applicable"]
 Kind = Literal[
@@ -133,6 +131,11 @@ class LabelRecord(Record):
     reviewer_b: HumanJudgment | None
     resolution: HumanJudgment | None
     disagreement: Literal["none", "unresolved", "resolved"]
+    # A private frozen Reviewer-A corpus is intentionally incomplete for high
+    # consequence cases: an independent blinded Reviewer B is still pending.
+    review_stage: Literal["complete", "reviewer_b_pending"] = Field(
+        default="complete", exclude=True
+    )
 
     @model_validator(mode="after")
     def review_contract(self) -> Self:
@@ -146,10 +149,16 @@ class LabelRecord(Record):
             raise ValueError("resolution_required")
         if self.disagreement != "resolved" and self.resolution is not None:
             raise ValueError("unexpected_resolution")
-        if self.label_origin == "human_adjudicated":
-            high = any(j and j.dimensions.consequence == "high" for j in (a, b, self.resolution))
-            if high and b is None:
-                raise ValueError("dual_review_required")
+        high = any(j and j.dimensions.consequence == "high" for j in (a, b, self.resolution))
+        if (
+            self.label_origin == "human_adjudicated"
+            and high
+            and b is None
+            and self.review_stage != "reviewer_b_pending"
+        ):
+            raise ValueError("dual_review_required")
+        if self.review_stage == "reviewer_b_pending" and (b is not None or not high):
+            raise ValueError("invalid_reviewer_b_pending_stage")
         return self
 
     def final_dimensions(self) -> Dimensions | None:

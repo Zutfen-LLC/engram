@@ -1,0 +1,95 @@
+{
+  "artifact_schema_version": "engram-blind-tranche-public-v1",
+  "code_sha": "1bbd4b3dcdfbad9eab49416f225cd7295353104e",
+  "coverage": {
+    "age": {
+      "24to72h": 9,
+      "72hto7d": 11,
+      "ge30d": 24,
+      "lt24h": 6
+    },
+    "evidence": {
+      "below_reference_confidence": 12,
+      "none_recorded": 13,
+      "qualified_recorded": 25
+    },
+    "governance": {
+      "conflict": 4,
+      "none_recorded": 46
+    },
+    "kind": {
+      "doctrine": 10,
+      "fact": 30,
+      "invariant": 3,
+      "observation": 3,
+      "preference": 3,
+      "procedure": 1
+    },
+    "kind_gate": {
+      "review_gated": 16,
+      "standard": 34
+    },
+    "source_type": {
+      "extraction": 5,
+      "manual": 7,
+      "migration": 11,
+      "pre_compress": 1,
+      "session_end": 7,
+      "sync_turn": 19
+    },
+    "temporal_evidence": {
+      "cooling_window": 9,
+      "evidence_matured": 16,
+      "no_evidence_timestamp": 25
+    }
+  },
+  "population_coverage": {
+    "age": {
+      "24to72h": 15,
+      "72hto7d": 95,
+      "ge30d": 123,
+      "lt24h": 6
+    },
+    "evidence": {
+      "below_reference_confidence": 147,
+      "none_recorded": 25,
+      "qualified_recorded": 67
+    },
+    "governance": {
+      "conflict": 4,
+      "none_recorded": 235
+    },
+    "kind": {
+      "doctrine": 20,
+      "fact": 209,
+      "invariant": 3,
+      "observation": 3,
+      "preference": 3,
+      "procedure": 1
+    },
+    "kind_gate": {
+      "review_gated": 26,
+      "standard": 213
+    },
+    "source_type": {
+      "extraction": 116,
+      "manual": 10,
+      "migration": 21,
+      "pre_compress": 1,
+      "session_end": 10,
+      "sync_turn": 81
+    },
+    "temporal_evidence": {
+      "cooling_window": 14,
+      "evidence_matured": 53,
+      "no_evidence_timestamp": 172
+    }
+  },
+  "selected_count": 50,
+  "selection_digest": "0e4167a3fab5591e7a40a10a8fa2782bc3ea31fd7cab776fdc20f99f20ba2c8b",
+  "selection_seed": "eng-calibration-001b-dogfood-20260905-v1",
+  "selection_version": "eng-calibration-001b-blind-tranche-v1",
+  "snapshot_identity": "1d1de9f799c2ff203ff0554fee2273d98ed7e697555215c9b7036b2815023117",
+  "source_dataset_id": "dogfood-admission",
+  "source_dataset_version": "dogfood-20260905T014414Z"
+}

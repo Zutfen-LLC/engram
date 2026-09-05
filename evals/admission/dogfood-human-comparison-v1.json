@@ -1,0 +1,123 @@
+{
+  "automatic_admission": {
+    "false_automatic": 0,
+    "high_consequence_automatic": 0,
+    "high_consequence_false_automatic": 0,
+    "high_consequence_precision_ppv": null,
+    "human_permitted": 0,
+    "precision_ppv": null
+  },
+  "consequence": {
+    "high": {
+      "agreement": 9,
+      "automatic": 0,
+      "false_automatic": 0,
+      "labeled": 9,
+      "mismatch": 0
+    },
+    "low": {
+      "agreement": 15,
+      "automatic": 0,
+      "false_automatic": 0,
+      "labeled": 22,
+      "mismatch": 7
+    },
+    "medium": {
+      "agreement": 14,
+      "automatic": 0,
+      "false_automatic": 0,
+      "labeled": 19,
+      "mismatch": 5
+    }
+  },
+  "epistemic_support": {
+    "adequately_supported": 21,
+    "unknown": 6,
+    "weakly_supported": 23
+  },
+  "evaluation_at": "2026-09-05T01:44:17.399954+00:00",
+  "final_corpus_digest": "4876d3bb1857fcf761f1bb3566d9d7cf76bb21cd2b5acbc8365123d8de527f8a",
+  "held_back": {
+    "human_expected_storage_retain": 31,
+    "human_governed_eligible": 23,
+    "human_retention_retain": 40,
+    "human_startup_eligible": 15
+  },
+  "overall": {
+    "agreement_count": 38,
+    "automatic_admission_count": 0,
+    "final_labeled_n": 50,
+    "human_expected_storage_disposition": {
+      "defer": 9,
+      "reject": 10,
+      "retain": 31
+    },
+    "mismatch_count": 12
+  },
+  "policy_config": {
+    "auto_promote_confidence_threshold": 0.699999988079071,
+    "auto_promote_enabled": true,
+    "auto_promote_evidence_enabled": true,
+    "auto_promote_evidence_threshold": 0.699999988079071,
+    "auto_promote_min_age_hours": 72
+  },
+  "policy_state": {
+    "blockers": {
+      "age": 2,
+      "confidence": 39,
+      "conflict": 3,
+      "evidence_score": 5,
+      "kind_policy": 16,
+      "missing_source_prior": 2,
+      "no_retention_evidence": 22,
+      "retention_disposition": 27,
+      "taxonomy_confidence": 16
+    },
+    "readiness": {
+      "below_evidence_threshold": 4,
+      "below_taxonomy_confidence_minimum": 11,
+      "blocked_by_conflict_or_dispute": 3,
+      "blocked_by_kind_policy": 16,
+      "cooling": 2,
+      "missing_evidence": 14
+    },
+    "selected_lanes": {
+      "legacy_confidence": 3,
+      "none": 47
+    }
+  },
+  "report_schema_version": "engram-human-policy-comparison-v1",
+  "retention_cross_tab": {
+    "do_not_retain": {
+      "automatic": 0,
+      "blocked_or_held": 10
+    },
+    "retain": {
+      "automatic": 0,
+      "blocked_or_held": 40
+    },
+    "uncertain": {
+      "automatic": 0,
+      "blocked_or_held": 0
+    }
+  },
+  "review_requirement": {
+    "high_consequence_review_yes_automatic": 0,
+    "review_no_terminal_blocked": 35,
+    "review_yes_automatic": 0
+  },
+  "snapshot_digest": "1d1de9f799c2ff203ff0554fee2273d98ed7e697555215c9b7036b2815023117",
+  "synthesis_counts": {
+    "conflict_or_supersession": 0,
+    "cooling_delay": 2,
+    "kind_or_taxonomy_gate": 27,
+    "missing_evidence_or_source_prior": 37,
+    "non_propositional_or_extraction": 0,
+    "retention_epistemic_or_temporal": 9,
+    "review_gate_missing": 0
+  },
+  "taxonomy": {
+    "stored_kind_vs_human_expected_disagreements": 28
+  },
+  "tranche_selection_digest": "0e4167a3fab5591e7a40a10a8fa2782bc3ea31fd7cab776fdc20f99f20ba2c8b"
+}
