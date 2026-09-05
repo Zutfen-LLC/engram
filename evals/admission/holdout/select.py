@@ -68,7 +68,20 @@ def select_holdout(
     if development.get("snapshot_identity") != snapshot.manifest.data_digest:
         raise ValueError("development_tranche_snapshot_mismatch")
     definition = SelectionDefinition(selection_seed=seed, target_count=target_count)
-    tranche = select_tranche(snapshot, definition, code_sha=code_sha, review_key=snapshot_key)
+    # Remove the development samples from the eligible pool before selection:
+    # holdout selection must operate only on the genuinely fresh population.
+    excluded_ids = set(development.get("sample_ids", ()))
+    # model_copy deliberately bypasses Dataset validation: the filtered view
+    # is selection-internal only (manifest membership describes the full
+    # snapshot) and is never serialized or treated as a standalone dataset.
+    filtered = snapshot.model_copy(
+        update={
+            "samples": tuple(
+                s for s in snapshot.samples if s.sample_id not in excluded_ids
+            )
+        }
+    )
+    tranche = select_tranche(filtered, definition, code_sha=code_sha, review_key=snapshot_key)
     overlap = check_disjoint(
         tranche.sample_ids, tuple(development.get("sample_ids", ()))
     )
