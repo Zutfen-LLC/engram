@@ -225,6 +225,10 @@ def operational_counts(dataset: Dataset) -> dict[str, object]:
     counts["blockers"] = dict(sorted(Counter(b for r in results for b in r.blocker_codes).items()))
     counts["population_count"] = dataset.manifest.eligible_population_count
     counts["selected_count"] = len(results)
-    counts["unknown_policy_count"] = sum(r.would_promote is None for r in results)
+    # Only genuinely unknown policy evaluations count here: rows where the
+    # evaluator could not state a policy result at all (missing configuration).
+    # A "none" policy version (known policy, no selected promotion basis) is a
+    # completed evaluation and must not contribute.
+    counts["unknown_policy_count"] = sum(r.current_policy_version == "unknown" for r in results)
     counts["malformed_evidence_count"] = sum(r.evidence_state == "malformed/stale" for r in results)
     return counts

@@ -10,9 +10,12 @@ from pydantic import AwareDatetime, Field
 from engram.classification import RetentionDisposition
 from engram.models import ClassificationRun, MemoryItem, MemoryKind, TenantConfig
 from engram.promotion import PromotionSupport, _config_values, assess_promotion_candidate
+from engram.promotion_policy import (
+    EVIDENCE_PROMOTION_POLICY_VERSION,
+    LEGACY_PROMOTION_POLICY_VERSION,
+)
 from engram.promotion_readiness import (
     _evidence_trust,
-    _policy_version_for_basis,
     classify_readiness,
     evidence_state_of,
 )
@@ -65,11 +68,21 @@ class PolicyInput(Record):
     recalled: Literal["yes", "no", "unknown"]
 
 
+PolicyVersion = Literal[
+    "promotion-legacy-v1",
+    "promotion-evidence-v1",
+    "none",
+    "unknown",
+]
+
+
 class PolicyEvaluationResult(Record):
     sample_id: Token
     current_review_status: str
     actual_kind: str
-    current_policy_version: str
+    # ``none``: known policy evaluated; no promotion basis was selected.
+    # ``unknown``: policy/configuration could not be established.
+    current_policy_version: PolicyVersion
     current_selected_lane: str
     would_promote: bool | None
     blocker_codes: tuple[str, ...]
@@ -80,6 +93,20 @@ class PolicyEvaluationResult(Record):
     readiness_state: str
     terminal_under_current_policy: bool | None
     conflict_recheck_status: Literal["not_run"] = "not_run"
+
+
+def _policy_version(selected_basis: str | None) -> PolicyVersion:
+    """Map a selected promotion basis to its closed policy-version contract.
+
+    Called only with known configuration: a completed evaluation that selected
+    no promotion basis reports ``none``. ``unknown`` is reserved for the
+    missing-configuration path and never produced here.
+    """
+    if selected_basis == "retention_evidence":
+        return EVIDENCE_PROMOTION_POLICY_VERSION
+    if selected_basis == "legacy_confidence":
+        return LEGACY_PROMOTION_POLICY_VERSION
+    return "none"
 
 
 def evaluate(
@@ -166,7 +193,10 @@ def evaluate(
         sample_id=item.sample_id,
         current_review_status=item.review_status,
         actual_kind=item.kind,
-        current_policy_version=_policy_version_for_basis(candidate.selected_basis) or "unknown",
+        # Known configuration: a completed evaluation that selects no promotion
+        # basis reports "none", not "unknown". "unknown" is reserved for the
+        # missing-configuration path above.
+        current_policy_version=_policy_version(candidate.selected_basis),
         current_selected_lane=candidate.selected_basis or "none",
         would_promote=enabled and eligible_item and candidate.would_promote,
         blocker_codes=tuple(candidate.blockers),

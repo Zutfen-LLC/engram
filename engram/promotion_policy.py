@@ -6,8 +6,13 @@ import math
 from dataclasses import dataclass
 from typing import Literal
 
-LEGACY_PROMOTION_POLICY_VERSION = "promotion-legacy-v1"
-EVIDENCE_PROMOTION_POLICY_VERSION = "promotion-evidence-v1"
+# Literal typing only; the values and runtime behavior are unchanged. It lets
+# downstream closed Literal contracts (admission evaluation results) accept
+# these constants without duplicating the version strings.
+LEGACY_PROMOTION_POLICY_VERSION: Literal["promotion-legacy-v1"] = "promotion-legacy-v1"
+EVIDENCE_PROMOTION_POLICY_VERSION: Literal["promotion-evidence-v1"] = (
+    "promotion-evidence-v1"
+)
 EVIDENCE_SOURCE_PRIOR_WEIGHT = 0.20
 EVIDENCE_RETENTION_WEIGHT = 0.80
 EVIDENCE_SCORE_CEILING = 0.85

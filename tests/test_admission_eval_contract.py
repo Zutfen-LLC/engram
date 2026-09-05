@@ -168,6 +168,73 @@ def test_fixed_time_and_canonical_lanes(dataset):
     assert not evaluate(legacy, disabled, dataset.evaluation_at).would_promote
 
 
+def test_policy_version_states_are_semantically_distinct(dataset):
+    # Known configuration + legacy lane -> explicit legacy policy version.
+    legacy = dataset.samples[0].policy_input.model_copy(update={"receipt": None})
+    assert evaluate(legacy, dataset.config, dataset.evaluation_at).current_policy_version == (
+        "promotion-legacy-v1"
+    )
+    # Known configuration + evidence lane -> explicit evidence policy version.
+    sample = next(s for s in dataset.samples if s.sample_id == "cooling")
+    after = evaluate(sample.policy_input, dataset.config, dataset.evaluation_at + timedelta(days=4))
+    assert after.current_policy_version == "promotion-evidence-v1"
+    # Known configuration + deterministic blocked/terminal candidate -> "none",
+    # not "unknown": the policy was evaluated; no promotion basis was selected.
+    blocked = next(
+        s
+        for s in dataset.samples
+        if (r := evaluate(s.policy_input, dataset.config, dataset.evaluation_at))
+        and r.current_selected_lane == "none"
+        and r.would_promote is False
+        and r.terminal_under_current_policy
+    )
+    result = evaluate(blocked.policy_input, dataset.config, dataset.evaluation_at)
+    assert result.current_selected_lane == "none"
+    assert result.current_policy_version == "none"
+    assert result.current_policy_version != "unknown"
+    assert result.would_promote is False
+    assert result.blocker_codes  # deterministically blocked, not unevaluated
+    # Missing configuration -> genuinely unknown policy evaluation.
+    unknown = evaluate(blocked.policy_input, None, dataset.evaluation_at)
+    assert unknown.current_policy_version == "unknown"
+    assert unknown.current_selected_lane == "unknown"
+    assert unknown.would_promote is None
+    # Closed contract: the field rejects values outside the four states.
+    from evals.admission.policy import PolicyEvaluationResult
+
+    raw = result.model_dump(mode="json")
+    raw["current_policy_version"] = "probably-v2"
+    with pytest.raises(ValidationError):
+        PolicyEvaluationResult.model_validate(raw)
+
+
+def test_unknown_policy_count_excludes_known_blocked_rows(dataset):
+    from evals.admission.dataset import operational_counts
+
+    counts = operational_counts(dataset)
+    # Every synthetic row has known configuration, so no row is genuinely
+    # unknown even though blocked rows report current_policy_version="none".
+    from typing import cast
+
+    policy_counts = cast("dict[str, int]", counts["current_policy_version"])
+    assert policy_counts.get("none", 0) > 0
+    assert counts["unknown_policy_count"] == 0
+    # Re-evaluate the same samples without configuration: blocked rows must
+    # not inflate the unknown count until the policy itself is unavailable.
+    from evals.admission.dataset import Dataset as AdmissionDataset
+    from evals.admission.dataset import Sample
+    from evals.admission.dataset import data_digest as recompute
+
+    raw = dataset.model_dump(mode="json")
+    raw["config"] = None
+    samples = tuple(Sample.model_validate(s) for s in raw["samples"])
+    raw["manifest"]["data_digest"] = recompute(samples, None, dataset.evaluation_at)
+    stripped = AdmissionDataset.model_validate(raw)
+    unknown_counts = operational_counts(stripped)
+    assert unknown_counts["current_policy_version"] == {"unknown": len(dataset.samples)}
+    assert unknown_counts["unknown_policy_count"] == len(dataset.samples)
+
+
 def test_stratification_is_order_independent(dataset):
     sampling = Sampling(
         selection_method="stratified_hash",
