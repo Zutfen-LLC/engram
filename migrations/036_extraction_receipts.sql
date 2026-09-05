@@ -93,3 +93,5 @@ CREATE POLICY extraction_owner ON extraction_item_links USING (
     AND EXISTS (SELECT 1 FROM extraction_runs r WHERE r.id = extraction_item_links.run_id)
 );
 GRANT SELECT, INSERT ON extraction_runs, extraction_item_links TO engram_app;
+-- Migration 003 grants full DML to future tables. Remove inherited mutation privileges.
+REVOKE UPDATE, DELETE ON extraction_runs, extraction_item_links FROM engram_app;

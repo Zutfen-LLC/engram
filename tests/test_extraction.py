@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
+import asyncpg
 import httpx
 import pytest
 from sqlalchemy import select, text
@@ -22,6 +23,7 @@ from engram.db import apply_rls_context, get_session
 from engram.extraction import ProviderExtraction, digest
 from engram.extraction_schema import ExtractedProposition, ExtractorOutput
 from engram.memory_context import resolve_memory_context, unrestricted_memory_context
+from engram.migrations import normalize_asyncpg_url
 from engram.models import ExtractionRun
 
 
@@ -226,6 +228,72 @@ async def test_concurrent_idempotency_receipt_links_and_admission_unchanged(extr
     body["idempotency_key"] = "another-run"
     reply = await client.post("/v1/extract", json=body)
     assert reply.json()["receipt"]["candidates"][0]["outcome"] == "deduped", reply.text
+
+
+@pytest.mark.parametrize("reapply", [False, True], ids=["fresh-migration", "reapplied-migration"])
+async def test_extraction_app_role_append_only_privileges_and_owned_rows(extraction_stack, reapply):
+    client, provider, owner, _, tid, pid, _, _ = extraction_stack
+    configure(provider, proposition("I no longer prefer dark mode.", kind="preference"))
+    reply = await client.post(
+        "/v1/extract", json=request(mode="write_proposed", idempotency_key="append-only")
+    )
+    assert reply.status_code == 200, reply.text
+    receipt = reply.json()["receipt"]
+    candidate = receipt["candidates"][0]
+    assert candidate["outcome"] == "written"
+    if reapply:
+        async with owner.begin() as session:
+            raw = await session.get_raw_connection()
+            await raw.driver_connection.execute(
+                Path("migrations/036_extraction_receipts.sql").read_text()
+            )
+
+    conn = await asyncpg.connect(normalize_asyncpg_url(os.environ["ENGRAM_APP_DATABASE_URL"]))
+    try:
+        assert tuple(await conn.fetchrow(
+            "SELECT current_user,rolsuper,rolbypassrls FROM pg_roles WHERE rolname=current_user"
+        )) == ("engram_app", False, False)
+        await conn.execute(
+            "SELECT set_config('app.tenant_id',$1,false),set_config('app.principal_id',$2,false)",
+            str(tid), str(pid),
+        )
+        rows = (
+            ("extraction_runs", "id", UUID(receipt["run_id"])),
+            ("extraction_item_links", "candidate_id", UUID(candidate["candidate_id"])),
+        )
+        before = {}
+        for table, key, row_id in rows:
+            privileges = await conn.fetchrow(
+                "SELECT has_table_privilege(current_user,$1,'SELECT'),"
+                "has_table_privilege(current_user,$1,'INSERT'),"
+                "has_table_privilege(current_user,$1,'UPDATE'),"
+                "has_table_privilege(current_user,$1,'DELETE')",
+                f"public.{table}",
+            )
+            assert tuple(privileges) == (True, True, False, False), table
+            before[table] = await conn.fetchrow(
+                f"SELECT * FROM {table} WHERE {key}=$1", row_id
+            )
+            assert before[table] is not None, "the owned row must be visible under RLS"
+
+        for table, key, row_id in rows:
+            for operation in (
+                f"UPDATE {table} SET {key}={key} WHERE {key}=$1",
+                f"DELETE FROM {table} WHERE {key}=$1",
+            ):
+                with pytest.raises(
+                    asyncpg.InsufficientPrivilegeError,
+                    match=f"permission denied for table {table}",
+                ) as denied:
+                    await conn.execute(operation, row_id)
+                assert denied.value.sqlstate == "42501"
+                # Check both rows after every attempt, including the cascading run delete.
+                for visible_table, visible_key, visible_id in rows:
+                    assert await conn.fetchrow(
+                        f"SELECT * FROM {visible_table} WHERE {visible_key}=$1", visible_id
+                    ) == before[visible_table]
+    finally:
+        await conn.close()
 
 
 async def test_full_schema_extraction_rollback_preserves_written_memory_and_policy(

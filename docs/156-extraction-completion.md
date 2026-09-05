@@ -15,7 +15,12 @@ The schema version is `engram.extraction.v1`. The prompt version is
 `api.deepinfra.com`. Both configured and returned model names were
 `deepseek-ai/DeepSeek-V4-Flash`.
 
-Migration 036 adds immutable extraction receipts and item links. Each write
+Migration 036 adds extraction receipts and item links that are append-only
+to the runtime app role. `engram_app` has SELECT and INSERT only. Migration
+036 explicitly revokes UPDATE and DELETE because migration 003 grants full
+DML to future tables. Reapplication preserves these effective privileges.
+The UPDATE triggers and link constraints provide additional protection.
+Owner/migration-role administrative deletion remains possible. Each write
 binds a normalized content hash, ingest, item, candidate, and extraction run.
 The receipt stores taxonomy and retention output with structured provenance.
 It does not create trusted promotion evidence in `classification_runs`.
@@ -114,6 +119,17 @@ The targeted suite covers concurrent retries, distinct-key deduplication,
 partial candidate failure, failed final commits, linkage, immutability,
 secret rejection, provider failures, unknown attribution, cue correction,
 pronoun context, SDK/OpenAPI consistency, Hermes fallback, and rollback.
+
+The append-only regression in `tests/test_extraction.py` is included in the
+canonical trust-proof set. It checks PostgreSQL's effective privilege matrix
+for both extraction tables after initial migration and reapplication. It
+creates a valid run and link through the API. The same tenant/principal can
+read both rows as `engram_app`. PostgreSQL denies UPDATE and DELETE on each
+owned row with SQLSTATE `42501` and a table-permission error. Both rows remain
+unchanged after each attempt, including the run deletion that would cascade
+to the link if DELETE were allowed. This proves the privilege boundary
+independently of the UPDATE trigger and cross-principal RLS denial.
+The focused extraction suite passed all 33 tests against Compose PostgreSQL.
 
 `make check VENV_BIN=/usr/local/bin` passed inside the CI Compose container:
 3,539 root tests passed, with 34 expected skips and no database skips. The

@@ -87,8 +87,13 @@ authoritative. Existing `/v1/classify` and `/v1/remember` behavior is preserved.
 
 Receipts and links have FORCE RLS. They are principal-scoped and tenant-scoped.
 Workspace membership also restricts receipt reads. API retrieval applies the
-current profile. Database triggers reject receipt updates and invalid item
-links. Receipt hashes use RFC 8785 canonical JSON and SHA-256. A hash attests
+current profile. Extraction evidence is append-only to the runtime app role.
+`engram_app` has SELECT and INSERT only on both extraction tables. Migration
+036 explicitly revokes UPDATE and DELETE because migration 003 grants full
+DML to future tables. Reapplication preserves these effective privileges.
+The UPDATE triggers and link constraints provide additional protection.
+Owner/migration-role maintenance and administrative deletion remain possible.
+Receipt hashes use RFC 8785 canonical JSON and SHA-256. A hash attests
 to the server-stored process result when checked against the stored receipt.
 It is not a digital signature or proof of factual correctness.
 
