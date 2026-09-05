@@ -149,6 +149,7 @@ def _run_preflight() -> None:
 
     _section("Type Check: Service")
     _run("mypy", "engram/")
+    _run("mypy", "--explicit-package-bases", "evals/admission/")
 
     _section("Type Check: SDK")
     _run(

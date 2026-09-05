@@ -1,0 +1,200 @@
+{
+  "$defs": {
+    "Sampling": {
+      "additionalProperties": false,
+      "properties": {
+        "excluded_strata": {
+          "default": [],
+          "items": {
+            "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+            "type": "string"
+          },
+          "title": "Excluded Strata",
+          "type": "array"
+        },
+        "per_stratum": {
+          "minimum": 1,
+          "title": "Per Stratum",
+          "type": "integer"
+        },
+        "selection_method": {
+          "enum": [
+            "census",
+            "stratified_hash"
+          ],
+          "title": "Selection Method",
+          "type": "string"
+        },
+        "selection_seed": {
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+          "title": "Selection Seed",
+          "type": "string"
+        },
+        "strata": {
+          "items": {
+            "enum": [
+              "source_type",
+              "kind",
+              "review_status",
+              "blocker",
+              "evidence_state",
+              "selected_lane",
+              "age_bucket",
+              "conflict",
+              "dispute",
+              "recalled",
+              "labeled_consequence"
+            ],
+            "type": "string"
+          },
+          "title": "Strata",
+          "type": "array"
+        }
+      },
+      "required": [
+        "selection_method",
+        "selection_seed",
+        "strata",
+        "per_stratum"
+      ],
+      "title": "Sampling",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "allowed_use": {
+      "const": "evaluation_only",
+      "title": "Allowed Use",
+      "type": "string"
+    },
+    "code_sha": {
+      "pattern": "^[0-9a-f]{40}$",
+      "title": "Code Sha",
+      "type": "string"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "data_digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Data Digest",
+      "type": "string"
+    },
+    "dataset_id": {
+      "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+      "title": "Dataset Id",
+      "type": "string"
+    },
+    "dataset_version": {
+      "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+      "title": "Dataset Version",
+      "type": "string"
+    },
+    "eligible_population_count": {
+      "minimum": 0,
+      "title": "Eligible Population Count",
+      "type": "integer"
+    },
+    "label_schema_version": {
+      "const": "engram-admission-label-v1",
+      "title": "Label Schema Version",
+      "type": "string"
+    },
+    "manifest_schema_version": {
+      "const": "engram-eval-dataset-manifest-v1",
+      "title": "Manifest Schema Version",
+      "type": "string"
+    },
+    "privacy_class": {
+      "enum": [
+        "public_synthetic",
+        "sanitized_fixture",
+        "private_dogfood",
+        "private_incident"
+      ],
+      "title": "Privacy Class",
+      "type": "string"
+    },
+    "sample_content_hashes": {
+      "items": {
+        "pattern": "^(sha256:)?[0-9a-f]{64}$|^kg-auto-[0-9a-f]{32}$",
+        "type": "string"
+      },
+      "title": "Sample Content Hashes",
+      "type": "array"
+    },
+    "sample_count": {
+      "minimum": 0,
+      "title": "Sample Count",
+      "type": "integer"
+    },
+    "sample_ids": {
+      "items": {
+        "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+        "type": "string"
+      },
+      "title": "Sample Ids",
+      "type": "array"
+    },
+    "sampling": {
+      "$ref": "#/$defs/Sampling"
+    },
+    "snapshot_as_of": {
+      "format": "date-time",
+      "title": "Snapshot As Of",
+      "type": "string"
+    },
+    "source_class": {
+      "enum": [
+        "synthetic",
+        "dogfood",
+        "incident",
+        "sanitized"
+      ],
+      "title": "Source Class",
+      "type": "string"
+    },
+    "stratum_counts": {
+      "items": {
+        "maxItems": 2,
+        "minItems": 2,
+        "prefixItems": [
+          {
+            "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+            "type": "string"
+          },
+          {
+            "type": "integer"
+          }
+        ],
+        "type": "array"
+      },
+      "title": "Stratum Counts",
+      "type": "array"
+    }
+  },
+  "required": [
+    "manifest_schema_version",
+    "dataset_id",
+    "dataset_version",
+    "label_schema_version",
+    "created_at",
+    "snapshot_as_of",
+    "source_class",
+    "code_sha",
+    "sample_count",
+    "eligible_population_count",
+    "allowed_use",
+    "privacy_class",
+    "sampling",
+    "sample_ids",
+    "sample_content_hashes",
+    "data_digest",
+    "stratum_counts"
+  ],
+  "title": "Manifest",
+  "type": "object"
+}

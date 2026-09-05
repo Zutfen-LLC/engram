@@ -1,0 +1,120 @@
+{
+  "code_sha": "662068da2c3d647c31ad318c1efbfac89b685275",
+  "config": {
+    "auto_promote_confidence_threshold": 0.7,
+    "auto_promote_enabled": true,
+    "auto_promote_evidence_enabled": true,
+    "auto_promote_evidence_threshold": 0.7,
+    "auto_promote_min_age_hours": 72
+  },
+  "dataset_digest": "355c405451a722e100faa198a0a9956ed46e96165e44e95b9e0b2295030670dc",
+  "evaluation_at": "2026-09-04T00:00:00+00:00",
+  "labeled_contract_comparisons": {
+    "acceptable_abstention_labeled": 7,
+    "blocker_comparisons": 1,
+    "blocker_matches": 1,
+    "high_consequence_comparisons": 5,
+    "high_consequence_failures": 3,
+    "kind_comparisons": 27,
+    "kind_matches": 27,
+    "kind_unknown": 1,
+    "labeled": 28,
+    "next_action_comparisons": 2,
+    "next_action_matches": 2,
+    "retention_do_not_retain_automatic_True": 6,
+    "retention_retain_automatic_False": 12,
+    "retention_retain_automatic_True": 8,
+    "retention_uncertain_automatic_False": 1,
+    "retention_uncertain_automatic_True": 1,
+    "review_comparisons": 7,
+    "review_required_automatic_failures": 3,
+    "synthetic_authored": 28
+  },
+  "limitations": [
+    "Static promotion readiness only; conflict_recheck_status=not_run.",
+    "Kind comparison uses captured taxonomy; no classifier is executed.",
+    "Retention comparison measures promotion readiness, not capture rejection.",
+    "A blocked promotion does not establish an epistemic abstention or review requirement.",
+    "No dogfood precision, factual accuracy, calibration, or rollout gates are claimed.",
+    "Synthetic judgments are authored expectations. They are not human dogfood labels."
+  ],
+  "manifest_digest": "8e3844fc6c20469b3638af7a7ab321f56d38775c90e74789d52b21a49c5d132c",
+  "operational_observations": {
+    "blockers": {
+      "age": 1,
+      "confidence": 10,
+      "conflict": 1,
+      "evidence_inconsistent": 1,
+      "evidence_score": 1,
+      "external_dispute": 1,
+      "kind_policy": 5,
+      "missing_source_prior": 1,
+      "no_retention_evidence": 2,
+      "retention_disposition": 2
+    },
+    "current_job_state": {
+      "missing": 27,
+      "scheduled": 1
+    },
+    "current_policy_version": {
+      "none": 10,
+      "promotion-evidence-v1": 17,
+      "promotion-legacy-v1": 1
+    },
+    "current_selected_lane": {
+      "legacy_confidence": 1,
+      "none": 10,
+      "retention_evidence": 17
+    },
+    "evidence_state": {
+      "bound-below-threshold": 1,
+      "bound-qualified": 23,
+      "malformed/stale": 1,
+      "none": 3
+    },
+    "kind": {
+      "decision": 2,
+      "diary_entry": 1,
+      "doctrine": 1,
+      "fact": 11,
+      "invariant": 1,
+      "observation": 4,
+      "preference": 2,
+      "procedure": 4,
+      "summary": 2
+    },
+    "malformed_evidence_count": 1,
+    "population_count": 28,
+    "readiness_state": {
+      "below_evidence_threshold": 1,
+      "blocked_by_conflict_or_dispute": 2,
+      "blocked_by_kind_policy": 5,
+      "cooling": 1,
+      "eligible_now": 15,
+      "malformed_or_stale_evidence": 1,
+      "missing_evidence": 2,
+      "not_a_promotion_candidate": 1
+    },
+    "selected_count": 28,
+    "source_type": {
+      "extraction": 27,
+      "manual": 1
+    },
+    "terminal_under_current_policy": {
+      "False": 16,
+      "True": 12
+    },
+    "unknown_policy_count": 0,
+    "would_promote": {
+      "False": 13,
+      "True": 15
+    }
+  },
+  "policy_versions_evaluated": [
+    "promotion-legacy-v1",
+    "promotion-evidence-v1"
+  ],
+  "report_version": "engram-admission-baseline-v1",
+  "runner_digest": "7d75fbf9774c312860dcde7a901e5413347c3ffafbba3b932ef1d3343e2a3ea4",
+  "snapshot_as_of": "2026-09-04T00:00:00+00:00"
+}
