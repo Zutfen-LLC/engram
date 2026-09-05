@@ -43,6 +43,7 @@ class VolatileEntry:
     confidence: float | None = None
     reason: str | None = None
     workspace: str | None = None
+    extraction_request: dict[str, Any] | None = None
 
     def to_json_line(self) -> str:
         """Serialize to a single JSON-Lines record (no trailing newline)."""
@@ -115,6 +116,7 @@ class VolatileStore:
         """
         tmp = self._path.with_suffix(self._path.suffix + ".tmp")
         with tmp.open("w", encoding="utf-8") as fh:
+            os.chmod(tmp, 0o600)
             for entry in entries:
                 fh.write(entry.to_json_line())
                 fh.write("\n")

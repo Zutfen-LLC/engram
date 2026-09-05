@@ -105,3 +105,7 @@ __all__ = [
     "ContextReceiptVerificationCheck",
     "ContextReceiptVerifyResponse",
 ]
+
+from .extraction import ExtractionMessage, ExtractRequest, ExtractResponse
+
+__all__ += ["ExtractRequest", "ExtractResponse", "ExtractionMessage"]

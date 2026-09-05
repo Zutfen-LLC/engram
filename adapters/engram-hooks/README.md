@@ -368,3 +368,24 @@ Routing mirrors [design.md](../../../docs/design.md) §4 source-trust defaults:
 - [Engram REST API](../../../engram/api) — server-side route definitions.
 - [Design doc](../../../docs/design.md) — trust model (§4) and what is/isn't in
   the service (§5).
+
+## Structured extraction flag
+
+Set `ENGRAM_HOOKS_STRUCTURED_EXTRACTION=true` to send lifecycle messages to
+`POST /v1/extract`. The default is false. Reload Hermes after changing the flag.
+The server uses its configured classification provider for extraction.
+
+The hook preserves roles, message IDs, tool names, timestamps, and authorized
+source references. Missing roles remain unknown. The local guard runs before
+network submission. New writes report `written_proposed`. These writes do not
+mean promotion or admission.
+
+On provider or server failure, the volatile store retains the structured
+request and its retry key. Replay the request with that key to resolve an
+unknown commit result. Low-retention candidates also use the volatile store.
+Set the flag to false to restore the existing classifier pipeline.
+
+For example, a user message that says "I no longer prefer dark mode" and an
+assistant inference remain separate attributed candidates. The candidates
+share a batch evidence root. Tool output and assistant interpretation also
+share that root. The root does not prove independent corroboration.

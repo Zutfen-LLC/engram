@@ -28,6 +28,7 @@ _MEMORY_ITEM_READ_ROUTES = {
 _PROFILE_ENFORCED_MUTATIONS = {
     ("POST", "/v1/remember"),
     ("POST", "/v1/classify"),
+    ("POST", "/v1/extract"),
     ("POST", "/v1/kg"),
     ("POST", "/v1/kg/invalidate"),
     ("POST", "/v1/diary"),
@@ -57,6 +58,7 @@ _EXPLICITLY_UNAFFECTED_GET_ROUTES = {
     # ENG-CONTEXT-003A: receipt inspect/verify read receipts, not memory
     # items. The memory-context dependency is used for profile narrowing
     # (which receipts the caller may see), not for item-level read scoping.
+    ("GET", "/v1/extract/{run_id}"),
     ("GET", "/v1/context-receipts"),
     ("GET", "/v1/context-receipts/{receipt_id}"),
     ("GET", "/v1/context-receipts/{receipt_id}/verify"),

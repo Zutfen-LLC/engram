@@ -196,6 +196,10 @@ class HooksConfig:
         default_factory=lambda: _env_int("ENGRAM_HOOKS_RECALL_MAX_SESSIONS", 512)
     )
 
+    structured_extraction: bool = field(
+        default_factory=lambda: _env_bool("ENGRAM_HOOKS_STRUCTURED_EXTRACTION", False)
+    )
+
     def __post_init__(self) -> None:
         import os
 

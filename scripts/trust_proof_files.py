@@ -200,7 +200,8 @@ CONTEXT_RECEIPT_DARK_WRITE_PROOFS = (
 
 # ── Canonical aggregate ─────────────────────────────────────────────
 TRUST_PROOF_FILES: tuple[str, ...] = (
-    SCOPE_PROOFS
+    ("tests/test_extraction.py", "tests/test_extraction_migration.py")
+    + SCOPE_PROOFS
     + RLS_PROOFS
     + SUPERSEDE_PROOFS
     + RANKING_PROOFS

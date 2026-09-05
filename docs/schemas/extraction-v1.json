@@ -1,0 +1,746 @@
+{
+  "request": {
+    "$defs": {
+      "ExtractionMessage": {
+        "additionalProperties": false,
+        "properties": {
+          "message_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Message Id",
+            "type": "string"
+          },
+          "role": {
+            "default": "unknown",
+            "enum": [
+              "user",
+              "assistant",
+              "system",
+              "tool",
+              "unknown"
+            ],
+            "title": "Role",
+            "type": "string"
+          },
+          "content": {
+            "maxLength": 16000,
+            "minLength": 1,
+            "title": "Content",
+            "type": "string"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Created At"
+          },
+          "tool_name": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Tool Name"
+          },
+          "source_uri": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Source Uri"
+          }
+        },
+        "required": [
+          "message_id",
+          "content"
+        ],
+        "title": "ExtractionMessage",
+        "type": "object"
+      }
+    },
+    "additionalProperties": false,
+    "properties": {
+      "messages": {
+        "items": {
+          "$ref": "#/$defs/ExtractionMessage"
+        },
+        "maxItems": 64,
+        "minItems": 1,
+        "title": "Messages",
+        "type": "array"
+      },
+      "source_type": {
+        "default": "extraction",
+        "enum": [
+          "sync_turn",
+          "pre_compress",
+          "session_end",
+          "extraction"
+        ],
+        "title": "Source Type",
+        "type": "string"
+      },
+      "workspace": {
+        "anyOf": [
+          {
+            "maxLength": 128,
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Workspace"
+      },
+      "visibility": {
+        "anyOf": [
+          {
+            "enum": [
+              "private",
+              "workspace",
+              "tenant",
+              "public"
+            ],
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Visibility"
+      },
+      "mode": {
+        "default": "preview",
+        "enum": [
+          "preview",
+          "write_proposed"
+        ],
+        "title": "Mode",
+        "type": "string"
+      },
+      "idempotency_key": {
+        "anyOf": [
+          {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Idempotency Key"
+      }
+    },
+    "required": [
+      "messages"
+    ],
+    "title": "ExtractRequest",
+    "type": "object"
+  },
+  "response": {
+    "$defs": {
+      "EvidenceMessage": {
+        "additionalProperties": false,
+        "properties": {
+          "message_id": {
+            "title": "Message Id",
+            "type": "string"
+          },
+          "role": {
+            "enum": [
+              "user",
+              "assistant",
+              "system",
+              "tool",
+              "unknown"
+            ],
+            "title": "Role",
+            "type": "string"
+          },
+          "input_hash": {
+            "title": "Input Hash",
+            "type": "string"
+          },
+          "character_count": {
+            "title": "Character Count",
+            "type": "integer"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Created At"
+          },
+          "tool_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Tool Name"
+          },
+          "source_uri": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Source Uri"
+          }
+        },
+        "required": [
+          "message_id",
+          "role",
+          "input_hash",
+          "character_count"
+        ],
+        "title": "EvidenceMessage",
+        "type": "object"
+      },
+      "EvidenceSpan": {
+        "additionalProperties": false,
+        "properties": {
+          "message_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Message Id",
+            "type": "string"
+          },
+          "start": {
+            "minimum": 0,
+            "title": "Start",
+            "type": "integer"
+          },
+          "end": {
+            "exclusiveMinimum": 0,
+            "title": "End",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "message_id",
+          "start",
+          "end"
+        ],
+        "title": "EvidenceSpan",
+        "type": "object"
+      },
+      "ExtractionCandidate": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "maxLength": 4000,
+            "minLength": 1,
+            "title": "Content",
+            "type": "string"
+          },
+          "suggested_kind": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Suggested Kind",
+            "type": "string"
+          },
+          "suggested_wing": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Suggested Wing"
+          },
+          "suggested_room": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Suggested Room"
+          },
+          "subject": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Subject"
+          },
+          "taxonomy_confidence": {
+            "maximum": 0.95,
+            "minimum": 0,
+            "title": "Taxonomy Confidence",
+            "type": "number"
+          },
+          "retention_confidence": {
+            "maximum": 0.95,
+            "minimum": 0,
+            "title": "Retention Confidence",
+            "type": "number"
+          },
+          "retention_disposition": {
+            "enum": [
+              "retain",
+              "transient",
+              "noise",
+              "uncertain"
+            ],
+            "title": "Retention Disposition",
+            "type": "string"
+          },
+          "assertion_mode": {
+            "enum": [
+              "direct_statement",
+              "tool_observation",
+              "quoted_source",
+              "derived_summary",
+              "inference",
+              "unknown"
+            ],
+            "title": "Assertion Mode",
+            "type": "string"
+          },
+          "evidence": {
+            "items": {
+              "$ref": "#/$defs/EvidenceSpan"
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "title": "Evidence",
+            "type": "array"
+          },
+          "source_cues": {
+            "items": {
+              "$ref": "#/$defs/SourceCue"
+            },
+            "maxItems": 16,
+            "title": "Source Cues",
+            "type": "array"
+          },
+          "reason_codes": {
+            "items": {
+              "enum": [
+                "durable",
+                "ephemeral",
+                "uncertain",
+                "no_memory",
+                "duplicate",
+                "unsafe",
+                "unsupported"
+              ],
+              "type": "string"
+            },
+            "maxItems": 8,
+            "title": "Reason Codes",
+            "type": "array"
+          },
+          "candidate_id": {
+            "format": "uuid",
+            "title": "Candidate Id",
+            "type": "string"
+          },
+          "content_hash": {
+            "title": "Content Hash",
+            "type": "string"
+          },
+          "asserting_role": {
+            "enum": [
+              "user",
+              "assistant",
+              "system",
+              "tool",
+              "unknown"
+            ],
+            "title": "Asserting Role",
+            "type": "string"
+          },
+          "asserting_principal_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Asserting Principal Id"
+          },
+          "asserting_tool": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Asserting Tool"
+          },
+          "attribution_basis": {
+            "const": "caller_supplied_roles",
+            "default": "caller_supplied_roles",
+            "title": "Attribution Basis",
+            "type": "string"
+          },
+          "evidence_root": {
+            "title": "Evidence Root",
+            "type": "string"
+          },
+          "evidence_root_basis": {
+            "const": "input_batch",
+            "default": "input_batch",
+            "title": "Evidence Root Basis",
+            "type": "string"
+          },
+          "outcome": {
+            "enum": [
+              "written",
+              "deduped",
+              "rejected",
+              "abstained",
+              "volatile_recommended",
+              "error",
+              "preview"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "outcome_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Outcome Reason"
+          },
+          "memory_item_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Memory Item Id"
+          },
+          "ingest_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Ingest Id"
+          }
+        },
+        "required": [
+          "content",
+          "suggested_kind",
+          "taxonomy_confidence",
+          "retention_confidence",
+          "retention_disposition",
+          "assertion_mode",
+          "evidence",
+          "candidate_id",
+          "content_hash",
+          "asserting_role",
+          "evidence_root",
+          "outcome"
+        ],
+        "title": "ExtractionCandidate",
+        "type": "object"
+      },
+      "ExtractionReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "schema_version": {
+            "const": "engram.extraction.v1",
+            "default": "engram.extraction.v1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "prompt_version": {
+            "default": "engram.extract.3",
+            "title": "Prompt Version",
+            "type": "string"
+          },
+          "run_id": {
+            "format": "uuid",
+            "title": "Run Id",
+            "type": "string"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          },
+          "principal_id": {
+            "format": "uuid",
+            "title": "Principal Id",
+            "type": "string"
+          },
+          "workspace_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace Id"
+          },
+          "memory_profile_revision_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Profile Revision Id"
+          },
+          "source_type": {
+            "title": "Source Type",
+            "type": "string"
+          },
+          "visibility": {
+            "title": "Visibility",
+            "type": "string"
+          },
+          "mode": {
+            "enum": [
+              "preview",
+              "write_proposed"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "input_hash": {
+            "title": "Input Hash",
+            "type": "string"
+          },
+          "evidence_root": {
+            "title": "Evidence Root",
+            "type": "string"
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/$defs/EvidenceMessage"
+            },
+            "title": "Messages",
+            "type": "array"
+          },
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "provider_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Provider Model"
+          },
+          "input_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Input Tokens"
+          },
+          "output_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Output Tokens"
+          },
+          "provider_cost_usd": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Provider Cost Usd"
+          },
+          "latency_ms": {
+            "title": "Latency Ms",
+            "type": "integer"
+          },
+          "reason_codes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Reason Codes",
+            "type": "array"
+          },
+          "candidates": {
+            "items": {
+              "$ref": "#/$defs/ExtractionCandidate"
+            },
+            "title": "Candidates",
+            "type": "array"
+          }
+        },
+        "required": [
+          "run_id",
+          "tenant_id",
+          "principal_id",
+          "workspace_id",
+          "memory_profile_revision_id",
+          "source_type",
+          "visibility",
+          "mode",
+          "input_hash",
+          "evidence_root",
+          "messages",
+          "provider",
+          "model",
+          "latency_ms",
+          "reason_codes",
+          "candidates"
+        ],
+        "title": "ExtractionReceipt",
+        "type": "object"
+      },
+      "SourceCue": {
+        "additionalProperties": false,
+        "properties": {
+          "cue_type": {
+            "enum": [
+              "temporal",
+              "scope",
+              "security",
+              "qualification",
+              "negation"
+            ],
+            "title": "Cue Type",
+            "type": "string"
+          },
+          "evidence": {
+            "$ref": "#/$defs/EvidenceSpan"
+          },
+          "value": {
+            "default": "",
+            "maxLength": 512,
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "cue_type",
+          "evidence"
+        ],
+        "title": "SourceCue",
+        "type": "object"
+      }
+    },
+    "additionalProperties": false,
+    "properties": {
+      "receipt": {
+        "$ref": "#/$defs/ExtractionReceipt"
+      },
+      "receipt_hash": {
+        "title": "Receipt Hash",
+        "type": "string"
+      }
+    },
+    "required": [
+      "receipt",
+      "receipt_hash"
+    ],
+    "title": "ExtractResponse",
+    "type": "object"
+  }
+}

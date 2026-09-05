@@ -151,10 +151,19 @@ class HookResult:
     event: str
     extracted: int = 0
     rejected: int = 0
-    promoted: int = 0       # compatibility counter: remembered as proposed
+    written_proposed: int = 0
     parked: int = 0         # parked in the local volatile store
     errors: int = 0
     details: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def promoted(self) -> int:
+        """Compatibility alias for proposed writes. This does not mean admission."""
+        return self.written_proposed
+
+    @promoted.setter
+    def promoted(self, value: int) -> None:
+        self.written_proposed = value
 
     @property
     def remembered(self) -> int:
@@ -211,7 +220,9 @@ class LifecycleHooks:
             )
             return None
         self._client = engram_client.EngramClient(
-            self.config.base_url, self.config.api_key, timeout=self.config.timeout
+            self.config.base_url, self.config.api_key,
+            timeout=max(45.0, self.config.timeout) if self.config.structured_extraction
+            else self.config.timeout
         )
         return self._client
 
@@ -422,6 +433,14 @@ class LifecycleHooks:
         :data:`~engram_hooks.config.EVENT_HOOK_MAP`). ``payload`` is whatever
         Hermes passed. Returns a :class:`HookResult` summarizing the routing.
         """
+        if self.config.structured_extraction:
+            try:
+                return await self._run_structured(event, payload)
+            except ValueError:
+                return HookResult(
+                    event=event, rejected=1,
+                    details=[{"route": "rejected", "reason": "invalid_structured_payload"}],
+                )
         start = time.monotonic()
         source_type = self.config.source_type_for(event)
         candidates = self._extract_candidates(payload)
@@ -444,7 +463,7 @@ class LifecycleHooks:
                 if detail.get("guard_rejected"):
                     guard_rejected += 1
             elif route == "remembered":
-                result.promoted += 1
+                result.written_proposed += 1
             elif route == "parked":
                 result.parked += 1
             if detail.get("classified"):
@@ -476,6 +495,114 @@ class LifecycleHooks:
                 candidate_bytes=candidate_bytes,
                 latency_ms=round((time.monotonic() - start) * 1000),
             )
+        return result
+
+    async def _run_structured(self, event: str, payload: Any) -> HookResult:
+        """Keep role and message boundaries through extraction and volatile fallback."""
+        import hashlib
+        import json
+
+        from engram_client import EngramHTTPError, ExtractionMessage, ExtractRequest
+
+        from .guards import has_extraction_secrets
+
+        result = HookResult(event=event)
+        raw = payload.get("messages", [payload]) if isinstance(payload, dict) else payload
+        if not isinstance(raw, list):
+            raw = [raw]
+        messages = []
+        for index, entry in enumerate(raw):
+            data = entry if isinstance(entry, dict) else {"content": entry}
+            if any(has_extraction_secrets(value) for value in data.values()
+                   if isinstance(value, str)):
+                result.rejected += 1
+                result.details.append({"route": "rejected", "reason": "secrets"})
+                return result
+            content = data.get("content") or data.get("text") or data.get("summary")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            verdict = prepare_memory_write_guard(content)
+            if not is_allowed(verdict):
+                result.rejected += 1
+                return result
+            role = data.get("role", "unknown")
+            if role not in {"user", "assistant", "tool", "system", "unknown"}:
+                role = "unknown"
+            message_id = data.get("message_id") or data.get("id")
+            if not message_id:
+                message_id = hashlib.sha256(
+                    f"{index}:{role}:{content}".encode()
+                ).hexdigest()
+            messages.append(ExtractionMessage(
+                message_id=str(message_id), role=role, content=content,
+                created_at=data.get("created_at"), tool_name=data.get("tool_name"),
+                source_uri=data.get("source_uri"),
+            ))
+        if not messages:
+            return result
+        source_type = self.config.source_type_for(event)
+        identity = json.dumps({
+            "messages": [m.model_dump(mode="json") for m in messages],
+            "source_type": source_type, "workspace": self.config.default_workspace,
+        }, sort_keys=True)
+        request = ExtractRequest(
+            messages=messages, source_type=source_type, workspace=self.config.default_workspace,
+            mode="write_proposed", idempotency_key=hashlib.sha256(identity.encode()).hexdigest(),
+        )
+        try:
+            client = self._get_client()
+            if client is None:
+                raise RuntimeError("extraction client unavailable")
+            response = await client.extract(request)
+        except EngramHTTPError as exc:
+            if exc.status_code < 500:
+                result.rejected += len(messages)
+                result.details.append({"route": "rejected", "reason": "request_rejected"})
+                return result
+            return self._park_extraction_failure(event, request, messages, result)
+        except Exception:
+            return self._park_extraction_failure(event, request, messages, result)
+        result.extracted = len(response.receipt.candidates)
+        for candidate in response.receipt.candidates:
+            outcome = candidate.outcome
+            if outcome == "written":
+                result.written_proposed += 1
+            elif outcome == "rejected":
+                result.rejected += 1
+            elif outcome in {"volatile_recommended", "error"}:
+                self.volatile.add(VolatileEntry(
+                    content=candidate.content, source_type=source_type,
+                    reason=candidate.outcome_reason, workspace=self.config.default_workspace,
+                    extraction_request=request.model_dump(mode="json"),
+                ))
+                result.parked += 1
+                if outcome == "error":
+                    result.errors += 1
+            result.details.append({
+                "route": "written_proposed" if outcome == "written" else outcome,
+                "candidate_id": str(candidate.candidate_id),
+                "memory_item_id": (
+                    str(candidate.memory_item_id) if candidate.memory_item_id else None
+                ),
+                "assertion_mode": candidate.assertion_mode,
+                "evidence_root": candidate.evidence_root,
+                "receipt_hash": response.receipt_hash,
+            })
+        return result
+
+    def _park_extraction_failure(
+        self, event: str, request: Any, messages: list[Any], result: HookResult,
+    ) -> HookResult:
+        source_type = self.config.source_type_for(event)
+        # Keep the exact request and retry key. Do not claim a durable write after a timeout.
+        self.volatile.add(VolatileEntry(
+            content="\n".join(m.content for m in messages), source_type=source_type,
+            reason="extraction_unavailable", workspace=self.config.default_workspace,
+            extraction_request=request.model_dump(mode="json"),
+        ))
+        result.parked += 1
+        result.errors += 1
+        result.details.append({"route": "parked", "reason": "extraction_unavailable"})
         return result
 
     async def _report_lifecycle_summary(
