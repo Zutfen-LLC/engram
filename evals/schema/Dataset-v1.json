@@ -1,0 +1,1102 @@
+{
+  "$defs": {
+    "ConfigSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "auto_promote_confidence_threshold": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Auto Promote Confidence Threshold",
+          "type": "number"
+        },
+        "auto_promote_enabled": {
+          "title": "Auto Promote Enabled",
+          "type": "boolean"
+        },
+        "auto_promote_evidence_enabled": {
+          "title": "Auto Promote Evidence Enabled",
+          "type": "boolean"
+        },
+        "auto_promote_evidence_threshold": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Auto Promote Evidence Threshold",
+          "type": "number"
+        },
+        "auto_promote_min_age_hours": {
+          "minimum": 0,
+          "title": "Auto Promote Min Age Hours",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "auto_promote_enabled",
+        "auto_promote_confidence_threshold",
+        "auto_promote_min_age_hours",
+        "auto_promote_evidence_enabled",
+        "auto_promote_evidence_threshold"
+      ],
+      "title": "ConfigSnapshot",
+      "type": "object"
+    },
+    "Dimensions": {
+      "additionalProperties": false,
+      "properties": {
+        "acceptable_abstention": {
+          "enum": [
+            "yes",
+            "no",
+            "unknown"
+          ],
+          "title": "Acceptable Abstention",
+          "type": "string"
+        },
+        "assertion_origin": {
+          "enum": [
+            "direct_user",
+            "agent_inference",
+            "unknown",
+            "unavailable"
+          ],
+          "title": "Assertion Origin",
+          "type": "string"
+        },
+        "atomic": {
+          "enum": [
+            "yes",
+            "no",
+            "unknown"
+          ],
+          "title": "Atomic",
+          "type": "string"
+        },
+        "attribution": {
+          "enum": [
+            "adequate",
+            "inadequate",
+            "unknown",
+            "unavailable",
+            "not_applicable"
+          ],
+          "title": "Attribution",
+          "type": "string"
+        },
+        "conflict_expected": {
+          "enum": [
+            "yes",
+            "no",
+            "unknown"
+          ],
+          "title": "Conflict Expected",
+          "type": "string"
+        },
+        "consequence": {
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "unknown"
+          ],
+          "title": "Consequence",
+          "type": "string"
+        },
+        "dispute_expected": {
+          "enum": [
+            "yes",
+            "no",
+            "unknown"
+          ],
+          "title": "Dispute Expected",
+          "type": "string"
+        },
+        "epistemic_state": {
+          "enum": [
+            "adequately_supported",
+            "weakly_supported",
+            "contradicted",
+            "contested",
+            "ambiguous",
+            "unverifiable",
+            "unknown"
+          ],
+          "title": "Epistemic State",
+          "type": "string"
+        },
+        "evidence_independence": {
+          "enum": [
+            "known_independent",
+            "known_shared_root",
+            "unknown"
+          ],
+          "title": "Evidence Independence",
+          "type": "string"
+        },
+        "evidence_span": {
+          "enum": [
+            "adequate",
+            "inadequate",
+            "unknown",
+            "unavailable",
+            "not_applicable"
+          ],
+          "title": "Evidence Span",
+          "type": "string"
+        },
+        "expected_blockers": {
+          "anyOf": [
+            {
+              "items": {
+                "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Expected Blockers"
+        },
+        "expected_governed_semantic_eligibility": {
+          "enum": [
+            "yes",
+            "no",
+            "unknown"
+          ],
+          "title": "Expected Governed Semantic Eligibility",
+          "type": "string"
+        },
+        "expected_kind": {
+          "enum": [
+            "preference",
+            "fact",
+            "observation",
+            "decision",
+            "procedure",
+            "summary",
+            "doctrine",
+            "invariant",
+            "diary_entry",
+            "unknown"
+          ],
+          "title": "Expected Kind",
+          "type": "string"
+        },
+        "expected_next_action": {
+          "enum": [
+            "automatic_admission",
+            "review",
+            "wait",
+            "reject",
+            "unknown"
+          ],
+          "title": "Expected Next Action",
+          "type": "string"
+        },
+        "expected_scope": {
+          "enum": [
+            "private",
+            "workspace",
+            "tenant",
+            "unknown"
+          ],
+          "title": "Expected Scope",
+          "type": "string"
+        },
+        "expected_startup_eligibility": {
+          "enum": [
+            "yes",
+            "no",
+            "unknown"
+          ],
+          "title": "Expected Startup Eligibility",
+          "type": "string"
+        },
+        "expected_storage_disposition": {
+          "enum": [
+            "retain",
+            "reject",
+            "defer",
+            "unknown"
+          ],
+          "title": "Expected Storage Disposition",
+          "type": "string"
+        },
+        "expected_subject_or_domain": {
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+          "title": "Expected Subject Or Domain",
+          "type": "string"
+        },
+        "factual_outcome": {
+          "anyOf": [
+            {
+              "enum": [
+                "verified_correct",
+                "verified_incorrect",
+                "became_outdated",
+                "not_verifiable",
+                "not_yet_known"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Factual Outcome"
+        },
+        "human_review_required": {
+          "enum": [
+            "yes",
+            "no",
+            "unknown"
+          ],
+          "title": "Human Review Required",
+          "type": "string"
+        },
+        "proposition_count": {
+          "enum": [
+            "zero",
+            "one",
+            "multiple",
+            "unknown"
+          ],
+          "title": "Proposition Count",
+          "type": "string"
+        },
+        "retention_value": {
+          "enum": [
+            "retain",
+            "do_not_retain",
+            "uncertain"
+          ],
+          "title": "Retention Value",
+          "type": "string"
+        },
+        "scope_visibility_concern": {
+          "enum": [
+            "yes",
+            "no",
+            "unknown"
+          ],
+          "title": "Scope Visibility Concern",
+          "type": "string"
+        },
+        "source_span": {
+          "enum": [
+            "adequate",
+            "inadequate",
+            "unknown",
+            "unavailable",
+            "not_applicable"
+          ],
+          "title": "Source Span",
+          "type": "string"
+        },
+        "supersession_expected": {
+          "enum": [
+            "yes",
+            "no",
+            "unknown"
+          ],
+          "title": "Supersession Expected",
+          "type": "string"
+        },
+        "temporal_validity_issue": {
+          "enum": [
+            "yes",
+            "no",
+            "unknown"
+          ],
+          "title": "Temporal Validity Issue",
+          "type": "string"
+        }
+      },
+      "required": [
+        "atomic",
+        "proposition_count",
+        "attribution",
+        "source_span",
+        "evidence_span",
+        "assertion_origin",
+        "expected_kind",
+        "expected_subject_or_domain",
+        "expected_scope",
+        "retention_value",
+        "epistemic_state",
+        "factual_outcome",
+        "consequence",
+        "expected_storage_disposition",
+        "expected_startup_eligibility",
+        "expected_governed_semantic_eligibility",
+        "human_review_required",
+        "acceptable_abstention",
+        "conflict_expected",
+        "dispute_expected",
+        "supersession_expected",
+        "temporal_validity_issue",
+        "scope_visibility_concern",
+        "evidence_independence",
+        "expected_blockers",
+        "expected_next_action"
+      ],
+      "title": "Dimensions",
+      "type": "object"
+    },
+    "HumanJudgment": {
+      "additionalProperties": false,
+      "properties": {
+        "adjudicated_at": {
+          "format": "date-time",
+          "title": "Adjudicated At",
+          "type": "string"
+        },
+        "adjudicator_confidence": {
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "unknown"
+          ],
+          "title": "Adjudicator Confidence",
+          "type": "string"
+        },
+        "adjudicator_ref": {
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+          "title": "Adjudicator Ref",
+          "type": "string"
+        },
+        "dimensions": {
+          "$ref": "#/$defs/Dimensions"
+        },
+        "reason_code": {
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+          "title": "Reason Code",
+          "type": "string"
+        },
+        "usefulness": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Usefulness"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "adjudicator_ref",
+        "adjudicated_at",
+        "adjudicator_confidence",
+        "reason_code",
+        "dimensions"
+      ],
+      "title": "HumanJudgment",
+      "type": "object"
+    },
+    "LabelRecord": {
+      "additionalProperties": false,
+      "properties": {
+        "content_hash": {
+          "anyOf": [
+            {
+              "pattern": "^(sha256:)?[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Content Hash"
+        },
+        "dataset_id": {
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+          "title": "Dataset Id",
+          "type": "string"
+        },
+        "dataset_version": {
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+          "title": "Dataset Version",
+          "type": "string"
+        },
+        "disagreement": {
+          "enum": [
+            "none",
+            "unresolved",
+            "resolved"
+          ],
+          "title": "Disagreement",
+          "type": "string"
+        },
+        "fixture_role": {
+          "enum": [
+            "ordinary_claim",
+            "stale_claim",
+            "incorrect_claim",
+            "ambiguous_claim",
+            "contested_claim",
+            "conflict_peer",
+            "distractor",
+            "adversarial",
+            "non_propositional"
+          ],
+          "title": "Fixture Role",
+          "type": "string"
+        },
+        "label_origin": {
+          "enum": [
+            "synthetic_authored",
+            "human_adjudicated"
+          ],
+          "title": "Label Origin",
+          "type": "string"
+        },
+        "label_schema_version": {
+          "const": "engram-admission-label-v1",
+          "title": "Label Schema Version",
+          "type": "string"
+        },
+        "resolution": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HumanJudgment"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reviewer_a": {
+          "$ref": "#/$defs/HumanJudgment"
+        },
+        "reviewer_b": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HumanJudgment"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sample_id": {
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+          "title": "Sample Id",
+          "type": "string"
+        },
+        "source_sample_ref": {
+          "anyOf": [
+            {
+              "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Sample Ref"
+        }
+      },
+      "required": [
+        "sample_id",
+        "label_schema_version",
+        "dataset_id",
+        "dataset_version",
+        "fixture_role",
+        "label_origin",
+        "reviewer_a",
+        "reviewer_b",
+        "resolution",
+        "disagreement"
+      ],
+      "title": "LabelRecord",
+      "type": "object"
+    },
+    "Manifest": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_use": {
+          "const": "evaluation_only",
+          "title": "Allowed Use",
+          "type": "string"
+        },
+        "code_sha": {
+          "pattern": "^[0-9a-f]{40}$",
+          "title": "Code Sha",
+          "type": "string"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "data_digest": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Data Digest",
+          "type": "string"
+        },
+        "dataset_id": {
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+          "title": "Dataset Id",
+          "type": "string"
+        },
+        "dataset_version": {
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+          "title": "Dataset Version",
+          "type": "string"
+        },
+        "eligible_population_count": {
+          "minimum": 0,
+          "title": "Eligible Population Count",
+          "type": "integer"
+        },
+        "label_schema_version": {
+          "const": "engram-admission-label-v1",
+          "title": "Label Schema Version",
+          "type": "string"
+        },
+        "manifest_schema_version": {
+          "const": "engram-eval-dataset-manifest-v1",
+          "title": "Manifest Schema Version",
+          "type": "string"
+        },
+        "privacy_class": {
+          "enum": [
+            "public_synthetic",
+            "sanitized_fixture",
+            "private_dogfood",
+            "private_incident"
+          ],
+          "title": "Privacy Class",
+          "type": "string"
+        },
+        "sample_content_hashes": {
+          "items": {
+            "pattern": "^(sha256:)?[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "title": "Sample Content Hashes",
+          "type": "array"
+        },
+        "sample_count": {
+          "minimum": 0,
+          "title": "Sample Count",
+          "type": "integer"
+        },
+        "sample_ids": {
+          "items": {
+            "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+            "type": "string"
+          },
+          "title": "Sample Ids",
+          "type": "array"
+        },
+        "sampling": {
+          "$ref": "#/$defs/Sampling"
+        },
+        "snapshot_as_of": {
+          "format": "date-time",
+          "title": "Snapshot As Of",
+          "type": "string"
+        },
+        "source_class": {
+          "enum": [
+            "synthetic",
+            "dogfood",
+            "incident",
+            "sanitized"
+          ],
+          "title": "Source Class",
+          "type": "string"
+        },
+        "stratum_counts": {
+          "items": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              }
+            ],
+            "type": "array"
+          },
+          "title": "Stratum Counts",
+          "type": "array"
+        }
+      },
+      "required": [
+        "manifest_schema_version",
+        "dataset_id",
+        "dataset_version",
+        "label_schema_version",
+        "created_at",
+        "snapshot_as_of",
+        "source_class",
+        "code_sha",
+        "sample_count",
+        "eligible_population_count",
+        "allowed_use",
+        "privacy_class",
+        "sampling",
+        "sample_ids",
+        "sample_content_hashes",
+        "data_digest",
+        "stratum_counts"
+      ],
+      "title": "Manifest",
+      "type": "object"
+    },
+    "PolicyInput": {
+      "additionalProperties": false,
+      "properties": {
+        "conflict_resolution_status": {
+          "anyOf": [
+            {
+              "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Conflict Resolution Status"
+        },
+        "content_hash": {
+          "pattern": "^(sha256:)?[0-9a-f]{64}$",
+          "title": "Content Hash",
+          "type": "string"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "external_dispute": {
+          "title": "External Dispute",
+          "type": "boolean"
+        },
+        "external_noise": {
+          "title": "External Noise",
+          "type": "boolean"
+        },
+        "job_state": {
+          "enum": [
+            "missing",
+            "scheduled",
+            "overdue",
+            "dead",
+            "unknown"
+          ],
+          "title": "Job State",
+          "type": "string"
+        },
+        "kind": {
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+          "title": "Kind",
+          "type": "string"
+        },
+        "kind_auto_promote": {
+          "title": "Kind Auto Promote",
+          "type": "boolean"
+        },
+        "kind_enabled": {
+          "title": "Kind Enabled",
+          "type": "boolean"
+        },
+        "live": {
+          "title": "Live",
+          "type": "boolean"
+        },
+        "memory_confidence": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Memory Confidence",
+          "type": "number"
+        },
+        "recalled": {
+          "enum": [
+            "yes",
+            "no",
+            "unknown"
+          ],
+          "title": "Recalled",
+          "type": "string"
+        },
+        "receipt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Receipt"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retention_confidence": {
+          "anyOf": [
+            {
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Retention Confidence"
+        },
+        "retention_disposition": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Retention Disposition"
+        },
+        "retention_evidence_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Retention Evidence At"
+        },
+        "review_status": {
+          "enum": [
+            "active",
+            "proposed",
+            "rejected",
+            "archived",
+            "disputed"
+          ],
+          "title": "Review Status",
+          "type": "string"
+        },
+        "sample_id": {
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+          "title": "Sample Id",
+          "type": "string"
+        },
+        "source_confidence_prior": {
+          "anyOf": [
+            {
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source Confidence Prior"
+        },
+        "source_type": {
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+          "title": "Source Type",
+          "type": "string"
+        },
+        "superseded": {
+          "title": "Superseded",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "sample_id",
+        "content_hash",
+        "source_type",
+        "kind",
+        "review_status",
+        "created_at",
+        "memory_confidence",
+        "source_confidence_prior",
+        "retention_confidence",
+        "retention_disposition",
+        "retention_evidence_at",
+        "conflict_resolution_status",
+        "live",
+        "superseded",
+        "kind_enabled",
+        "kind_auto_promote",
+        "external_dispute",
+        "external_noise",
+        "receipt",
+        "job_state",
+        "recalled"
+      ],
+      "title": "PolicyInput",
+      "type": "object"
+    },
+    "Receipt": {
+      "additionalProperties": false,
+      "properties": {
+        "binding_matches": {
+          "title": "Binding Matches",
+          "type": "boolean"
+        },
+        "bound_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Bound At"
+        },
+        "classification_version": {
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+          "title": "Classification Version",
+          "type": "string"
+        },
+        "content_hash": {
+          "pattern": "^(sha256:)?[0-9a-f]{64}$",
+          "title": "Content Hash",
+          "type": "string"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "retention_confidence": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Retention Confidence",
+          "type": "number"
+        },
+        "retention_disposition": {
+          "enum": [
+            "retain",
+            "transient",
+            "noise",
+            "uncertain"
+          ],
+          "title": "Retention Disposition",
+          "type": "string"
+        },
+        "retention_policy_version": {
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+          "title": "Retention Policy Version",
+          "type": "string"
+        },
+        "source_type": {
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+          "title": "Source Type",
+          "type": "string"
+        },
+        "suggested_kind": {
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+          "title": "Suggested Kind",
+          "type": "string"
+        },
+        "taxonomy_confidence": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Taxonomy Confidence",
+          "type": "number"
+        }
+      },
+      "required": [
+        "content_hash",
+        "source_type",
+        "suggested_kind",
+        "taxonomy_confidence",
+        "retention_confidence",
+        "retention_disposition",
+        "created_at",
+        "bound_at",
+        "classification_version",
+        "retention_policy_version",
+        "binding_matches"
+      ],
+      "title": "Receipt",
+      "type": "object"
+    },
+    "Sample": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Content"
+        },
+        "label": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LabelRecord"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "policy_input": {
+          "$ref": "#/$defs/PolicyInput"
+        },
+        "sample_id": {
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+          "title": "Sample Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sample_id",
+        "content",
+        "policy_input",
+        "label"
+      ],
+      "title": "Sample",
+      "type": "object"
+    },
+    "Sampling": {
+      "additionalProperties": false,
+      "properties": {
+        "excluded_strata": {
+          "default": [],
+          "items": {
+            "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+            "type": "string"
+          },
+          "title": "Excluded Strata",
+          "type": "array"
+        },
+        "per_stratum": {
+          "minimum": 1,
+          "title": "Per Stratum",
+          "type": "integer"
+        },
+        "selection_method": {
+          "enum": [
+            "census",
+            "stratified_hash"
+          ],
+          "title": "Selection Method",
+          "type": "string"
+        },
+        "selection_seed": {
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+          "title": "Selection Seed",
+          "type": "string"
+        },
+        "strata": {
+          "items": {
+            "enum": [
+              "source_type",
+              "kind",
+              "review_status",
+              "blocker",
+              "evidence_state",
+              "selected_lane",
+              "age_bucket",
+              "conflict",
+              "dispute",
+              "recalled",
+              "labeled_consequence"
+            ],
+            "type": "string"
+          },
+          "title": "Strata",
+          "type": "array"
+        }
+      },
+      "required": [
+        "selection_method",
+        "selection_seed",
+        "strata",
+        "per_stratum"
+      ],
+      "title": "Sampling",
+      "type": "object"
+    },
+    "Usefulness": {
+      "additionalProperties": false,
+      "properties": {
+        "context_ref": {
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+          "title": "Context Ref",
+          "type": "string"
+        },
+        "task_ref": {
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+          "title": "Task Ref",
+          "type": "string"
+        },
+        "useful": {
+          "enum": [
+            "yes",
+            "no",
+            "unknown"
+          ],
+          "title": "Useful",
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_ref",
+        "context_ref",
+        "useful"
+      ],
+      "title": "Usefulness",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "config": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ConfigSnapshot"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "evaluation_at": {
+      "format": "date-time",
+      "title": "Evaluation At",
+      "type": "string"
+    },
+    "manifest": {
+      "$ref": "#/$defs/Manifest"
+    },
+    "samples": {
+      "items": {
+        "$ref": "#/$defs/Sample"
+      },
+      "title": "Samples",
+      "type": "array"
+    }
+  },
+  "required": [
+    "manifest",
+    "config",
+    "evaluation_at",
+    "samples"
+  ],
+  "title": "Dataset",
+  "type": "object"
+}

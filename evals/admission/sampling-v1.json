@@ -1,0 +1,18 @@
+{
+  "selection_method": "census",
+  "selection_seed": "dogfood-baseline-v1",
+  "strata": [
+    "source_type",
+    "kind",
+    "review_status",
+    "blocker",
+    "evidence_state",
+    "selected_lane",
+    "age_bucket",
+    "conflict",
+    "dispute",
+    "recalled"
+  ],
+  "per_stratum": 10,
+  "excluded_strata": []
+}
