@@ -187,6 +187,12 @@ Missing evidence remains `none`; inconsistent recorded evidence is
 `malformed/stale`. Missing configuration yields unknown decisions. None of these
 states is converted to safe, zero confidence, or a successful admission.
 
+Policy-version reporting distinguishes `none` from `unknown` in
+`current_policy_version`: `none` means a known policy evaluated and selected no
+promotion basis (blocked candidates included); `unknown` means the
+policy/configuration itself could not be established. Blocked rows do not lack
+a policy, and only `unknown` rows contribute to `unknown_policy_count`.
+
 ## Complete field reference
 
 The [generated field reference](field-reference-v1.md) lists required fields,

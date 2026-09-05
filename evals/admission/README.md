@@ -78,6 +78,27 @@ Public baseline reports contain aggregate observations and content-addressed
 manifest evidence. They do not publish private sample membership or per-item
 content hashes. Never use the historical 239-item count as a new measurement.
 
+## Terminology: policy version states
+
+`current_policy_version` reports four distinct states:
+
+- `promotion-legacy-v1` — the canonical evaluator selected the legacy
+  confidence promotion basis.
+- `promotion-evidence-v1` — the canonical evaluator selected the
+  retention-evidence promotion basis.
+- `none` — evaluation completed under known policy/configuration, but no
+  promotion basis was selected (insufficient confidence or evidence score,
+  taxonomy confidence, retention disposition, kind policy, conflicts or
+  disputes, missing evidence, or another known policy blocker). `none` does
+  not mean evaluation failed, and it does not contribute to
+  `unknown_policy_count`.
+- `unknown` — required policy/configuration/state was unavailable such that
+  the evaluator cannot responsibly state the applicable policy result (for
+  example, a missing configuration snapshot). Only these rows count in
+  `unknown_policy_count`.
+
+Blocked rows are not rows without a policy: they carry `current_policy_version="none"`.
+
 ## Verification and limits
 
 `make check` and the Compose CI path include the contract tests. Both also run

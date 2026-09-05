@@ -1,5 +1,6 @@
 {
   "captured_utc": "2026-09-05T01:44:17.399954+00:00",
+  "code_sha": "662068da2c3d647c31ad318c1efbfac89b685275",
   "config": {
     "auto_promote_confidence_threshold": 0.699999988079071,
     "auto_promote_enabled": true,
@@ -41,8 +42,8 @@
       "scheduled": 2
     },
     "current_policy_version": {
-      "promotion-legacy-v1": 3,
-      "unknown": 236
+      "none": 236,
+      "promotion-legacy-v1": 3
     },
     "current_selected_lane": {
       "legacy_confidence": 3,
@@ -94,5 +95,6 @@
     "promotion-evidence-v1"
   ],
   "report_version": "engram-admission-baseline-v1",
-  "runner_digest": "b676e8886fe1eae78ebe87ced051b4a6f682aee93fc1223ccb1be2f6fe10f299"
+  "runner_digest": "7d75fbf9774c312860dcde7a901e5413347c3ffafbba3b932ef1d3343e2a3ea4",
+  "snapshot_as_of": "2026-09-05T01:44:17.399954+00:00"
 }
