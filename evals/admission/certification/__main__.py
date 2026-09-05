@@ -52,6 +52,7 @@ def main() -> int:
     select_cmd.add_argument("--snapshot", type=Path, required=True)
     select_cmd.add_argument("--development-tranche", type=Path, required=True)
     select_cmd.add_argument("--holdout-manifest", type=Path, required=True)
+    select_cmd.add_argument("--prior-snapshot", type=Path, default=None)
     select_cmd.add_argument("--seed", required=True)
     select_cmd.add_argument("--code-sha", required=True)
     select_cmd.add_argument("--snapshot-key-file", type=Path, required=True)
@@ -89,6 +90,7 @@ def main() -> int:
             print(json.dumps({"doctrine_digest": value}))
         elif args.command == "select-corpus":
             key = args.snapshot_key_file.read_bytes().strip()
+            prior = _read_dataset(args.prior_snapshot) if args.prior_snapshot else None
             manifest = select_certification_corpus(
                 _read_dataset(args.snapshot),
                 args.development_tranche,
@@ -96,6 +98,7 @@ def main() -> int:
                 seed=args.seed,
                 code_sha=args.code_sha,
                 snapshot_key=key,
+                prior_snapshot=prior,
                 frozen_at=None,
             )
             write_private(args.output, manifest)
