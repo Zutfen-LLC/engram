@@ -64,6 +64,16 @@ Preserve the private artifact to reproduce the baseline. A second live capture
 has a new timestamp and can have a different population. Replaying the saved
 artifact uses its fixed timestamp and configuration.
 
+## Fresh dogfood baseline (2026-09-05)
+
+Captured on `engram01` against the live dogfood database (deployed policy
+`662068da`), authorized application role, tenant `Default`, census of 239 live
+proposals at `2026-09-05T01:44:17Z`. The content-free aggregate report is
+checked in as `dogfood-baseline-v1.json`. The private snapshot artifact
+(HMAC sample IDs, no memory text) remains on the dogfood host in a
+protected operator-data location outside the repository, mode `0600`.
+It is an unlabeled operational baseline, not a correctness measurement.
+
 Public baseline reports contain aggregate observations and content-addressed
 manifest evidence. They do not publish private sample membership or per-item
 content hashes. Never use the historical 239-item count as a new measurement.

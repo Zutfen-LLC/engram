@@ -1,0 +1,98 @@
+{
+  "captured_utc": "2026-09-05T01:44:17.399954+00:00",
+  "config": {
+    "auto_promote_confidence_threshold": 0.699999988079071,
+    "auto_promote_enabled": true,
+    "auto_promote_evidence_enabled": true,
+    "auto_promote_evidence_threshold": 0.699999988079071,
+    "auto_promote_min_age_hours": 72
+  },
+  "dataset_digest": "1d1de9f799c2ff203ff0554fee2273d98ed7e697555215c9b7036b2815023117",
+  "deployed_policy_sha": "662068da2c3d647c31ad318c1efbfac89b685275",
+  "description": "Unlabeled operational dogfood baseline from the live engram01 deployment (issue #162A). Aggregate counts only: no memory text, no raw item IDs, no per-item hashes. This is an operational readiness census, not a correctness or precision measurement. Promotion precision, factual accuracy, false-promotion rate/cost, calibration, human agreement, and rollout gates remain #162B+ work.",
+  "dogfood_host": "engram01",
+  "evaluation_at": "2026-09-05T01:44:17.399954+00:00",
+  "labeled_contract_comparisons": {
+    "unlabeled": 239
+  },
+  "limitations": [
+    "Static promotion readiness only; conflict_recheck_status=not_run.",
+    "Kind comparison uses captured taxonomy; no classifier is executed.",
+    "Retention comparison measures promotion readiness, not capture rejection.",
+    "A blocked promotion does not establish an epistemic abstention or review requirement.",
+    "No dogfood precision, factual accuracy, calibration, or rollout gates are claimed.",
+    "Synthetic judgments are authored expectations. They are not human dogfood labels."
+  ],
+  "manifest_digest": "3004fbef2f23efa114c6190bc77b27c3a242f442d1702c57c1f1b8e6e9dd7c7a",
+  "operational_observations": {
+    "blockers": {
+      "age": 2,
+      "confidence": 218,
+      "conflict": 3,
+      "evidence_score": 22,
+      "kind_policy": 26,
+      "missing_source_prior": 4,
+      "no_retention_evidence": 169,
+      "retention_disposition": 185,
+      "taxonomy_confidence": 41
+    },
+    "current_job_state": {
+      "missing": 237,
+      "scheduled": 2
+    },
+    "current_policy_version": {
+      "promotion-legacy-v1": 3,
+      "unknown": 236
+    },
+    "current_selected_lane": {
+      "legacy_confidence": 3,
+      "none": 236
+    },
+    "evidence_state": {
+      "bound-below-threshold": 64,
+      "bound-qualified": 3,
+      "none": 172
+    },
+    "kind": {
+      "doctrine": 20,
+      "fact": 209,
+      "invariant": 3,
+      "observation": 3,
+      "preference": 3,
+      "procedure": 1
+    },
+    "malformed_evidence_count": 0,
+    "population_count": 239,
+    "readiness_state": {
+      "below_evidence_threshold": 21,
+      "below_taxonomy_confidence_minimum": 36,
+      "blocked_by_conflict_or_dispute": 3,
+      "blocked_by_kind_policy": 26,
+      "cooling": 2,
+      "missing_evidence": 151
+    },
+    "selected_count": 239,
+    "source_type": {
+      "extraction": 116,
+      "manual": 10,
+      "migration": 21,
+      "pre_compress": 1,
+      "session_end": 10,
+      "sync_turn": 81
+    },
+    "terminal_under_current_policy": {
+      "False": 2,
+      "True": 237
+    },
+    "unknown_policy_count": 0,
+    "would_promote": {
+      "False": 239
+    }
+  },
+  "policy_versions_evaluated": [
+    "promotion-legacy-v1",
+    "promotion-evidence-v1"
+  ],
+  "report_version": "engram-admission-baseline-v1",
+  "runner_digest": "b676e8886fe1eae78ebe87ced051b4a6f682aee93fc1223ccb1be2f6fe10f299"
+}
