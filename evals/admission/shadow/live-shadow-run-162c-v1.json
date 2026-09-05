@@ -1,0 +1,23 @@
+{
+  "bounded_at": "2026-09-05T16:17:31.462517+00:00",
+  "current_vs_candidate_diffs": {
+    "candidate-current-compat-v1": 0,
+    "candidate-evidence-recovery-v1": 7,
+    "candidate-kind-decoupled-v1": 7,
+    "candidate-tier-separated-v1": 7
+  },
+  "description": "bounded live dogfood shadow run; read-only; no production mutation",
+  "evaluation_at": "2026-09-05T01:44:17.399954+00:00",
+  "host": "engram01",
+  "live_shadow_schema_version": "engram-162c-live-shadow-v1",
+  "max_cases": 50,
+  "no_production_mutation_proof": {
+    "capture_transaction": "READ ONLY REPEATABLE READ",
+    "lifecycle_mutations": 0,
+    "write_statements": 0
+  },
+  "observed_n": 50,
+  "private_artifacts": "engram01:/home/hermes/.local/share/engram/evals/162c/ (0600, outside Git)",
+  "report_digest": "c5d3498b64c69c0fc79b895607508db2bd984c5157b946ba8166e9b4fa94163e",
+  "snapshot_digest": "1d1de9f799c2ff203ff0554fee2273d98ed7e697555215c9b7036b2815023117"
+}
