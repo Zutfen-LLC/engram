@@ -124,6 +124,8 @@ def test_labels_cannot_mutate_or_enter_policy(dataset):
     before = sample.model_dump_json()
     first = evaluate(sample.policy_input, dataset.config, dataset.evaluation_at)
     with pytest.raises(ValidationError):
+        LabelRecord.model_validate(first.model_dump())
+    with pytest.raises(ValidationError):
         sample.label.reviewer_a.dimensions.retention_value = "do_not_retain"
     with pytest.raises(ValidationError):
         PolicyInput.model_validate(sample.label.model_dump())
