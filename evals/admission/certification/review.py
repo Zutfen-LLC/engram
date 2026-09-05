@@ -191,7 +191,10 @@ def build_reviewer_b_packet(
         "frozen_digest"
     ):
         raise ValueError("reviewer_a_digest_mismatch")
-    cases = {int(c["case"]): c for c in _cases(packet)}
+    packet_cases = _cases(packet)
+    if packet.get("case_count") is not None and packet["case_count"] != len(packet_cases):
+        raise ValueError("packet_case_count_mismatch")
+    cases = dict(enumerate(packet_cases, start=1))
     selected = []
     for number in sorted(queue):
         if number not in cases:
