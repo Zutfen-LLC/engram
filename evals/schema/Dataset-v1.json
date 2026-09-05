@@ -469,6 +469,15 @@
             }
           ]
         },
+        "review_stage": {
+          "default": "complete",
+          "enum": [
+            "complete",
+            "reviewer_b_pending"
+          ],
+          "title": "Review Stage",
+          "type": "string"
+        },
         "reviewer_a": {
           "$ref": "#/$defs/HumanJudgment"
         },

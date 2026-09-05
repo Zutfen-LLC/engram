@@ -25,6 +25,7 @@ dual review, unresolved disagreement, and resolution separately.
 | `reviewer_b` | yes | HumanJudgment or null | — |
 | `resolution` | yes | HumanJudgment or null | — |
 | `disagreement` | yes | none, unresolved, resolved | resolved, unresolved |
+| `review_stage` | no | complete, reviewer_b_pending | complete, reviewer_b_pending |
 
 ## Dimensions
 
