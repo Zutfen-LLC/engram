@@ -1,0 +1,206 @@
+{
+  "candidate_declarations": [
+    {
+      "automatic_admission_conditions": [
+        "would_promote true on retention_evidence lane",
+        "evidence_state == bound-qualified",
+        "no conflict/external_dispute/review_policy blocker"
+      ],
+      "governed_semantics": "yes only for non-protected auto-promote kinds with bound receipt and taxonomy_confidence >= taxonomy_minimum; no when governed authority is denied; unknown when taxonomy evidence is absent",
+      "hypothesis": "Exact parity with the canonical current evaluator for runner validation; not a structural hypothesis.",
+      "oracle": "no",
+      "parameter_provenance": "production constants verbatim (promotion_policy.py)",
+      "parameters": {
+        "deferral_window_hours": 0,
+        "deferral_window_provenance": "declared-profile-parameter-162c-v1",
+        "evidence_threshold": 0.7,
+        "legacy_confidence_threshold": 0.7,
+        "taxonomy_minimum": 0.7
+      },
+      "policy_version": "candidate-current-compat-v1",
+      "protected_kind_behavior": "identical to current policy (kind_policy blocker parks)",
+      "required_input_signals": [
+        "source_type",
+        "kind",
+        "kind_enabled",
+        "kind_auto_promote",
+        "review_status",
+        "live",
+        "superseded",
+        "created_at",
+        "memory_confidence",
+        "retention_confidence",
+        "retention_disposition",
+        "retention_evidence_at",
+        "conflict_resolution_status",
+        "external_dispute",
+        "external_noise",
+        "receipt",
+        "receipt.taxonomy_confidence",
+        "evidence_state",
+        "job_state"
+      ],
+      "review_routing_conditions": [],
+      "startup_semantics": "yes only when storage retain AND governed yes AND bound-qualified receipt AND cooling matured; unknown while cooling; never implied by retention alone",
+      "storage_semantics": "mirror of canonical would_promote/readiness states one-for-one",
+      "unknown_behavior": "unknown policy version propagates to all tiers"
+    },
+    {
+      "automatic_admission_conditions": [
+        "would_promote true on retention_evidence lane",
+        "evidence_state == bound-qualified",
+        "no conflict/external_dispute/review_policy blocker"
+      ],
+      "governed_semantics": "yes only for non-protected auto-promote kinds with bound receipt and taxonomy_confidence >= taxonomy_minimum; no when governed authority is denied; unknown when taxonomy evidence is absent",
+      "hypothesis": "H2: separating storage / governed / startup / automatic / review decisions recovers useful memories without looser automatic admission, because under-admission partly comes from collapsing the tiers into one Boolean.",
+      "oracle": "no",
+      "parameter_provenance": "evidence/taxonomy/legacy constants verbatim from production; deferral window 168h declared structurally (one week re-evaluation cadence), chosen before any label was seen",
+      "parameters": {
+        "deferral_window_hours": 168,
+        "deferral_window_provenance": "declared-profile-parameter-162c-v1",
+        "evidence_threshold": 0.7,
+        "legacy_confidence_threshold": 0.7,
+        "taxonomy_minimum": 0.7
+      },
+      "policy_version": "candidate-tier-separated-v1",
+      "protected_kind_behavior": "defer + review, never auto, never silent parking",
+      "required_input_signals": [
+        "source_type",
+        "kind",
+        "kind_enabled",
+        "kind_auto_promote",
+        "review_status",
+        "live",
+        "superseded",
+        "created_at",
+        "memory_confidence",
+        "retention_confidence",
+        "retention_disposition",
+        "retention_evidence_at",
+        "conflict_resolution_status",
+        "external_dispute",
+        "external_noise",
+        "receipt",
+        "receipt.taxonomy_confidence",
+        "evidence_state",
+        "job_state"
+      ],
+      "review_routing_conditions": [
+        "review only for conflict/dispute governance cases and protected kinds without auto-promote authority"
+      ],
+      "startup_semantics": "yes only when storage retain AND governed yes AND bound-qualified receipt AND cooling matured; unknown while cooling; never implied by retention alone",
+      "storage_semantics": "retain when qualified or cooling; defer when evidence is starved or disposition not retain; reject only when not a live candidate",
+      "unknown_behavior": "unknown policy version propagates to all tiers"
+    },
+    {
+      "automatic_admission_conditions": [
+        "would_promote true on retention_evidence lane",
+        "evidence_state == bound-qualified",
+        "no conflict/external_dispute/review_policy blocker"
+      ],
+      "governed_semantics": "yes only for non-protected auto-promote kinds with bound receipt and taxonomy_confidence >= taxonomy_minimum; no when governed authority is denied; unknown when taxonomy evidence is absent",
+      "hypothesis": "H3: missing/insufficient retention evidence or source prior can route useful candidates to defer + human review instead of a terminal hold, without treating missing evidence as support.",
+      "oracle": "no",
+      "parameter_provenance": "evidence/taxonomy/legacy constants verbatim from production; deferral window 168h declared structurally before labels",
+      "parameters": {
+        "deferral_window_hours": 168,
+        "deferral_window_provenance": "declared-profile-parameter-162c-v1",
+        "evidence_threshold": 0.7,
+        "legacy_confidence_threshold": 0.7,
+        "taxonomy_minimum": 0.7
+      },
+      "policy_version": "candidate-evidence-recovery-v1",
+      "protected_kind_behavior": "defer + review, never auto, never silent parking",
+      "required_input_signals": [
+        "source_type",
+        "kind",
+        "kind_enabled",
+        "kind_auto_promote",
+        "review_status",
+        "live",
+        "superseded",
+        "created_at",
+        "memory_confidence",
+        "retention_confidence",
+        "retention_disposition",
+        "retention_evidence_at",
+        "conflict_resolution_status",
+        "external_dispute",
+        "external_noise",
+        "receipt",
+        "receipt.taxonomy_confidence",
+        "evidence_state",
+        "job_state"
+      ],
+      "review_routing_conditions": [
+        "adds review routing for evidence-starved and non-retain-disposition cases (P2-specific); conflict/dispute and protected-kind routing as P1"
+      ],
+      "startup_semantics": "yes only when storage retain AND governed yes AND bound-qualified receipt AND cooling matured; unknown while cooling; never implied by retention alone",
+      "storage_semantics": "defer replaces every evidence-derived terminal hold; missing evidence stays unknown epistemically (defer, not retain)",
+      "unknown_behavior": "unknown policy version propagates to all tiers"
+    },
+    {
+      "automatic_admission_conditions": [
+        "would_promote true on retention_evidence lane",
+        "evidence_state == bound-qualified",
+        "no conflict/external_dispute/review_policy blocker"
+      ],
+      "governed_semantics": "yes only for non-protected auto-promote kinds with bound receipt and taxonomy_confidence >= taxonomy_minimum; no when governed authority is denied; unknown when taxonomy evidence is absent",
+      "hypothesis": "H4: kind/taxonomy gating can be separated from storage worthiness for ordinary kinds while protected kinds stay fail-closed behind review.",
+      "oracle": "no",
+      "parameter_provenance": "evidence/taxonomy/legacy constants verbatim from production; deferral window 168h declared structurally before labels",
+      "parameters": {
+        "deferral_window_hours": 168,
+        "deferral_window_provenance": "declared-profile-parameter-162c-v1",
+        "evidence_threshold": 0.7,
+        "legacy_confidence_threshold": 0.7,
+        "taxonomy_minimum": 0.7
+      },
+      "policy_version": "candidate-kind-decoupled-v1",
+      "protected_kind_behavior": "protected kinds remain fail-closed: defer + review when taxonomy confidence is below minimum or authority absent",
+      "required_input_signals": [
+        "source_type",
+        "kind",
+        "kind_enabled",
+        "kind_auto_promote",
+        "review_status",
+        "live",
+        "superseded",
+        "created_at",
+        "memory_confidence",
+        "retention_confidence",
+        "retention_disposition",
+        "retention_evidence_at",
+        "conflict_resolution_status",
+        "external_dispute",
+        "external_noise",
+        "receipt",
+        "receipt.taxonomy_confidence",
+        "evidence_state",
+        "job_state"
+      ],
+      "review_routing_conditions": [
+        "review for protected kinds failing taxonomy minimum; ordinary kind-gate cases retain storage value without review"
+      ],
+      "startup_semantics": "yes only when storage retain AND governed yes AND bound-qualified receipt AND cooling matured; unknown while cooling; never implied by retention alone",
+      "storage_semantics": "ordinary-kind taxonomy/kind-gate cases retain storage value; protected kinds defer + review; evidence rules as P1",
+      "unknown_behavior": "unknown policy version propagates to all tiers"
+    }
+  ],
+  "dataset_roles": {
+    "dogfood-development-v1": "50-case #162B human corpus; development/hypothesis-generating only; informed candidate design; never certification",
+    "holdout": "fresh blind dogfood sample; selection only after this freeze; labels adjudicated blind; generalization evidence",
+    "synthetic_contract": "policy-boundary and adversarial regression"
+  },
+  "freeze_digest": "0e1692ed0f06f2d5f75f25eebec8a9075efd35aea3ec70333b9f8e095101d116",
+  "freeze_schema_version": "engram-candidate-freeze-v1",
+  "frozen_at": "2026-09-05T12:00:00+00:00",
+  "issue": "162C",
+  "oracle_analyses": [
+    {
+      "excluded_from_shortlist": true,
+      "name": "oracle-risk-upper-bound-v1",
+      "question": "If Engram had a reliable human consequence classifier, how much additional automatic admission would become possible without unsafe outcomes?"
+    }
+  ]
+}
