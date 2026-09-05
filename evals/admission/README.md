@@ -185,3 +185,43 @@ the final frozen corpus and comparison, keeping review-case IDs and decision-tim
 records out of Git. Private labels, private membership, source snapshot, and per-case policy output
 remain outside Git under restricted permissions. A zero automatic-admission count is reported with PPV
 `null`/undefined, never as 100% precision.
+
+## #162D certification (P3 kind-decoupled candidate)
+
+`evals.admission.certification` extends the merged #162C machinery — it does
+not duplicate it. The committed `certification/doctrine-162d-v1.json` is the
+versioned, digest-pinned ADR/config required by the ticket's pre-run gate
+freeze: candidate/baseline digests, all numerical gates G0–G7, the paired
+bootstrap uncertainty method (10,000 resamples, fixed seed), corpus doctrine
+(N=100, zero overlap with the spent #162B/#162C corpora, exclusions applied
+BEFORE selection), review workflow, unknown-signal rules, terminal statuses,
+and non-authorization semantics. `load_doctrine()` fails closed on any drift.
+
+Workflow (private artifacts outside Git, 0700/0600, via
+`python -m evals.admission.certification`):
+
+1. `select-corpus` — fresh N=100 manifest from a live snapshot; requires the
+   doctrine on disk (gates frozen before membership exists); records derived
+   zero-overlap proofs against both spent corpora; flags population
+   shortfall as a pre-declared INCONCLUSIVE run.
+2. blind packet + Reviewer A over all 100 (existing `blind_review` CLI),
+   then `expand-reviewer-a` to freeze the A ledger.
+3. Reviewer B independently reviews the derived queue (every
+   high-consequence case plus every substantive A/B disagreement);
+   `finalize-corpus` seals the dual-reviewed corpus — it refuses unresolved
+   substantive disagreement, missing B coverage, or any policy field, and
+   must run BEFORE any reveal.
+4. `run` — deterministic certification evaluation (replayed twice,
+   byte-compared): P0/current exact parity gate, paired +5pp storage
+   accuracy with bootstrap interval, 15% relative held-back reduction,
+   zero-violation high-consequence safety gates, 35% review-burden gate,
+   false governed/startup eligibility gates, and automatic admission locked
+   to INSUFFICIENT_EVIDENCE with ppv=null at zero positives (an unexpected
+   positive fails closed). Terminal decision is exactly one of
+   CERTIFIED_STORAGE_POLICY / NOT_CERTIFIED / INCONCLUSIVE; a passing point
+   estimate whose interval cannot support a defensible conclusion is
+   INCONCLUSIVE, never a silent pass.
+
+A pass authorizes only accepting P3 as the evidence-backed design for the
+storage/kind-decoupling portion of future #158 implementation. It changes no
+production behavior.
