@@ -167,3 +167,19 @@ from these observations.
 Existing classification and recall corpora remain unchanged. The admission
 loader rejects them because they do not carry the new contract. Existing recall
 golden entries never become factual labels through this package.
+
+## Human corpus freeze and comparison (#173)
+
+`human_corpus.finalize_human_corpus()` is the private, policy-blind finalization
+step. It rejects policy fields in the Reviewer B and adjudication artifacts,
+preserves both reviewers, validates each final `engram-admission-label-v1`
+record, and fails closed unless every high-consequence label has Reviewer B and
+all disagreements are resolved. `human_comparison.compare_frozen_corpus()`
+first verifies that frozen digest/gate, then evaluates only the captured
+snapshot policy inputs; it never reads or mutates live memories.
+
+The checked-in `dogfood-human-corpus-v1.json` and
+`dogfood-human-comparison-v1.json` are aggregate-only reports. Private labels,
+private membership, source snapshot, and per-case policy output remain outside
+Git under restricted permissions. A zero automatic-admission count is reported
+with PPV `null`/undefined, never as 100% precision.
