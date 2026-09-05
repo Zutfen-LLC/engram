@@ -64,6 +64,51 @@ Preserve the private artifact to reproduce the baseline. A second live capture
 has a new timestamp and can have a different population. Replaying the saved
 artifact uses its fixed timestamp and configuration.
 
+## Blind human-review packet (#173 first handoff)
+
+`evals.admission.blind_review` creates only the pre-adjudication artifacts:
+deterministic protected membership, a blind JSON/Markdown packet, and empty
+resumable review state. It never invokes the promotion evaluator and the packet
+serializer rejects current-policy fields.
+
+Run it only on an authorized host. Keep every output except the generated
+content-free public manifest outside the repository. The directory is created
+mode `0700`; every private file is exclusive-created mode `0600`.
+
+```bash
+python -m evals.admission.blind_review select \
+  --snapshot /protected/162a/dogfood-snapshot.json \
+  --snapshot-key-file /protected/162a/.snapshot-key \
+  --seed eng-calibration-001b-dogfood-20260905-v1 \
+  --target-count 50 \
+  --code-sha "$REVIEW_TOOL_SHA" \
+  --private-output /protected/162b/tranche-private.json \
+  --public-output /tmp/blind-tranche-public.json
+```
+
+```bash
+python -m evals.admission.blind_review packet \
+  --snapshot /protected/162a/dogfood-snapshot.json \
+  --tranche /protected/162b/tranche-private.json \
+  --snapshot-key-file /protected/162a/.snapshot-key \
+  --tenant "$EVAL_TENANT_ID" \
+  --principal "$EVAL_PRINCIPAL_ID" \
+  --json-output /protected/162b/blind-packet.json \
+  --markdown-output /protected/162b/blind-packet.md \
+  --state-output /protected/162b/review-state.json \
+  --proof-output /protected/162b/read-only-proof.json
+```
+
+Content recovery sets a repeatable-read `READ ONLY` transaction and RLS context,
+queries only selected snapshot content hashes, then verifies each returned row
+by recomputing its HMAC identity from the protected snapshot key. It also checks
+the captured content hash. It never joins by text. Secret-bearing content is
+replaced with a fixed redaction marker before either packet is written.
+
+The review state intentionally has no Reviewer A/B judgments, frozen timestamp,
+or policy reveal. Do not add labels or reveal/compare current policy until a
+human reviewer has frozen the applicable judgment.
+
 ## Fresh dogfood baseline (2026-09-05)
 
 Captured on `engram01` against the live dogfood database (deployed policy

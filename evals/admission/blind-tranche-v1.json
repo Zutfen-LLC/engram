@@ -1,0 +1,21 @@
+{
+  "selection_version": "eng-calibration-001b-blind-tranche-v1",
+  "selection_seed": "eng-calibration-001b-dogfood-20260905-v1",
+  "target_count": 50,
+  "selection_method": "rare_strata_first_balanced_hash",
+  "strata": [
+    "source_type",
+    "kind",
+    "decision_time_evidence_context",
+    "age_bucket",
+    "temporal_evidence_context",
+    "governance_context",
+    "kind_review_gate"
+  ],
+  "privacy": "content_free_public_definition",
+  "notes": [
+    "The private selection list contains only protected HMAC identities.",
+    "Selection does not invoke or serialize policy evaluation output.",
+    "The target is capped at the source population and may be smaller only when the snapshot is smaller."
+  ]
+}
