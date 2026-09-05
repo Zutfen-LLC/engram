@@ -13,7 +13,14 @@ from engram.safety import has_secrets
 
 Token = Annotated[str, Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$")]
 Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
-ContentHash = Annotated[str, Field(pattern=r"^(sha256:)?[0-9a-f]{64}$")]
+# Production content_hash values are opaque identity strings, not a fixed digest
+# format: canonical writes use ``sha256:<64hex>`` while KG auto-extraction
+# (engram/api/routes/kg.py) emits ``kg-auto-<32hex>``. Capture must accept every
+# shape production stores, so this validates structure without asserting a
+# single algorithm. The value is identity/audit only; no evaluator path parses it.
+ContentHash = Annotated[
+    str, Field(pattern=r"^(sha256:)?[0-9a-f]{64}$|^kg-auto-[0-9a-f]{32}$")
+]
 Judgment = Literal["yes", "no", "unknown"]
 Quality = Literal["adequate", "inadequate", "unknown", "unavailable", "not_applicable"]
 Kind = Literal[

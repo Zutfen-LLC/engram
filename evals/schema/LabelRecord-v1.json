@@ -394,7 +394,7 @@
     "content_hash": {
       "anyOf": [
         {
-          "pattern": "^(sha256:)?[0-9a-f]{64}$",
+          "pattern": "^(sha256:)?[0-9a-f]{64}$|^kg-auto-[0-9a-f]{32}$",
           "type": "string"
         },
         {

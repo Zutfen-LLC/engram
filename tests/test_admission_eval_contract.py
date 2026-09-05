@@ -218,6 +218,23 @@ def test_secret_rejected_even_after_rehash(dataset):
         Dataset.model_validate(raw)
 
 
+def test_kg_auto_content_hash_is_a_valid_policy_input(dataset):
+    # Live dogfood proposals carry KG auto-extraction hashes (engram/api/routes/kg.py
+    # emits ``kg-auto-<32hex>``). Capture must accept production-stored shapes and
+    # the evaluator must still produce a decision for them.
+    base = dataset.samples[0].policy_input.model_dump(mode="json")
+    base["content_hash"] = "kg-auto-" + "a" * 32
+    item = PolicyInput.model_validate(base)
+    assert item.content_hash.startswith("kg-auto-")
+    result = evaluate(item, dataset.config, dataset.evaluation_at)
+    assert result.would_promote is not None
+    # A malformed hash is still rejected.
+    bad = dict(base)
+    bad["content_hash"] = "not-a-hash"
+    with pytest.raises(ValidationError):
+        PolicyInput.model_validate(bad)
+
+
 def test_committed_reports_and_reference_match(dataset):
     directory = ROOT / "evals/admission"
     assert json.loads((directory / "contract-baseline-v1.json").read_text()) == report(dataset)

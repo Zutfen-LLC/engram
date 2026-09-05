@@ -402,7 +402,7 @@
         "content_hash": {
           "anyOf": [
             {
-              "pattern": "^(sha256:)?[0-9a-f]{64}$",
+              "pattern": "^(sha256:)?[0-9a-f]{64}$|^kg-auto-[0-9a-f]{32}$",
               "type": "string"
             },
             {
@@ -576,7 +576,7 @@
         },
         "sample_content_hashes": {
           "items": {
-            "pattern": "^(sha256:)?[0-9a-f]{64}$",
+            "pattern": "^(sha256:)?[0-9a-f]{64}$|^kg-auto-[0-9a-f]{32}$",
             "type": "string"
           },
           "title": "Sample Content Hashes",
@@ -670,7 +670,7 @@
           "title": "Conflict Resolution Status"
         },
         "content_hash": {
-          "pattern": "^(sha256:)?[0-9a-f]{64}$",
+          "pattern": "^(sha256:)?[0-9a-f]{64}$|^kg-auto-[0-9a-f]{32}$",
           "title": "Content Hash",
           "type": "string"
         },
@@ -866,7 +866,7 @@
           "type": "string"
         },
         "content_hash": {
-          "pattern": "^(sha256:)?[0-9a-f]{64}$",
+          "pattern": "^(sha256:)?[0-9a-f]{64}$|^kg-auto-[0-9a-f]{32}$",
           "title": "Content Hash",
           "type": "string"
         },

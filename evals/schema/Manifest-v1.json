@@ -120,7 +120,7 @@
     },
     "sample_content_hashes": {
       "items": {
-        "pattern": "^(sha256:)?[0-9a-f]{64}$",
+        "pattern": "^(sha256:)?[0-9a-f]{64}$|^kg-auto-[0-9a-f]{32}$",
         "type": "string"
       },
       "title": "Sample Content Hashes",
