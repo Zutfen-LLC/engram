@@ -1,0 +1,22 @@
+{
+  "artifact_schema_version": "engram-admission-incident-seed-aggregate-v1",
+  "decision_time_vs_later_outcome": "Each private incident keeps decision-time evidence/state separate from later observed outcome/context; public evidence contains no case identifiers or content.",
+  "incident_class_distribution": {
+    "conflict_involved": 1,
+    "held_back_despite_likely_value": 1,
+    "poor_extraction_or_non_propositional": 1,
+    "stale_or_superseded": 1
+  },
+  "incident_count": 4,
+  "limitations": "No qualifying case observed in this tranche/history for each unavailable class; later outcome is not used as decision-time evidence.",
+  "privacy": "aggregate_only_no_raw_membership_or_content",
+  "private_incident_seed_digest": "917d0ff3440e6ee4da97bb77dc934993678668fdf275c4910b42f4bc3748e4c6",
+  "source_final_corpus_digest": "4876d3bb1857fcf761f1bb3566d9d7cf76bb21cd2b5acbc8365123d8de527f8a",
+  "source_snapshot_digest": "1d1de9f799c2ff203ff0554fee2273d98ed7e697555215c9b7036b2815023117",
+  "unavailable_incident_classes": [
+    "correctly_useful_with_verified_later_outcome",
+    "incorrectly_retained_with_verified_later_outcome",
+    "wrongly_promoted_or_admitted",
+    "delayed_or_orphaned_by_orchestration"
+  ]
+}

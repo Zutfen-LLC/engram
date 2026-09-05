@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
+
+from evals.admission.dataset import Sample, build_dataset
+from evals.admission.policy import PolicyInput
 
 
 def _judgment(*, kind: str = "fact", consequence: str = "high") -> dict[str, object]:
@@ -186,3 +191,87 @@ def test_compare_requires_immutable_complete_final_corpus() -> None:
     }
     with pytest.raises(ValueError, match="reveal_gate_failed"):
         assert_reveal_gate(artifact)
+
+
+def test_public_incident_seed_is_aggregate_only_and_records_unavailable_classes() -> None:
+    report = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "evals/admission/dogfood-human-incident-seed-v1.json"
+        ).read_text()
+    )
+    assert report["artifact_schema_version"] == "engram-admission-incident-seed-aggregate-v1"
+    assert report["incident_count"] == 4
+    assert report["decision_time_vs_later_outcome"].startswith("Each private incident")
+    assert "wrongly_promoted_or_admitted" in report["unavailable_incident_classes"]
+    assert "review_case_id" not in report
+    assert "memory_content" not in report
+    assert "raw_content" not in report
+
+
+def test_comparison_is_deterministic_and_reports_zero_positive_ppv_as_undefined() -> None:
+    from evals.admission.dataset import Dataset
+    from evals.admission.human_comparison import compare_frozen_corpus
+    from evals.admission.human_corpus import finalize_human_corpus
+    from evals.admission.schema import Sampling, digest
+
+    frozen = _reviewer_a_frozen()
+    frozen["frozen_digest"] = digest(frozen)
+    corpus = finalize_human_corpus(
+        _packet(), frozen, _ledger(), _resolution(), frozen_at=datetime(2026, 9, 5, tzinfo=UTC)
+    )
+    config = Dataset.model_validate_json(
+        (Path(__file__).resolve().parents[1] / "evals/admission/contract-v1.json").read_bytes()
+    ).config
+    assert config is not None
+    sample_id = "a" * 64
+    policy = PolicyInput.model_validate(
+        {
+            "sample_id": sample_id,
+            "content_hash": "sha256:" + "b" * 64,
+            "source_type": "extraction",
+            "kind": "fact",
+            "review_status": "proposed",
+            "created_at": "2026-09-01T00:00:00+00:00",
+            "memory_confidence": 0.1,
+            "source_confidence_prior": 0.1,
+            "retention_confidence": None,
+            "retention_disposition": None,
+            "retention_evidence_at": None,
+            "conflict_resolution_status": None,
+            "live": True,
+            "superseded": False,
+            "kind_enabled": True,
+            "kind_auto_promote": True,
+            "external_dispute": False,
+            "external_noise": False,
+            "receipt": None,
+            "job_state": "unknown",
+            "recalled": "unknown",
+        }
+    )
+    snapshot = build_dataset(
+        (Sample(sample_id=sample_id, content=None, policy_input=policy, label=None),),
+        config=config,
+        at=datetime(2026, 9, 5, tzinfo=UTC),
+        code_sha="0" * 40,
+        dataset_id="test",
+        dataset_version="v1",
+        privacy="private_dogfood",
+        sampling=Sampling(
+            selection_method="census", selection_seed="test", strata=(), per_stratum=1
+        ),
+        population_count=1,
+        counts=(),
+    )
+    tranche = {
+        "snapshot_identity": snapshot.manifest.data_digest,
+        "sample_ids": [sample_id],
+        "review_case_ids": ["rvw_aaaaaaaaaaaaaaaaaaaaaaaa"],
+        "selection_digest": "c" * 64,
+    }
+    first = compare_frozen_corpus(corpus, snapshot, tranche)
+    second = compare_frozen_corpus(corpus, snapshot, tranche)
+    assert first == second
+    assert first["automatic_admission"]["precision_ppv"] is None
+    assert first["overall"]["automatic_admission_count"] == 0

@@ -178,8 +178,10 @@ all disagreements are resolved. `human_comparison.compare_frozen_corpus()`
 first verifies that frozen digest/gate, then evaluates only the captured
 snapshot policy inputs; it never reads or mutates live memories.
 
-The checked-in `dogfood-human-corpus-v1.json` and
-`dogfood-human-comparison-v1.json` are aggregate-only reports. Private labels,
-private membership, source snapshot, and per-case policy output remain outside
-Git under restricted permissions. A zero automatic-admission count is reported
-with PPV `null`/undefined, never as 100% precision.
+The checked-in `dogfood-human-corpus-v1.json`, `dogfood-human-comparison-v1.json`,
+`dogfood-human-comparison-v1.md`, and `dogfood-human-incident-seed-v1.json` are aggregate-only
+reports. `incident_seed.build_incident_seed()` creates the private `0600` incident artifact from
+the final frozen corpus and comparison, keeping review-case IDs and decision-time/later-outcome
+records out of Git. Private labels, private membership, source snapshot, and per-case policy output
+remain outside Git under restricted permissions. A zero automatic-admission count is reported with PPV
+`null`/undefined, never as 100% precision.
