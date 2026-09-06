@@ -16,29 +16,124 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Final, Literal
 
-import jsonschema  # type: ignore[import-untyped]
 import rfc8785
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 POLICY_DIRECTORY: Path = Path(__file__).resolve().parent.parent / "policies" / "admission"
-POLICY_SCHEMA_PATH: Path = (
-    Path(__file__).resolve().parent.parent / "schemas" / "admission-policy-v1.schema.json"
-)
 POLICY_SCHEMA_VERSION: Final[str] = "engram.admission-policy.v1"
 V2_SCHEMA_VERSION: Final[str] = "engram.admission-assessment.v2"
-SURFACES: Final[tuple[str, str, str]] = (
-    "startup",
-    "semantic_governed",
-    "semantic_exploratory",
-)
 SurfaceDecision = Literal["allow", "withhold", "review_required", "blocked", "unknown"]
 RiskState = Literal["low", "medium", "high", "unknown", "not_applicable"]
 EpistemicState = Literal[
     "supported", "contested", "insufficient_evidence", "unknown", "not_applicable"
 ]
+SURFACES: Final[tuple[str, str, str]] = (
+    "startup",
+    "semantic_governed",
+    "semantic_exploratory",
+)
 
 
 class PolicyLoadError(ValueError):
     """A policy artifact cannot be used safely."""
+
+
+class _PolicyModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class _AssessmentSelection(_PolicyModel):
+    policy_version: str = Field(min_length=1)
+    accepted_contract_hashes: tuple[str, ...] = Field(min_length=1)
+    required_purposes: tuple[Literal["combined"], ...] = Field(min_length=1)
+
+
+class _ProvenanceConditions(_PolicyModel):
+    required_assertion_fields: tuple[Literal["assertion_mode", "origin"], ...] = Field(
+        min_length=2
+    )
+
+
+class _RiskConditions(_PolicyModel):
+    known_governed_values: tuple[Literal["low", "medium"], ...] = Field(min_length=1)
+    review_values: tuple[Literal["high", "unknown"], ...] = Field(min_length=1)
+
+
+class _RetentionConditions(_PolicyModel):
+    governed_value: Literal["retain"]
+
+
+class _EpistemicConditions(_PolicyModel):
+    governed_value: Literal["supported"]
+    requires_calibrated: bool
+
+
+class _GovernanceConditions(_PolicyModel):
+    blockers: tuple[Literal["not_live", "conflict", "external_dispute", "human_review"], ...]
+
+
+class _Conditions(_PolicyModel):
+    provenance: _ProvenanceConditions
+    risk: _RiskConditions
+    retention: _RetentionConditions
+    epistemic: _EpistemicConditions
+    governance: _GovernanceConditions
+
+
+class _ObservationWindows(_PolicyModel):
+    low: int = Field(ge=0)
+    medium: int = Field(ge=0)
+
+
+class _StartupRules(_PolicyModel):
+    new_automatic_admission: bool
+    allow_existing_human_verified: bool
+
+
+class _SurfaceOutputs(_PolicyModel):
+    semantic_exploratory: SurfaceDecision
+    semantic_governed: SurfaceDecision
+    startup: SurfaceDecision
+
+
+class _Outputs(_PolicyModel):
+    blocked: _SurfaceOutputs
+    review_required: _SurfaceOutputs
+    withhold: _SurfaceOutputs
+    qualified: _SurfaceOutputs
+
+
+class _Rules(_PolicyModel):
+    precedence: tuple[
+        Literal[
+            "not_live",
+            "conflict",
+            "governance",
+            "assessment_unavailable",
+            "risk_high",
+            "risk_unknown",
+            "epistemic_contested",
+            "epistemic_insufficient",
+            "qualified",
+        ],
+        ...,
+    ] = Field(min_length=1)
+    conditions: _Conditions
+    observation_windows_hours: _ObservationWindows
+    startup: _StartupRules
+    outputs: _Outputs
+
+
+class _AdmissionPolicyArtifact(_PolicyModel):
+    schema_version: Literal["engram.admission-policy.v1"]
+    profile_key: str = Field(pattern=r"^[a-z0-9_]+$")
+    policy_version: str = Field(min_length=1, max_length=128)
+    artifact_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    supported_surfaces: tuple[
+        Literal["semantic_exploratory", "semantic_governed", "startup"], ...
+    ]
+    assessment_selection: _AssessmentSelection
+    rules: _Rules
 
 
 def _digest(value: Any) -> str:
@@ -59,6 +154,16 @@ class LoadedAdmissionPolicy:
     required_purposes: tuple[str, ...]
     observation_windows_hours: Mapping[str, int]
     allow_existing_human_verified_startup: bool
+    precedence: tuple[str, ...]
+    required_provenance_fields: tuple[str, ...]
+    known_governed_risks: tuple[str, ...]
+    review_risks: tuple[str, ...]
+    governed_retention: str
+    governed_epistemic: str
+    requires_calibrated_epistemic: bool
+    governance_blockers: tuple[str, ...]
+    new_automatic_startup_admission: bool
+    outputs: Mapping[str, Mapping[str, SurfaceDecision]]
 
 
 @dataclass(frozen=True)
@@ -69,6 +174,7 @@ class AdmissionItemState:
     kind: str
     source_type: str
     assertion_mode: str
+    origin: str
     review_status: str
     created_at: datetime
     valid_to: datetime | None
@@ -97,7 +203,7 @@ class EffectiveAssessmentState:
     """
 
     selection_status: Literal[
-        "selected", "missing", "disabled", "stale", "mismatched", "failed", "uncalibrated"
+        "selected", "absent", "disabled", "stale", "mismatched", "failed", "uncalibrated"
     ]
     contract_hash: str | None
     assessment_refs: tuple[Mapping[str, str], ...]
@@ -164,27 +270,38 @@ def load_admission_policy(profile_key: str) -> LoadedAdmissionPolicy:
         raise PolicyLoadError(f"policy artifact not found: {profile_key}")
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-        schema = json.loads(POLICY_SCHEMA_PATH.read_text(encoding="utf-8"))
-        jsonschema.Draft202012Validator(schema).validate(raw)
-    except (OSError, json.JSONDecodeError, jsonschema.ValidationError) as exc:
+        artifact = _AdmissionPolicyArtifact.model_validate(raw)
+    except (OSError, json.JSONDecodeError, ValidationError) as exc:
         raise PolicyLoadError(f"invalid policy artifact {profile_key}: {exc}") from exc
-    if raw["schema_version"] != POLICY_SCHEMA_VERSION or raw["profile_key"] != profile_key:
+    if artifact.schema_version != POLICY_SCHEMA_VERSION or artifact.profile_key != profile_key:
         raise PolicyLoadError("policy artifact identity mismatch")
     actual_digest = _digest(_artifact_digest_payload(raw))
-    if raw["artifact_digest"] != actual_digest:
+    if artifact.artifact_digest != actual_digest:
         raise PolicyLoadError("policy artifact digest drift")
-    selection = raw["assessment_selection"]
+    selection = artifact.assessment_selection
+    rules = artifact.rules
     return LoadedAdmissionPolicy(
-        profile_key=raw["profile_key"],
-        policy_version=raw["policy_version"],
+        profile_key=artifact.profile_key,
+        policy_version=artifact.policy_version,
         artifact_digest=actual_digest,
-        assessment_policy_version=selection["policy_version"],
-        accepted_contract_hashes=frozenset(selection["accepted_contract_hashes"]),
-        required_purposes=tuple(selection["required_purposes"]),
-        observation_windows_hours=dict(raw["rules"]["observation_windows_hours"]),
-        allow_existing_human_verified_startup=raw["rules"]["startup"][
-            "allow_existing_human_verified"
-        ],
+        assessment_policy_version=selection.policy_version,
+        accepted_contract_hashes=frozenset(selection.accepted_contract_hashes),
+        required_purposes=selection.required_purposes,
+        observation_windows_hours=rules.observation_windows_hours.model_dump(),
+        allow_existing_human_verified_startup=rules.startup.allow_existing_human_verified,
+        precedence=rules.precedence,
+        required_provenance_fields=rules.conditions.provenance.required_assertion_fields,
+        known_governed_risks=rules.conditions.risk.known_governed_values,
+        review_risks=rules.conditions.risk.review_values,
+        governed_retention=rules.conditions.retention.governed_value,
+        governed_epistemic=rules.conditions.epistemic.governed_value,
+        requires_calibrated_epistemic=rules.conditions.epistemic.requires_calibrated,
+        governance_blockers=rules.conditions.governance.blockers,
+        new_automatic_startup_admission=rules.startup.new_automatic_admission,
+        outputs={
+            key: getattr(rules.outputs, key).model_dump()
+            for key in ("blocked", "review_required", "withhold", "qualified")
+        },
     )
 
 
@@ -256,63 +373,128 @@ def evaluate_admission_profile(
     window: int | None = None
     eligible_at: datetime | None = None
 
-    if not item.live_proposal:
+    def apply_output(name: str) -> None:
+        nonlocal exploratory, governed, startup
+        output = policy.outputs[name]
+        exploratory = output["semantic_exploratory"]
+        governed = output["semantic_governed"]
+        startup = output["startup"]
+
+    def provenance_missing() -> str | None:
+        return next(
+            (
+                field
+                for field in policy.required_provenance_fields
+                if getattr(item, field, "unknown") in {"", "unknown", "not_applicable"}
+            ),
+            None,
+        )
+
+    def record_unavailability_diagnostics() -> None:
+        missing = provenance_missing()
+        if missing is not None:
+            blockers.add(f"provenance_{missing}_missing")
+            reasons.add("required_provenance_missing")
+        if assessment.selection_status != "selected":
+            blockers.add(f"assessment_{assessment.selection_status}")
+            reasons.add("effective_assessment_not_qualified")
+        if missing is not None or assessment.selection_status != "selected":
+            actions.add("new_evidence_required")
+
+    def matches(rule: str) -> bool:
+        if rule == "not_live":
+            return not item.live_proposal
+        if rule == "conflict":
+            return (
+                (item.unresolved_conflict and "conflict" in policy.governance_blockers)
+                or (item.external_dispute and "external_dispute" in policy.governance_blockers)
+            )
+        if rule == "governance":
+            return item.governed_review_required and "human_review" in policy.governance_blockers
+        if rule == "assessment_unavailable":
+            return provenance_missing() is not None or assessment.selection_status != "selected"
+        if rule == "risk_high":
+            return risk == "high" and risk in policy.review_risks
+        if rule == "risk_unknown":
+            return risk not in policy.known_governed_risks
+        if rule == "epistemic_contested":
+            return epistemic == "contested"
+        if rule == "epistemic_insufficient":
+            return (
+                assessment.contract_hash not in policy.accepted_contract_hashes
+                or (policy.requires_calibrated_epistemic and not assessment.calibrated)
+                or epistemic != policy.governed_epistemic
+                or retention != policy.governed_retention
+            )
+        return rule == "qualified"
+
+    first_rule = next((rule for rule in policy.precedence if matches(rule)), None)
+    if first_rule is None:
+        raise PolicyLoadError("policy precedence has no matching rule")
+
+    if first_rule == "not_live":
         blockers.add("not_live_proposal")
         reasons.add("lifecycle_not_applicable")
-        exploratory = governed = startup = "blocked"
-    elif item.unresolved_conflict or item.external_dispute:
+        apply_output("blocked")
+    elif first_rule == "conflict":
         blockers.add("unresolved_conflict" if item.unresolved_conflict else "external_dispute")
         reasons.add("governance_blocked")
         actions.add("conflict_resolution_required")
-        exploratory = governed = startup = "blocked"
-    elif item.governed_review_required:
+        apply_output("blocked")
+    elif first_rule == "governance":
         blockers.add("governed_review_required")
         reasons.add("existing_governance_requires_review")
         actions.add("human_review_required")
-        governed = startup = "review_required"
-    elif risk == "high":
+        apply_output("review_required")
+    elif first_rule == "assessment_unavailable":
+        record_unavailability_diagnostics()
+        if risk == "medium" and risk in policy.known_governed_risks:
+            actions.add("human_review_required")
+            apply_output("review_required")
+        else:
+            apply_output("withhold")
+    elif first_rule == "risk_high":
+        record_unavailability_diagnostics()
         blockers.add("risk_high")
         reasons.add("high_consequence_requires_review")
         actions.add("human_review_required")
-        governed = startup = "review_required"
-    elif risk in {"unknown", "not_applicable"}:
+        apply_output("review_required")
+    elif first_rule == "risk_unknown":
+        record_unavailability_diagnostics()
         blockers.add("risk_unknown")
         reasons.add("unknown_consequence_requires_review")
         actions.add("human_review_required")
-        governed = startup = "review_required"
-    elif epistemic == "contested":
+        apply_output("review_required")
+    elif first_rule == "epistemic_contested":
         blockers.add("epistemic_contested")
         reasons.add("contested_evidence_requires_review")
         actions.add("human_review_required")
-        governed = startup = "review_required"
-    elif (
-        assessment.selection_status != "selected"
-        or assessment.contract_hash not in policy.accepted_contract_hashes
-        or not assessment.calibrated
-        or epistemic != "supported"
-        or retention != "retain"
-    ):
+        apply_output("review_required")
+    elif first_rule == "epistemic_insufficient":
         blockers.add(
             "epistemic_insufficient"
             if epistemic == "insufficient_evidence"
             else f"assessment_{assessment.selection_status}"
         )
         reasons.add("effective_assessment_not_qualified")
-        if risk == "medium":
-            governed = startup = "review_required"
+        if risk == "medium" and risk in policy.known_governed_risks:
             actions.add("human_review_required")
+            apply_output("review_required")
         else:
-            governed = startup = "withhold"
             actions.add("new_evidence_required")
+            apply_output("withhold")
     else:
         window = policy.observation_windows_hours[risk]
         eligible_at = item.created_at + timedelta(hours=window)
         if evaluation_time >= eligible_at:
-            governed = "allow"
+            apply_output("qualified")
             reasons.add("governed_evidence_qualified")
             if item.human_verified and policy.allow_existing_human_verified_startup:
                 startup = "allow"
                 reasons.add("existing_human_verified_startup_authority")
+            elif policy.new_automatic_startup_admission:
+                startup = "allow"
+                reasons.add("new_automatic_startup_authority")
             else:
                 blockers.add("startup_automatic_uncertified")
                 reasons.add("startup_automatic_admission_disabled")

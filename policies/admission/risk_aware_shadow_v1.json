@@ -2,16 +2,16 @@
   "schema_version": "engram.admission-policy.v1",
   "profile_key": "risk_aware_shadow_v1",
   "policy_version": "risk-aware-shadow-v1",
-  "artifact_digest": "sha256:54472448dd0c5a8c86b923d7fad40793d4e91374fae08e92faff22f274d1d7a9",
+  "artifact_digest": "sha256:c32b8037a03d919d410137092246e63e7de10ff2e5fdf7e18d97b3ca2f28edda",
   "supported_surfaces": ["semantic_exploratory", "semantic_governed", "startup"],
   "assessment_selection": {
     "policy_version": "assessment-selection-v1",
-    "accepted_contract_hashes": ["sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+    "accepted_contract_hashes": ["sha256:d907baa0b6c6aab01cd4a848f5f967f69aa857200b26160ce4bfe50b9f0e718d"],
     "required_purposes": ["combined"]
   },
   "rules": {
     "precedence": [
-      "not_live", "conflict", "governance", "risk_high", "risk_unknown",
+      "not_live", "conflict", "governance", "risk_high", "risk_unknown", "assessment_unavailable",
       "epistemic_contested", "epistemic_insufficient", "qualified"
     ],
     "conditions": {
