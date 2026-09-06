@@ -1209,6 +1209,13 @@ class RecallLog(Base):
     token_budget: Mapped[int | None] = mapped_column(nullable=True)
     scoring_version: Mapped[str] = mapped_column(String(20), default="v1")
     config_version: Mapped[str] = mapped_column(String(20), default="v1")
+    # Effective recall admission profile (issue #160). "legacy" is the
+    # pre-profile semantic behavior and also the backfilled value for
+    # historical rows; "startup" marks the startup pipeline; governed /
+    # exploratory are the profile-gated semantic paths.
+    recall_profile: Mapped[str] = mapped_column(
+        Text, default="legacy", server_default=text("'legacy'"), nullable=False
+    )
     memory_profile_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     memory_profile_revision_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
