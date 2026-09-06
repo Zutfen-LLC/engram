@@ -44,6 +44,18 @@ EXPECTED_MATRIX: dict[tuple[str, str], dict] = {
     ("POST", "/v1/feedback"): {"all_of": ("write",)},
     ("GET", "/v1/items"): {"all_of": ("read",)},
     ("GET", "/v1/items/{item_id}"): {"all_of": ("read",)},
+    # Admission decisions (issue #159). The current/history views follow item
+    # read eligibility; the reviewer detail (normalized decision inputs and
+    # diagnostic evidence references) and the bounded reevaluation request
+    # both require review authority.
+    ("GET", "/v1/items/{item_id}/admission-assessment"): {"all_of": ("read",)},
+    ("GET", "/v1/items/{item_id}/admission-assessments"): {"all_of": ("read",)},
+    ("GET", "/v1/items/{item_id}/admission-assessments/{assessment_id}"): {
+        "all_of": ("review",)
+    },
+    ("POST", "/v1/items/{item_id}/admission-assessments/reevaluate"): {
+        "all_of": ("review",)
+    },
     ("GET", "/v1/items/{item_id}/assessments"): {"all_of": ("read",)},
     ("GET", "/v1/items/{item_id}/assessments/{assessment_id}/debug"): {"all_of": ("review",)},
     ("GET", "/v1/items/{item_id}/reassessments/{request_id}"): {"all_of": ("review",)},

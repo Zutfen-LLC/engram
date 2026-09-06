@@ -698,6 +698,12 @@ class ItemEvent(Base):
         String(32), nullable=True
     )
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The admission assessment (issue #159) that authorized this audit row.
+    # Nullable forever: events written before #159, and every event that is
+    # not a Path A admission, legitimately have no assessment to name.
+    admission_assessment_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )
@@ -793,6 +799,84 @@ class MemoryAssessment(Base):
     receipt: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     canonical_hash: Mapped[str] = mapped_column(Text, server_default=text("''"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class AdmissionAssessment(Base):
+    """Append-only admission decision for one item under one policy profile.
+
+    Records what current Path A policy decided, from which exact inputs, under
+    which policy identity, what blocked or authorized it, and what must happen
+    next (issue #159). It is a decision artifact, not a promotion policy: the
+    referenced #157 assessments in ``available_memory_assessment_refs`` stay
+    diagnostic in v1. Rows are immutable — enforced by both the revoked
+    app-role grants and a database trigger.
+    """
+
+    __tablename__ = "admission_assessments"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    memory_item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    schema_version: Mapped[str] = mapped_column(Text, nullable=False)
+    mode: Mapped[str] = mapped_column(Text, nullable=False)
+    evaluation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    job_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    trigger_type: Mapped[str] = mapped_column(Text, nullable=False)
+    trigger_id: Mapped[str] = mapped_column(Text, nullable=False)
+    invocation_source: Mapped[str] = mapped_column(Text, nullable=False)
+    actor_principal_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    item_content_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    input_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    policy_profile_key: Mapped[str] = mapped_column(Text, nullable=False)
+    policy_contract_version: Mapped[str] = mapped_column(Text, nullable=False)
+    policy_config_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    selected_basis: Mapped[str | None] = mapped_column(Text, nullable=True)
+    outcome: Mapped[str] = mapped_column(Text, nullable=False)
+    blocker_codes: Mapped[list[Any]] = mapped_column(JSONB, nullable=False, default=list)
+    reason_codes: Mapped[list[Any]] = mapped_column(JSONB, nullable=False, default=list)
+    decision_inputs: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    classification_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    available_memory_assessment_refs: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+    conflict_recheck_status: Mapped[str] = mapped_column(Text, nullable=False)
+    cooling_period_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    eligible_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_evaluation_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_actions: Mapped[list[Any]] = mapped_column(JSONB, nullable=False, default=list)
+    decision_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    prior_assessment_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    linked_item_event_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class AdmissionAssessmentCurrent(Base):
+    """Mutable one-row current projection keyed by (tenant, item, profile).
+
+    Holds identity plus only the operational metadata needed to resolve
+    precedence deterministically — never a copy of the decision, which stays
+    in the pointed :class:`AdmissionAssessment`. Shadow rows are never
+    projected; ``mode_rank`` makes an authoritative row supersede a
+    ``legacy_import`` one, and ``mutation_rank`` breaks a same-instant tie
+    toward the evaluation that actually mutated item state.
+    """
+
+    __tablename__ = "admission_assessment_current"
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    memory_item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    policy_profile_key: Mapped[str] = mapped_column(Text, primary_key=True)
+    assessment_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    mode: Mapped[str] = mapped_column(Text, nullable=False)
+    mode_rank: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    mutation_rank: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )
 

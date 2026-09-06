@@ -12,6 +12,17 @@ from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
+from engram.admission_assessment import (
+    POLICY_CONTRACT_VERSION as ADMISSION_POLICY_CONTRACT_VERSION,
+)
+from engram.admission_assessment import (
+    POLICY_PROFILE_KEY as ADMISSION_POLICY_PROFILE_KEY,
+)
+from engram.api.routes.admission_assessments import (
+    MISSING_ADMISSION_SUMMARY,
+    admission_summaries,
+    matches_admission_filters,
+)
 from engram.api.routes.memory import (
     _insert_item_event,
     _now_dt,
@@ -258,6 +269,24 @@ class PromotionReadinessResponse(BaseModel):
     conflict_recheck_status: Literal["not_run"]
     last_evaluation: PromotionReadinessLastEvaluation
 
+    # Safe admission summary (issue #159). This is the durable decision the
+    # promotion path recorded, not a recomputation: readiness above explains
+    # what current policy would say, while these say what it actually decided
+    # and when it must be reconsidered. ``missing`` — the state while capture
+    # is disabled — never masquerades as an ``unknown`` outcome. Reviewer-only
+    # detail (normalized decision inputs, evidence references) is deliberately
+    # absent; it needs review authority and its own endpoint.
+    admission_assessment_id: UUID | None = None
+    admission_assessment_status: Literal["current", "stale", "missing", "legacy_import"] = (
+        "missing"
+    )
+    admission_outcome: str | None = None
+    admission_policy_profile: str = ADMISSION_POLICY_PROFILE_KEY
+    admission_policy_version: str = ADMISSION_POLICY_CONTRACT_VERSION
+    admission_reason_codes: list[str] = Field(default_factory=list)
+    admission_next_actions: list[str] = Field(default_factory=list)
+    next_evaluation_at: datetime | None = None
+
 
 async def _resolve_tenant_id(session: AsyncSession) -> UUID:
     row = await session.execute(text("SELECT current_setting('app.tenant_id', true)"))
@@ -272,6 +301,11 @@ async def review_queue(
     kind: str | None = None,
     workspace: str | None = None,
     limit: int = 50,
+    admission_outcome: str | None = None,
+    admission_blocker: str | None = None,
+    admission_next_action: str | None = None,
+    admission_state: str | None = None,
+    admission_due_before: datetime | None = None,
     caller: Principal = Depends(REVIEW_SCOPE),  # noqa: B008
     session: AsyncSession = Depends(get_session),  # noqa: B008
     memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
@@ -283,6 +317,14 @@ async def review_queue(
     promotion basis and eligibility clock, stable blockers, kind policy, and
     an explicit ``promotion_conflict_recheck_status='not_run'``. Previewing
     never performs a semantic conflict check or mutates state.
+
+    The ``admission_*`` parameters filter on the durable admission decision
+    (issue #159): outcome, a blocker code, a required next action, the
+    assessment's current/stale/missing/legacy_import state, and a
+    due-before time on ``next_evaluation_at``. They are applied to the page
+    this query already selected rather than widening the scan, so the queue
+    stays bounded; an item with no recorded decision matches only
+    ``admission_state=missing``.
     """
     tenant_id = memory_context.tenant_id
     if not memory_context.may_read_anything:
@@ -314,6 +356,30 @@ async def review_queue(
         stmt = stmt.where(MemoryItem.workspace_id == workspace_id)
 
     items = list((await session.execute(stmt)).scalars())
+    admission_filtered = any(
+        value is not None
+        for value in (
+            admission_outcome,
+            admission_blocker,
+            admission_next_action,
+            admission_state,
+            admission_due_before,
+        )
+    )
+    summaries = await admission_summaries(session, items)
+    if admission_filtered:
+        items = [
+            item
+            for item in items
+            if matches_admission_filters(
+                summaries.get(item.id),
+                outcome=admission_outcome,
+                blocker=admission_blocker,
+                next_action=admission_next_action,
+                state=admission_state,
+                due_before=admission_due_before,
+            )
+        ]
     config = (
         await session.execute(
             select(TenantConfig).where(
@@ -377,6 +443,14 @@ async def review_queue(
                 if candidate.selected_basis == "retention_evidence"
                 else "promotion-legacy-v1",
                 "promotion_conflict_recheck_status": "not_run",
+                # The safe admission summary only; the blocker codes the
+                # filter matched on stay internal to filtering, since the
+                # queue already publishes current-policy blockers above.
+                **{
+                    key: value
+                    for key, value in summaries.get(item.id, MISSING_ADMISSION_SUMMARY).items()
+                    if key != "admission_blocker_codes"
+                },
             }
         )
     return output
