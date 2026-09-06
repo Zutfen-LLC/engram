@@ -28,6 +28,8 @@ All tool names are prefixed with `engram_`.
 | `engram_recall` | Fetch a bounded working set of active memories (startup or semantic mode). |
 | `engram_search` | Keyword (FTS), semantic (vector), or hybrid search over active memories. |
 | `engram_classify` | Suggest kind, wing, room, and visibility for raw text. |
+| `engram_assessments` | Read an item's versioned assessment history (taxonomy, retention, epistemic, risk). |
+| `engram_reassess` | Request a new versioned assessment for an item under the deployed contract. |
 | `engram_kg_query` | Query knowledge-graph triples for an entity (subject or object). |
 | `engram_kg_add` | Add a knowledge-graph triple, backed by a memory item. |
 | `engram_diary_write` | Write a private diary entry for a principal. |
@@ -224,7 +226,7 @@ Persist a memory item. Returns `{id, status, review_status, memory_confidence}`.
 | `wing` | string | no | Top-level taxonomy bucket. |
 | `room` | string | no | Sub-bucket within a wing. |
 | `workspace` | string | no | Workspace name or id. |
-| `visibility` | `private` \| `workspace` \| `tenant` | no | `workspace` |
+| `visibility` | `private` \| `workspace` \| `tenant` \| `public` | no | Derived from `workspace` when omitted — see below. |
 | `source_type` | `manual` \| `import` \| `migration` \| `extraction` \| `sync_turn` \| `pre_compress` | no | `manual` |
 | `importance` | float | no | `0.5` |
 | `sensitivity` | `normal` \| `sensitive` \| `restricted` | no | `normal` |
@@ -257,6 +259,25 @@ Persist a memory item. Returns `{id, status, review_status, memory_confidence}`.
 | `context` | string | no | Surrounding context. |
 | `workspace` | string | no | Workspace vocabulary scope. |
 
+### `engram_assessments`
+
+Read normalized assessment history for a memory item. Unknown scores remain `null` until calibrated.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `item_id` | string (UUID) | yes | Memory item id. |
+| `limit` | int | no | `50` |
+
+### `engram_reassess`
+
+Request a new versioned assessment under the currently deployed assessment contract. Requires review scope.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `item_id` | string (UUID) | yes | Memory item id. |
+| `purpose` | `taxonomy` \| `retention` \| `epistemic` \| `risk` \| `combined` | no | `combined` |
+| `reason` | `provider_recovery` \| `model_upgrade` \| `provenance_added` \| `human_correction` \| `policy_rollout` \| `manual` | no | `manual` |
+
 ### `engram_kg_query`
 
 | Parameter | Type | Required | Description |
@@ -280,6 +301,10 @@ Persist a memory item. Returns `{id, status, review_status, memory_confidence}`.
 
 ### `engram_diary_write`
 
+Writes the caller's own diary by default. Admin representation of another
+principal is explicit and by id via `on_behalf_of_principal_id`, never via the
+legacy `principal` name field.
+
 The response includes `attribution_status`. Modern entries report `recorded`;
 deduplicated diary rows from before actor-bearing audit events may report
 `legacy_unknown` with null `actor_principal_id` and `represented`. No actor is
@@ -288,8 +313,10 @@ inferred and no retroactive event is created.
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `entry` | string | yes | Diary text. |
-| `principal` | string | yes | Principal name (not id). |
+| `principal` | string | no | Deprecated legacy self-target hint. If given it must equal the caller's own name (422 otherwise) and cannot be combined with `on_behalf_of_principal_id`. |
 | `topic` | string | no | Optional topic tag. |
+| `on_behalf_of_principal_id` | string (UUID) | no | Admin-only: write into another principal's diary by id. Requires the caller to hold the `admin` scope and be an `admin`-typed principal; the target principal must exist. |
+| `reason` | string | no | Audit reason recorded on the `diary_create` event. |
 
 ## See also
 
