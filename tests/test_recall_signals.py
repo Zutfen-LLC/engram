@@ -22,6 +22,7 @@ from engram.recall_signals import (
     RECALL_ADMISSION_POLICY_VERSION,
     SIGNALS_VERSION,
     AdmissionAssessmentBinding,
+    RecallAdmissionDecision,
     compute_signal_rank_score,
     compute_utility_score,
     decide_recall_admission,
@@ -327,6 +328,90 @@ def test_disputed_stay_kind_blocked_assessment_withholds_in_every_profile() -> N
         assert "admission_blocked" in decision.reason_codes
 
 
+def test_governed_disputed_stay_kind_with_stale_assessment_withholds() -> None:
+    """Correctness regression (issue #160 correction): a stale assessment
+    cannot authorize serving a disputed stay-kind item either — governed
+    recall fails closed on stale durable admission state for *every*
+    governance-compatible review status, not just active items."""
+    binding = AdmissionAssessmentBinding(
+        assessment_id=str(uuid4()), status="stale", outcome="admitted"
+    )
+    decision = decide_recall_admission(
+        _make_item(review_status="disputed", kind="doctrine"),
+        profile=GOVERNED_PROFILE,
+        stay_kinds={"doctrine"},
+        assessment=binding,
+    )
+    assert decision.decision == "withhold"
+    assert decision.reason_codes == ("admission_assessment_stale",)
+    assert decision.assessment_id == binding.assessment_id
+
+
+def test_exploratory_disputed_stay_kind_with_stale_assessment_marks_not_trusts() -> None:
+    """Exploratory keeps admitting the disputed stay kind but carries the
+    staleness as a mark — the candidate policy for non-strict profiles."""
+    binding = AdmissionAssessmentBinding(
+        assessment_id=str(uuid4()), status="stale", outcome="admitted"
+    )
+    decision = decide_recall_admission(
+        _make_item(review_status="disputed", kind="doctrine"),
+        profile=EXPLORATORY_PROFILE,
+        stay_kinds={"doctrine"},
+        assessment=binding,
+    )
+    assert decision.decision == "admit"
+    assert "admitted_disputed_stay_kind" in decision.reason_codes
+    assert "admission_assessment_stale" in decision.reason_codes
+
+
+def test_stale_assessment_withholds_for_every_governed_review_status() -> None:
+    """The governed stale-withhold is applied centrally, so it cannot drift
+    per review-status branch — including future governance-compatible
+    states added to the window."""
+    binding = AdmissionAssessmentBinding(
+        assessment_id=str(uuid4()), status="stale", outcome="admitted"
+    )
+    for review_status, kind in (("active", "fact"), ("disputed", "doctrine")):
+        decision = decide_recall_admission(
+            _make_item(review_status=review_status, kind=kind),
+            profile=GOVERNED_PROFILE,
+            stay_kinds={"doctrine"},
+            assessment=binding,
+        )
+        assert decision.decision == "withhold"
+        assert decision.reason_codes == ("admission_assessment_stale",)
+
+
+def test_blocked_assessment_wins_on_every_candidate_profile_branch() -> None:
+    """A blocked outcome withholds for every (profile, review-status) pair —
+    including combinations each branch used to decide separately, and even
+    when the row is simultaneously stale (blocked outranks the stale mark
+    because both withhold, and the explicit policy outcome is the louder
+    reason)."""
+    blocked = AdmissionAssessmentBinding(
+        assessment_id=str(uuid4()), status="current", outcome="blocked"
+    )
+    stale_blocked = AdmissionAssessmentBinding(
+        assessment_id=str(uuid4()), status="stale", outcome="blocked"
+    )
+    cases = (
+        _make_item(review_status="active"),
+        _make_item(review_status="disputed", kind="doctrine"),
+        _make_item(review_status="proposed"),
+    )
+    for binding in (blocked, stale_blocked):
+        for profile in (GOVERNED_PROFILE, EXPLORATORY_PROFILE):
+            for item in cases:
+                decision = decide_recall_admission(
+                    item,
+                    profile=profile,
+                    stay_kinds={"doctrine"},
+                    assessment=binding,
+                )
+                assert decision.decision == "withhold", (profile, item.review_status, binding)
+                assert decision.reason_codes == ("admission_blocked",)
+
+
 # ---- admission: exploratory ----
 
 
@@ -443,3 +528,106 @@ def test_signal_item_fields_never_expose_a_blended_trust_score() -> None:
     decision = decide_recall_admission(_make_item(), profile=GOVERNED_PROFILE, stay_kinds=set())
     fields = signal_item_fields(_make_item(), decision=decision, similarity=0.5, now=_NOW)
     assert "trust_score" not in fields
+
+
+# ---- memory_confidence is not epistemic confidence ----
+
+
+def test_memory_confidence_is_not_even_a_signal_input() -> None:
+    """``memory_confidence`` is the historical source-policy prior for
+    automated captures — never epistemic confidence. No separated-signal
+    function may accept it, so it can never move epistemic state, admission,
+    or a warning."""
+    import inspect
+
+    for fn in (compute_utility_score, derive_epistemic_state, structured_warning_codes):
+        assert "memory_confidence" not in inspect.signature(fn).parameters
+    assert "memory_confidence" not in inspect.signature(decide_recall_admission).parameters
+
+
+def test_changing_memory_confidence_changes_no_signal_output() -> None:
+    """Two items identical except ``memory_confidence`` produce byte-identical
+    separated-signal output — most importantly no generic warning that a
+    caller could reasonably read as a factual/epistemic confidence claim
+    (the ``low_confidence`` conflation #160 removes)."""
+    low = signal_item_fields(
+        _make_item(memory_confidence=0.1),
+        decision=decide_recall_admission(
+            _make_item(memory_confidence=0.1), profile=GOVERNED_PROFILE, stay_kinds=set()
+        ),
+        similarity=0.8,
+        now=_NOW,
+    )
+    high = signal_item_fields(
+        _make_item(memory_confidence=0.95),
+        decision=decide_recall_admission(
+            _make_item(memory_confidence=0.95), profile=GOVERNED_PROFILE, stay_kinds=set()
+        ),
+        similarity=0.8,
+        now=_NOW,
+    )
+    assert low == high
+    assert low["epistemic_state"] == "insufficient_evidence"
+    assert "low_confidence" not in low["warning_codes"]
+    assert "low confidence" not in [w.lower() for w in low["warnings"]]
+    # The misleading code is gone from the vocabulary entirely.
+    from engram.recall_signals import _WARNING_TEXT
+
+    assert "low_confidence" not in _WARNING_TEXT
+
+
+# ---- exposure counters never feed signals ----
+
+
+def test_exposure_counters_change_no_signal_output() -> None:
+    """recall_count / last_recalled_at / startup_recall_count are exposure
+    telemetry only — a heavily-served item must be indistinguishable from a
+    never-served one in utility, epistemic state, admission, and warnings
+    (feedback-loop safeguard)."""
+    fresh = _make_item(recall_count=0, startup_recall_count=0, last_recalled_at=None)
+    hot = _make_item(
+        recall_count=10_000, startup_recall_count=10_000, last_recalled_at=_NOW
+    )
+    decision_fresh = decide_recall_admission(
+        fresh, profile=GOVERNED_PROFILE, stay_kinds=set()
+    )
+    decision_hot = decide_recall_admission(hot, profile=GOVERNED_PROFILE, stay_kinds=set())
+    assert decision_fresh == decision_hot
+    fields_fresh = signal_item_fields(fresh, decision=decision_fresh, similarity=0.7, now=_NOW)
+    fields_hot = signal_item_fields(hot, decision=decision_hot, similarity=0.7, now=_NOW)
+    assert fields_fresh == fields_hot
+
+
+# ---- importance orders but never admits ----
+
+
+def test_importance_changes_utility_and_rank_but_not_admission_or_epistemic() -> None:
+    """Importance is the caller's explicit priority: among admitted items it
+    moves utility and therefore rank, but it can never change the admission
+    decision or the epistemic state at any value."""
+    low_item = _make_item(review_status="proposed", importance=0.0)
+    high_item = _make_item(review_status="proposed", importance=1.0)
+    for item in (low_item, high_item):
+        governed = decide_recall_admission(item, profile=GOVERNED_PROFILE, stay_kinds=set())
+        assert governed.decision == "withhold"
+        assert governed.reason_codes == ("proposed_not_admitted",)
+        exploratory = decide_recall_admission(
+            item, profile=EXPLORATORY_PROFILE, stay_kinds=set()
+        )
+        assert exploratory.decision == "admit"
+
+    low_fields = signal_item_fields(
+        low_item,
+        decision=RecallAdmissionDecision(profile="exploratory", decision="admit", reason_codes=()),
+        similarity=0.8,
+        now=_NOW,
+    )
+    high_fields = signal_item_fields(
+        high_item,
+        decision=RecallAdmissionDecision(profile="exploratory", decision="admit", reason_codes=()),
+        similarity=0.8,
+        now=_NOW,
+    )
+    assert high_fields["utility_score"] > low_fields["utility_score"]
+    assert high_fields["score"] > low_fields["score"]
+    assert high_fields["epistemic_state"] == low_fields["epistemic_state"] == "unknown"

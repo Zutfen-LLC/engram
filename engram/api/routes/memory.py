@@ -165,7 +165,10 @@ class RecallRequest(BaseModel):
     # default (legacy). "governed"/"exploratory" apply to mode='semantic'
     # only; "startup" is accepted (and implied) for mode='startup'. The union
     # covers both modes; the per-mode contract is enforced by
-    # resolve_recall_profile in the route (HTTP 422).
+    # resolve_serving_profile in the route (HTTP 422). Until #162
+    # certification, governed/exploratory are NOT servable here — requesting
+    # them is a 422, and they can be evaluated only via the REVIEW_SCOPE +
+    # tenant-policy-gated POST /v1/recall/shadow-compare.
     recall_profile: Literal["legacy", "governed", "exploratory", "startup"] | None = None
 
 
@@ -1307,12 +1310,16 @@ async def recall(
             detail="mode='semantic' requires a non-empty query",
         )
 
-    # Validate the profile up front so an invalid or mode-incompatible
-    # request fails before any embedding work (issue #160).
-    from engram.recall_profiles import RecallProfileError, resolve_recall_profile
+    # Validate the serving profile up front so an invalid, mode-incompatible,
+    # or uncertified-for-serving request fails before any embedding work
+    # (issue #160). Uncertified governed/exploratory raise
+    # RecallProfileNotServableError — a subclass of RecallProfileError — and
+    # are rejected: before #162 certification they may be evaluated only via
+    # the shadow comparison surface, never served.
+    from engram.recall_profiles import RecallProfileError, resolve_serving_profile
 
     try:
-        resolve_recall_profile(req.recall_profile, mode=mode)
+        resolve_serving_profile(req.recall_profile, mode=mode)
     except RecallProfileError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

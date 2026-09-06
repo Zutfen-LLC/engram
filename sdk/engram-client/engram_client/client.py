@@ -321,9 +321,13 @@ class EngramClient:
     ) -> RecallResponse:
         """Bounded recall: deterministic startup set or semantic query.
 
-        ``recall_profile`` selects the admission profile for semantic mode
-        (None → tenant default/legacy; "governed" or "exploratory" are
-        explicit opt-ins — issue #160).
+        ``recall_profile``: None resolves to the tenant default, and only
+        profiles certified for serving are accepted — currently ``legacy``
+        (plus ``startup`` for startup mode). Requesting ``governed`` or
+        ``exploratory`` is rejected with HTTP 422 until accepted #162
+        certification (issue #160): candidate profiles are evaluated on the
+        server's shadow-comparison surface only and can never be served or
+        selected through this method.
         """
         req = RecallRequest(
             mode=mode,

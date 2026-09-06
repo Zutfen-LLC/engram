@@ -107,6 +107,21 @@ async def test_recall_startup_defaults(mcp_server, mock_client) -> None:
     assert kwargs["query"] is None
 
 
+async def test_recall_exposes_no_profile_parameter(mcp_server, mock_client) -> None:
+    """The MCP tool must never select a recall profile — especially not the
+    exploratory one (issue #160: candidate profiles are shadow-only and
+    exploratory is a privileged review surface). No declared parameter and no
+    forwarded kwarg may broaden access."""
+    tools = {t.name: t for t in await mcp_server.list_tools()}
+    assert "recall_profile" not in tools["engram_recall"].inputSchema.get("properties", {})
+    assert "profile" not in tools["engram_recall"].inputSchema.get("properties", {})
+
+    await _call(mcp_server, "engram_recall", {"mode": "semantic", "query": "x"})
+
+    kwargs = mock_client.recall.await_args.kwargs
+    assert "recall_profile" not in kwargs
+
+
 # ---- engram_search ----
 
 

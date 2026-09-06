@@ -26,6 +26,7 @@ telemetry-write failure never fails the read.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -52,7 +53,7 @@ from engram.recall_profiles import (
     STARTUP_PROFILE_KEY,
     RecallProfileSpec,
     apply_profile_budget_caps,
-    resolve_recall_profile,
+    resolve_serving_profile,
 )
 from engram.relationship_recall import expand_recall_candidates
 
@@ -1024,6 +1025,31 @@ def _semantic_base_item_fields(
     }
 
 
+def _signal_corpus_eligibility(
+    profile: RecallProfileSpec,
+    stay_kinds: set[str],
+) -> ColumnElement[bool]:
+    """The pre-retrieval corpus predicate for a signal profile (issue #160).
+
+    Everything mechanically expressible without examining relevance is pushed
+    into SQL *before* the bounded HNSW window, so rows the admission gate
+    would inevitably withhold (e.g. disputed items whose kind is not a
+    governed stay kind) can never occupy the candidate window and starve
+    eligible rows sitting just outside it. For governed recall this is
+    exactly::
+
+        review_status = 'active'
+        OR (review_status = 'disputed' AND kind is governed to remain in
+        recall while disputed)
+
+    Per-item durable-admission freshness cannot be expressed without
+    examining state, so it remains the post-retrieval admission gate's job.
+    """
+    if "disputed" in profile.review_statuses:
+        return _review_status_clause(stay_kinds)
+    return MemoryItem.review_status.in_(profile.review_statuses)
+
+
 async def _admit_and_rank_signal_items(
     session: AsyncSession,
     *,
@@ -1031,21 +1057,21 @@ async def _admit_and_rank_signal_items(
     tenant_id: str,
     candidates: list[dict[str, Any]],
     item_by_id: dict[UUID, MemoryItem],
+    stay_kinds: set[str],
     now: datetime,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Governed admission + separated-signal ranking (issue #160).
 
     Admission runs on the retrieved candidate window — after relevance
-    retrieval, before ranking, packing, and (by not running at all for signal
-    profiles) before any graph/tunnel expansion, so nothing ineligible can
-    enter the packet through a side door. Withheld items are counted by reason
-    code (``omitted_by_admission``) without retaining their content.
+    retrieval (whose SQL already excluded mechanically-ineligible rows — see
+    :func:`_signal_corpus_eligibility`), before ranking, packing, and (by not
+    running at all for signal profiles) before any graph/tunnel expansion, so
+    nothing ineligible can enter the packet through a side door. Withheld
+    items are counted by reason code (``omitted_by_admission``) without
+    retaining their content.
 
     Returns (admitted items sorted by signal rank, omission counts by code).
     """
-    stay_kinds: set[str] = set()
-    if "disputed" in profile.review_statuses:
-        stay_kinds = await get_disputed_stay_kind_names(session, tenant_id)
     bindings = await recall_signals.load_admission_bindings(
         session, tenant_id=tenant_id, items=list(item_by_id.values())
     )
@@ -1090,6 +1116,252 @@ async def _admit_and_rank_signal_items(
     return [entry[0] for entry in admitted], omitted
 
 
+@dataclass
+class SemanticPacketEvaluation:
+    """One profile's complete packet evaluation — read-only, no side effects.
+
+    Shared by authoritative serving (``execute_semantic_recall``, which adds
+    the recall_logs audit row and exposure-counter telemetry around it) and
+    the shadow comparison surface (``engram.recall_shadow``, which adds
+    nothing). Keeping the evaluation free of writes is what makes "candidate
+    profiles may be evaluated but never served" a structural property rather
+    than a convention.
+    """
+
+    profile: RecallProfileSpec
+    items: list[dict[str, Any]]
+    working_set: str
+    candidate_count: int
+    omitted_by_admission: dict[str, int]
+    item_count: int = 0
+    byte_count: int = 0
+    byte_budget: int | None = None
+    token_budget: int | None = None
+    item_budget: int | None = None
+
+    def finalize_counts(self) -> None:
+        self.item_count = len(self.items)
+        self.byte_count = sum(len(item["content"].encode()) for item in self.items)
+
+
+async def generate_query_embedding(
+    query: str,
+    *,
+    embedding_profile: Any,
+    tenant_id: str,
+    principal_id: str,
+) -> list[float] | None:
+    """Generate the query embedding, honoring provider-capable signatures.
+
+    Shared by authoritative serving and the shadow comparison surface so both
+    evaluate packets for the identical query vector.
+    """
+    import inspect
+
+    if len(inspect.signature(generate_embedding).parameters) >= 2:
+        return await generate_embedding(
+            query,
+            embedding_profile,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            operation="embedding_query_recall",
+            usage_class="request",
+        )
+    return await generate_embedding(query)
+
+
+async def evaluate_semantic_profile(
+    session: AsyncSession,
+    *,
+    memory_context: ResolvedMemoryContext,
+    workspace_id: str | None,
+    profile: RecallProfileSpec,
+    query_embedding: list[float],
+    embedding_profile: Any,
+    stay_kinds: set[str],
+    byte_budget: int | None,
+    token_budget: int | None,
+    item_budget: int | None,
+    now: datetime,
+) -> SemanticPacketEvaluation:
+    """Evaluate one profile's packet for a query embedding, writing nothing.
+
+    Corpus eligibility, retrieval, admission, ranking, and budget packing for
+    one profile. The legacy profile keeps its pre-#160 behavior byte-for-byte
+    (trust-weighted retrieval via ``semantic.search`` plus relationship
+    expansion); signal profiles retrieve through the neutral
+    ``semantic.retrieve_candidates`` primitive with their full eligibility
+    predicate applied before the bounded HNSW window, then run the admission
+    gate and separated-signal ranking.
+    """
+    byte_budget, token_budget, item_budget = apply_profile_budget_caps(
+        profile, byte_budget, token_budget, item_budget
+    )
+
+    # 1. Count the eligible corpus under the exact predicate retrieval uses.
+    if profile.signals_enabled:
+        candidate_total = await semantic.candidate_count(
+            session,
+            memory_context=memory_context,
+            workspace_id=workspace_id,
+            review_statuses=None,
+            corpus_eligibility=_signal_corpus_eligibility(profile, stay_kinds),
+            embedding_profile=embedding_profile,
+        )
+    else:
+        candidate_total = await semantic.candidate_count(
+            session,
+            memory_context=memory_context,
+            workspace_id=workspace_id,
+            review_statuses=profile.review_statuses,
+            embedding_profile=embedding_profile,
+        )
+
+    empty = SemanticPacketEvaluation(
+        profile=profile,
+        items=[],
+        working_set="",
+        candidate_count=candidate_total,
+        omitted_by_admission={},
+        byte_budget=byte_budget,
+        token_budget=token_budget,
+        item_budget=item_budget,
+    )
+    if candidate_total == 0:
+        return empty
+
+    # 2. Retrieve nearest candidates. item_budget is already resolved (and
+    #    profile-capped) above.
+    item_limit = item_budget if item_budget is not None else settings.recall_item_budget
+    fetch_limit = min(item_limit * _SEMANTIC_OVERFETCH, _SEMANTIC_OVERFETCH_CAP)
+    if profile.signals_enabled:
+        candidates = await semantic.retrieve_candidates(
+            session,
+            query_embedding,
+            fetch_limit,
+            memory_context=memory_context,
+            workspace_id=workspace_id,
+            corpus_eligibility=_signal_corpus_eligibility(profile, stay_kinds),
+            embedding_profile=embedding_profile,
+        )
+    else:
+        candidates = await semantic.search(
+            session,
+            query_embedding,
+            fetch_limit,
+            memory_context=memory_context,
+            workspace_id=workspace_id,
+            review_statuses=profile.review_statuses,
+            embedding_profile=embedding_profile,
+        )
+
+    # 3. Enrich candidates with full MemoryItem trust fields (pinned,
+    #    importance, source_trust, memory_confidence, human_verified).
+    #    Ids already passed the eligibility-filtered retrieval above; the
+    #    read-eligibility filter here is cheap defense in depth.
+    candidate_ids = [UUID(c["id"]) for c in candidates]
+    item_by_id: dict[UUID, MemoryItem] = {}
+    if candidate_ids:
+        rows = await session.execute(
+            select(MemoryItem).where(
+                MemoryItem.id.in_(candidate_ids),
+                read_eligibility_expression(memory_context),
+            )
+        )
+        item_by_id = {item.id: item for item in rows.scalars().all()}
+
+    omitted_by_admission: dict[str, int] = {}
+    if profile.signals_enabled:
+        # 4. Governed admission + separated-signal ranking (issue #160).
+        #    Relationship expansion deliberately does not run for signal
+        #    profiles: admission must be enforced before graph/tunnel
+        #    expansion, and the expansion rescorer still speaks the legacy
+        #    blended score. Teaching expansion the signal model is follow-up
+        #    work; until then these profiles serve only direct semantic hits.
+        enriched, omitted_by_admission = await _admit_and_rank_signal_items(
+            session,
+            profile=profile,
+            tenant_id=str(memory_context.tenant_id),
+            candidates=candidates,
+            item_by_id=item_by_id,
+            stay_kinds=stay_kinds,
+            now=now,
+        )
+    else:
+        # 4. Build per-item response dicts in trust-weighted order (legacy
+        #    profile — pre-#160 behavior, byte-for-byte). The candidate dicts
+        #    already carry the trust-weighted semantic score, similarity, and
+        #    trust blend computed by engram.semantic; we add the MemoryItem
+        #    fields (pinned, etc.) needed by callers.
+        enriched = []
+        for cand in candidates:
+            item = item_by_id.get(UUID(cand["id"]))
+            if item is None:
+                # Stale embedding whose item disappeared — skip.
+                continue
+            distance = float(cand.get("distance", 0.0))
+            similarity = float(cand.get("similarity_score", 1.0 - distance))
+            trust_score = float(cand.get("trust_score", 1.0))
+            semantic_score = float(cand.get("score", similarity * trust_score))
+            warnings: list[str] = []
+            if item.review_status == "proposed":
+                warnings.append("unreviewed")
+            item_dict = _semantic_base_item_fields(
+                item, distance=distance, similarity=similarity
+            )
+            item_dict.update(
+                {
+                    "score": round(semantic_score, 4),
+                    "trust_score": round(trust_score, 4),
+                    "reasons": [
+                        f"semantic similarity {similarity:.2f}",
+                        f"trust_score={trust_score:.2f}",
+                        f"cosine_distance={distance:.4f}",
+                    ],
+                    "warnings": warnings,
+                }
+            )
+            enriched.append(item_dict)
+
+        # 4b. Relationship-aware expansion (ENG-AUD-012 / F19): graph (depth-1,
+        #     bounded) then tunnel (bounded) expansion of the top semantic
+        #     candidates, merged and rescored — semantic relevance still
+        #     dominates the blended score (see engram.relationship_recall).
+        #     Runs before budget packing so expanded memories compete for
+        #     budget on equal footing with direct semantic hits; never
+        #     bypasses eligibility. Legacy profile only (see above).
+        enriched = await expand_recall_candidates(
+            session,
+            memory_context=memory_context,
+            workspace_id=workspace_id,
+            semantic_items=enriched,
+            item_by_id=item_by_id,
+            now=now,
+        )
+
+    # 5. Enforce item/byte/token budgets.
+    selected = _enforce_semantic_budget(
+        enriched,
+        byte_budget=byte_budget,
+        token_budget=token_budget,
+        item_budget=item_budget,
+    )
+
+    working_set = "\n".join(f"[{item['kind']}] {item['content']}" for item in selected)
+    evaluation = SemanticPacketEvaluation(
+        profile=profile,
+        items=selected,
+        working_set=working_set,
+        candidate_count=candidate_total,
+        omitted_by_admission=omitted_by_admission,
+        byte_budget=byte_budget,
+        token_budget=token_budget,
+        item_budget=item_budget,
+    )
+    evaluation.finalize_counts()
+    return evaluation
+
+
 async def execute_semantic_recall(
     session: AsyncSession,
     memory_context: ResolvedMemoryContext,
@@ -1103,15 +1375,17 @@ async def execute_semantic_recall(
 ) -> dict[str, Any]:
     """Execute semantic recall and return the response dict.
 
-    Owns the query-embedding generation flow end to end. Recall profile
-    (issue #160 / ENG-RECALL-003) selects the admission/ranking behavior:
+    Owns the query-embedding generation flow end to end.
 
-    * ``legacy`` (default) — pre-#160 behavior unchanged: active + proposed
-      items, blended trust ranking, relationship expansion.
-    * ``governed`` — admission-gated reviewed corpus, separated
-      relevance/utility/epistemic signals, no relationship expansion.
-    * ``exploratory`` — proposals admitted with machine-readable unknown
-      evidence under tighter budget caps, no relationship expansion.
+    Serving authority (issue #160 rollout boundary): the served packet is
+    always produced by a profile certified in
+    ``recall_profiles.CERTIFIED_SERVING_PROFILES`` — ``legacy`` until accepted
+    #162 certification records otherwise. An explicitly requested uncertified
+    profile (``governed``/``exploratory``) raises
+    ``RecallProfileNotServableError`` (the route maps it to HTTP 422), and an
+    uncertified ``settings.recall_default_profile`` is refused with a warning
+    rather than honored. Candidate profiles are evaluated only by the
+    read-only shadow comparison surface (``engram.recall_shadow``).
 
     When embeddings are unavailable (provider=none) or the corpus has no
     candidates, returns an empty working set with a helpful message rather
@@ -1122,20 +1396,26 @@ async def execute_semantic_recall(
     principal_id = str(memory_context.principal_id)
     config = await _get_tenant_config(session, tenant_id)
 
-    profile = resolve_recall_profile(
+    serving = resolve_serving_profile(
         recall_profile, mode="semantic", default=settings.recall_default_profile
     )
+    profile = serving.spec
+    if serving.refused_default is not None:
+        # Configuration alone can never promote an uncertified profile into
+        # production authority; make the refusal visible instead of silent.
+        logger.warning(
+            "recall_default_profile_refused tenant=%s requested=%s serving=legacy "
+            "(profile not certified for serving; see docs/adr-160-recall-profiles.md)",
+            tenant_id,
+            serving.refused_default,
+        )
 
     # Apply configured defaults for omitted budgets so semantic recall is
-    # bounded by default (no API-documented way to request unbounded recall),
-    # then clamp to the profile's caps (exploratory only; never widens).
+    # bounded by default (no API-documented way to request unbounded recall).
     byte_budget, token_budget, item_budget = _resolve_recall_budgets(
         byte_budget=byte_budget,
         token_budget=token_budget,
         item_budget=item_budget,
-    )
-    byte_budget, token_budget, item_budget = apply_profile_budget_caps(
-        profile, byte_budget, token_budget, item_budget
     )
 
     # Resolve workspace_id if provided. An explicit workspace request that
@@ -1148,8 +1428,6 @@ async def execute_semantic_recall(
     # 1. Resolve the embedding profile and count the eligible corpus before
     #    calling the provider. Empty/denied contexts are a truthful
     #    ``not_attempted`` embedding outcome.
-    import inspect
-
     from engram.embedding_profiles import get_active_profile
 
     embedding_profile = await get_active_profile(session)
@@ -1169,17 +1447,12 @@ async def execute_semantic_recall(
     query_embedding: list[float] | None = None
     embedding_outcome = "not_attempted"
     if candidate_total > 0:
-        if len(inspect.signature(generate_embedding).parameters) >= 2:
-            query_embedding = await generate_embedding(
-                query,
-                embedding_profile,
-                tenant_id=tenant_id,
-                principal_id=principal_id,
-                operation="embedding_query_recall",
-                usage_class="request",
-            )
-        else:
-            query_embedding = await generate_embedding(query)
+        query_embedding = await generate_query_embedding(
+            query,
+            embedding_profile=embedding_profile,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+        )
         embedding_outcome = "succeeded" if query_embedding is not None else "disabled"
 
     if query_embedding is None or candidate_total == 0:
@@ -1225,133 +1498,27 @@ async def execute_semantic_recall(
             "omitted_by_admission": {},
         }
 
-    # 2. Retrieve nearest candidates by cosine similarity, scoped to the
-    #    caller's tenant/principal/workspace eligibility (engram.memory_access).
-    #    item_budget is already resolved (and profile-capped) above.
-    item_limit = item_budget if item_budget is not None else settings.recall_item_budget
-    fetch_limit = min(item_limit * _SEMANTIC_OVERFETCH, _SEMANTIC_OVERFETCH_CAP)
-    candidates = await semantic.search(
+    # 2. Evaluate the certified (legacy) packet — read-only core; the audit
+    #    row and exposure telemetry below are the serving side effects.
+    evaluation = await evaluate_semantic_profile(
         session,
-        query_embedding,
-        fetch_limit,
         memory_context=memory_context,
         workspace_id=workspace_id,
-        review_statuses=profile.review_statuses,
+        profile=profile,
+        query_embedding=query_embedding,
         embedding_profile=embedding_profile,
-    )
-
-    # 4. Enrich candidates with full MemoryItem trust fields (pinned,
-    #    importance, source_trust, memory_confidence, human_verified).
-    #    Ids already passed the eligibility-filtered search above; the
-    #    tenant_id filter here is cheap defense in depth.
-    candidate_ids = [UUID(c["id"]) for c in candidates]
-    item_by_id: dict[UUID, MemoryItem] = {}
-    if candidate_ids:
-        rows = await session.execute(
-            select(MemoryItem).where(
-                MemoryItem.id.in_(candidate_ids),
-                read_eligibility_expression(memory_context),
-            )
-        )
-        item_by_id = {item.id: item for item in rows.scalars().all()}
-
-    omitted_by_admission: dict[str, int] = {}
-    if profile.signals_enabled:
-        # 5. Governed admission + separated-signal ranking (issue #160).
-        #    Relationship expansion deliberately does not run for signal
-        #    profiles: admission must be enforced before graph/tunnel
-        #    expansion, and the expansion rescorer still speaks the legacy
-        #    blended score. Teaching expansion the signal model is follow-up
-        #    work; until then these profiles serve only direct semantic hits.
-        enriched, omitted_by_admission = await _admit_and_rank_signal_items(
-            session,
-            profile=profile,
-            tenant_id=tenant_id,
-            candidates=candidates,
-            item_by_id=item_by_id,
-            now=now,
-        )
-        # Structured audit trail for gate-level withholding (the response
-        # carries the same counts; recall_logs has no JSON omission column
-        # yet — persisting it there is follow-up work, see the ADR).
-        if omitted_by_admission:
-            logger.info(
-                "semantic_recall_admission tenant=%s profile=%s withheld_by_code=%s",
-                tenant_id,
-                profile.key,
-                dict(sorted(omitted_by_admission.items())),
-            )
-    else:
-        # 5. Build per-item response dicts in trust-weighted order (legacy
-        #    profile — pre-#160 behavior, byte-for-byte). The candidate dicts
-        #    already carry the trust-weighted semantic score, similarity, and
-        #    trust blend computed by engram.semantic; we add the MemoryItem
-        #    fields (pinned, etc.) needed by callers.
-        enriched = []
-        for cand in candidates:
-            item = item_by_id.get(UUID(cand["id"]))
-            if item is None:
-                # Stale embedding whose item disappeared — skip.
-                continue
-            distance = float(cand.get("distance", 0.0))
-            similarity = float(cand.get("similarity_score", 1.0 - distance))
-            trust_score = float(cand.get("trust_score", 1.0))
-            semantic_score = float(cand.get("score", similarity * trust_score))
-            warnings: list[str] = []
-            if item.review_status == "proposed":
-                warnings.append("unreviewed")
-            item_dict = _semantic_base_item_fields(
-                item, distance=distance, similarity=similarity
-            )
-            item_dict.update(
-                {
-                    "score": round(semantic_score, 4),
-                    "trust_score": round(trust_score, 4),
-                    "reasons": [
-                        f"semantic similarity {similarity:.2f}",
-                        f"trust_score={trust_score:.2f}",
-                        f"cosine_distance={distance:.4f}",
-                    ],
-                    "warnings": warnings,
-                }
-            )
-            enriched.append(item_dict)
-
-        # 5b. Relationship-aware expansion (ENG-AUD-012 / F19): graph (depth-1,
-        #     bounded) then tunnel (bounded) expansion of the top semantic
-        #     candidates, merged and rescored — semantic relevance still
-        #     dominates the blended score (see engram.relationship_recall). Runs
-        #     before budget packing so expanded memories compete for budget on
-        #     equal footing with direct semantic hits; never bypasses eligibility.
-        #     Legacy profile only (see the signals branch above).
-        enriched = await expand_recall_candidates(
-            session,
-            memory_context=memory_context,
-            workspace_id=workspace_id,
-            semantic_items=enriched,
-            item_by_id=item_by_id,
-            now=now,
-        )
-
-    # 6. Enforce item/byte/token budgets.
-    selected = _enforce_semantic_budget(
-        enriched,
+        stay_kinds=set(),
         byte_budget=byte_budget,
         token_budget=token_budget,
         item_budget=item_budget,
+        now=now,
     )
 
-    # 7. Build working set + counts.
-    working_set_lines = [f"[{item['kind']}] {item['content']}" for item in selected]
-    working_set = "\n".join(working_set_lines)
-    item_count = len(selected)
-    byte_count = sum(len(item["content"].encode()) for item in selected)
-
-    # 8. Write recall_logs (mode='semantic', query populated). The effective
+    # 3. Write recall_logs (mode='semantic', query populated). The effective
     #    profile and its ranking version are recorded for audit
     #    reproducibility (issue #160).
     config_version = config.config_version if config is not None else "v1"
-    selected_ids = [UUID(item["id"]) for item in selected]
+    selected_ids = [UUID(item["id"]) for item in evaluation.items]
     recall_log = RecallLog(
         tenant_id=tenant_id,
         principal_id=principal_id,
@@ -1369,7 +1536,7 @@ async def execute_semantic_recall(
     )
     session.add(recall_log)
 
-    # 9. Update recall signals. Only recall_count/last_recalled_at —
+    # 4. Update recall signals. Only recall_count/last_recalled_at —
     #    startup_recall_count drives the startup anti-feedback penalty and
     #    must not accumulate from semantic queries (design §4). These are
     #    exposure counters only: they never feed admission, epistemic state,
@@ -1387,19 +1554,19 @@ async def execute_semantic_recall(
     await session.commit()
 
     return {
-        "working_set": working_set,
-        "item_count": item_count,
-        "byte_count": byte_count,
+        "working_set": evaluation.working_set,
+        "item_count": evaluation.item_count,
+        "byte_count": evaluation.byte_count,
         "pinned_omitted_count": 0,
-        "omitted_count": max(0, candidate_total - item_count),
-        "items": selected,
+        "omitted_count": max(0, evaluation.candidate_count - evaluation.item_count),
+        "items": evaluation.items,
         "scoring_version": profile.ranking_version,
         "config_version": config_version,
         "recall_log_id": str(recall_log.id),
         "message": None,
         # Telemetry context (ENG-METER-001).
         "workspace_id": str(workspace_id) if workspace_id else None,
-        "candidate_count": candidate_total,
+        "candidate_count": evaluation.candidate_count,
         "embedding_outcome": "succeeded",
         # Profile context (issue #160): the effective profile, the signal
         # model version (None on the legacy blend), and admission omission
@@ -1408,5 +1575,5 @@ async def execute_semantic_recall(
         "signals_version": (
             recall_signals.SIGNALS_VERSION if profile.signals_enabled else None
         ),
-        "omitted_by_admission": omitted_by_admission,
+        "omitted_by_admission": evaluation.omitted_by_admission,
     }

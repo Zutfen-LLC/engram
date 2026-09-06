@@ -218,8 +218,11 @@ class RecallRequest(BaseModel):
     byte_budget: int | None = None
     token_budget: int | None = None
     item_budget: int | None = None
-    # Recall admission profile (issue #160): None/legacy (compat), governed,
-    # or exploratory (semantic mode only; explicit opt-in).
+    # Recall admission profile (issue #160). Only certified profiles may be
+    # SERVED: "legacy" (and "startup" for startup mode). "governed"/
+    # "exploratory" are uncertified candidates — the server rejects them with
+    # HTTP 422 until accepted #162 certification; they are evaluable only on
+    # the server's REVIEW_SCOPE + tenant-policy-gated shadow surface.
     recall_profile: Literal["legacy", "governed", "exploratory", "startup"] | None = None
 
 

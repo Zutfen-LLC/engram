@@ -103,7 +103,12 @@ class Settings(BaseSettings):
     # Default semantic recall profile when a request omits recall_profile
     # (issue #160). "legacy" preserves the pre-profile behavior byte-for-byte
     # until governed is certified and SDK/MCP consumers migrate. Must be a key
-    # of engram.recall_profiles.SEMANTIC_PROFILES.
+    # of engram.recall_profiles.SEMANTIC_PROFILES. NOTE: naming an uncertified
+    # profile here does NOT make it authoritative — serving falls back to the
+    # certified legacy packet with a warning (see
+    # engram.recall_profiles.resolve_serving_profile). Serving authority is
+    # granted only by the code-level CERTIFIED_SERVING_PROFILES constant
+    # changed alongside accepted #162 certification, never by configuration.
     recall_default_profile: str = "legacy"
     max_pinned_tokens: int = 2048  # hard ceiling for pinned items in startup recall
     stale_after_days: int = 90  # items not verified in N days are "stale"

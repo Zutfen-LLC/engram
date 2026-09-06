@@ -40,6 +40,11 @@ EXPECTED_MATRIX: dict[tuple[str, str], dict] = {
     ("GET", "/whoami"): {"all_of": ("read",)},
     ("POST", "/v1/remember"): {"all_of": ("write",)},
     ("POST", "/v1/recall"): {"all_of": ("read",)},
+    # Candidate recall-profile shadow comparison (issue #160). The only
+    # surface that can compute governed/exploratory packets before #162
+    # certification; review capability is necessary but the tenant policy
+    # allow (checked in the handler) is also required.
+    ("POST", "/v1/recall/shadow-compare"): {"all_of": ("review",)},
     ("POST", "/v1/search"): {"all_of": ("read",)},
     ("POST", "/v1/feedback"): {"all_of": ("write",)},
     ("GET", "/v1/items"): {"all_of": ("read",)},

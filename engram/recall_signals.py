@@ -36,7 +36,6 @@ from typing import Any, Final, Literal
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from engram.config import settings
 from engram.models import MemoryItem
 from engram.recall_profiles import RecallProfileSpec
 
@@ -66,6 +65,12 @@ _UTILITY_RANK_FLOOR: Final = 0.5
 
 # Free-text mirrors of the machine-readable warning codes (kept for callers
 # that render human warnings; codes are the contract, text is presentation).
+#
+# No ``memory_confidence``-derived code exists here by design: that column is
+# the historical source-policy prior for automated captures, not epistemic
+# confidence (issue #160), and a generic "low confidence" warning on this path
+# would reintroduce exactly the conflation #160 removes. Epistemic state stays
+# ``unknown``/``insufficient_evidence`` until #157 enrichment lands.
 _WARNING_TEXT: Final[dict[str, str]] = {
     "unreviewed": "unreviewed",
     "evidence_unknown": "evidence state unknown",
@@ -73,7 +78,6 @@ _WARNING_TEXT: Final[dict[str, str]] = {
     "disputed": "disputed — pending resolution",
     "admission_assessment_stale": "admission assessment stale",
     "admission_legacy_import": "legacy-imported admission state",
-    "low_confidence": "low confidence",
 }
 
 
@@ -183,13 +187,16 @@ def structured_warning_codes(
     conflict_resolution_status: str | None,
     epistemic_state: str | None = None,
     assessment_status: str | None = None,
-    memory_confidence: float | None = None,
 ) -> list[str]:
     """Machine-readable handling codes for one admitted item.
 
     Codes are the contract (SDK/MCP render or branch on them); the free-text
     ``warnings`` list is derived from these via :data:`_WARNING_TEXT`.
     Emitted in a fixed order so payloads are byte-stable for equal state.
+
+    ``memory_confidence`` is deliberately not a parameter: it is the legacy
+    source-policy prior, not epistemic confidence, and must never produce a
+    warning that reads as a factual-confidence claim.
     """
     codes: list[str] = []
     if review_status == "proposed":
@@ -204,50 +211,28 @@ def structured_warning_codes(
         codes.append("admission_assessment_stale")
     elif assessment_status == "legacy_import":
         codes.append("admission_legacy_import")
-    if memory_confidence is not None and memory_confidence < 0.5:
-        codes.append("low_confidence")
     return codes
 
 
 # ---- admission ----
 
 
-def _admit_reviewed(
-    *,
+def _assessment_withhold(
     profile: RecallProfileSpec,
     assessment: AdmissionAssessmentBinding | None,
-    strict_stale: bool,
-) -> RecallAdmissionDecision:
-    """Admission for governance-admitted (active) items.
+) -> RecallAdmissionDecision | None:
+    """Durable-admission withholds that win over every review-status branch.
 
-    ``strict_stale`` (governed): a stale assessment cannot authorize serving —
-    withhold. Exploratory marks instead (its purpose is bounded uncertainty),
-    but an explicit policy ``blocked`` outcome withholds in both profiles.
-    A ``legacy_import`` projection is a stored snapshot, never a claim, so it
-    can only ever be marked, not authoritative.
+    An explicit policy ``blocked`` outcome withholds in every profile and
+    every review status; a ``stale`` projection cannot authorize serving
+    under a strict (governed) profile, again regardless of review status —
+    active, disputed stay-kind, or any future governance-compatible state.
+    Returns ``None`` when the assessment does not withhold, leaving the
+    caller to apply review-status policy and mark (never trust) the
+    assessment.
     """
-    base = ("admitted_review_active",)
     if assessment is None:
-        return RecallAdmissionDecision(
-            profile=profile.key, decision="admit", reason_codes=base
-        )
-    if assessment.status == "stale":
-        if strict_stale:
-            # A stale decision cannot authorize serving; no binding is claimed.
-            return RecallAdmissionDecision(
-                profile=profile.key,
-                decision="withhold",
-                reason_codes=("admission_assessment_stale",),
-                assessment_status=assessment.status,
-            )
-        return RecallAdmissionDecision(
-            profile=profile.key,
-            decision="admit",
-            reason_codes=base + ("admission_assessment_stale",),
-            assessment_id=assessment.assessment_id,
-            assessment_status=assessment.status,
-            assessment_outcome=assessment.outcome,
-        )
+        return None
     if assessment.outcome == "blocked":
         return RecallAdmissionDecision(
             profile=profile.key,
@@ -257,23 +242,32 @@ def _admit_reviewed(
             assessment_status=assessment.status,
             assessment_outcome=assessment.outcome,
         )
-    if assessment.status == "legacy_import":
+    if assessment.status == "stale" and profile.strict_stale:
         return RecallAdmissionDecision(
             profile=profile.key,
-            decision="admit",
-            reason_codes=base + ("admission_legacy_import",),
+            decision="withhold",
+            reason_codes=("admission_assessment_stale",),
             assessment_id=assessment.assessment_id,
             assessment_status=assessment.status,
             assessment_outcome=assessment.outcome,
         )
-    return RecallAdmissionDecision(
-        profile=profile.key,
-        decision="admit",
-        reason_codes=base,
-        assessment_id=assessment.assessment_id,
-        assessment_status=assessment.status,
-        assessment_outcome=assessment.outcome,
-    )
+    return None
+
+
+def _marking_codes(assessment: AdmissionAssessmentBinding | None) -> tuple[str, ...]:
+    """Non-withholding assessment facts an admitted item carries as marks.
+
+    A non-strict (exploratory) stale projection, and any ``legacy_import``
+    projection, are stored snapshots — they are reported, never trusted as
+    authorization.
+    """
+    if assessment is None:
+        return ()
+    if assessment.status == "stale":
+        return ("admission_assessment_stale",)
+    if assessment.status == "legacy_import":
+        return ("admission_legacy_import",)
+    return ()
 
 
 def decide_recall_admission(
@@ -290,37 +284,38 @@ def decide_recall_admission(
     (``RecallProfileSpec.admits_proposals`` / ``strict_stale``), never its key.
     Similarity, importance, and exposure are not inputs by construction — a
     highly similar or important proposal cannot enter a governed packet, and
-    repeated serving cannot raise admission. An explicit policy ``blocked``
-    outcome withholds in every profile; a stale assessment withholds when
-    ``strict_stale`` and is merely marked otherwise.
+    repeated serving cannot raise admission.
+
+    Durable-assessment precedence is applied centrally before any
+    review-status policy: ``blocked`` withholds in every profile, and a stale
+    projection withholds whenever the profile is strict (governed fails
+    closed on stale state no matter whether the item is active or a disputed
+    stay kind). Non-withholding stale/legacy_import assessments are carried
+    as marks on admitted items, never treated as authorization.
     """
-    if item.review_status == "active":
-        return _admit_reviewed(
-            profile=profile, assessment=assessment, strict_stale=profile.strict_stale
+    withheld = _assessment_withhold(profile, assessment)
+    if withheld is not None:
+        return withheld
+
+    def _admit(base: tuple[str, ...]) -> RecallAdmissionDecision:
+        return RecallAdmissionDecision(
+            profile=profile.key,
+            decision="admit",
+            reason_codes=base + _marking_codes(assessment),
+            assessment_id=assessment.assessment_id if assessment is not None else None,
+            assessment_status=assessment.status if assessment is not None else None,
+            assessment_outcome=assessment.outcome if assessment is not None else None,
         )
+
+    if item.review_status == "active":
+        return _admit(("admitted_review_active",))
 
     if item.review_status == "disputed":
         # Same doctrine as startup recall: a governed stay kind stays in
-        # recall while its dispute is unresolved; everything else leaves. An
-        # explicit policy block still wins, exactly as for active items.
-        if assessment is not None and assessment.outcome == "blocked":
-            return RecallAdmissionDecision(
-                profile=profile.key,
-                decision="withhold",
-                reason_codes=("admission_blocked",),
-                assessment_id=assessment.assessment_id,
-                assessment_status=assessment.status,
-                assessment_outcome=assessment.outcome,
-            )
+        # recall while its dispute is unresolved; everything else leaves.
+        # (Blocked and strict-stale assessments already withheld above.)
         if item.kind in stay_kinds:
-            return RecallAdmissionDecision(
-                profile=profile.key,
-                decision="admit",
-                reason_codes=("admitted_disputed_stay_kind",),
-                assessment_id=assessment.assessment_id if assessment is not None else None,
-                assessment_status=assessment.status if assessment is not None else None,
-                assessment_outcome=assessment.outcome if assessment is not None else None,
-            )
+            return _admit(("admitted_disputed_stay_kind",))
         return RecallAdmissionDecision(
             profile=profile.key,
             decision="withhold",
@@ -329,26 +324,9 @@ def decide_recall_admission(
 
     if item.review_status == "proposed":
         if profile.admits_proposals:
-            if assessment is not None and assessment.outcome == "blocked":
-                return RecallAdmissionDecision(
-                    profile=profile.key,
-                    decision="withhold",
-                    reason_codes=("admission_blocked",),
-                    assessment_id=assessment.assessment_id,
-                    assessment_status=assessment.status,
-                    assessment_outcome=assessment.outcome,
-                )
-            reason_codes: tuple[str, ...] = ("exploratory_proposal",)
-            if assessment is not None and assessment.status == "stale":
-                reason_codes = reason_codes + ("admission_assessment_stale",)
-            return RecallAdmissionDecision(
-                profile=profile.key,
-                decision="admit",
-                reason_codes=reason_codes,
-                assessment_id=assessment.assessment_id if assessment is not None else None,
-                assessment_status=assessment.status if assessment is not None else None,
-                assessment_outcome=assessment.outcome if assessment is not None else None,
-            )
+            # Exploratory: unadmitted evidence may be inspected, marked as
+            # the unknown-evidence state it is — never ranked as trusted.
+            return _admit(("exploratory_proposal",))
         # Governed (and any future strict profile): unadmitted evidence is
         # excluded no matter how relevant or important.
         return RecallAdmissionDecision(
@@ -396,7 +374,6 @@ def signal_item_fields(
         conflict_resolution_status=item.conflict_resolution_status,
         epistemic_state=epistemic_state,
         assessment_status=decision.assessment_status,
-        memory_confidence=item.memory_confidence,
     )
     rank = compute_signal_rank_score(similarity=similarity, utility=utility)
     reasons = [
@@ -428,12 +405,16 @@ async def load_admission_bindings(
 ) -> dict[uuid.UUID, AdmissionAssessmentBinding]:
     """Digest-verified admission bindings for a bounded candidate window.
 
-    Short-circuits to empty while ``admission_assessment_capture_enabled`` is
-    off (the default): no rows can exist, so recall pays no extra queries.
+    Read visibility is deliberately NOT conditioned on
+    ``admission_assessment_capture_enabled``: that flag governs the *capture*
+    of new authoritative assessments (issue #159 rollout/rollback), not the
+    resolution of already-persisted projections. Disabling capture must never
+    hide an existing ``blocked``/``stale`` decision from recall enforcement —
+    the rollback invariant is "no new capture effect", not "no reads".
     Items with no recorded projection are absent from the result — callers
     treat absence as ``missing``, which the rule-based gate already handles.
     """
-    if not settings.admission_assessment_capture_enabled or not items:
+    if not items:
         return {}
     from engram.admission_assessment import resolve_bulk_admissions
 
