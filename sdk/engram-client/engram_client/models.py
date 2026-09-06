@@ -14,6 +14,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, model_validator
 
+from .assessments import AssessmentDimensions
+
 SourceKind = Literal[
     "manual", "import", "migration", "extraction", "sync_turn", "pre_compress", "session_end"
 ]
@@ -264,7 +266,10 @@ class ClassifyRequest(BaseModel):
     correlation_id: UUID | None = None
 
 
+
+
 class ClassifyResponse(BaseModel):
+    assessment_dimensions: AssessmentDimensions = Field(default_factory=AssessmentDimensions)
     classification_run_id: UUID
     expires_at: datetime
     correlation_id: UUID

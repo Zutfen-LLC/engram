@@ -180,6 +180,15 @@ class Settings(BaseSettings):
     # guard against oscillation). 0.0 applies any improvement.
     classification_refine_min_delta: float = 0.0
 
+    # Assessment history is independent of legacy classification and promotion.
+    assessment_reassessment_enabled: bool = False
+    assessment_capture_enabled: bool = False
+    assessment_selection_enabled: bool = False
+    assessment_effective_contract_hash: str = ""
+    assessment_policy_version: str = "assessment-selection-v1"
+    assessment_calibration_profiles_path: str | None = None
+    assessment_calibration_version: str = "uncalibrated"
+
     # Relationship-aware recall — graph + tunnel expansion (ENG-AUD-012 / F19).
     # Semantic recall expands its top candidates via depth-1 graph edges and
     # tunnel membership before rescoring/budget packing (see

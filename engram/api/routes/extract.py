@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from engram.api.routes.memory import RememberRequest, _remember_impl, _resolve_principal
 from engram.auth import READ_SCOPE, WRITE_SCOPE, Principal
 from engram.canonicalize import canonicalize, content_hash
+from engram.config import settings
 from engram.db import get_session
 from engram.extraction import (
     digest,
@@ -337,6 +338,19 @@ async def extract(
                         ingest_id=candidate.ingest_id,
                     )
                 )
+        if settings.assessment_capture_enabled and settings.assessment_reassessment_enabled:
+            from engram.assessment_schema import ReassessRequest
+            from engram.assessments import request_assessment
+
+            await session.flush()
+            for assessed_item_id in sorted(
+                {c.memory_item_id for c in candidates if c.memory_item_id}, key=str,
+            ):
+                item = await session.get(MemoryItem, assessed_item_id)
+                if item is not None:
+                    await request_assessment(
+                        session, item, memory_context, ReassessRequest(reason="provenance_added"),
+                    )
         await session.commit()
         for candidate in candidates:
             if candidate.ingest_id is not None:

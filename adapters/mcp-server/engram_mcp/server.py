@@ -17,8 +17,10 @@ import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any, Literal
+from uuid import UUID
 
 import engram_client
+from engram_client.assessments import Purpose, Reason, ReassessRequest
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
 from pydantic import BaseModel
@@ -221,6 +223,22 @@ def register_tools(mcp: FastMCP[EngramState]) -> None:
         """Suggest kind, wing, room, and visibility for raw text."""
         resp = await _client(ctx).classify(content, context=context, workspace=workspace)
         return resp.model_dump(mode="json")
+
+    @mcp.tool(name="engram_assessments")
+    async def assessments(ctx: ToolCtx, item_id: str, limit: int = 50) -> dict[str, Any]:
+        """Read assessment history. Retention measures usefulness. Unknown scores are null."""
+        response = await _client(ctx).assessments(UUID(item_id), limit=limit)
+        return response.model_dump(mode="json")
+
+    @mcp.tool(name="engram_reassess")
+    async def reassess(
+        ctx: ToolCtx, item_id: str, purpose: Purpose = "combined", reason: Reason = "manual",
+    ) -> dict[str, Any]:
+        """Request reassessment using the deployed contract. Requires review scope."""
+        response = await _client(ctx).reassess(UUID(item_id), ReassessRequest(
+            purpose=purpose, reason=reason,
+        ))
+        return response.model_dump(mode="json")
 
     @mcp.tool(name="engram_kg_query")
     async def kg_query(

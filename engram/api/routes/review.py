@@ -200,6 +200,9 @@ class PromotionReadinessResponse(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    assessment_policy_version: str = "assessment-selection-v1"
+    effective_assessments: dict[str, Any] = Field(default_factory=dict)
+
     item_id: UUID
     source_type: str
     kind: str
@@ -411,6 +414,11 @@ async def promotion_readiness(
         raise HTTPException(status_code=404, detail="Item not found")
     readiness = await build_promotion_readiness(session, item, now=datetime.now(UTC))
     data = readiness.as_dict()
+    from engram.assessments import effective_assessment_values
+    from engram.config import settings
+
+    data["assessment_policy_version"] = settings.assessment_policy_version
+    data["effective_assessments"] = await effective_assessment_values(session, item, memory_context)
     data["jobs"] = [
         PromotionReadinessJob(
             job_id=UUID(job["job_id"]),
