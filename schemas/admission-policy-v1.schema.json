@@ -39,7 +39,7 @@
         "precedence": {
           "type": "array",
           "const": [
-            "not_live", "conflict", "governance", "assessment_unavailable", "risk_high", "risk_unknown",
+            "not_live", "conflict", "governance", "risk_high", "risk_unknown", "assessment_unavailable",
             "epistemic_contested", "epistemic_insufficient", "qualified"
           ]
         },

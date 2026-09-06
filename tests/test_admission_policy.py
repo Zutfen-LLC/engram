@@ -111,13 +111,56 @@ def test_unknown_risk_never_falls_back_to_low_risk() -> None:
 def test_each_nonselected_assessment_state_remains_visible(status: str) -> None:
     decision = evaluate_admission_profile(
         item(),
-        evidence(selection_status=status, risk_state="low", epistemic_state="supported"),
+        evidence(
+            selection_status=status,
+            risk_state="unknown",
+            epistemic_state="unknown",
+            retention_state="unknown",
+            calibrated=False,
+        ),
         load_admission_policy("risk_aware_shadow_v1"),
         NOW,
     )
 
     assert f"assessment_{status}" in decision.blocker_codes
-    assert decision.surface_decisions["semantic_governed"] == "withhold"
+    assert decision.surface_decisions == {
+        "semantic_exploratory": "allow",
+        "semantic_governed": "review_required",
+        "startup": "review_required",
+    }
+
+
+def test_high_risk_with_missing_provenance_remains_review_required() -> None:
+    decision = evaluate_admission_profile(
+        item(origin="unknown"),
+        evidence(risk_state="high"),
+        load_admission_policy("risk_aware_shadow_v1"),
+        NOW,
+    )
+
+    assert "risk_high" in decision.blocker_codes
+    assert "provenance_origin_missing" in decision.blocker_codes
+    assert decision.surface_decisions["semantic_governed"] == "review_required"
+    assert decision.surface_decisions["startup"] == "review_required"
+
+
+def test_unknown_risk_with_missing_provenance_remains_review_required() -> None:
+    decision = evaluate_admission_profile(
+        item(assertion_mode="unknown"),
+        evidence(
+            risk_state="unknown",
+            epistemic_state="unknown",
+            retention_state="unknown",
+            calibrated=False,
+        ),
+        load_admission_policy("risk_aware_shadow_v1"),
+        NOW,
+    )
+
+    assert "risk_unknown" in decision.blocker_codes
+    assert "provenance_assertion_mode_missing" in decision.blocker_codes
+    assert decision.surface_decisions["semantic_governed"] == "review_required"
+    assert decision.surface_decisions["startup"] == "review_required"
 
 
 def test_required_origin_prevents_qualified_admission() -> None:
@@ -175,6 +218,18 @@ def test_evidence_starved_medium_risk_fact_routes_to_review() -> None:
     assert "epistemic_insufficient" in decision.blocker_codes
 
 
+def test_evidence_starved_low_risk_fact_remains_withheld() -> None:
+    decision = evaluate_admission_profile(
+        item(),
+        evidence(risk_state="low", epistemic_state="insufficient_evidence", calibrated=False),
+        load_admission_policy("risk_aware_shadow_v1"),
+        NOW,
+    )
+
+    assert decision.surface_decisions["semantic_governed"] == "withhold"
+    assert decision.surface_decisions["startup"] == "withhold"
+
+
 def test_low_risk_governed_surface_has_no_observation_window() -> None:
     decision = evaluate_admission_profile(
         item(created_at=NOW), evidence(), load_admission_policy("risk_aware_shadow_v1"), NOW
@@ -185,7 +240,7 @@ def test_low_risk_governed_surface_has_no_observation_window() -> None:
     assert decision.observation_window_hours == 0
     assert decision.eligible_at == NOW
     assert decision.decision_hash == (
-        "sha256:037bfbd39826d7f7ad3ff13ea9e8bb04e54884c27ee8fd645439a12fc21a793f"
+        "sha256:5b0d9aeefd700ff98f859062f484d17eacd31fac0b97e6b473284c381fb3fd6f"
     )
 
 

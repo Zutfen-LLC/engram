@@ -390,6 +390,17 @@ def evaluate_admission_profile(
             None,
         )
 
+    def record_unavailability_diagnostics() -> None:
+        missing = provenance_missing()
+        if missing is not None:
+            blockers.add(f"provenance_{missing}_missing")
+            reasons.add("required_provenance_missing")
+        if assessment.selection_status != "selected":
+            blockers.add(f"assessment_{assessment.selection_status}")
+            reasons.add("effective_assessment_not_qualified")
+        if missing is not None or assessment.selection_status != "selected":
+            actions.add("new_evidence_required")
+
     def matches(rule: str) -> bool:
         if rule == "not_live":
             return not item.live_proposal
@@ -436,27 +447,20 @@ def evaluate_admission_profile(
         actions.add("human_review_required")
         apply_output("review_required")
     elif first_rule == "assessment_unavailable":
-        missing = provenance_missing()
-        if missing is not None:
-            blockers.add(f"provenance_{missing}_missing")
-            reasons.add("required_provenance_missing")
-            actions.add("new_evidence_required")
-            apply_output("withhold")
+        record_unavailability_diagnostics()
+        if risk == "medium" and risk in policy.known_governed_risks:
+            actions.add("human_review_required")
+            apply_output("review_required")
         else:
-            blockers.add(f"assessment_{assessment.selection_status}")
-            reasons.add("effective_assessment_not_qualified")
-            if risk in policy.known_governed_risks and risk == "medium":
-                actions.add("human_review_required")
-                apply_output("review_required")
-            else:
-                actions.add("new_evidence_required")
-                apply_output("withhold")
+            apply_output("withhold")
     elif first_rule == "risk_high":
+        record_unavailability_diagnostics()
         blockers.add("risk_high")
         reasons.add("high_consequence_requires_review")
         actions.add("human_review_required")
         apply_output("review_required")
     elif first_rule == "risk_unknown":
+        record_unavailability_diagnostics()
         blockers.add("risk_unknown")
         reasons.add("unknown_consequence_requires_review")
         actions.add("human_review_required")
