@@ -278,6 +278,7 @@ async def test_v2_shadow_row_is_immutable_history_and_never_current() -> None:
         kind="fact",
         source_type="manual",
         assertion_mode="unknown",
+        origin="unknown",
         review_status="proposed",
         created_at=now,
         valid_to=None,
@@ -288,7 +289,7 @@ async def test_v2_shadow_row_is_immutable_history_and_never_current() -> None:
         human_verified=False,
     )
     evidence = EffectiveAssessmentState(
-        selection_status="missing",
+        selection_status="absent",
         contract_hash=None,
         assessment_refs=(),
         risk_state="unknown",

@@ -39,7 +39,7 @@
         "precedence": {
           "type": "array",
           "const": [
-            "not_live", "conflict", "governance", "risk_high", "risk_unknown",
+            "not_live", "conflict", "governance", "assessment_unavailable", "risk_high", "risk_unknown",
             "epistemic_contested", "epistemic_insufficient", "qualified"
           ]
         },
@@ -52,11 +52,37 @@
           "type": "object", "additionalProperties": false,
           "required": ["provenance", "risk", "retention", "epistemic", "governance"],
           "properties": {
-            "provenance": {"type": "object"},
-            "risk": {"type": "object"},
-            "retention": {"type": "object"},
-            "epistemic": {"type": "object"},
-            "governance": {"type": "object"}
+            "provenance": {
+              "type": "object", "additionalProperties": false,
+              "required": ["required_assertion_fields"],
+              "properties": {"required_assertion_fields": {"const": ["assertion_mode", "origin"]}}
+            },
+            "risk": {
+              "type": "object", "additionalProperties": false,
+              "required": ["known_governed_values", "review_values"],
+              "properties": {
+                "known_governed_values": {"const": ["low", "medium"]},
+                "review_values": {"const": ["high", "unknown"]}
+              }
+            },
+            "retention": {
+              "type": "object", "additionalProperties": false,
+              "required": ["governed_value"],
+              "properties": {"governed_value": {"const": "retain"}}
+            },
+            "epistemic": {
+              "type": "object", "additionalProperties": false,
+              "required": ["governed_value", "requires_calibrated"],
+              "properties": {
+                "governed_value": {"const": "supported"},
+                "requires_calibrated": {"type": "boolean"}
+              }
+            },
+            "governance": {
+              "type": "object", "additionalProperties": false,
+              "required": ["blockers"],
+              "properties": {"blockers": {"const": ["not_live", "conflict", "external_dispute", "human_review"]}}
+            }
           }
         },
         "startup": {
@@ -71,12 +97,23 @@
           "type": "object", "additionalProperties": false,
           "required": ["blocked", "review_required", "withhold", "qualified"],
           "properties": {
-            "blocked": {"type": "object"},
-            "review_required": {"type": "object"},
-            "withhold": {"type": "object"},
-            "qualified": {"type": "object"}
+            "blocked": {"$ref": "#/$defs/surface_outputs"},
+            "review_required": {"$ref": "#/$defs/surface_outputs"},
+            "withhold": {"$ref": "#/$defs/surface_outputs"},
+            "qualified": {"$ref": "#/$defs/surface_outputs"}
           }
         }
+      }
+    }
+  },
+  "$defs": {
+    "surface_outputs": {
+      "type": "object", "additionalProperties": false,
+      "required": ["semantic_exploratory", "semantic_governed", "startup"],
+      "properties": {
+        "semantic_exploratory": {"enum": ["allow", "withhold", "review_required", "blocked", "unknown"]},
+        "semantic_governed": {"enum": ["allow", "withhold", "review_required", "blocked", "unknown"]},
+        "startup": {"enum": ["allow", "withhold", "review_required", "blocked", "unknown"]}
       }
     }
   }

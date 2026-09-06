@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from engram.admission_policy import (
 )
 
 NOW = datetime(2026, 9, 6, tzinfo=UTC)
+CONTRACT_HASH = "sha256:d907baa0b6c6aab01cd4a848f5f967f69aa857200b26160ce4bfe50b9f0e718d"
 
 
 def item(**changes: object) -> AdmissionItemState:
@@ -28,6 +30,7 @@ def item(**changes: object) -> AdmissionItemState:
         "kind": "fact",
         "source_type": "manual",
         "assertion_mode": "direct_statement",
+        "origin": "direct_user",
         "review_status": "proposed",
         "created_at": NOW - timedelta(hours=80),
         "valid_to": None,
@@ -44,11 +47,11 @@ def item(**changes: object) -> AdmissionItemState:
 def evidence(**changes: object) -> EffectiveAssessmentState:
     values: dict[str, object] = {
         "selection_status": "selected",
-        "contract_hash": "sha256:" + "b" * 64,
+        "contract_hash": CONTRACT_HASH,
         "assessment_refs": (
             {
                 "assessment_id": "00000000-0000-0000-0000-000000000003",
-                "contract_hash": "sha256:" + "b" * 64,
+                "contract_hash": CONTRACT_HASH,
                 "canonical_hash": "sha256:" + "c" * 64,
                 "purpose": "combined",
             },
@@ -68,6 +71,13 @@ def test_checked_in_candidate_policy_has_a_deterministic_digest() -> None:
     assert policy.profile_key == "risk_aware_shadow_v1"
     assert policy.artifact_digest.startswith("sha256:")
     assert load_admission_policy("risk_aware_shadow_v1") == policy
+
+
+def test_checked_in_policy_validates_against_the_static_schema() -> None:
+    artifact = json.loads(Path("policies/admission/risk_aware_shadow_v1.json").read_text())
+    schema = json.loads(Path("schemas/admission-policy-v1.schema.json").read_text())
+
+    jsonschema.Draft202012Validator(schema).validate(artifact)
 
 
 def test_high_risk_fact_requires_governed_and_startup_review() -> None:
@@ -94,6 +104,64 @@ def test_unknown_risk_never_falls_back_to_low_risk() -> None:
     assert "risk_unknown" in decision.blocker_codes
 
 
+@pytest.mark.parametrize(
+    "status",
+    ["disabled", "absent", "stale", "mismatched", "failed", "uncalibrated"],
+)
+def test_each_nonselected_assessment_state_remains_visible(status: str) -> None:
+    decision = evaluate_admission_profile(
+        item(),
+        evidence(selection_status=status, risk_state="low", epistemic_state="supported"),
+        load_admission_policy("risk_aware_shadow_v1"),
+        NOW,
+    )
+
+    assert f"assessment_{status}" in decision.blocker_codes
+    assert decision.surface_decisions["semantic_governed"] == "withhold"
+
+
+def test_required_origin_prevents_qualified_admission() -> None:
+    decision = evaluate_admission_profile(
+        item(origin="unknown"), evidence(), load_admission_policy("risk_aware_shadow_v1"), NOW
+    )
+
+    assert "provenance_origin_missing" in decision.blocker_codes
+    assert decision.surface_decisions["semantic_governed"] == "withhold"
+
+
+def test_declared_output_map_changes_the_evaluation() -> None:
+    policy = load_admission_policy("risk_aware_shadow_v1")
+    changed = replace(
+        policy,
+        outputs={
+            **policy.outputs,
+            "qualified": {
+                "semantic_exploratory": "allow",
+                "semantic_governed": "withhold",
+                "startup": "blocked",
+            },
+        },
+    )
+
+    decision = evaluate_admission_profile(item(created_at=NOW), evidence(), changed, NOW)
+
+    assert decision.surface_decisions["semantic_governed"] == "withhold"
+
+
+def test_declared_precedence_changes_the_evaluation() -> None:
+    policy = load_admission_policy("risk_aware_shadow_v1")
+    changed = replace(
+        policy,
+        precedence=("qualified", *tuple(rule for rule in policy.precedence if rule != "qualified")),
+    )
+
+    decision = evaluate_admission_profile(
+        item(), evidence(risk_state="medium", retention_state="transient"), changed, NOW
+    )
+
+    assert decision.surface_decisions["semantic_governed"] == "allow"
+
+
 def test_evidence_starved_medium_risk_fact_routes_to_review() -> None:
     decision = evaluate_admission_profile(
         item(),
@@ -117,7 +185,7 @@ def test_low_risk_governed_surface_has_no_observation_window() -> None:
     assert decision.observation_window_hours == 0
     assert decision.eligible_at == NOW
     assert decision.decision_hash == (
-        "sha256:f5ea4481ef62c3134f23209c77cd1a3ec7f6767c615f8a2c53fc53b9bd6385e6"
+        "sha256:037bfbd39826d7f7ad3ff13ea9e8bb04e54884c27ee8fd645439a12fc21a793f"
     )
 
 

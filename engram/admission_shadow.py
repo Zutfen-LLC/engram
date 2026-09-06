@@ -19,8 +19,9 @@ from engram.admission_policy import (
     evaluate_admission_profile,
     load_admission_policy,
 )
-from engram.assessments import effective_assessment_values
+from engram.assessments import effective_assessment_selection
 from engram.config import settings
+from engram.conflicts import check_promotion_conflict
 from engram.memory_access import read_eligibility_expression
 from engram.memory_context import ResolvedMemoryContext
 from engram.models import AdmissionAssessment, MemoryItem
@@ -39,7 +40,7 @@ SHADOW_PROFILE_KEY: Final[Literal["risk_aware_shadow_v1"]] = "risk_aware_shadow_
 SHADOW_TRIGGER_TYPE = "admission.shadow_simulation"
 SHADOW_INVOCATION_SOURCE = "admission.shadow"
 SelectionStatus = Literal[
-    "selected", "missing", "disabled", "stale", "mismatched", "failed", "uncalibrated"
+    "selected", "absent", "disabled", "stale", "mismatched", "failed", "uncalibrated"
 ]
 PolicyRiskState = Literal["low", "medium", "high", "unknown", "not_applicable"]
 
@@ -115,10 +116,21 @@ def _assessment_state(
             retention_state="unknown",
             calibrated=False,
         )
+    selection_status = values.get("selection_status")
     combined = values.get("combined")
+    if selection_status in {"disabled", "absent", "stale", "mismatched", "failed"}:
+        return EffectiveAssessmentState(
+            selection_status=cast(SelectionStatus, selection_status),
+            contract_hash=None,
+            assessment_refs=(),
+            risk_state="unknown",
+            epistemic_state="unknown",
+            retention_state="unknown",
+            calibrated=False,
+        )
     if not isinstance(combined, dict):
         return EffectiveAssessmentState(
-            selection_status="missing",
+            selection_status="absent",
             contract_hash=None,
             assessment_refs=(),
             risk_state="unknown",
@@ -166,6 +178,7 @@ def _assessment_state(
         "canonical_hash": str(combined.get("canonical_hash", "")),
         "purpose": "combined",
         "assertion_mode": str(dimensions.get("assertion_mode", "unknown")),
+        "origin": str(dimensions.get("origin", "unknown")),
     }
     return EffectiveAssessmentState(
         selection_status=cast(SelectionStatus, status),
@@ -197,6 +210,11 @@ def _item_state(
         source_type=item.source_type,
         assertion_mode=(
             str(assessment.assessment_refs[0].get("assertion_mode", "unknown"))
+            if assessment.assessment_refs
+            else "unknown"
+        ),
+        origin=(
+            str(assessment.assessment_refs[0].get("origin", "unknown"))
             if assessment.assessment_refs
             else "unknown"
         ),
@@ -239,7 +257,7 @@ async def simulate_item(
     resolved_policy = policy or load_admission_policy(SHADOW_PROFILE_KEY)
     item_support = support or (await load_promotion_support(session, [item]))[item.id]
     config = await _config(session, str(item.tenant_id))
-    _, threshold, min_age, evidence_enabled, evidence_threshold = _config_values(config)
+    enabled, threshold, min_age, evidence_enabled, evidence_threshold = _config_values(config)
     path_a = assess_promotion_candidate(
         item,
         item_support,
@@ -248,9 +266,18 @@ async def simulate_item(
         evidence_enabled=evidence_enabled,
         evidence_threshold=evidence_threshold,
         now=evaluation_time,
-        conflict_recheck_status="not_run_preview",
+        conflict_recheck_status="not_run",
     )
-    values = await effective_assessment_values(session, item, context)
+    if not enabled:
+        path_a.would_promote = False
+        path_a.blockers.append("promotion_disabled")
+    elif path_a.would_promote:
+        conflict = await check_promotion_conflict(session, item, memory_context=context)
+        path_a.conflict_recheck_status = "blocked" if conflict else "clear"
+        if conflict is not None:
+            path_a.would_promote = False
+            path_a.blockers.append("conflict_recheck")
+    values = await effective_assessment_selection(session, item, context)
     assessment = _assessment_state(values, resolved_policy)
     shadow = evaluate_admission_profile(
         _item_state(item, item_support, assessment), assessment, resolved_policy, evaluation_time
