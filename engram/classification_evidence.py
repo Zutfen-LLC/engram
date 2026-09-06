@@ -68,6 +68,13 @@ def durable_provenance(
         provenance["taxonomy_threshold"] = source["threshold"]
     if source.get("error_type") is not None:
         provenance["provider_error"] = {"type": str(source["error_type"])}
+    raw_llm_payload = source.get("llm_payload")
+    if isinstance(raw_llm_payload, dict):
+        raw_retention = raw_llm_payload.get("raw_retention_confidence")
+        if isinstance(raw_retention, (int, float)) and not isinstance(raw_retention, bool):
+            # Keep only the fact that the provider returned a numeric retention
+            # value. The raw provider payload is not durable evidence.
+            provenance["retention_assessment_recorded"] = True
     return cast(dict[str, Any], _redact_context(provenance, context))
 
 

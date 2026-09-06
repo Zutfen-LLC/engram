@@ -74,12 +74,18 @@ Provider failure or disablement commits an explicit failed or disabled assessmen
 before the existing queue schedules a retry. Scores remain null. The queue exposes
 attempt counts and dead-letter state. A reviewer can retry a dead request when its
 input and contract still match. Retry preserves attempt numbers and receipts.
-It records actor, reason, request ID, and target hash in an item event.
+Retry lookup uses current item write eligibility and review scope, regardless
+of the original request principal. The worker continues under the request's
+immutable pinned execution authority and original request actor. The retry
+action itself records the current reviewer as actor, with its reason, request
+ID, and target hash in an item event.
 After an input or target change, the reviewer must create a new request.
 
 Batches contain at most 100 eligible items. Continue with the last returned item
-ID. The queue orders reassessment tenants by their last attempt. It retains the
-existing due-time order for other job types. Successful assessment and the
+ID. An evidence validation error fails the batch with HTTP 422 and rolls back
+all requests from that batch. The queue orders reassessment tenants by their
+last attempt only when selecting the reassessment lane. It retains the existing
+global due-time order for mixed and other job-type claims. Successful assessment and the
 `classification_reassessed` promotion trigger commit together. The durable
 follow-up runs the existing promotion evaluator. No threshold, cooling window,
 or admission evidence weight changes in this issue.

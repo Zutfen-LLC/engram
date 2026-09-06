@@ -108,10 +108,16 @@ async def reassess_batch(
         query = query.where(MemoryItem.id > request.after_item_id)
     items = (await session.scalars(query.order_by(MemoryItem.id).limit(request.limit))).all()
     result = []
-    for item in items:
-        if live_item(item):
-            row = await request_assessment(session, item, context, request)
-            result.append(await request_view(session, row))
+    try:
+        for item in items:
+            if live_item(item):
+                row = await request_assessment(session, item, context, request)
+                result.append(await request_view(session, row))
+    except ValueError as exc:
+        # Evidence validation errors must roll back earlier batch work. The
+        # batch therefore has one explicit, controlled failure result.
+        await session.rollback()
+        raise HTTPException(422, str(exc)) from exc
     await session.commit()
     return result
 
@@ -182,7 +188,6 @@ async def retry_request(
         select(AssessmentRequest).where(
             AssessmentRequest.id == request_id,
             AssessmentRequest.memory_item_id == item_id,
-            AssessmentRequest.principal_id == context.principal_id,
         )
     )
     if row is None:

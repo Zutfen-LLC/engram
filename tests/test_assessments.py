@@ -1,6 +1,7 @@
 """Assessment lifecycle proofs through HTTP and the worker job boundary."""
 
 import pytest
+from sqlalchemy import text
 
 from engram.config import settings
 from tests.test_extraction import extraction_stack  # noqa: F401
@@ -344,6 +345,160 @@ async def test_dead_provider_job_can_recover_without_rewriting_failure(
     assert (await client.get(status_url)).json()["job_status"] == "succeeded"
 
 
+async def test_dead_request_recovery_can_be_completed_by_another_reviewer(
+    assessment_stack, monkeypatch
+):
+    import ast
+    from uuid import uuid4
+
+    from engram.auth import Principal, get_current_principal
+    from engram.db import apply_rls_context, get_session
+
+    client, _, owner, factory, tenant_id, principal_a, app, _ = assessment_stack
+    principal_b = uuid4()
+    principal_c = uuid4()
+    item_id = None
+    async with owner.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO principals(id,tenant_id,name,type) VALUES "
+                "(:b,:t,:bn,'agent'),(:c,:t,:cn,'agent')"
+            ),
+            {
+                "b": principal_b,
+                "c": principal_c,
+                "t": tenant_id,
+                "bn": f"reviewer-b-{principal_b}",
+                "cn": f"reviewer-c-{principal_c}",
+            },
+        )
+
+    async def scoped_session(principal_id):
+        async def dependency():
+            async with factory() as db:
+                await apply_rls_context(db, tenant_id=tenant_id, principal_id=principal_id)
+                yield db
+
+        return dependency
+
+    try:
+        response = await client.post(
+            "/v1/remember",
+            json={
+                "content": "A tenant-visible assessment recovery item.",
+                "kind": "fact",
+                "visibility": "tenant",
+            },
+        )
+        assert response.status_code == 201, response.text
+        item_id = response.json()["id"]
+
+        async def failed(_request):
+            import httpx
+
+            return httpx.Response(503, json={"error": {"message": "fixture unavailable"}})
+
+        provider_transport(monkeypatch, failed)
+        monkeypatch.setattr(settings, "job_max_attempts", 1)
+        created = await client.post(f"/v1/items/{item_id}/reassess", json={})
+        assert created.status_code == 200, created.text
+        request_id = created.json()["request_id"]
+        await run_job(assessment_stack)
+
+        status_url = f"/v1/items/{item_id}/reassessments/{request_id}"
+        assert (await client.get(status_url)).json()["job_status"] == "dead"
+        async with owner.connect() as conn:
+            failed_before = (
+                await conn.execute(
+                    text(
+                        "SELECT id,attempt,state,receipt FROM memory_assessments "
+                        "WHERE request_id=:r"
+                    ),
+                    {"r": request_id},
+                )
+            ).mappings().all()
+            original_request_principal = await conn.scalar(
+                text("SELECT principal_id FROM assessment_requests WHERE id=:r"),
+                {"r": request_id},
+            )
+
+        provider_transport(monkeypatch)
+        app.dependency_overrides[get_current_principal] = lambda: Principal(
+            str(tenant_id), str(principal_b), ("read", "write", "review")
+        )
+        app.dependency_overrides[get_session] = await scoped_session(principal_b)
+
+        visible = await client.get(status_url)
+        assert visible.status_code == 200, visible.text
+        duplicate = await client.post(f"/v1/items/{item_id}/reassess", json={})
+        assert duplicate.status_code == 200, duplicate.text
+        assert duplicate.json()["request_id"] == request_id
+        retried = await client.post(
+            status_url + "/retry", json={"reason": "provider_recovery"}
+        )
+        assert retried.status_code == 200, retried.text
+        await run_job(assessment_stack)
+
+        async with owner.connect() as conn:
+            request_row = await conn.execute(
+                text("SELECT principal_id FROM assessment_requests WHERE id=:r"),
+                {"r": request_id},
+            )
+            assert request_row.scalar_one() == original_request_principal == principal_a
+            attempts = (
+                await conn.execute(
+                    text(
+                        "SELECT id,attempt,state,receipt FROM memory_assessments "
+                        "WHERE request_id=:r ORDER BY attempt"
+                    ),
+                    {"r": request_id},
+                )
+            ).mappings().all()
+            retry_event = (
+                await conn.execute(
+                    text(
+                        "SELECT actor_principal_id,reason,new_value FROM item_events "
+                        "WHERE item_id=:i AND field_name='assessment_retry'"
+                    ),
+                    {"i": item_id},
+                )
+            ).mappings().one()
+
+        assert len(attempts) == 2
+        assert attempts[0]["state"] == "failed"
+        assert attempts[1]["state"] == "completed"
+        assert attempts[0]["receipt"] == failed_before[0]["receipt"]
+        assert retry_event["actor_principal_id"] == principal_b
+        assert retry_event["reason"] == "provider_recovery"
+        assert ast.literal_eval(retry_event["new_value"])["request_id"] == str(request_id)
+
+        app.dependency_overrides[get_current_principal] = lambda: Principal(
+            str(tenant_id), str(principal_c), ("read", "write")
+        )
+        app.dependency_overrides[get_session] = await scoped_session(principal_c)
+        assert (await client.post(status_url + "/retry", json={})).status_code == 403
+    finally:
+        app.dependency_overrides[get_current_principal] = lambda: Principal(
+            str(tenant_id), str(principal_a), ("read", "write", "review")
+        )
+        app.dependency_overrides[get_session] = await scoped_session(principal_a)
+        async with owner.begin() as conn:
+            if item_id is not None:
+                await conn.execute(
+                    text("DELETE FROM assessment_requests WHERE memory_item_id=:i"),
+                    {"i": item_id},
+                )
+                await conn.execute(
+                    text("DELETE FROM jobs WHERE payload->>'memory_item_id'=:i"),
+                    {"i": item_id},
+                )
+                await conn.execute(text("DELETE FROM memory_items WHERE id=:i"), {"i": item_id})
+            await conn.execute(
+                text("DELETE FROM principals WHERE id IN (:b,:c)"),
+                {"b": principal_b, "c": principal_c},
+            )
+
+
 async def test_assessment_access_follows_item_and_review_authority(assessment_stack):
     from uuid import uuid4
 
@@ -440,6 +595,81 @@ async def test_assessment_queue_rotates_between_tenants(assessment_stack):
             await conn.execute(text("DELETE FROM tenants WHERE id=:i"), {"i": other})
 
 
+async def test_assessment_fairness_does_not_change_global_job_order(assessment_stack):
+    from datetime import UTC, datetime, timedelta
+    from uuid import uuid4
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from engram.jobs import claim_next_job, enqueue_job_in_transaction, mark_job_succeeded
+
+    _, _, owner, _, tenant_id, *_ = assessment_stack
+    other = uuid4()
+    factory = async_sessionmaker(owner, expire_on_commit=False)
+    # Use a fixed historical window so this test's jobs sort before pending
+    # jobs left by earlier integration tests.
+    now = datetime(2000, 1, 1, tzinfo=UTC)
+    async with owner.begin() as conn:
+        await conn.execute(
+            text("INSERT INTO tenants(id,name,slug) VALUES (:t,:s,:s)"),
+            {"t": other, "s": f"assessment-mixed-{other}"},
+        )
+    job_ids = []
+    try:
+        async with factory() as db:
+            for tenant in (tenant_id, tenant_id, other):
+                job_ids.append(
+                    await enqueue_job_in_transaction(
+                        db,
+                        tenant_id=tenant,
+                        job_type="assessment.reassess",
+                        payload={},
+                        run_after=now - timedelta(seconds=5),
+                    )
+                )
+            unrelated = await enqueue_job_in_transaction(
+                db,
+                tenant_id=tenant_id,
+                job_type="embedding.generate",
+                payload={},
+                run_after=now - timedelta(seconds=10),
+            )
+            job_ids.append(unrelated)
+            unrelated_second = await enqueue_job_in_transaction(
+                db,
+                tenant_id=tenant_id,
+                job_type="classification.refine",
+                payload={},
+                run_after=now - timedelta(seconds=8),
+            )
+            job_ids.append(unrelated_second)
+            await db.commit()
+
+            first = await claim_next_job(db, worker_id="mixed")
+            assert first is not None
+            assert first.job_type == "embedding.generate"
+            await mark_job_succeeded(db, first.id)
+            second = await claim_next_job(db, worker_id="mixed")
+            assert second is not None
+            assert second.job_type == "classification.refine"
+            await mark_job_succeeded(db, second.id)
+
+            lane = []
+            for _ in range(3):
+                claimed = await claim_next_job(
+                    db, worker_id="lane", job_types=["assessment.reassess"]
+                )
+                assert claimed is not None
+                lane.append(claimed.tenant_id)
+                await mark_job_succeeded(db, claimed.id)
+            assert lane == [tenant_id, other, tenant_id]
+    finally:
+        async with owner.begin() as conn:
+            for job_id in job_ids:
+                await conn.execute(text("DELETE FROM jobs WHERE id=:i"), {"i": job_id})
+            await conn.execute(text("DELETE FROM tenants WHERE id=:i"), {"i": other})
+
+
 async def test_migration_backfills_legacy_receipt_without_epistemic_evidence(assessment_stack):
     import os
     from pathlib import Path
@@ -479,13 +709,90 @@ async def test_migration_backfills_legacy_receipt_without_epistemic_evidence(ass
         assert row["dimensions"]["taxonomy"]["raw_value"] == pytest.approx(
             classified["taxonomy_confidence"],
         )
-        assert row["dimensions"]["retention"]["raw_value"] == classified["retention_confidence"]
+        assert row["dimensions"]["retention"]["raw_value"] is None
         assert row["dimensions"]["epistemic_state"] == "unknown"
         await conn.execute(Path("migrations/037_memory_assessments.sql").read_text())
         second = (await client.get(f"/v1/items/{item_id}/assessments")).json()
         assert second == first
     finally:
         await conn.close()
+
+
+async def test_migration_backfill_preserves_recorded_llm_retention(assessment_stack, monkeypatch):
+    import os
+    from pathlib import Path
+
+    import asyncpg
+
+    from engram import classification
+    from engram.migrations import normalize_asyncpg_url
+
+    client, *_ = assessment_stack
+    monkeypatch.setattr(settings, "classification_provider", "openai")
+
+    async def recorded_llm_output(_prompt, **_kwargs):
+        return {
+            "suggested_kind": "fact",
+            "taxonomy_confidence": 0.91,
+            "retention_confidence": 0.73,
+            "retention_disposition": "retain",
+        }
+
+    monkeypatch.setattr(classification, "_call_openai_classification", recorded_llm_output)
+    classified_response = await client.post(
+        "/v1/classify",
+        json={"content": "Preserve this model retention value.", "source_type": "manual"},
+    )
+    assert classified_response.status_code == 200, classified_response.text
+    classified = classified_response.json()
+    async with assessment_stack[2].connect() as conn:
+        provenance = (
+            await conn.execute(
+                text("SELECT provenance FROM classification_runs WHERE id=:id"),
+                {"id": classified["classification_run_id"]},
+            )
+        ).scalar_one()
+    assert provenance["retention_assessment_recorded"] is True
+    remembered = await client.post(
+        "/v1/remember",
+        json={
+            "content": "Preserve this model retention value.",
+            "kind": classified["suggested_kind"],
+            "source_type": "manual",
+            "classification_run_id": classified["classification_run_id"],
+        },
+    )
+    assert remembered.status_code == 201, remembered.text
+    item_id = remembered.json()["id"]
+    conn = await asyncpg.connect(normalize_asyncpg_url(os.environ["ENGRAM_OWNER_DATABASE_URL"]))
+    try:
+        await conn.execute(Path("migrations/037_memory_assessments.sql").read_text())
+        history = (await client.get(f"/v1/items/{item_id}/assessments")).json()
+        assert history["assessments"][0]["dimensions"]["retention"]["raw_value"] == pytest.approx(
+            classified["retention_confidence"]
+        )
+        assert history["assessments"][0]["dimensions"]["epistemic_state"] == "unknown"
+    finally:
+        await conn.close()
+
+
+async def test_batch_reassessment_returns_controlled_error_for_invalid_evidence(
+    assessment_stack, monkeypatch
+):
+    from engram.api.routes import assessments as assessment_routes
+
+    client, *_ = assessment_stack
+    await create_item(client)
+
+    async def invalid_request(*args, **kwargs):
+        raise ValueError("assessment evidence exceeds 64 extraction links")
+
+    monkeypatch.setattr(assessment_routes, "request_assessment", invalid_request)
+    response = await client.post(
+        "/v1/assessments/reassess", json={"limit": 1}
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "assessment evidence exceeds 64 extraction links"
 
 
 async def test_profile_cannot_read_request_or_select_effective_assessment(assessment_stack):
