@@ -846,6 +846,14 @@ class AdmissionAssessment(Base):
     available_memory_assessment_refs: Mapped[list[Any]] = mapped_column(
         JSONB, nullable=False, default=list
     )
+    # V2 shadow-policy inputs.  V1 rows leave these fields NULL forever.
+    risk_state: Mapped[str | None] = mapped_column(Text, nullable=True)
+    epistemic_state: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retention_state: Mapped[str | None] = mapped_column(Text, nullable=True)
+    effective_memory_assessment_refs: Mapped[list[Any] | None] = mapped_column(JSONB, nullable=True)
+    highest_admission_tier: Mapped[str | None] = mapped_column(Text, nullable=True)
+    surface_decisions: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    observation_window_hours: Mapped[int | None] = mapped_column(Integer, nullable=True)
     conflict_recheck_status: Mapped[str] = mapped_column(Text, nullable=False)
     cooling_period_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     eligible_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

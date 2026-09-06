@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://engram.dev/schemas/admission-policy-v1.schema.json",
+  "title": "Engram admission policy artifact v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "profile_key", "policy_version", "artifact_digest",
+    "supported_surfaces", "assessment_selection", "rules"
+  ],
+  "properties": {
+    "schema_version": {"const": "engram.admission-policy.v1"},
+    "profile_key": {"type": "string", "pattern": "^[a-z0-9_]+$"},
+    "policy_version": {"type": "string", "minLength": 1, "maxLength": 128},
+    "artifact_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "supported_surfaces": {
+      "type": "array",
+      "const": ["semantic_exploratory", "semantic_governed", "startup"]
+    },
+    "assessment_selection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy_version", "accepted_contract_hashes", "required_purposes"],
+      "properties": {
+        "policy_version": {"type": "string"},
+        "accepted_contract_hashes": {
+          "type": "array", "minItems": 1, "items": {"pattern": "^sha256:[0-9a-f]{64}$"}
+        },
+        "required_purposes": {"type": "array", "const": ["combined"]}
+      }
+    },
+    "rules": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "precedence", "conditions", "observation_windows_hours", "startup", "outputs"
+      ],
+      "properties": {
+        "precedence": {
+          "type": "array",
+          "const": [
+            "not_live", "conflict", "governance", "risk_high", "risk_unknown", "assessment_unavailable",
+            "epistemic_contested", "epistemic_insufficient", "qualified"
+          ]
+        },
+        "observation_windows_hours": {
+          "type": "object", "additionalProperties": false,
+          "required": ["low", "medium"],
+          "properties": {"low": {"const": 0}, "medium": {"const": 72}}
+        },
+        "conditions": {
+          "type": "object", "additionalProperties": false,
+          "required": ["provenance", "risk", "retention", "epistemic", "governance"],
+          "properties": {
+            "provenance": {
+              "type": "object", "additionalProperties": false,
+              "required": ["required_assertion_fields"],
+              "properties": {"required_assertion_fields": {"const": ["assertion_mode", "origin"]}}
+            },
+            "risk": {
+              "type": "object", "additionalProperties": false,
+              "required": ["known_governed_values", "review_values"],
+              "properties": {
+                "known_governed_values": {"const": ["low", "medium"]},
+                "review_values": {"const": ["high", "unknown"]}
+              }
+            },
+            "retention": {
+              "type": "object", "additionalProperties": false,
+              "required": ["governed_value"],
+              "properties": {"governed_value": {"const": "retain"}}
+            },
+            "epistemic": {
+              "type": "object", "additionalProperties": false,
+              "required": ["governed_value", "requires_calibrated"],
+              "properties": {
+                "governed_value": {"const": "supported"},
+                "requires_calibrated": {"type": "boolean"}
+              }
+            },
+            "governance": {
+              "type": "object", "additionalProperties": false,
+              "required": ["blockers"],
+              "properties": {"blockers": {"const": ["not_live", "conflict", "external_dispute", "human_review"]}}
+            }
+          }
+        },
+        "startup": {
+          "type": "object", "additionalProperties": false,
+          "required": ["new_automatic_admission", "allow_existing_human_verified"],
+          "properties": {
+            "new_automatic_admission": {"const": false},
+            "allow_existing_human_verified": {"const": true}
+          }
+        },
+        "outputs": {
+          "type": "object", "additionalProperties": false,
+          "required": ["blocked", "review_required", "withhold", "qualified"],
+          "properties": {
+            "blocked": {"$ref": "#/$defs/surface_outputs"},
+            "review_required": {"$ref": "#/$defs/surface_outputs"},
+            "withhold": {"$ref": "#/$defs/surface_outputs"},
+            "qualified": {"$ref": "#/$defs/surface_outputs"}
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "surface_outputs": {
+      "type": "object", "additionalProperties": false,
+      "required": ["semantic_exploratory", "semantic_governed", "startup"],
+      "properties": {
+        "semantic_exploratory": {"enum": ["allow", "withhold", "review_required", "blocked", "unknown"]},
+        "semantic_governed": {"enum": ["allow", "withhold", "review_required", "blocked", "unknown"]},
+        "startup": {"enum": ["allow", "withhold", "review_required", "blocked", "unknown"]}
+      }
+    }
+  }
+}

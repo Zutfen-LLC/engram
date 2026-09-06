@@ -291,3 +291,57 @@ async def effective_assessment_values(
         purpose: assessment.model_dump(mode="json")
         for purpose, assessment in history.effective.items()
     }
+
+
+async def effective_assessment_selection(
+    session: AsyncSession,
+    item: MemoryItem,
+    context: ResolvedMemoryContext,
+    *,
+    purpose: str = "combined",
+) -> dict[str, Any]:
+    """Expose the #157 selection result without collapsing rejected inputs.
+
+    This helper is for policy simulation. The public effective projection stays
+    limited to completed, exact assessments. The simulator also needs the
+    reason that an assessment was not selected.
+    """
+    if not settings.assessment_selection_enabled:
+        return {"selection_status": "disabled", "combined": None}
+    rows = list(
+        (
+            await session.scalars(
+                select(MemoryAssessment)
+                .where(
+                    MemoryAssessment.tenant_id == item.tenant_id,
+                    MemoryAssessment.memory_item_id == item.id,
+                    MemoryAssessment.purpose == purpose,
+                )
+                .order_by(MemoryAssessment.created_at.desc(), MemoryAssessment.id.desc())
+            )
+        ).all()
+    )
+    if not rows:
+        return {"selection_status": "absent", "combined": None}
+    if not settings.assessment_effective_contract_hash:
+        return {"selection_status": "mismatched", "combined": None}
+    snapshot = await evidence_snapshot(session, item, context)
+    current_input_digest = digest(snapshot)
+    exact_rows = [
+        row
+        for row in rows
+        if row.contract_hash == settings.assessment_effective_contract_hash
+        and row.input_digest == current_input_digest
+    ]
+    completed = next((row for row in exact_rows if row.state == "completed"), None)
+    if completed is not None:
+        return {
+            "selection_status": "selected",
+            "combined": assessment_view(completed).model_dump(mode="json"),
+        }
+    for state in ("failed", "disabled", "stale"):
+        if any(row.state == state for row in exact_rows):
+            return {"selection_status": state, "combined": None}
+    if any(row.contract_hash == settings.assessment_effective_contract_hash for row in rows):
+        return {"selection_status": "stale", "combined": None}
+    return {"selection_status": "mismatched", "combined": None}

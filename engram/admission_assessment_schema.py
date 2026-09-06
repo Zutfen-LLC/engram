@@ -23,6 +23,16 @@ from engram.admission_assessment import (
     AdmissionProjectionStatus,
 )
 
+AdmissionRiskState = Literal["low", "medium", "high", "unknown", "not_applicable"]
+AdmissionEpistemicState = Literal[
+    "supported", "contested", "insufficient_evidence", "unknown", "not_applicable"
+]
+AdmissionRetentionState = Literal["retain", "transient", "noise", "uncertain", "unknown"]
+AdmissionTier = Literal["none", "semantic_exploratory", "semantic_governed", "startup"]
+AdmissionSurfaceDecision = Literal[
+    "allow", "withhold", "review_required", "blocked", "unknown"
+]
+
 
 class AdmissionAssessmentView(BaseModel):
     """One recorded decision, safe for any reader eligible to read the item.
@@ -32,7 +42,9 @@ class AdmissionAssessmentView(BaseModel):
     """
 
     assessment_id: UUID
-    schema_version: Literal["engram.admission-assessment.v1"]
+    schema_version: Literal[
+        "engram.admission-assessment.v1", "engram.admission-assessment.v2"
+    ]
     mode: AdmissionMode
     policy_profile_key: str
     policy_contract_version: str
@@ -56,6 +68,12 @@ class AdmissionAssessmentView(BaseModel):
     evaluation_id: UUID | None
     prior_assessment_id: UUID | None
     linked_item_event_id: UUID | None
+    risk_state: AdmissionRiskState | None = None
+    epistemic_state: AdmissionEpistemicState | None = None
+    retention_state: AdmissionRetentionState | None = None
+    highest_admission_tier: AdmissionTier | None = None
+    surface_decisions: dict[str, AdmissionSurfaceDecision] | None = None
+    observation_window_hours: int | None = None
 
 
 class AdmissionAssessmentDetail(AdmissionAssessmentView):
@@ -69,6 +87,7 @@ class AdmissionAssessmentDetail(AdmissionAssessmentView):
 
     decision_inputs: dict[str, Any] = Field(default_factory=dict)
     available_memory_assessment_refs: list[dict[str, Any]] = Field(default_factory=list)
+    effective_memory_assessment_refs: list[dict[str, Any]] = Field(default_factory=list)
     classification_run_id: UUID | None = None
     job_id: UUID | None = None
     actor_principal_id: UUID | None = None
@@ -97,7 +116,7 @@ class AdmissionAssessmentHistory(BaseModel):
     """Bounded, newest-first immutable history for one item."""
 
     item_id: UUID
-    policy_profile_key: str
+    policy_profile_key: Literal["path_a_compat", "risk_aware_shadow_v1"]
     assessments: list[AdmissionAssessmentView]
     next_before: UUID | None = None
 
@@ -127,6 +146,58 @@ class AdmissionReevaluateResponse(BaseModel):
     policy_profile_key: str
 
 
+class AdmissionShadowSimulationRequest(BaseModel):
+    """An explicit shadow-history write is never the default."""
+
+    model_config = {"extra": "forbid"}
+
+    persist_shadow: bool = False
+    trigger_id: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class AdmissionShadowSimulationView(BaseModel):
+    """Safe normalized result for one V2 shadow comparison."""
+
+    item_id: UUID
+    path_a_compat: dict[str, Any]
+    shadow_profile_key: Literal["risk_aware_shadow_v1"]
+    shadow_policy_version: str
+    shadow_policy_digest: str
+    shadow_decision_hash: str
+    highest_admission_tier: str
+    surface_decisions: dict[str, str]
+    risk_state: str
+    epistemic_state: str
+    retention_state: str
+    effective_memory_assessment_refs: list[dict[str, str]] = Field(default_factory=list)
+    blocker_codes: list[str]
+    reason_codes: list[str]
+    next_actions: list[str]
+    observation_window_hours: int | None
+    eligible_at: datetime | None
+    next_evaluation_at: datetime | None
+    surface_differs_from_path_a: dict[str, bool]
+    persisted_shadow_assessment_id: UUID | None = None
+
+
+class AdmissionShadowSimulationPageRequest(AdmissionShadowSimulationRequest):
+    limit: int = Field(default=50, ge=1, le=100)
+    after: UUID | None = None
+    workspace_id: UUID | None = None
+
+
+class AdmissionShadowSimulationPage(BaseModel):
+    profile_key: Literal["risk_aware_shadow_v1"]
+    scanned_count: int
+    returned_count: int
+    next_after: UUID | None
+    changed_admissions: int
+    changed_exclusions: int
+    changed_review_routing: int
+    strata_counts: dict[str, dict[str, int]]
+    results: list[AdmissionShadowSimulationView]
+
+
 __all__ = [
     "AdmissionAssessmentCurrentResponse",
     "AdmissionAssessmentDetail",
@@ -134,4 +205,8 @@ __all__ = [
     "AdmissionAssessmentView",
     "AdmissionReevaluateRequest",
     "AdmissionReevaluateResponse",
+    "AdmissionShadowSimulationPage",
+    "AdmissionShadowSimulationPageRequest",
+    "AdmissionShadowSimulationRequest",
+    "AdmissionShadowSimulationView",
 ]

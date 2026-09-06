@@ -11,7 +11,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -37,6 +37,16 @@ from engram.admission_assessment_schema import (
     AdmissionAssessmentView,
     AdmissionReevaluateRequest,
     AdmissionReevaluateResponse,
+    AdmissionShadowSimulationPage,
+    AdmissionShadowSimulationPageRequest,
+    AdmissionShadowSimulationRequest,
+    AdmissionShadowSimulationView,
+)
+from engram.admission_shadow import (
+    SHADOW_PROFILE_KEY,
+    persist_shadow_comparison,
+    simulate_item,
+    simulate_tenant_page,
 )
 from engram.auth import READ_SCOPE, REVIEW_SCOPE
 from engram.config import settings
@@ -112,6 +122,12 @@ def _view_payload(row: AdmissionAssessment) -> dict[str, Any]:
         "evaluation_id": row.evaluation_id,
         "prior_assessment_id": row.prior_assessment_id,
         "linked_item_event_id": row.linked_item_event_id,
+        "risk_state": row.risk_state,
+        "epistemic_state": row.epistemic_state,
+        "retention_state": row.retention_state,
+        "highest_admission_tier": row.highest_admission_tier,
+        "surface_decisions": dict(row.surface_decisions) if row.surface_decisions else None,
+        "observation_window_hours": row.observation_window_hours,
     }
 
 
@@ -125,6 +141,9 @@ def assessment_detail(row: AdmissionAssessment) -> AdmissionAssessmentDetail:
             **_view_payload(row),
             "decision_inputs": dict(row.decision_inputs),
             "available_memory_assessment_refs": list(row.available_memory_assessment_refs),
+            "effective_memory_assessment_refs": list(
+                row.effective_memory_assessment_refs or []
+            ),
             "classification_run_id": row.classification_run_id,
             "job_id": row.job_id,
             "actor_principal_id": row.actor_principal_id,
@@ -209,6 +228,9 @@ async def admission_assessment_history(
     item_id: UUID,
     limit: int = Query(default=50, ge=1, le=100),
     before: UUID | None = None,
+    profile_key: Literal["path_a_compat", "risk_aware_shadow_v1"] = Query(
+        default=POLICY_PROFILE_KEY
+    ),
     session: AsyncSession = Depends(get_session),  # noqa: B008
     context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> AdmissionAssessmentHistory:
@@ -221,7 +243,7 @@ async def admission_assessment_history(
     base = select(AdmissionAssessment).where(
         AdmissionAssessment.tenant_id == item.tenant_id,
         AdmissionAssessment.memory_item_id == item.id,
-        AdmissionAssessment.policy_profile_key == POLICY_PROFILE_KEY,
+        AdmissionAssessment.policy_profile_key == profile_key,
     )
     query = base
     if before is not None:
@@ -243,7 +265,7 @@ async def admission_assessment_history(
     )
     return AdmissionAssessmentHistory(
         item_id=item.id,
-        policy_profile_key=POLICY_PROFILE_KEY,
+        policy_profile_key=profile_key,
         assessments=[assessment_view(row) for row in rows[:limit]],
         next_before=rows[limit - 1].id if len(rows) > limit else None,
     )
@@ -313,6 +335,120 @@ async def reevaluate(
         trigger_type=_REASON_TRIGGERS[request.reason],
         trigger_id=request.trigger_id,
         policy_profile_key=POLICY_PROFILE_KEY,
+    )
+
+
+def _shadow_trigger_id(request: AdmissionShadowSimulationRequest) -> str:
+    return request.trigger_id or f"api:{uuid.uuid4()}"
+
+
+def _require_shadow_persistence_authority(
+    request: AdmissionShadowSimulationRequest,
+    context: ResolvedMemoryContext,
+) -> None:
+    if request.persist_shadow and not context.admin_workspace_bypass:
+        raise HTTPException(403, "Admin scope is required to persist shadow assessments")
+
+
+@router.post(
+    "/items/{item_id}/admission-assessments/simulate",
+    response_model=AdmissionShadowSimulationView,
+    dependencies=[Depends(REVIEW_SCOPE)],
+)
+async def simulate_admission_item(
+    item_id: UUID,
+    request: AdmissionShadowSimulationRequest,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+    context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
+) -> AdmissionShadowSimulationView:
+    """Compare Path A with the shadow profile without changing item state."""
+    _require_shadow_persistence_authority(request, context)
+    item = await _eligible_item(session, item_id, context)
+    now = datetime.now(UTC)
+    comparison = await simulate_item(session, item=item, context=context, evaluation_time=now)
+    persisted_id: UUID | None = None
+    if request.persist_shadow:
+        row = await persist_shadow_comparison(
+            session,
+            comparison=comparison,
+            item=item,
+            actor_principal_id=context.principal_id,
+            evaluated_at=now,
+            trigger_id=_shadow_trigger_id(request),
+        )
+        persisted_id = row.id
+        await session.commit()
+    return AdmissionShadowSimulationView.model_validate(
+        {
+            **comparison.detail_payload(),
+            "persisted_shadow_assessment_id": persisted_id,
+        }
+    )
+
+
+@router.post(
+    "/admission-assessments/simulate",
+    response_model=AdmissionShadowSimulationPage,
+    dependencies=[Depends(REVIEW_SCOPE)],
+)
+async def simulate_admission_page(
+    request: AdmissionShadowSimulationPageRequest,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+    context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
+) -> AdmissionShadowSimulationPage:
+    """Run one keyset-bounded, tenant-isolated shadow comparison page."""
+    _require_shadow_persistence_authority(request, context)
+    now = datetime.now(UTC)
+    page = await simulate_tenant_page(
+        session,
+        context=context,
+        evaluation_time=now,
+        limit=request.limit,
+        after=request.after,
+        workspace_id=request.workspace_id,
+    )
+    persisted: dict[UUID, UUID] = {}
+    if request.persist_shadow:
+        trigger_id = _shadow_trigger_id(request)
+        items = {
+            row.id: row
+            for row in (
+                await session.scalars(
+                    select(MemoryItem).where(
+                        MemoryItem.id.in_([comparison.item_id for comparison in page.comparisons])
+                    )
+                )
+            ).all()
+        }
+        for comparison in page.comparisons:
+            row = await persist_shadow_comparison(
+                session,
+                comparison=comparison,
+                item=items[comparison.item_id],
+                actor_principal_id=context.principal_id,
+                evaluated_at=now,
+                trigger_id=trigger_id,
+            )
+            persisted[comparison.item_id] = row.id
+        await session.commit()
+    return AdmissionShadowSimulationPage(
+        profile_key=SHADOW_PROFILE_KEY,
+        scanned_count=page.scanned_count,
+        returned_count=len(page.comparisons),
+        next_after=page.next_after,
+        changed_admissions=page.changed_admissions,
+        changed_exclusions=page.changed_exclusions,
+        changed_review_routing=page.changed_review_routing,
+        strata_counts=page.strata_counts,
+        results=[
+            AdmissionShadowSimulationView.model_validate(
+                {
+                    **comparison.detail_payload(),
+                    "persisted_shadow_assessment_id": persisted.get(comparison.item_id),
+                }
+            )
+            for comparison in page.comparisons
+        ],
     )
 
 
