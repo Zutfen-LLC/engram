@@ -286,6 +286,31 @@ def main() -> None:
         action="store_true",
         help="Report what would be imported without writing anything.",
     )
+    admission_simulate = admission_sub.add_parser(
+        "simulate",
+        help="Compare Path A with the bounded risk-aware shadow profile. Reads use the "
+        "supplied API key's tenant, principal, and memory-profile boundary. This command "
+        "does not mutate lifecycle state or queue work.",
+    )
+    admission_simulate.add_argument("--tenant", required=True)
+    admission_simulate.add_argument(
+        "--api-key-id",
+        required=True,
+        help="API key UUID whose pinned profile and review authority scope the read.",
+    )
+    admission_simulate.add_argument("--limit", type=int, default=50)
+    admission_simulate.add_argument("--after", default=None)
+    admission_simulate.add_argument("--workspace", default=None)
+    admission_simulate.add_argument(
+        "--persist-shadow",
+        action="store_true",
+        help="Append immutable V2 shadow history. Requires the supplied key to have admin scope.",
+    )
+    admission_simulate.add_argument(
+        "--trigger-id",
+        default=None,
+        help="Stable operator trigger identity for persisted shadow rows.",
+    )
 
     backfill_parser = sub.add_parser(
         "backfill-embeddings",
@@ -608,13 +633,27 @@ def main() -> None:
             )
         )
     elif args.command == "admission-assessments":
+        if args.admission_command == "backfill":
+            raise SystemExit(
+                asyncio.run(
+                    _run_admission_backfill(
+                        args.tenant,
+                        limit=args.limit,
+                        after=args.after,
+                        dry_run=args.dry_run,
+                    )
+                )
+            )
         raise SystemExit(
             asyncio.run(
-                _run_admission_backfill(
+                _run_admission_shadow_simulation(
                     args.tenant,
+                    api_key_id=args.api_key_id,
                     limit=args.limit,
                     after=args.after,
-                    dry_run=args.dry_run,
+                    workspace=args.workspace,
+                    persist_shadow=args.persist_shadow,
+                    trigger_id=args.trigger_id,
                 )
             )
         )
@@ -1805,6 +1844,144 @@ async def _run_admission_backfill(
             dry_run=dry_run,
         )
     print(result.summarize())
+    return 0
+
+
+async def _run_admission_shadow_simulation(
+    tenant_id: str,
+    *,
+    api_key_id: str,
+    limit: int,
+    after: str | None,
+    workspace: str | None,
+    persist_shadow: bool,
+    trigger_id: str | None,
+    session_factory: Any | None = None,
+) -> int:
+    """Run one profile-scoped, provider-free shadow comparison page.
+
+    The command takes an API-key ID rather than a bare principal ID.  An API
+    key is the durable source of the request's profile and scopes.  This keeps
+    the owner-session CLI from widening a profile-bound reader's visibility.
+    """
+    from datetime import UTC
+
+    from sqlalchemy import select
+
+    from engram.admission_shadow import (
+        MAX_SHADOW_SIMULATION_LIMIT,
+        persist_shadow_comparison,
+        simulate_tenant_page,
+    )
+    from engram.db import owner_session_factory as default_factory
+    from engram.memory_context import _reconstruct_pinned_context
+    from engram.models import ApiKey, MemoryProfile
+
+    try:
+        tenant = uuid.UUID(tenant_id)
+        key_id = uuid.UUID(api_key_id)
+        after_id = uuid.UUID(after) if after else None
+        workspace_id = uuid.UUID(workspace) if workspace else None
+    except ValueError as exc:
+        print(f"invalid simulation identifier: {exc}", file=sys.stderr)
+        return 2
+    if not 1 <= limit <= MAX_SHADOW_SIMULATION_LIMIT:
+        print(
+            f"--limit must be between 1 and {MAX_SHADOW_SIMULATION_LIMIT}",
+            file=sys.stderr,
+        )
+        return 2
+    factory = session_factory if session_factory is not None else default_factory
+    async with factory() as session:
+        key = await session.scalar(
+            select(ApiKey).where(ApiKey.id == key_id, ApiKey.tenant_id == tenant)
+        )
+        if key is None or key.revoked_at is not None or key.principal_id is None:
+            print("API key is unavailable for the requested tenant", file=sys.stderr)
+            return 2
+        scopes = set(key.scopes or [])
+        if "review" not in scopes and "admin" not in scopes:
+            print("API key requires review scope for shadow simulation", file=sys.stderr)
+            return 2
+        if persist_shadow and "admin" not in scopes:
+            print("--persist-shadow requires an API key with admin scope", file=sys.stderr)
+            return 2
+        revision_id = None
+        if key.memory_profile_id is not None:
+            profile = await session.scalar(
+                select(MemoryProfile).where(
+                    MemoryProfile.id == key.memory_profile_id,
+                    MemoryProfile.tenant_id == tenant,
+                    MemoryProfile.disabled_at.is_(None),
+                )
+            )
+            if profile is None or profile.active_revision_id is None:
+                print("API key memory profile is unavailable", file=sys.stderr)
+                return 2
+            revision_id = profile.active_revision_id
+        context = await _reconstruct_pinned_context(
+            session,
+            tenant_id=tenant,
+            principal_id=key.principal_id,
+            api_key_id=key.id,
+            memory_profile_id=key.memory_profile_id,
+            memory_profile_revision_id=revision_id,
+        )
+        now = datetime.now(UTC)
+        page = await simulate_tenant_page(
+            session,
+            context=context,
+            evaluation_time=now,
+            limit=limit,
+            after=after_id,
+            workspace_id=workspace_id,
+        )
+        persisted: dict[str, str] = {}
+        if persist_shadow:
+            from engram.models import MemoryItem
+
+            items = {
+                row.id: row
+                for row in (
+                    await session.scalars(
+                        select(MemoryItem).where(
+                            MemoryItem.id.in_([item.item_id for item in page.comparisons])
+                        )
+                    )
+                ).all()
+            }
+            durable_trigger = trigger_id or f"cli:{uuid.uuid4()}"
+            for comparison in page.comparisons:
+                row = await persist_shadow_comparison(
+                    session,
+                    comparison=comparison,
+                    item=items[comparison.item_id],
+                    actor_principal_id=context.principal_id,
+                    evaluated_at=now,
+                    trigger_id=durable_trigger,
+                )
+                persisted[str(comparison.item_id)] = str(row.id)
+            await session.commit()
+    payload = {
+        "profile_key": "risk_aware_shadow_v1",
+        "scanned_count": page.scanned_count,
+        "returned_count": len(page.comparisons),
+        "next_after": str(page.next_after) if page.next_after else None,
+        "changed_admissions": page.changed_admissions,
+        "changed_exclusions": page.changed_exclusions,
+        "changed_review_routing": page.changed_review_routing,
+        "strata_counts": page.strata_counts,
+        "results": [
+            {
+                **comparison.detail_payload(),
+                "persisted_shadow_assessment_id": persisted.get(str(comparison.item_id)),
+            }
+            for comparison in page.comparisons
+        ],
+    }
+    import json
+
+    print(json.dumps(payload, default=_json_default, sort_keys=True))
     return 0
 
 

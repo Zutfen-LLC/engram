@@ -31,6 +31,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import NullPool
 
 from engram.admission_assessment import POLICY_PROFILE_KEY
+from engram.admission_policy import (
+    AdmissionItemState,
+    EffectiveAssessmentState,
+    evaluate_admission_profile,
+    load_admission_policy,
+)
+from engram.admission_shadow import ShadowComparison, persist_shadow_comparison
 from engram.config import settings
 from engram.db import apply_rls_context
 from engram.jobs import claim_next_job
@@ -257,6 +264,71 @@ async def _projection(item_id: uuid.UUID) -> dict[str, object] | None:
             .one_or_none()
         )
     return dict(row) if row else None
+
+
+async def test_v2_shadow_row_is_immutable_history_and_never_current() -> None:
+    tenant_id, principal_id = await _default_ids()
+    item_id = await _insert_item(tenant_id=tenant_id, principal_id=principal_id)
+    now = _now()
+    policy = load_admission_policy("risk_aware_shadow_v1")
+    state = AdmissionItemState(
+        item_id=str(item_id),
+        tenant_id=tenant_id,
+        content_hash="sha256:" + "a" * 64,
+        kind="fact",
+        source_type="manual",
+        assertion_mode="unknown",
+        review_status="proposed",
+        created_at=now,
+        valid_to=None,
+        superseded_by=None,
+        unresolved_conflict=False,
+        external_dispute=False,
+        governed_review_required=False,
+        human_verified=False,
+    )
+    evidence = EffectiveAssessmentState(
+        selection_status="missing",
+        contract_hash=None,
+        assessment_refs=(),
+        risk_state="unknown",
+        epistemic_state="unknown",
+        retention_state="unknown",
+        calibrated=False,
+    )
+    decision = evaluate_admission_profile(state, evidence, policy, now)
+    async with _factory() as session:
+        item = await session.get(MemoryItem, item_id)
+        assert item is not None
+        comparison = ShadowComparison(
+            item_id,
+            {"would_promote": False, "outcome": "withhold"},
+            decision,
+        )
+        row = await persist_shadow_comparison(
+            session,
+            comparison=comparison,
+            item=item,
+            actor_principal_id=uuid.UUID(principal_id),
+            evaluated_at=now,
+            trigger_id="test-shadow",
+        )
+        await session.commit()
+
+    rows = await _assessments(item_id)
+    assert len(rows) == 1
+    assert rows[0]["id"] == row.id
+    assert rows[0]["schema_version"] == "engram.admission-assessment.v2"
+    assert rows[0]["mode"] == "shadow"
+    assert rows[0]["policy_profile_key"] == "risk_aware_shadow_v1"
+    assert rows[0]["resulting_state_digest"] is None
+    assert rows[0]["linked_item_event_id"] is None
+    assert rows[0]["observation_window_hours"] is None
+    assert await _projection(item_id) is None
+    async with _factory() as session:
+        assert await session.scalar(
+            select(MemoryItem.review_status).where(MemoryItem.id == item_id)
+        ) == "proposed"
 
 
 async def _review_status(item_id: uuid.UUID) -> str:

@@ -56,6 +56,13 @@ EXPECTED_MATRIX: dict[tuple[str, str], dict] = {
     ("POST", "/v1/items/{item_id}/admission-assessments/reevaluate"): {
         "all_of": ("review",)
     },
+    # Issue #158 shadow simulation exposes normalized policy evidence. It
+    # requires review scope. Persisting immutable shadow history has an
+    # additional handler-level admin check and cannot widen the route policy.
+    ("POST", "/v1/items/{item_id}/admission-assessments/simulate"): {
+        "all_of": ("review",)
+    },
+    ("POST", "/v1/admission-assessments/simulate"): {"all_of": ("review",)},
     ("GET", "/v1/items/{item_id}/assessments"): {"all_of": ("read",)},
     ("GET", "/v1/items/{item_id}/assessments/{assessment_id}/debug"): {"all_of": ("review",)},
     ("GET", "/v1/items/{item_id}/reassessments/{request_id}"): {"all_of": ("review",)},
