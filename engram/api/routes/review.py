@@ -20,6 +20,7 @@ from engram.admission_assessment import (
 )
 from engram.api.routes.admission_assessments import (
     MISSING_ADMISSION_SUMMARY,
+    AdmissionFilterScanExhaustedError,
     AdmissionQueueFilters,
     admission_summaries,
     select_filtered_review_items,
@@ -322,11 +323,30 @@ async def review_queue(
     The ``admission_*`` parameters filter on the durable admission decision
     (issue #159): outcome, a blocker code, a required next action, the
     assessment's current/stale/missing/legacy_import state, and a
-    due-before time on ``next_evaluation_at``. They are applied to the page
-    this query already selected rather than widening the scan, so the queue
-    stays bounded; an item with no recorded decision matches only
-    ``admission_state=missing``.
+    due-before time on ``next_evaluation_at``. Stored facts are selected in
+    SQL. Computed states use a bounded keyset walk. The endpoint returns 409
+    when more candidates remain after the scan cap. An item with no recorded
+    decision matches only ``admission_state=missing``. Combining ``missing``
+    with a decision predicate returns 422.
     """
+    filters = AdmissionQueueFilters(
+        outcome=admission_outcome,
+        blocker=admission_blocker,
+        next_action=admission_next_action,
+        state=admission_state,
+        due_before=admission_due_before,
+    )
+    incompatible = filters.incompatible_with_missing
+    if incompatible:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "incompatible_admission_filters",
+                "message": "admission_state=missing cannot be combined with decision predicates",
+                "incompatible_filters": list(incompatible),
+            },
+        )
+
     tenant_id = memory_context.tenant_id
     if not memory_context.may_read_anything:
         return []
@@ -360,16 +380,19 @@ async def review_queue(
             return []
         stmt = stmt.where(MemoryItem.workspace_id == workspace_id)
 
-    filters = AdmissionQueueFilters(
-        outcome=admission_outcome,
-        blocker=admission_blocker,
-        next_action=admission_next_action,
-        state=admission_state,
-        due_before=admission_due_before,
-    )
-    items = await select_filtered_review_items(
-        session, base_stmt=stmt, filters=filters, limit=page_limit
-    )
+    try:
+        items = await select_filtered_review_items(
+            session, base_stmt=stmt, filters=filters, limit=page_limit
+        )
+    except AdmissionFilterScanExhaustedError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "admission_filter_scan_exhausted",
+                "message": "The bounded admission filter search is incomplete",
+                "scanned": exc.scanned,
+            },
+        ) from exc
     summaries = await admission_summaries(session, items)
     config = (
         await session.execute(

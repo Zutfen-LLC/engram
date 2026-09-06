@@ -193,26 +193,32 @@ distinct from a recorded decision whose outcome is `unknown`.
 
 ## Transaction and lock order
 
-The canonical `promotion.evaluate` path (issue #155) is unchanged in shape:
+The canonical `promotion.evaluate` path (issue #155) keeps the same policy and
+mutation shape:
 
-1. parse and reuse the existing job/evaluation/trigger contract;
-2. preliminary work without the item lock, as current code already does;
-3. `SELECT ... FOR UPDATE` on the item and reload decision-affecting state
+1. lock the durable job row and parse the existing job/trigger contract;
+2. use `job.id` as the stable `evaluation_id` for every attempt;
+3. look up the tenant-scoped assessment bound to that identity. If it exists,
+   validate its item, job, mode, invocation source, and trigger binding. Return
+   without evaluating policy or mutating the item. Fail closed if the binding
+   conflicts;
+4. do preliminary work without the item lock, as current code already does;
+5. `SELECT ... FOR UPDATE` on the item and reload decision-affecting state
    (`SKIP LOCKED` semantics for the untargeted sweep are unchanged);
-4. revalidate policy/config under the lock. A `tenant_config` change committed
+6. revalidate policy/config under the lock. A `tenant_config` change committed
    between the pre-lock read and the lock makes the pre-lock result `stale`: it
    is recorded as immutable non-current history and the pass re-evaluates on
    the reloaded policy before any mutation;
-5. recompute the candidate from locked state through the production evaluator;
-6. run the promotion-time conflict recheck bound to that locked state;
-7. build the canonical decision and hash;
-8. for a non-mutating result: insert the assessment and update the projection
+7. recompute the candidate from locked state through the production evaluator;
+8. run the promotion-time conflict recheck bound to that locked state;
+9. build the canonical decision and hash;
+10. for a non-mutating result: insert the assessment and update the projection
    in the same transaction;
-9. for `proposed -> active`: preallocate the audit event ID, run the guarded
+11. for `proposed -> active`: preallocate the audit event ID, run the guarded
    mutation, insert the event, insert the assessment naming that event, set the
    event's `admission_assessment_id`, update the projection — all committed
    atomically;
-10. if the guarded mutation loses the race, no `admitted` assessment or event
+12. if the guarded mutation loses the race, no `admitted` assessment or event
     is written. The pass reloads and appends a truthful non-mutating result
     (`not_applicable`, reason `mutation_race_lost`), and projection precedence
     keeps it from displacing the winner.
@@ -229,14 +235,22 @@ cannot carry a lifecycle mutation with it. Preview rows always record
 
 ## Idempotency and concurrency
 
-- `evaluation_id` is unique per tenant, and `insert_assessment()` resolves a
+- `job_id` is the durable queue execution identity and a foreign-key reference
+  to the queue row. For `promotion.evaluate`, `evaluation_id` is the canonical
+  decision lookup identity and has the same UUID value as `job.id`. It remains
+  stable across every attempt of that job.
+- The handler locks the job row and performs the completed-execution lookup
+  before it reloads the item, reconstructs execution authority, or calls the
+  policy evaluator. A retry therefore cannot create a new mutation after the
+  first decision commits. The row lock also makes concurrent attempts perform
+  this check in sequence.
+- `evaluation_id` is unique per tenant. `insert_assessment()` also resolves a
   supplied identity back to the decision already bound to it before inserting
-  anything. That reuse is the mechanism; the unique index is the backstop. It
-  matters in a specific crash window: a `promotion.evaluate` job whose decision
-  committed, whose worker then died before the queue could mark the job
-  succeeded, and which is reclaimed with the same `evaluation_id` while the
-  item is still `proposed`. Without the lookup, that retry would raise a unique
-  violation and dead-letter a job whose work was already durably complete.
+  anything. The handler lookup is the early reuse mechanism. The unique index
+  and insert lookup are backstops. A partial unique index on
+  `(tenant_id, job_id)` also permits only one authoritative row with a
+  canonical evaluation identity. Stale pre-lock history has no
+  `evaluation_id`, so it does not claim this binding.
 - The execution identity binds the decision the execution actually reached.
   When policy changes between the pre-lock read and the lock, the superseded
   pre-lock row is recorded as history with **no** `evaluation_id`, and the
@@ -279,6 +293,16 @@ comparison against live item and policy state, which no SQL expression can
 express; those walk the SQL-narrowed queue in bounded keyset batches until the
 requested page is filled or `MAX_ADMISSION_FILTER_SCAN` rows have been
 examined.
+
+`admission_state=missing` cannot be combined with outcome, blocker,
+next-action, or due-before predicates. The API returns HTTP 422 for these
+combinations. A missing assessment has no decision facts to filter.
+
+If a computed-state walk reaches the scan cap and more candidates remain, the
+API returns HTTP 409. The error detail contains
+`code=admission_filter_scan_exhausted` and the number of scanned rows. It does
+not return an ordinary list that appears exhaustive. A match that fills the
+requested page on the final permitted row returns normally.
 
 Filtering a preselected page instead would report "nothing matches" whenever
 the matching item happened to sit past the caller's limit — a false negative on

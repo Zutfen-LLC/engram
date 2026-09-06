@@ -26,14 +26,17 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from engram.admission_assessment import POLICY_PROFILE_KEY
 from engram.config import settings
-from engram.models import MemoryItem
-from engram.promotion import auto_promote_proposed_memories
+from engram.db import apply_rls_context
+from engram.jobs import claim_next_job
+from engram.models import Job, MemoryItem
+from engram.promotion import auto_promote_proposed_memories, enqueue_promotion_evaluation
+from engram.worker import handle_promotion_evaluate, process_one_job
 
 _engine = create_async_engine(settings.database_url, poolclass=NullPool)
 _factory: async_sessionmaker[AsyncSession] = async_sessionmaker(
@@ -1132,29 +1135,77 @@ async def test_a_conflict_blocked_decision_is_current_after_its_own_marking() ->
 # --- Canonical evaluation retry (issue #159 review) --------------------------
 
 
-async def _evaluate_with_identity(
-    tenant_id: str, item_id: uuid.UUID, evaluation_id: uuid.UUID
-) -> object:
-    """Run one canonical item-scoped evaluation under a fixed identity."""
-    from engram.promotion import evaluate_promotion_item_current_state
-
+async def _enqueue_evaluation_job(
+    tenant_id: str, principal_id: str, item_id: uuid.UUID, *, trigger_id: str
+) -> uuid.UUID:
     async with _factory() as session:
-        await session.execute(
-            text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id}
-        )
-        return await evaluate_promotion_item_current_state(
+        await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
+        job_id = await enqueue_promotion_evaluation(
             session,
-            tenant_id,
-            item_id,
-            evaluation_context={
-                "evaluation_id": str(evaluation_id),
-                "trigger_type": "classification_bound",
-                "trigger_id": "retry-test",
-            },
+            tenant_id=tenant_id,
+            memory_item_id=item_id,
+            trigger_type="manual",
+            trigger_id=trigger_id,
+        )
+        await session.commit()
+    return job_id
+
+
+async def _run_evaluation_job(tenant_id: str, principal_id: str, job_id: uuid.UUID) -> None:
+    """Run the real worker handler without final queue bookkeeping."""
+    async with _factory() as session:
+        await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
+        job = await session.scalar(select(Job).where(Job.id == job_id))
+        assert job is not None
+        await handle_promotion_evaluate(session, job)
+
+
+async def _run_claimed_job_without_finalizing(
+    tenant_id: str, principal_id: str, job_id: uuid.UUID
+) -> None:
+    """Commit handler work but leave the claimed queue row unfinished."""
+    async with _factory() as session:
+        job = await claim_next_job(
+            session, worker_id="crashing-worker", job_types=["promotion.evaluate"]
+        )
+    assert job is not None
+    assert job.id == job_id
+    async with _factory() as session:
+        await apply_rls_context(session, tenant_id=tenant_id, principal_id=principal_id)
+        await handle_promotion_evaluate(session, job)
+
+
+async def _reclaim_and_process_evaluation_job() -> None:
+    processed = await process_one_job(
+        worker_id="retry-worker",
+        session_factory=_factory,
+        app_session_factory=_factory,
+        job_types=["promotion.evaluate"],
+        lease_stale_after=0,
+    )
+    assert processed is True
+
+
+async def _job_status(job_id: uuid.UUID) -> str:
+    async with _factory() as session:
+        return str(await session.scalar(select(Job.status).where(Job.id == job_id)))
+
+
+async def _review_change_count(item_id: uuid.UUID) -> int:
+    async with _factory() as session:
+        return int(
+            await session.scalar(
+                text(
+                    "SELECT count(*) FROM item_events "
+                    "WHERE item_id = :id AND event_type = 'review_change'"
+                ),
+                {"id": item_id},
+            )
+            or 0
         )
 
 
-async def test_retrying_a_canonical_evaluation_reuses_its_bound_decision() -> None:
+async def test_worker_retry_reuses_its_non_mutating_canonical_decision() -> None:
     """The crash window: the decision commits, the worker dies before the job
     is marked succeeded, the job is reclaimed with the same evaluation_id and
     the item is still proposed. The retry must resolve to the decision already
@@ -1164,38 +1215,59 @@ async def test_retrying_a_canonical_evaluation_reuses_its_bound_decision() -> No
     item_id = await _insert_item(
         tenant_id=tenant_id, principal_id=principal_id, memory_confidence=0.1
     )
-    evaluation_id = uuid.uuid4()
+    job_id = await _enqueue_evaluation_job(
+        tenant_id, principal_id, item_id, trigger_id="retry-non-mutating"
+    )
 
-    await _evaluate_with_identity(tenant_id, item_id, evaluation_id)
+    # The handler commits its decision. Queue success bookkeeping is not run,
+    # which simulates a worker crash in the post-commit window.
+    await _run_claimed_job_without_finalizing(tenant_id, principal_id, job_id)
     first = await _assessments(item_id)
     assert len(first) == 1
     assert first[0]["outcome"] == "insufficient_evidence"
-    assert first[0]["evaluation_id"] == evaluation_id
+    assert first[0]["evaluation_id"] == job_id
+    assert first[0]["job_id"] == job_id
 
-    # The retry: same identity, item still proposed.
-    await _evaluate_with_identity(tenant_id, item_id, evaluation_id)
+    # The same durable job is retried. The handler must reuse the first row.
+    await _reclaim_and_process_evaluation_job()
     second = await _assessments(item_id)
     assert len(second) == 1, "a retry must not append a second bound decision"
     assert second[0]["id"] == first[0]["id"]
     assert await _review_status(item_id) == "proposed"
+    assert await _review_change_count(item_id) == 0
+    assert await _job_status(job_id) == "succeeded"
 
 
-async def test_a_retried_cooling_evaluation_is_also_idempotent() -> None:
+async def test_worker_retry_does_not_promote_after_item_state_changes() -> None:
     settings.admission_assessment_capture_enabled = True
     tenant_id, principal_id = await _default_ids()
     item_id = await _insert_item(
         tenant_id=tenant_id,
         principal_id=principal_id,
-        memory_confidence=0.95,
-        created_at=_now() - timedelta(hours=1),
+        memory_confidence=0.1,
     )
-    evaluation_id = uuid.uuid4()
+    job_id = await _enqueue_evaluation_job(
+        tenant_id, principal_id, item_id, trigger_id="retry-state-change"
+    )
 
-    await _evaluate_with_identity(tenant_id, item_id, evaluation_id)
-    await _evaluate_with_identity(tenant_id, item_id, evaluation_id)
+    await _run_claimed_job_without_finalizing(tenant_id, principal_id, job_id)
+    first = (await _assessments(item_id))[0]
+    assert first["outcome"] == "insufficient_evidence"
+
+    # A fresh evaluation would now promote this old, high-confidence fact.
+    async with _engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE memory_items SET memory_confidence = 0.95 WHERE id = :id"),
+            {"id": item_id},
+        )
+
+    await _reclaim_and_process_evaluation_job()
     rows = await _assessments(item_id)
     assert len(rows) == 1
-    assert rows[0]["outcome"] == "cooling"
+    assert rows[0]["id"] == first["id"]
+    assert await _review_status(item_id) == "proposed"
+    assert await _review_change_count(item_id) == 0
+    assert await _job_status(job_id) == "succeeded"
 
 
 async def test_the_evaluation_identity_binds_the_authoritative_decision_not_the_stale_one() -> None:
@@ -1208,7 +1280,9 @@ async def test_the_evaluation_identity_binds_the_authoritative_decision_not_the_
     item_id = await _insert_item(
         tenant_id=tenant_id, principal_id=principal_id, memory_confidence=0.9
     )
-    evaluation_id = uuid.uuid4()
+    job_id = await _enqueue_evaluation_job(
+        tenant_id, principal_id, item_id, trigger_id="retry-policy-change"
+    )
 
     from engram.promotion import _config as real_config
 
@@ -1236,7 +1310,7 @@ async def test_the_evaluation_identity_binds_the_authoritative_decision_not_the_
 
     promotion_module._config = changing_config  # type: ignore[assignment]
     try:
-        await _evaluate_with_identity(tenant_id, item_id, evaluation_id)
+        await _run_claimed_job_without_finalizing(tenant_id, principal_id, job_id)
     finally:
         promotion_module._config = real_config  # type: ignore[assignment]
 
@@ -1248,12 +1322,45 @@ async def test_the_evaluation_identity_binds_the_authoritative_decision_not_the_
     # The superseded pre-lock row holds no execution identity...
     assert stale[0]["evaluation_id"] is None
     # ...the decision this execution actually reached does.
-    assert authoritative[0]["evaluation_id"] == evaluation_id
+    assert authoritative[0]["evaluation_id"] == job_id
+    assert authoritative[0]["job_id"] == job_id
 
     # And a retry of that execution resolves to the authoritative row.
-    await _evaluate_with_identity(tenant_id, item_id, evaluation_id)
+    await _reclaim_and_process_evaluation_job()
     after = await _assessments(item_id)
     assert len(after) == 2, "the retry must not append another decision"
+
+
+async def test_concurrent_retries_of_an_already_bound_job_converge() -> None:
+    settings.admission_assessment_capture_enabled = True
+    tenant_id, principal_id = await _default_ids()
+    item_id = await _insert_item(
+        tenant_id=tenant_id, principal_id=principal_id, memory_confidence=0.1
+    )
+    job_id = await _enqueue_evaluation_job(
+        tenant_id, principal_id, item_id, trigger_id="concurrent-retry"
+    )
+    await _run_evaluation_job(tenant_id, principal_id, job_id)
+    first = (await _assessments(item_id))[0]
+
+    # Make a fresh evaluation mutation-capable. Both retries must stop at the
+    # already-bound decision while serialized by the durable job-row lock.
+    async with _engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE memory_items SET memory_confidence = 0.95 WHERE id = :id"),
+            {"id": item_id},
+        )
+    await asyncio.gather(
+        _run_evaluation_job(tenant_id, principal_id, job_id),
+        _run_evaluation_job(tenant_id, principal_id, job_id),
+    )
+
+    rows = await _assessments(item_id)
+    assert len(rows) == 1
+    assert rows[0]["id"] == first["id"]
+    assert rows[0]["evaluation_id"] == job_id
+    assert await _review_status(item_id) == "proposed"
+    assert await _review_change_count(item_id) == 0
 
 
 # --- Audit linkage lifecycle (issue #159 review) -----------------------------

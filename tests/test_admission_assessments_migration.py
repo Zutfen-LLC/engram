@@ -355,6 +355,49 @@ async def test_evaluation_id_is_unique_per_tenant() -> None:
         await owner.close()
 
 
+async def test_one_canonical_decision_can_bind_each_job() -> None:
+    """The job binding rejects duplicates but permits stale pre-lock history."""
+    import asyncpg
+
+    owner = await _owner_with_038()
+    tenant_id: uuid.UUID | None = None
+    try:
+        tenant_id, _, item_id = await _seed_item(owner)
+        job_id = uuid.uuid4()
+        await owner.execute(
+            "INSERT INTO jobs(id, tenant_id, job_type) "
+            "VALUES ($1, $2, 'promotion.evaluate')",
+            job_id,
+            tenant_id,
+        )
+        sql = """INSERT INTO admission_assessments(
+                     id, tenant_id, memory_item_id, schema_version, mode, evaluation_id,
+                     job_id, trigger_type, trigger_id, invocation_source, evaluated_at,
+                     item_content_hash, input_digest, policy_profile_key,
+                     policy_contract_version, policy_config_digest, outcome,
+                     conflict_recheck_status, decision_hash)
+                 VALUES ($1, $2, $3, 'engram.admission-assessment.v1', 'authoritative', $4,
+                     $5, 'manual', 't', 'promotion.evaluate', now(), 'sha256:aa',
+                     'sha256:bb', 'path_a_compat', 'path-a-compat-v1', 'sha256:cc', 'cooling',
+                     'not_run', 'sha256:dd')"""
+        await owner.execute(sql, uuid.uuid4(), tenant_id, item_id, uuid.uuid4(), job_id)
+        with pytest.raises(asyncpg.UniqueViolationError):
+            await owner.execute(sql, uuid.uuid4(), tenant_id, item_id, uuid.uuid4(), job_id)
+
+        # A superseded pre-lock row has job provenance but no canonical
+        # evaluation identity. The partial unique index permits that history.
+        await owner.execute(sql, uuid.uuid4(), tenant_id, item_id, None, job_id)
+    finally:
+        if tenant_id is not None:
+            await owner.execute(
+                "DELETE FROM admission_assessments WHERE tenant_id = $1", tenant_id
+            )
+            await owner.execute("DELETE FROM jobs WHERE tenant_id = $1", tenant_id)
+            await owner.execute("DELETE FROM memory_items WHERE tenant_id = $1", tenant_id)
+            await owner.execute("DELETE FROM tenants WHERE id = $1", tenant_id)
+        await owner.close()
+
+
 async def test_outcome_and_mode_vocabularies_are_closed_in_the_database() -> None:
     import asyncpg
 

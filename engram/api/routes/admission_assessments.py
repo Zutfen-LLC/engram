@@ -421,6 +421,27 @@ class AdmissionQueueFilters:
     def needs_computed_state(self) -> bool:
         return self.state in _COMPUTED_STATES
 
+    @property
+    def incompatible_with_missing(self) -> tuple[str, ...]:
+        """Return filters that cannot describe a missing assessment."""
+        if self.state != "missing":
+            return ()
+        companions = (
+            ("admission_outcome", self.outcome),
+            ("admission_blocker", self.blocker),
+            ("admission_next_action", self.next_action),
+            ("admission_due_before", self.due_before),
+        )
+        return tuple(name for name, value in companions if value is not None)
+
+
+class AdmissionFilterScanExhaustedError(RuntimeError):
+    """A computed-state queue search has unexamined candidate rows."""
+
+    def __init__(self, scanned: int) -> None:
+        super().__init__(f"admission filter scan exhausted after {scanned} rows")
+        self.scanned = scanned
+
 
 def apply_admission_sql_filters(stmt: Select[Any], filters: AdmissionQueueFilters) -> Select[Any]:
     """Push every filter that is a stored fact down into SQL.
@@ -504,11 +525,10 @@ async def select_filtered_review_items(
                 tuple_(MemoryItem.created_at, MemoryItem.id)
                 < tuple_(literal(cursor[0]), literal(cursor[1]))
             )
+        remaining = MAX_ADMISSION_FILTER_SCAN - scanned
         batch = list(
             (
-                await session.execute(
-                    batch_stmt.limit(min(_ADMISSION_SCAN_BATCH, MAX_ADMISSION_FILTER_SCAN))
-                )
+                await session.execute(batch_stmt.limit(min(_ADMISSION_SCAN_BATCH, remaining)))
             ).scalars()
         )
         if not batch:
@@ -528,6 +548,19 @@ async def select_filtered_review_items(
             ):
                 matched.append(item)
         cursor = (batch[-1].created_at, batch[-1].id)
+    if len(matched) < limit and scanned >= MAX_ADMISSION_FILTER_SCAN and cursor is not None:
+        has_more = await session.scalar(
+            select(
+                exists(
+                    filtered.where(
+                        tuple_(MemoryItem.created_at, MemoryItem.id)
+                        < tuple_(literal(cursor[0]), literal(cursor[1]))
+                    )
+                )
+            )
+        )
+        if has_more:
+            raise AdmissionFilterScanExhaustedError(scanned)
     return matched
 
 

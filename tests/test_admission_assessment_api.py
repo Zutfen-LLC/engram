@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import text
+from sqlalchemy import text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -22,6 +22,7 @@ from engram.admission_assessment import POLICY_CONTRACT_VERSION, POLICY_PROFILE_
 from engram.api.app import create_app
 from engram.config import settings
 from engram.db import get_session
+from engram.models import MemoryItem
 from engram.promotion import auto_promote_proposed_memories
 
 _engine = create_async_engine(settings.database_url, poolclass=NullPool)
@@ -465,6 +466,29 @@ async def test_review_queue_filters_on_admission_state(client) -> None:
     assert [row["id"] for row in missing] == [str(unrecorded)]
 
 
+@pytest.mark.parametrize(
+    ("parameter", "value"),
+    [
+        ("admission_outcome", "review_required"),
+        ("admission_blocker", "kind_policy"),
+        ("admission_next_action", "human_review_required"),
+        ("admission_due_before", "2099-01-01T00:00:00Z"),
+    ],
+)
+async def test_missing_state_rejects_each_decision_predicate(
+    client, parameter: str, value: str
+) -> None:
+    response = await client.get(
+        "/v1/review/queue",
+        params={"admission_state": "missing", parameter: value},
+    )
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail["code"] == "incompatible_admission_filters"
+    assert detail["incompatible_filters"] == [parameter]
+
+
 async def test_review_queue_filters_on_due_time(client) -> None:
     settings.admission_assessment_capture_enabled = True
     tenant_id, principal_id = await _default_ids()
@@ -606,6 +630,65 @@ async def test_queue_computed_state_filter_also_reaches_past_the_page(client) ->
     ).json()
     assert len(missing) == 40
     assert str(needle) not in {row["id"] for row in missing}
+
+
+async def _assessed_queue_in_newest_order(count: int) -> tuple[str, list[uuid.UUID]]:
+    settings.admission_assessment_capture_enabled = True
+    tenant_id, principal_id = await _default_ids()
+    item_ids = [
+        await _insert_item(tenant_id=tenant_id, principal_id=principal_id, kind="preference")
+        for _ in range(count)
+    ]
+    base = datetime.now(UTC) - timedelta(days=10)
+    async with _engine.begin() as conn:
+        for offset, item_id in enumerate(item_ids):
+            await conn.execute(
+                text("UPDATE memory_items SET created_at = :created WHERE id = :id"),
+                {"created": base - timedelta(hours=offset), "id": item_id},
+            )
+    await _promote(tenant_id)
+    return tenant_id, item_ids
+
+
+async def _make_assessments_stale(item_ids: list[uuid.UUID]) -> None:
+    async with _engine.begin() as conn:
+        await conn.execute(
+            update(MemoryItem).where(MemoryItem.id.in_(item_ids)).values(memory_confidence=0.1)
+        )
+
+
+async def test_computed_state_scan_exhaustion_is_explicit(client, monkeypatch) -> None:
+    import engram.api.routes.admission_assessments as admission_routes
+
+    _, item_ids = await _assessed_queue_in_newest_order(4)
+    await _make_assessments_stale(item_ids[:3])
+    monkeypatch.setattr(admission_routes, "MAX_ADMISSION_FILTER_SCAN", 3)
+
+    response = await client.get(
+        "/v1/review/queue", params={"admission_state": "current", "limit": 1}
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "admission_filter_scan_exhausted",
+        "message": "The bounded admission filter search is incomplete",
+        "scanned": 3,
+    }
+
+
+async def test_computed_state_match_at_scan_boundary_is_returned(client, monkeypatch) -> None:
+    import engram.api.routes.admission_assessments as admission_routes
+
+    _, item_ids = await _assessed_queue_in_newest_order(4)
+    await _make_assessments_stale([item_ids[0], item_ids[1], item_ids[3]])
+    monkeypatch.setattr(admission_routes, "MAX_ADMISSION_FILTER_SCAN", 3)
+
+    response = await client.get(
+        "/v1/review/queue", params={"admission_state": "current", "limit": 1}
+    )
+
+    assert response.status_code == 200
+    assert [row["id"] for row in response.json()] == [str(item_ids[2])]
 
 
 async def test_queue_filter_scan_is_bounded(client) -> None:

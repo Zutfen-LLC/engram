@@ -71,6 +71,7 @@ from engram.memory_context import (
     memory_context_from_ingest,
 )
 from engram.models import (
+    AdmissionAssessment,
     CandidateIngest,
     EmbeddingProfile,
     ItemEvent,
@@ -1857,6 +1858,18 @@ async def handle_promotion_evaluate(session: AsyncSession, job: Job) -> None:
         parse_promotion_evaluate_payload,
     )
 
+    # ``job.id`` is the durable queue execution identity. Lock that row for
+    # the whole evaluation transaction. Concurrent calls for the same job
+    # then serialize before either call can evaluate policy or mutate an item.
+    locked_job = await session.scalar(
+        select(Job).where(Job.id == job.id, Job.tenant_id == job.tenant_id).with_for_update()
+    )
+    if locked_job is None:
+        raise RuntimeError(
+            f"promotion.evaluate job {job.id} is not visible in tenant {job.tenant_id}"
+        )
+    job = locked_job
+
     try:
         contract = parse_promotion_evaluate_payload(job.payload)
     except PromotionEvaluateContractError as exc:
@@ -1870,6 +1883,55 @@ async def handle_promotion_evaluate(session: AsyncSession, job: Job) -> None:
         # reconstruct-or-raise — never fall through to the unprofiled
         # memory_context=None path, which is v1's compatibility form alone.
         raise ValueError("promotion.evaluate v2 contract lost its pinned execution authority")
+
+    # One durable promotion.evaluate job has one canonical decision identity.
+    # Reuse job.id as evaluation_id on every attempt. Check the binding while
+    # holding the job-row lock and before any item or policy evaluation. This
+    # closes the crash window after the decision commits but before queue
+    # bookkeeping marks the job succeeded.
+    bound_assessments = list(
+        await session.scalars(
+            select(AdmissionAssessment).where(
+                AdmissionAssessment.tenant_id == job.tenant_id,
+                or_(
+                    AdmissionAssessment.evaluation_id == job.id,
+                    (
+                        (AdmissionAssessment.job_id == job.id)
+                        & (AdmissionAssessment.mode == "authoritative")
+                        & AdmissionAssessment.evaluation_id.is_not(None)
+                    ),
+                ),
+            )
+        )
+    )
+    if len(bound_assessments) > 1:
+        raise RuntimeError(
+            "promotion.evaluate has multiple canonical decisions for "
+            f"job {job.id} in tenant {job.tenant_id}"
+        )
+    bound_assessment = bound_assessments[0] if bound_assessments else None
+    if bound_assessment is not None:
+        binding_matches = (
+            bound_assessment.memory_item_id == contract.memory_item_id
+            and bound_assessment.job_id == job.id
+            and bound_assessment.mode == "authoritative"
+            and bound_assessment.invocation_source == "promotion.evaluate"
+            and bound_assessment.trigger_type == contract.trigger_type
+            and bound_assessment.trigger_id == contract.trigger_id
+        )
+        if not binding_matches:
+            raise RuntimeError(
+                "promotion.evaluate canonical decision binding conflicts with "
+                f"job {job.id} in tenant {job.tenant_id}"
+            )
+        await session.commit()
+        logger.info(
+            "promotion.evaluate item=%s job=%s reused assessment=%s",
+            contract.memory_item_id,
+            job.id,
+            bound_assessment.id,
+        )
+        return
 
     # Reload + verify visibility within the routed tenant before doing any
     # further work. The job's tenant_id is routing context, not proof: the
@@ -1899,7 +1961,7 @@ async def handle_promotion_evaluate(session: AsyncSession, job: Job) -> None:
     # fallback.
     memory_context = await _job_memory_context(session, job)
 
-    evaluation_id = uuid.uuid4()
+    evaluation_id = job.id
     evaluation_context: dict[str, object] = {
         "evaluation_id": str(evaluation_id),
         "job_id": str(job.id),
@@ -2076,8 +2138,6 @@ async def handle_recall_telemetry(session: AsyncSession, job: Job) -> None:
         mode,
         len(item_ids),
     )
-
-
 
 # Registry of job type → handler.
 JOB_HANDLERS: dict[str, JobHandler] = {

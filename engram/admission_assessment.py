@@ -781,8 +781,9 @@ async def insert_assessment(
     together).
 
     Idempotent on canonical evaluation identity. A ``promotion.evaluate`` job
-    that committed its decision and then died before the queue could mark it
-    succeeded is reclaimed and re-executed with the *same* ``evaluation_id``.
+    uses its durable ``job.id`` as ``evaluation_id``. A job that committed its
+    decision and then died before the queue could mark it succeeded is
+    reclaimed and re-executed with the same identity.
     That retry must resolve to the decision already bound to that identity
     rather than appending a second one — which is what the
     ``(tenant_id, evaluation_id)`` unique index exists to guarantee, and what

@@ -74,8 +74,8 @@ CREATE TABLE IF NOT EXISTS admission_assessments (
     linked_item_event_id UUID,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     -- One canonical evaluation execution yields at most one assessment per
-    -- tenant, so a promotion.evaluate retry reuses the bound row instead of
-    -- appending a second mutation decision.
+    -- tenant. promotion.evaluate uses its durable jobs.id as evaluation_id,
+    -- so every retry resolves the same bound decision.
     UNIQUE (tenant_id, evaluation_id),
     UNIQUE (tenant_id, memory_item_id, id)
 );
@@ -88,6 +88,12 @@ CREATE INDEX IF NOT EXISTS idx_admission_assessment_history
 CREATE INDEX IF NOT EXISTS idx_admission_assessment_due
     ON admission_assessments(tenant_id, policy_profile_key, next_evaluation_at)
     WHERE next_evaluation_at IS NOT NULL;
+-- job_id also binds the durable queue execution. The partial predicate keeps
+-- stale pre-lock history, which has no evaluation_id, outside this canonical
+-- one-decision-per-job constraint.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_admission_assessment_canonical_job
+    ON admission_assessments(tenant_id, job_id)
+    WHERE job_id IS NOT NULL AND evaluation_id IS NOT NULL AND mode = 'authoritative';
 
 -- The one-row current projection. Only authoritative and legacy_import rows
 -- may be projected; the pointed assessment remains the source of truth, so
