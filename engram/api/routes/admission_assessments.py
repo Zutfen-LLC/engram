@@ -9,13 +9,15 @@ endpoint enqueues the existing #155 ``promotion.evaluate`` job and returns.
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import literal, select, tuple_
+from sqlalchemy import exists, literal, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import Select
 
 from engram.admission_assessment import (
     POLICY_CONTRACT_VERSION,
@@ -41,7 +43,7 @@ from engram.config import settings
 from engram.db import get_session
 from engram.memory_access import read_eligibility_expression, write_eligibility_expression
 from engram.memory_context import ResolvedMemoryContext, resolve_memory_context
-from engram.models import AdmissionAssessment, MemoryItem
+from engram.models import AdmissionAssessment, AdmissionAssessmentCurrent, MemoryItem
 from engram.promotion import (
     TRIGGER_MANUAL,
     TRIGGER_POLICY_CHANGED,
@@ -374,6 +376,159 @@ async def admission_summaries(
             "admission_blocker_codes": list(row.blocker_codes),
         }
     return summaries
+
+
+# One filtered review-queue page never scans more than this many candidate
+# rows. The computed current/stale state cannot be expressed as a SQL
+# predicate (it is a digest comparison against live item and policy state), so
+# that filter walks the queue in bounded batches instead of silently stopping
+# at the first unfiltered window. Reaching this cap is an explicit bounded end,
+# not a claim that nothing further matches.
+MAX_ADMISSION_FILTER_SCAN = 2000
+
+# Batch size for that walk.
+_ADMISSION_SCAN_BATCH = 200
+
+# States that are decided by comparing digests against current state, and so
+# cannot be resolved in SQL.
+_COMPUTED_STATES = frozenset({"current", "stale", "legacy_import"})
+
+
+@dataclass(frozen=True)
+class AdmissionQueueFilters:
+    """The exact admission filter set this issue scopes to the review queue."""
+
+    outcome: str | None = None
+    blocker: str | None = None
+    next_action: str | None = None
+    state: str | None = None
+    due_before: datetime | None = None
+
+    @property
+    def active(self) -> bool:
+        return any(
+            value is not None
+            for value in (
+                self.outcome,
+                self.blocker,
+                self.next_action,
+                self.state,
+                self.due_before,
+            )
+        )
+
+    @property
+    def needs_computed_state(self) -> bool:
+        return self.state in _COMPUTED_STATES
+
+
+def apply_admission_sql_filters(stmt: Select[Any], filters: AdmissionQueueFilters) -> Select[Any]:
+    """Push every filter that is a stored fact down into SQL.
+
+    Outcome, blocker code, next action and due time all live on the pointed
+    assessment, so they select rows in the database rather than thinning an
+    arbitrary page after the fact. ``missing`` is the absence of a projection
+    row, which is also a SQL predicate. Only ``current`` / ``stale`` /
+    ``legacy_import`` need the digest comparison the caller does afterwards,
+    and even those are narrowed here first (a legacy_import row must at least
+    be in legacy_import mode).
+    """
+    projection = (
+        select(AdmissionAssessment)
+        .join(
+            AdmissionAssessmentCurrent,
+            AdmissionAssessmentCurrent.assessment_id == AdmissionAssessment.id,
+        )
+        .where(
+            AdmissionAssessmentCurrent.tenant_id == MemoryItem.tenant_id,
+            AdmissionAssessmentCurrent.memory_item_id == MemoryItem.id,
+            AdmissionAssessmentCurrent.policy_profile_key == POLICY_PROFILE_KEY,
+        )
+    )
+    if filters.state == "missing":
+        # No decision has ever been recorded. Nothing else can be asserted
+        # about such an item, so no other filter may accompany this one.
+        return stmt.where(~exists(projection))
+    conditions = []
+    if filters.outcome is not None:
+        conditions.append(AdmissionAssessment.outcome == filters.outcome)
+    if filters.blocker is not None:
+        conditions.append(AdmissionAssessment.blocker_codes.contains([filters.blocker]))
+    if filters.next_action is not None:
+        conditions.append(AdmissionAssessment.next_actions.contains([filters.next_action]))
+    if filters.due_before is not None:
+        conditions.append(AdmissionAssessment.next_evaluation_at.is_not(None))
+        conditions.append(AdmissionAssessment.next_evaluation_at < filters.due_before)
+    if filters.state == "legacy_import":
+        conditions.append(AdmissionAssessment.mode == "legacy_import")
+    elif filters.state in {"current", "stale"}:
+        # Both are authoritative-or-legacy rows; which one is decided by the
+        # digest comparison the caller performs on the narrowed set.
+        conditions.append(AdmissionAssessment.mode.in_(("authoritative", "legacy_import")))
+    if not conditions:
+        return stmt
+    return stmt.where(exists(projection.where(*conditions)))
+
+
+async def select_filtered_review_items(
+    session: AsyncSession,
+    *,
+    base_stmt: Select[Any],
+    filters: AdmissionQueueFilters,
+    limit: int,
+) -> list[MemoryItem]:
+    """Return up to ``limit`` items matching ``filters``, bounded but honest.
+
+    With only stored-fact filters, SQL selects the page directly and one query
+    suffices. When the computed current/stale state is also requested, the
+    remaining predicate cannot be a SQL expression, so this walks the
+    SQL-narrowed queue in keyset batches and keeps going until the requested
+    page is full or :data:`MAX_ADMISSION_FILTER_SCAN` rows have been examined.
+
+    The distinction matters operationally: stopping at the first unfiltered
+    window would report "nothing matches" whenever the matching item happened
+    to sit past the caller's limit, which is exactly the false-negative answer
+    #159 exists to eliminate.
+    """
+    filtered = apply_admission_sql_filters(base_stmt, filters)
+    if not filters.needs_computed_state:
+        return list((await session.execute(filtered.limit(limit))).scalars())
+
+    matched: list[MemoryItem] = []
+    scanned = 0
+    cursor: tuple[datetime, uuid.UUID] | None = None
+    while len(matched) < limit and scanned < MAX_ADMISSION_FILTER_SCAN:
+        batch_stmt = filtered
+        if cursor is not None:
+            batch_stmt = batch_stmt.where(
+                tuple_(MemoryItem.created_at, MemoryItem.id)
+                < tuple_(literal(cursor[0]), literal(cursor[1]))
+            )
+        batch = list(
+            (
+                await session.execute(
+                    batch_stmt.limit(min(_ADMISSION_SCAN_BATCH, MAX_ADMISSION_FILTER_SCAN))
+                )
+            ).scalars()
+        )
+        if not batch:
+            break
+        scanned += len(batch)
+        summaries = await admission_summaries(session, batch)
+        for item in batch:
+            if len(matched) >= limit:
+                break
+            if matches_admission_filters(
+                summaries.get(item.id),
+                outcome=filters.outcome,
+                blocker=filters.blocker,
+                next_action=filters.next_action,
+                state=filters.state,
+                due_before=filters.due_before,
+            ):
+                matched.append(item)
+        cursor = (batch[-1].created_at, batch[-1].id)
+    return matched
 
 
 def matches_admission_filters(

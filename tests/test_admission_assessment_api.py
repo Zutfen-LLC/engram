@@ -147,7 +147,11 @@ async def client(app):
 
 
 async def _insert_item(
-    *, tenant_id: str, principal_id: str, memory_confidence: float = 0.9
+    *,
+    tenant_id: str,
+    principal_id: str,
+    memory_confidence: float = 0.9,
+    kind: str = "fact",
 ) -> uuid.UUID:
     item_id = uuid.uuid4()
     async with _factory() as session:
@@ -156,7 +160,7 @@ async def _insert_item(
                 "INSERT INTO memory_items (id, tenant_id, principal_id, content, "
                 "content_hash, kind, visibility, review_status, memory_confidence, "
                 "source_trust, authority, importance, source_type, created_at, valid_from) "
-                "VALUES (:id, :t, :p, :c, :h, 'fact', 'tenant', 'proposed', :mc, 0.5, 10, "
+                "VALUES (:id, :t, :p, :c, :h, :k, 'tenant', 'proposed', :mc, 0.5, 10, "
                 "0.5, 'manual', :created, :created)"
             ),
             {
@@ -165,6 +169,7 @@ async def _insert_item(
                 "p": principal_id,
                 "c": f"content {item_id}",
                 "h": f"sha256:{uuid.uuid4().hex * 2}",
+                "k": kind,
                 "mc": memory_confidence,
                 "created": datetime.now(UTC) - timedelta(hours=100),
             },
@@ -516,3 +521,103 @@ async def test_review_queue_entries_carry_the_summary_without_blocker_internals(
     # current-policy blockers are already published as promotion_blockers.
     assert "admission_blocker_codes" not in entry
     assert "promotion_blockers" in entry
+
+
+async def test_queue_filter_finds_a_match_beyond_the_first_unfiltered_window(client) -> None:
+    """The regression that motivated SQL-side filtering.
+
+    Sixty proposed items, only the oldest of which is review_required. With a
+    limit of 5, a filter applied to a preselected newest-first page would see
+    only the five newest and answer "nothing matches" — a false negative on
+    exactly the operational question the queue exists to answer.
+
+    The needle is a ``preference``, a seeded kind that is permanently not
+    auto-promotable, so its ``review_required`` decision stays put across
+    later passes instead of quietly being admitted out of the queue.
+    """
+    settings.admission_assessment_capture_enabled = True
+    tenant_id, principal_id = await _default_ids()
+
+    needle = await _insert_item(
+        tenant_id=tenant_id, principal_id=principal_id, kind="preference"
+    )
+    # A wall of newer, low-confidence proposals ahead of it.
+    for _ in range(59):
+        await _insert_item(
+            tenant_id=tenant_id, principal_id=principal_id, memory_confidence=0.1
+        )
+    async with _engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE memory_items SET created_at = :c WHERE id = :i"),
+            {"c": datetime.now(UTC) - timedelta(days=400), "i": needle},
+        )
+    await _promote(tenant_id)
+
+    unfiltered = (await client.get("/v1/review/queue", params={"limit": 5})).json()
+    assert len(unfiltered) == 5
+    assert str(needle) not in {row["id"] for row in unfiltered}
+
+    for params in (
+        {"admission_outcome": "review_required"},
+        {"admission_blocker": "kind_policy"},
+        {"admission_next_action": "human_review_required"},
+    ):
+        found = (
+            await client.get("/v1/review/queue", params={**params, "limit": 5})
+        ).json()
+        assert [row["id"] for row in found] == [str(needle)], params
+
+
+async def test_queue_computed_state_filter_also_reaches_past_the_page(client) -> None:
+    """``current``/``stale`` cannot be a SQL predicate, so it walks the queue
+    in bounded batches rather than stopping at the first window."""
+    settings.admission_assessment_capture_enabled = True
+    tenant_id, principal_id = await _default_ids()
+
+    needle = await _insert_item(
+        tenant_id=tenant_id, principal_id=principal_id, kind="preference"
+    )
+    # Age the needle to the back of the queue *before* evaluating it:
+    # created_at is part of the evaluated input, so moving it afterwards would
+    # legitimately make its own decision stale.
+    async with _engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE memory_items SET created_at = :c WHERE id = :i"),
+            {"c": datetime.now(UTC) - timedelta(days=400), "i": needle},
+        )
+    await _promote(tenant_id)
+    # Newer items with no recorded decision at all sit ahead of it.
+    settings.admission_assessment_capture_enabled = False
+    for _ in range(40):
+        await _insert_item(tenant_id=tenant_id, principal_id=principal_id)
+
+    found = (
+        await client.get(
+            "/v1/review/queue", params={"admission_state": "current", "limit": 5}
+        )
+    ).json()
+    assert [row["id"] for row in found] == [str(needle)]
+
+    # And the complement resolves the other way.
+    missing = (
+        await client.get(
+            "/v1/review/queue", params={"admission_state": "missing", "limit": 100}
+        )
+    ).json()
+    assert len(missing) == 40
+    assert str(needle) not in {row["id"] for row in missing}
+
+
+async def test_queue_filter_scan_is_bounded(client) -> None:
+    """Bounded means bounded: the walk stops at an explicit cap rather than
+    scanning a whole tenant backlog to answer one filtered page."""
+    from engram.api.routes.admission_assessments import (
+        MAX_ADMISSION_FILTER_SCAN,
+        AdmissionQueueFilters,
+    )
+
+    assert MAX_ADMISSION_FILTER_SCAN > 0
+    assert AdmissionQueueFilters(state="current").needs_computed_state is True
+    # Stored-fact filters never need the walk at all.
+    assert AdmissionQueueFilters(outcome="cooling").needs_computed_state is False
+    assert AdmissionQueueFilters(state="missing").needs_computed_state is False

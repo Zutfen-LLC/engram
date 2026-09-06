@@ -25,7 +25,14 @@ CREATE TABLE IF NOT EXISTS admission_assessments (
     actor_principal_id UUID,
     evaluated_at TIMESTAMPTZ NOT NULL,
     item_content_hash TEXT NOT NULL,
+    -- The state that was EVALUATED: strictly pre-mutation. On an admission
+    -- this says review_status='proposed', because that is what policy read
+    -- and authorized the transition out of.
     input_digest TEXT NOT NULL,
+    -- The state the authorized mutation was expected to PRODUCE, or NULL when
+    -- the decision changed nothing. Freshness resolves against this when
+    -- present, so a decision is never stale by virtue of its own effect.
+    resulting_state_digest TEXT,
     policy_profile_key TEXT NOT NULL,
     policy_contract_version TEXT NOT NULL,
     policy_config_digest TEXT NOT NULL,
@@ -56,7 +63,15 @@ CREATE TABLE IF NOT EXISTS admission_assessments (
             AND jsonb_array_length(next_actions) <= 8),
     decision_hash TEXT NOT NULL,
     prior_assessment_id UUID REFERENCES admission_assessments(id) ON DELETE SET NULL,
-    linked_item_event_id UUID REFERENCES item_events(id) ON DELETE SET NULL,
+    -- Deferred NO ACTION, not SET NULL. SET NULL would make PostgreSQL's
+    -- referential action attempt an UPDATE on this table when the audit event
+    -- goes away, which the no-rewrite trigger below refuses — so deleting a
+    -- memory item that has a linked admitted decision, or deleting the linked
+    -- event on its own, would fail. Deferring to commit lets the parent item's
+    -- cascade remove the event and this row together (the constraint is
+    -- satisfied because both are gone), while destroying the event alone still
+    -- violates it. History is never rewritten either way.
+    linked_item_event_id UUID,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     -- One canonical evaluation execution yields at most one assessment per
     -- tenant, so a promotion.evaluate retry reuses the bound row instead of
@@ -96,6 +111,33 @@ CREATE TABLE IF NOT EXISTS admission_assessment_current (
     FOREIGN KEY (tenant_id, memory_item_id, assessment_id)
         REFERENCES admission_assessments(tenant_id, memory_item_id, id) ON DELETE CASCADE
 );
+
+-- Converge an already-created table from an earlier build of this migration.
+ALTER TABLE admission_assessments
+    ADD COLUMN IF NOT EXISTS resulting_state_digest TEXT;
+
+-- The linked-event constraint is added after item_events is known to exist and
+-- is replaced on reapplication, so a table created by an earlier build of this
+-- migration converges off ON DELETE SET NULL.
+ALTER TABLE admission_assessments
+    DROP CONSTRAINT IF EXISTS admission_assessments_linked_item_event_id_fkey;
+ALTER TABLE admission_assessments
+    DROP CONSTRAINT IF EXISTS fk_admission_assessment_linked_event;
+ALTER TABLE admission_assessments
+    ADD CONSTRAINT fk_admission_assessment_linked_event
+    FOREIGN KEY (linked_item_event_id) REFERENCES item_events(id)
+    DEFERRABLE INITIALLY DEFERRED;
+
+-- Only a decision whose own authorized mutation changed item state may claim
+-- a resulting state: an admission (proposed -> active) or a promotion-time
+-- conflict block (which writes conflict metadata). A shadow preview provably
+-- changes nothing, so it can never claim one.
+ALTER TABLE admission_assessments
+    DROP CONSTRAINT IF EXISTS admission_resulting_state_requires_mutation;
+ALTER TABLE admission_assessments
+    ADD CONSTRAINT admission_resulting_state_requires_mutation
+    CHECK (resulting_state_digest IS NULL
+        OR (mode <> 'shadow' AND outcome IN ('admitted', 'blocked')));
 
 -- item_events audit rows may name the assessment that authorized them.
 -- Nullable: every historical event predates this migration and stays unlinked.

@@ -325,8 +325,13 @@ async def test_only_an_admitted_row_may_link_a_mutation_event() -> None:
 
 
 async def test_evaluation_id_is_unique_per_tenant() -> None:
-    """A retried canonical evaluation reuses its bound decision instead of
-    appending a second mutation decision."""
+    """The database refuses a second decision under one execution identity.
+
+    This is the backstop, not the mechanism. Actually *reusing* the bound
+    decision on retry is application behavior and is proven end-to-end in
+    tests/test_admission_assessments_postgres.py; what this asserts is that
+    the schema makes a duplicate impossible even if that path were bypassed.
+    """
     import asyncpg
 
     owner = await _owner_with_038()
@@ -383,7 +388,13 @@ async def test_item_events_carries_a_nullable_assessment_reference() -> None:
 async def test_deleting_an_item_cascades_its_decisions_away() -> None:
     """A decision about an item that no longer exists binds to nothing, so the
     ON DELETE CASCADE must actually work — the no-rewrite trigger covers
-    UPDATE only, precisely so item deletion does not fail outright."""
+    UPDATE only, precisely so item deletion does not fail outright.
+
+    The linked-event half of this (an admitted decision that names a real
+    audit event, which is where an ``ON DELETE SET NULL`` link would collide
+    with the no-rewrite trigger) is exercised against the real promotion path
+    in tests/test_admission_assessments_postgres.py.
+    """
     owner = await _owner_with_038()
     try:
         tenant_id, _, item_id = await _seed_item(owner)

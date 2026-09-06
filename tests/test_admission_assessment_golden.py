@@ -39,6 +39,7 @@ _ITEM = "22222222-2222-4222-8222-222222222222"
 _CONTENT_HASH = "sha256:" + "a" * 64
 _INPUT_DIGEST = "sha256:" + "b" * 64
 _POLICY_DIGEST = "sha256:" + "c" * 64
+_RESULT_DIGEST = "sha256:" + "e" * 64
 
 
 def _envelope(**overrides: object) -> dict[str, object]:
@@ -49,6 +50,7 @@ def _envelope(**overrides: object) -> dict[str, object]:
         "mode": "authoritative",
         "item_content_hash": _CONTENT_HASH,
         "input_digest": _INPUT_DIGEST,
+        "resulting_state_digest": None,
         "policy_profile_key": POLICY_PROFILE_KEY,
         "policy_contract_version": POLICY_CONTRACT_VERSION,
         "policy_config_digest": _POLICY_DIGEST,
@@ -79,8 +81,8 @@ GOLDEN: list[tuple[str, dict[str, object], bytes, str]] = [
     (
         "cooling",
         _envelope(),
-        b'{"blocker_codes":["age"],"conflict_recheck_status":"not_run","cooling_period_start":"2026-02-01T00:00:00+00:00","decision_inputs":{"legacy_age_qualified":false,"legacy_trust_qualified":true,"memory_confidence":0.9,"min_age_hours":72},"eligible_at":"2026-02-04T00:00:00+00:00","input_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","item_content_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","memory_item_id":"22222222-2222-4222-8222-222222222222","mode":"authoritative","next_actions":["wait_until"],"next_evaluation_at":"2026-02-04T00:00:00+00:00","outcome":"cooling","policy_config_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","policy_contract_version":"path-a-compat-v1","policy_profile_key":"path_a_compat","reason_codes":["lane_qualified_awaiting_age","no_lane_qualified"],"schema_version":"engram.admission-assessment.v1","selected_basis":null,"tenant_id":"11111111-1111-4111-8111-111111111111"}',
-        "sha256:807ff899f413245bc2b7eeb07c1c6faff4068d2bb47d5eec3293fbf6b7ebb625",
+        b'{"blocker_codes":["age"],"conflict_recheck_status":"not_run","cooling_period_start":"2026-02-01T00:00:00+00:00","decision_inputs":{"legacy_age_qualified":false,"legacy_trust_qualified":true,"memory_confidence":0.9,"min_age_hours":72},"eligible_at":"2026-02-04T00:00:00+00:00","input_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","item_content_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","memory_item_id":"22222222-2222-4222-8222-222222222222","mode":"authoritative","next_actions":["wait_until"],"next_evaluation_at":"2026-02-04T00:00:00+00:00","outcome":"cooling","policy_config_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","policy_contract_version":"path-a-compat-v1","policy_profile_key":"path_a_compat","reason_codes":["lane_qualified_awaiting_age","no_lane_qualified"],"resulting_state_digest":null,"schema_version":"engram.admission-assessment.v1","selected_basis":null,"tenant_id":"11111111-1111-4111-8111-111111111111"}',
+        "sha256:4a3f52951a2a60ae732e626686ef654d10f1ad4e04964fd28355f7b0b7a4d56e",
     ),
     (
         "admitted",
@@ -92,9 +94,13 @@ GOLDEN: list[tuple[str, dict[str, object], bytes, str]] = [
             conflict_recheck_status="clear",
             next_actions=["none"],
             next_evaluation_at=None,
+            # An admission records the state its own mutation produced, so it
+            # resolves current immediately after commit rather than stale
+            # against its own effect.
+            resulting_state_digest=_RESULT_DIGEST,
         ),
-        b'{"blocker_codes":[],"conflict_recheck_status":"clear","cooling_period_start":"2026-02-01T00:00:00+00:00","decision_inputs":{"legacy_age_qualified":false,"legacy_trust_qualified":true,"memory_confidence":0.9,"min_age_hours":72},"eligible_at":"2026-02-04T00:00:00+00:00","input_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","item_content_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","memory_item_id":"22222222-2222-4222-8222-222222222222","mode":"authoritative","next_actions":["none"],"next_evaluation_at":null,"outcome":"admitted","policy_config_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","policy_contract_version":"path-a-compat-v1","policy_profile_key":"path_a_compat","reason_codes":["lane_selected_legacy_confidence","mutation_committed"],"schema_version":"engram.admission-assessment.v1","selected_basis":"legacy_confidence","tenant_id":"11111111-1111-4111-8111-111111111111"}',
-        "sha256:0fa564f4772d9ba78808425d8ad1ab2da058998dc9768e5b72bd499d546bfa0d",
+        b'{"blocker_codes":[],"conflict_recheck_status":"clear","cooling_period_start":"2026-02-01T00:00:00+00:00","decision_inputs":{"legacy_age_qualified":false,"legacy_trust_qualified":true,"memory_confidence":0.9,"min_age_hours":72},"eligible_at":"2026-02-04T00:00:00+00:00","input_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","item_content_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","memory_item_id":"22222222-2222-4222-8222-222222222222","mode":"authoritative","next_actions":["none"],"next_evaluation_at":null,"outcome":"admitted","policy_config_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","policy_contract_version":"path-a-compat-v1","policy_profile_key":"path_a_compat","reason_codes":["lane_selected_legacy_confidence","mutation_committed"],"resulting_state_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","schema_version":"engram.admission-assessment.v1","selected_basis":"legacy_confidence","tenant_id":"11111111-1111-4111-8111-111111111111"}',
+        "sha256:574d2f80194daf67b70330f66f0cf0f39643fcf4d445095fa8d88d15b2b3e821",
     ),
     (
         "blocked_shadow",
@@ -111,8 +117,8 @@ GOLDEN: list[tuple[str, dict[str, object], bytes, str]] = [
             next_actions=["conflict_resolution_required"],
             next_evaluation_at=None,
         ),
-        b'{"blocker_codes":["conflict_recheck"],"conflict_recheck_status":"not_run_preview","cooling_period_start":"2026-02-01T00:00:00+00:00","decision_inputs":{"legacy_age_qualified":false,"legacy_trust_qualified":true,"memory_confidence":0.9,"min_age_hours":72},"eligible_at":"2026-02-04T00:00:00+00:00","input_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","item_content_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","memory_item_id":"22222222-2222-4222-8222-222222222222","mode":"shadow","next_actions":["conflict_resolution_required"],"next_evaluation_at":null,"outcome":"blocked","policy_config_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","policy_contract_version":"path-a-compat-v1","policy_profile_key":"path_a_compat","reason_codes":["conflict_recheck_blocked","lane_selected_retention_evidence"],"schema_version":"engram.admission-assessment.v1","selected_basis":"retention_evidence","tenant_id":"11111111-1111-4111-8111-111111111111"}',
-        "sha256:1ded69af709738f558b8ac787a9fe97b9e71db3cbc075132ca4c15b86eca411b",
+        b'{"blocker_codes":["conflict_recheck"],"conflict_recheck_status":"not_run_preview","cooling_period_start":"2026-02-01T00:00:00+00:00","decision_inputs":{"legacy_age_qualified":false,"legacy_trust_qualified":true,"memory_confidence":0.9,"min_age_hours":72},"eligible_at":"2026-02-04T00:00:00+00:00","input_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","item_content_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","memory_item_id":"22222222-2222-4222-8222-222222222222","mode":"shadow","next_actions":["conflict_resolution_required"],"next_evaluation_at":null,"outcome":"blocked","policy_config_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","policy_contract_version":"path-a-compat-v1","policy_profile_key":"path_a_compat","reason_codes":["conflict_recheck_blocked","lane_selected_retention_evidence"],"resulting_state_digest":null,"schema_version":"engram.admission-assessment.v1","selected_basis":"retention_evidence","tenant_id":"11111111-1111-4111-8111-111111111111"}',
+        "sha256:c8605a21ab2c699eb6434c599dc36970d4bd6119f74215b62e3ae82bd3bac405",
     ),
 ]
 

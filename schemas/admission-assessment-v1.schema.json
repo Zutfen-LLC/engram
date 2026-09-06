@@ -12,6 +12,7 @@
     "mode",
     "item_content_hash",
     "input_digest",
+    "resulting_state_digest",
     "policy_profile_key",
     "policy_contract_version",
     "policy_config_digest",
@@ -38,8 +39,15 @@
     },
     "item_content_hash": { "$ref": "#/$defs/digest" },
     "input_digest": {
-      "description": "SHA-256 over the RFC 8785 bytes of the item/governance/evidence state actually evaluated. Excludes #157 evidence-assessment identity, which is diagnostic in v1 and must not behave like a promotion input.",
+      "description": "SHA-256 over the RFC 8785 bytes of the item/governance/evidence state actually EVALUATED — strictly pre-mutation. On an admission this binds review_status='proposed', because that is the state policy read and authorized the transition out of; hashing post-mutation state here would make the record assert that policy admitted an already-active item. Excludes #157 evidence-assessment identity, which is diagnostic in v1 and must not behave like a promotion input.",
       "$ref": "#/$defs/digest"
+    },
+    "resulting_state_digest": {
+      "description": "SHA-256 over the RFC 8785 bytes of the state this decision's own authorized mutation was expected to PRODUCE, or null when the decision changed nothing. Freshness resolves against this when present, so a decision is never stale by virtue of its own effect — an admission stays current immediately after it commits, and a promotion-time conflict block stays current after writing the conflict metadata its recheck caused. A later unrelated change still makes the decision stale normally. Only a non-shadow decision whose outcome is admitted or blocked may carry one.",
+      "oneOf": [
+        { "$ref": "#/$defs/digest" },
+        { "type": "null" }
+      ]
     },
     "policy_profile_key": {
       "description": "v1 defines exactly one production profile: the current two-lane Path A behavior.",

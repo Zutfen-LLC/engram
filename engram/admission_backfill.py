@@ -43,6 +43,7 @@ from engram.admission_assessment import (
     LaneQualification,
     build_decision,
     evidence_assessment_refs,
+    input_state_payload,
     insert_assessment,
     policy_config_payload,
     project_current,
@@ -176,8 +177,13 @@ async def backfill_admission_assessments(
             else _admission_timing(item, candidate, lanes)
         )
         decision = build_decision(
-            item=item,
-            run=support.classification_run,
+            tenant_id=item.tenant_id,
+            memory_item_id=item.id,
+            item_content_hash=item.content_hash,
+            input_state=input_state_payload(item, support.classification_run),
+            # A legacy import is a snapshot of state as it already stands. It
+            # authorized no mutation, so there is no resulting state to record.
+            resulting_state=None,
             mode="legacy_import",
             mutated=False,
             live_proposal=live_proposal,

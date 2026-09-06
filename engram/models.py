@@ -829,7 +829,11 @@ class AdmissionAssessment(Base):
     actor_principal_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     item_content_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    # Evaluated (pre-mutation) state identity.
     input_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    # State the authorized mutation was expected to produce; NULL when the
+    # decision changed nothing.
+    resulting_state_digest: Mapped[str | None] = mapped_column(Text, nullable=True)
     policy_profile_key: Mapped[str] = mapped_column(Text, nullable=False)
     policy_contract_version: Mapped[str] = mapped_column(Text, nullable=False)
     policy_config_digest: Mapped[str] = mapped_column(Text, nullable=False)

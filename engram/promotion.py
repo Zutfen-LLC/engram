@@ -18,6 +18,7 @@ from engram.admission_assessment import (
     LaneQualification,
     build_decision,
     evidence_assessment_refs,
+    input_state_payload,
     insert_assessment,
     policy_config_payload,
     project_current,
@@ -694,20 +695,20 @@ async def _capture_admission_assessment(
     session: AsyncSession,
     item: MemoryItem,
     candidate: PromotionCandidate,
-    support: PromotionSupport,
+    snapshot: _EvaluatedItemState,
     lanes: LaneQualification,
     capture: _AdmissionCaptureContext,
     *,
     mode: str,
     mutated: bool,
     moment: datetime,
-    min_age_hours: int,
-    evidence_enabled: bool,
     policy_config: dict[str, Any],
     conflict_recheck_status: str,
+    resulting_state: dict[str, Any] | None = None,
     live_proposal: bool = True,
     policy_changed: bool = False,
     race_lost: bool = False,
+    claim_evaluation_id: bool = True,
     actor_principal_id: uuid.UUID | None = None,
     linked_item_event_id: uuid.UUID | None = None,
     assessment_id: uuid.UUID | None = None,
@@ -721,15 +722,14 @@ async def _capture_admission_assessment(
     decision = _build_admission_decision(
         item,
         candidate,
-        support,
+        snapshot,
         lanes,
         mode=mode,
         mutated=mutated,
         live_proposal=live_proposal,
-        min_age_hours=min_age_hours,
-        evidence_enabled=evidence_enabled,
         policy_config=policy_config,
         conflict_recheck_status=conflict_recheck_status,
+        resulting_state=resulting_state,
         policy_changed=policy_changed,
         race_lost=race_lost,
     )
@@ -740,12 +740,18 @@ async def _capture_admission_assessment(
         trigger_id=capture.trigger_id,
         invocation_source=capture.invocation_source,
         evaluated_at=moment,
-        # A retried canonical evaluation carries the same evaluation_id, so
-        # the (tenant_id, evaluation_id) unique index makes the retry reuse
-        # the bound decision instead of appending a second one. Only the
-        # first item of a pass may claim it; a multi-item sweep records the
-        # rest without one rather than colliding on a shared identity.
-        evaluation_id=capture.evaluation_id,
+        # A retried canonical evaluation carries the same evaluation_id, and
+        # insert_assessment resolves it back to the decision already bound to
+        # that identity instead of appending a second one. Only the first
+        # item of a pass may claim it; a multi-item sweep records the rest
+        # without one rather than colliding on a shared identity.
+        #
+        # `claim_evaluation_id=False` marks a row that is *not* the outcome of
+        # the canonical execution — a superseded pre-lock result recorded
+        # alongside the reevaluation that replaces it. Binding the execution
+        # identity there would point the canonical evaluation at the wrong
+        # historical row and leave the authoritative decision unaddressable.
+        evaluation_id=capture.evaluation_id if claim_evaluation_id else None,
         job_id=capture.job_id,
         actor_principal_id=actor_principal_id,
         classification_run_id=candidate.classification_run_id,
@@ -759,40 +765,58 @@ async def _capture_admission_assessment(
     return row
 
 
-def _build_admission_decision(
+@dataclass(frozen=True)
+class _EvaluatedItemState:
+    """The exact pre-mutation state one decision was made against.
+
+    Taken before any lifecycle mutation in this pass, and never re-read from
+    the ORM object afterwards. That ordering is the whole point: the guarded
+    ``proposed -> active`` UPDATE and the conflict-recheck marking both
+    synchronize back onto the live object, so a decision built from that
+    object after the fact would record state its own mutation produced — an
+    admitted decision claiming it evaluated an already-active item.
+    """
+
+    tenant_id: uuid.UUID
+    memory_item_id: uuid.UUID
+    content_hash: str
+    input_state: dict[str, Any]
+    decision_inputs: dict[str, Any]
+
+    def promoted_state(self) -> dict[str, Any]:
+        """The state a successful ``proposed -> active`` admission produces."""
+        return {**self.input_state, "review_status": "active"}
+
+    def conflict_marked_state(self, conflicting_item_id: uuid.UUID) -> dict[str, Any]:
+        """The state a promotion-time conflict block produces.
+
+        The recheck writes ``conflict_resolution_status`` and
+        ``conflicts_with_item_id``, and both participate in the evaluated
+        input, so without this the blocked decision would be stale against the
+        item the instant its own transaction committed.
+        """
+        return {
+            **self.input_state,
+            "conflict_resolution_status": "unresolved",
+            "conflicts_with_item_id": str(conflicting_item_id),
+        }
+
+
+def _snapshot_evaluated_state(
     item: MemoryItem,
     candidate: PromotionCandidate,
     support: PromotionSupport,
     lanes: LaneQualification,
     *,
-    mode: str,
-    mutated: bool,
     min_age_hours: int,
     evidence_enabled: bool,
-    policy_config: dict[str, Any],
-    conflict_recheck_status: str,
-    live_proposal: bool = True,
-    policy_changed: bool = False,
-    race_lost: bool = False,
-) -> AdmissionDecision:
-    """Assemble the canonical decision from an evaluation already performed.
-
-    Pure and database-free by design: every value it reads was produced by the
-    production evaluator, so this can be called while the evaluating
-    transaction is still open (the authoritative path) or captured in memory
-    and persisted after that transaction has been rolled back (the dry-run
-    preview path), with identical results.
-    """
-    cooling_start, eligible_at, next_evaluation_at = _admission_timing(item, candidate, lanes)
-    return build_decision(
-        item=item,
-        run=support.classification_run,
-        mode=cast(Any, mode),
-        mutated=mutated,
-        live_proposal=live_proposal,
-        blockers=candidate.blockers,
-        selected_basis=candidate.selected_basis,
-        lanes=lanes,
+) -> _EvaluatedItemState:
+    """Freeze everything the decision record needs, before anything mutates."""
+    return _EvaluatedItemState(
+        tenant_id=item.tenant_id,
+        memory_item_id=item.id,
+        content_hash=item.content_hash,
+        input_state=input_state_payload(item, support.classification_run),
         decision_inputs=_admission_decision_inputs(
             item,
             candidate,
@@ -801,6 +825,50 @@ def _build_admission_decision(
             min_age_hours=min_age_hours,
             evidence_enabled=evidence_enabled,
         ),
+    )
+
+
+def _build_admission_decision(
+    item: MemoryItem,
+    candidate: PromotionCandidate,
+    snapshot: _EvaluatedItemState,
+    lanes: LaneQualification,
+    *,
+    mode: str,
+    mutated: bool,
+    policy_config: dict[str, Any],
+    conflict_recheck_status: str,
+    resulting_state: dict[str, Any] | None = None,
+    live_proposal: bool = True,
+    policy_changed: bool = False,
+    race_lost: bool = False,
+) -> AdmissionDecision:
+    """Assemble the canonical decision from an evaluation already performed.
+
+    Pure and database-free by design: every value it reads was produced by the
+    production evaluator or frozen into ``snapshot`` before any mutation, so
+    this can be called while the evaluating transaction is still open (the
+    authoritative path) or captured in memory and persisted after that
+    transaction has been rolled back (the dry-run preview path), with
+    identical results.
+
+    ``item`` is used only for the eligibility clock, which no mutation in this
+    pass touches; every hashed value comes from ``snapshot``.
+    """
+    cooling_start, eligible_at, next_evaluation_at = _admission_timing(item, candidate, lanes)
+    return build_decision(
+        tenant_id=snapshot.tenant_id,
+        memory_item_id=snapshot.memory_item_id,
+        item_content_hash=snapshot.content_hash,
+        input_state=snapshot.input_state,
+        resulting_state=resulting_state,
+        mode=cast(Any, mode),
+        mutated=mutated,
+        live_proposal=live_proposal,
+        blockers=candidate.blockers,
+        selected_basis=candidate.selected_basis,
+        lanes=lanes,
+        decision_inputs=snapshot.decision_inputs,
         policy_config=policy_config,
         conflict_recheck_status=conflict_recheck_status,
         cooling_period_start=cooling_start,
@@ -1009,6 +1077,93 @@ async def _advance_reconciliation_cursor(
             index_elements=[PromotionReconciliationState.tenant_id], set_=values
         )
     )
+
+
+async def _mark_promotion_conflict(
+    session: AsyncSession,
+    item: MemoryItem,
+    candidate: PromotionCandidate,
+    conflict: PromotionConflictCheck,
+    *,
+    tenant_id: str,
+    source: str,
+    event_provenance: dict[str, Any],
+    evaluation_context: dict[str, object] | None,
+) -> bool:
+    """Mark a promotion-time conflict block and write its audit event.
+
+    Returns whether the guarded marking actually applied; it does not when
+    the row left the live-proposal state under a concurrent writer.
+
+    Extracted verbatim from the promotion loop so the admission-capture
+    path can run it *before* recording its decision — the marking writes
+    conflict metadata that is itself part of the evaluated input — without
+    forking a second implementation. The emitted audit JSON is unchanged.
+    """
+    actor = await resolve_trusted_system_actor(session, tenant_id)
+    marked = await session.execute(
+        update(MemoryItem)
+        .where(
+            MemoryItem.id == item.id,
+            MemoryItem.review_status == "proposed",
+            MemoryItem.valid_to.is_(None),
+            MemoryItem.superseded_by.is_(None),
+        )
+        .values(
+            conflict_resolution_status="unresolved",
+            conflicts_with_item_id=conflict.conflicting_item_id,
+        )
+        .returning(MemoryItem.id)
+    )
+    if marked.scalar_one_or_none() is not None:
+        session.add(
+            ItemEvent(
+                item_id=item.id,
+                **event_provenance,
+                event_type="conflict_resolution",
+                field_name="conflict_resolution_status",
+                old_value=item.conflict_resolution_status,
+                new_value="unresolved",
+                actor_principal_id=actor,
+                reason=json.dumps(
+                    {
+                        "operation": "auto-promotion",
+                        "invocation_source": source,
+                        "selected_basis": candidate.selected_basis,
+                        "promotion_policy_version": (
+                            EVIDENCE_PROMOTION_POLICY_VERSION
+                            if candidate.selected_basis == "retention_evidence"
+                            else LEGACY_PROMOTION_POLICY_VERSION
+                        ),
+                        "conflict_recheck": "blocked",
+                        "conflicting_item_id": str(conflict.conflicting_item_id),
+                        "conflict_verdict": conflict.verdict,
+                        "conflict_reason": conflict.reason,
+                        "conflict_detection_mode": (
+                            "embedding"
+                            if conflict.used_embeddings
+                            else "heuristic_fallback"
+                        ),
+                        "source_item_id": str(item.id),
+                        "kind": item.kind,
+                        "source_type": item.source_type,
+                        "classification_run_id": (
+                            str(candidate.classification_run_id)
+                            if candidate.classification_run_id
+                            else None
+                        ),
+                        "evidence_score": candidate.evidence_score,
+                        "legacy_confidence": candidate.legacy_confidence,
+                        "evidence_threshold": candidate.evidence_threshold,
+                        "legacy_threshold": candidate.legacy_threshold,
+                        **(evaluation_context or {}),
+                    },
+                    sort_keys=True,
+                ),
+            )
+        )
+        return True
+    return False
 
 
 async def auto_promote_proposed_memories(
@@ -1251,6 +1406,22 @@ async def auto_promote_proposed_memories(
             if capture.enabled
             else {}
         )
+        # Freeze the evaluated state here — before the guarded promotion UPDATE
+        # or the conflict-recheck marking below, either of which synchronizes
+        # back onto `item` and would otherwise be hashed as though it were the
+        # input policy read.
+        snapshot = (
+            _snapshot_evaluated_state(
+                item,
+                candidate,
+                support_map[item.id],
+                lanes,
+                min_age_hours=min_age,
+                evidence_enabled=evidence_enabled,
+            )
+            if capture.enabled and lanes is not None
+            else None
+        )
         if capture.enabled and policy_changed_under_lock:
             # Truthful, non-current history for the superseded pre-lock policy.
             # It is deliberately built from the pre-change configuration: this
@@ -1265,26 +1436,36 @@ async def auto_promote_proposed_memories(
                 evidence_threshold=stale_evidence_threshold,
                 now=moment,
             )
+            stale_lanes = _lane_qualification(
+                item,
+                support_map[item.id],
+                confidence_threshold=stale_threshold,
+                min_age_hours=stale_min_age,
+                evidence_enabled=stale_evidence_enabled,
+                evidence_threshold=stale_evidence_threshold,
+                now=moment,
+            )
             await _capture_admission_assessment(
                 session,
                 item,
                 stale_candidate,
-                support_map[item.id],
-                _lane_qualification(
+                _snapshot_evaluated_state(
                     item,
+                    stale_candidate,
                     support_map[item.id],
-                    confidence_threshold=stale_threshold,
+                    stale_lanes,
                     min_age_hours=stale_min_age,
                     evidence_enabled=stale_evidence_enabled,
-                    evidence_threshold=stale_evidence_threshold,
-                    now=moment,
                 ),
+                stale_lanes,
                 capture,
                 mode="authoritative",
                 mutated=False,
                 moment=moment,
-                min_age_hours=stale_min_age,
-                evidence_enabled=stale_evidence_enabled,
+                # This row is history for a policy that no longer applies; the
+                # reevaluation below is what this execution actually decided,
+                # so that is what the evaluation identity must resolve to.
+                claim_evaluation_id=False,
                 policy_config=policy_config_payload(
                     confidence_threshold=stale_threshold,
                     min_age_hours=stale_min_age,
@@ -1295,7 +1476,9 @@ async def auto_promote_proposed_memories(
                 conflict_recheck_status="not_run",
                 policy_changed=True,
             )
-            capture = replace(capture, evaluation_id=None)
+            # Deliberately no `replace(capture, evaluation_id=None)` here: the
+            # identity is still unclaimed and belongs to the reevaluation this
+            # pass is about to record for the same item.
         conflict: PromotionConflictCheck | None = None
         if candidate.would_promote:
             conflict = await check_promotion_conflict(
@@ -1308,37 +1491,56 @@ async def auto_promote_proposed_memories(
         result.candidates.append(candidate)
         _count_blockers(result, candidate.blockers)
         if not candidate.would_promote:
+            # A blocking conflict recheck writes conflict metadata that is
+            # itself part of the evaluated input. The marking therefore runs
+            # before the decision is recorded, so the decision can declare the
+            # state its own recheck produced instead of being stale against it
+            # the moment the transaction commits.
+            conflict_marked = False
             if capture.enabled and not dry_run:
-                assert lanes is not None
+                assert lanes is not None and snapshot is not None
+                if conflict is not None:
+                    conflict_marked = await _mark_promotion_conflict(
+                        session,
+                        item,
+                        candidate,
+                        conflict,
+                        tenant_id=str(tenant_id),
+                        source=source,
+                        event_provenance=event_provenance,
+                        evaluation_context=evaluation_context,
+                    )
                 await _capture_admission_assessment(
                     session,
                     item,
                     candidate,
-                    support_map[item.id],
+                    snapshot,
                     lanes,
                     capture,
                     mode="authoritative",
                     mutated=False,
                     moment=moment,
-                    min_age_hours=min_age,
-                    evidence_enabled=evidence_enabled,
                     policy_config=policy_config,
                     conflict_recheck_status=candidate.conflict_recheck_status,
+                    resulting_state=(
+                        snapshot.conflict_marked_state(conflict.conflicting_item_id)
+                        if conflict_marked and conflict is not None
+                        else None
+                    ),
                 )
                 capture = replace(capture, evaluation_id=None)
+                continue
             elif capture.enabled and dry_run:
-                assert lanes is not None
+                assert lanes is not None and snapshot is not None
                 shadow_decisions.append(
                     (
                         _build_admission_decision(
                             item,
                             candidate,
-                            support_map[item.id],
+                            snapshot,
                             lanes,
                             mode="shadow",
                             mutated=False,
-                            min_age_hours=min_age,
-                            evidence_enabled=evidence_enabled,
                             policy_config=policy_config,
                             # A preview never runs the promotion-time semantic
                             # conflict recheck, and says exactly that rather
@@ -1350,68 +1552,16 @@ async def auto_promote_proposed_memories(
                     )
                 )
             if conflict and not dry_run:
-                actor = await resolve_trusted_system_actor(session, str(tenant_id))
-                marked = await session.execute(
-                    update(MemoryItem)
-                    .where(
-                        MemoryItem.id == item.id,
-                        MemoryItem.review_status == "proposed",
-                        MemoryItem.valid_to.is_(None),
-                        MemoryItem.superseded_by.is_(None),
-                    )
-                    .values(
-                        conflict_resolution_status="unresolved",
-                        conflicts_with_item_id=conflict.conflicting_item_id,
-                    )
-                    .returning(MemoryItem.id)
+                await _mark_promotion_conflict(
+                    session,
+                    item,
+                    candidate,
+                    conflict,
+                    tenant_id=str(tenant_id),
+                    source=source,
+                    event_provenance=event_provenance,
+                    evaluation_context=evaluation_context,
                 )
-                if marked.scalar_one_or_none() is not None:
-                    session.add(
-                        ItemEvent(
-                            item_id=item.id,
-                            **event_provenance,
-                            event_type="conflict_resolution",
-                            field_name="conflict_resolution_status",
-                            old_value=item.conflict_resolution_status,
-                            new_value="unresolved",
-                            actor_principal_id=actor,
-                            reason=json.dumps(
-                                {
-                                    "operation": "auto-promotion",
-                                    "invocation_source": source,
-                                    "selected_basis": candidate.selected_basis,
-                                    "promotion_policy_version": (
-                                        EVIDENCE_PROMOTION_POLICY_VERSION
-                                        if candidate.selected_basis == "retention_evidence"
-                                        else LEGACY_PROMOTION_POLICY_VERSION
-                                    ),
-                                    "conflict_recheck": "blocked",
-                                    "conflicting_item_id": str(conflict.conflicting_item_id),
-                                    "conflict_verdict": conflict.verdict,
-                                    "conflict_reason": conflict.reason,
-                                    "conflict_detection_mode": (
-                                        "embedding"
-                                        if conflict.used_embeddings
-                                        else "heuristic_fallback"
-                                    ),
-                                    "source_item_id": str(item.id),
-                                    "kind": item.kind,
-                                    "source_type": item.source_type,
-                                    "classification_run_id": (
-                                        str(candidate.classification_run_id)
-                                        if candidate.classification_run_id
-                                        else None
-                                    ),
-                                    "evidence_score": candidate.evidence_score,
-                                    "legacy_confidence": candidate.legacy_confidence,
-                                    "evidence_threshold": candidate.evidence_threshold,
-                                    "legacy_threshold": candidate.legacy_threshold,
-                                    **(evaluation_context or {}),
-                                },
-                                sort_keys=True,
-                            ),
-                        )
-                    )
             continue
         result.would_promote += 1
         result.would_promote_ids.append(item.id)
@@ -1428,19 +1578,17 @@ async def auto_promote_proposed_memories(
             # operator to reconcile policy rather than silently doing nothing.
             result.skipped_disabled += 1
             if capture.enabled and not dry_run:
-                assert lanes is not None
+                assert lanes is not None and snapshot is not None
                 await _capture_admission_assessment(
                     session,
                     item,
                     candidate,
-                    support_map[item.id],
+                    snapshot,
                     lanes,
                     capture,
                     mode="authoritative",
                     mutated=False,
                     moment=moment,
-                    min_age_hours=min_age,
-                    evidence_enabled=evidence_enabled,
                     policy_config=policy_config,
                     conflict_recheck_status=candidate.conflict_recheck_status,
                     policy_changed=True,
@@ -1449,18 +1597,16 @@ async def auto_promote_proposed_memories(
             continue
         if dry_run:
             if capture.enabled:
-                assert lanes is not None
+                assert lanes is not None and snapshot is not None
                 shadow_decisions.append(
                     (
                         _build_admission_decision(
                             item,
                             candidate,
-                            support_map[item.id],
+                            snapshot,
                             lanes,
                             mode="shadow",
                             mutated=False,
-                            min_age_hours=min_age,
-                            evidence_enabled=evidence_enabled,
                             policy_config=policy_config,
                             # A preview never runs the promotion-time semantic
                             # conflict recheck, and says exactly that rather
@@ -1501,12 +1647,12 @@ async def auto_promote_proposed_memories(
             # truthful non-mutating result, and the projection's precedence
             # rule keeps it from displacing the winner.
             if capture.enabled:
-                assert lanes is not None
+                assert lanes is not None and snapshot is not None
                 await _capture_admission_assessment(
                     session,
                     item,
                     candidate,
-                    support_map[item.id],
+                    snapshot,
                     lanes,
                     capture,
                     mode="authoritative",
@@ -1514,8 +1660,6 @@ async def auto_promote_proposed_memories(
                     live_proposal=False,
                     race_lost=True,
                     moment=moment,
-                    min_age_hours=min_age,
-                    evidence_enabled=evidence_enabled,
                     policy_config=policy_config,
                     conflict_recheck_status=candidate.conflict_recheck_status,
                 )
@@ -1543,22 +1687,26 @@ async def auto_promote_proposed_memories(
         )
         session.add(event)
         if capture.enabled:
-            assert lanes is not None
+            assert lanes is not None and snapshot is not None
             await session.flush()
             assessment_row = await _capture_admission_assessment(
                 session,
                 item,
                 candidate,
-                support_map[item.id],
+                snapshot,
                 lanes,
                 capture,
                 mode="authoritative",
                 mutated=True,
                 moment=moment,
-                min_age_hours=min_age,
-                evidence_enabled=evidence_enabled,
                 policy_config=policy_config,
                 conflict_recheck_status=candidate.conflict_recheck_status,
+                # The evaluated input stays `proposed` — that is what policy
+                # read and authorized this transition out of. The resulting
+                # state records what the mutation produced, so the decision
+                # resolves `current` immediately after commit instead of being
+                # stale against its own effect.
+                resulting_state=snapshot.promoted_state(),
                 actor_principal_id=actor,
                 linked_item_event_id=event_id,
             )

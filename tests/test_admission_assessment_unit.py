@@ -498,9 +498,13 @@ def test_blocker_order_is_canonicalized_before_hashing() -> None:
 
 
 def _decision(**overrides: object) -> object:
+    item = _Item()
     kwargs: dict[str, object] = dict(
-        item=_Item(),
-        run=None,
+        tenant_id=item.tenant_id,
+        memory_item_id=item.id,
+        item_content_hash=item.content_hash,
+        input_state=input_state_payload(item, None),  # type: ignore[arg-type]
+        resulting_state=None,
         mode="authoritative",
         mutated=False,
         live_proposal=True,
@@ -528,7 +532,9 @@ def test_decision_hash_changes_with_every_hashed_field() -> None:
     base = _decision().hash()  # type: ignore[attr-defined]
     assert _decision(mode="shadow").hash() != base  # type: ignore[attr-defined]
     assert _decision(policy_config=_policy(min_age_hours=99)).hash() != base  # type: ignore[attr-defined]
-    assert _decision(item=_Item(memory_confidence=0.1)).hash() != base  # type: ignore[attr-defined]
+    assert _decision(
+        input_state=input_state_payload(_Item(memory_confidence=0.1), None)  # type: ignore[arg-type]
+    ).hash() != base  # type: ignore[attr-defined]
     assert _decision(decision_inputs={"other": 1}).hash() != base  # type: ignore[attr-defined]
     assert _decision(conflict_recheck_status="not_run_preview").hash() != base  # type: ignore[attr-defined]
 
@@ -549,6 +555,7 @@ def test_envelope_carries_exactly_the_documented_fields() -> None:
         "mode",
         "item_content_hash",
         "input_digest",
+        "resulting_state_digest",
         "policy_profile_key",
         "policy_contract_version",
         "policy_config_digest",
@@ -597,6 +604,7 @@ class _Row:
         self.id = uuid.uuid4()
         self.mode = mode
         self.input_digest = "sha256:" + "1" * 64
+        self.resulting_state_digest: str | None = None
         self.policy_config_digest = "sha256:" + "2" * 64
         self.outcome = "cooling"
         self.reason_codes = ["lane_qualified_awaiting_age"]
@@ -694,3 +702,82 @@ def test_next_evaluation_is_the_boundary_when_one_exists_and_none_otherwise() ->
 def test_decision_hash_helper_matches_the_decision_objects_hash() -> None:
     decision = _decision()
     assert decision_hash(decision.envelope()) == decision.hash()  # type: ignore[attr-defined]
+
+
+# --- Evaluated versus resulting state ---------------------------------------
+
+
+def test_a_decision_that_changed_nothing_records_no_resulting_state() -> None:
+    decision = _decision()
+    assert decision.resulting_state_digest is None  # type: ignore[attr-defined]
+    assert decision.envelope()["resulting_state_digest"] is None  # type: ignore[attr-defined]
+
+
+def test_the_resulting_state_is_hashed_separately_from_the_evaluated_input() -> None:
+    """Two different claims, two different digests. Folding the produced state
+    into the input would make an admitted decision assert that policy
+    evaluated an already-active item."""
+    evaluated = input_state_payload(_Item(), None)  # type: ignore[arg-type]
+    produced = {**evaluated, "review_status": "active"}
+    decision = _decision(
+        mutated=True,
+        blockers=[],
+        selected_basis="legacy_confidence",
+        lanes=QUALIFIED,
+        input_state=evaluated,
+        resulting_state=produced,
+        next_evaluation_at=None,
+    )
+    assert decision.outcome == "admitted"  # type: ignore[attr-defined]
+    assert decision.input_digest == digest(evaluated)  # type: ignore[attr-defined]
+    assert decision.resulting_state_digest == digest(produced)  # type: ignore[attr-defined]
+    assert decision.input_digest != decision.resulting_state_digest  # type: ignore[attr-defined]
+
+
+def test_the_resulting_state_participates_in_the_decision_hash() -> None:
+    evaluated = input_state_payload(_Item(), None)  # type: ignore[arg-type]
+    without = _decision(
+        mutated=True, blockers=[], selected_basis="legacy_confidence",
+        lanes=QUALIFIED, next_evaluation_at=None,
+    )
+    with_result = _decision(
+        mutated=True, blockers=[], selected_basis="legacy_confidence",
+        lanes=QUALIFIED, next_evaluation_at=None,
+        resulting_state={**evaluated, "review_status": "active"},
+    )
+    assert without.hash() != with_result.hash()  # type: ignore[attr-defined]
+
+
+def test_a_shadow_preview_can_never_record_a_resulting_state() -> None:
+    """A preview provably changes nothing, so claiming a produced state would
+    be a claim about a mutation that never happened."""
+    with pytest.raises(AdmissionAssessmentError):
+        _decision(
+            mode="shadow",
+            resulting_state=input_state_payload(_Item(), None),  # type: ignore[arg-type]
+        )
+
+
+def test_freshness_resolves_against_the_resulting_state_when_present() -> None:
+    """A decision must not be stale because of its own effect."""
+    row = _Row()
+    row.resulting_state_digest = "sha256:" + "7" * 64
+    # Current state matches what the mutation produced -> current.
+    assert (
+        resolve_projection_status(
+            row,  # type: ignore[arg-type]
+            current_input_digest=row.resulting_state_digest,
+            current_policy_config_digest=row.policy_config_digest,
+        ).status
+        == "current"
+    )
+    # Current state matching the *evaluated* input instead means the mutation
+    # was undone, which is a genuine divergence.
+    assert (
+        resolve_projection_status(
+            row,  # type: ignore[arg-type]
+            current_input_digest=row.input_digest,
+            current_policy_config_digest=row.policy_config_digest,
+        ).status
+        == "stale"
+    )

@@ -1010,3 +1010,310 @@ async def test_withdrawing_auto_promotion_under_the_lock_fails_closed() -> None:
     assert "policy_state_changed_during_evaluation" in rows[0]["reason_codes"]  # type: ignore[operator]
     # A stale decision never becomes the current projection.
     assert await _projection(item_id) is None
+
+
+# --- Evaluated vs resulting state identity (issue #159 review) ---------------
+
+
+async def test_admitted_decision_records_the_state_it_evaluated_not_produced() -> None:
+    """The decision must say policy evaluated a *proposed* item.
+
+    The guarded ``proposed -> active`` UPDATE synchronizes back onto the live
+    ORM object, so a decision built from that object afterwards would record
+    ``review_status='active'`` — asserting that policy admitted an item that
+    was already admitted. The evaluated input is snapshotted before the
+    mutation precisely to make that unrepresentable.
+    """
+    settings.admission_assessment_capture_enabled = True
+    tenant_id, principal_id = await _default_ids()
+    item_id = await _insert_item(tenant_id=tenant_id, principal_id=principal_id)
+    await _promote(tenant_id)
+
+    row = (await _assessments(item_id))[0]
+    assert row["outcome"] == "admitted"
+    assert row["decision_inputs"]["review_status"] == "proposed"  # type: ignore[index]
+    # And the produced state is recorded separately, not folded into the input.
+    assert row["resulting_state_digest"] is not None
+    assert row["resulting_state_digest"] != row["input_digest"]
+
+
+async def _resolved_status(tenant_id: str, item_id: uuid.UUID) -> str:
+    from engram.admission_assessment import load_current_assessment, resolve_projection_status
+    from engram.api.routes.admission_assessments import current_digests
+
+    async with _factory() as session:
+        await session.execute(
+            text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id}
+        )
+        item = await session.get(MemoryItem, item_id)
+        assert item is not None
+        row = await load_current_assessment(
+            session, tenant_id=tenant_id, memory_item_id=item_id
+        )
+        current_input, current_policy = await current_digests(session, item)
+        return resolve_projection_status(
+            row,
+            current_input_digest=current_input,
+            current_policy_config_digest=current_policy,
+        ).status
+
+
+async def test_an_admission_is_current_immediately_after_it_commits() -> None:
+    """A decision must not be stale because of its own effect."""
+    settings.admission_assessment_capture_enabled = True
+    tenant_id, principal_id = await _default_ids()
+    item_id = await _insert_item(tenant_id=tenant_id, principal_id=principal_id)
+    await _promote(tenant_id)
+
+    assert await _review_status(item_id) == "active"
+    assert await _resolved_status(tenant_id, item_id) == "current"
+
+
+async def test_a_later_unrelated_change_still_makes_an_admission_stale() -> None:
+    """Recording the resulting state must not disable staleness generally."""
+    settings.admission_assessment_capture_enabled = True
+    tenant_id, principal_id = await _default_ids()
+    item_id = await _insert_item(tenant_id=tenant_id, principal_id=principal_id)
+    await _promote(tenant_id)
+    assert await _resolved_status(tenant_id, item_id) == "current"
+
+    async with _engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE memory_items SET memory_confidence = 0.42 WHERE id = :i"),
+            {"i": item_id},
+        )
+    assert await _resolved_status(tenant_id, item_id) == "stale"
+
+
+async def test_a_conflict_blocked_decision_is_current_after_its_own_marking() -> None:
+    """The promotion-time conflict recheck writes conflict metadata that is
+    itself part of the evaluated input. Without recording the resulting state
+    the blocked decision would be stale the instant its transaction committed
+    — stale against a mutation its own evaluation caused."""
+    settings.admission_assessment_capture_enabled = True
+    tenant_id, principal_id = await _default_ids()
+    item_id = await _insert_item(tenant_id=tenant_id, principal_id=principal_id)
+
+    import engram.promotion as promotion_module
+    from engram.conflicts import PromotionConflictCheck
+
+    other_id = await _insert_item(
+        tenant_id=tenant_id, principal_id=principal_id, review_status="active"
+    )
+    real_check = promotion_module.check_promotion_conflict
+
+    async def always_conflicts(session, item, **kwargs):  # type: ignore[no-untyped-def]
+        return PromotionConflictCheck(
+            conflicting_item_id=other_id,
+            verdict="conflict",
+            reason="test",
+            used_embeddings=False,
+        )
+
+    promotion_module.check_promotion_conflict = always_conflicts  # type: ignore[assignment]
+    try:
+        result = await _promote(tenant_id)
+    finally:
+        promotion_module.check_promotion_conflict = real_check  # type: ignore[assignment]
+
+    assert result.promoted == 0  # type: ignore[attr-defined]
+    assert await _review_status(item_id) == "proposed"
+    row = (await _assessments(item_id))[0]
+    assert row["outcome"] == "blocked"
+    assert row["conflict_recheck_status"] == "blocked"
+    # The evaluated input is the pre-marking state...
+    assert row["decision_inputs"]["conflict_resolution_status"] is None  # type: ignore[index]
+    # ...and the marking it caused is recorded as the resulting state, so the
+    # decision resolves current rather than stale against its own effect.
+    assert row["resulting_state_digest"] is not None
+    assert await _resolved_status(tenant_id, item_id) == "current"
+
+
+# --- Canonical evaluation retry (issue #159 review) --------------------------
+
+
+async def _evaluate_with_identity(
+    tenant_id: str, item_id: uuid.UUID, evaluation_id: uuid.UUID
+) -> object:
+    """Run one canonical item-scoped evaluation under a fixed identity."""
+    from engram.promotion import evaluate_promotion_item_current_state
+
+    async with _factory() as session:
+        await session.execute(
+            text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id}
+        )
+        return await evaluate_promotion_item_current_state(
+            session,
+            tenant_id,
+            item_id,
+            evaluation_context={
+                "evaluation_id": str(evaluation_id),
+                "trigger_type": "classification_bound",
+                "trigger_id": "retry-test",
+            },
+        )
+
+
+async def test_retrying_a_canonical_evaluation_reuses_its_bound_decision() -> None:
+    """The crash window: the decision commits, the worker dies before the job
+    is marked succeeded, the job is reclaimed with the same evaluation_id and
+    the item is still proposed. The retry must resolve to the decision already
+    bound to that identity, not collide with it."""
+    settings.admission_assessment_capture_enabled = True
+    tenant_id, principal_id = await _default_ids()
+    item_id = await _insert_item(
+        tenant_id=tenant_id, principal_id=principal_id, memory_confidence=0.1
+    )
+    evaluation_id = uuid.uuid4()
+
+    await _evaluate_with_identity(tenant_id, item_id, evaluation_id)
+    first = await _assessments(item_id)
+    assert len(first) == 1
+    assert first[0]["outcome"] == "insufficient_evidence"
+    assert first[0]["evaluation_id"] == evaluation_id
+
+    # The retry: same identity, item still proposed.
+    await _evaluate_with_identity(tenant_id, item_id, evaluation_id)
+    second = await _assessments(item_id)
+    assert len(second) == 1, "a retry must not append a second bound decision"
+    assert second[0]["id"] == first[0]["id"]
+    assert await _review_status(item_id) == "proposed"
+
+
+async def test_a_retried_cooling_evaluation_is_also_idempotent() -> None:
+    settings.admission_assessment_capture_enabled = True
+    tenant_id, principal_id = await _default_ids()
+    item_id = await _insert_item(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        memory_confidence=0.95,
+        created_at=_now() - timedelta(hours=1),
+    )
+    evaluation_id = uuid.uuid4()
+
+    await _evaluate_with_identity(tenant_id, item_id, evaluation_id)
+    await _evaluate_with_identity(tenant_id, item_id, evaluation_id)
+    rows = await _assessments(item_id)
+    assert len(rows) == 1
+    assert rows[0]["outcome"] == "cooling"
+
+
+async def test_the_evaluation_identity_binds_the_authoritative_decision_not_the_stale_one() -> None:
+    """When policy changes between the pre-lock read and the lock, the
+    superseded pre-lock row is recorded as history — but the canonical
+    execution identity must resolve to the reevaluation that replaced it,
+    otherwise a retry would reuse the wrong historical row."""
+    settings.admission_assessment_capture_enabled = True
+    tenant_id, principal_id = await _default_ids()
+    item_id = await _insert_item(
+        tenant_id=tenant_id, principal_id=principal_id, memory_confidence=0.9
+    )
+    evaluation_id = uuid.uuid4()
+
+    from engram.promotion import _config as real_config
+
+    calls: list[int] = []
+
+    async def changing_config(session: AsyncSession, tid: str) -> object:
+        calls.append(1)
+        if len(calls) == 2:
+            import asyncpg
+
+            from engram.migrations import normalize_asyncpg_url
+
+            conn = await asyncpg.connect(normalize_asyncpg_url(settings.database_url))
+            try:
+                await conn.execute(
+                    "UPDATE tenant_config SET auto_promote_confidence_threshold = 0.99 "
+                    "WHERE tenant_id = $1",
+                    uuid.UUID(tid),
+                )
+            finally:
+                await conn.close()
+        return await real_config(session, tid)
+
+    import engram.promotion as promotion_module
+
+    promotion_module._config = changing_config  # type: ignore[assignment]
+    try:
+        await _evaluate_with_identity(tenant_id, item_id, evaluation_id)
+    finally:
+        promotion_module._config = real_config  # type: ignore[assignment]
+
+    rows = await _assessments(item_id)
+    assert len(rows) == 2
+    stale = [row for row in rows if row["outcome"] == "stale"]
+    authoritative = [row for row in rows if row["outcome"] != "stale"]
+    assert len(stale) == 1 and len(authoritative) == 1
+    # The superseded pre-lock row holds no execution identity...
+    assert stale[0]["evaluation_id"] is None
+    # ...the decision this execution actually reached does.
+    assert authoritative[0]["evaluation_id"] == evaluation_id
+
+    # And a retry of that execution resolves to the authoritative row.
+    await _evaluate_with_identity(tenant_id, item_id, evaluation_id)
+    after = await _assessments(item_id)
+    assert len(after) == 2, "the retry must not append another decision"
+
+
+# --- Audit linkage lifecycle (issue #159 review) -----------------------------
+
+
+async def test_deleting_an_item_with_a_linked_admitted_decision_succeeds() -> None:
+    """The bidirectional audit link must not block the parent-item cascade.
+
+    ``ON DELETE SET NULL`` would make PostgreSQL attempt an UPDATE on
+    immutable history when the audit event goes away; the constraint is
+    deferred NO ACTION instead, so both rows disappear together in the same
+    parent cascade and nothing is ever rewritten.
+    """
+    settings.admission_assessment_capture_enabled = True
+    tenant_id, principal_id = await _default_ids()
+    item_id = await _insert_item(tenant_id=tenant_id, principal_id=principal_id)
+    await _promote(tenant_id)
+
+    row = (await _assessments(item_id))[0]
+    assert row["outcome"] == "admitted"
+    event_id = row["linked_item_event_id"]
+    assert event_id is not None
+    async with _factory() as session:
+        back_reference = await session.scalar(
+            text("SELECT admission_assessment_id FROM item_events WHERE id = :e"),
+            {"e": event_id},
+        )
+    assert back_reference == row["id"]
+
+    async with _engine.begin() as conn:
+        await conn.execute(
+            text("DELETE FROM memory_items WHERE id = :i"), {"i": item_id}
+        )
+
+    assert await _assessments(item_id) == []
+    assert await _projection(item_id) is None
+    async with _factory() as session:
+        assert (
+            await session.scalar(
+                text("SELECT count(*) FROM item_events WHERE id = :e"), {"e": event_id}
+            )
+            == 0
+        )
+
+
+async def test_destroying_a_linked_audit_event_alone_is_refused() -> None:
+    """The other half of the contract: the cascade may take both rows, but
+    nothing may orphan an admitted decision from the event it authorized."""
+    import asyncpg
+
+    settings.admission_assessment_capture_enabled = True
+    tenant_id, principal_id = await _default_ids()
+    item_id = await _insert_item(tenant_id=tenant_id, principal_id=principal_id)
+    await _promote(tenant_id)
+    event_id = (await _assessments(item_id))[0]["linked_item_event_id"]
+
+    with pytest.raises((asyncpg.PostgresError, Exception)):
+        async with _engine.begin() as conn:
+            await conn.execute(
+                text("DELETE FROM item_events WHERE id = :e"), {"e": event_id}
+            )
+    # Both halves survive the refused deletion.
+    assert len(await _assessments(item_id)) == 1

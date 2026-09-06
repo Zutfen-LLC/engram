@@ -529,6 +529,20 @@ class AdmissionDecision:
     ``created_at``) and the mutable projection deliberately live outside the
     hashed envelope, so the same decision over the same inputs verifies to the
     same hash across runtimes and across replays.
+
+    ``input_digest`` and ``resulting_state_digest`` are two different claims
+    and must never be conflated:
+
+    * ``input_digest`` binds the state that was **evaluated** — strictly
+      pre-mutation. On an admission it says ``review_status='proposed'``,
+      because that is the state current policy actually read and authorized
+      the transition out of. Hashing post-mutation state here would make the
+      record assert that policy admitted an already-active item.
+    * ``resulting_state_digest`` binds the state the authorized mutation was
+      expected to **produce**, and is ``None`` when the decision changed
+      nothing. Freshness resolves against it when present, so a decision does
+      not become stale by virtue of the very mutation it authorized, while a
+      later unrelated change still makes it stale normally.
     """
 
     tenant_id: uuid.UUID
@@ -536,6 +550,7 @@ class AdmissionDecision:
     mode: AdmissionMode
     item_content_hash: str
     input_digest: str
+    resulting_state_digest: str | None
     policy_config_digest: str
     selected_basis: str | None
     outcome: AdmissionOutcome
@@ -556,6 +571,7 @@ class AdmissionDecision:
             "mode": self.mode,
             "item_content_hash": self.item_content_hash,
             "input_digest": self.input_digest,
+            "resulting_state_digest": self.resulting_state_digest,
             "policy_profile_key": POLICY_PROFILE_KEY,
             "policy_contract_version": POLICY_CONTRACT_VERSION,
             "policy_config_digest": self.policy_config_digest,
@@ -587,8 +603,11 @@ def canonical_blocker_order(blockers: list[str] | tuple[str, ...]) -> tuple[str,
 
 def build_decision(
     *,
-    item: MemoryItem,
-    run: ClassificationRun | None,
+    tenant_id: uuid.UUID,
+    memory_item_id: uuid.UUID,
+    item_content_hash: str,
+    input_state: dict[str, Any],
+    resulting_state: dict[str, Any] | None,
     mode: AdmissionMode,
     mutated: bool,
     live_proposal: bool,
@@ -613,6 +632,13 @@ def build_decision(
     and ``mutated`` all come from the production evaluator and mutation path.
     ``outcome_override`` exists for the legacy import, whose outcome reflects
     currently stored state rather than a reconstructed historical evaluation.
+
+    ``input_state`` is passed in rather than derived from a live ORM object on
+    purpose. The caller snapshots it **before** performing any lifecycle
+    mutation, so a decision can never be hashed against state its own
+    mutation produced — a live object would report post-mutation values by the
+    time this runs. ``resulting_state`` is the caller's explicit statement of
+    what the authorized mutation changed, or ``None`` when nothing changed.
     """
     if conflict_recheck_status not in CONFLICT_RECHECK_STATUSES:
         raise AdmissionAssessmentError(
@@ -650,12 +676,19 @@ def build_decision(
     due = next_evaluation_at if "wait_until" in actions else None
     if "wait_until" in actions and due is None:
         raise AdmissionAssessmentError("a cooling decision must carry next_evaluation_at")
+    if resulting_state is not None and mode == "shadow":
+        raise AdmissionAssessmentError(
+            "a shadow preview changes nothing and can never record a resulting state"
+        )
     return AdmissionDecision(
-        tenant_id=item.tenant_id,
-        memory_item_id=item.id,
+        tenant_id=tenant_id,
+        memory_item_id=memory_item_id,
         mode=mode,
-        item_content_hash=item.content_hash,
-        input_digest=digest(input_state_payload(item, run)),
+        item_content_hash=item_content_hash,
+        input_digest=digest(input_state),
+        resulting_state_digest=(
+            digest(resulting_state) if resulting_state is not None else None
+        ),
         policy_config_digest=digest(policy_config),
         selected_basis=selected_basis,
         outcome=outcome,
@@ -746,7 +779,26 @@ async def insert_assessment(
     Never commits: the caller owns the transaction, which is what makes the
     mutation/assessment/event/projection commit atomic (or fail closed
     together).
+
+    Idempotent on canonical evaluation identity. A ``promotion.evaluate`` job
+    that committed its decision and then died before the queue could mark it
+    succeeded is reclaimed and re-executed with the *same* ``evaluation_id``.
+    That retry must resolve to the decision already bound to that identity
+    rather than appending a second one — which is what the
+    ``(tenant_id, evaluation_id)`` unique index exists to guarantee, and what
+    this lookup makes true rather than merely enforced. Without it the retry
+    would not be idempotent at all; it would raise a unique violation and
+    dead-letter a job whose work was already durably complete.
     """
+    if evaluation_id is not None:
+        bound = await session.scalar(
+            select(AdmissionAssessment).where(
+                AdmissionAssessment.tenant_id == decision.tenant_id,
+                AdmissionAssessment.evaluation_id == evaluation_id,
+            )
+        )
+        if bound is not None:
+            return bound
     row = AdmissionAssessment(
         id=assessment_id or uuid.uuid4(),
         tenant_id=decision.tenant_id,
@@ -762,6 +814,7 @@ async def insert_assessment(
         evaluated_at=evaluated_at,
         item_content_hash=decision.item_content_hash,
         input_digest=decision.input_digest,
+        resulting_state_digest=decision.resulting_state_digest,
         policy_profile_key=POLICY_PROFILE_KEY,
         policy_contract_version=POLICY_CONTRACT_VERSION,
         policy_config_digest=decision.policy_config_digest,
@@ -876,11 +929,21 @@ def resolve_projection_status(
     current_input_digest: str,
     current_policy_config_digest: str,
 ) -> ResolvedAdmission:
-    """Compare the pointed assessment's digests against current state."""
+    """Compare the pointed assessment's digests against current state.
+
+    A decision that authorized a lifecycle mutation is compared against the
+    state that mutation was expected to produce, not against the state it
+    evaluated. Otherwise every successful admission would resolve as stale the
+    instant it committed — stale because of its own effect — which would make
+    the status useless exactly where it matters most. A later unrelated change
+    still moves current state away from the recorded resulting state and makes
+    the decision stale in the ordinary way.
+    """
     if assessment is None:
         return ResolvedAdmission("missing", None)
+    expected_state = assessment.resulting_state_digest or assessment.input_digest
     fresh = (
-        assessment.input_digest == current_input_digest
+        expected_state == current_input_digest
         and assessment.policy_config_digest == current_policy_config_digest
     )
     if not fresh:

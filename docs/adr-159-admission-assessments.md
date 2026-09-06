@@ -54,6 +54,40 @@ and prior, memory confidence, retention fields, conflict state,
 authority/sensitivity/verification, visibility, creation time, and the bound
 classification receipt's identity, values and versions.
 
+## Evaluated state versus resulting state
+
+`input_digest` and `resulting_state_digest` are two different claims and are
+never conflated.
+
+`input_digest` is the state that was **evaluated**, strictly pre-mutation. On
+an admission it binds `review_status='proposed'`, because that is what policy
+read and authorized the transition out of. This is not incidental: the guarded
+`proposed -> active` UPDATE and the promotion-time conflict marking both
+synchronize back onto the live ORM object, so a decision assembled from that
+object afterwards would record state its own mutation produced — an `admitted`
+decision asserting that policy admitted an already-active item. The evaluator
+therefore snapshots the evaluated state *before* any mutation in the pass, and
+the hashing path consumes that snapshot rather than a live object.
+
+`resulting_state_digest` is the state the decision's own authorized mutation
+was expected to **produce**, and is `NULL` when the decision changed nothing.
+Exactly two decisions carry one:
+
+- `admitted` — the item moves to `review_status='active'`;
+- `blocked` by a promotion-time conflict recheck — the recheck writes
+  `conflict_resolution_status='unresolved'` and `conflicts_with_item_id`, both
+  of which are part of the evaluated input.
+
+Freshness resolves against the resulting state when present. Without it, every
+successful admission would resolve as `stale` the instant it committed — stale
+because of its own effect — which would make the status useless exactly where
+it matters most. A later *unrelated* change still moves current state away from
+the recorded resulting state and makes the decision stale in the ordinary way.
+
+A shadow preview provably changes nothing and can never record a resulting
+state; the database enforces that alongside the outcome restriction.
+
+
 #157 assessment IDs and hashes are recorded separately in
 `available_memory_assessment_refs` and move neither digest. Letting them move
 a digest would make an evidence assessment retroactively look like a promotion
@@ -66,11 +100,11 @@ the decision envelope, produced by the same pinned `rfc8785` library the
 context manifest and extraction receipts use.
 
 Included: schema version, tenant/item identity, mode, item content hash, input
-digest, policy profile/contract/config digest, selected basis, outcome,
-blocker codes in canonical sorted order, reason codes in canonical sorted
-order, normalized decision inputs, conflict-recheck status, and the
-cooling/eligibility/next-action values that are deterministic outputs of the
-evaluated state.
+digest, resulting-state digest, policy profile/contract/config digest, selected
+basis, outcome, blocker codes in canonical sorted order, reason codes in
+canonical sorted order, normalized decision inputs, conflict-recheck status,
+and the cooling/eligibility/next-action values that are deterministic outputs
+of the evaluated state.
 
 Excluded: assessment ID, `created_at` / `evaluated_at`, job / evaluation /
 request IDs, actor ID, and all mutable projection state.
@@ -195,15 +229,60 @@ cannot carry a lifecycle mutation with it. Preview rows always record
 
 ## Idempotency and concurrency
 
-- `evaluation_id` is unique per tenant. A retry of the same canonical
-  evaluation reuses the bound assessment rather than appending a second
-  mutation decision. A multi-item sweep claims the evaluation identity for at
-  most one item and records the rest without one.
+- `evaluation_id` is unique per tenant, and `insert_assessment()` resolves a
+  supplied identity back to the decision already bound to it before inserting
+  anything. That reuse is the mechanism; the unique index is the backstop. It
+  matters in a specific crash window: a `promotion.evaluate` job whose decision
+  committed, whose worker then died before the queue could mark the job
+  succeeded, and which is reclaimed with the same `evaluation_id` while the
+  item is still `proposed`. Without the lookup, that retry would raise a unique
+  violation and dead-letter a job whose work was already durably complete.
+- The execution identity binds the decision the execution actually reached.
+  When policy changes between the pre-lock read and the lock, the superseded
+  pre-lock row is recorded as history with **no** `evaluation_id`, and the
+  reevaluation that replaces it claims the identity — otherwise a retry would
+  resolve to the wrong historical row and the authoritative decision would be
+  unaddressable.
+- A multi-item sweep claims the evaluation identity for at most one item and
+  records the rest without one.
 - Queue claim semantics remain `FOR UPDATE SKIP LOCKED`; item lock order is
   unchanged.
 - Two workers racing one newly eligible proposal yield exactly one
   `proposed -> active` mutation, one `admitted` assessment and one linked
   `review_change` event.
+
+## Audit linkage lifecycle
+
+An admitted decision and the `review_change` event it authorized name each
+other. That bidirectional link must not make the parent item undeletable.
+
+`admission_assessments.linked_item_event_id` is a **deferred `NO ACTION`**
+foreign key, not `ON DELETE SET NULL`. `SET NULL` would make PostgreSQL's
+referential action attempt an `UPDATE` on `admission_assessments` when the
+audit event goes away — which the no-rewrite trigger refuses — so deleting a
+memory item that has a linked admitted decision, or deleting the linked event
+on its own, would fail outright. Deferring the check to commit lets the parent
+item's cascade remove the event and the decision together (the constraint is
+satisfied because both are gone), while destroying the event alone still
+violates it. History is never rewritten either way.
+
+## Review-queue filtering
+
+The admission filters (outcome, blocker code, next action, assessment state,
+due-before) are applied as **selection**, not as post-processing of a page.
+
+Outcome, blocker code, next action and due time are stored facts on the pointed
+assessment, so they become SQL predicates against a correlated `EXISTS` over
+the projection. `missing` is the absence of a projection row, also a SQL
+predicate. Only `current` / `stale` / `legacy_import` require the digest
+comparison against live item and policy state, which no SQL expression can
+express; those walk the SQL-narrowed queue in bounded keyset batches until the
+requested page is filled or `MAX_ADMISSION_FILTER_SCAN` rows have been
+examined.
+
+Filtering a preselected page instead would report "nothing matches" whenever
+the matching item happened to sit past the caller's limit — a false negative on
+exactly the operational question this issue exists to answer.
 
 ## Authorization, RLS, privacy
 

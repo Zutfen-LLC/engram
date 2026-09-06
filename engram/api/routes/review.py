@@ -20,8 +20,9 @@ from engram.admission_assessment import (
 )
 from engram.api.routes.admission_assessments import (
     MISSING_ADMISSION_SUMMARY,
+    AdmissionQueueFilters,
     admission_summaries,
-    matches_admission_filters,
+    select_filtered_review_items,
 )
 from engram.api.routes.memory import (
     _insert_item_event,
@@ -334,6 +335,11 @@ async def review_queue(
         workspace = None
         limit = 50
 
+    page_limit = min(limit, 200)
+    # Deliberately unbounded here: the page limit is applied by the selector
+    # below, after the admission predicates. Limiting first and filtering the
+    # resulting page would answer "nothing matches" whenever the matching item
+    # happened to sit past the caller's limit.
     stmt = (
         select(MemoryItem)
         .where(
@@ -342,8 +348,7 @@ async def review_queue(
             MemoryItem.valid_to.is_(None),
             MemoryItem.superseded_by.is_(None),
         )
-        .order_by(MemoryItem.created_at.desc())
-        .limit(min(limit, 200))
+        .order_by(MemoryItem.created_at.desc(), MemoryItem.id.desc())
     )
     if kind is not None:
         stmt = stmt.where(MemoryItem.kind == kind)
@@ -355,31 +360,17 @@ async def review_queue(
             return []
         stmt = stmt.where(MemoryItem.workspace_id == workspace_id)
 
-    items = list((await session.execute(stmt)).scalars())
-    admission_filtered = any(
-        value is not None
-        for value in (
-            admission_outcome,
-            admission_blocker,
-            admission_next_action,
-            admission_state,
-            admission_due_before,
-        )
+    filters = AdmissionQueueFilters(
+        outcome=admission_outcome,
+        blocker=admission_blocker,
+        next_action=admission_next_action,
+        state=admission_state,
+        due_before=admission_due_before,
+    )
+    items = await select_filtered_review_items(
+        session, base_stmt=stmt, filters=filters, limit=page_limit
     )
     summaries = await admission_summaries(session, items)
-    if admission_filtered:
-        items = [
-            item
-            for item in items
-            if matches_admission_filters(
-                summaries.get(item.id),
-                outcome=admission_outcome,
-                blocker=admission_blocker,
-                next_action=admission_next_action,
-                state=admission_state,
-                due_before=admission_due_before,
-            )
-        ]
     config = (
         await session.execute(
             select(TenantConfig).where(

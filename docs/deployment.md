@@ -1298,6 +1298,11 @@ append-only `admission_assessments` table, the mutable one-row
 reconstruction and no row-per-item backfill, so it applies in constant time
 regardless of how many memory items a tenant has.
 
+The migration is also **convergent**, not merely idempotent: re-running it over
+a database created by an earlier build of the same migration adds
+`resulting_state_digest` and replaces the linked-event foreign key in place.
+Deployments that only ever apply the released file see no difference.
+
 ### Configuration
 
 | Variable | Default | Effect |
