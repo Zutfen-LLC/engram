@@ -1363,6 +1363,69 @@ async def test_concurrent_retries_of_an_already_bound_job_converge() -> None:
     assert await _review_change_count(item_id) == 0
 
 
+# --- Durable provenance lifecycle -------------------------------------------
+
+
+async def test_completed_job_can_be_pruned_without_rewriting_its_decision() -> None:
+    """Queue retention must not control durable decision retention."""
+    settings.admission_assessment_capture_enabled = True
+    tenant_id, principal_id = await _default_ids()
+    item_id = await _insert_item(
+        tenant_id=tenant_id, principal_id=principal_id, memory_confidence=0.1
+    )
+    job_id = await _enqueue_evaluation_job(
+        tenant_id, principal_id, item_id, trigger_id="job-pruning"
+    )
+
+    await _reclaim_and_process_evaluation_job()
+    assert await _job_status(job_id) == "succeeded"
+    before = await _assessments(item_id)
+    projection_before = await _projection(item_id)
+    assert len(before) == 1
+    assert before[0]["job_id"] == job_id
+    assert before[0]["evaluation_id"] == job_id
+    assert projection_before is not None
+
+    async with _engine.begin() as conn:
+        await conn.execute(text("DELETE FROM jobs WHERE id = :id"), {"id": job_id})
+
+    async with _factory() as session:
+        assert await session.scalar(select(Job.id).where(Job.id == job_id)) is None
+    after = await _assessments(item_id)
+    assert after == before
+    assert after[0]["job_id"] == job_id
+    assert after[0]["decision_hash"] == before[0]["decision_hash"]
+    assert await _projection(item_id) == projection_before
+
+
+async def test_classification_run_can_be_pruned_without_rewriting_its_decision() -> None:
+    """Classification provenance remains after its source receipt is deleted."""
+    settings.admission_assessment_capture_enabled = True
+    tenant_id, principal_id = await _default_ids()
+    item_id = await _insert_item(
+        tenant_id=tenant_id, principal_id=principal_id, memory_confidence=0.1
+    )
+    run_id = await _bind_classification_run(item_id, tenant_id, principal_id)
+    await _promote(tenant_id)
+
+    before = await _assessments(item_id)
+    projection_before = await _projection(item_id)
+    assert len(before) == 1
+    assert before[0]["classification_run_id"] == run_id
+    assert projection_before is not None
+
+    async with _engine.begin() as conn:
+        await conn.execute(
+            text("DELETE FROM classification_runs WHERE id = :id"), {"id": run_id}
+        )
+
+    after = await _assessments(item_id)
+    assert after == before
+    assert after[0]["classification_run_id"] == run_id
+    assert after[0]["decision_hash"] == before[0]["decision_hash"]
+    assert await _projection(item_id) == projection_before
+
+
 # --- Audit linkage lifecycle (issue #159 review) -----------------------------
 
 

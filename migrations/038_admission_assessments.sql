@@ -18,7 +18,10 @@ CREATE TABLE IF NOT EXISTS admission_assessments (
         CHECK (schema_version = 'engram.admission-assessment.v1'),
     mode TEXT NOT NULL CHECK (mode IN ('authoritative','shadow','legacy_import')),
     evaluation_id UUID,
-    job_id UUID REFERENCES jobs(id) ON DELETE SET NULL,
+    -- Durable provenance, not a lifecycle dependency. The insert trigger
+    -- validates that the job belongs to this tenant. The UUID remains after
+    -- transient queue history is pruned.
+    job_id UUID,
     trigger_type TEXT NOT NULL,
     trigger_id TEXT NOT NULL,
     invocation_source TEXT NOT NULL,
@@ -48,7 +51,9 @@ CREATE TABLE IF NOT EXISTS admission_assessments (
     decision_inputs JSONB NOT NULL DEFAULT '{}'::jsonb
         CHECK (jsonb_typeof(decision_inputs) = 'object'
             AND octet_length(decision_inputs::text) <= 8192),
-    classification_run_id UUID REFERENCES classification_runs(id) ON DELETE SET NULL,
+    -- Durable provenance. Classification receipts are lifecycle-deletable,
+    -- so no referential action may rewrite this immutable row.
+    classification_run_id UUID,
     available_memory_assessment_refs JSONB NOT NULL DEFAULT '[]'::jsonb
         CHECK (jsonb_typeof(available_memory_assessment_refs) = 'array'
             AND jsonb_array_length(available_memory_assessment_refs) <= 16
@@ -62,7 +67,7 @@ CREATE TABLE IF NOT EXISTS admission_assessments (
         CHECK (jsonb_typeof(next_actions) = 'array'
             AND jsonb_array_length(next_actions) <= 8),
     decision_hash TEXT NOT NULL,
-    prior_assessment_id UUID REFERENCES admission_assessments(id) ON DELETE SET NULL,
+    prior_assessment_id UUID,
     -- Deferred NO ACTION, not SET NULL. SET NULL would make PostgreSQL's
     -- referential action attempt an UPDATE on this table when the audit event
     -- goes away, which the no-rewrite trigger below refuses — so deleting a
@@ -121,6 +126,27 @@ CREATE TABLE IF NOT EXISTS admission_assessment_current (
 -- Converge an already-created table from an earlier build of this migration.
 ALTER TABLE admission_assessments
     ADD COLUMN IF NOT EXISTS resulting_state_digest TEXT;
+
+-- Converge earlier builds away from referential SET NULL actions. Those
+-- actions issue UPDATE statements against immutable history and make the
+-- referenced queue or classification row undeletable. The insert trigger
+-- validates each provenance UUID while its source row exists.
+ALTER TABLE admission_assessments
+    DROP CONSTRAINT IF EXISTS admission_assessments_job_id_fkey;
+ALTER TABLE admission_assessments
+    DROP CONSTRAINT IF EXISTS admission_assessments_classification_run_id_fkey;
+
+-- A prior assessment is durable history, not transient provenance. Keep its
+-- referential link, but defer a NO ACTION check so an item cascade can remove
+-- the complete same-item history chain without rewriting a row.
+ALTER TABLE admission_assessments
+    DROP CONSTRAINT IF EXISTS admission_assessments_prior_assessment_id_fkey;
+ALTER TABLE admission_assessments
+    DROP CONSTRAINT IF EXISTS fk_admission_assessment_prior;
+ALTER TABLE admission_assessments
+    ADD CONSTRAINT fk_admission_assessment_prior
+    FOREIGN KEY (prior_assessment_id) REFERENCES admission_assessments(id)
+    DEFERRABLE INITIALLY DEFERRED;
 
 -- The linked-event constraint is added after item_events is known to exist and
 -- is replaced on reapplication, so a table created by an earlier build of this
@@ -191,6 +217,13 @@ BEGIN
         IF NEW.job_id IS NOT NULL AND NOT EXISTS (
             SELECT 1 FROM jobs j WHERE j.id = NEW.job_id AND j.tenant_id = NEW.tenant_id) THEN
             RAISE EXCEPTION 'admission assessment job mismatch' USING ERRCODE = '23514';
+        END IF;
+        IF NEW.classification_run_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM classification_runs r WHERE r.id = NEW.classification_run_id
+            AND r.tenant_id = NEW.tenant_id
+            AND r.memory_item_id = NEW.memory_item_id) THEN
+            RAISE EXCEPTION 'admission assessment classification run mismatch'
+                USING ERRCODE = '23514';
         END IF;
     ELSE
         IF NOT EXISTS (SELECT 1 FROM admission_assessments a WHERE a.id = NEW.assessment_id

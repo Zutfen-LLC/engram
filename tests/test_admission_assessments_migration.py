@@ -135,6 +135,81 @@ async def test_migration_is_reapplicable() -> None:
         await owner.close()
 
 
+async def test_immutable_provenance_constraints_have_safe_delete_semantics() -> None:
+    """No foreign-key action may rewrite an admission history row."""
+    owner = await _owner_with_038()
+    try:
+        rows = await owner.fetch(
+            """SELECT a.attname, c.confdeltype, c.condeferrable, c.condeferred
+               FROM pg_constraint c
+               JOIN pg_attribute a
+                 ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+               WHERE c.conrelid = 'admission_assessments'::regclass
+                 AND c.contype = 'f'
+                 AND a.attname = ANY($1::text[])""",
+            ["job_id", "classification_run_id", "prior_assessment_id"],
+        )
+        constraints = {row["attname"]: row for row in rows}
+        assert "job_id" not in constraints
+        assert "classification_run_id" not in constraints
+        prior = constraints["prior_assessment_id"]
+        assert prior["confdeltype"] == b"a"  # NO ACTION
+        assert prior["condeferrable"] is True
+        assert prior["condeferred"] is True
+    finally:
+        await owner.close()
+
+
+async def test_provenance_insert_validation_rejects_cross_tenant_sources() -> None:
+    """Plain provenance UUIDs still require a valid tenant and item binding."""
+    import asyncpg
+
+    owner = await _owner_with_038()
+    try:
+        tenant_a, _, item_a = await _seed_item(owner)
+        tenant_b, principal_b, item_b = await _seed_item(owner)
+        job_b = uuid.uuid4()
+        run_b = uuid.uuid4()
+        await owner.execute(
+            "INSERT INTO jobs(id, tenant_id, job_type) "
+            "VALUES ($1, $2, 'promotion.evaluate')",
+            job_b,
+            tenant_b,
+        )
+        await owner.execute(
+            """INSERT INTO classification_runs(
+                   id, tenant_id, principal_id, memory_item_id, bound_at, content_hash,
+                   canonicalization_version, source_type, suggested_kind,
+                   taxonomy_confidence, retention_confidence, retention_disposition,
+                   reason, provenance, classification_version, retention_policy_version,
+                   expires_at)
+               VALUES ($1, $2, $3, $4, now(), 'sha256:aa', 'v1', 'manual', 'fact',
+                   0.9, 0.9, 'retain', 'test', '{}'::jsonb, 'classification-v2',
+                   'retention-v1', now() + interval '1 day')""",
+            run_b,
+            tenant_b,
+            principal_b,
+            item_b,
+        )
+        sql = """INSERT INTO admission_assessments(
+                     id, tenant_id, memory_item_id, schema_version, mode, job_id,
+                     classification_run_id, trigger_type, trigger_id, invocation_source,
+                     evaluated_at, item_content_hash, input_digest, policy_profile_key,
+                     policy_contract_version, policy_config_digest, outcome,
+                     conflict_recheck_status, decision_hash)
+                 VALUES ($1, $2, $3, 'engram.admission-assessment.v1', 'authoritative',
+                     $4, $5, 'manual', 'test', 'promotion.evaluate', now(), 'sha256:aa',
+                     'sha256:bb', 'path_a_compat', 'path-a-compat-v1', 'sha256:cc',
+                     'cooling', 'not_run', 'sha256:dd')"""
+
+        with pytest.raises(asyncpg.CheckViolationError):
+            await owner.execute(sql, uuid.uuid4(), tenant_a, item_a, job_b, None)
+        with pytest.raises(asyncpg.CheckViolationError):
+            await owner.execute(sql, uuid.uuid4(), tenant_a, item_a, None, run_b)
+    finally:
+        await owner.close()
+
+
 async def test_downgrade_preserves_history_and_refuses_while_work_is_in_flight() -> None:
     """Rollback is "stop capturing", never "destroy the record"."""
     owner = await _owner_with_038()
@@ -455,6 +530,58 @@ async def test_deleting_an_item_cascades_its_decisions_away() -> None:
         await owner.execute("DELETE FROM memory_items WHERE id = $1", item_id)
         assert await owner.fetchval(
             "SELECT count(*) FROM admission_assessments WHERE id = $1", row_id
+        ) == 0
+        assert await owner.fetchval(
+            "SELECT count(*) FROM admission_assessment_current WHERE memory_item_id = $1",
+            item_id,
+        ) == 0
+    finally:
+        await owner.close()
+
+
+async def test_item_cleanup_cascades_a_prior_assessment_chain() -> None:
+    """An item cascade removes a prior chain without rewriting it."""
+    import asyncpg
+
+    owner = await _owner_with_038()
+    try:
+        tenant_id, _, item_id = await _seed_item(owner)
+        prior_id = await _insert(owner, tenant_id, item_id)
+        current_id = uuid.uuid4()
+        await owner.execute(
+            """INSERT INTO admission_assessments(
+                   id, tenant_id, memory_item_id, schema_version, mode, trigger_type,
+                   trigger_id, invocation_source, evaluated_at, item_content_hash,
+                   input_digest, policy_profile_key, policy_contract_version,
+                   policy_config_digest, outcome, conflict_recheck_status,
+                   decision_hash, prior_assessment_id)
+               VALUES ($1, $2, $3, 'engram.admission-assessment.v1', 'authoritative',
+                   'legacy_caller', 'test-current', 'test', now(), 'sha256:aa',
+                   'sha256:bb', 'path_a_compat', 'path-a-compat-v1', 'sha256:cc',
+                   'cooling', 'not_run', 'sha256:ee', $4)""",
+            current_id,
+            tenant_id,
+            item_id,
+            prior_id,
+        )
+        await owner.execute(
+            """INSERT INTO admission_assessment_current(tenant_id, memory_item_id,
+                   policy_profile_key, assessment_id, mode, mode_rank, mutation_rank,
+                   evaluated_at)
+               SELECT $1, $2, 'path_a_compat', $3, 'authoritative', 1, 0, evaluated_at
+               FROM admission_assessments WHERE id = $3""",
+            tenant_id,
+            item_id,
+            current_id,
+        )
+
+        with pytest.raises(asyncpg.ForeignKeyViolationError):
+            await owner.execute("DELETE FROM admission_assessments WHERE id = $1", prior_id)
+        await owner.execute("DELETE FROM memory_items WHERE id = $1", item_id)
+
+        assert await owner.fetchval(
+            "SELECT count(*) FROM admission_assessments WHERE id = ANY($1::uuid[])",
+            [prior_id, current_id],
         ) == 0
         assert await owner.fetchval(
             "SELECT count(*) FROM admission_assessment_current WHERE memory_item_id = $1",

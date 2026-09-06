@@ -235,10 +235,12 @@ cannot carry a lifecycle mutation with it. Preview rows always record
 
 ## Idempotency and concurrency
 
-- `job_id` is the durable queue execution identity and a foreign-key reference
-  to the queue row. For `promotion.evaluate`, `evaluation_id` is the canonical
-  decision lookup identity and has the same UUID value as `job.id`. It remains
-  stable across every attempt of that job.
+- `job_id` is the durable queue execution identity and an immutable provenance
+  UUID. The insert trigger proves that the source job belongs to the same
+  tenant. It is not a foreign key because queue history can be pruned. For
+  `promotion.evaluate`, `evaluation_id` is the canonical decision lookup
+  identity and has the same UUID value as `job.id`. It remains stable across
+  every attempt of that job.
 - The handler locks the job row and performs the completed-execution lookup
   before it reloads the item, reconstructs execution authority, or calls the
   policy evaluator. A retry therefore cannot create a new mutation after the
@@ -266,6 +268,18 @@ cannot carry a lifecycle mutation with it. Preview rows always record
   `review_change` event.
 
 ## Audit linkage lifecycle
+
+`job_id` and `classification_run_id` are durable provenance UUIDs without
+foreign keys. Their source rows are lifecycle-deletable. Referential
+`ON DELETE SET NULL` actions would issue forbidden updates against immutable
+assessment history. The integrity trigger validates each supplied source and
+its tenant or item binding when the assessment is inserted. Later source-row
+pruning leaves the recorded UUID unchanged.
+
+`prior_assessment_id` keeps a deferred `NO ACTION` foreign key. Every linked
+prior row belongs to the same item and policy profile. Deferring the check
+allows an item cascade to delete the complete history chain. A standalone
+prior-row deletion cannot orphan a surviving assessment.
 
 An admitted decision and the `review_change` event it authorized name each
 other. That bidirectional link must not make the parent item undeletable.
