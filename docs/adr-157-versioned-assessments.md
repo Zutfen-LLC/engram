@@ -134,8 +134,12 @@ It includes the creation time in UTC. This is a database-attested hash. It is
 not a digital signature or proof that the proposition is true.
 
 Migration 037 copies existing bound classification receipts into legacy assessment
-rows. It preserves taxonomy, retention, disposition, content/context hashes, and
-known provider versions. Unknown prompt/configuration versions remain null.
+rows. It preserves taxonomy, disposition, content/context hashes, and known
+provider versions. It preserves retention when the durable marker records a
+provider assessment. For pre-marker receipts, it preserves only nonzero retention.
+The old zero value is also the rules-only, provider-disabled, and provider-failure
+sentinel, so it maps to unknown unless another durable marker proves otherwise.
+Unknown prompt/configuration versions remain null.
 Epistemic state and risk remain unknown. Migration reapplication does not change
 existing rows. Unbound receipts are not backfilled.
 

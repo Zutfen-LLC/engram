@@ -209,42 +209,63 @@ async def claim_next_job(
     moment = now or _utcnow()
     types_filter = tuple(job_types) if job_types else None
 
-    subq = (
+    eligible = (
         select(Job.id)
         .where(
             Job.status == STATUS_PENDING,
             Job.run_after <= moment,
         )
-        .limit(1)
-        .with_for_update(skip_locked=True)
     )
     if types_filter:
-        subq = subq.where(Job.job_type.in_(types_filter))
+        eligible = eligible.where(Job.job_type.in_(types_filter))
 
-    if types_filter and set(types_filter) == {"assessment.reassess"}:
-        # Fairness is a lane policy. Apply it only when the claim is restricted
-        # to reassessment work, so it cannot reorder unrelated queue work.
-        history = Job.__table__.alias("assessment_history")
-        last_assessment_attempt = select(func.max(history.c.updated_at)).where(
-            history.c.tenant_id == Job.tenant_id,
-            history.c.job_type == "assessment.reassess",
-            history.c.attempts > 0,
-        ).correlate(Job).scalar_subquery()
-        subq = subq.order_by(
+    normal_candidate = (
+        eligible.add_columns(Job.job_type)
+        .order_by(Job.run_after.asc(), Job.priority.asc(), Job.created_at.asc())
+        .limit(1)
+        .with_for_update(skip_locked=True)
+        .cte("normal_candidate")
+    )
+    history = Job.__table__.alias("assessment_history")
+    last_assessment_attempt = select(func.max(history.c.updated_at)).where(
+        history.c.tenant_id == Job.tenant_id,
+        history.c.job_type == "assessment.reassess",
+        history.c.attempts > 0,
+    ).correlate(Job).scalar_subquery()
+    fair_assessment_candidate = (
+        eligible.where(
+            Job.job_type == "assessment.reassess",
+            select(normal_candidate.c.id)
+            .where(normal_candidate.c.job_type == "assessment.reassess")
+            .exists(),
+        )
+        .order_by(
             last_assessment_attempt.asc().nulls_first(),
             Job.run_after.asc(),
             Job.priority.asc(),
             Job.created_at.asc(),
         )
-    else:
-        # Preserve the queue's historical global ordering for mixed and
-        # unfiltered claims.
-        subq = subq.order_by(Job.run_after.asc(), Job.priority.asc(), Job.created_at.asc())
+        .limit(1)
+        .with_for_update(skip_locked=True)
+        .cte("fair_assessment_candidate")
+    )
+    candidate_id = (
+        select(fair_assessment_candidate.c.id)
+        .union_all(
+            select(normal_candidate.c.id).where(
+                normal_candidate.c.job_type != "assessment.reassess"
+            )
+        )
+        .scalar_subquery()
+    )
 
+    # A normal candidate selects the queue position. If that position is a
+    # reassessment, select fairly inside that lane. Otherwise retain the
+    # historical global due-time and priority order for unrelated work.
     claimed = (
         await session.execute(
             update(Job)
-            .where(Job.id == subq)
+            .where(Job.id == candidate_id)
             .values(
                 status=STATUS_RUNNING,
                 attempts=Job.attempts + 1,

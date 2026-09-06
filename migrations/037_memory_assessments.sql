@@ -169,8 +169,11 @@ ALTER TABLE memory_assessments ADD CONSTRAINT assessment_dimensions_valid CHECK 
 
 -- Backfill only bound receipts. Unknown versions and attribution stay unknown.
 -- Rules-only and provider-disabled classification stores retention_confidence=0
--- for compatibility. Only the explicit durable marker proves that a provider
--- returned a numeric retention value for the historical classification.
+-- for compatibility. The explicit durable marker proves that a provider
+-- returned a numeric retention value after this marker was introduced. Older
+-- receipts have no marker. A nonzero older value is unambiguously not the
+-- rules-only/provider-failure sentinel, so preserve it. An older zero remains
+-- ambiguous and maps to unknown.
 INSERT INTO memory_assessments(id, tenant_id, memory_item_id, legacy_run_id, purpose,
     contract_hash, input_digest, state, receipt, created_at)
 SELECT r.id, r.tenant_id, r.memory_item_id, r.id, 'combined',
@@ -184,6 +187,9 @@ SELECT r.id, r.tenant_id, r.memory_item_id, r.id, 'combined',
             'suggested_kind', r.suggested_kind,
             'retention', jsonb_build_object('raw_value', CASE
                 WHEN r.provenance->>'retention_assessment_recorded' = 'true'
+                THEN r.retention_confidence
+                WHEN NOT (r.provenance ? 'retention_assessment_recorded')
+                    AND r.retention_confidence <> 0
                 THEN r.retention_confidence
                 ELSE NULL
             END),

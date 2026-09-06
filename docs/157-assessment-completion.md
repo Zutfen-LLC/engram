@@ -12,7 +12,7 @@ solely because it is newer.
 | --- | --- |
 | `confidence` | Deprecated taxonomy-only alias |
 | `taxonomy_confidence` | Raw taxonomy score |
-| `retention_confidence` | Raw usefulness score; rules-only zero becomes null in the additive API field |
+| `retention_confidence` | Raw usefulness score; marker-recorded values and pre-marker nonzero values are preserved. Ambiguous old zero becomes null in the additive API field. |
 | `retention_disposition` | Storage disposition; no truth or admission claim |
 | `memory_confidence` | Historical source-policy prior; unchanged |
 | Bound classification receipt | Immutable legacy assessment with unknown epistemic state and risk |

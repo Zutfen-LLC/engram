@@ -1,5 +1,7 @@
 """Assessment lifecycle proofs through HTTP and the worker job boundary."""
 
+import json
+
 import pytest
 from sqlalchemy import text
 
@@ -65,6 +67,54 @@ async def create_item(client):
     )
     assert response.status_code == 201, response.text
     return response.json()["id"]
+
+
+async def insert_legacy_classification_run(
+    stack,
+    *,
+    item_id: str,
+    retention_confidence: float,
+    provenance: dict[str, object],
+) -> None:
+    """Create a bound receipt with the pre-#181 database shape.
+
+    This bypasses the current classification implementation. Production rows
+    created before #181 cannot contain its provenance marker.
+    """
+    from uuid import uuid4
+
+    _, _, owner, _, tenant_id, principal_id, *_ = stack
+    run_id = uuid4()
+    async with owner.begin() as db:
+        await db.execute(
+            text(
+                """
+                INSERT INTO classification_runs(
+                    id, tenant_id, principal_id, memory_item_id, bound_at,
+                    content_hash, canonicalization_version, source_type,
+                    context_hash, suggested_kind, taxonomy_confidence,
+                    retention_confidence, retention_disposition, reason,
+                    provenance, classification_version, retention_policy_version,
+                    expires_at
+                ) VALUES (
+                    :id, :tenant_id, :principal_id, :item_id, now(),
+                    :content_hash, 'v1', 'manual', 'legacy-context', 'fact',
+                    0.91, :retention_confidence, 'retain', 'legacy provider result',
+                    CAST(:provenance AS jsonb), 'classification-v1', 'retention-v1',
+                    now() + interval '1 day'
+                )
+                """
+            ),
+            {
+                "id": run_id,
+                "tenant_id": tenant_id,
+                "principal_id": principal_id,
+                "item_id": item_id,
+                "content_hash": f"legacy-content-{run_id}",
+                "retention_confidence": retention_confidence,
+                "provenance": json.dumps(provenance),
+            },
+        )
 
 
 async def run_job(stack):
@@ -551,6 +601,7 @@ async def test_assessment_access_follows_item_and_review_authority(assessment_st
 
 
 async def test_assessment_queue_rotates_between_tenants(assessment_stack):
+    from datetime import UTC, datetime, timedelta
     from uuid import uuid4
 
     from sqlalchemy import text
@@ -558,41 +609,92 @@ async def test_assessment_queue_rotates_between_tenants(assessment_stack):
 
     from engram.jobs import claim_next_job, enqueue_job_in_transaction, mark_job_succeeded
 
-    _, _, owner, _, tid, *_ = assessment_stack
-    other = uuid4()
+    _, _, owner, _, _, *_ = assessment_stack
+    first_tenant = uuid4()
+    second_tenant = uuid4()
     factory = async_sessionmaker(owner, expire_on_commit=False)
+    now = datetime(2000, 1, 1, tzinfo=UTC)
     async with owner.begin() as conn:
-        await conn.execute(
-            text("INSERT INTO tenants(id,name,slug) VALUES (:t,:s,:s)"),
-            {"t": other, "s": f"assessment-{other}"},
-        )
+        for tenant in (first_tenant, second_tenant):
+            await conn.execute(
+                text("INSERT INTO tenants(id,name,slug) VALUES (:t,:s,:s)"),
+                {"t": tenant, "s": f"assessment-{tenant}"},
+            )
     job_ids = []
     try:
         async with factory() as db:
-            for tenant in (tid, tid, other):
+            for tenant in (first_tenant, first_tenant, second_tenant):
                 job_ids.append(
                     await enqueue_job_in_transaction(
                         db,
                         tenant_id=tenant,
                         job_type="assessment.reassess",
                         payload={},
+                        run_after=now - timedelta(seconds=5),
                     )
                 )
             await db.commit()
-            first = await claim_next_job(
-                db, worker_id="fairness", job_types=["assessment.reassess"]
-            )
-            assert first.tenant_id == tid
+            first = await claim_next_job(db, worker_id="fairness", now=now)
+            assert first.tenant_id == first_tenant
             await mark_job_succeeded(db, first.id)
-            second = await claim_next_job(
-                db, worker_id="fairness", job_types=["assessment.reassess"]
-            )
-            assert second.tenant_id == other
+            second = await claim_next_job(db, worker_id="fairness", now=now)
+            assert second.tenant_id == second_tenant
     finally:
         async with owner.begin() as conn:
             for job_id in job_ids:
                 await conn.execute(text("DELETE FROM jobs WHERE id=:i"), {"i": job_id})
-            await conn.execute(text("DELETE FROM tenants WHERE id=:i"), {"i": other})
+            for tenant in (first_tenant, second_tenant):
+                await conn.execute(text("DELETE FROM tenants WHERE id=:i"), {"i": tenant})
+
+
+async def test_assessment_queue_filtered_claims_remain_fair(assessment_stack):
+    from datetime import UTC, datetime, timedelta
+    from uuid import uuid4
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from engram.jobs import claim_next_job, enqueue_job_in_transaction, mark_job_succeeded
+
+    _, _, owner, _, _, *_ = assessment_stack
+    first_tenant = uuid4()
+    second_tenant = uuid4()
+    factory = async_sessionmaker(owner, expire_on_commit=False)
+    now = datetime(2000, 1, 1, tzinfo=UTC)
+    async with owner.begin() as conn:
+        for tenant in (first_tenant, second_tenant):
+            await conn.execute(
+                text("INSERT INTO tenants(id,name,slug) VALUES (:t,:s,:s)"),
+                {"t": tenant, "s": f"filtered-assessment-{tenant}"},
+            )
+    job_ids = []
+    try:
+        async with factory() as db:
+            for tenant in (first_tenant, first_tenant, second_tenant):
+                job_ids.append(
+                    await enqueue_job_in_transaction(
+                        db,
+                        tenant_id=tenant,
+                        job_type="assessment.reassess",
+                        payload={},
+                        run_after=now - timedelta(seconds=5),
+                    )
+                )
+            await db.commit()
+            first = await claim_next_job(
+                db, worker_id="filtered-fairness", job_types=["assessment.reassess"], now=now
+            )
+            assert first.tenant_id == first_tenant
+            await mark_job_succeeded(db, first.id)
+            second = await claim_next_job(
+                db, worker_id="filtered-fairness", job_types=["assessment.reassess"], now=now
+            )
+            assert second.tenant_id == second_tenant
+    finally:
+        async with owner.begin() as conn:
+            for job_id in job_ids:
+                await conn.execute(text("DELETE FROM jobs WHERE id=:i"), {"i": job_id})
+            for tenant in (first_tenant, second_tenant):
+                await conn.execute(text("DELETE FROM tenants WHERE id=:i"), {"i": tenant})
 
 
 async def test_assessment_fairness_does_not_change_global_job_order(assessment_stack):
@@ -603,21 +705,23 @@ async def test_assessment_fairness_does_not_change_global_job_order(assessment_s
 
     from engram.jobs import claim_next_job, enqueue_job_in_transaction, mark_job_succeeded
 
-    _, _, owner, _, tenant_id, *_ = assessment_stack
-    other = uuid4()
+    _, _, owner, _, _, *_ = assessment_stack
+    first_tenant = uuid4()
+    second_tenant = uuid4()
     factory = async_sessionmaker(owner, expire_on_commit=False)
     # Use a fixed historical window so this test's jobs sort before pending
     # jobs left by earlier integration tests.
     now = datetime(2000, 1, 1, tzinfo=UTC)
     async with owner.begin() as conn:
-        await conn.execute(
-            text("INSERT INTO tenants(id,name,slug) VALUES (:t,:s,:s)"),
-            {"t": other, "s": f"assessment-mixed-{other}"},
-        )
+        for tenant in (first_tenant, second_tenant):
+            await conn.execute(
+                text("INSERT INTO tenants(id,name,slug) VALUES (:t,:s,:s)"),
+                {"t": tenant, "s": f"assessment-mixed-{tenant}"},
+            )
     job_ids = []
     try:
         async with factory() as db:
-            for tenant in (tenant_id, tenant_id, other):
+            for tenant in (first_tenant, first_tenant, second_tenant):
                 job_ids.append(
                     await enqueue_job_in_transaction(
                         db,
@@ -629,7 +733,7 @@ async def test_assessment_fairness_does_not_change_global_job_order(assessment_s
                 )
             unrelated = await enqueue_job_in_transaction(
                 db,
-                tenant_id=tenant_id,
+                tenant_id=first_tenant,
                 job_type="embedding.generate",
                 payload={},
                 run_after=now - timedelta(seconds=10),
@@ -637,7 +741,7 @@ async def test_assessment_fairness_does_not_change_global_job_order(assessment_s
             job_ids.append(unrelated)
             unrelated_second = await enqueue_job_in_transaction(
                 db,
-                tenant_id=tenant_id,
+                tenant_id=first_tenant,
                 job_type="classification.refine",
                 payload={},
                 run_after=now - timedelta(seconds=8),
@@ -645,32 +749,31 @@ async def test_assessment_fairness_does_not_change_global_job_order(assessment_s
             job_ids.append(unrelated_second)
             await db.commit()
 
-            first = await claim_next_job(db, worker_id="mixed")
+            first = await claim_next_job(db, worker_id="mixed", now=now)
             assert first is not None
             assert first.job_type == "embedding.generate"
             await mark_job_succeeded(db, first.id)
-            second = await claim_next_job(db, worker_id="mixed")
+            second = await claim_next_job(db, worker_id="mixed", now=now)
             assert second is not None
             assert second.job_type == "classification.refine"
             await mark_job_succeeded(db, second.id)
 
-            lane = []
-            for _ in range(3):
-                claimed = await claim_next_job(
-                    db, worker_id="lane", job_types=["assessment.reassess"]
-                )
-                assert claimed is not None
-                lane.append(claimed.tenant_id)
-                await mark_job_succeeded(db, claimed.id)
-            assert lane == [tenant_id, other, tenant_id]
+            first_assessment = await claim_next_job(db, worker_id="mixed", now=now)
+            assert first_assessment is not None
+            assert first_assessment.tenant_id == first_tenant
+            await mark_job_succeeded(db, first_assessment.id)
+            second_assessment = await claim_next_job(db, worker_id="mixed", now=now)
+            assert second_assessment is not None
+            assert second_assessment.tenant_id == second_tenant
     finally:
         async with owner.begin() as conn:
             for job_id in job_ids:
                 await conn.execute(text("DELETE FROM jobs WHERE id=:i"), {"i": job_id})
-            await conn.execute(text("DELETE FROM tenants WHERE id=:i"), {"i": other})
+            for tenant in (first_tenant, second_tenant):
+                await conn.execute(text("DELETE FROM tenants WHERE id=:i"), {"i": tenant})
 
 
-async def test_migration_backfills_legacy_receipt_without_epistemic_evidence(assessment_stack):
+async def test_migration_backfill_preserves_pre_marker_nonzero_retention(assessment_stack):
     import os
     from pathlib import Path
 
@@ -679,38 +782,27 @@ async def test_migration_backfills_legacy_receipt_without_epistemic_evidence(ass
     from engram.migrations import normalize_asyncpg_url
 
     client, *_ = assessment_stack
-    content = "Keep an audit trail for schema changes."
-    classified = (
-        await client.post(
-            "/v1/classify",
-            json={
-                "content": content,
-                "source_type": "sync_turn",
-            },
-        )
-    ).json()
-    captured = await client.post(
-        "/v1/remember",
-        json={
-            "content": content,
-            "kind": classified["suggested_kind"],
-            "source_type": "sync_turn",
-            "classification_run_id": classified["classification_run_id"],
+    item_id = await create_item(client)
+    await insert_legacy_classification_run(
+        assessment_stack,
+        item_id=item_id,
+        retention_confidence=0.82,
+        provenance={
+            "provider": "openai",
+            "model": "gpt-4o-mini",
+            "classification_mode": "llm",
         },
     )
-    assert captured.status_code == 201, captured.text
-    item_id = captured.json()["id"]
     conn = await asyncpg.connect(normalize_asyncpg_url(os.environ["ENGRAM_OWNER_DATABASE_URL"]))
     try:
         await conn.execute(Path("migrations/037_memory_assessments.sql").read_text())
         first = (await client.get(f"/v1/items/{item_id}/assessments")).json()
         row = first["assessments"][0]
         assert row["state"] == "legacy"
-        assert row["dimensions"]["taxonomy"]["raw_value"] == pytest.approx(
-            classified["taxonomy_confidence"],
-        )
-        assert row["dimensions"]["retention"]["raw_value"] is None
+        assert row["dimensions"]["taxonomy"]["raw_value"] == pytest.approx(0.91)
+        assert row["dimensions"]["retention"]["raw_value"] == pytest.approx(0.82)
         assert row["dimensions"]["epistemic_state"] == "unknown"
+        assert row["dimensions"]["risk"] == "unknown"
         await conn.execute(Path("migrations/037_memory_assessments.sql").read_text())
         second = (await client.get(f"/v1/items/{item_id}/assessments")).json()
         assert second == first
@@ -718,7 +810,40 @@ async def test_migration_backfills_legacy_receipt_without_epistemic_evidence(ass
         await conn.close()
 
 
-async def test_migration_backfill_preserves_recorded_llm_retention(assessment_stack, monkeypatch):
+async def test_migration_backfill_maps_pre_marker_zero_retention_to_unknown(assessment_stack):
+    import os
+    from pathlib import Path
+
+    import asyncpg
+
+    from engram.migrations import normalize_asyncpg_url
+
+    client, *_ = assessment_stack
+    item_id = await create_item(client)
+    await insert_legacy_classification_run(
+        assessment_stack,
+        item_id=item_id,
+        retention_confidence=0.0,
+        provenance={"provider": "none", "classification_mode": "rules_only"},
+    )
+    conn = await asyncpg.connect(normalize_asyncpg_url(os.environ["ENGRAM_OWNER_DATABASE_URL"]))
+    try:
+        legacy_value = await conn.fetchval(
+            "SELECT retention_confidence FROM classification_runs WHERE memory_item_id=$1::uuid",
+            item_id,
+        )
+        assert legacy_value == pytest.approx(0.0)
+        await conn.execute(Path("migrations/037_memory_assessments.sql").read_text())
+        history = (await client.get(f"/v1/items/{item_id}/assessments")).json()
+        assert history["assessments"][0]["dimensions"]["retention"]["raw_value"] is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.parametrize("retention_confidence", [0.73, 0.0])
+async def test_migration_backfill_preserves_recorded_llm_retention(
+    assessment_stack, monkeypatch, retention_confidence
+):
     import os
     from pathlib import Path
 
@@ -734,7 +859,7 @@ async def test_migration_backfill_preserves_recorded_llm_retention(assessment_st
         return {
             "suggested_kind": "fact",
             "taxonomy_confidence": 0.91,
-            "retention_confidence": 0.73,
+            "retention_confidence": retention_confidence,
             "retention_disposition": "retain",
         }
 
