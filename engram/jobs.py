@@ -27,10 +27,11 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import func, select, text, update
+from sqlalchemy import case, func, select, text, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from engram.models import Job
 
@@ -209,13 +210,28 @@ async def claim_next_job(
     moment = now or _utcnow()
     types_filter = tuple(job_types) if job_types else None
 
+    # Reassessment batches rotate by the tenant's last attempt. Other job
+    # types retain their existing due-time order.
+    history = aliased(Job)
+    last_assessment_attempt = select(func.max(history.updated_at)).where(
+        history.tenant_id == Job.tenant_id,
+        history.job_type == "assessment.reassess", history.attempts > 0,
+    ).correlate(Job).scalar_subquery()
+    fair_due_time = case(
+        (Job.job_type == "assessment.reassess",
+         func.coalesce(last_assessment_attempt, datetime(1970, 1, 1, tzinfo=UTC))),
+        else_=Job.run_after,
+    )
+
     subq = (
         select(Job.id)
         .where(
             Job.status == STATUS_PENDING,
             Job.run_after <= moment,
         )
-        .order_by(Job.run_after.asc(), Job.priority.asc(), Job.created_at.asc())
+        .order_by(
+            fair_due_time.asc(), Job.run_after.asc(), Job.priority.asc(), Job.created_at.asc(),
+        )
         .limit(1)
         .with_for_update(skip_locked=True)
     )

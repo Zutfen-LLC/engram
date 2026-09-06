@@ -22,6 +22,7 @@ from uuid import UUID
 import httpx
 from pydantic import BaseModel
 
+from .assessments import AssessmentHistory, ReassessRequest, ReassessResponse
 from .extraction import ExtractRequest, ExtractResponse
 from .models import (
     AgentCreated,
@@ -372,6 +373,25 @@ class EngramClient:
         return await self._send(
             "POST", "/v1/extract", ExtractResponse,
             json_body=request.model_dump(mode="json", exclude_none=True),
+        )
+
+    async def assessments(self, item_id: UUID, *, limit: int = 50) -> AssessmentHistory:
+        """Read normalized assessment history. Unknown scores remain null."""
+        return await self._send(
+            "GET", f"/v1/items/{item_id}/assessments?limit={limit}", AssessmentHistory,
+        )
+
+    async def reassess(self, item_id: UUID, request: ReassessRequest) -> ReassessResponse:
+        """Request a versioned assessment with review authority."""
+        return await self._send(
+            "POST", f"/v1/items/{item_id}/reassess", ReassessResponse,
+            json_body=request.model_dump(mode="json", exclude_none=True),
+        )
+
+    async def reassessment_status(self, item_id: UUID, request_id: UUID) -> ReassessResponse:
+        """Read retry and dead-letter status for a reassessment."""
+        return await self._send(
+            "GET", f"/v1/items/{item_id}/reassessments/{request_id}", ReassessResponse,
         )
 
     async def classify(

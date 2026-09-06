@@ -1248,6 +1248,13 @@ async def _remember_impl(
                 dedupe_key=f"embedding.generate:{item.id}:{profile.id}",
             )
 
+    if (settings.assessment_capture_enabled and settings.assessment_reassessment_enabled
+            and not extraction_transaction):
+        from engram.assessment_schema import ReassessRequest
+        from engram.assessments import request_assessment
+
+        await request_assessment(session, item, memory_context, ReassessRequest())
+
     await _commit_remember_success(session, defer_commit=extraction_transaction)
 
     outcome_ctx["final_kind"] = kind
@@ -2177,6 +2184,16 @@ async def get_item(
     if item is None:
         raise HTTPException(status_code=404, detail="Item not found")
     item["authority_label"] = authority_label(int(item["authority"]))
+    item["assessment_policy_version"] = settings.assessment_policy_version
+    item["effective_assessments"] = {}
+    if settings.assessment_selection_enabled:
+        from engram.assessments import effective_assessment_values
+
+        assessed_item = await session.get(MemoryItem, item_id)
+        if assessed_item is not None:
+            item["effective_assessments"] = await effective_assessment_values(
+                session, assessed_item, memory_context,
+            )
     events = await _fetch_events(session, item_id)
     kg_facts = await _fetch_kg_facts(session, item_id)
     return {

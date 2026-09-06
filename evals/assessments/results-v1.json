@@ -1,0 +1,100 @@
+{
+  "abstention_rate": 0.16666666666666666,
+  "brier_score": 0.22925,
+  "dataset_version": "assessment-synthetic-v1",
+  "expected_calibration_error": 0.365,
+  "kind_confusion": {
+    "decision": {
+      "decision": 2,
+      "fact": 1
+    },
+    "diary": {
+      "diary": 1,
+      "fact": 1
+    },
+    "fact": {
+      "abstained": 2,
+      "fact": 3
+    },
+    "preference": {
+      "preference": 2
+    }
+  },
+  "minimum_profile_bin_samples": 50,
+  "probabilistic_sample_count": 10,
+  "purpose": "Calibration metric regression fixtures. These scores are synthetic, not provider measurements.",
+  "reliability_bins": [
+    {
+      "count": 1,
+      "lower": 0.0,
+      "mean_raw_value": 0.0,
+      "observed_frequency": 0.0,
+      "upper": 0.1
+    },
+    {
+      "count": 1,
+      "lower": 0.1,
+      "mean_raw_value": 0.1,
+      "observed_frequency": 0.0,
+      "upper": 0.2
+    },
+    {
+      "count": 1,
+      "lower": 0.2,
+      "mean_raw_value": 0.2,
+      "observed_frequency": 1.0,
+      "upper": 0.3
+    },
+    {
+      "count": 1,
+      "lower": 0.3,
+      "mean_raw_value": 0.3,
+      "observed_frequency": 0.0,
+      "upper": 0.4
+    },
+    {
+      "count": 0,
+      "lower": 0.4,
+      "mean_raw_value": null,
+      "observed_frequency": null,
+      "upper": 0.5
+    },
+    {
+      "count": 1,
+      "lower": 0.5,
+      "mean_raw_value": 0.5,
+      "observed_frequency": 1.0,
+      "upper": 0.6
+    },
+    {
+      "count": 1,
+      "lower": 0.6,
+      "mean_raw_value": 0.6,
+      "observed_frequency": 0.0,
+      "upper": 0.7
+    },
+    {
+      "count": 1,
+      "lower": 0.7,
+      "mean_raw_value": 0.7,
+      "observed_frequency": 1.0,
+      "upper": 0.8
+    },
+    {
+      "count": 1,
+      "lower": 0.8,
+      "mean_raw_value": 0.8,
+      "observed_frequency": 1.0,
+      "upper": 0.9
+    },
+    {
+      "count": 2,
+      "lower": 0.9,
+      "mean_raw_value": 0.925,
+      "observed_frequency": 0.5,
+      "upper": 1.0
+    }
+  ],
+  "sample_count": 12,
+  "status": "uncalibrated"
+}

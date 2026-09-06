@@ -49,6 +49,7 @@ from uuid import UUID
 from sqlalchemy import insert, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from engram.assessment_worker import handle_assessment_reassess
 from engram.authority import authority_allows_supersession, qualifies_for_auto_supersession
 from engram.config import settings
 from engram.db import _DEFAULT_PRINCIPAL_NAME, apply_rls_context
@@ -2077,8 +2078,10 @@ async def handle_recall_telemetry(session: AsyncSession, job: Job) -> None:
     )
 
 
+
 # Registry of job type → handler.
 JOB_HANDLERS: dict[str, JobHandler] = {
+    "assessment.reassess": handle_assessment_reassess,
     "embedding.generate": handle_embedding_generate,
     "conflict.check": handle_conflict_check,
     "classification.refine": handle_classification_refine,

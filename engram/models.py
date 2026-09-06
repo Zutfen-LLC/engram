@@ -752,6 +752,51 @@ class ClassificationRun(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class AssessmentRequest(Base):
+    """Immutable reassessment identity and requesting authority."""
+
+    __tablename__ = "assessment_requests"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    memory_item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    principal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    execution_context_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    purpose: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    target: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    contract_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    input_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    job_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class MemoryAssessment(Base):
+    """Append-only dimensions and bounded process evidence for one item."""
+
+    __tablename__ = "memory_assessments"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    memory_item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    request_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    legacy_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    purpose: Mapped[str] = mapped_column(Text, nullable=False)
+    contract_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    input_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(Text, nullable=False)
+    prior_assessment_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    receipt: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    canonical_hash: Mapped[str] = mapped_column(Text, server_default=text("''"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
 class ClassificationRule(Base):
     __tablename__ = "classification_rules"
 

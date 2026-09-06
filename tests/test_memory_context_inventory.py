@@ -13,6 +13,9 @@ _MEMORY_ITEM_READ_ROUTES = {
     ("POST", "/v1/search"),
     ("GET", "/v1/items"),
     ("GET", "/v1/items/{item_id}"),
+    ("GET", "/v1/items/{item_id}/assessments"),
+    ("GET", "/v1/items/{item_id}/assessments/{assessment_id}/debug"),
+    ("GET", "/v1/items/{item_id}/reassessments/{request_id}"),
     ("GET", "/v1/kg/query"),
     ("GET", "/v1/kg/timeline"),
     ("GET", "/v1/review/queue"),
@@ -26,6 +29,9 @@ _MEMORY_ITEM_READ_ROUTES = {
 }
 
 _PROFILE_ENFORCED_MUTATIONS = {
+    ("POST", "/v1/items/{item_id}/reassess"),
+    ("POST", "/v1/items/{item_id}/reassessments/{request_id}/retry"),
+    ("POST", "/v1/assessments/reassess"),
     ("POST", "/v1/remember"),
     ("POST", "/v1/classify"),
     ("POST", "/v1/extract"),

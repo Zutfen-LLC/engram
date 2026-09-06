@@ -19,6 +19,8 @@ EXPECTED_TOOLS = {
     "engram_recall",
     "engram_search",
     "engram_classify",
+    "engram_assessments",
+    "engram_reassess",
     "engram_kg_query",
     "engram_kg_add",
     "engram_diary_write",

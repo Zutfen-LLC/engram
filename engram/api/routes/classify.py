@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from uuid import UUID, uuid4
 
@@ -10,6 +11,7 @@ from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from engram.assessment_schema import AssessmentDimensions, CalibratedScore
 from engram.auth import ADMIN_SCOPE, READ_SCOPE
 from engram.auth import Principal as AuthPrincipal
 from engram.candidate_ingests import CandidateIdentity, create_ingest
@@ -53,11 +55,14 @@ class ClassifyResponse(BaseModel):
     # classifier has no opinion and the caller's visibility should be preserved.
     suggested_visibility: str | None = None
     taxonomy_confidence: float = Field(ge=0.0, le=0.95)
-    confidence: float = Field(ge=0.0, le=0.95)
-    retention_confidence: float = Field(ge=0.0, le=0.95)
+    confidence: float = Field(ge=0.0, le=0.95, deprecated=True,
+                              description="Legacy alias for taxonomy confidence only.")
+    retention_confidence: float = Field(ge=0.0, le=0.95,
+        description="Raw durable-usefulness estimate. This does not measure factual support.")
     retention_disposition: RetentionDisposition
     reason: str
     rules_matched: list[str] = Field(default_factory=list)
+    assessment_dimensions: AssessmentDimensions = Field(default_factory=AssessmentDimensions)
 
     @model_validator(mode="after")
     def keep_legacy_confidence_alias_equal(self) -> ClassifyResponse:
@@ -182,11 +187,26 @@ async def classify(
     )
     session.add(run)
     await session.commit()
+    raw_retention = result.provenance.get("llm_payload", {}).get("raw_retention_confidence")
+    retention_available = (
+        isinstance(raw_retention, (int, float))
+        and not isinstance(raw_retention, bool)
+        and math.isfinite(raw_retention)
+    )
     return ClassifyResponse(
         classification_run_id=run.id,
         expires_at=run.expires_at,
         correlation_id=correlation_id,
         ingest_id=ingest.id,
+        assessment_dimensions=AssessmentDimensions(
+            taxonomy=CalibratedScore(raw_value=result.taxonomy_confidence),
+            suggested_kind=result.suggested_kind,
+            retention=CalibratedScore(raw_value=(
+                result.retention_confidence if retention_available else None
+            )),
+            retention_disposition=result.retention_disposition,
+            reason_codes=["epistemic_not_assessed", "uncalibrated"],
+        ),
         **result.model_dump(exclude={"provenance"}),
     )
 
