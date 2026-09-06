@@ -16,7 +16,7 @@ auth and typed exceptions for 4xx/5xx responses.
 from __future__ import annotations
 
 import warnings
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 from uuid import UUID
 
 import httpx
@@ -317,8 +317,14 @@ class EngramClient:
         byte_budget: int | None = None,
         token_budget: int | None = None,
         item_budget: int | None = None,
+        recall_profile: Literal["legacy", "governed", "exploratory", "startup"] | None = None,
     ) -> RecallResponse:
-        """Bounded recall: deterministic startup set or semantic query."""
+        """Bounded recall: deterministic startup set or semantic query.
+
+        ``recall_profile`` selects the admission profile for semantic mode
+        (None → tenant default/legacy; "governed" or "exploratory" are
+        explicit opt-ins — issue #160).
+        """
         req = RecallRequest(
             mode=mode,
             query=query,
@@ -326,6 +332,7 @@ class EngramClient:
             byte_budget=byte_budget,
             token_budget=token_budget,
             item_budget=item_budget,
+            recall_profile=recall_profile,
         )
         return await self._send(
             "POST",

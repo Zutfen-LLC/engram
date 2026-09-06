@@ -218,6 +218,9 @@ class RecallRequest(BaseModel):
     byte_budget: int | None = None
     token_budget: int | None = None
     item_budget: int | None = None
+    # Recall admission profile (issue #160): None/legacy (compat), governed,
+    # or exploratory (semantic mode only; explicit opt-in).
+    recall_profile: Literal["legacy", "governed", "exploratory", "startup"] | None = None
 
 
 class RecallResponse(BaseModel):
@@ -231,6 +234,13 @@ class RecallResponse(BaseModel):
     config_version: str = "v1"
     recall_log_id: str | None = None
     message: str | None = None
+    # Additive profile context (issue #160). Items on governed/exploratory
+    # profiles carry per-item relevance_score / utility_score /
+    # epistemic_state / warning_codes / admission blocks (untyped dicts pass
+    # them through; unknown states stay null/unknown, never zero).
+    recall_profile: str | None = None
+    signals_version: str | None = None
+    omitted_by_admission: dict[str, int] = Field(default_factory=dict)
 
 
 # ---- /v1/search ----

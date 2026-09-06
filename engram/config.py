@@ -100,6 +100,11 @@ class Settings(BaseSettings):
     # Recall defaults
     recall_byte_budget: int = 4096
     recall_item_budget: int = 50
+    # Default semantic recall profile when a request omits recall_profile
+    # (issue #160). "legacy" preserves the pre-profile behavior byte-for-byte
+    # until governed is certified and SDK/MCP consumers migrate. Must be a key
+    # of engram.recall_profiles.SEMANTIC_PROFILES.
+    recall_default_profile: str = "legacy"
     max_pinned_tokens: int = 2048  # hard ceiling for pinned items in startup recall
     stale_after_days: int = 90  # items not verified in N days are "stale"
     # penalize after N startup recalls without feedback
@@ -299,6 +304,19 @@ class Settings(BaseSettings):
         limit = min(limit, self.startup_recall_candidate_limit_max)
         limit = max(limit, self.recall_item_budget)
         self.startup_recall_candidate_limit = limit
+        return self
+
+    @model_validator(mode="after")
+    def _validate_recall_default_profile(self) -> Settings:
+        """The default profile must be a registered semantic profile key."""
+        from engram.recall_profiles import SEMANTIC_PROFILES
+
+        if self.recall_default_profile not in SEMANTIC_PROFILES:
+            valid = ", ".join(sorted(SEMANTIC_PROFILES))
+            raise ValueError(
+                f"recall_default_profile={self.recall_default_profile!r} is not a "
+                f"registered recall profile (valid: {valid})"
+            )
         return self
 
     @model_validator(mode="after")

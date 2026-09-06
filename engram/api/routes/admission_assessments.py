@@ -459,57 +459,23 @@ async def admission_summaries(
 
     Used by the review queue so filtering and display never degrade into a
     per-item resolution loop. Items with no recorded decision are absent from
-    the result; callers render them as ``missing``.
+    the result; callers render them as ``missing``. Resolution itself is the
+    shared bulk path (``resolve_bulk_admissions``) so recall admission and the
+    review queue can never disagree about what "stale" means.
     """
-    from engram.models import AdmissionAssessmentCurrent
-    from engram.promotion import _config, _config_values, load_promotion_support
+    from engram.admission_assessment import resolve_bulk_admissions
 
     if not items:
         return {}
-    tenant_id = items[0].tenant_id
-    rows = (
-        await session.scalars(
-            select(AdmissionAssessment)
-            .join(
-                AdmissionAssessmentCurrent,
-                AdmissionAssessmentCurrent.assessment_id == AdmissionAssessment.id,
-            )
-            .where(
-                AdmissionAssessmentCurrent.tenant_id == tenant_id,
-                AdmissionAssessmentCurrent.memory_item_id.in_([item.id for item in items]),
-                AdmissionAssessmentCurrent.policy_profile_key == POLICY_PROFILE_KEY,
-            )
-        )
-    ).all()
-    by_item = {row.memory_item_id: row for row in rows}
-    config = await _config(session, str(tenant_id))
-    _, threshold, min_age, evidence_enabled, evidence_threshold = _config_values(config)
-    support_map = await load_promotion_support(session, items)
+    resolved_map = await resolve_bulk_admissions(session, items)
     summaries: dict[uuid.UUID, dict[str, Any]] = {}
     for item in items:
-        row = by_item.get(item.id)
-        if row is None:
+        resolved = resolved_map.get(item.id)
+        if resolved is None or resolved.assessment is None:
             continue
-        support = support_map[item.id]
-        kind = support.kind
-        resolved = resolve_projection_status(
-            row,
-            current_input_digest=digest(input_state_payload(item, support.classification_run)),
-            current_policy_config_digest=digest(
-                policy_config_payload(
-                    confidence_threshold=threshold,
-                    min_age_hours=min_age,
-                    evidence_enabled=evidence_enabled,
-                    evidence_threshold=evidence_threshold,
-                    kind_auto_promote_allowed=bool(
-                        kind and kind.enabled and kind.auto_promote_from_inferred
-                    ),
-                )
-            ),
-        )
         summaries[item.id] = {
             **summary_payload(resolved),
-            "admission_blocker_codes": list(row.blocker_codes),
+            "admission_blocker_codes": list(resolved.assessment.blocker_codes),
         }
     return summaries
 
