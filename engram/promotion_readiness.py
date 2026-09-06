@@ -40,14 +40,14 @@ from __future__ import annotations
 import json
 import uuid
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, cast
 
 from sqlalchemy import ColumnElement, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from engram.models import ItemEvent, Job, MemoryItem
+from engram.models import ItemEvent, Job, MemoryItem, TenantConfig
 from engram.promotion import (
     BLOCK_AGE,
     BLOCK_CONFIDENCE,
@@ -532,6 +532,13 @@ class PromotionReadiness:
 
     conflict_recheck_status: str
     last_evaluation: dict[str, Any]
+    # Safe admission summary (issue #159). Always present, always honest:
+    # ``admission_assessment_status='missing'`` is what a reader sees while
+    # capture is disabled or before this item was ever evaluated, and stays
+    # distinct from a recorded decision whose outcome is ``unknown``. Carries
+    # no normalized decision inputs and no provider/conflict internals —
+    # those need review authority and the dedicated detail endpoint.
+    admission: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -594,6 +601,7 @@ class PromotionReadiness:
             "jobs": [job.as_dict() for job in self.jobs],
             "conflict_recheck_status": self.conflict_recheck_status,
             "last_evaluation": dict(self.last_evaluation),
+            **dict(self.admission),
         }
 
 
@@ -768,7 +776,54 @@ async def build_promotion_readiness(
         jobs=jobs,
         conflict_recheck_status="not_run",
         last_evaluation=await last_evaluation_for_item(session, item.id),
+        admission=await _admission_summary(session, item, support, config),
     )
+
+
+async def _admission_summary(
+    session: AsyncSession,
+    item: MemoryItem,
+    support: PromotionSupport,
+    config: TenantConfig | None,
+) -> dict[str, Any]:
+    """Resolve this item's current admission decision for the readiness payload.
+
+    Freshness is a comparison against present state, not a stored flag, so the
+    digests are recomputed here from the same config and item/evidence state
+    the evaluator reads. Never raises into the readiness path: an item with no
+    decision — the ordinary case while capture is disabled — resolves to
+    ``missing``.
+    """
+    from engram.admission_assessment import (
+        digest,
+        input_state_payload,
+        load_current_assessment,
+        policy_config_payload,
+        resolve_projection_status,
+        summary_payload,
+    )
+
+    _, threshold, min_age, evidence_enabled, evidence_threshold = _config_values(config)
+    kind = support.kind
+    row = await load_current_assessment(
+        session, tenant_id=item.tenant_id, memory_item_id=item.id
+    )
+    resolved = resolve_projection_status(
+        row,
+        current_input_digest=digest(input_state_payload(item, support.classification_run)),
+        current_policy_config_digest=digest(
+            policy_config_payload(
+                confidence_threshold=threshold,
+                min_age_hours=min_age,
+                evidence_enabled=evidence_enabled,
+                evidence_threshold=evidence_threshold,
+                kind_auto_promote_allowed=bool(
+                    kind and kind.enabled and kind.auto_promote_from_inferred
+                ),
+            )
+        ),
+    )
+    return summary_payload(resolved)
 
 
 def _optional_str(value: Any) -> str | None:

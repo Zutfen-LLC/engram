@@ -252,6 +252,41 @@ def main() -> None:
         "completed; a failed identity requires a fresh --request-id.",
     )
 
+    admission_parser = sub.add_parser(
+        "admission-assessments",
+        help="Inspect and import durable admission decisions (issue #159).",
+    )
+    admission_sub = admission_parser.add_subparsers(
+        dest="admission_command", required=True
+    )
+    admission_backfill = admission_sub.add_parser(
+        "backfill",
+        help="Import one bounded page of legacy admission assessments for a tenant. "
+        "Snapshots currently observable state only: it never reconstructs a "
+        "historical policy evaluation, never claims a past active item passed a "
+        "promotion lane, and never manufactures evidence-assessment references.",
+    )
+    admission_backfill.add_argument(
+        "--tenant", required=True, help="Tenant id to import (required; the scan is per tenant)."
+    )
+    admission_backfill.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="Items to scan in this page (capped; the command is bounded by design).",
+    )
+    admission_backfill.add_argument(
+        "--after",
+        default=None,
+        help="Resume strictly after this item id. Pass the printed resume_after "
+        "to continue a restartable import.",
+    )
+    admission_backfill.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would be imported without writing anything.",
+    )
+
     backfill_parser = sub.add_parser(
         "backfill-embeddings",
         help="Populate pending/missing memory_embeddings for the configured "
@@ -569,6 +604,17 @@ def main() -> None:
             asyncio.run(
                 _run_reconciliation_request(
                     args.tenant, reason=args.reason, request_id=args.request_id
+                )
+            )
+        )
+    elif args.command == "admission-assessments":
+        raise SystemExit(
+            asyncio.run(
+                _run_admission_backfill(
+                    args.tenant,
+                    limit=args.limit,
+                    after=args.after,
+                    dry_run=args.dry_run,
                 )
             )
         )
@@ -1721,6 +1767,45 @@ async def _run_reconciliation_request(
             f"status={result.status} job_id={result.job_id}"
         )
         return 0
+
+
+async def _run_admission_backfill(
+    tenant_id: str,
+    *,
+    limit: int = 100,
+    after: str | None = None,
+    dry_run: bool = False,
+    session_factory: Any | None = None,
+) -> int:
+    """Run one bounded, restartable legacy admission-assessment import page.
+
+    Connects as the table-owning role so the scan covers the tenant without
+    depending on a caller principal's per-item read eligibility; the query
+    still filters by an explicit ``tenant_id``, so the result is identical
+    under RLS. Prints the resume cursor: repeat with ``--after`` until the
+    scanned count is zero.
+    """
+    import uuid as _uuid
+
+    from engram.admission_backfill import backfill_admission_assessments
+    from engram.db import owner_session_factory as _default_factory
+
+    try:
+        after_item_id = _uuid.UUID(after) if after else None
+    except ValueError:
+        print(f"invalid --after item id: {after!r}")
+        return 2
+    factory = session_factory if session_factory is not None else _default_factory
+    async with factory() as session:
+        result = await backfill_admission_assessments(
+            session,
+            tenant_id,
+            limit=limit,
+            after_item_id=after_item_id,
+            dry_run=dry_run,
+        )
+    print(result.summarize())
+    return 0
 
 
 async def _run_backfill(

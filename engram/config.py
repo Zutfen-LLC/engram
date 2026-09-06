@@ -189,6 +189,15 @@ class Settings(BaseSettings):
     assessment_calibration_profiles_path: str | None = None
     assessment_calibration_version: str = "uncalibrated"
 
+    # Durable admission decisions (issue #159). Disabled by default: with
+    # capture off, current Path A promotion behavior and its audit JSON are
+    # byte-for-byte unchanged. Enabling it also buys a stronger audit
+    # invariant — a proposed -> active mutation fails closed if its
+    # assessment, linked audit event and current projection cannot commit
+    # atomically with it — so enabling it requires the #159-capable worker and
+    # API set to be rolled out together (see docs/deployment.md).
+    admission_assessment_capture_enabled: bool = False
+
     # Relationship-aware recall — graph + tunnel expansion (ENG-AUD-012 / F19).
     # Semantic recall expands its top candidates via depth-1 graph edges and
     # tunnel membership before rescoring/budget packing (see

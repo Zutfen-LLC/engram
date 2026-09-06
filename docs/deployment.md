@@ -1288,3 +1288,70 @@ correct across processes and across multiple API keys. Exhaustion returns
 HTTP `429` with `Retry-After` set to the next UTC midnight. This setting is
 currently managed directly in versioned `tenant_config`; there is no public
 configuration endpoint.
+
+## 13. Migration 038 — durable admission assessments (ENG-PROMOTION-003D)
+
+Migration `038_admission_assessments.sql` is additive: it creates the
+append-only `admission_assessments` table, the mutable one-row
+`admission_assessment_current` projection, and a nullable
+`item_events.admission_assessment_id` reference. It performs no historical
+reconstruction and no row-per-item backfill, so it applies in constant time
+regardless of how many memory items a tenant has.
+
+The migration is also **convergent**, not merely idempotent: re-running it over
+a database created by an earlier build of the same migration adds
+`resulting_state_digest` and replaces the linked-event foreign key in place.
+Deployments that only ever apply the released file see no difference.
+
+### Configuration
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `ENGRAM_ADMISSION_ASSESSMENT_CAPTURE_ENABLED` | `false` | When `false`, current Path A promotion behavior and its audit-event JSON are byte-for-byte unchanged and no assessment is written. When `true`, every Path A decision is persisted, and a `proposed -> active` mutation fails closed if its assessment, linked audit event and current projection cannot commit atomically with it. |
+
+No promotion policy, threshold, weight or cooling period is introduced or
+changed by this migration or this flag.
+
+### Rollout order (strict)
+
+Enabling capture strengthens an audit invariant, so the code that knows how to
+satisfy it must be deployed everywhere first:
+
+1. apply migration 038 (safe with the old code running: nothing writes to the
+   new tables while the flag is off);
+2. roll out the #159-capable API **and** worker images with the flag still
+   `false`;
+3. only then set `ENGRAM_ADMISSION_ASSESSMENT_CAPTURE_ENABLED=true` on the API
+   and the worker together.
+
+A mixed-version worker that does not know #159 may keep performing legacy
+promotion **only while the flag is disabled**. Enabling capture while an older
+worker is still running would let that worker promote items without recording
+the decision the flag promises — the two must be rolled out together.
+
+### Rollback
+
+1. set `ENGRAM_ADMISSION_ASSESSMENT_CAPTURE_ENABLED=false`;
+2. promotion continues on the existing Path A mutation and audit behavior;
+3. `admission_assessments` and `admission_assessment_current` are preserved for
+   inspection — the rollback stops capture, it does not destroy the record.
+
+`migrations/downgrades/038_admission_assessments.sql` deliberately drops
+nothing. It refuses to run while pending or running `promotion.evaluate` jobs
+may still be about to commit an assessment; drain the queue first.
+
+### Legacy import (optional)
+
+```bash
+engram admission-assessments backfill --tenant <id> --limit 500 [--after <item-id>] [--dry-run]
+```
+
+Bounded, restartable and idempotent. It snapshots currently observable state
+only: an already-`active` item is recorded as `not_applicable` (this import has
+no evidence about which lane, if any, admitted it), a live proposal that
+current policy would otherwise admit is recorded as `unknown` (no
+promotion-time conflict recheck was ever run for it), and
+`conflict_recheck_status` is always `unavailable_legacy`. Repeat with the
+printed `resume_after` until the scanned count reaches zero. A later
+authoritative evaluation supersedes an imported projection without rewriting
+the import row.
