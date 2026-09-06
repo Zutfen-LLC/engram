@@ -80,15 +80,22 @@ async def client(app):
 @pytest.fixture(autouse=True)
 async def _clean_db():
     if not await _db_ok():
+        yield
         return
-    async with _engine.begin() as conn:
-        await conn.execute(text("DELETE FROM feedback_events"))
-        await conn.execute(text("DELETE FROM recall_logs"))
-        await conn.execute(text("DELETE FROM memory_edges"))
-        await conn.execute(text("DELETE FROM memory_embeddings"))
-        await conn.execute(text("DELETE FROM memory_items"))
-        await conn.execute(text("DELETE FROM tenants WHERE slug LIKE 'other-%'"))
-        await conn.execute(text("DELETE FROM principals WHERE name LIKE 'other-agent-%'"))
+
+    async def clear() -> None:
+        async with _engine.begin() as conn:
+            await conn.execute(text("DELETE FROM feedback_events"))
+            await conn.execute(text("DELETE FROM recall_logs"))
+            await conn.execute(text("DELETE FROM memory_edges"))
+            await conn.execute(text("DELETE FROM memory_embeddings"))
+            await conn.execute(text("DELETE FROM memory_items"))
+            await conn.execute(text("DELETE FROM tenants WHERE slug LIKE 'other-%'"))
+            await conn.execute(text("DELETE FROM principals WHERE name LIKE 'other-agent-%'"))
+
+    await clear()
+    yield
+    await clear()
 
 
 @pytest.fixture(autouse=True)
