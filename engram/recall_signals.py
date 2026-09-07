@@ -13,6 +13,11 @@ distinct, inspectable signal families that never feed each other:
 * **Epistemic state** — ``supported`` / ``contested`` / ``insufficient_evidence``
   / ``unknown``, derived from review, conflict, and verification state.
   Unknown evidence is *marked*, never converted into a numeric trust floor.
+  Since issue #188 this local derivation is **legacy/local-profile only**: on
+  the V2-bound candidate profiles the served evidence state is the exact
+  ``risk_aware_shadow_v1`` fresh evaluation the admission decision already
+  consumed (the ``evidence`` block), never a second item-local
+  interpretation of review/verification state.
 * **Governance/admission** — for the V2-bound candidate profiles
   (``governed`` / ``exploratory``, issue #186) the admit/withhold decision is
   the exact #158 ``risk_aware_shadow_v1`` per-surface decision
@@ -37,7 +42,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Final, Literal, Protocol
+from typing import Any, Final, Literal, Protocol, cast
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -87,11 +92,34 @@ _UTILITY_RANK_FLOOR: Final = 0.5
 _WARNING_TEXT: Final[dict[str, str]] = {
     "unreviewed": "unreviewed",
     "evidence_unknown": "evidence state unknown",
+    "evidence_contested": "evidence contested",
+    "evidence_insufficient": "insufficient evidence",
     "conflict_unresolved": "unresolved conflicts",
     "disputed": "disputed — pending resolution",
+    "risk_high": "high risk — review required",
+    "risk_unknown": "unknown risk",
     "admission_assessment_stale": "admission assessment stale",
     "admission_legacy_import": "legacy-imported admission state",
 }
+
+# The epistemic presentation vocabulary of the canonical V2 fresh evaluation
+# (issue #188). ``not_applicable`` is deliberately absent from the admissible
+# presentation set: the V2 gate does not ordinarily admit it, and an admitted
+# combination that carries it is a contract break handled fail-closed (see
+# :class:`V2EvidenceContractError`), never reinterpreted.
+_V2_PRESENTABLE_EPISTEMIC_STATES: Final[frozenset[str]] = frozenset(
+    {"supported", "contested", "insufficient_evidence", "unknown"}
+)
+
+
+class V2EvidenceContractError(ValueError):
+    """An admitted V2-bound item whose bound evidence state cannot be presented.
+
+    Raised only for impossible admitted combinations (a non-current
+    resolution, a non-``allow`` surface decision, or an unpresentable
+    epistemic state such as ``not_applicable`` reaching the served payload) —
+    the fail-closed alternative to inventing a safe-looking interpretation.
+    """
 
 
 @dataclass(frozen=True)
@@ -347,6 +375,7 @@ def structured_warning_codes(
     conflict_resolution_status: str | None,
     epistemic_state: str | None = None,
     assessment_status: str | None = None,
+    risk_state: str | None = None,
 ) -> list[str]:
     """Machine-readable handling codes for one admitted item.
 
@@ -354,19 +383,35 @@ def structured_warning_codes(
     ``warnings`` list is derived from these via :data:`_WARNING_TEXT`.
     Emitted in a fixed order so payloads are byte-stable for equal state.
 
-    ``memory_confidence`` is deliberately not a parameter: it is the legacy
-    source-policy prior, not epistemic confidence, and must never produce a
-    warning that reads as a factual-confidence claim.
+    The epistemic codes derive from whatever ``epistemic_state`` the caller
+    passes — the locally derived state on a legacy/local profile, the
+    canonical V2 fresh evaluation on a V2-bound profile (issue #188):
+    ``unknown`` → ``evidence_unknown``, ``contested`` → ``evidence_contested``,
+    ``insufficient_evidence`` → ``evidence_insufficient``, ``supported`` → no
+    evidence-quality warning. ``risk_state`` is a V2-bound input only: a
+    ``high`` or ``unknown`` risk must stay unmistakable even though the
+    exploratory surface allowed the item. ``memory_confidence`` is
+    deliberately not a parameter: it is the legacy source-policy prior, not
+    epistemic confidence, and must never produce a warning that reads as a
+    factual-confidence claim.
     """
     codes: list[str] = []
     if review_status == "proposed":
         codes.append("unreviewed")
     if epistemic_state == "unknown":
         codes.append("evidence_unknown")
+    elif epistemic_state == "contested":
+        codes.append("evidence_contested")
+    elif epistemic_state == "insufficient_evidence":
+        codes.append("evidence_insufficient")
     if conflict_resolution_status == "unresolved" or review_status == "disputed":
         codes.append("conflict_unresolved")
     if review_status == "disputed":
         codes.append("disputed")
+    if risk_state == "high":
+        codes.append("risk_high")
+    elif risk_state == "unknown":
+        codes.append("risk_unknown")
     if assessment_status == "stale":
         codes.append("admission_assessment_stale")
     elif assessment_status == "legacy_import":
@@ -701,6 +746,62 @@ def _decide_v2_surface(
 # ---- per-item served payload ----
 
 
+def build_v2_evidence_fields(binding: V2SurfaceBinding) -> dict[str, Any]:
+    """The canonical served evidence block for an admitted V2-bound item.
+
+    A pure projection of the :class:`V2SurfaceBinding` the admission decision
+    already consumed (issue #188): every field is read from the binding's own
+    fresh evaluation — never re-derived from item state, never re-selected
+    from ``memory_assessments``, never a second policy evaluation. The
+    identity invariant this guarantees is mechanical:
+
+    * ``evidence.profile_key`` is the binding's profile key;
+    * policy version, artifact digest, decision hash, epistemic/risk/
+      retention state, and effective assessment refs are the fresh
+      evaluation's exact values;
+    * ``v2_resolution_status`` is the binding's resolution status.
+
+    Only an admitted combination may be presented: a non-``current``
+    resolution, a non-``allow`` surface decision, or an epistemic state
+    outside the presentable vocabulary (``not_applicable``, ``None``) raises
+    :class:`V2EvidenceContractError` — those shapes cannot produce an
+    admitted item under the #186 gate, so reaching one here is a contract
+    break that must fail closed rather than be reinterpreted.
+    """
+    fresh = binding.fresh
+    if (
+        binding.resolution_status != "current"
+        or fresh is None
+        or fresh.surface_decision != "allow"
+    ):
+        raise V2EvidenceContractError(
+            f"admitted item carries a non-admissible V2 binding: "
+            f"resolution_status={binding.resolution_status!r} "
+            f"surface_decision={binding.surface_decision!r}"
+        )
+    epistemic_state = fresh.epistemic_state
+    if (
+        epistemic_state is None
+        or epistemic_state not in _V2_PRESENTABLE_EPISTEMIC_STATES
+    ):
+        raise V2EvidenceContractError(
+            f"admitted item carries an unpresentable V2 epistemic state: "
+            f"{epistemic_state!r}"
+        )
+    return {
+        "source": "v2_fresh_evaluation",
+        "profile_key": binding.profile_key,
+        "policy_version": fresh.policy_version,
+        "policy_artifact_digest": fresh.policy_artifact_digest,
+        "decision_hash": fresh.decision_hash,
+        "v2_resolution_status": binding.resolution_status,
+        "epistemic_state": epistemic_state,
+        "risk_state": fresh.risk_state,
+        "retention_state": fresh.retention_state,
+        "effective_assessment_refs": [dict(ref) for ref in fresh.effective_assessment_refs],
+    }
+
+
 def signal_item_fields(
     item: MemoryItem,
     *,
@@ -713,6 +814,15 @@ def signal_item_fields(
     Returns the separated-signal block (relevance/utility/epistemic/risk +
     the admission receipt) that ``execute_semantic_recall`` merges into the
     served item dict. No blended ``trust_score`` is produced or accepted here.
+
+    Evidence authority (issue #188): on a V2-bound profile
+    (``decision.v2`` present) the served epistemic state and the structured
+    ``evidence`` block are exact projections of the already-bound V2 fresh
+    evaluation — the same state the admission policy consumed. The item-local
+    review/conflict/verification heuristic is not consulted and can never
+    contradict the canonical state. Non-V2 decisions keep the local
+    derivation (no candidate profile uses it today; it exists for legacy
+    local-profile compatibility and is byte-stable).
     """
     utility = compute_utility_score(
         importance=item.importance,
@@ -720,16 +830,24 @@ def signal_item_fields(
         valid_from=item.valid_from,
         now=now,
     )
-    epistemic_state = derive_epistemic_state(
-        review_status=item.review_status,
-        human_verified=item.human_verified,
-        conflict_resolution_status=item.conflict_resolution_status,
-    )
+    evidence: dict[str, Any] | None = None
+    risk_state: str | None = None
+    if decision.v2 is not None:
+        evidence = build_v2_evidence_fields(decision.v2)
+        epistemic_state = cast(EpistemicState, evidence["epistemic_state"])
+        risk_state = evidence["risk_state"]
+    else:
+        epistemic_state = derive_epistemic_state(
+            review_status=item.review_status,
+            human_verified=item.human_verified,
+            conflict_resolution_status=item.conflict_resolution_status,
+        )
     codes = structured_warning_codes(
         review_status=item.review_status,
         conflict_resolution_status=item.conflict_resolution_status,
         epistemic_state=epistemic_state,
         assessment_status=decision.assessment_status,
+        risk_state=risk_state,
     )
     rank = compute_signal_rank_score(similarity=similarity, utility=utility)
     reasons = [
@@ -737,7 +855,7 @@ def signal_item_fields(
         f"utility {utility:.2f}",
         f"admission {decision.profile}:{','.join(decision.reason_codes)}",
     ]
-    return {
+    fields = {
         "score": rank,
         "relevance_score": round(similarity, 4),
         "utility_score": utility,
@@ -748,6 +866,12 @@ def signal_item_fields(
         "admission": decision.payload(),
         "signals_version": SIGNALS_VERSION,
     }
+    if evidence is not None:
+        # The canonical evidence block: an exact mirror of the V2 fresh
+        # evaluation admission consumed — including the top-level
+        # epistemic state above, which is this block's own value.
+        fields["evidence"] = evidence
+    return fields
 
 
 # ---- bulk assessment loading ----
@@ -794,11 +918,13 @@ __all__ = [
     "V2_ADMISSION_PROFILE_KEY",
     "V2_RESOLUTION_STATUSES",
     "V2SurfaceBinding",
+    "V2EvidenceContractError",
     "V2FreshEvaluation",
     "V2PersistedIdentity",
     "AdmissionAssessmentBinding",
     "EpistemicState",
     "RecallAdmissionDecision",
+    "build_v2_evidence_fields",
     "build_v2_surface_binding",
     "compute_signal_rank_score",
     "compute_utility_score",
