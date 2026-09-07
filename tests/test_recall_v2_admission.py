@@ -37,7 +37,7 @@ from engram.admission_shadow import (
 )
 from engram.config import settings
 from engram.recall_profiles import EXPLORATORY_PROFILE, GOVERNED_PROFILE
-from engram.recall_signals import decide_recall_admission
+from engram.recall_signals import AdmissionAssessmentBinding, decide_recall_admission
 from tests.test_recall_profile_semantic import (
     _db_ok,
     _persist_v2_row,
@@ -393,6 +393,12 @@ async def test_missing_v2_row_resolves_missing_and_never_admits():
     assert decision.decision == "withhold"
     assert decision.reason_codes == ("v2_decision_missing",)
     assert decision.v2 is not None and decision.v2.assessment_id is None
+    # BLOCKER 3: missing means no persisted identity, while the fresh block
+    # still describes what the current policy evaluates.
+    v2 = decision.v2.payload()
+    assert v2["persisted"] is None
+    assert v2["fresh"]["decision_hash"] == resolved.decision.decision_hash
+    assert v2["fresh"]["schema_version"] == "engram.admission-assessment.v2"
 
 
 async def test_changed_item_state_stales_the_row_never_historical_allow():
@@ -425,6 +431,13 @@ async def test_changed_item_state_stales_the_row_never_historical_allow():
         )
         assert decision.decision == "withhold", profile
         assert decision.reason_codes == ("v2_decision_stale",)
+        # BLOCKER 3: the persisted row's recorded hash and the fresh
+        # evaluation's hash are both visible and visibly different.
+        v2 = decision.v2.payload() if decision.v2 is not None else None
+        assert v2 is not None
+        assert v2["persisted"]["decision_hash"] == resolved.assessment.decision_hash
+        assert v2["fresh"]["decision_hash"] == resolved.decision.decision_hash
+        assert v2["persisted"]["decision_hash"] != v2["fresh"]["decision_hash"]
 
 
 async def test_input_digest_mismatch_stales_the_row():
@@ -502,6 +515,22 @@ async def test_policy_digest_mismatch_fails_closed():
     resolution = await _resolve([item_id])
     resolved = resolution.items[uuid.UUID(item_id)]
     assert resolved.status == "mismatched"
+    # BLOCKER 3: the diverged artifact digest the row was recorded under and
+    # the current artifact digest are both visible in the binding.
+    decision = decide_recall_admission(
+        (await _load_items_for([item_id]))[0],
+        profile=GOVERNED_PROFILE,
+        stay_kinds=set(),
+        v2_resolution=resolved,
+    )
+    assert decision.reason_codes == ("v2_decision_mismatched",)
+    assert decision.v2 is not None
+    v2 = decision.v2.payload()
+    assert v2["persisted"]["policy_artifact_digest"] == "sha256:" + "0" * 64
+    assert v2["fresh"]["policy_artifact_digest"] != v2["persisted"]["policy_artifact_digest"]
+    assert v2["fresh"]["policy_artifact_digest"] == load_admission_policy(
+        "risk_aware_shadow_v1"
+    ).artifact_digest
 
 
 async def test_unsupported_schema_fails_closed():
@@ -530,6 +559,19 @@ async def test_unsupported_schema_fails_closed():
     resolution = await _resolve([item_id])
     resolved = resolution.items[uuid.UUID(item_id)]
     assert resolved.status == "unsupported"
+    # BLOCKER 3: the unsupported persisted schema stays visible instead of
+    # being overwritten by the fresh evaluation's V2 schema.
+    decision = decide_recall_admission(
+        (await _load_items_for([item_id]))[0],
+        profile=GOVERNED_PROFILE,
+        stay_kinds=set(),
+        v2_resolution=resolved,
+    )
+    assert decision.reason_codes == ("v2_decision_unsupported",)
+    v2 = decision.v2.payload() if decision.v2 is not None else None
+    assert v2 is not None
+    assert v2["persisted"]["schema_version"] == "engram.admission-assessment.v1"
+    assert v2["fresh"]["schema_version"] == "engram.admission-assessment.v2"
 
 
 async def test_newest_row_wins_for_resolution():
@@ -543,6 +585,49 @@ async def test_newest_row_wins_for_resolution():
     resolved = resolution.items[uuid.UUID(item_id)]
     assert resolved.status == "current"
     assert resolved.decision.surface_decisions["semantic_governed"] == "allow"
+    # BLOCKER 3: for a current resolution the persisted identity and the
+    # fresh evaluation identity agree — same row, same artifact, same hash.
+    decision = decide_recall_admission(
+        (await _load_items_for([item_id]))[0],
+        profile=GOVERNED_PROFILE,
+        stay_kinds=set(),
+        v2_resolution=resolved,
+    )
+    assert decision.decision == "admit"
+    v2 = decision.payload()["v2"]
+    assert v2["persisted"]["assessment_id"] == str(resolved.assessment.id)
+    assert v2["persisted"]["schema_version"] == v2["fresh"]["schema_version"]
+    assert v2["persisted"]["policy_artifact_digest"] == v2["fresh"]["policy_artifact_digest"]
+    assert v2["persisted"]["decision_hash"] == v2["fresh"]["decision_hash"]
+
+
+async def test_blocked_path_a_binding_withholds_but_keeps_the_v2_binding():
+    """BLOCKER 1 at the resolver level: a current V2 allow that a #159
+    blocked durable outcome withholds still resolves and reports ``current``
+    — the local defense wins the decision, never the visibility of the V2
+    state it disagreed with."""
+    await _skip_without_db()
+    item_id = await _insert_proposal()
+    await _persist_v2_row(item_id, risk="low")
+    resolved = (await _resolve([item_id])).items[uuid.UUID(item_id)]
+    assert resolved.status == "current"
+    assert resolved.decision.surface_decisions["semantic_governed"] == "allow"
+
+    blocked = AdmissionAssessmentBinding(
+        assessment_id=str(uuid.uuid4()), status="current", outcome="blocked"
+    )
+    item = (await _load_items_for([item_id]))[0]
+    for profile in (GOVERNED_PROFILE, EXPLORATORY_PROFILE):
+        decision = decide_recall_admission(
+            item, profile=profile, stay_kinds=set(), assessment=blocked, v2_resolution=resolved
+        )
+        assert decision.decision == "withhold", profile
+        assert decision.reason_codes == ("admission_blocked",), profile
+        assert decision.v2 is not None
+        assert decision.v2.resolution_status == "current", profile
+        assert decision.v2.surface_decision == "allow", profile
+        assert decision.v2.persisted is not None
+        assert decision.v2.persisted.decision_hash == resolved.decision.decision_hash
 
 
 # ---- boundedness and side-effect freedom ------------------------------------
@@ -568,8 +653,32 @@ async def test_query_count_is_constant_in_window_size_and_no_provider_calls(
     large = await _resolve(item_ids)
     assert small.query_count == large.query_count
     assert large.query_count > 0
-    # Bounded accounting: support(4) + selection(2) + latest rows(1).
+    # The count is the number of queries actually executed: support(4) +
+    # selection(2 — rows exist for some items and the contract hash is
+    # configured, so the evidence-manifest query runs) + latest rows(1).
     assert large.query_count == 7
+
+
+async def test_query_count_reports_executed_queries_not_a_ceiling():
+    """MINOR correction (#186 review): when the bulk #157 selection takes an
+    early return (no item in the window has assessment rows), its second
+    query never runs — ``query_count`` must report the executed 6, not the
+    theoretical maximum 7. Still constant in window size."""
+    await _skip_without_db()
+    # risk=None persists the V2 row but creates no #157 assessment row, so
+    # the selection finds no rows for the whole window and stops after one
+    # query.
+    item_ids = [await _insert_proposal(content=f"no-selection {i}") for i in range(4)]
+    for item_id in item_ids:
+        await _persist_v2_row(item_id, risk=None)
+    small = await _resolve(item_ids[:1])
+    large = await _resolve(item_ids)
+    assert small.query_count == large.query_count
+    # support(4) + selection(1 — no rows, evidence query skipped) + latest(1).
+    assert large.query_count == 6
+    # And the same window with #157 rows present executes the full seven.
+    await _persist_v2_row(item_ids[0], risk="low")
+    assert (await _resolve(item_ids)).query_count == 7
 
 
 async def test_resolver_is_read_only():

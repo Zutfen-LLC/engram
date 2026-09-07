@@ -100,6 +100,33 @@ class _FakeResolution:
     assessment: Any = None
 
 
+def _persisted_row(
+    decision: AdmissionPolicyDecision,
+    *,
+    schema_version: str | None = None,
+    policy_contract_version: str | None = None,
+    policy_artifact_digest: str | None = None,
+    decision_hash: str | None = None,
+) -> SimpleNamespace:
+    """A persisted-row stand-in whose identity defaults to the fresh
+    decision's (the ``current`` case) and diverges per argument otherwise."""
+    return SimpleNamespace(
+        id=uuid4(),
+        schema_version=schema_version if schema_version is not None else decision.schema_version,
+        policy_contract_version=(
+            policy_contract_version
+            if policy_contract_version is not None
+            else decision.policy_version
+        ),
+        policy_config_digest=(
+            policy_artifact_digest
+            if policy_artifact_digest is not None
+            else decision.policy_config_digest
+        ),
+        decision_hash=decision_hash if decision_hash is not None else decision.decision_hash,
+    )
+
+
 def _v2_decision(
     *,
     governed: str = "allow",
@@ -134,9 +161,17 @@ def _v2_decision(
     )
 
 
-def _current(decision: AdmissionPolicyDecision) -> _FakeResolution:
+def _current(decision: AdmissionPolicyDecision, **divergence: Any) -> _FakeResolution:
+    """A ``current`` resolution: a row whose identity matches the decision.
+
+    ``divergence`` kwargs forward to :func:`_persisted_row` to build the
+    non-current shapes (a stale hash, a mismatched digest, an unsupported
+    schema) while keeping the status vocabulary explicit at the call site.
+    """
     return _FakeResolution(
-        status="current", decision=decision, assessment=SimpleNamespace(id=uuid4())
+        status="current",
+        decision=decision,
+        assessment=_persisted_row(decision, **divergence),
     )
 
 
@@ -283,7 +318,10 @@ def test_governed_admits_only_on_current_v2_allow() -> None:
     assert decision.v2 is not None
     assert decision.v2.resolution_status == "current"
     assert decision.v2.profile_key == "risk_aware_shadow_v1"
-    assert decision.v2.decision_hash == "sha256:" + "b" * 64
+    assert decision.v2.fresh is not None
+    assert decision.v2.fresh.decision_hash == "sha256:" + "b" * 64
+    assert decision.v2.persisted is not None
+    assert decision.v2.persisted.decision_hash == "sha256:" + "b" * 64
 
 
 def test_admitted_item_carries_the_full_safe_v2_binding_block() -> None:
@@ -296,26 +334,44 @@ def test_admitted_item_carries_the_full_safe_v2_binding_block() -> None:
     assert payload["surface"] == "semantic_governed"
     assert payload["surface_decision"] == "allow"
     v2 = payload["v2"]
-    assert v2["assessment_id"] == str(resolution.assessment.id)
-    assert v2["schema_version"] == "engram.admission-assessment.v2"
-    assert v2["policy_artifact_digest"] == "sha256:" + "a" * 64
-    assert v2["decision_hash"] == "sha256:" + "b" * 64
+    assert v2["profile_key"] == "risk_aware_shadow_v1"
     assert v2["resolution_status"] == "current"
+    assert v2["surface"] == "semantic_governed"
     assert v2["surface_decision"] == "allow"
-    assert v2["risk_state"] == "low"
-    assert v2["epistemic_state"] == "supported"
-    assert v2["retention_state"] == "retain"
-    assert v2["reason_codes"] == ["governed_evidence_qualified"]
+    # Persisted identity: what the durable row says about itself.
+    persisted = v2["persisted"]
+    assert persisted["assessment_id"] == str(resolution.assessment.id)
+    assert persisted["schema_version"] == "engram.admission-assessment.v2"
+    assert persisted["policy_contract_version"] == "risk-aware-shadow-v1"
+    assert persisted["policy_artifact_digest"] == "sha256:" + "a" * 64
+    assert persisted["decision_hash"] == "sha256:" + "b" * 64
+    # Fresh identity and outcome: what the current policy evaluates.
+    fresh = v2["fresh"]
+    assert fresh["schema_version"] == "engram.admission-assessment.v2"
+    assert fresh["policy_version"] == "risk-aware-shadow-v1"
+    assert fresh["policy_artifact_digest"] == "sha256:" + "a" * 64
+    assert fresh["decision_hash"] == "sha256:" + "b" * 64
+    assert fresh["surface_decision"] == "allow"
+    assert fresh["highest_admission_tier"] == "semantic_governed"
+    assert fresh["risk_state"] == "low"
+    assert fresh["epistemic_state"] == "supported"
+    assert fresh["retention_state"] == "retain"
+    assert fresh["reason_codes"] == ["governed_evidence_qualified"]
     # The binding is identity + codes only — never content or provider output.
-    assert set(v2) == {
+    assert set(v2) == {"profile_key", "resolution_status", "surface", "surface_decision",
+                       "persisted", "fresh"}
+    assert set(persisted) == {
         "assessment_id",
         "schema_version",
-        "profile_key",
+        "policy_contract_version",
+        "policy_artifact_digest",
+        "decision_hash",
+    }
+    assert set(fresh) == {
+        "schema_version",
         "policy_version",
         "policy_artifact_digest",
         "decision_hash",
-        "resolution_status",
-        "surface",
         "surface_decision",
         "highest_admission_tier",
         "risk_state",
@@ -484,9 +540,99 @@ def test_path_a_blocked_and_stale_bindings_withhold_despite_v2_allow() -> None:
     assert governed_stale.reason_codes == ("admission_assessment_stale",)
 
 
+def test_local_withhold_preserves_the_resolved_v2_binding() -> None:
+    """BLOCKER 1 regression (#186 review): when a recall-local #159 rule wins
+    and withholds, the result still exposes the exact V2 state it disagreed
+    with — resolution ``current``, the exact surface decision ``allow``, the
+    persisted/fresh identity — instead of misreporting the V2 state as
+    ``missing``. Local precedence for the final decision and primary reason
+    code is unchanged; only the V2 visibility is preserved."""
+    blocked = AdmissionAssessmentBinding(
+        assessment_id=str(uuid4()), status="current", outcome="blocked"
+    )
+    stale = AdmissionAssessmentBinding(
+        assessment_id=str(uuid4()), status="stale", outcome="admitted"
+    )
+    item = _make_item(review_status="proposed")
+
+    # 1. Current V2 allow + current #159 blocked: withholds everywhere, but
+    #    the binding shows exactly what V2 said.
+    allow = _current(_v2_decision(governed="allow", exploratory="allow"))
+    for profile in (GOVERNED_PROFILE, EXPLORATORY_PROFILE):
+        decision = decide_recall_admission(
+            item, profile=profile, stay_kinds=set(), assessment=blocked, v2_resolution=allow
+        )
+        assert decision.decision == "withhold", profile.key
+        assert decision.reason_codes == ("admission_blocked",), profile.key
+        assert decision.surface == profile.v2_surface
+        assert decision.surface_decision == "allow"
+        assert decision.assessment_id == blocked.assessment_id
+        assert decision.assessment_outcome == "blocked"
+        assert decision.v2 is not None
+        assert decision.v2.resolution_status == "current"
+        assert decision.v2.surface_decision == "allow"
+        assert decision.v2.persisted is not None
+        assert decision.v2.fresh is not None
+        assert decision.v2.fresh.surface_decision == "allow"
+        payload = decision.payload()
+        assert payload["v2"]["resolution_status"] == "current"
+        assert payload["v2"]["fresh"]["surface_decision"] == "allow"
+        assert payload["v2"]["persisted"]["decision_hash"] == payload["v2"]["fresh"][
+            "decision_hash"
+        ]
+
+    # 2. Current governed V2 allow + stale #159 binding: governed is strict,
+    #    so the stale durable outcome withholds — and the binding still shows
+    #    the current V2 allow it withheld against.
+    governed_stale = decide_recall_admission(
+        item,
+        profile=GOVERNED_PROFILE,
+        stay_kinds=set(),
+        assessment=stale,
+        v2_resolution=_current(_v2_decision(governed="allow")),
+    )
+    assert governed_stale.decision == "withhold"
+    assert governed_stale.reason_codes == ("admission_assessment_stale",)
+    assert governed_stale.assessment_status == "stale"
+    assert governed_stale.v2 is not None
+    assert governed_stale.v2.resolution_status == "current"
+    assert governed_stale.v2.surface_decision == "allow"
+
+
+def test_local_lifecycle_withholds_also_preserve_the_v2_binding() -> None:
+    """The same preservation holds for the other recall-local defenses: a
+    not-live item (or an unresolved conflict) withholds with its exact V2
+    state visible, not as absent V2 state."""
+    allow = _current(_v2_decision(governed="allow", exploratory="allow"))
+    active = decide_recall_admission(
+        _make_item(review_status="active"),
+        profile=GOVERNED_PROFILE,
+        stay_kinds=set(),
+        v2_resolution=allow,
+    )
+    assert active.decision == "withhold"
+    assert active.reason_codes == ("v2_item_not_live",)
+    assert active.v2 is not None
+    assert active.v2.resolution_status == "current"
+    assert active.v2.surface_decision == "allow"
+    conflicted = decide_recall_admission(
+        _make_item(review_status="proposed", conflict_resolution_status="unresolved"),
+        profile=EXPLORATORY_PROFILE,
+        stay_kinds=set(),
+        v2_resolution=allow,
+    )
+    assert conflicted.decision == "withhold"
+    assert conflicted.reason_codes == ("conflict_unresolved",)
+    assert conflicted.v2 is not None
+    assert conflicted.v2.resolution_status == "current"
+    assert conflicted.v2.surface_decision == "allow"
+
+
 def test_exploratory_admits_with_v2_allow_and_marks_stale_path_a_binding() -> None:
     """Non-strict profiles carry the stale Path-A snapshot as a mark —
-    reported, never trusted as authorization."""
+    reported, never trusted as authorization (BLOCKER 1 scenario 3: the
+    stale #159 state stays a mark, and the V2 binding stays current, while
+    the item still admits exactly as the surface decision says)."""
     stale = AdmissionAssessmentBinding(
         assessment_id=str(uuid4()), status="stale", outcome="admitted"
     )
@@ -502,7 +648,12 @@ def test_exploratory_admits_with_v2_allow_and_marks_stale_path_a_binding() -> No
     assert decision.reason_codes == ("admitted_v2_surface_allow", "admission_assessment_stale")
     # The legacy payload fields keep their #159 meaning; V2 identity is separate.
     assert decision.assessment_id == stale.assessment_id
+    assert decision.assessment_status == "stale"
     assert decision.v2 is not None and decision.v2.resolution_status == "current"
+    assert decision.v2.surface_decision == "allow"
+    payload = decision.payload()
+    assert payload["v2"]["resolution_status"] == "current"
+    assert payload["v2"]["fresh"]["surface_decision"] == "allow"
 
 
 def test_local_gate_helper_reports_only_withholds() -> None:
@@ -536,11 +687,86 @@ def test_missing_binding_builder_is_explicit_not_silent() -> None:
     payload = binding.payload()
     assert payload["resolution_status"] == "missing"
     assert payload["surface"] == "semantic_governed"
-    assert payload["assessment_id"] is None
+    assert payload["persisted"] is None
+    assert payload["fresh"] is None
+    assert binding.assessment_id is None
     assert payload["surface_decision"] is None
     # Even with no row, the binding names the policy profile that would own
     # the decision — a withheld item never reads as "no policy ran".
     assert payload["profile_key"] == "risk_aware_shadow_v1"
+
+
+def test_binding_separates_persisted_from_fresh_identity_per_resolution_status() -> None:
+    """BLOCKER 3 regression (#186 review): the serialized binding never mixes
+    the persisted row's identity with the fresh evaluation's. Each status
+    keeps both sides individually visible and mechanically comparable — for
+    ``current`` they agree; for every divergence the differing fields stay
+    distinct instead of being silently collapsed."""
+    decision = _v2_decision(governed="allow")
+    item = _make_item(review_status="proposed")
+
+    def _payload(resolution: _FakeResolution | None) -> dict[str, Any]:
+        decided = decide_recall_admission(
+            item, profile=GOVERNED_PROFILE, stay_kinds=set(), v2_resolution=resolution
+        )
+        assert decided.decision == "withhold" or resolution is not None
+        return decided.payload()["v2"]
+
+    # current: persisted and fresh identities agree.
+    v2 = _payload(_current(decision))
+    assert v2["resolution_status"] == "current"
+    assert v2["persisted"]["schema_version"] == v2["fresh"]["schema_version"]
+    assert v2["persisted"]["policy_artifact_digest"] == v2["fresh"]["policy_artifact_digest"]
+    assert v2["persisted"]["decision_hash"] == v2["fresh"]["decision_hash"]
+
+    # missing (a row-less resolution): no persisted identity; the fresh
+    # evaluation still describes what the current policy produces.
+    v2 = _payload(_FakeResolution(status="missing", decision=decision, assessment=None))
+    assert v2["resolution_status"] == "missing"
+    assert v2["persisted"] is None
+    assert v2["fresh"]["decision_hash"] == decision.decision_hash
+    assert v2["fresh"]["surface_decision"] == "allow"
+
+    # stale: the differing decision hashes are both visible.
+    v2 = _payload(
+        _FakeResolution(
+            status="stale",
+            decision=decision,
+            assessment=_persisted_row(decision, decision_hash="sha256:" + "c" * 64),
+        )
+    )
+    assert v2["resolution_status"] == "stale"
+    assert v2["persisted"]["decision_hash"] == "sha256:" + "c" * 64
+    assert v2["fresh"]["decision_hash"] == "sha256:" + "b" * 64
+    assert v2["persisted"]["decision_hash"] != v2["fresh"]["decision_hash"]
+
+    # mismatched: the persisted and current artifact digests are both visible.
+    v2 = _payload(
+        _FakeResolution(
+            status="mismatched",
+            decision=decision,
+            assessment=_persisted_row(decision, policy_artifact_digest="sha256:" + "d" * 64),
+        )
+    )
+    assert v2["resolution_status"] == "mismatched"
+    assert v2["persisted"]["policy_artifact_digest"] == "sha256:" + "d" * 64
+    assert v2["fresh"]["policy_artifact_digest"] == "sha256:" + "a" * 64
+    assert v2["persisted"]["policy_artifact_digest"] != v2["fresh"]["policy_artifact_digest"]
+
+    # unsupported: the persisted row's non-V2 schema stays visible while the
+    # fresh evaluation still identifies the current V2 schema.
+    v2 = _payload(
+        _FakeResolution(
+            status="unsupported",
+            decision=decision,
+            assessment=_persisted_row(
+                decision, schema_version="engram.admission-assessment.v1"
+            ),
+        )
+    )
+    assert v2["resolution_status"] == "unsupported"
+    assert v2["persisted"]["schema_version"] == "engram.admission-assessment.v1"
+    assert v2["fresh"]["schema_version"] == "engram.admission-assessment.v2"
 
 
 def test_v2_vocabulary_cannot_drift_from_the_resolver() -> None:
@@ -553,6 +779,139 @@ def test_v2_vocabulary_cannot_drift_from_the_resolver() -> None:
 
     assert set(V2_RESOLUTION_STATUSES) == set(get_args(V2ResolutionStatus))
     assert V2_ADMISSION_PROFILE_KEY == SHADOW_PROFILE_KEY
+
+
+# ---- withheld-candidate diagnostics (issue #186 review blockers 1 + 2) ------
+
+
+def _diagnostic(
+    item: MemoryItem,
+    *,
+    profile: Any,
+    assessment: AdmissionAssessmentBinding | None,
+    resolution: _FakeResolution | None,
+) -> dict[str, Any]:
+    from engram.recall import _admission_diagnostic
+
+    decision = decide_recall_admission(
+        item, profile=profile, stay_kinds=set(), assessment=assessment, v2_resolution=resolution
+    )
+    return _admission_diagnostic(
+        item, profile=profile, decision=decision, assessment=assessment
+    )
+
+
+def test_withheld_diagnostic_reports_the_blocked_local_v2_disagreement() -> None:
+    """BLOCKER 1 regression at the diagnostic layer: a #159-blocked withhold
+    over a current V2 allow reports resolution ``current``, surface decision
+    ``allow``, and ``gates_disagree`` true — never a fabricated ``missing``
+    with a silent agreement."""
+    blocked = AdmissionAssessmentBinding(
+        assessment_id=str(uuid4()), status="current", outcome="blocked"
+    )
+    item = _make_item(review_status="proposed")
+    resolution = _current(_v2_decision(governed="allow", exploratory="allow"))
+    for profile in (GOVERNED_PROFILE, EXPLORATORY_PROFILE):
+        diagnostic = _diagnostic(
+            item, profile=profile, assessment=blocked, resolution=resolution
+        )
+        assert diagnostic["decision"] == "withhold", profile.key
+        assert diagnostic["reason_codes"] == ["admission_blocked"], profile.key
+        assert diagnostic["v2_resolution_status"] == "current", profile.key
+        assert diagnostic["v2_surface_decision"] == "allow", profile.key
+        assert diagnostic["gates_disagree"] is True, profile.key
+
+
+def test_withheld_diagnostic_reports_the_governed_stale_disagreement() -> None:
+    """BLOCKER 1 regression, scenario 2: a stale #159 binding withholding a
+    governed candidate over a current V2 allow is reported as the local/V2
+    disagreement it is."""
+    stale = AdmissionAssessmentBinding(
+        assessment_id=str(uuid4()), status="stale", outcome="admitted"
+    )
+    diagnostic = _diagnostic(
+        _make_item(review_status="proposed"),
+        profile=GOVERNED_PROFILE,
+        assessment=stale,
+        resolution=_current(_v2_decision(governed="allow")),
+    )
+    assert diagnostic["decision"] == "withhold"
+    assert diagnostic["reason_codes"] == ["admission_assessment_stale"]
+    assert diagnostic["v2_resolution_status"] == "current"
+    assert diagnostic["v2_surface_decision"] == "allow"
+    assert diagnostic["gates_disagree"] is True
+
+
+def test_withheld_diagnostic_distinguishes_unavailability_from_disagreement() -> None:
+    """A fail-closed V2 unavailability (no row, or a non-current row) is not
+    a gate disagreement — ``gates_disagree`` stays false there."""
+    item = _make_item(review_status="proposed")
+    missing = _diagnostic(item, profile=GOVERNED_PROFILE, assessment=None, resolution=None)
+    assert missing["reason_codes"] == ["v2_decision_missing"]
+    assert missing["v2_resolution_status"] == "missing"
+    assert missing["v2_surface_decision"] is None
+    assert missing["gates_disagree"] is False
+
+    stale_row = _FakeResolution(
+        status="stale",
+        decision=_v2_decision(governed="allow"),
+        assessment=_persisted_row(_v2_decision(governed="allow"), decision_hash="sha256:c"),
+    )
+    unavailable = _diagnostic(
+        item, profile=GOVERNED_PROFILE, assessment=None, resolution=stale_row
+    )
+    assert unavailable["v2_resolution_status"] == "stale"
+    assert unavailable["gates_disagree"] is False
+
+
+def test_withheld_diagnostic_carries_the_full_safe_v2_binding() -> None:
+    """BLOCKER 2 regression: a withheld candidate's diagnostic carries the
+    same bounded safe binding an admitted item exposes — persisted and fresh
+    identity, exact surface, and the bounded state/code sets — enough to
+    identify the exact V2 decision without hidden implementation state."""
+    item = _make_item(review_status="proposed")
+    resolution = _current(_v2_decision(governed="review_required", exploratory="allow"))
+    diagnostic = _diagnostic(
+        item, profile=GOVERNED_PROFILE, assessment=None, resolution=resolution
+    )
+    assert diagnostic["reason_codes"] == ["v2_surface_review_required"]
+    v2 = diagnostic["v2"]
+    assert v2["profile_key"] == "risk_aware_shadow_v1"
+    assert v2["resolution_status"] == "current"
+    assert v2["surface"] == "semantic_governed"
+    assert v2["surface_decision"] == "review_required"
+    assert v2["persisted"]["assessment_id"] == str(resolution.assessment.id)
+    assert v2["persisted"]["schema_version"] == "engram.admission-assessment.v2"
+    assert v2["persisted"]["policy_contract_version"] == "risk-aware-shadow-v1"
+    assert v2["persisted"]["policy_artifact_digest"] == "sha256:" + "a" * 64
+    assert v2["persisted"]["decision_hash"] == v2["fresh"]["decision_hash"]
+    assert v2["fresh"]["policy_version"] == "risk-aware-shadow-v1"
+    assert v2["fresh"]["highest_admission_tier"] == "none"
+    assert v2["fresh"]["risk_state"] == "low"
+    assert v2["fresh"]["epistemic_state"] == "supported"
+    assert v2["fresh"]["retention_state"] == "retain"
+    assert v2["fresh"]["effective_assessment_refs"][0]["purpose"] == "combined"
+    assert v2["fresh"]["observation_window_hours"] == 0
+    assert v2["fresh"]["blocker_codes"] == []
+    assert v2["fresh"]["reason_codes"] == ["governed_evidence_qualified"]
+    assert v2["fresh"]["next_actions"] == ["none"]
+    # Same contract as the admitted item's block — identity and codes only.
+    assert set(v2) == {"profile_key", "resolution_status", "surface", "surface_decision",
+                       "persisted", "fresh"}
+
+
+def test_withheld_diagnostic_binding_is_content_free() -> None:
+    """The diagnostic and its binding never carry item content, provider
+    output, or free-form evaluation text — only bounded identity and codes."""
+    item = _make_item(review_status="proposed", content="secret-ish item content")
+    diagnostic = _diagnostic(
+        item,
+        profile=GOVERNED_PROFILE,
+        assessment=None,
+        resolution=_current(_v2_decision(governed="blocked")),
+    )
+    serialized = str(diagnostic)
+    assert "secret-ish item content" not in serialized
 
 
 # ---- admission invariants ----

@@ -1191,7 +1191,11 @@ def _admission_diagnostic(
     Identity and codes only: no content, no provider output. The item is
     already read-eligible and relevance-retrieved for this caller, so its id
     and reason codes leak nothing the caller cannot already see. The V2
-    facts come straight from the decision's own binding.
+    facts come straight from the decision's own binding — the full safe
+    ``v2`` block (persisted and fresh identity, exact surface decision,
+    bounded state and code sets), the same builder admitted items carry, so
+    an operator can audit exactly which V2 decision was (or would have been)
+    consumed without any hidden implementation state.
     ``gates_disagree`` is the bounded mismatch diagnostic of issue #186 —
     true exactly when a *current* V2 decision and the recall-local hard gate
     would decide differently (unavailable V2 state is fail-closed
@@ -1217,6 +1221,7 @@ def _admission_diagnostic(
         "v2_resolution_status": v2_status,
         "v2_surface_decision": surface_decision,
         "gates_disagree": v2_status == "current" and (local_would_admit != v2_allows),
+        "v2": binding.payload() if binding is not None else None,
     }
 
 

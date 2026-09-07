@@ -29,6 +29,9 @@ from engram.admission_policy import (
     load_admission_policy,
 )
 from engram.assessments import (
+    _effective_assessment_selection_bulk_counted as _selection_bulk_counted,
+)
+from engram.assessments import (
     effective_assessment_selection,
     effective_assessment_selection_bulk,
 )
@@ -73,11 +76,13 @@ PolicyRiskState = Literal["low", "medium", "high", "unknown", "not_applicable"]
 V2ResolutionStatus = Literal["current", "missing", "stale", "mismatched", "unsupported"]
 
 # ``load_promotion_support`` runs four bounded queries regardless of window
-# size; the bulk #157 selection runs at most two (assessment rows, then the
-# lateral evidence manifest for items that have rows); the latest-row lookup
-# is one. The resolver's query count is therefore constant in the window.
+# size; the latest-row lookup is one. The bulk #157 selection executes one or
+# two queries depending on its early returns (no assessment rows, or no
+# configured effective contract hash, stop after the first) — the resolver
+# counts what actually ran via the counted selection helper, so
+# ``BulkV2Resolution.query_count`` is the executed total, never a ceiling,
+# and remains constant in the window size.
 _SUPPORT_QUERY_COUNT: Final[int] = 4
-_SELECTION_QUERY_COUNT: Final[int] = 2
 _LATEST_ROW_QUERY_COUNT: Final[int] = 1
 
 
@@ -212,14 +217,15 @@ async def resolve_bulk_v2_decisions(
 ) -> BulkV2Resolution:
     """Resolve the effective V2 decision for a bounded window, in bulk.
 
-    The query count is constant in the window (support + bulk #157 selection
-    + one latest-row lookup); there is no per-item N-query resolution. Every
-    item gets an entry — an item with no persisted V2 row resolves
-    ``missing`` (explicit, distinguishable from a policy ``unknown``
-    decision), never as low-risk or review-active. The resolver reads only:
-    it never projects a shadow row current, mutates review state, enqueues
-    work, or calls a provider. All items must belong to one tenant and be
-    read-eligible for ``context`` (the caller's RLS session enforces this).
+    The query count is the number of queries actually executed (support +
+    bulk #157 selection + one latest-row lookup) and is constant in the
+    window; there is no per-item N-query resolution. Every item gets an
+    entry — an item with no persisted V2 row resolves ``missing``
+    (explicit, distinguishable from a policy ``unknown`` decision), never as
+    low-risk or review-active. The resolver reads only: it never projects a
+    shadow row current, mutates review state, enqueues work, or calls a
+    provider. All items must belong to one tenant and be read-eligible for
+    ``context`` (the caller's RLS session enforces this).
     """
     resolved_policy = policy or load_admission_policy(SHADOW_PROFILE_KEY)
     if not items:
@@ -230,8 +236,10 @@ async def resolve_bulk_v2_decisions(
         item.id: {"selection_status": "disabled", "combined": None} for item in items
     }
     if settings.assessment_selection_enabled:
-        query_count += _SELECTION_QUERY_COUNT
-        selections = await effective_assessment_selection_bulk(session, items, context)
+        selections, selection_queries = await _selection_bulk_counted(
+            session, items, context
+        )
+        query_count += selection_queries
     query_count += _LATEST_ROW_QUERY_COUNT
     latest_rows = (
         await session.scalars(

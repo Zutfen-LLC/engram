@@ -219,19 +219,38 @@ historical record of the first slice.
    Recall-local rules survive as **withhold-only** defense in depth: the
    #159 `blocked` outcome (every profile) and strict-stale binding
    (governed), plus the lifecycle facts the window already enforces. A
-   local/V2 disagreement always withholds and is itemized in the packet's
-   bounded, content-free `admission_diagnostics` (id, codes, resolution
-   status, surface decision, `gates_disagree`) for operator evaluation.
+   local/V2 disagreement always withholds, keeps the local reason code as
+   the primary reason, and is itemized in the packet's bounded,
+   content-free `admission_diagnostics` — each entry carrying the reason
+   codes, the V2 resolution status and exact surface decision,
+   `gates_disagree`, and the same full `v2` binding block admitted items
+   carry (see below), so an operator can tell exactly which V2 decision a
+   local boundary overrode.
 
 4. **Payload contract** (additive; `recall-shadow-compare-v2`). Admitted
-   candidate items carry the full V2 binding block
-   (`admission.v2`: assessment id, schema version, policy version + artifact
-   digest, decision hash, resolution status, exact surface + decision,
-   risk/epistemic/retention state, effective #157 assessment refs,
-   observation-window/eligible/next-evaluation, bounded code sets); each
-   candidate packet carries `admission_diagnostics` and a
-   `v2_resolution` summary (policy identity, per-status counts, query
-   count). The pre-existing `admission.assessment_*` fields keep their #159
+   candidate items carry the full V2 binding block (`admission.v2`),
+   and — since the #186 review correction — withheld candidates expose the
+   same block through `admission_diagnostics`. The binding keeps the
+   persisted row's identity and the fresh evaluation's identity separate
+   and never collapses them:
+
+   * `persisted` — what the durable row says about itself (assessment id,
+     schema version, policy contract version, artifact digest, decision
+     hash), read from the row's own columns; `null` when no row exists;
+   * `fresh` — what re-evaluating now under the current policy produces
+     (schema version, policy version + artifact digest, decision hash, the
+     exact surface decision, risk/epistemic/retention state, effective
+     #157 assessment refs, observation-window/eligible/next-evaluation,
+     bounded code sets).
+
+   For `current` the two agree; for `stale` both decision hashes stay
+   visible, for `mismatched` both artifact digests, for `unsupported` the
+   row's non-V2 schema next to the fresh V2 one, for `missing` there is no
+   persisted identity while `fresh` still describes the current
+   evaluation. Each candidate packet also carries a `v2_resolution`
+   summary (policy identity, per-status counts, the number of queries the
+   resolver actually executed — constant in window size, never a ceiling).
+   The pre-existing `admission.assessment_*` fields keep their #159
    Path-A meaning.
 
 5. **Boundary unchanged.** This remains a shadow-only integration:

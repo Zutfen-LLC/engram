@@ -108,24 +108,47 @@ class AdmissionAssessmentBinding:
 
 
 @dataclass(frozen=True)
-class V2SurfaceBinding:
-    """The exact #158 V2 decision a candidate admission consumed (issue #186).
+class V2PersistedIdentity:
+    """What the persisted V2 shadow row says about itself (issue #186).
 
-    Safe deterministic identity only: schema/contract version, decision and
-    policy-artifact digests, resolution status, the exact surface and its
-    decision, risk/epistemic/retention state, effective #157 assessment
-    references, and the bounded code sets. No provider output, no extraction
-    spans, no content, no conflict identities beyond policy-level codes.
+    Read from the row's own columns — never from the fresh evaluation — so a
+    non-current row keeps its own identity: an ``unsupported`` row reports the
+    schema it was actually recorded under, a ``mismatched`` row the artifact
+    digest it was actually evaluated against, a ``stale`` row the decision
+    hash it actually recorded. Safe deterministic identity only.
     """
 
-    assessment_id: str | None
-    schema_version: str | None
-    profile_key: str
-    policy_version: str | None
-    policy_artifact_digest: str | None
-    decision_hash: str | None
-    resolution_status: str
-    surface: str
+    assessment_id: str
+    schema_version: str
+    policy_contract_version: str
+    policy_artifact_digest: str
+    decision_hash: str
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "assessment_id": self.assessment_id,
+            "schema_version": self.schema_version,
+            "policy_contract_version": self.policy_contract_version,
+            "policy_artifact_digest": self.policy_artifact_digest,
+            "decision_hash": self.decision_hash,
+        }
+
+
+@dataclass(frozen=True)
+class V2FreshEvaluation:
+    """What re-evaluating the item now under the current policy produces.
+
+    The same evaluation the shared resolver runs (the #158 simulator's exact
+    decision): current schema and policy identity, the fresh decision hash,
+    the per-surface outcome this binding consumed, and the bounded state and
+    code sets. This is the verification basis — a persisted row is ``current``
+    exactly when its recorded identity agrees with this evaluation's.
+    """
+
+    schema_version: str
+    policy_version: str
+    policy_artifact_digest: str
+    decision_hash: str
     surface_decision: str | None
     highest_admission_tier: str | None = None
     risk_state: str | None = None
@@ -141,14 +164,10 @@ class V2SurfaceBinding:
 
     def payload(self) -> dict[str, Any]:
         return {
-            "assessment_id": self.assessment_id,
             "schema_version": self.schema_version,
-            "profile_key": self.profile_key,
             "policy_version": self.policy_version,
             "policy_artifact_digest": self.policy_artifact_digest,
             "decision_hash": self.decision_hash,
-            "resolution_status": self.resolution_status,
-            "surface": self.surface,
             "surface_decision": self.surface_decision,
             "highest_admission_tier": self.highest_admission_tier,
             "risk_state": self.risk_state,
@@ -163,6 +182,49 @@ class V2SurfaceBinding:
             "blocker_codes": list(self.blocker_codes),
             "reason_codes": list(self.reason_codes),
             "next_actions": list(self.next_actions),
+        }
+
+
+@dataclass(frozen=True)
+class V2SurfaceBinding:
+    """The exact #158 V2 decision a candidate admission consumed (issue #186).
+
+    Persisted-row identity and fresh-evaluation identity are carried
+    separately and never collapsed: ``persisted`` is what the durable
+    artifact says (``None`` when no row exists), ``fresh`` is what the
+    current policy evaluates now (``None`` only when no resolution ran at
+    all). For ``current`` they agree; for every other status the differing
+    fields stay individually visible (stale hashes, mismatched digests,
+    unsupported schemas). Alongside them: resolution status, the exact
+    surface and its fresh decision, and the profile key. No provider output,
+    no extraction spans, no content, no conflict identities beyond
+    policy-level codes.
+    """
+
+    profile_key: str
+    resolution_status: str
+    surface: str
+    persisted: V2PersistedIdentity | None
+    fresh: V2FreshEvaluation | None
+
+    @property
+    def assessment_id(self) -> str | None:
+        """The persisted row's id — the durable artifact a current row is."""
+        return self.persisted.assessment_id if self.persisted is not None else None
+
+    @property
+    def surface_decision(self) -> str | None:
+        """The fresh evaluation's decision on this binding's exact surface."""
+        return self.fresh.surface_decision if self.fresh is not None else None
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "profile_key": self.profile_key,
+            "resolution_status": self.resolution_status,
+            "surface": self.surface,
+            "surface_decision": self.surface_decision,
+            "persisted": self.persisted.payload() if self.persisted is not None else None,
+            "fresh": self.fresh.payload() if self.fresh is not None else None,
         }
 
 
@@ -335,32 +397,40 @@ def build_v2_surface_binding(
     """Assemble the safe binding block from one resolved V2 decision.
 
     ``resolution=None`` means no V2 state could be resolved at all — the
-    binding still names the surface and the explicit ``missing`` status so a
-    withheld item's payload never reads as "no policy ran".
+    binding still names the surface and the explicit ``missing`` status (with
+    neither persisted nor fresh identity) so a withheld item's payload never
+    reads as "no policy ran". When a resolution exists, the persisted identity
+    is read from the row's own columns and the fresh identity from the
+    decision the resolver just evaluated; the two are never mixed, so a
+    non-current row keeps its own schema, digests, and hash next to the
+    current evaluation's.
     """
     if resolution is None:
         return V2SurfaceBinding(
-            assessment_id=None,
-            schema_version=None,
             profile_key=V2_ADMISSION_PROFILE_KEY,
-            policy_version=None,
-            policy_artifact_digest=None,
-            decision_hash=None,
             resolution_status="missing",
             surface=surface,
-            surface_decision=None,
+            persisted=None,
+            fresh=None,
         )
     decision = resolution.decision
     assessment = resolution.assessment
-    return V2SurfaceBinding(
-        assessment_id=str(assessment.id) if assessment is not None else None,
+    persisted = (
+        V2PersistedIdentity(
+            assessment_id=str(assessment.id),
+            schema_version=str(assessment.schema_version),
+            policy_contract_version=str(assessment.policy_contract_version),
+            policy_artifact_digest=str(assessment.policy_config_digest),
+            decision_hash=str(assessment.decision_hash),
+        )
+        if assessment is not None
+        else None
+    )
+    fresh = V2FreshEvaluation(
         schema_version=decision.schema_version,
-        profile_key=decision.profile_key,
         policy_version=decision.policy_version,
         policy_artifact_digest=decision.policy_config_digest,
         decision_hash=decision.decision_hash,
-        resolution_status=resolution.status,
-        surface=surface,
         surface_decision=decision.surface_decisions.get(surface),
         highest_admission_tier=decision.highest_admission_tier,
         risk_state=decision.risk_state,
@@ -373,6 +443,13 @@ def build_v2_surface_binding(
         blocker_codes=tuple(decision.blocker_codes),
         reason_codes=tuple(decision.reason_codes),
         next_actions=tuple(decision.next_actions),
+    )
+    return V2SurfaceBinding(
+        profile_key=decision.profile_key,
+        resolution_status=resolution.status,
+        surface=surface,
+        persisted=persisted,
+        fresh=fresh,
     )
 
 
@@ -442,29 +519,29 @@ def decide_recall_admission(
     exploratory since issue #186) consume the exact #158 ``risk_aware_shadow_v1``
     per-surface decision resolved in bulk by the shared resolver; ``review_status``
     is no longer a positive admission source and never was allowed to widen a
-    boundary. Before the surface decision is consulted, two layers can only
-    withhold:
-
-    * the #159 durable binding (``blocked`` everywhere; ``stale`` when the
-      profile is strict) — recall-local defense in depth;
-    * the mechanically-expressible lifecycle facts the corpus window already
-      enforced (live proposal, no unresolved conflict) — mirrored here so the
-      gate is safe even when called outside the retrieval pipeline.
+    boundary. The V2-bound path evaluates its own recall-local defense in depth
+    (the #159 ``blocked``/strict-``stale`` binding, then the lifecycle facts the
+    corpus window already enforces) *before* consulting the surface decision,
+    with the same precedence the generic pre-check below would apply — but,
+    unlike that pre-check, it retains the resolved V2 binding on the withheld
+    result, so a local withhold never misreports the V2 state as absent.
 
     Non-V2 profiles keep the pre-#186 review-status policy unchanged (legacy
     never runs this gate at all; the branches remain for any future strict
-    local profile). Similarity, importance, and exposure are not inputs by
+    local profile): the #159 durable binding (``blocked`` everywhere;
+    ``stale`` when the profile is strict) withholds first, then review
+    status decides. Similarity, importance, and exposure are not inputs by
     construction — a highly similar or important item cannot buy admission,
     and repeated serving cannot raise it.
     """
-    withheld = _assessment_withhold(profile, assessment)
-    if withheld is not None:
-        return withheld
-
     if profile.v2_surface is not None:
         return _decide_v2_surface(
             item, profile=profile, resolution=v2_resolution, assessment=assessment
         )
+
+    withheld = _assessment_withhold(profile, assessment)
+    if withheld is not None:
+        return withheld
 
     def _admit(base: tuple[str, ...]) -> RecallAdmissionDecision:
         return RecallAdmissionDecision(
@@ -561,8 +638,9 @@ def _decide_v2_surface(
     the lifecycle facts the corpus window already enforces), then V2
     resolution availability, then the exact surface decision. A decision
     withheld by a local rule still carries the full V2 binding — including
-    its resolution status — so no V2 state is ever hidden, but the most
-    fundamental boundary is the stated reason.
+    its resolution status and the #159 assessment identity that withheld it
+    — so no V2 state is ever hidden, but the most fundamental boundary is
+    the stated reason.
     """
     surface = profile.v2_surface
     assert surface is not None  # guarded by the caller dispatching on v2_surface
@@ -573,6 +651,9 @@ def _decide_v2_surface(
             profile=profile.key,
             decision="withhold",
             reason_codes=(reason,),
+            assessment_id=assessment.assessment_id if assessment is not None else None,
+            assessment_status=assessment.status if assessment is not None else None,
+            assessment_outcome=assessment.outcome if assessment is not None else None,
             surface=surface,
             surface_decision=binding.surface_decision,
             v2=binding,
@@ -713,6 +794,8 @@ __all__ = [
     "V2_ADMISSION_PROFILE_KEY",
     "V2_RESOLUTION_STATUSES",
     "V2SurfaceBinding",
+    "V2FreshEvaluation",
+    "V2PersistedIdentity",
     "AdmissionAssessmentBinding",
     "EpistemicState",
     "RecallAdmissionDecision",

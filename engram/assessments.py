@@ -388,21 +388,46 @@ async def effective_assessment_selection_bulk(
 ) -> dict[UUID, dict[str, Any]]:
     """Bulk #157 effective selection for one bounded candidate window.
 
-    Two queries total regardless of window size: one for every candidate
+    At most two queries regardless of window size: one for every candidate
     item's assessment rows, one lateral ``assessment_evidence_manifest`` call
     for the items that actually have rows (an item with no rows is ``absent``
-    without needing its evidence digest). Per-item results are byte-identical
-    to :func:`effective_assessment_selection` — the same pure selection core,
+    without needing its evidence digest; a tenant with no configured
+    effective contract hash stops after the first). The evidence query is
+    skipped on those early exits, so callers that must account for executed
+    queries use :func:`_effective_assessment_selection_bulk_counted`, which
+    also returns the actual count. Per-item results are byte-identical to
+    :func:`effective_assessment_selection` — the same pure selection core,
     the same snapshot builder — so the #158 simulator and the #186 bulk V2
     resolver cannot drift on selection semantics. All items must belong to
     one tenant.
     """
+    selections, _executed = await _effective_assessment_selection_bulk_counted(
+        session, items, context, purpose=purpose
+    )
+    return selections
+
+
+async def _effective_assessment_selection_bulk_counted(
+    session: AsyncSession,
+    items: list[MemoryItem],
+    context: ResolvedMemoryContext,
+    *,
+    purpose: str = "combined",
+) -> tuple[dict[UUID, dict[str, Any]], int]:
+    """The bulk selection plus the number of queries it actually executed.
+
+    Deterministic from the branches taken — no SQL instrumentation: 0 when
+    selection is disabled or the window is empty, 1 when no item has rows or
+    no effective contract hash is configured, 2 once the evidence manifest
+    is fetched. The #186 V2 resolver reports this count so its
+    ``query_count`` is the executed total, never a ceiling.
+    """
     if not items:
-        return {}
-    result: dict[UUID, dict[str, Any]] = {}
+        return {}, 0
     if not settings.assessment_selection_enabled:
-        return {item.id: {"selection_status": "disabled", "combined": None} for item in items}
+        return {item.id: {"selection_status": "disabled", "combined": None} for item in items}, 0
     tenant_id = items[0].tenant_id
+    executed = 1
     rows = list(
         (
             await session.scalars(
@@ -422,6 +447,7 @@ async def effective_assessment_selection_bulk(
     by_item: dict[UUID, list[MemoryAssessment]] = {}
     for row in rows:
         by_item.setdefault(row.memory_item_id, []).append(row)
+    result: dict[UUID, dict[str, Any]] = {}
     with_rows: list[MemoryItem] = []
     for item in items:
         if by_item.get(item.id):
@@ -429,15 +455,16 @@ async def effective_assessment_selection_bulk(
         else:
             result[item.id] = {"selection_status": "absent", "combined": None}
     if not with_rows:
-        return result
+        return result, executed
     if not settings.assessment_effective_contract_hash:
         for item in with_rows:
             result[item.id] = {"selection_status": "mismatched", "combined": None}
-        return result
+        return result, executed
     snapshots = await _evidence_snapshots_bulk(session, with_rows, context)
+    executed += 1
     for item in with_rows:
         result[item.id] = _select_effective_assessment(by_item[item.id], snapshots[item.id])
-    return result
+    return result, executed
 
 
 async def _evidence_snapshots_bulk(

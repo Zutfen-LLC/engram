@@ -708,8 +708,11 @@ async def test_governed_candidate_admits_only_v2_qualified_proposals(
     v2 = served["admission"]["v2"]
     assert v2["resolution_status"] == "current"
     assert v2["profile_key"] == "risk_aware_shadow_v1"
-    assert v2["risk_state"] == "low"
-    assert v2["decision_hash"].startswith("sha256:")
+    assert v2["fresh"]["risk_state"] == "low"
+    assert v2["fresh"]["decision_hash"].startswith("sha256:")
+    # current means the persisted identity and the fresh evaluation agree.
+    assert v2["persisted"]["decision_hash"] == v2["fresh"]["decision_hash"]
+    assert v2["persisted"]["policy_artifact_digest"] == v2["fresh"]["policy_artifact_digest"]
     from engram.recall_signals import compute_signal_rank_score
 
     assert served["score"] == compute_signal_rank_score(
@@ -1105,10 +1108,155 @@ async def test_capture_disabled_preserves_stale_assessment_enforcement(
         by_profile["governed"]["omitted_by_admission"].get("admission_assessment_stale")
         == 1
     )
+    # BLOCKER 1 regression (#186 review): the withheld diagnostic reports the
+    # disagreement truthfully — V2 resolution current, exact surface allow,
+    # gates_disagree true — instead of a fabricated missing/absent V2 state.
+    diag = by_profile["governed"]["admission_diagnostics"][0]
+    assert diag["item_id"] == item["id"]
+    assert diag["reason_codes"] == ["admission_assessment_stale"]
+    assert diag["v2_resolution_status"] == "current"
+    assert diag["v2_surface_decision"] == "allow"
+    assert diag["gates_disagree"] is True
+    # BLOCKER 2 regression: the diagnostic carries the full safe binding —
+    # enough to identify the exact V2 decision without hidden state.
+    v2_diag = diag["v2"]
+    assert v2_diag["resolution_status"] == "current"
+    assert v2_diag["surface"] == "semantic_governed"
+    assert v2_diag["fresh"]["surface_decision"] == "allow"
+    assert v2_diag["persisted"]["assessment_id"] is not None
+    assert v2_diag["persisted"]["decision_hash"] == v2_diag["fresh"]["decision_hash"]
     expl_by_id = {i["id"]: i for i in by_profile["exploratory"]["items"]}
     assert item["id"] in expl_by_id
     assert "admission_assessment_stale" in expl_by_id[item["id"]]["warning_codes"]
     assert expl_by_id[item["id"]]["admission"]["v2"]["resolution_status"] == "current"
+
+
+async def _seed_path_a_blocked(item_id: str) -> None:
+    """Record a digest-current #159 ``blocked`` decision through the real
+    capture path (insert + project), so the recall resolver resolves it
+    ``current`` with outcome ``blocked`` — the strongest local withhold,
+    seeded against current state so V2 is the only other voice."""
+    from sqlalchemy import select
+
+    from engram.admission_assessment import (
+        AdmissionDecision,
+        digest,
+        input_state_payload,
+        insert_assessment,
+        policy_config_payload,
+        project_current,
+    )
+    from engram.db import apply_rls_context
+    from engram.models import MemoryItem
+    from engram.promotion import _config, _config_values, load_promotion_support
+
+    async with _test_session_factory() as session:
+        row = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT t.id::text AS tenant_id, p.id::text AS principal_id "
+                        "FROM tenants t JOIN principals p ON p.tenant_id = t.id "
+                        "WHERE t.slug = 'default' AND p.name = 'admin'"
+                    )
+                )
+            )
+            .mappings()
+            .one()
+        )
+        await apply_rls_context(
+            session, tenant_id=row["tenant_id"], principal_id=row["principal_id"]
+        )
+        item = await session.scalar(select(MemoryItem).where(MemoryItem.id == item_id))
+        assert item is not None
+        config = await _config(session, str(item.tenant_id))
+        _, threshold, min_age, evidence_enabled, evidence_threshold = _config_values(config)
+        support = (await load_promotion_support(session, [item]))[item.id]
+        kind = support.kind
+        decision = AdmissionDecision(
+            tenant_id=item.tenant_id,
+            memory_item_id=item.id,
+            mode="authoritative",
+            item_content_hash=item.content_hash,
+            input_digest=digest(input_state_payload(item, support.classification_run)),
+            resulting_state_digest=None,
+            policy_config_digest=digest(
+                policy_config_payload(
+                    confidence_threshold=threshold,
+                    min_age_hours=min_age,
+                    evidence_enabled=evidence_enabled,
+                    evidence_threshold=evidence_threshold,
+                    kind_auto_promote_allowed=bool(
+                        kind and kind.enabled and kind.auto_promote_from_inferred
+                    ),
+                )
+            ),
+            selected_basis=None,
+            outcome="blocked",
+            blocker_codes=("test_blocked",),
+            reason_codes=("test_blocked",),
+            decision_inputs={},
+            conflict_recheck_status="not_run",
+            cooling_period_start=None,
+            eligible_at=None,
+            next_evaluation_at=None,
+            next_actions=("none",),
+        )
+        persisted = await insert_assessment(
+            session,
+            decision,
+            trigger_type="test",
+            trigger_id=f"test:{item_id}",
+            invocation_source="test",
+            evaluated_at=datetime.now(UTC),
+        )
+        await project_current(session, persisted)
+        await session.commit()
+
+
+async def test_blocked_path_a_binding_withholds_with_truthful_v2_disagreement(
+    client, monkeypatch
+):
+    """BLOCKER 1 regression, end to end (#186 review): a current V2 allow that
+    a digest-current #159 ``blocked`` binding withholds is reported as exactly
+    that — resolution ``current``, surface ``allow``, ``gates_disagree`` true,
+    full binding attached — on BOTH candidate profiles, never as absent V2
+    state."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    item = await _remember(
+        client, "semantic target blocked binding", source_type="extraction"
+    )
+    # Current V2 allow on the exact surface (low risk, qualified).
+    await _persist_v2_row(item["id"])
+    # A digest-current #159 blocked decision — the local boundary that wins.
+    await _seed_path_a_blocked(item["id"])
+
+    shadow = await _shadow_compare(client, profiles=["governed", "exploratory"])
+    by_profile = {c["profile"]: c for c in shadow["candidates"]}
+    assert by_profile["governed"]["item_count"] == 0
+    assert by_profile["exploratory"]["item_count"] == 0
+    for profile_key in ("governed", "exploratory"):
+        packet = by_profile[profile_key]
+        assert packet["omitted_by_admission"] == {"admission_blocked": 1}, profile_key
+        diag = packet["admission_diagnostics"][0]
+        assert diag["item_id"] == item["id"]
+        assert diag["reason_codes"] == ["admission_blocked"]
+        # The exact V2 state the local gate disagreed with stays visible.
+        assert diag["v2_resolution_status"] == "current"
+        assert diag["v2_surface_decision"] == "allow"
+        assert diag["gates_disagree"] is True
+        v2 = diag["v2"]
+        assert v2["resolution_status"] == "current"
+        assert v2["fresh"]["surface_decision"] == "allow"
+        assert v2["persisted"]["assessment_id"] is not None
+        assert v2["persisted"]["decision_hash"] == v2["fresh"]["decision_hash"]
+        assert v2["persisted"]["policy_artifact_digest"] == v2["fresh"][
+            "policy_artifact_digest"
+        ]
 
 
 # ---- audit ----
