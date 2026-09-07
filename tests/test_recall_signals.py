@@ -15,7 +15,7 @@ Pure-function contract tests — no DB. These pin the core invariants:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -29,6 +29,8 @@ from engram.recall_signals import (
     SIGNALS_VERSION,
     AdmissionAssessmentBinding,
     RecallAdmissionDecision,
+    V2EvidenceContractError,
+    build_v2_evidence_fields,
     build_v2_surface_binding,
     compute_signal_rank_score,
     compute_utility_score,
@@ -982,12 +984,31 @@ def test_signal_item_fields_expose_separate_signals_with_versions() -> None:
     assert fields["signals_version"] == SIGNALS_VERSION
     assert fields["relevance_score"] == 0.9
     assert 0.0 <= fields["utility_score"] <= 1.0
-    assert fields["epistemic_state"] == "unknown"
-    assert "evidence_unknown" in fields["warning_codes"]
+    # Issue #188: the served epistemic state is the V2 fresh evaluation the
+    # admission consumed ("supported"), not the item-local proposal heuristic
+    # ("unknown") — and the structured evidence block mirrors it exactly.
+    assert fields["epistemic_state"] == "supported"
+    evidence = fields["evidence"]
+    assert evidence["source"] == "v2_fresh_evaluation"
+    assert evidence["epistemic_state"] == fields["epistemic_state"]
+    assert evidence == {
+        "source": "v2_fresh_evaluation",
+        "profile_key": "risk_aware_shadow_v1",
+        "policy_version": "risk-aware-shadow-v1",
+        "policy_artifact_digest": "sha256:" + "a" * 64,
+        "decision_hash": "sha256:" + "b" * 64,
+        "v2_resolution_status": "current",
+        "epistemic_state": "supported",
+        "risk_state": "low",
+        "retention_state": "retain",
+        "effective_assessment_refs": evidence["effective_assessment_refs"],
+    }
+    assert "evidence_unknown" not in fields["warning_codes"]
     assert fields["admission"]["profile"] == "exploratory"
     assert fields["admission"]["decision"] == "admit"
     assert fields["admission"]["policy_version"] == RECALL_ADMISSION_POLICY_VERSION
     assert fields["admission"]["v2"]["resolution_status"] == "current"
+    # The lifecycle mark stays where it is independently true.
     assert "unreviewed" in fields["warnings"]
     # The rank score is reproducible from its published inputs.
     assert fields["score"] == compute_signal_rank_score(
@@ -1047,7 +1068,8 @@ def test_changing_memory_confidence_changes_no_signal_output() -> None:
         now=_NOW,
     )
     assert low == high
-    assert low["epistemic_state"] == "unknown"
+    # The canonical V2 state (supported) — memory_confidence cannot touch it.
+    assert low["epistemic_state"] == "supported"
     assert "low_confidence" not in low["warning_codes"]
     assert "low confidence" not in [w.lower() for w in low["warnings"]]
     # The misleading code is gone from the vocabulary entirely.
@@ -1121,3 +1143,317 @@ def test_importance_changes_utility_and_rank_but_not_admission_or_epistemic() ->
     )
     assert high_fields["utility_score"] > low_fields["utility_score"]
     assert high_fields["score"] > low_fields["score"]
+
+
+# ---- canonical served evidence state (issue #188) ---------------------------
+
+
+def _admitted(
+    item: MemoryItem,
+    *,
+    profile: Any = GOVERNED_PROFILE,
+    decision_overrides: dict[str, Any] | None = None,
+    **decision_kwargs: Any,
+) -> tuple[RecallAdmissionDecision, dict[str, Any]]:
+    """An admitted decision from a current exact-surface allow + its fields."""
+    resolution = _current(
+        _v2_decision(
+            governed=decision_kwargs.pop("governed", "allow"),
+            exploratory=decision_kwargs.pop("exploratory", "allow"),
+        )
+    )
+    decision = decide_recall_admission(
+        item, profile=profile, stay_kinds=set(), v2_resolution=resolution
+    )
+    assert decision.decision == "admit"
+    if decision_overrides:
+        decision = replace(decision, **decision_overrides)
+    return decision, signal_item_fields(item, decision=decision, similarity=0.8, now=_NOW)
+
+
+def _v2_decision_states(
+    *, epistemic_state: str, risk_state: str, governed: str = "allow"
+) -> AdmissionPolicyDecision:
+    """A representative decision envelope with explicit evidence states."""
+    decision = _v2_decision(governed=governed)
+    return replace(
+        decision,
+        epistemic_state=epistemic_state,  # type: ignore[arg-type]
+        risk_state=risk_state,  # type: ignore[arg-type]
+    )
+
+
+def test_evidence_block_mirrors_the_bound_v2_fresh_evaluation() -> None:
+    """Required test 1: a low-risk supported governed ``current+allow`` item
+    is admitted, and every served evidence field is the exact value of the
+    ``admission.v2`` binding admission consumed — the identity invariant."""
+    item = _make_item(review_status="proposed")
+    decision, fields = _admitted(item, profile=GOVERNED_PROFILE)
+    admission_v2 = fields["admission"]["v2"]
+    fresh = admission_v2["fresh"]
+    evidence = fields["evidence"]
+
+    assert fields["admission"]["decision"] == "admit"
+    assert evidence["source"] == "v2_fresh_evaluation"
+    assert evidence["profile_key"] == admission_v2["profile_key"]
+    assert evidence["policy_version"] == fresh["policy_version"]
+    assert evidence["policy_artifact_digest"] == fresh["policy_artifact_digest"]
+    assert evidence["decision_hash"] == fresh["decision_hash"]
+    assert evidence["v2_resolution_status"] == "current"
+    assert evidence["epistemic_state"] == fresh["epistemic_state"] == "supported"
+    assert evidence["risk_state"] == fresh["risk_state"] == "low"
+    assert evidence["retention_state"] == fresh["retention_state"]
+    assert evidence["effective_assessment_refs"] == fresh["effective_assessment_refs"]
+    assert fields["epistemic_state"] == evidence["epistemic_state"]
+
+
+def test_evidence_epistemic_states_each_carry_their_warning_code() -> None:
+    """Required tests 2-4 + the warning matrix: on admitted exploratory items
+    the V2 fresh epistemic state is preserved exactly and maps to its stable
+    evidence code — ``unknown``/``contested``/``insufficient_evidence`` —
+    while ``supported`` carries no evidence-quality code at all."""
+    item = _make_item(review_status="proposed")
+    from engram.recall_signals import _WARNING_TEXT
+
+    expected_code = {
+        "unknown": "evidence_unknown",
+        "contested": "evidence_contested",
+        "insufficient_evidence": "evidence_insufficient",
+        "supported": None,
+    }
+    for state, code in expected_code.items():
+        resolution = _current(_v2_decision_states(epistemic_state=state, risk_state="low"))
+        decision = decide_recall_admission(
+            item, profile=EXPLORATORY_PROFILE, stay_kinds=set(), v2_resolution=resolution
+        )
+        assert decision.decision == "admit", state
+        fields = signal_item_fields(item, decision=decision, similarity=0.8, now=_NOW)
+        assert fields["epistemic_state"] == state, state
+        assert fields["evidence"]["epistemic_state"] == state, state
+        assert fields["admission"]["v2"]["fresh"]["epistemic_state"] == state, state
+        evidence_codes = {
+            "evidence_unknown",
+            "evidence_contested",
+            "evidence_insufficient",
+        }
+        for candidate in evidence_codes:
+            if candidate == code:
+                assert candidate in fields["warning_codes"], state
+            else:
+                assert candidate not in fields["warning_codes"], state
+        # The human-readable mirror exists for every emitted code.
+        for warning_code in fields["warning_codes"]:
+            assert warning_code in _WARNING_TEXT
+
+
+def test_high_and_unknown_risk_stay_unmistakable_on_admitted_exploratory() -> None:
+    """Required tests 5-6: an exploratory item the exact surface allowed is
+    not silently de-risked — ``high``/``unknown`` V2 risk states surface both
+    in the evidence block and as stable ``risk_high``/``risk_unknown`` codes;
+    low/medium need no generic risk code. The served packet stays internally
+    consistent: the exact surface decision is ``allow`` and the human-readable
+    risk warning stays neutral about it (no invented review requirement)."""
+    item = _make_item(review_status="proposed")
+    expected_code = {"high": "risk_high", "unknown": "risk_unknown", "low": None}
+    served: dict[str, dict[str, Any]] = {}
+    for risk, code in expected_code.items():
+        resolution = _current(
+            _v2_decision_states(epistemic_state="supported", risk_state=risk)
+        )
+        decision = decide_recall_admission(
+            item, profile=EXPLORATORY_PROFILE, stay_kinds=set(), v2_resolution=resolution
+        )
+        assert decision.decision == "admit", risk
+        fields = signal_item_fields(item, decision=decision, similarity=0.8, now=_NOW)
+        served[risk] = fields
+        assert fields["evidence"]["risk_state"] == risk, risk
+        assert fields["admission"]["v2"]["fresh"]["risk_state"] == risk, risk
+        if code is None:
+            assert "risk_high" not in fields["warning_codes"], risk
+            assert "risk_unknown" not in fields["warning_codes"], risk
+        else:
+            assert code in fields["warning_codes"], risk
+        # The exact exploratory decision that admitted the item is ``allow``;
+        # the human-readable mirror must not contradict it by claiming a
+        # review requirement (issue #188 review finding).
+        assert fields["admission"]["v2"]["fresh"]["surface_decision"] == "allow", risk
+        assert "review required" not in " ".join(fields["warnings"]).lower(), risk
+
+    high = served["high"]
+    assert "risk_high" in high["warning_codes"]
+    assert "high risk" in high["warnings"]
+
+
+def test_local_heuristic_cannot_compete_with_the_v2_evidence_state() -> None:
+    """Required test 7: a proposed item the local heuristic labels ``unknown``
+    must present the V2 fresh state instead when the two disagree — and a
+    verified proposal must not flip an ``insufficient_evidence`` V2 state
+    (required test 9: verification stays an independent lifecycle mark, never
+    an override of the canonical evidence state)."""
+    proposed = _make_item(review_status="proposed")
+    # The local heuristic really would have said "unknown" pre-#188.
+    assert derive_epistemic_state(
+        review_status="proposed",
+        human_verified=False,
+        conflict_resolution_status=None,
+    ) == "unknown"
+
+    resolution = _current(_v2_decision_states(epistemic_state="supported", risk_state="low"))
+    decision = decide_recall_admission(
+        proposed, profile=EXPLORATORY_PROFILE, stay_kinds=set(), v2_resolution=resolution
+    )
+    fields = signal_item_fields(proposed, decision=decision, similarity=0.8, now=_NOW)
+    assert fields["epistemic_state"] == "supported"
+    assert fields["evidence"]["epistemic_state"] == "supported"
+    assert "evidence_unknown" not in fields["warning_codes"]
+
+    verified = _make_item(review_status="proposed", human_verified=True)
+    assert derive_epistemic_state(
+        review_status="proposed",
+        human_verified=True,
+        conflict_resolution_status=None,
+    ) == "unknown"  # the local heuristic's own precedence
+    insufficient = _current(
+        _v2_decision_states(epistemic_state="insufficient_evidence", risk_state="low")
+    )
+    decision = decide_recall_admission(
+        verified, profile=EXPLORATORY_PROFILE, stay_kinds=set(), v2_resolution=insufficient
+    )
+    fields = signal_item_fields(verified, decision=decision, similarity=0.8, now=_NOW)
+    assert fields["epistemic_state"] == "insufficient_evidence"
+    assert fields["evidence"]["epistemic_state"] == "insufficient_evidence"
+    assert "evidence_insufficient" in fields["warning_codes"]
+
+
+def test_mutable_item_state_cannot_move_the_canonical_evidence_state() -> None:
+    """Required test 8: with the resolved V2 decision held fixed, changing
+    only ``memory_confidence``, importance, source trust, recall counters, or
+    age changes neither ``evidence.*`` nor the top-level epistemic state.
+    The evidence block is a projection of the binding, not a derivation."""
+    resolution = _current(_v2_decision_states(epistemic_state="unknown", risk_state="unknown"))
+    baseline_item = _make_item(review_status="proposed")
+    baseline_decision = decide_recall_admission(
+        baseline_item, profile=EXPLORATORY_PROFILE, stay_kinds=set(), v2_resolution=resolution
+    )
+    baseline = signal_item_fields(
+        baseline_item, decision=baseline_decision, similarity=0.8, now=_NOW
+    )
+    mutated = _make_item(
+        review_status="proposed",
+        memory_confidence=0.99,
+        source_trust=1.0,
+        importance=1.0,
+        human_verified=True,
+        recall_count=10_000,
+        startup_recall_count=10_000,
+        last_recalled_at=_NOW,
+        created_at=_NOW - timedelta(days=365),
+        valid_from=_NOW - timedelta(days=365),
+    )
+    mutated_decision = decide_recall_admission(
+        mutated, profile=EXPLORATORY_PROFILE, stay_kinds=set(), v2_resolution=resolution
+    )
+    fields = signal_item_fields(mutated, decision=mutated_decision, similarity=0.8, now=_NOW)
+    assert fields["evidence"] == baseline["evidence"]
+    assert fields["epistemic_state"] == baseline["epistemic_state"] == "unknown"
+    assert fields["warning_codes"] == baseline["warning_codes"]
+    # Utility legitimately moved with importance/age; admission did not.
+    assert fields["utility_score"] != baseline["utility_score"]
+    assert fields["admission"]["decision"] == "admit"
+
+
+def test_non_v2_decision_keeps_the_local_derivation_shape() -> None:
+    """A decision with no V2 binding (a legacy local profile) keeps the
+    pre-#188 payload shape: local epistemic derivation, no ``evidence`` block,
+    no risk codes."""
+    item = _make_item(review_status="proposed")
+    decision = RecallAdmissionDecision(
+        profile="local", decision="admit", reason_codes=("exploratory_proposal",)
+    )
+    fields = signal_item_fields(item, decision=decision, similarity=0.8, now=_NOW)
+    assert "evidence" not in fields
+    assert fields["epistemic_state"] == "unknown"
+    assert "evidence_unknown" in fields["warning_codes"]
+    assert "risk_high" not in fields["warning_codes"]
+    assert "risk_unknown" not in fields["warning_codes"]
+
+
+def test_impossible_admitted_combinations_fail_closed() -> None:
+    """``not_applicable`` epistemic state, a missing fresh evaluation, a
+    non-current resolution, and a non-``allow`` surface decision cannot
+    produce a served evidence block: the builders raise instead of inventing
+    a safe-looking interpretation."""
+    from pytest import raises as assert_raises
+
+    not_applicable = build_v2_surface_binding(
+        _FakeResolution(
+            status="current",
+            decision=_v2_decision_states(epistemic_state="not_applicable", risk_state="low"),
+            assessment=_persisted_row(
+                _v2_decision_states(epistemic_state="not_applicable", risk_state="low")
+            ),
+        ),
+        surface="semantic_governed",
+    )
+    with assert_raises(V2EvidenceContractError):
+        build_v2_evidence_fields(not_applicable)
+
+    noncurrent = build_v2_surface_binding(
+        _FakeResolution(
+            status="stale",
+            decision=_v2_decision(),
+            assessment=_persisted_row(_v2_decision(), decision_hash="sha256:" + "c" * 64),
+        ),
+        surface="semantic_governed",
+    )
+    with assert_raises(V2EvidenceContractError):
+        build_v2_evidence_fields(noncurrent)
+
+    withheld = build_v2_surface_binding(
+        _current(_v2_decision(governed="review_required")), surface="semantic_governed"
+    )
+    assert withheld.surface_decision == "review_required"
+    with assert_raises(V2EvidenceContractError):
+        build_v2_evidence_fields(withheld)
+
+    rowless = build_v2_surface_binding(None, surface="semantic_governed")
+    assert rowless.fresh is None
+    with assert_raises(V2EvidenceContractError):
+        build_v2_evidence_fields(rowless)
+
+
+def test_withheld_items_never_carry_an_evidence_block() -> None:
+    """Required test 10 (payload half): a withheld V2-bound decision produces
+    no per-item fields at all on the recall path — the fields builder is only
+    invoked for admits, and the withhold payload's diagnostic ``v2`` block
+    keeps its full non-current identity."""
+    item = _make_item(review_status="proposed")
+    for status in ("missing", "stale", "mismatched", "unsupported"):
+        resolution = _FakeResolution(
+            status=status,
+            decision=_v2_decision(),
+            assessment=None if status == "missing" else _persisted_row(_v2_decision()),
+        )
+        decision = decide_recall_admission(
+            item, profile=GOVERNED_PROFILE, stay_kinds=set(), v2_resolution=resolution
+        )
+        assert decision.decision == "withhold", status
+        assert decision.v2 is not None
+        assert decision.v2.resolution_status == status
+        # A diagnostic block exists; a served evidence block never does.
+        payload = decision.payload()
+        assert payload["v2"]["resolution_status"] == status
+        assert "evidence" not in payload
+
+
+def test_evidence_presentation_performs_no_io() -> None:
+    """Required tests 11-12 (unit half): the evidence block is built by a pure
+    function of the already-bound decision — ``signal_item_fields`` and
+    ``build_v2_evidence_fields`` are synchronous and take no session, so no
+    provider call or query can hide behind presentation."""
+    import inspect
+
+    assert not inspect.iscoroutinefunction(signal_item_fields)
+    assert not inspect.iscoroutinefunction(build_v2_evidence_fields)
+    assert "session" not in inspect.signature(build_v2_evidence_fields).parameters
+    assert "session" not in inspect.signature(signal_item_fields).parameters

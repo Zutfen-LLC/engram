@@ -1,9 +1,11 @@
 # ADR-160: Recall admission profiles and separated recall signals
 
 Status: Proposed (implementation landed; candidate profiles shadow-only until
-#162 certification; candidate admission is V2-bound since issue #186)
+#162 certification; candidate admission is V2-bound since issue #186, served
+evidence presentation since issue #188)
 Date: 2026-09-06
-Issue: #160 (ENG-RECALL-003), parent #153; supplement: #186 (ENG-RECALL-003B)
+Issue: #160 (ENG-RECALL-003), parent #153; supplements: #186
+(ENG-RECALL-003B), #188 (ENG-RECALL-003C)
 Depends on: #157 (versioned memory assessments), #158 (risk-aware admission
 policy), #159 (durable admission assessments)
 
@@ -267,6 +269,68 @@ current — an unqualified or never-simulated corpus evaluates to explicit
 `v2_decision_missing` withholdings, which is the certification-honest
 behavior #186 requires.
 
+## Supplement (issue #188, ENG-RECALL-003C): canonical served evidence state
+
+PR #187 fixed the admission *authority*; issue #188 fixes the served item
+*presentation* so an admitted candidate packet can never describe a different
+evidence state than the one that admitted it. It is a shadow-only
+presentation/contract correction: no ranking, packing, production serving,
+promotion, review state, or certification authority changes.
+
+1. **Canonical evidence source.** For the V2-bound profiles (`governed`,
+   `exploratory`), the served evidence state of an admitted item is the
+   already-resolved `admission.v2.fresh` evaluation — the exact state the
+   admission policy consumed. No second #157 selection pass, no per-item
+   `memory_assessments` query, no second V2 policy evaluation, and no
+   positive inference from `review_status`, `memory_confidence`,
+   `source_trust`, importance, age, recall counts, or human verification on
+   these profiles. The item-local review/conflict/verification heuristic
+   (`derive_epistemic_state`) remains only for non-V2 local profiles (none
+   are registered today) and for its pre-existing unit contracts.
+
+2. **`evidence` payload block (additive).** Every admitted V2-bound item
+   carries a structured block that is a pure projection of the binding —
+   `source: "v2_fresh_evaluation"`, `profile_key`, `policy_version`,
+   `policy_artifact_digest`, `decision_hash`, `v2_resolution_status`,
+   `epistemic_state`, `risk_state`, `retention_state`,
+   `effective_assessment_refs` — and the pre-existing top-level
+   `epistemic_state` field now mirrors `evidence.epistemic_state` exactly.
+   The identity invariant (`evidence.* == admission.v2.fresh.*`) is
+   structural: the block is built by one pure function
+   (`recall_signals.build_v2_evidence_fields`) from the `RecallAdmissionDecision`
+   the gate already returned. An impossible admitted combination
+   (non-`current` resolution, non-`allow` surface decision, or an
+   unpresentable epistemic state such as `not_applicable`) raises
+   `V2EvidenceContractError` instead of being reinterpreted. The block is
+   deliberately **receipt-ready**: the #160 Context Ledger receipt slice can
+   copy/bind it as-is; no receipt storage or contract lands here. Raw #157
+   `selection_status` is intentionally not surfaced in this slice (it would
+   revise the #158 decision/hash contract and stale persisted V2 rows);
+   unavailability remains visible through the bound blocker/reason/
+   next-action codes.
+
+3. **Warning contract.** Warnings on admitted V2-bound items derive from the
+   canonical V2 evidence state plus independently true lifecycle/governance
+   marks (`unreviewed`, dispute/conflict, #159 stale/legacy-import) and can
+   never contradict `evidence.*`: `unknown` → `evidence_unknown`,
+   `contested` → `evidence_contested`, `insufficient_evidence` →
+   `evidence_insufficient`, `supported` → no evidence-quality code;
+   `risk_state` `high`/`unknown` → `risk_high`/`risk_unknown`, so an
+   exploratory item the exact surface allowed still carries its risk
+   unmistakably. Non-`current` V2 resolutions never produce served evidence
+   fields — they remain fail-closed withholds represented through the
+   withheld `admission_diagnostics.v2` blocks.
+
+4. **Boundaries unchanged.** Ranking (`compute_signal_rank_score`, utility
+   weights), relevance retrieval, ordering, budgets, live-proposal corpus
+   eligibility, #159 local-withhold precedence, and graph/tunnel expansion
+   are untouched; the evidence/risk fields do not feed ranking.
+   `CERTIFIED_SERVING_PROFILES` remains `{"legacy"}`, ordinary recall stays
+   legacy-only, the shadow comparison stays reviewer + tenant-policy gated
+   and writes nothing, MCP exposes no profile selection, and the legacy
+   packet shape is byte-for-byte unchanged (no `evidence` /
+   `warning_codes` keys on legacy items).
+
 ## Feedback-loop safeguards (issue #160)
 
 * utility excludes exposure counters (`recall_count`,
@@ -279,18 +343,20 @@ behavior #186 requires.
 
 ## Known limitations / follow-ups (issue #160 remains open)
 
-This ADR records the #160 slice plus the #186 V2-binding supplement.
+This ADR records the #160 slice plus the #186 V2-binding and #188
+evidence-presentation supplements.
 Deliberately deferred, tracked by the issue:
 
 * **Signal-aware graph/tunnel expansion** — expansion is legacy-only;
   admission must precede expansion and the rescorer still speaks the blended
   score. Governed/exploratory evaluate direct semantic hits only until
   expansion learns the signal model.
-* **#157 bulk epistemic enrichment beyond V2** — the V2 resolver supplies
+* **#157 enrichment on non-V2 paths** — the V2 resolver supplies
   risk/epistemic/retention state for candidate admission in bulk
-  (`effective_assessment_selection_bulk`); enriching the *served item*
-  epistemic fields beyond the item-level derivation, where V2 does not
-  already carry it, is follow-up.
+  (`effective_assessment_selection_bulk`), and since #188 the served items of
+  the V2-bound candidate profiles present exactly that state. Startup and any
+  future non-V2 profile still use their own item-level derivation; enriching
+  *those* served fields from #157 is follow-up.
 * **Evidence-root diversity / redundancy packing** — packing is purely
   rank-ordered; evidence-root grouping (via the #157 evidence manifest) is
   follow-up.
@@ -300,7 +366,9 @@ Deliberately deferred, tracked by the issue:
   + freshness only; versioned, bounded feedback with actor/root provenance is
   follow-up.
 * **Semantic Context Ledger receipts** — receipts remain startup-only;
-  binding per-item admission evidence lands with semantic receipts.
+  since #188 the candidate packet's `evidence` block is receipt-ready (the
+  receipt slice can copy/bind it without reconstructing it), and binding
+  per-item admission evidence into receipts lands with semantic receipts.
 * **Review/historical recall surfaces** — not selectable; they need their own
   capability contracts.
 * **Dogfood evaluation + exposure-concentration analysis** — run on the

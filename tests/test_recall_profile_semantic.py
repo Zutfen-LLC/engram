@@ -487,6 +487,10 @@ async def test_ordinary_semantic_recall_serves_legacy_packet(client, monkeypatch
     assert "trust_score" in proposal
     assert "unreviewed" in proposal["warnings"]
     assert "epistemic_state" not in proposal
+    # Issue #188: the structured evidence block and machine codes are
+    # candidate-profile additions — the legacy item shape gains no keys.
+    assert "evidence" not in proposal
+    assert "warning_codes" not in proposal
 
     # Explicit legacy behaves identically.
     explicit = await _recall(client, recall_profile="legacy")
@@ -605,12 +609,16 @@ async def test_shadow_comparison_evaluates_candidates_without_mutating_serving(
     assert governed["v2_resolution"]["resolution_status_counts"] == {"current": 1}
     assert governed["admission_diagnostics"] == []
 
-    # Exploratory candidate: the qualified proposal is admitted and marked as
-    # the unknown-evidence state a proposal is.
+    # Exploratory candidate: the qualified proposal is admitted. Since #188
+    # its served evidence state is the canonical V2 fresh evaluation
+    # ("supported") — not the item-local proposal heuristic ("unknown").
     exploratory = next(c for c in shadow["candidates"] if c["profile"] == "exploratory")
     expl_by_id = {i["id"]: i for i in exploratory["items"]}
     assert proposed_id in expl_by_id
-    assert expl_by_id[proposed_id]["epistemic_state"] == "unknown"
+    assert expl_by_id[proposed_id]["epistemic_state"] == "supported"
+    assert (
+        expl_by_id[proposed_id]["evidence"]["epistemic_state"] == "supported"
+    )
     assert "unreviewed" in expl_by_id[proposed_id]["warning_codes"]
 
     # Read-only proof: no audit row, no exposure counters, serving unchanged.
@@ -699,7 +707,8 @@ async def test_governed_candidate_admits_only_v2_qualified_proposals(
     assert "trust_score" not in served
     assert served["relevance_score"] > 0
     assert 0.0 <= served["utility_score"] <= 1.0
-    assert served["epistemic_state"] == "unknown"
+    # Issue #188: the served evidence state is the canonical V2 fresh state.
+    assert served["epistemic_state"] == "supported"
     assert served["admission"]["profile"] == "governed"
     assert served["admission"]["decision"] == "admit"
     assert served["admission"]["surface"] == "semantic_governed"
@@ -713,6 +722,8 @@ async def test_governed_candidate_admits_only_v2_qualified_proposals(
     # current means the persisted identity and the fresh evaluation agree.
     assert v2["persisted"]["decision_hash"] == v2["fresh"]["decision_hash"]
     assert v2["persisted"]["policy_artifact_digest"] == v2["fresh"]["policy_artifact_digest"]
+    # The evidence block is an exact projection of that same binding.
+    _evidence_identity_asserts(served)
     from engram.recall_signals import compute_signal_rank_score
 
     assert served["score"] == compute_signal_rank_score(
@@ -818,7 +829,11 @@ async def test_governed_candidate_withholds_item_with_stale_assessment(
     assert expl["item_count"] == 1
     expl_by_id = {item["id"]: item for item in expl["items"]}
     assert "admission_assessment_stale" in expl_by_id[proposed_id]["warning_codes"]
-    assert expl_by_id[proposed_id]["epistemic_state"] == "unknown"
+    # Issue #188: the #159 stale mark stays an independent lifecycle warning,
+    # while the served epistemic state remains the canonical V2 fresh state
+    # ("supported"), mirrored in the evidence block — not the local heuristic.
+    assert expl_by_id[proposed_id]["epistemic_state"] == "supported"
+    _evidence_identity_asserts(expl_by_id[proposed_id])
 
 
 async def test_governed_candidate_ordering_is_deterministic(client, monkeypatch):
@@ -1350,3 +1365,274 @@ async def test_shadow_rejects_certified_or_unknown_profiles(client):
         assert resp.status_code == 422, resp.text
     resp = await client.post("/v1/recall/shadow-compare", json={"query": "q"})
     assert resp.status_code == 200  # default governed selection is valid
+
+
+# ---- canonical served evidence state (issue #188) ---------------------------
+
+
+def _evidence_identity_asserts(item: dict[str, Any]) -> None:
+    """The #188 identity invariant, mechanically: every evidence field equals
+    the ``admission.v2`` binding the admission decision consumed, and the
+    top-level epistemic state mirrors the evidence block."""
+    v2 = item["admission"]["v2"]
+    fresh = v2["fresh"]
+    evidence = item["evidence"]
+    assert evidence["source"] == "v2_fresh_evaluation"
+    assert evidence["profile_key"] == v2["profile_key"]
+    assert evidence["policy_version"] == fresh["policy_version"]
+    assert evidence["policy_artifact_digest"] == fresh["policy_artifact_digest"]
+    assert evidence["decision_hash"] == fresh["decision_hash"]
+    assert evidence["v2_resolution_status"] == v2["resolution_status"] == "current"
+    assert evidence["epistemic_state"] == fresh["epistemic_state"]
+    assert evidence["risk_state"] == fresh["risk_state"]
+    assert evidence["retention_state"] == fresh["retention_state"]
+    assert evidence["effective_assessment_refs"] == fresh["effective_assessment_refs"]
+    assert item["epistemic_state"] == evidence["epistemic_state"]
+
+
+async def test_served_evidence_state_is_the_exact_v2_fresh_evaluation(
+    client, monkeypatch
+):
+    """Issue #188 required tests 1-6 against the real resolver path: for every
+    #157 evidence state the exploratory surface admits (supported, unknown,
+    contested, insufficient_evidence, high/unknown risk), the served packet
+    preserves the exact V2 fresh state, mirrors it in the structured evidence
+    block, and carries the stable warning code; governed admits only the
+    qualified item and itemizes the rest as surface diagnostics."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    fixtures: dict[str, dict[str, Any]] = {}
+    supported = await _remember(client, "evidence matrix supported", source_type="extraction")
+    await _persist_v2_row(supported["id"], risk="low", epistemic_state="supported")
+    fixtures[supported["id"]] = {
+        "epistemic_state": "supported",
+        "risk_state": "low",
+        "warning_code": None,
+        "governed_admitted": True,
+        "governed_surface_decision": "allow",
+    }
+    absent = await _remember(client, "evidence matrix absent", source_type="extraction")
+    await _persist_v2_row(absent["id"], risk=None)
+    fixtures[absent["id"]] = {
+        "epistemic_state": "unknown",
+        "risk_state": "unknown",
+        "warning_code": ("evidence_unknown", "risk_unknown"),
+        "governed_admitted": False,
+        # unknown risk hits the risk_unknown rule -> review_required output.
+        "governed_surface_decision": "review_required",
+    }
+    contested = await _remember(client, "evidence matrix contested", source_type="extraction")
+    await _persist_v2_row(contested["id"], risk="low", epistemic_state="contested")
+    fixtures[contested["id"]] = {
+        "epistemic_state": "contested",
+        "risk_state": "low",
+        "warning_code": ("evidence_contested",),
+        "governed_admitted": False,
+        "governed_surface_decision": "review_required",
+    }
+    insufficient = await _remember(
+        client, "evidence matrix insufficient", source_type="extraction"
+    )
+    await _persist_v2_row(insufficient["id"], risk="low", epistemic_state="insufficient_evidence")
+    fixtures[insufficient["id"]] = {
+        "epistemic_state": "insufficient_evidence",
+        "risk_state": "low",
+        "warning_code": ("evidence_insufficient",),
+        "governed_admitted": False,
+        # epistemic_insufficient (low risk) -> withhold output on governed.
+        "governed_surface_decision": "withhold",
+    }
+    high = await _remember(client, "evidence matrix high risk", source_type="extraction")
+    await _persist_v2_row(high["id"], risk="high", epistemic_state="supported")
+    fixtures[high["id"]] = {
+        "epistemic_state": "supported",
+        "risk_state": "high",
+        "warning_code": ("risk_high",),
+        "governed_admitted": False,
+        "governed_surface_decision": "review_required",
+    }
+
+    shadow = await _shadow_compare(client, profiles=["governed", "exploratory"])
+    governed = next(c for c in shadow["candidates"] if c["profile"] == "governed")
+    exploratory = next(c for c in shadow["candidates"] if c["profile"] == "exploratory")
+
+    # Exploratory: every exact semantic_exploratory allow is admitted with the
+    # exact V2 state, its warning code, and no contradicting code.
+    assert {i["id"] for i in exploratory["items"]} == set(fixtures)
+    by_id = {i["id"]: i for i in exploratory["items"]}
+    for item_id, expected in fixtures.items():
+        item = by_id[item_id]
+        _evidence_identity_asserts(item)
+        assert item["evidence"]["epistemic_state"] == expected["epistemic_state"]
+        assert item["evidence"]["risk_state"] == expected["risk_state"]
+        codes = item["warning_codes"]
+        for code in ("evidence_unknown", "evidence_contested", "evidence_insufficient",
+                     "risk_high", "risk_unknown"):
+            if expected["warning_code"] and code in expected["warning_code"]:
+                assert code in codes, (item_id, code)
+            else:
+                assert code not in codes, (item_id, code)
+        # The evidence/risk presentation never moved the rank inputs.
+        from engram.recall_signals import compute_signal_rank_score
+
+        assert item["score"] == compute_signal_rank_score(
+            similarity=item["relevance_score"], utility=item["utility_score"]
+        )
+
+    # Governed: only the qualified (supported/low) item; every other
+    # candidate's exact surface decision withheld it — no evidence block is
+    # served for withheld candidates, and their diagnostic V2 identity stays
+    # intact (required test 10).
+    assert {i["id"] for i in governed["items"]} == {
+        item_id for item_id, expected in fixtures.items() if expected["governed_admitted"]
+    }
+    for item in governed["items"]:
+        _evidence_identity_asserts(item)
+    diag_by_id = {d["item_id"]: d for d in governed["admission_diagnostics"]}
+    for item_id, expected in fixtures.items():
+        if expected["governed_admitted"]:
+            assert item_id not in diag_by_id
+            continue
+        assert diag_by_id[item_id]["v2_resolution_status"] == "current"
+        assert (
+            diag_by_id[item_id]["v2_surface_decision"]
+            == expected["governed_surface_decision"]
+        )
+        assert diag_by_id[item_id]["decision"] == "withhold"
+
+
+async def test_evidence_presentation_adds_no_resolution_or_evaluation(
+    client, monkeypatch
+):
+    """Issue #188 required tests 11-12: the evidence block is projected from
+    the admission binding — the shared V2 evaluation core runs exactly once
+    per candidate window (never a second pass for presentation), the bulk
+    resolution runs once per packet, and no provider call happens beyond the
+    one shared query embedding."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    for i in range(3):
+        item = await _remember(client, f"evidence io {i}", source_type="extraction")
+        await _persist_v2_row(item["id"])
+
+    import engram.admission_shadow as admission_shadow_mod
+
+    evaluation_calls = {"count": 0}
+    original_evaluate = admission_shadow_mod._evaluate_shadow_decision
+
+    def counting_evaluate(*args: Any, **kwargs: Any) -> Any:
+        evaluation_calls["count"] += 1
+        return original_evaluate(*args, **kwargs)
+
+    monkeypatch.setattr(
+        admission_shadow_mod, "_evaluate_shadow_decision", counting_evaluate
+    )
+
+    resolve_calls = {"count": 0}
+    original_resolve = admission_shadow_mod.resolve_bulk_v2_decisions
+
+    async def counting_resolve(*args: Any, **kwargs: Any) -> Any:
+        resolve_calls["count"] += 1
+        return await original_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(
+        admission_shadow_mod, "resolve_bulk_v2_decisions", counting_resolve
+    )
+
+    import engram.embeddings as embeddings_mod
+    from engram import recall as recall_mod
+
+    provider_calls = {"count": 0}
+
+    async def counting_embedding(text_value: str, *_args: object, **kwargs: object) -> Any:
+        provider_calls["count"] += 1
+        return _fake_embedding_for(text_value)
+
+    monkeypatch.setattr(recall_mod, "generate_embedding", counting_embedding)
+    monkeypatch.setattr(memory_routes, "generate_embedding", counting_embedding)
+    monkeypatch.setattr(embeddings_mod, "generate_embedding", counting_embedding)
+
+    shadow = await _shadow_compare(client, profiles=["governed", "exploratory"])
+
+    # Two candidate packets, one bulk resolution each — never per item,
+    # never a second presentation pass.
+    assert resolve_calls["count"] == 2
+    # Exactly one V2 evaluation per resolved item per packet: the evaluation
+    # admission consumed is the same one presentation projects.
+    resolved_total = sum(
+        c["v2_resolution"]["resolved_count"] for c in shadow["candidates"]
+    )
+    assert resolved_total == 6  # 3 items x 2 packets
+    assert evaluation_calls["count"] == resolved_total
+    # One shared query embedding for the whole comparison (legacy + both
+    # candidates) — evidence presentation never calls a provider.
+    assert provider_calls["count"] == 1
+    # The per-window query count equals a standalone resolution of the same
+    # items: presentation happens after resolution and adds no query.
+    from sqlalchemy import select as sa_select
+
+    from engram.models import MemoryItem
+
+    async with _test_session_factory() as session:
+        from engram.db import apply_rls_context
+
+        ids = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT t.id::text AS tenant_id, p.id::text AS principal_id "
+                        "FROM tenants t JOIN principals p ON p.tenant_id = t.id "
+                        "WHERE t.slug = 'default' AND p.name = 'admin'"
+                    )
+                )
+            )
+            .mappings()
+            .one()
+        )
+        await apply_rls_context(
+            session, tenant_id=ids["tenant_id"], principal_id=ids["principal_id"]
+        )
+        window = list(
+            (
+                await session.scalars(
+                    sa_select(MemoryItem).where(MemoryItem.review_status == "proposed")
+                )
+            ).all()
+        )
+        context = _test_memory_context(ids["tenant_id"], ids["principal_id"])
+        standalone = await original_resolve(
+            session, items=window, context=context, evaluation_time=datetime.now(UTC)
+        )
+    packet_queries = {
+        c["v2_resolution"]["query_count"] for c in shadow["candidates"]
+    }
+    assert packet_queries == {standalone.query_count}
+    assert standalone.query_count > 0
+
+
+async def test_shadow_compare_with_evidence_remains_read_only(client, monkeypatch):
+    """Issue #188 required test 13: with evidence blocks in the candidate
+    packets, the comparison still writes nothing — no recall log, no exposure
+    counters, no review/promotion/assessment mutation."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    item = await _remember(client, "evidence read-only target", source_type="extraction")
+    await _persist_v2_row(item["id"])
+    logs_before = await _recall_log_count()
+    counts_before = await _recall_counts([item["id"]])
+
+    shadow = await _shadow_compare(client, profiles=["governed", "exploratory"])
+    assert shadow["candidates"][0]["items"]
+    assert shadow["candidates"][0]["items"][0]["evidence"]["source"] == "v2_fresh_evaluation"
+
+    assert await _recall_log_count() == logs_before
+    assert await _recall_counts([item["id"]]) == counts_before
