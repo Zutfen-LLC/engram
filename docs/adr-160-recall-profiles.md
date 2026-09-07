@@ -417,6 +417,78 @@ governed/exploratory production serving and no #162 certification/cutover.
    dogfood ranking tuning, and #162 certification/cutover all remain
    follow-up.
 
+## Supplement (issue #192, ENG-RECALL-003E): conflict-preserving, diversity-aware packing
+
+Issue #192 replaces the candidate profiles' final rank-then-truncate selection
+with one versioned, deterministic packing contract (`recall_packing`, version
+`recall-packing-v1`) that operates **only after admission (#186), relationship
+expansion (#190), and the separated relevance/utility ranking** — and only
+inside the shadow comparison surface. It authorizes no governed/exploratory
+production serving, no #161 corroboration, and no #162 certification/cutover.
+
+1. **Packing is selection, never mutation.** The packer consumes the finished
+   admitted/ranked candidate list and returns selected ids (rendered in the
+   ranking's order), a bounded per-item `packing_reason`
+   (`ranked | conflict_pair_preserved | diversity_fill`), and bounded omission
+   counts (`redundant_known_root`, `conflict_counterpart_budget`, `budget`).
+   Relevance, utility, epistemic state, risk, warning codes, the `admission`
+   receipt, the `evidence` block, and relationship metadata are not inputs it
+   can rewrite; changing packing config or neighboring candidates can change
+   *whether* an admitted item is selected, never *what that item claims about
+   itself*.
+
+2. **Diversity uses only mechanically-known shared-root identities.** Two
+   durable facts create a redundancy group, nothing else: an explicit
+   `derived_from` edge between two admitted candidates, and an exact
+   `content_hash` duplicate (the same identity `idx_memitems_dedup` encodes —
+   legal only across principal/workspace scope boundaries). Vector similarity
+   alone is relevance, never root identity: two merely similar items are never
+   grouped, and absent root knowledge is **unknown** — never coerced to
+   "independent" (independence/quorum/corroboration semantics remain #161's
+   sole property). Packing never manufactures corroboration or support state.
+
+3. **Known-root groups are anti-crowd-out, not destructive dedup.** The packer
+   first selects one representative per group in rank order (representative =
+   highest rank, deterministic tie-breaks), so same-root siblings cannot spend
+   the budget that distinct context needs; siblings then fill leftover capacity
+   in the fill phase and are counted `redundant_known_root` only when they
+   remain unpacked because their root was already represented.
+
+4. **Explicit conflicts are a representation obligation, not a truth
+   decision.** Conflict sources are exactly the durable `conflicts_with_item_id`
+   linkage and explicit `contradicts` edges, each restricted to counterparts
+   that are themselves admitted candidates under the caller's real read/RLS/
+   workspace boundary. Selecting one side creates a co-pack obligation for the
+   admitted counterpart — attempted immediately, ahead of lower-ranked
+   redundancy, under the same hard budgets. A budget-impossible co-pack is
+   recorded (`conflict_counterpart_budget`), never silently resolved; a
+   withheld or inaccessible counterpart creates no obligation, no selection,
+   and no identity leak (packing diagnostics are counts only). Preserving a
+   pair never labels either side more truthful and never upgrades/downgrades
+   evidence state.
+
+5. **Budgets stay hard and the accounting reconciles.** Selection measures
+   the actual rendered accounting (`len(content.encode())` bytes,
+   `max(1, bytes // 4)` tokens) with the legacy skip-not-break discipline;
+   item/byte/token budgets are never exceeded, exact boundaries are
+   deterministic, and `selected + Σ omitted == admitted count` holds
+   mechanically. The packet-level `packing` summary is a fixed key set
+   (version, selected count, preserved conflict-pair count, omission counts)
+   — no rejected content, no counterpart ids.
+
+6. **Bounded, deterministic, legacy-untouched.** The packer is pure and
+   in-memory over the already-bounded admitted set; its only I/O is one bulk
+   edge query whose endpoints are both inside that set (constant query count
+   regardless of candidate volume, no provider call, no graph walk, no second
+   V2 evaluation or #157 selection). Fixed state/config reproduces selected
+   ids, rendered order, reasons, and counts. The legacy profile's
+   rank-then-truncate packing stays byte-for-byte unchanged (no `packing`
+   summary, no per-item `packing_reason` keys on legacy items);
+   `CERTIFIED_SERVING_PROFILES` stays `{"legacy"}`.
+
+Context Ledger receipt binding, demonstrated-usefulness feedback,
+dogfood/exposure evaluation, and #162 certification/cutover remain follow-up.
+
 ## Feedback-loop safeguards (issue #160)
 
 * utility excludes exposure counters (`recall_count`,
@@ -430,26 +502,21 @@ governed/exploratory production serving and no #162 certification/cutover.
 ## Known limitations / follow-ups (issue #160 remains open)
 
 This ADR records the #160 slice plus the #186 V2-binding, #188
-evidence-presentation, and #190 admission-first relationship-expansion
-supplements.
+evidence-presentation, #190 admission-first relationship-expansion, and #192
+conflict-preserving/diversity-aware packing supplements.
 Deliberately deferred, tracked by the issue:
 
-* **Conflict-preserving/diversity packing over expanded candidates** — since
-  #190 the candidate profiles expand through graph/tunnel relationships
-  (admission-first, `relationship-relevance-v1`), but packing is still
-  purely rank-ordered: evidence-root grouping and conflict-pair preservation
-  over direct + expanded candidates are follow-up.
 * **#157 enrichment on non-V2 paths** — the V2 resolver supplies
   risk/epistemic/retention state for candidate admission in bulk
   (`effective_assessment_selection_bulk`), and since #188 the served items of
   the V2-bound candidate profiles present exactly that state. Startup and any
   future non-V2 profile still use their own item-level derivation; enriching
   *those* served fields from #157 is follow-up.
-* **Evidence-root diversity / redundancy packing** — packing is purely
-  rank-ordered; evidence-root grouping (via the #157 evidence manifest) is
-  follow-up.
-* **Conflict-pair preservation in packing** — contested items are admitted
-  and marked, but packing can still drop one side of an unresolved conflict.
+* **Evidence-root-aware packing inputs** — since #192 packing groups only
+  mechanically-known root identities (`derived_from` edges, exact
+  `content_hash` duplicates) and preserves explicit conflicts; richer
+  evidence-root identity from the #157 evidence manifest would be #161-owned
+  follow-up and must not be inferred from similarity.
 * **Demonstrated-usefulness feedback in utility** — utility-v1 is importance
   + freshness only; versioned, bounded feedback with actor/root provenance is
   follow-up.

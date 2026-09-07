@@ -78,7 +78,11 @@ class RecallShadowPacket(BaseModel):
     #158 V2 resolution summary. Legacy evaluates them to ``[]`` / ``None``.
     ``expansion`` is the issue #190 addition: the bounded admission-first
     relationship-expansion summary (contract version plus seed/neighbor/
-    admission counts). Legacy evaluates it to ``None``.
+    admission counts). ``packing`` is the issue #192 addition: the bounded
+    ``recall-packing-v1`` summary (selected count, preserved conflict pairs,
+    omission counts by reason — never rejected content or counterpart
+    identities). Legacy evaluates both to ``None``; candidate items carry an
+    additive ``packing_reason`` each.
     """
 
     profile: str
@@ -91,6 +95,7 @@ class RecallShadowPacket(BaseModel):
     admission_diagnostics: list[dict[str, Any]] = Field(default_factory=list)
     v2_resolution: dict[str, Any] | None = None
     expansion: dict[str, Any] | None = None
+    packing: dict[str, Any] | None = None
     effective_byte_budget: int | None
     effective_token_budget: int | None
     effective_item_budget: int | None

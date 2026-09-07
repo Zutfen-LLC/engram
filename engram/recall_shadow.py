@@ -91,8 +91,11 @@ def _packet_payload(evaluation: recall_module.SemanticPacketEvaluation) -> dict[
     resolution summary — the operator-facing evidence of exactly which #158
     decisions admitted or withheld each candidate (issue #186). Since issue
     #190 each packet also carries the bounded relationship-expansion summary
-    (contract version, seed/neighbor/admission counts). Legacy evaluates to
-    an empty diagnostics list / ``None`` summaries.
+    (contract version, seed/neighbor/admission counts), and since issue #192
+    the bounded ``recall-packing-v1`` summary (selected count, preserved
+    conflict pairs, omission counts by reason — counts only, no rejected
+    content or counterpart identities). Legacy evaluates to an empty
+    diagnostics list / ``None`` summaries.
     """
     profile = evaluation.profile
     return {
@@ -108,6 +111,7 @@ def _packet_payload(evaluation: recall_module.SemanticPacketEvaluation) -> dict[
         "admission_diagnostics": evaluation.admission_diagnostics,
         "v2_resolution": evaluation.v2_resolution,
         "expansion": evaluation.expansion,
+        "packing": evaluation.packing,
         "effective_byte_budget": evaluation.byte_budget,
         "effective_token_budget": evaluation.token_budget,
         "effective_item_budget": evaluation.item_budget,
