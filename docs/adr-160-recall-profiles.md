@@ -66,7 +66,11 @@ recall.
      `engram/recall_shadow.py`): it evaluates the legacy packet and each
      requested candidate profile with the same read-only evaluation core
      serving uses (`engram.recall.evaluate_semantic_profile`) and returns
-     id-level comparisons. It writes no `recall_logs` row, bumps no
+     id-level comparisons. It runs whenever *any* requested packet has an
+     eligible corpus — legacy may legitimately evaluate to an empty packet
+     while a candidate is non-empty (e.g. the only eligible item is a
+     disputed governed stay kind, invisible to legacy's active+proposed
+     window). It writes no `recall_logs` row, bumps no
      `recall_count`/`last_recalled_at` exposure counters, enqueues nothing,
      and feeds no promotion/evidence input — so an uncertified profile can
      never affect recall telemetry as though its packet had been served.
@@ -147,9 +151,11 @@ recall.
    (`settings.recall_default_profile`, refused while uncertified), which
    preserves pre-#160 behavior byte-for-byte — including `trust_score`,
    relationship expansion, and `scoring_version='semantic-v3'`.
-   `recall_logs.recall_profile` (migration 040, backfilled `'legacy'`)
-   records the effective served profile — which can only be `legacy` or
-   `startup` while certification stands; the response adds `recall_profile`,
+   `recall_logs.recall_profile` (migration 040) records the effective served
+   profile — which can only be `legacy` or `startup` while certification
+   stands. Historical rows are backfilled truthfully from the mode they
+   already record (startup rows → `startup`, matching what new startup logs
+   write; semantic rows → `legacy`); the response adds `recall_profile`,
    `signals_version`, `omitted_by_admission` (constant `None`/`{}` under
    legacy serving, kept for forward compatibility). SDK
    `RecallRequest`/`RecallResponse` gained the same additive fields (the

@@ -389,14 +389,19 @@ async def test_worker_queue_due_job_only_slightly_overdue_remains_healthy() -> N
     """A due job overdue by only a few seconds stays under the diagnostic threshold."""
     if not await _db_ok():
         pytest.skip(_DB_SKIP_REASON)
+    # Fresh timestamp, not the module-level NOW: the doctor measures age
+    # against the wall clock, so a frozen import-time NOW turns "10 seconds
+    # overdue" into "minutes overdue" once the suite runs long enough to
+    # cross the lease-stale threshold after this module was imported.
+    now = datetime.now(UTC)
     async with _test_session_factory() as session:
         tenant_id, _ = await _seed_tenant(session, label="wq-just-due")
         await _insert_job(
             session,
             tenant_id=tenant_id,
             status="pending",
-            created_at=NOW - timedelta(seconds=10),
-            run_after=NOW - timedelta(seconds=10),
+            created_at=now - timedelta(seconds=10),
+            run_after=now - timedelta(seconds=10),
         )
     report = await _run(tenant_id)
     check = _check(report, "worker.queue")

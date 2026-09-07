@@ -3,8 +3,10 @@
 
 Both migrations are additive and must stay reapplicable (the runner may
 replay a partially applied deployment), and their downgrades must leave the
-schema usable rather than half-dropped. The test always restores the upgraded
-state before finishing.
+schema usable rather than half-dropped. 040's backfill is additionally proven
+truthful: historical rows are reconstructed from the mode they already
+record (startup rows → 'startup', semantic rows → 'legacy'). The tests
+always restore the upgraded state before finishing.
 
 They skip without a reachable database (see ``make compose-ci``).
 """
@@ -86,6 +88,74 @@ async def test_040_is_reapplicable_and_its_downgrade_is_safe(owner) -> None:
         "WHERE conrelid = 'recall_logs'::regclass AND conname = 'recall_logs_recall_profile_check'"
     )
     assert constraint == "recall_logs_recall_profile_check"
+
+
+async def test_040_backfills_historical_profiles_from_mode(owner) -> None:
+    """Pre-040 rows are truthfully reconstructed from the mode they already
+    record: startup recall is its own profile and always was, so historical
+    startup rows must backfill 'startup' (exactly what new startup logs
+    write), not 'legacy'. Historical semantic rows were the legacy blend by
+    definition."""
+    import uuid
+
+    tenant_id, principal_id = await owner.fetchrow(
+        "SELECT t.id, p.id FROM tenants t JOIN principals p "
+        "ON p.tenant_id = t.id AND p.name = 'admin' WHERE t.slug = 'default'"
+    )
+
+    # Rewind to the pre-040 shape (no recall_profile column) and write two
+    # historical rows the way the pre-040 code did — mode only.
+    await owner.execute(_M040_DOWN.read_text())
+    assert not await _column(owner, "recall_logs", "recall_profile")
+    startup_row, semantic_row = uuid.uuid4(), uuid.uuid4()
+    await owner.execute(
+        "INSERT INTO recall_logs (id, tenant_id, principal_id, mode, query) "
+        "VALUES ($1, $2, $3, 'startup', NULL)",
+        startup_row,
+        tenant_id,
+        principal_id,
+    )
+    await owner.execute(
+        "INSERT INTO recall_logs (id, tenant_id, principal_id, mode, query) "
+        "VALUES ($1, $2, $3, 'semantic', 'historical query')",
+        semantic_row,
+        tenant_id,
+        principal_id,
+    )
+
+    # Applying 040 reconstructs each row's profile from its mode.
+    await owner.execute(_M040.read_text())
+    assert (
+        await owner.fetchval(
+            "SELECT recall_profile FROM recall_logs WHERE id = $1", startup_row
+        )
+        == "startup"
+    )
+    assert (
+        await owner.fetchval(
+            "SELECT recall_profile FROM recall_logs WHERE id = $1", semantic_row
+        )
+        == "legacy"
+    )
+
+    # The backfill is a self-healing UPDATE: replaying the migration over a
+    # database that applied an earlier revision (startup rows mislabeled
+    # 'legacy') corrects them.
+    await owner.execute(
+        "UPDATE recall_logs SET recall_profile = 'legacy' WHERE id = $1", startup_row
+    )
+    await owner.execute(_M040.read_text())
+    assert (
+        await owner.fetchval(
+            "SELECT recall_profile FROM recall_logs WHERE id = $1", startup_row
+        )
+        == "startup"
+    )
+
+    await owner.execute(
+        "DELETE FROM recall_logs WHERE id = ANY($1::uuid[])",
+        [startup_row, semantic_row],
+    )
 
 
 async def test_041_is_reapplicable_and_its_downgrade_fails_closed(owner) -> None:

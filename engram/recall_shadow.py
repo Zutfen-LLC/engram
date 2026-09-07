@@ -34,7 +34,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram import recall as recall_module
-from engram import recall_signals, semantic
+from engram import recall_signals
 from engram.memory_access import resolve_workspace_scope
 from engram.memory_context import ResolvedMemoryContext
 from engram.memory_kinds import get_disputed_stay_kind_names
@@ -152,22 +152,38 @@ async def evaluate_recall_shadow_comparison(
     from engram.embedding_profiles import get_active_profile
 
     embedding_profile = await get_active_profile(session)
-    if not memory_context.may_read_anything or (
+    stay_kinds: set[str] = set()
+    profiles: list[RecallProfileSpec] = [LEGACY_PROFILE] + [
+        SEMANTIC_PROFILES[key] for key in ordered
+    ]
+    if any("disputed" in p.review_statuses for p in profiles):
+        stay_kinds = await get_disputed_stay_kind_names(session, tenant_id)
+
+    # Embedding preflight: run the comparison iff ANY requested packet — the
+    # legacy baseline or a candidate — has an eligible corpus. The legacy
+    # count alone must never gate the run: a tenant whose only eligible item
+    # is a disputed governed stay kind has an empty legacy corpus (its window
+    # is active + proposed) but a non-empty governed corpus, and legacy may
+    # legitimately evaluate to an empty packet while a candidate is
+    # non-empty. Each packet's own count travels in its payload.
+    corpus_denied = not memory_context.may_read_anything or (
         workspace is not None and not workspace_accessible
-    ):
-        candidate_total = 0
-    else:
-        candidate_total = await semantic.candidate_count(
-            session,
-            memory_context=memory_context,
-            workspace_id=workspace_id,
-            review_statuses=LEGACY_PROFILE.review_statuses,
-            embedding_profile=embedding_profile,
-        )
+    )
+    eligible_total = 0
+    if not corpus_denied:
+        for eval_profile in profiles:
+            eligible_total += await recall_module._profile_candidate_count(
+                session,
+                memory_context=memory_context,
+                workspace_id=workspace_id,
+                profile=eval_profile,
+                stay_kinds=stay_kinds,
+                embedding_profile=embedding_profile,
+            )
 
     query_embedding = None
     embedding_outcome = "not_attempted"
-    if candidate_total > 0:
+    if eligible_total > 0:
         query_embedding = await recall_module.generate_query_embedding(
             query,
             embedding_profile=embedding_profile,
@@ -186,17 +202,17 @@ async def evaluate_recall_shadow_comparison(
         "certified_serving_profiles": sorted(CERTIFIED_SERVING_PROFILES),
         "message": None,
         "workspace_id": str(workspace_id) if workspace_id else None,
-        "candidate_count": candidate_total,
+        # Total eligible corpus across the compared profiles — nonzero
+        # exactly when the comparison had anything to evaluate.
+        "candidate_count": eligible_total,
         "embedding_outcome": embedding_outcome,
         "legacy": None,
         "candidates": [],
     }
 
-    if query_embedding is None or candidate_total == 0:
+    if query_embedding is None or eligible_total == 0:
         payload["message"] = recall_module._NO_EMBEDDINGS_MESSAGE
         return payload
-
-    stay_kinds = await get_disputed_stay_kind_names(session, tenant_id)
 
     legacy_evaluation = await recall_module.evaluate_semantic_profile(
         session,

@@ -1170,6 +1170,40 @@ async def generate_query_embedding(
     return await generate_embedding(query)
 
 
+async def _profile_candidate_count(
+    session: AsyncSession,
+    *,
+    memory_context: ResolvedMemoryContext,
+    workspace_id: str | None,
+    profile: RecallProfileSpec,
+    stay_kinds: set[str],
+    embedding_profile: Any,
+) -> int:
+    """Count one profile's eligible corpus under its exact retrieval predicate.
+
+    Single source of truth for "how large is this profile's eligible corpus":
+    both the packet evaluation and the shadow comparison's embedding
+    preflight call it, so the count and the retrieved window can never
+    disagree about eligibility.
+    """
+    if profile.signals_enabled:
+        return await semantic.candidate_count(
+            session,
+            memory_context=memory_context,
+            workspace_id=workspace_id,
+            review_statuses=None,
+            corpus_eligibility=_signal_corpus_eligibility(profile, stay_kinds),
+            embedding_profile=embedding_profile,
+        )
+    return await semantic.candidate_count(
+        session,
+        memory_context=memory_context,
+        workspace_id=workspace_id,
+        review_statuses=profile.review_statuses,
+        embedding_profile=embedding_profile,
+    )
+
+
 async def evaluate_semantic_profile(
     session: AsyncSession,
     *,
@@ -1199,23 +1233,14 @@ async def evaluate_semantic_profile(
     )
 
     # 1. Count the eligible corpus under the exact predicate retrieval uses.
-    if profile.signals_enabled:
-        candidate_total = await semantic.candidate_count(
-            session,
-            memory_context=memory_context,
-            workspace_id=workspace_id,
-            review_statuses=None,
-            corpus_eligibility=_signal_corpus_eligibility(profile, stay_kinds),
-            embedding_profile=embedding_profile,
-        )
-    else:
-        candidate_total = await semantic.candidate_count(
-            session,
-            memory_context=memory_context,
-            workspace_id=workspace_id,
-            review_statuses=profile.review_statuses,
-            embedding_profile=embedding_profile,
-        )
+    candidate_total = await _profile_candidate_count(
+        session,
+        memory_context=memory_context,
+        workspace_id=workspace_id,
+        profile=profile,
+        stay_kinds=stay_kinds,
+        embedding_profile=embedding_profile,
+    )
 
     empty = SemanticPacketEvaluation(
         profile=profile,

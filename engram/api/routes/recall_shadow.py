@@ -102,6 +102,10 @@ class RecallShadowCompareResponse(BaseModel):
     certified_serving_profiles: list[str]
     message: str | None
     workspace_id: str | None
+    # Total eligible corpus across the compared profiles — nonzero exactly
+    # when the comparison had anything to evaluate. Each packet (legacy and
+    # candidates) carries its own precise candidate_count; legacy may be 0
+    # while a candidate is non-empty.
     candidate_count: int
     embedding_outcome: str
     legacy: RecallShadowPacket | None

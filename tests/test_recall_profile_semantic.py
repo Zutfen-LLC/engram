@@ -403,6 +403,59 @@ async def test_shadow_comparison_evaluates_candidates_without_mutating_serving(
     assert {i["id"] for i in after["items"]} == served_ids
 
 
+async def test_shadow_runs_when_only_a_candidate_corpus_is_eligible(
+    client, monkeypatch
+):
+    """Preflight regression: the comparison must run whenever ANY requested
+    packet has an eligible corpus. A tenant whose only eligible item is a
+    disputed governed stay kind has an EMPTY legacy corpus (its window is
+    active + proposed) but a non-empty governed corpus — legacy legitimately
+    evaluates to an empty packet while governed evaluates the item."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    item = await _remember(client, "semantic target disputed doctrine")
+    # A governed stay kind under dispute: eligible for governed recall, and
+    # invisible to the legacy active+proposed window.
+    async with _test_engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE memory_items SET review_status = 'disputed', "
+                "kind = 'doctrine' WHERE id = :id"
+            ),
+            {"id": item["id"]},
+        )
+
+    shadow = await _shadow_compare(client, profiles=["governed", "exploratory"])
+
+    # The legacy baseline evaluated (to an empty packet), it did not abort
+    # the comparison.
+    assert shadow["legacy"] is not None
+    assert shadow["legacy"]["profile"] == "legacy"
+    assert shadow["legacy"]["item_count"] == 0
+    assert shadow["legacy"]["candidate_count"] == 0
+    assert shadow["message"] is None
+
+    governed = next(c for c in shadow["candidates"] if c["profile"] == "governed")
+    assert governed["item_count"] == 1
+    served = governed["items"][0]
+    assert served["id"] == item["id"]
+    assert served["epistemic_state"] == "contested"
+    assert served["admission"]["reason_codes"] == ["admitted_disputed_stay_kind"]
+    assert governed["comparison"] == {
+        "in_both": [],
+        "only_in_legacy": [],
+        "only_in_candidate": [item["id"]],
+    }
+
+    # Exploratory's window (active + proposed) also cannot see the disputed
+    # item, but the comparison still ran for it.
+    exploratory = next(c for c in shadow["candidates"] if c["profile"] == "exploratory")
+    assert exploratory["item_count"] == 0
+
+
 async def test_governed_candidate_excludes_proposal_with_signal_fields(
     client, monkeypatch
 ):
