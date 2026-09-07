@@ -1716,6 +1716,46 @@ async def _update_item(item_id: str, **assignments: Any) -> None:
         )
 
 
+# A third deterministic angle (cosine ~0.7071 against the query vector):
+# strictly weaker than _NEAR_VEC, still well inside the retrieval window.
+_LOWER_VEC = [0.7071067811865476, 0.7071067811865476] + [0.0] * 1534
+
+
+def _patch_keyed_embeddings(
+    monkeypatch: pytest.MonkeyPatch, vectors: dict[str, list[float]]
+) -> None:
+    """Deterministic per-content embeddings for the source-attribution
+    regressions: exact contents in ``vectors`` get their assigned vector,
+    everything else falls back to the prefix-based module fake."""
+    import engram.embeddings as embeddings_mod
+    from engram import recall as recall_mod
+
+    async def keyed_embedding(
+        text_value: str, *_args: object, **_kwargs: object
+    ) -> list[float] | None:
+        if text_value in vectors:
+            return vectors[text_value]
+        return _fake_embedding_for(text_value)
+
+    monkeypatch.setattr(recall_mod, "generate_embedding", keyed_embedding)
+    monkeypatch.setattr(memory_routes, "generate_embedding", keyed_embedding)
+    monkeypatch.setattr(embeddings_mod, "generate_embedding", keyed_embedding)
+
+
+async def _set_item_embedding(item_id: str, vector: list[float]) -> None:
+    """Rewrite one stored embedding — the surgical "vary only this seed"
+    knob for attribution regressions (item content and V2 binding intact)."""
+    literal = "[" + ", ".join(repr(component) for component in vector) + "]"
+    async with _test_engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE memory_embeddings SET embedding = CAST(:vec AS vector) "
+                "WHERE memory_item_id = :id"
+            ),
+            {"id": item_id, "vec": literal},
+        )
+
+
 async def _fabricate_v2_row(
     item_id: str,
     *,
@@ -1944,6 +1984,130 @@ async def test_admitted_seed_discovers_qualified_tunnel_neighbor(client, monkeyp
     assert any('same tunnel "ops-link"' in r for r in expanded["reasons"])
     assert governed["expansion"]["tunnel_neighbors"] == 1
     assert governed["expansion"]["admitted_expanded"] == 1
+
+
+# ---- tunnel source-seed attribution (#191 merge-blocker fix) ----
+
+
+async def test_tunnel_neighbor_attributes_only_the_seed_that_reaches_it(
+    client, monkeypatch
+):
+    """Tunnel relevance derives from the admitted seed whose tunnel
+    membership actually discovered the neighbor — never from the strongest
+    admitted seed in the packet. A (similarity 1.0, no tunnel relationship
+    to C) leaves C attributed entirely to B (lower similarity,
+    tunnel-connected to C), and varying only A's similarity while holding B
+    and the topology fixed changes nothing about C at all."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_keyed_embeddings(
+        monkeypatch,
+        {
+            "attribution unrelated high seed": _TARGET_VEC,  # A: similarity 1.0
+            "attribution connected low seed": _NEAR_VEC,  # B: similarity ~0.92
+        },
+    )
+    await _enable_tenant_shadow_policy()
+
+    high = await _seed_qualified(client, "attribution unrelated high seed")
+    connected = await _seed_qualified(
+        client, "attribution connected low seed", wing="AttrSeed", room="src"
+    )
+    neighbor = await _seed_qualified(
+        client, "attribution tunnel neighbor", wing="AttrFar", room="dst"
+    )
+    await _make_expansion_only(neighbor["id"])
+    await _mk_tunnel("AttrSeed", "AttrFar", label="attr-link")
+
+    governed = await _candidate_packet(client)
+    by_id = {item["id"]: item for item in governed["items"]}
+    high_similarity = by_id[high["id"]]["similarity_score"]
+    connected_similarity = by_id[connected["id"]]["similarity_score"]
+    assert high_similarity > connected_similarity  # A is the packet's best seed
+    expanded = by_id[neighbor["id"]]
+    relationship = _relationship(expanded)
+    assert relationship["origins"] == ["tunnel"]
+    assert relationship["source_seed_score"] == connected_similarity
+    assert relationship["source_seed_score"] != high_similarity
+
+    def _snapshot(packet: dict[str, Any]) -> dict[str, Any]:
+        item = next(i for i in packet["items"] if i["id"] == neighbor["id"])
+        return {
+            "relationship": item["relationship"],
+            "relevance": item["relevance_score"],
+            "utility": item["utility_score"],
+            "score": item["score"],
+            "admission": item["admission"],
+            "evidence": item["evidence"],
+        }
+
+    before = _snapshot(governed)
+    # Vary ONLY A: its similarity drops well below B's. B and the tunnel
+    # topology are untouched, and A must remain an admitted (still unrelated)
+    # seed so the variation is real.
+    await _set_item_embedding(high["id"], _LOWER_VEC)
+    varied_packet = await _candidate_packet(client)
+    assert high["id"] in {item["id"] for item in varied_packet["items"]}
+    varied = _snapshot(varied_packet)
+    assert varied == before
+
+
+async def test_tunnel_multi_seed_source_attribution_strongest_connected_wins(
+    client, monkeypatch
+):
+    """Multi-source tunnel attribution: when two admitted seeds both
+    genuinely reach C through their own tunnels, C uses the strongest of
+    those two; remove the stronger seed's tunnel and attribution drops to
+    the remaining connected seed exactly — the unrelated-seed rule seen from
+    the other side."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_keyed_embeddings(
+        monkeypatch,
+        {
+            "attribution multi strong seed": _TARGET_VEC,  # similarity 1.0
+            "attribution multi weak seed": _NEAR_VEC,  # similarity ~0.92
+        },
+    )
+    await _enable_tenant_shadow_policy()
+
+    strong = await _seed_qualified(
+        client, "attribution multi strong seed", wing="AttrStrong", room="src"
+    )
+    weak = await _seed_qualified(
+        client, "attribution multi weak seed", wing="AttrWeak", room="src"
+    )
+    neighbor = await _seed_qualified(
+        client, "attribution multi tunnel neighbor", wing="AttrFarWing", room="dst"
+    )
+    await _make_expansion_only(neighbor["id"])
+    await _mk_tunnel("AttrStrong", "AttrFarWing", label="strong-link")
+    await _mk_tunnel("AttrWeak", "AttrFarWing", label="weak-link")
+
+    governed = await _candidate_packet(client)
+    by_id = {item["id"]: item for item in governed["items"]}
+    relationship = _relationship(by_id[neighbor["id"]])
+    assert relationship["origins"] == ["tunnel"]
+    # Both seeds actually reach C: the strongest connected seed wins.
+    assert relationship["source_seed_score"] == by_id[strong["id"]]["similarity_score"]
+    assert relationship["source_seed_score"] != by_id[weak["id"]]["similarity_score"]
+
+    # Remove ONLY the strong seed's tunnel: the weak seed becomes the sole
+    # actually-connected source and attribution follows it exactly.
+    async with _test_engine.begin() as conn:
+        await conn.execute(
+            text(
+                "DELETE FROM tunnels "
+                "WHERE source_wing = 'AttrStrong' AND target_wing = 'AttrFarWing'"
+            )
+        )
+    after = await _candidate_packet(client)
+    by_id_after = {item["id"]: item for item in after["items"]}
+    relationship_after = _relationship(by_id_after[neighbor["id"]])
+    assert relationship_after["source_seed_score"] == by_id_after[weak["id"]][
+        "similarity_score"
+    ]
+    assert relationship_after["relevance_score"] < relationship["relevance_score"]
 
 
 async def test_withheld_direct_candidate_does_not_consume_graph_capacity(

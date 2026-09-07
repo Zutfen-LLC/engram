@@ -118,6 +118,12 @@ class _GraphLink:
 class _TunnelLink:
     neighbor_id: UUID
     tunnel_label: str
+    # A seed whose tunnel membership exposed the (wing, room) this neighbor
+    # was pulled from (None on the frozen legacy path, whose blend never
+    # reads it). The candidate-profile path (issue #190) uses it for precise
+    # per-neighbor source-seed relevance attribution — mirrors
+    # ``_GraphLink.seed_id``.
+    seed_id: UUID | None = None
 
 
 @dataclass
@@ -297,20 +303,38 @@ async def _fetch_graph_neighbors(
     return {nid: candidate_links[nid] for nid in (*enriched_ids, *new_neighbor_ids)}
 
 
+@dataclass(frozen=True)
+class _TunnelTarget:
+    """One (wing, room) target tunnels expose, with every seed that reaches it.
+
+    ``label`` keeps the legacy dedup semantics (last matching seed/tunnel
+    write wins). ``seed_ids`` accumulates *all* seeds whose tunnel membership
+    exposes the target, because every item pulled from that target is
+    genuinely reachable from each of them — the provenance the
+    candidate-profile path binds into ``_TunnelLink.seed_id`` so tunnel
+    relevance attributes only seeds that actually reached an item, never an
+    unrelated packet-level best seed (issue #190).
+    """
+
+    label: str
+    seed_ids: frozenset[UUID]
+
+
 async def _tunnel_targets(
     session: AsyncSession,
     *,
     memory_context: ResolvedMemoryContext,
     seed_items: list[MemoryItem],
-) -> dict[tuple[str, str | None], str]:
+) -> dict[tuple[str, str | None], _TunnelTarget]:
     """Resolve the (wing, room) targets tunnels expose for these seeds.
 
     A seed's tunnel membership is any ``Tunnel`` row whose source or target
     (wing, room) matches the seed's own (wing, room); the *other* endpoint of
     that tunnel names the neighboring (wing, room) to pull items from.
-    Returns ``(target_wing, target_room) -> label``, deduped across
-    seeds/tunnels. Shared by the legacy and candidate-profile fetchers so
-    the two can never disagree about tunnel topology.
+    Returns ``(target_wing, target_room) -> label + the seeds that reach it``,
+    deduped across seeds/tunnels. Shared by the legacy and candidate-profile
+    fetchers so the two can never disagree about tunnel topology; the frozen
+    legacy fetcher ignores the seed attribution (its blend never reads it).
     """
     wings = {item.wing for item in seed_items if item.wing}
     if not wings:
@@ -328,7 +352,7 @@ async def _tunnel_targets(
     if not tunnels:
         return {}
 
-    targets: dict[tuple[str, str | None], str] = {}
+    targets: dict[tuple[str, str | None], _TunnelTarget] = {}
     for item in seed_items:
         if not item.wing:
             continue
@@ -337,11 +361,23 @@ async def _tunnel_targets(
             if tunnel.source_wing == item.wing and (
                 tunnel.source_room is None or tunnel.source_room == item.room
             ):
-                targets[(tunnel.target_wing, tunnel.target_room)] = label
+                key = (tunnel.target_wing, tunnel.target_room)
+                prior = targets.get(key)
+                targets[key] = _TunnelTarget(
+                    label=label,
+                    seed_ids=(prior.seed_ids if prior is not None else frozenset())
+                    | {item.id},
+                )
             if tunnel.target_wing == item.wing and (
                 tunnel.target_room is None or tunnel.target_room == item.room
             ):
-                targets[(tunnel.source_wing, tunnel.source_room)] = label
+                key = (tunnel.source_wing, tunnel.source_room)
+                prior = targets.get(key)
+                targets[key] = _TunnelTarget(
+                    label=label,
+                    seed_ids=(prior.seed_ids if prior is not None else frozenset())
+                    | {item.id},
+                )
     return targets
 
 
@@ -365,9 +401,10 @@ async def _fetch_tunnel_neighbors(
 
     candidate_links: dict[UUID, list[_TunnelLink]] = defaultdict(list)
     remaining = settings.max_tunnel_additions
-    for (target_wing, target_room), label in sorted(
+    for (target_wing, target_room), target in sorted(
         targets.items(), key=lambda kv: (kv[0][0], kv[0][1] or "")
     ):
+        label = target.label
         if remaining <= 0:
             break
         filters: list[Any] = [
@@ -402,6 +439,27 @@ async def _fetch_tunnel_neighbors(
     return dict(candidate_links)
 
 
+def _add_candidate_tunnel_links(
+    links_by_neighbor: dict[UUID, list[_TunnelLink]],
+    neighbor_id: UUID,
+    label: str,
+    seed_ids: list[UUID],
+) -> bool:
+    """Record one tunnel link per reaching seed, deduped by (label, seed_id).
+
+    Returns whether the neighbor was linked for the first time — the signal
+    the bounded new-neighbor budget keys on: re-seeing an already-linked
+    neighbor through another target adds source attribution, never budget.
+    """
+    links = links_by_neighbor[neighbor_id]
+    newly_linked = not links
+    for seed_id in seed_ids:
+        link = _TunnelLink(neighbor_id=neighbor_id, tunnel_label=label, seed_id=seed_id)
+        if link not in links:
+            links.append(link)
+    return newly_linked
+
+
 async def _fetch_candidate_tunnel_neighbors(
     session: AsyncSession,
     *,
@@ -419,6 +477,13 @@ async def _fetch_candidate_tunnel_neighbors(
     importance-free (``created_at desc, id asc``): utility signals may order
     only already-admitted items, never influence which neighbors a candidate
     profile discovers within its bounded window.
+
+    Source-seed attribution (the tunnel analogue of ``_GraphLink.seed_id``):
+    every neighbor pulled from a target (wing, room) is linked once per
+    admitted seed whose tunnel membership exposed that target, deduped by
+    (label, seed_id) — so relationship relevance can attribute exactly the
+    seeds that actually reached the item, never an unrelated packet-level
+    best seed (issue #190).
 
     ``enrichment_ids`` (the whole direct candidate window) receives the same
     direct-vs-new split the graph fetcher applies: already-evaluated direct
@@ -442,9 +507,12 @@ async def _fetch_candidate_tunnel_neighbors(
 
     candidate_links: dict[UUID, list[_TunnelLink]] = defaultdict(list)
     remaining = settings.max_tunnel_additions
-    for (target_wing, target_room), label in sorted(
+    for (target_wing, target_room), target in sorted(
         targets.items(), key=lambda kv: (kv[0][0], kv[0][1] or "")
     ):
+        label = target.label
+        # Deterministic attribution order: seed ids ascending.
+        target_seed_ids = sorted(target.seed_ids)
         if enrichment_ids:
             # Direct-item enrichment: bounded by the already-evaluated direct
             # window itself, so it needs no LIMIT and never touches the
@@ -466,9 +534,7 @@ async def _fetch_candidate_tunnel_neighbors(
                 .order_by(MemoryItem.created_at.desc(), MemoryItem.id.asc())
             )
             for row in (await session.execute(enrich_stmt)).scalars().all():
-                if row.id in candidate_links:
-                    continue
-                candidate_links[row.id].append(_TunnelLink(neighbor_id=row.id, tunnel_label=label))
+                _add_candidate_tunnel_links(candidate_links, row.id, label, target_seed_ids)
         if remaining <= 0:
             # Enrichment is budget-free, so later targets still get their
             # enrichment pass; with no enrichment set the rest of this loop
@@ -495,10 +561,8 @@ async def _fetch_candidate_tunnel_neighbors(
 
         rows = list((await session.execute(stmt)).scalars().all())
         for row in rows:
-            if row.id in candidate_links:
-                continue
-            candidate_links[row.id].append(_TunnelLink(neighbor_id=row.id, tunnel_label=label))
-            remaining -= 1
+            if _add_candidate_tunnel_links(candidate_links, row.id, label, target_seed_ids):
+                remaining -= 1
 
     return dict(candidate_links)
 
@@ -691,8 +755,11 @@ class CandidateNeighborDiscovery:
 
     ``graph_links`` / ``tunnel_links`` include already-evaluated direct
     candidates reachable from an admitted seed (origin-merging enrichment —
-    zero capacity cost, never re-admitted). ``neighbor_items`` carries the
-    backing ``MemoryItem`` rows for every *genuinely new* discovered id only
+    zero capacity cost, never re-admitted). Every link carries the admitted
+    seed it was reached from (``seed_id`` — the exact provenance
+    relationship relevance attributes, never a packet-level best seed).
+    ``neighbor_items`` carries the backing ``MemoryItem`` rows for every
+    *genuinely new* discovered id only
     (never the seeds or the enrichment window) — fetched in one bounded bulk
     query with read-eligibility defense in depth. Discovery confers no
     admission: every discovered neighbor must be independently admitted by

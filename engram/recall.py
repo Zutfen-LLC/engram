@@ -1314,28 +1314,31 @@ def _candidate_relevance(
     similarity: float | None,
     discovery: relationship_recall.CandidateNeighborDiscovery,
     seed_similarity: dict[UUID, float],
-    best_seed_score: float,
 ) -> relationship_recall.RelationshipRelevance:
     """Relationship-aware relevance for one linked candidate item.
 
-    Source-seed attribution: graph links carry the exact seed they were
-    reached from; tunnel membership derives from any matching seed's
-    (wing, room), so it attributes the strongest admitted seed — the same
-    conservative choice the legacy expansion documents. Both are relevance
-    inputs only: nothing here touches admission or evidence state.
+    Source-seed attribution: graph and tunnel links alike carry the exact
+    admitted seed that reached the item (graph: the edge's seed endpoint;
+    tunnel: a seed whose tunnel membership exposed the (wing, room) the item
+    was pulled from), so ``source_seed_score`` is the strongest similarity
+    among the seeds that actually reached it — an unrelated stronger seed in
+    the packet contributes nothing. Both are relevance inputs only: nothing
+    here touches admission or evidence state.
     """
     graph_links = discovery.graph_links.get(item_id, [])
-    tunnel_labels = [link.tunnel_label for link in discovery.tunnel_links.get(item_id, [])]
+    tunnel_links = discovery.tunnel_links.get(item_id, [])
     graph_seed_scores = [
         seed_similarity[link.seed_id] for link in graph_links if link.seed_id in seed_similarity
     ]
-    source_scores = graph_seed_scores + ([best_seed_score] if tunnel_labels else [])
-    source_seed_score = max(source_scores, default=0.0)
+    tunnel_seed_scores = [
+        seed_similarity[link.seed_id] for link in tunnel_links if link.seed_id in seed_similarity
+    ]
+    source_seed_score = max(graph_seed_scores + tunnel_seed_scores, default=0.0)
     return relationship_recall.compute_relationship_relevance(
         direct_semantic_score=similarity,
         source_seed_score=source_seed_score,
         graph_links=[(link.edge_type, link.weight) for link in graph_links],
-        tunnel_labels=tunnel_labels,
+        tunnel_labels=[link.tunnel_label for link in tunnel_links],
     )
 
 
@@ -1385,7 +1388,6 @@ async def _expand_signal_candidates(
     seed_similarity = {
         entry.item.id: entry.similarity for entry in seeds if entry.similarity is not None
     }
-    best_seed_score = max(seed_similarity.values(), default=0.0)
 
     discovery = await relationship_recall.discover_candidate_neighbors(
         session,
@@ -1451,7 +1453,6 @@ async def _expand_signal_candidates(
                 similarity=None,
                 discovery=discovery,
                 seed_similarity=seed_similarity,
-                best_seed_score=best_seed_score,
             )
             item_dict = _semantic_base_item_fields(item, distance=None, similarity=None)
             item_dict.update(
@@ -1488,7 +1489,6 @@ async def _expand_signal_candidates(
             similarity=entry.similarity,
             discovery=discovery,
             seed_similarity=seed_similarity,
-            best_seed_score=best_seed_score,
         )
         entry.item_dict["relevance_score"] = relevance.relevance_score
         entry.item_dict["score"] = recall_signals.compute_signal_rank_score(
