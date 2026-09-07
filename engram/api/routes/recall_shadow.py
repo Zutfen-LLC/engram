@@ -76,6 +76,9 @@ class RecallShadowPacket(BaseModel):
     ``admission_diagnostics`` and ``v2_resolution`` are the issue #186
     binding: bounded, content-free per-candidate withhold diagnostics and the
     #158 V2 resolution summary. Legacy evaluates them to ``[]`` / ``None``.
+    ``expansion`` is the issue #190 addition: the bounded admission-first
+    relationship-expansion summary (contract version plus seed/neighbor/
+    admission counts). Legacy evaluates it to ``None``.
     """
 
     profile: str
@@ -87,6 +90,7 @@ class RecallShadowPacket(BaseModel):
     omitted_by_admission: dict[str, int]
     admission_diagnostics: list[dict[str, Any]] = Field(default_factory=list)
     v2_resolution: dict[str, Any] | None = None
+    expansion: dict[str, Any] | None = None
     effective_byte_budget: int | None
     effective_token_budget: int | None
     effective_item_budget: int | None

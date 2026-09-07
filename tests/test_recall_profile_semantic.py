@@ -114,8 +114,16 @@ async def _clean_db():
         await conn.execute(text("DELETE FROM jobs"))
         await conn.execute(text("DELETE FROM item_events"))
         await conn.execute(text("DELETE FROM classification_runs"))
+        # Issue #190 expansion fixtures: edges cascade with their items, but
+        # tunnels, workspaces/principals, and cross-tenant rows need explicit
+        # cleanup (after memory_items, which reference them).
+        await conn.execute(text("DELETE FROM memory_edges"))
+        await conn.execute(text("DELETE FROM tunnels"))
+        await conn.execute(text("DELETE FROM tenants WHERE slug LIKE 'exp190-%'"))
         await conn.execute(text("DELETE FROM memory_embeddings"))
         await conn.execute(text("DELETE FROM memory_items"))
+        await conn.execute(text("DELETE FROM workspaces WHERE slug LIKE 'exp190-%'"))
+        await conn.execute(text("DELETE FROM principals WHERE name LIKE 'exp190-%'"))
         # Tenant shadow policy fails closed after every test.
         await conn.execute(
             text(
@@ -1636,3 +1644,1093 @@ async def test_shadow_compare_with_evidence_remains_read_only(client, monkeypatc
 
     assert await _recall_log_count() == logs_before
     assert await _recall_counts([item["id"]]) == counts_before
+
+
+# ---- admission-first relationship expansion (issue #190 / ENG-RECALL-003D) ----
+#
+# The candidate profiles expand through the bounded graph/tunnel mechanics,
+# strictly after direct V2 admission: only admitted direct items seed
+# discovery, every expanded neighbor is independently admitted through the
+# exact V2 surface, and relationship-aware relevance (versioned,
+# importance-free) feeds the separated utility ranking. All fixtures below
+# make neighbors *expansion-only* by deleting their embedding row — semantic
+# retrieval can then never surface them, so their presence in a packet is
+# mechanical proof the expansion path (and only it) reached them.
+
+
+async def _link_items(
+    source_id: str, target_id: str, edge_type: str, *, weight: float | None = None
+) -> None:
+    async with _test_engine.begin() as conn:
+        tenant_id = await conn.scalar(
+            text("SELECT tenant_id::text FROM memory_items WHERE id = :id"), {"id": source_id}
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO memory_edges (id, tenant_id, source_item_id, target_item_id, "
+                "edge_type, weight) "
+                "VALUES (gen_random_uuid(), :tenant, :src, :tgt, :et, :w)"
+            ),
+            {"tenant": tenant_id, "src": source_id, "tgt": target_id, "et": edge_type, "w": weight},
+        )
+
+
+async def _unlink_items(source_id: str, target_id: str) -> None:
+    async with _test_engine.begin() as conn:
+        await conn.execute(
+            text(
+                "DELETE FROM memory_edges WHERE source_item_id = :src AND target_item_id = :tgt"
+            ),
+            {"src": source_id, "tgt": target_id},
+        )
+
+
+async def _mk_tunnel(source_wing: str, target_wing: str, *, label: str | None = None) -> None:
+    async with _test_engine.begin() as conn:
+        tenant_id = await conn.scalar(text("SELECT id::text FROM tenants WHERE slug = 'default'"))
+        await conn.execute(
+            text(
+                "INSERT INTO tunnels (id, tenant_id, source_wing, target_wing, label) "
+                "VALUES (gen_random_uuid(), :tenant, :sw, :tw, :label)"
+            ),
+            {"tenant": tenant_id, "sw": source_wing, "tw": target_wing, "label": label},
+        )
+
+
+async def _make_expansion_only(item_id: str) -> None:
+    """Remove the item's embedding so only relationship expansion can reach it."""
+    async with _test_engine.begin() as conn:
+        await conn.execute(
+            text("DELETE FROM memory_embeddings WHERE memory_item_id = :id"), {"id": item_id}
+        )
+
+
+async def _update_item(item_id: str, **assignments: Any) -> None:
+    if not assignments:
+        return
+    clause = ", ".join(f"{column} = :{column}" for column in assignments)
+    async with _test_engine.begin() as conn:
+        await conn.execute(
+            text(f"UPDATE memory_items SET {clause} WHERE id = :id"),
+            {"id": item_id, **assignments},
+        )
+
+
+async def _fabricate_v2_row(
+    item_id: str,
+    *,
+    schema_version: str | None = None,
+    policy_config_digest: str | None = None,
+) -> None:
+    """Append a newer V2-profile row with a chosen identity defect.
+
+    The latest-row lookup (evaluated_at desc, id desc) resolves this row, so
+    a wrong schema_version makes the item ``unsupported`` and a wrong policy
+    digest makes it ``mismatched`` — otherwise shaped exactly like a real
+    persisted V2 shadow row (the DB CHECK contract validates that shape).
+    """
+    from engram.admission_policy import V2_SCHEMA_VERSION
+    from engram.models import AdmissionAssessment as AssessmentRow
+
+    async with _test_session_factory() as session:
+        row = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT tenant_id::text, content_hash FROM memory_items WHERE id = :id"
+                    ),
+                    {"id": item_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        session.add(
+            AssessmentRow(
+                id=uuid4(),
+                tenant_id=row["tenant_id"],
+                memory_item_id=item_id,
+                schema_version=schema_version or V2_SCHEMA_VERSION,
+                mode="shadow",
+                trigger_type="test",
+                trigger_id=f"test:{uuid4()}",
+                invocation_source="test",
+                evaluated_at=datetime.now(UTC) + timedelta(seconds=1),
+                item_content_hash=row["content_hash"],
+                input_digest="sha256:" + "0" * 64,
+                policy_profile_key="risk_aware_shadow_v1",
+                policy_contract_version=_V2_POLICY.policy_version,
+                policy_config_digest=policy_config_digest or _V2_POLICY.artifact_digest,
+                selected_basis=None,
+                outcome="would_admit",
+                blocker_codes=[],
+                reason_codes=[],
+                decision_inputs={},
+                available_memory_assessment_refs=[],
+                # The v2 shadow-contract CHECK requires the V2 column set.
+                risk_state="low",
+                epistemic_state="supported",
+                retention_state="retain",
+                effective_memory_assessment_refs=[],
+                highest_admission_tier="semantic_governed",
+                surface_decisions={
+                    "semantic_exploratory": "allow",
+                    "semantic_governed": "allow",
+                    "startup": "withhold",
+                },
+                conflict_recheck_status="not_run",
+                next_actions=[],
+                decision_hash="sha256:" + "0" * 64,
+            )
+        )
+        await session.commit()
+
+
+async def _seed_qualified(
+    client: AsyncClient, content: str, **payload: Any
+) -> dict[str, Any]:
+    """A live proposal with a current qualifying V2 row (low risk, supported)."""
+    item = await _remember(client, content, source_type="extraction", **payload)
+    await _persist_v2_row(item["id"])
+    return item
+
+
+async def _candidate_packet(
+    client: AsyncClient, profile: str = "governed", **extra: Any
+) -> dict[str, Any]:
+    shadow = await _shadow_compare(client, profiles=[profile], **extra)
+    return shadow["candidates"][0]
+
+
+def _relationship(item: dict[str, Any]) -> dict[str, Any]:
+    relationship = item.get("relationship")
+    assert relationship is not None, "admitted expanded item must carry the relationship block"
+    return relationship
+
+
+# ---- admission-before-expansion ----
+
+
+async def test_withheld_direct_candidate_cannot_seed_graph_expansion(
+    client, monkeypatch
+):
+    """Required test 1: a direct candidate the exact V2 surface withholds
+    never seeds expansion — its qualified graph neighbor is absent, has no
+    diagnostic, and the packet records that no expansion ran at all."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    seed = await _remember(client, "semantic target withheld seed", source_type="extraction")
+    await _persist_v2_row(seed["id"], risk=None)  # governed: review_required
+    neighbor = await _seed_qualified(client, "graph neighbor of withheld seed")
+    await _make_expansion_only(neighbor["id"])
+    await _link_items(seed["id"], neighbor["id"], "derived_from", weight=1.0)
+
+    governed = await _candidate_packet(client)
+    assert governed["item_count"] == 0
+    diagnostics = {d["item_id"]: d for d in governed["admission_diagnostics"]}
+    # The seed itself is a DIRECT withhold; the neighbor was never discovered.
+    assert diagnostics[seed["id"]]["origin"] == "direct"
+    assert diagnostics[seed["id"]]["v2_surface_decision"] == "review_required"
+    assert neighbor["id"] not in diagnostics
+    assert governed["expansion"] is None  # zero admitted seeds -> no expansion
+
+
+async def test_withheld_direct_candidate_cannot_seed_tunnel_expansion(
+    client, monkeypatch
+):
+    """Required test 2: same boundary for tunnels — a withheld seed's wing
+    membership reveals nothing."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    seed = await _remember(
+        client,
+        "semantic target withheld tunnel seed",
+        source_type="extraction",
+        wing="WithheldWing",
+        room="src",
+    )
+    await _persist_v2_row(seed["id"], risk=None)
+    neighbor = await _seed_qualified(
+        client, "tunnel neighbor of withheld seed", wing="TunnelTarget", room="dst"
+    )
+    await _make_expansion_only(neighbor["id"])
+    await _mk_tunnel("WithheldWing", "TunnelTarget", label="blocked")
+
+    governed = await _candidate_packet(client)
+    assert governed["item_count"] == 0
+    diagnostics = {d["item_id"] for d in governed["admission_diagnostics"]}
+    assert neighbor["id"] not in diagnostics
+    assert governed["expansion"] is None
+
+
+async def test_admitted_seed_discovers_qualified_graph_neighbor(client, monkeypatch):
+    """Required tests 3 + 5: an admitted direct seed discovers an eligible
+    graph neighbor, and that neighbor is admitted only through its own
+    current + allow decision on the exact governed surface."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    seed = await _seed_qualified(client, "semantic target graph seed")
+    neighbor = await _seed_qualified(client, "qualified graph neighbor content")
+    await _make_expansion_only(neighbor["id"])
+    await _link_items(seed["id"], neighbor["id"], "derived_from")
+
+    governed = await _candidate_packet(client)
+    by_id = {item["id"]: item for item in governed["items"]}
+    assert set(by_id) == {seed["id"], neighbor["id"]}
+    expanded = by_id[neighbor["id"]]
+    # The neighbor presents the full admitted-candidate evidence identity.
+    assert expanded["admission"]["surface"] == "semantic_governed"
+    assert expanded["admission"]["surface_decision"] == "allow"
+    assert expanded["admission"]["v2"]["resolution_status"] == "current"
+    _evidence_identity_asserts(expanded)
+    # Expansion-only: no vector was ever compared against it.
+    assert expanded["distance"] is None
+    assert expanded["similarity_score"] is None
+    relationship = _relationship(expanded)
+    assert relationship["version"] == "relationship-relevance-v1"
+    assert relationship["origins"] == ["graph"]
+    assert relationship["direct"] is False
+    assert relationship["graph_edge_types"] == ["derived_from"]
+    assert relationship["relevance_score"] == expanded["relevance_score"]
+    assert any("linked via derived_from" in reason for reason in expanded["reasons"])
+    assert governed["expansion"] == {
+        "version": "relationship-relevance-v1",
+        "seed_count": 1,
+        "discovered_neighbors": 1,
+        "graph_neighbors": 1,
+        "tunnel_neighbors": 0,
+        "admitted_expanded": 1,
+        "withheld_expanded": 0,
+    }
+    assert governed["v2_resolution"]["resolved_count"] == 2
+    assert governed["v2_resolution"]["resolution_status_counts"] == {"current": 2}
+
+
+async def test_admitted_seed_discovers_qualified_tunnel_neighbor(client, monkeypatch):
+    """Required test 4: an admitted seed's tunnel membership discovers an
+    eligible neighbor in the tunneled (wing, room)."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    await _seed_qualified(
+        client, "semantic target tunnel seed", wing="TunnelSeed", room="ops"
+    )
+    neighbor = await _seed_qualified(
+        client, "qualified tunnel neighbor content", wing="TunnelFar", room="run"
+    )
+    await _make_expansion_only(neighbor["id"])
+    await _mk_tunnel("TunnelSeed", "TunnelFar", label="ops-link")
+
+    governed = await _candidate_packet(client)
+    by_id = {item["id"]: item for item in governed["items"]}
+    assert neighbor["id"] in by_id
+    expanded = by_id[neighbor["id"]]
+    _evidence_identity_asserts(expanded)
+    relationship = _relationship(expanded)
+    assert relationship["origins"] == ["tunnel"]
+    assert relationship["tunnel_labels"] == ["ops-link"]
+    assert relationship["graph_edge_types"] == []
+    assert any('same tunnel "ops-link"' in r for r in expanded["reasons"])
+    assert governed["expansion"]["tunnel_neighbors"] == 1
+    assert governed["expansion"]["admitted_expanded"] == 1
+
+
+# ---- independent neighbor admission ----
+
+
+async def test_neighbor_withheld_by_surface_despite_strongest_edge(client, monkeypatch):
+    """Required test 6: a maximal-weight edge cannot turn a review_required
+    governed decision into an admission; the withhold is diagnosed with its
+    graph origin."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    seed = await _seed_qualified(client, "semantic target strong edge seed")
+    neighbor = await _remember(client, "review routed graph neighbor", source_type="extraction")
+    await _persist_v2_row(neighbor["id"], risk=None)  # governed: review_required
+    await _make_expansion_only(neighbor["id"])
+    await _link_items(seed["id"], neighbor["id"], "supports", weight=1.0)
+
+    governed = await _candidate_packet(client)
+    assert {item["id"] for item in governed["items"]} == {seed["id"]}
+    assert governed["omitted_by_admission"].get("v2_surface_review_required") == 1
+    diagnostic = next(
+        d for d in governed["admission_diagnostics"] if d["item_id"] == neighbor["id"]
+    )
+    assert diagnostic["origin"] == "graph"
+    assert diagnostic["v2_resolution_status"] == "current"
+    assert diagnostic["v2_surface_decision"] == "review_required"
+    assert governed["expansion"]["withheld_expanded"] == 1
+
+
+async def test_exploratory_high_risk_neighbor_admitted_on_its_own_surface(
+    client, monkeypatch
+):
+    """Required test 7: a high-risk neighbor enters the exploratory packet
+    only because the exact exploratory surface allows it, with the canonical
+    risk warning preserved; governed withholds the same neighbor."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    seed = await _seed_qualified(client, "semantic target risk seed")
+    neighbor = await _remember(client, "high risk graph neighbor", source_type="extraction")
+    await _persist_v2_row(neighbor["id"], risk="high", epistemic_state="supported")
+    await _make_expansion_only(neighbor["id"])
+    await _link_items(seed["id"], neighbor["id"], "references")
+
+    governed = await _candidate_packet(client)
+    assert neighbor["id"] not in {item["id"] for item in governed["items"]}
+    gov_diag = {d["item_id"]: d for d in governed["admission_diagnostics"]}
+    assert gov_diag[neighbor["id"]]["v2_surface_decision"] == "review_required"
+
+    exploratory = await _candidate_packet(client, profile="exploratory")
+    by_id = {item["id"]: item for item in exploratory["items"]}
+    assert neighbor["id"] in by_id
+    item = by_id[neighbor["id"]]
+    assert item["admission"]["surface"] == "semantic_exploratory"
+    assert "risk_high" in item["warning_codes"]
+    _evidence_identity_asserts(item)
+    assert _relationship(item)["origins"] == ["graph"]
+
+
+async def test_noncurrent_expanded_neighbors_fail_closed_with_diagnostics(
+    client, monkeypatch
+):
+    """Required test 8: missing | stale | mismatched | unsupported expanded
+    neighbors are withheld, diagnostic-only, each with its own resolution
+    status and origin."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    seed = await _seed_qualified(client, "semantic target noncurrent seed")
+
+    missing = await _remember(client, "never assessed neighbor", source_type="extraction")
+    await _make_expansion_only(missing["id"])
+    await _link_items(seed["id"], missing["id"], "references")
+
+    stale = await _remember(client, "stale neighbor", source_type="extraction")
+    await _persist_v2_row(stale["id"])
+    await _update_item(stale["id"], human_verified=True)  # changes the fresh hash
+    await _make_expansion_only(stale["id"])
+    await _link_items(seed["id"], stale["id"], "references")
+
+    unsupported = await _remember(client, "unsupported neighbor", source_type="extraction")
+    await _persist_v2_row(unsupported["id"])
+    await _fabricate_v2_row(unsupported["id"], schema_version="engram.admission-assessment.v1")
+    await _make_expansion_only(unsupported["id"])
+    await _link_items(seed["id"], unsupported["id"], "references")
+
+    mismatched = await _remember(client, "mismatched neighbor", source_type="extraction")
+    await _persist_v2_row(mismatched["id"])
+    await _fabricate_v2_row(mismatched["id"], policy_config_digest="sha256:" + "f" * 64)
+    await _make_expansion_only(mismatched["id"])
+    await _link_items(seed["id"], mismatched["id"], "references")
+
+    governed = await _candidate_packet(client)
+    assert {item["id"] for item in governed["items"]} == {seed["id"]}
+    diagnostics = {d["item_id"]: d for d in governed["admission_diagnostics"]}
+    expected = {
+        missing["id"]: ("missing", "v2_decision_missing"),
+        stale["id"]: ("stale", "v2_decision_stale"),
+        unsupported["id"]: ("unsupported", "v2_decision_unsupported"),
+        mismatched["id"]: ("mismatched", "v2_decision_mismatched"),
+    }
+    for item_id, (status, reason) in expected.items():
+        assert diagnostics[item_id]["origin"] == "graph", item_id
+        assert diagnostics[item_id]["v2_resolution_status"] == status, item_id
+        assert diagnostics[item_id]["reason_codes"] == [reason], item_id
+    assert governed["expansion"]["withheld_expanded"] == 4
+    assert governed["expansion"]["admitted_expanded"] == 0
+
+
+async def test_supports_edge_cannot_upgrade_epistemic_state(client, monkeypatch):
+    """Required test 9: a maximal supports edge leaves the V2 epistemic state
+    unknown — relationship is relevance, never evidence."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    seed = await _seed_qualified(client, "semantic target epistemic seed")
+    neighbor = await _remember(client, "unknown evidence neighbor", source_type="extraction")
+    await _persist_v2_row(neighbor["id"], risk=None)  # epistemic: unknown
+    await _make_expansion_only(neighbor["id"])
+    await _link_items(seed["id"], neighbor["id"], "supports", weight=1.0)
+
+    exploratory = await _candidate_packet(client, profile="exploratory")
+    by_id = {item["id"]: item for item in exploratory["items"]}
+    assert neighbor["id"] in by_id  # the exploratory surface allows it
+    item = by_id[neighbor["id"]]
+    assert item["epistemic_state"] == "unknown"
+    assert item["evidence"]["epistemic_state"] == "unknown"
+    assert "evidence_unknown" in item["warning_codes"]
+    assert _relationship(item)["graph_edge_types"] == ["supports"]
+    assert item["admission"]["surface_decision"] == "allow"
+
+
+async def test_high_importance_neighbor_cannot_bypass_v2_withholding(
+    client, monkeypatch
+):
+    """Required test 10: importance is utility — it can never buy admission."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    seed = await _seed_qualified(client, "semantic target importance seed")
+    neighbor = await _remember(
+        client, "important but unqualified neighbor", source_type="extraction", importance=1.0
+    )
+    await _persist_v2_row(neighbor["id"], risk=None)
+    await _make_expansion_only(neighbor["id"])
+    await _link_items(seed["id"], neighbor["id"], "derived_from", weight=1.0)
+
+    governed = await _candidate_packet(client)
+    assert neighbor["id"] not in {item["id"] for item in governed["items"]}
+    assert governed["omitted_by_admission"].get("v2_surface_review_required") == 1
+
+
+# ---- relevance/utility separation ----
+
+
+async def test_importance_moves_utility_and_rank_but_not_relevance(client, monkeypatch):
+    """Required test 11: changing only the neighbor's importance changes its
+    utility and final rank, never its relationship relevance, evidence
+    state, or admission."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    seed = await _seed_qualified(client, "semantic target utility seed")
+    neighbor = await _seed_qualified(client, "utility probe neighbor", importance=0.1)
+    await _make_expansion_only(neighbor["id"])
+    await _link_items(seed["id"], neighbor["id"], "derived_from")
+
+    def _snapshot(packet: dict[str, Any]) -> dict[str, Any]:
+        item = next(i for i in packet["items"] if i["id"] == neighbor["id"])
+        return {
+            "relevance": item["relevance_score"],
+            "relationship": item["relationship"],
+            "evidence": item["evidence"],
+            "admission": item["admission"],
+            "utility": item["utility_score"],
+            "score": item["score"],
+        }
+
+    before = _snapshot(await _candidate_packet(client, profile="exploratory"))
+    await _update_item(neighbor["id"], importance=0.9)
+    after = _snapshot(await _candidate_packet(client, profile="exploratory"))
+
+    assert before["relevance"] == after["relevance"]
+    assert before["relationship"] == after["relationship"]
+    assert before["evidence"] == after["evidence"]
+    assert before["admission"] == after["admission"]
+    assert before["utility"] < after["utility"]
+    assert before["score"] < after["score"]
+
+
+async def test_edge_strength_moves_relevance_but_not_utility_or_admission(
+    client, monkeypatch
+):
+    """Required test 12: changing only the edge weight changes relationship
+    relevance, never utility, epistemic state, or admission."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    seed = await _seed_qualified(client, "semantic target edge weight seed")
+    neighbor = await _seed_qualified(client, "edge weight probe neighbor")
+    await _make_expansion_only(neighbor["id"])
+    await _link_items(seed["id"], neighbor["id"], "supports", weight=0.3)
+
+    def _snapshot(packet: dict[str, Any]) -> dict[str, Any]:
+        item = next(i for i in packet["items"] if i["id"] == neighbor["id"])
+        return {
+            "relevance": item["relevance_score"],
+            "graph_contribution": item["relationship"]["graph_contribution"],
+            "utility": item["utility_score"],
+            "evidence": item["evidence"],
+            "admission": item["admission"],
+        }
+
+    weak = _snapshot(await _candidate_packet(client, profile="exploratory"))
+    await _unlink_items(seed["id"], neighbor["id"])
+    await _link_items(seed["id"], neighbor["id"], "supports", weight=0.9)
+    strong = _snapshot(await _candidate_packet(client, profile="exploratory"))
+
+    assert weak["graph_contribution"] < strong["graph_contribution"]
+    assert weak["relevance"] < strong["relevance"]
+    assert weak["utility"] == strong["utility"]
+    assert weak["evidence"] == strong["evidence"]
+    assert weak["admission"] == strong["admission"]
+
+
+async def test_epistemic_and_utility_inputs_cannot_move_relationship_relevance(
+    client, monkeypatch
+):
+    """Required test 13: source trust, memory confidence, human verification,
+    and exposure counters are neither relevance nor admission inputs — for a
+    fixed expansion/admission binding they change nothing. (human_verified
+    IS an input to the V2 decision hash, so flipping it re-binds the row;
+    re-persisting restores the identical binding and proves relevance never
+    moved.)"""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    seed = await _seed_qualified(client, "semantic target exclusion seed")
+    neighbor = await _seed_qualified(client, "exclusion probe neighbor")
+    await _make_expansion_only(neighbor["id"])
+    await _link_items(seed["id"], neighbor["id"], "derived_from")
+
+    def _snapshot(packet: dict[str, Any]) -> dict[str, Any]:
+        item = next(i for i in packet["items"] if i["id"] == neighbor["id"])
+        return {
+            "relevance": item["relevance_score"],
+            "relationship": item["relationship"],
+            "evidence": item["evidence"],
+            "admission": item["admission"],
+        }
+
+    before = _snapshot(await _candidate_packet(client))
+    await _update_item(
+        neighbor["id"],
+        source_trust=0.05,
+        memory_confidence=0.05,
+        recall_count=99,
+        last_recalled_at=datetime.now(UTC),
+    )
+    after = _snapshot(await _candidate_packet(client))
+    assert before == after
+
+    # human_verified moves the V2 decision hash (it is epistemic input to
+    # the policy), so the binding re-persists first; with the binding fixed
+    # again, relevance is still exactly what it was.
+    await _update_item(neighbor["id"], human_verified=True)
+    async with _test_engine.begin() as conn:
+        # classification_runs is one-per-item; dropping the old run cascades
+        # its #157 assessment so the re-persist can rebuild both fresh.
+        await conn.execute(
+            text("DELETE FROM classification_runs WHERE memory_item_id = :id"),
+            {"id": neighbor["id"]},
+        )
+    await _persist_v2_row(neighbor["id"])
+    rebound = _snapshot(await _candidate_packet(client))
+    assert rebound["relevance"] == before["relevance"]
+    assert rebound["relationship"] == before["relationship"]
+    assert rebound["admission"]["decision"] == "admit"
+
+
+async def test_direct_and_expanded_origin_merge_is_deterministic(client, monkeypatch):
+    """Required test 14: a direct hit that is also a graph neighbor merges
+    origins deterministically and exposes the structured components."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    seed_a = await _seed_qualified(client, "semantic target merge a")
+    seed_b = await _seed_qualified(client, "semantic target merge b")
+    await _link_items(seed_b["id"], seed_a["id"], "supports", weight=0.6)
+
+    first = await _candidate_packet(client)
+    second = await _candidate_packet(client)
+    by_id = {item["id"]: item for item in first["items"]}
+    merged = by_id[seed_a["id"]]
+    # The merged item keeps its direct fields and gains the graph origin.
+    assert merged["distance"] is not None
+    assert merged["similarity_score"] is not None
+    relationship = _relationship(merged)
+    assert relationship["origins"] == ["semantic", "graph"]
+    assert relationship["direct"] is True
+    assert relationship["direct_semantic_score"] == merged["similarity_score"]
+    assert relationship["graph_edge_types"] == ["supports"]
+    assert set(relationship["components"]) == {"semantic", "graph", "tunnel"}
+    assert any("linked via supports" in r for r in merged["reasons"])
+    # Deterministic: identical packet on re-evaluation.
+    assert first["items"] == second["items"]
+    assert [i["id"] for i in first["items"]] == [i["id"] for i in second["items"]]
+
+
+async def test_candidate_rank_reproducible_from_published_inputs(client, monkeypatch):
+    """Required test 15: every packet item's rank is recomputable from its
+    published relevance + utility — direct, expanded, and merged alike."""
+    from engram.recall_signals import compute_signal_rank_score
+
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    seed = await _seed_qualified(client, "semantic target reproducibility seed")
+    graph_neighbor = await _seed_qualified(client, "reproducibility graph neighbor")
+    await _make_expansion_only(graph_neighbor["id"])
+    await _link_items(seed["id"], graph_neighbor["id"], "derived_from")
+
+    for profile in ("governed", "exploratory"):
+        packet = await _candidate_packet(client, profile=profile)
+        assert len(packet["items"]) == 2
+        for item in packet["items"]:
+            assert item["score"] == compute_signal_rank_score(
+                similarity=item["relevance_score"], utility=item["utility_score"]
+            )
+
+
+# ---- security / RLS boundaries through edges and tunnels ----
+
+
+async def test_cross_tenant_neighbor_is_never_discoverable(client, monkeypatch):
+    """Required test 16: an edge row can name a foreign item, but the
+    neighbor is never discovered or diagnosed."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    from engram.models import MemoryItem as MemoryItemRow
+    from engram.models import Principal as PrincipalRow
+    from engram.models import Tenant as TenantRow
+
+    seed = await _seed_qualified(client, "semantic target cross tenant seed")
+    async with _test_session_factory() as session:
+        tenant = TenantRow(name="exp190 other", slug=f"exp190-{uuid4().hex[:8]}")
+        session.add(tenant)
+        await session.flush()
+        principal = PrincipalRow(tenant_id=tenant.id, name="exp190-agent", type="agent")
+        session.add(principal)
+        await session.flush()
+        foreign = MemoryItemRow(
+            tenant_id=tenant.id,
+            principal_id=principal.id,
+            content="foreign secret",
+            content_hash=f"h-{uuid4()}",
+            kind="fact",
+            visibility="tenant",
+            review_status="proposed",
+        )
+        session.add(foreign)
+        await session.commit()
+        foreign_id = str(foreign.id)
+    # The edge row lives in the caller's tenant but points at the foreign item.
+    await _link_items(seed["id"], foreign_id, "derived_from", weight=1.0)
+
+    governed = await _candidate_packet(client)
+    assert foreign_id not in {item["id"] for item in governed["items"]}
+    assert foreign_id not in {d["item_id"] for d in governed["admission_diagnostics"]}
+
+
+async def test_private_neighbor_is_undiscoverable_and_undiagnosable(client, monkeypatch):
+    """Required test 17: another principal's private neighbor is invisible —
+    not in the packet, not even diagnosable by identity."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    seed = await _seed_qualified(client, "semantic target private seed")
+    neighbor = await _remember(
+        client,
+        "private neighbor of seed",
+        source_type="extraction",
+        visibility="private",
+    )
+    await _persist_v2_row(neighbor["id"])
+    async with _test_engine.begin() as conn:
+        other_principal = str(uuid4())
+        principal_name = f"exp190-private-{other_principal[:8]}"
+        tenant_id = await conn.scalar(
+            text("SELECT tenant_id::text FROM memory_items WHERE id = :id"), {"id": seed["id"]}
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO principals (id, tenant_id, name, type) "
+                "VALUES (:pid, :tid, :pname, 'agent')"
+            ),
+            {"pid": other_principal, "tid": tenant_id, "pname": principal_name},
+        )
+        await conn.execute(
+            text("UPDATE memory_items SET principal_id = :pid WHERE id = :id"),
+            {"pid": other_principal, "id": neighbor["id"]},
+        )
+    await _link_items(seed["id"], neighbor["id"], "derived_from", weight=1.0)
+
+    governed = await _candidate_packet(client)
+    assert neighbor["id"] not in {item["id"] for item in governed["items"]}
+    assert neighbor["id"] not in {d["item_id"] for d in governed["admission_diagnostics"]}
+    # An inaccessible seed reveals nothing either: the only admitted item is
+    # the seed itself (required test 19's non-disclosure property).
+    assert governed["expansion"]["discovered_neighbors"] == 0
+
+
+async def test_out_of_workspace_neighbor_unreachable_through_edge(client, monkeypatch):
+    """Required test 18: a workspace-scoped comparison cannot reach a
+    qualified neighbor outside the workspace, even through a visible edge."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    async with _test_engine.begin() as conn:
+        tenant_id = await conn.scalar(text("SELECT id::text FROM tenants WHERE slug = 'default'"))
+        admin_id = await conn.scalar(
+            text("SELECT p.id::text FROM principals p JOIN tenants t ON t.id = p.tenant_id "
+                 "WHERE t.slug = 'default' AND p.name = 'admin'")
+        )
+        workspace_id = str(uuid4())
+        workspace_slug = f"exp190-ws-{workspace_id[:8]}"
+        await conn.execute(
+            text(
+                "INSERT INTO workspaces (id, tenant_id, name, slug) "
+                "VALUES (:id, :tid, 'exp190 ws', :slug)"
+            ),
+            {"id": workspace_id, "tid": tenant_id, "slug": workspace_slug},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO workspace_members (id, workspace_id, principal_id, role) "
+                "VALUES (gen_random_uuid(), :ws, :pid, 'member')"
+            ),
+            {"ws": workspace_id, "pid": admin_id},
+        )
+
+    seed = await _seed_qualified(
+        client, "semantic target workspace seed", workspace=workspace_slug
+    )
+    neighbor = await _seed_qualified(client, "out of workspace neighbor")
+    await _make_expansion_only(neighbor["id"])
+    await _link_items(seed["id"], neighbor["id"], "derived_from", weight=1.0)
+
+    scoped = await _candidate_packet(client, workspace=workspace_slug)
+    assert {item["id"] for item in scoped["items"]} == {seed["id"]}
+    assert neighbor["id"] not in {d["item_id"] for d in scoped["admission_diagnostics"]}
+    assert scoped["expansion"]["discovered_neighbors"] == 0
+
+
+async def test_inaccessible_item_cannot_be_used_to_infer_neighbors(client, monkeypatch):
+    """Required test 19: an item the caller cannot read sits between the
+    admitted seed and further neighbors. Neither the inaccessible item nor
+    its own neighbors may be discovered, diagnosed, or inferred — the packet
+    and its diagnostics reveal nothing about them."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    seed = await _seed_qualified(client, "semantic target inaccessible seed")
+    # An edge-visible but unreadable middle item (another principal's
+    # private proposal), itself linked to a fully qualified neighbor.
+    middle = await _remember(
+        client, "private middle item", source_type="extraction", visibility="private"
+    )
+    far = await _seed_qualified(client, "qualified far neighbor of private middle")
+    await _make_expansion_only(middle["id"])
+    await _make_expansion_only(far["id"])
+    async with _test_engine.begin() as conn:
+        other_principal = str(uuid4())
+        tenant_id = await conn.scalar(
+            text("SELECT tenant_id::text FROM memory_items WHERE id = :id"), {"id": seed["id"]}
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO principals (id, tenant_id, name, type) "
+                "VALUES (:pid, :tid, :pname, 'agent')"
+            ),
+            {
+                "pid": other_principal,
+                "tid": tenant_id,
+                "pname": f"exp190-infer-{other_principal[:8]}",
+            },
+        )
+        await conn.execute(
+            text("UPDATE memory_items SET principal_id = :pid WHERE id = :id"),
+            {"pid": other_principal, "id": middle["id"]},
+        )
+    await _link_items(seed["id"], middle["id"], "derived_from", weight=1.0)
+    await _link_items(middle["id"], far["id"], "derived_from", weight=1.0)
+
+    governed = await _candidate_packet(client)
+    assert {item["id"] for item in governed["items"]} == {seed["id"]}
+    diagnosed = {d["item_id"] for d in governed["admission_diagnostics"]}
+    assert middle["id"] not in diagnosed
+    assert far["id"] not in diagnosed
+    assert governed["expansion"]["discovered_neighbors"] == 0
+
+
+# ---- performance / boundedness ----
+
+
+async def test_expansion_adds_no_provider_call(client, monkeypatch):
+    """Required test 20: with graph+tunnel expansion active, the comparison
+    still makes exactly one provider call — the shared query embedding."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    seed = await _seed_qualified(client, "semantic target provider seed")
+    neighbor = await _seed_qualified(client, "provider probe neighbor")
+    await _make_expansion_only(neighbor["id"])
+    await _link_items(seed["id"], neighbor["id"], "derived_from")
+    tunnel_neighbor = await _seed_qualified(
+        client, "provider tunnel neighbor", wing="ProvWing", room="a"
+    )
+    await _seed_qualified(
+        client, "semantic target provider wing seed", wing="ProvWing", room="a"
+    )
+    await _make_expansion_only(tunnel_neighbor["id"])
+    await _mk_tunnel("ProvWing", "ProvOtherWing")
+
+    # Seed first, THEN start counting: only the comparison itself is measured.
+    provider_calls = {"count": 0}
+
+    async def counting_embedding(text_value: str, *_args: object, **_kwargs: object) -> list[float]:
+        provider_calls["count"] += 1
+        return _fake_embedding_for(text_value)
+
+    import engram.embeddings as embeddings_mod
+    from engram import recall as recall_mod
+    from engram.api.routes import memory as memory_routes
+
+    monkeypatch.setattr(recall_mod, "generate_embedding", counting_embedding)
+    monkeypatch.setattr(memory_routes, "generate_embedding", counting_embedding)
+    monkeypatch.setattr(embeddings_mod, "generate_embedding", counting_embedding)
+
+    await _shadow_compare(client, profiles=["governed", "exploratory"])
+    assert provider_calls["count"] == 1
+
+
+async def test_expanded_neighbor_resolution_is_bulk_without_nplus1(client, monkeypatch):
+    """Required test 21: one bulk resolution per window — query count stays
+    constant as the neighbor count grows within the configured bounds."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    import engram.admission_shadow as admission_shadow_mod
+
+    resolve_calls = {"count": 0}
+    original_resolve = admission_shadow_mod.resolve_bulk_v2_decisions
+
+    async def counting_resolve(*args: Any, **kwargs: Any) -> Any:
+        resolve_calls["count"] += 1
+        return await original_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(admission_shadow_mod, "resolve_bulk_v2_decisions", counting_resolve)
+    monkeypatch.setattr(settings, "max_graph_neighbors_per_item", 10)
+
+    seed = await _seed_qualified(client, "semantic target bulk seed")
+
+    async def add_neighbors(count: int, prefix: str) -> list[str]:
+        ids = []
+        for i in range(count):
+            neighbor = await _seed_qualified(client, f"{prefix} neighbor {i:02d}")
+            await _make_expansion_only(neighbor["id"])
+            await _link_items(seed["id"], neighbor["id"], "references")
+            ids.append(neighbor["id"])
+        return ids
+
+    few = await add_neighbors(2, "bulk few")
+    packet_few = await _candidate_packet(client)
+    assert len(few) == packet_few["expansion"]["admitted_expanded"]
+
+    await add_neighbors(4, "bulk many")  # 6 neighbors total, within the caps
+    packet_many = await _candidate_packet(client)
+    assert packet_many["expansion"]["admitted_expanded"] == 6
+
+    # Direct window + neighbor window: exactly two bulk resolutions per
+    # packet regardless of neighbor count.
+    assert resolve_calls["count"] == 4  # two packets x two windows
+    # Merged per-packet query count is constant in neighbor count.
+    assert packet_few["v2_resolution"]["query_count"] == packet_many[
+        "v2_resolution"
+    ]["query_count"]
+    assert packet_many["v2_resolution"]["resolved_count"] == 7  # 1 direct + 6 neighbors
+
+
+async def test_graph_and_tunnel_caps_remain_enforced(client, monkeypatch):
+    """Required test 22: expansion cannot exceed the configured bounded
+    windows."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+    monkeypatch.setattr(settings, "max_graph_expanded_items", 2)
+    monkeypatch.setattr(settings, "max_graph_neighbors_per_item", 5)
+    monkeypatch.setattr(settings, "max_tunnel_additions", 1)
+
+    seed = await _seed_qualified(client, "semantic target caps seed")
+    for i in range(4):
+        neighbor = await _seed_qualified(client, f"caps graph neighbor {i}")
+        await _make_expansion_only(neighbor["id"])
+        await _link_items(seed["id"], neighbor["id"], "derived_from", weight=0.9 - i * 0.1)
+    tunnel_extra = await _seed_qualified(
+        client, "caps tunnel neighbor", wing="CapsWing", room="src"
+    )
+    # A second admitted direct seed in the tunneled wing drives discovery.
+    await _seed_qualified(
+        client, "semantic target caps tunnel seed", wing="CapsFar", room="dst"
+    )
+    await _make_expansion_only(tunnel_extra["id"])
+    await _mk_tunnel("CapsWing", "CapsFar")
+
+    governed = await _candidate_packet(client)
+    # max_graph_expanded_items=2 of the 4 graph neighbors, strongest first.
+    assert governed["expansion"]["graph_neighbors"] == 2
+    # Tunnel additions capped at 1 (the tunnel neighbor; the seed itself is
+    # excluded as a direct candidate).
+    assert governed["expansion"]["tunnel_neighbors"] == 1
+    assert governed["expansion"]["discovered_neighbors"] <= 3
+
+
+async def test_equal_score_tie_ordering_is_deterministic(client, monkeypatch):
+    """Required test 23: two neighbors with identical relevance, utility,
+    and timestamps keep a stable order (id-ordered) across evaluations."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    seed = await _seed_qualified(client, "semantic target tie seed")
+    anchors = datetime.now(UTC) - timedelta(days=7)
+    neighbors = []
+    for i in range(2):
+        neighbor = await _remember(client, f"tie neighbor {i}", source_type="extraction")
+        await _make_expansion_only(neighbor["id"])
+        await _link_items(seed["id"], neighbor["id"], "references", weight=0.5)
+        # Identical timestamps/weights/importance BEFORE persisting the V2
+        # row, so both neighbors stay current with identical rank inputs.
+        await _update_item(neighbor["id"], created_at=anchors, valid_from=anchors)
+        await _persist_v2_row(neighbor["id"])
+        neighbors.append(neighbor)
+
+    first = await _candidate_packet(client)
+    second = await _candidate_packet(client)
+    order_first = [item["id"] for item in first["items"]]
+    order_second = [item["id"] for item in second["items"]]
+    assert order_first == order_second
+    scores = [item["score"] for item in first["items"]]
+    assert scores[1] == scores[2]  # the tied neighbors
+    # Equal on every ranking input: the stable order is the id tiebreak.
+    assert order_first[1:] == sorted(order_first[1:])
+
+
+# ---- compatibility / read-only ----
+
+
+async def test_expansion_shadow_comparison_remains_read_only(client, monkeypatch):
+    """Required tests 24 + 25: with expansion active the comparison writes
+    nothing — no recall log, no exposure counter, no review/promotion/
+    assessment mutation — and the authoritative legacy packet keeps its
+    legacy-only shape (blended scoring; no signal/evidence/relationship
+    blocks). Legacy byte-compatibility itself is pinned by the pre-existing
+    legacy suites (test_relationship_recall / test_graph_recall /
+    test_tunnel_recall / legacy semantic tests), which this change runs
+    unchanged."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    seed = await _seed_qualified(client, "semantic target readonly seed")
+    neighbor = await _seed_qualified(client, "readonly neighbor")
+    await _make_expansion_only(neighbor["id"])
+    await _link_items(seed["id"], neighbor["id"], "derived_from")
+
+    async def _snapshot_state() -> tuple[int, list[int], dict[str, Any], int]:
+        async with _test_session_factory() as session:
+            logs = int(await session.scalar(text("SELECT count(*) FROM recall_logs")))
+            counts = list(
+                (
+                    await session.execute(
+                        text(
+                            "SELECT recall_count FROM memory_items "
+                            "WHERE id = ANY(CAST(:ids AS uuid[])) ORDER BY id"
+                        ),
+                        {"ids": [seed["id"], neighbor["id"]]},
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            reviews = dict(
+                (
+                    await session.execute(
+                        text("SELECT id::text, review_status FROM memory_items")
+                    )
+                ).all()
+            )
+            assessments = int(
+                await session.scalar(text("SELECT count(*) FROM admission_assessments"))
+            )
+        return logs, counts, reviews, assessments
+
+    before = await _snapshot_state()
+    shadow = await _shadow_compare(client, profiles=["governed", "exploratory"])
+    after = await _snapshot_state()
+    assert before == after
+
+    legacy_served = await _recall(client)
+    # The authoritative legacy write path is the only one that may write;
+    # its counts prove the comparison itself wrote nothing (the shadow left
+    # exactly one recall log and +1 exposure counters, not two of each).
+    async with _test_session_factory() as session:
+        logs = int(await session.scalar(text("SELECT count(*) FROM recall_logs")))
+        counts = list(
+            (
+                await session.execute(
+                    text(
+                        "SELECT recall_count FROM memory_items "
+                        "WHERE id = ANY(CAST(:ids AS uuid[])) ORDER BY id"
+                    ),
+                    {"ids": [seed["id"], neighbor["id"]]},
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert logs == before[0] + 1
+    assert counts == [count + 1 for count in before[1]]
+    # The candidate packet did expand (the boundary under test is real).
+    governed = next(c for c in shadow["candidates"] if c["profile"] == "governed")
+    assert governed["expansion"]["admitted_expanded"] == 1
+    # The legacy served packet is untouched by the candidate expansion
+    # machinery: blended scoring, trust_score present, and — where the legacy
+    # compatibility expansion surfaces the same neighbor — purely legacy
+    # fields (no signal/evidence/relationship blocks).
+    assert legacy_served["scoring_version"] == "semantic-v3"
+    assert legacy_served["recall_profile"] == "legacy"
+    for item in legacy_served["items"]:
+        assert "trust_score" in item
+        assert "relationship" not in item
+        assert "evidence" not in item
+        assert "warning_codes" not in item
+    # And production remains legacy-only (required test 26).
+    from engram.recall_profiles import CERTIFIED_SERVING_PROFILES
+
+    assert sorted(CERTIFIED_SERVING_PROFILES) == ["legacy"]
+    resp = await client.post(
+        "/v1/recall",
+        json={"mode": "semantic", "query": "q", "recall_profile": "governed"},
+    )
+    assert resp.status_code == 422

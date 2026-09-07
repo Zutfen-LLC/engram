@@ -331,6 +331,92 @@ promotion, review state, or certification authority changes.
    packet shape is byte-for-byte unchanged (no `evidence` /
    `warning_codes` keys on legacy items).
 
+## Supplement (issue #190, ENG-RECALL-003D): admission-first relationship expansion
+
+Issue #190 extends the governed/exploratory shadow profiles through the
+existing bounded graph/tunnel relationship expansion, without reintroducing
+the legacy blended trust/ranking model. Relationship expansion becomes an
+**admission-first relevance mechanism**: a relationship can make a memory
+*relevant*, it can never make that memory trusted, epistemically supported,
+review-approved, or admissible. This remains shadow-only — it authorizes no
+governed/exploratory production serving and no #162 certification/cutover.
+
+1. **Admission precedes expansion.** The candidate-profile pipeline order is
+   normative: direct semantic candidates → exact V2 admission on the direct
+   candidates → seeds chosen **only** from admitted direct candidates →
+   bounded graph/tunnel neighbor discovery → exact V2 admission on **every**
+   expanded neighbor → relationship-aware relevance → separated utility
+   ranking → budget packing. A withheld direct hit can never seed expansion
+   (zero admitted seeds means no expansion run at all), and seed admission
+   never transfers to a neighbor: each neighbor is admitted through the same
+   `decide_recall_admission` gate over its own resolved `risk_aware_shadow_v1`
+   decision, so only `current + exact-surface allow` enters the packet and
+   `missing | stale | mismatched | unsupported` and
+   `review_required | withhold | not_applicable` stay fail-closed.
+
+2. **Discovery under the same hard boundaries.** Neighbor discovery reuses
+   the shared bounded mechanics (depth-1 only, per-seed and total graph caps,
+   total tunnel cap, deterministic ordering/tie-breaking) and adds the same
+   live-proposal corpus window the profile's own direct retrieval applies
+   (`recall_signals.live_proposal_expression`) as the discovery prefilter —
+   the one prefilter the #190 contract permits precisely because it can
+   neither admit, widen, nor hide policy-relevant candidate state: it is the
+   identical window, and active/closed/conflicted rows are inevitably
+   withheld by the V2 gate anyway. Tenant/read-eligibility/workspace
+   boundaries are enforced inside discovery itself; the candidate tunnel
+   fetch orders `created_at desc, id asc` (importance-free) because utility
+   signals may order only already-admitted items, never decide which
+   neighbors a bounded window discovers.
+
+3. **Relationship relevance is versioned and utility-free.** One pure
+   contract (`relationship_recall.compute_relationship_relevance`, version
+   `relationship-relevance-v1`) computes relevance from exactly four inputs:
+   the item's direct semantic score (when it was a direct hit), the
+   source-seed relevance that justified expansion, the strongest graph edge
+   (bounded to `[0, 1]`, per-edge weights clamped), and tunnel membership.
+   Importance, source trust, memory confidence, human verification, review
+   state, exposure counters, and epistemic/risk state are not inputs — they
+   cannot move relevance by construction. The combination is
+   `clamp01(max(direct_score, w_semantic·semantic + w_graph·edge +
+   w_tunnel·tunnel))` over the existing relationship weights minus the
+   importance term: an unlinked direct item's relevance is exactly its
+   similarity (pre-#190 values), links never demote a direct hit, and a
+   relationship can only derive relevance from the bounded source-seed/
+   relationship contract. Admitted items reached through expansion carry a
+   structured `relationship` block (origin decomposition, direct/seed
+   scores, edge types, tunnel labels, per-component contributions,
+   `relevance_score`); the final rank feeds that value into the unchanged
+   `compute_signal_rank_score` with utility — never a new blended scalar.
+
+4. **Evidence identity is untouched by relationships.** An admitted expanded
+   item presents the same `admission.v2` / `evidence` identity as any direct
+   item (the #188 invariant): `admission.v2` is the binding that admitted
+   *that neighbor*, `evidence.*` is its pure projection, top-level
+   `epistemic_state` mirrors it, and relationship metadata never rewrites
+   evidence. A `supports` edge cannot produce `supported`; a `contradicts`
+   edge is relevance, never conflict resolution — full conflict-preserving/
+   diversity packing remains follow-up work.
+
+5. **Diagnostics and boundedness.** Withheld expanded neighbors remain
+   auditable and content-safe: `admission_diagnostics` entries carry the
+   expansion `origin` (`direct`, `graph`, `tunnel`, `graph+tunnel`) alongside
+   the V2 resolution status and exact surface decision, and each packet
+   carries a bounded `expansion` summary (contract version, seed/neighbor/
+   admitted/withheld counts). Expansion performs no provider call and one
+   bounded bulk V2 resolution for the newly discovered neighbor set per
+   packet (query count constant in neighbor count, on top of the
+   already-bounded discovery queries); the packet-level `v2_resolution`
+   summary totals both windows under the same policy identity.
+
+6. **Legacy stays compatibility-only.** `expand_recall_candidates` (the
+   legacy blend, importance included, `semantic-v3`) remains byte-for-byte
+   unchanged and remains the only expansion `POST /v1/recall` runs.
+   `CERTIFIED_SERVING_PROFILES` stays `{"legacy"}`, the shadow surface stays
+   read-only and reviewer + tenant-policy gated, no MCP profile selection is
+   enabled, and #161 corroboration, semantic Context Ledger receipts,
+   dogfood ranking tuning, and #162 certification/cutover all remain
+   follow-up.
+
 ## Feedback-loop safeguards (issue #160)
 
 * utility excludes exposure counters (`recall_count`,
@@ -343,14 +429,16 @@ promotion, review state, or certification authority changes.
 
 ## Known limitations / follow-ups (issue #160 remains open)
 
-This ADR records the #160 slice plus the #186 V2-binding and #188
-evidence-presentation supplements.
+This ADR records the #160 slice plus the #186 V2-binding, #188
+evidence-presentation, and #190 admission-first relationship-expansion
+supplements.
 Deliberately deferred, tracked by the issue:
 
-* **Signal-aware graph/tunnel expansion** — expansion is legacy-only;
-  admission must precede expansion and the rescorer still speaks the blended
-  score. Governed/exploratory evaluate direct semantic hits only until
-  expansion learns the signal model.
+* **Conflict-preserving/diversity packing over expanded candidates** — since
+  #190 the candidate profiles expand through graph/tunnel relationships
+  (admission-first, `relationship-relevance-v1`), but packing is still
+  purely rank-ordered: evidence-root grouping and conflict-pair preservation
+  over direct + expanded candidates are follow-up.
 * **#157 enrichment on non-V2 paths** — the V2 resolver supplies
   risk/epistemic/retention state for candidate admission in bulk
   (`effective_assessment_selection_bulk`), and since #188 the served items of
@@ -375,12 +463,14 @@ Deliberately deferred, tracked by the issue:
   shadow-comparison surface (the reason it exists). Since #186 this includes
   keeping the V2 row corpus fresh: candidate packets bind only to *current*
   persisted decisions, so dogfooding pairs the #158 simulate+persist pass
-  with the #160 comparison.
+  with the #160 comparison. Since #190 the compared packets include
+  relationship expansion, so dogfood measures its contribution too.
 * **Certification/default cutover** — flipping `CERTIFIED_SERVING_PROFILES`
   (and then `recall_default_profile`) is gated on a *fresh* accepted #162
-  certification of the now-integrated policy (V2-bound admission); #162D/#176
-  terminated NOT_CERTIFIED against the pre-#186 integration and nothing here
-  authorizes #161/#162 production enablement.
+  certification of the now-integrated policy (V2-bound admission +
+  admission-first expansion); #162D/#176 terminated NOT_CERTIFIED against the
+  pre-#186 integration and nothing here authorizes #161/#162 production
+  enablement.
 * **`omitted_by_admission` is response-only** — gate-level withholding counts
   by reason code are returned to the caller and logged; `recall_logs` has no
   JSON omission column yet (note: under shadow-only rollout these counts

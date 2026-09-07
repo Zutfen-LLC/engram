@@ -26,16 +26,17 @@ telemetry-write failure never fails the read.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import ColumnElement, and_, case, func, literal, or_, select, update
+from sqlalchemy import ColumnElement, case, func, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram import db as db_module
-from engram import recall_signals, semantic
+from engram import recall_signals, relationship_recall, semantic
 from engram.config import settings
 from engram.embeddings import generate_embedding
 from engram.jobs import enqueue_job
@@ -995,23 +996,27 @@ def _enforce_semantic_budget(
 def _semantic_base_item_fields(
     item: MemoryItem,
     *,
-    distance: float,
-    similarity: float,
+    distance: float | None,
+    similarity: float | None,
 ) -> dict[str, Any]:
     """Per-item fields shared by every semantic profile's served items.
 
     Both the legacy blend path and the signal path build on this so the
     served-decision fields (ENG-CONTEXT-001) stay contract-aligned: a new
     field lands in one place and every profile serves it. Scoring/reasons/
-    warnings differ per profile and are added by the caller.
+    warnings differ per profile and are added by the caller. ``distance``/
+    ``similarity`` are ``None`` for items reached only through relationship
+    expansion (no query vector was ever compared against them — issue #190);
+    their relevance lives in ``relevance_score`` and the structured
+    ``relationship`` block.
     """
     return {
         "id": str(item.id),
         "kind": item.kind,
         "content": item.content,
         "review_status": item.review_status,
-        "distance": round(distance, 4),
-        "similarity_score": round(similarity, 4),
+        "distance": round(distance, 4) if distance is not None else None,
+        "similarity_score": round(similarity, 4) if similarity is not None else None,
         "pinned": item.pinned,
         "importance": item.importance,
         "source_trust": item.source_trust,
@@ -1025,24 +1030,6 @@ def _semantic_base_item_fields(
     }
 
 
-def _live_proposal_expression() -> ColumnElement[bool]:
-    """The mechanically-expressible domain of the #158 V2 admission policy.
-
-    ``risk_aware_shadow_v1`` decides over live proposals (an active,
-    superseded, or closed item is ``not_live`` and blocked on every surface),
-    and unresolved conflicts are blocked before any evidence is examined.
-    Both facts are pure SQL, so they are applied *before* the bounded HNSW
-    window (issue #186) — rows the V2 gate would inevitably withhold can
-    never occupy the candidate window and starve eligible proposals.
-    """
-    return and_(
-        MemoryItem.review_status == "proposed",
-        MemoryItem.valid_to.is_(None),
-        MemoryItem.superseded_by.is_(None),
-        MemoryItem.conflict_resolution_status.is_distinct_from("unresolved"),
-    )
-
-
 def _signal_corpus_eligibility(
     profile: RecallProfileSpec,
     stay_kinds: set[str],
@@ -1053,14 +1040,16 @@ def _signal_corpus_eligibility(
     into SQL *before* the bounded HNSW window. Since issue #186 the signal
     profiles are V2-bound: their admission authority is the exact #158
     per-surface decision, whose expressible domain is the live-proposal
-    corpus (:func:`_live_proposal_expression`) — everything else (risk,
-    epistemic state, calibration, observation windows, external disputes) is
-    the post-retrieval V2 gate's job. ``stay_kinds`` is retained for
-    signature compatibility with future corpus doctrines; the disputed
-    stay-kind doctrine is not part of the V2-bound window (disputed items are
-    never live proposals).
+    corpus (:func:`engram.recall_signals.live_proposal_expression`) —
+    everything else (risk, epistemic state, calibration, observation windows,
+    external disputes) is the post-retrieval V2 gate's job. ``stay_kinds`` is
+    retained for signature compatibility with future corpus doctrines; the
+    disputed stay-kind doctrine is not part of the V2-bound window (disputed
+    items are never live proposals). Issue #190 reuses this exact predicate
+    as the relationship-expansion discovery window so direct retrieval and
+    neighbor discovery can never disagree about the corpus.
     """
-    return _live_proposal_expression()
+    return recall_signals.live_proposal_expression()
 
 
 @dataclass
@@ -1069,12 +1058,30 @@ class SignalAdmissionOutcome:
 
     ``admission_diagnostics`` carries one bounded, content-free entry per
     withheld candidate — identity and codes only — so operators can see the
-    exact local-versus-V2 disagreement that withheld it (issue #186)."""
+    exact local-versus-V2 disagreement that withheld it (issue #186). Since
+    issue #190 each entry also names the ``origin`` that surfaced the
+    candidate (direct semantic hit vs graph/tunnel expansion), and
+    ``expansion`` summarizes the admission-first expansion run itself
+    (contract version, seed/neighbor/admission counts)."""
 
     items: list[dict[str, Any]]
     omitted_by_admission: dict[str, int]
     admission_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     v2_resolution: dict[str, Any] | None = None
+    expansion: dict[str, Any] | None = None
+
+
+@dataclass
+class _AdmittedSignalItem:
+    """One admitted candidate item and the context its ranking consumed."""
+
+    item: MemoryItem
+    item_dict: dict[str, Any]
+    # Direct semantic similarity; None for items reached only through
+    # relationship expansion.
+    similarity: float | None
+    distance: float | None
+    created_ts: float
 
 
 async def _admit_and_rank_signal_items(
@@ -1082,29 +1089,39 @@ async def _admit_and_rank_signal_items(
     *,
     profile: RecallProfileSpec,
     memory_context: ResolvedMemoryContext,
+    workspace_id: str | None,
     candidates: list[dict[str, Any]],
     item_by_id: dict[UUID, MemoryItem],
     stay_kinds: set[str],
     now: datetime,
 ) -> SignalAdmissionOutcome:
-    """V2-bound admission + separated-signal ranking (issues #160 / #186).
+    """V2-bound admission + separated-signal ranking (issues #160 / #186 / #190).
 
     Admission runs on the retrieved candidate window — after relevance
     retrieval (whose SQL already excluded mechanically-ineligible rows — see
-    :func:`_signal_corpus_eligibility`), before ranking, packing, and (by not
-    running at all for signal profiles) before any graph/tunnel expansion, so
-    nothing ineligible can enter the packet through a side door.
-
-    The positive admission authority is the exact #158 ``risk_aware_shadow_v1``
+    :func:`_signal_corpus_eligibility`) and before ranking and packing, so
+    nothing ineligible can enter the packet through a side door. The
+    positive admission authority is the exact #158 ``risk_aware_shadow_v1``
     per-surface decision, resolved for the whole window by the shared bulk
     resolver (``admission_shadow.resolve_bulk_v2_decisions`` — the same
     evaluation the #158 simulator runs). Recall-local rules (the #159
-    blocked/stale binding, lifecycle facts) can only withhold. Withheld items
-    are counted by reason code (``omitted_by_admission``) and itemized
-    content-free in ``admission_diagnostics``.
+    blocked/stale binding, lifecycle facts) can only withhold.
 
-    Returns the admitted items sorted by signal rank plus the omission
-    counts, diagnostics, and V2 resolution summary.
+    Since issue #190 the same ordering governs relationship expansion, which
+    runs strictly between direct admission and ranking:
+
+    1. exact V2 admission on the direct candidates;
+    2. seeds are chosen only from admitted direct candidates;
+    3. bounded graph/tunnel neighbor discovery under tenant/scope/RLS and
+       the same live-proposal corpus window;
+    4. exact V2 admission on every expanded neighbor — seed admission never
+       transfers;
+    5. relationship-aware relevance (versioned, importance-free) feeds the
+       separated utility ranking; budget packing follows unchanged.
+
+    Withheld items (direct and expanded) are counted by reason code
+    (``omitted_by_admission``) and itemized content-free in
+    ``admission_diagnostics`` with their origin.
     """
     items = list(item_by_id.values())
     bindings = await recall_signals.load_admission_bindings(
@@ -1123,7 +1140,7 @@ async def _admit_and_rank_signal_items(
         )
         v2_summary = resolution.summary()
 
-    admitted: list[tuple[dict[str, Any], float, float]] = []
+    admitted: list[_AdmittedSignalItem] = []
     omitted: dict[str, int] = {}
     diagnostics: list[dict[str, Any]] = []
     for cand in candidates:
@@ -1167,15 +1184,341 @@ async def _admit_and_rank_signal_items(
         )
         created = cand.get("created_at")
         created_ts = created.timestamp() if created is not None else 0.0
-        admitted.append((item_dict, distance, created_ts))
+        admitted.append(
+            _AdmittedSignalItem(
+                item=item,
+                item_dict=item_dict,
+                similarity=similarity,
+                distance=distance,
+                created_ts=created_ts,
+            )
+        )
 
-    # Deterministic order: signal rank desc, then closer vector, then newer.
-    admitted.sort(key=lambda entry: (-entry[0]["score"], entry[1], -entry[2]))
+    # Admission-first relationship expansion (issue #190). Only V2-bound
+    # candidate profiles expand — the legacy profile keeps its own
+    # compatibility expansion path in evaluate_semantic_profile below.
+    expansion_summary: dict[str, Any] | None = None
+    if settings.relationship_expansion_enabled and profile.v2_surface is not None and admitted:
+        expansion_run = await _expand_signal_candidates(
+            session,
+            profile=profile,
+            memory_context=memory_context,
+            workspace_id=workspace_id,
+            admitted=admitted,
+            direct_candidate_ids=set(item_by_id),
+            stay_kinds=stay_kinds,
+            now=now,
+        )
+        admitted = expansion_run.admitted
+        for code, count in expansion_run.omitted_by_admission.items():
+            omitted[code] = omitted.get(code, 0) + count
+        diagnostics.extend(expansion_run.admission_diagnostics)
+        expansion_summary = expansion_run.expansion
+        if expansion_run.v2_resolution is not None:
+            assert v2_summary is not None  # the direct window resolved above
+            v2_summary = _merge_v2_resolution_summaries(v2_summary, expansion_run.v2_resolution)
+
+    # Deterministic order: signal rank desc, then closer vector (direct hits
+    # ahead of expansion-only items at equal rank), then newer, then id.
+    admitted.sort(
+        key=lambda entry: (
+            -entry.item_dict["score"],
+            entry.distance if entry.distance is not None else math.inf,
+            -entry.created_ts,
+            entry.item_dict["id"],
+        )
+    )
+    if expansion_summary is not None:
+        # The expansion path's ceiling — the same bound (and the same
+        # "applies whenever the expansion path runs, discoveries or not")
+        # the legacy expansion path applies after rescoring.
+        admitted = admitted[: settings.recall_candidate_ceiling]
     return SignalAdmissionOutcome(
-        items=[entry[0] for entry in admitted],
+        items=[entry.item_dict for entry in admitted],
         omitted_by_admission=omitted,
         admission_diagnostics=diagnostics,
         v2_resolution=v2_summary,
+        expansion=expansion_summary,
+    )
+
+
+def _merge_v2_resolution_summaries(
+    primary: dict[str, Any], neighbor: dict[str, Any]
+) -> dict[str, Any]:
+    """Combine the direct-window and expanded-neighbor resolution summaries.
+
+    Both resolutions ran the same policy artifact (same profile key/version/
+    digest), so the merged summary simply totals the windows: counts and
+    queries add, status counts merge — the packet-level evidence that the
+    expanded neighbors were resolved by the same shared bulk resolver, never
+    a second policy or a per-neighbor lookup.
+    """
+    status_counts: dict[str, int] = dict(primary["resolution_status_counts"])
+    for status, count in neighbor["resolution_status_counts"].items():
+        status_counts[status] = status_counts.get(status, 0) + count
+    return {
+        **primary,
+        "resolved_count": primary["resolved_count"] + neighbor["resolved_count"],
+        "resolution_status_counts": dict(sorted(status_counts.items())),
+        "query_count": primary["query_count"] + neighbor["query_count"],
+    }
+
+
+def _expansion_origin(
+    item_id: UUID, discovery: relationship_recall.CandidateNeighborDiscovery
+) -> str:
+    """Which expansion surface(s) reached this neighbor — the diagnostic
+    category that keeps direct withholds distinguishable from graph-,
+    tunnel-, and graph+tunnel-expanded withholds (issue #190).
+
+    Callers only pass ids that came out of the discovery maps, so the
+    neither-map case is a contract break, not a policy outcome — fail loudly
+    rather than mislabel a withhold.
+    """
+    in_graph = item_id in discovery.graph_links
+    in_tunnel = item_id in discovery.tunnel_links
+    if in_graph and in_tunnel:
+        return "graph+tunnel"
+    if in_graph:
+        return "graph"
+    if in_tunnel:
+        return "tunnel"
+    raise ValueError(f"expansion origin requested for an undiscovered item: {item_id}")
+
+
+def _relationship_reason_lines(
+    discovery: relationship_recall.CandidateNeighborDiscovery, item_id: UUID
+) -> list[str]:
+    """Human-readable relationship reasons, deterministic in output order."""
+    lines: list[str] = []
+    for link in sorted(
+        discovery.graph_links.get(item_id, []),
+        key=lambda link: (-link.weight, link.edge_type, str(link.neighbor_id)),
+    ):
+        reason = f"linked via {link.edge_type}"
+        if reason not in lines:
+            lines.append(reason)
+    for tlink in sorted(
+        discovery.tunnel_links.get(item_id, []),
+        key=lambda link: (link.tunnel_label, str(link.neighbor_id)),
+    ):
+        reason = f'same tunnel "{tlink.tunnel_label}"'
+        if reason not in lines:
+            lines.append(reason)
+    return lines
+
+
+def _candidate_relevance(
+    *,
+    item_id: UUID,
+    similarity: float | None,
+    discovery: relationship_recall.CandidateNeighborDiscovery,
+    seed_similarity: dict[UUID, float],
+    best_seed_score: float,
+) -> relationship_recall.RelationshipRelevance:
+    """Relationship-aware relevance for one linked candidate item.
+
+    Source-seed attribution: graph links carry the exact seed they were
+    reached from; tunnel membership derives from any matching seed's
+    (wing, room), so it attributes the strongest admitted seed — the same
+    conservative choice the legacy expansion documents. Both are relevance
+    inputs only: nothing here touches admission or evidence state.
+    """
+    graph_links = discovery.graph_links.get(item_id, [])
+    tunnel_labels = [link.tunnel_label for link in discovery.tunnel_links.get(item_id, [])]
+    graph_seed_scores = [
+        seed_similarity[link.seed_id] for link in graph_links if link.seed_id in seed_similarity
+    ]
+    source_scores = graph_seed_scores + ([best_seed_score] if tunnel_labels else [])
+    source_seed_score = max(source_scores, default=0.0)
+    return relationship_recall.compute_relationship_relevance(
+        direct_semantic_score=similarity,
+        source_seed_score=source_seed_score,
+        graph_links=[(link.edge_type, link.weight) for link in graph_links],
+        tunnel_labels=tunnel_labels,
+    )
+
+
+@dataclass
+class _SignalExpansionOutcome:
+    """What one admission-first expansion run added to a signal packet."""
+
+    admitted: list[_AdmittedSignalItem]
+    omitted_by_admission: dict[str, int]
+    admission_diagnostics: list[dict[str, Any]]
+    v2_resolution: dict[str, Any] | None
+    expansion: dict[str, Any]
+
+
+async def _expand_signal_candidates(
+    session: AsyncSession,
+    *,
+    profile: RecallProfileSpec,
+    memory_context: ResolvedMemoryContext,
+    workspace_id: str | None,
+    admitted: list[_AdmittedSignalItem],
+    direct_candidate_ids: set[UUID],
+    stay_kinds: set[str],
+    now: datetime,
+) -> _SignalExpansionOutcome:
+    """Admission-first graph/tunnel expansion for one V2-bound packet.
+
+    ``admitted`` are the direct candidates the exact V2 surface already
+    admitted, in retrieval order (the final signal-rank sort runs after
+    expansion) — only they may seed discovery. Newly discovered neighbors
+    (outside the direct candidate window, which was already
+    admission-evaluated) are resolved through the same shared bulk resolver
+    in ONE bounded call and admitted through the same
+    ``decide_recall_admission`` gate: no per-neighbor lookup, no provider
+    call, no second policy. Every linked admitted item — enriched direct
+    seeds and admitted neighbors alike — is re-scored through the versioned
+    relationship-relevance contract (``relationship-relevance-v1``) feeding
+    the unchanged separated-utility rank; utility (importance/freshness) is
+    computed by the signal model exactly as for direct items and never
+    enters relevance.
+    """
+    seeds = admitted[: settings.recall_semantic_expansion_seed_limit]
+    seed_ids = [entry.item.id for entry in seeds]
+    seed_similarity = {
+        entry.item.id: entry.similarity for entry in seeds if entry.similarity is not None
+    }
+    best_seed_score = max(seed_similarity.values(), default=0.0)
+
+    discovery = await relationship_recall.discover_candidate_neighbors(
+        session,
+        memory_context=memory_context,
+        workspace_id=workspace_id,
+        seed_ids=seed_ids,
+        seed_items=[entry.item for entry in seeds],
+        exclude_ids=direct_candidate_ids,
+    )
+
+    new_neighbor_ids = (set(discovery.graph_links) | set(discovery.tunnel_links)) - set(seed_ids)
+    new_neighbor_ids -= direct_candidate_ids
+
+    omitted: dict[str, int] = {}
+    diagnostics: list[dict[str, Any]] = []
+    neighbor_summary: dict[str, Any] | None = None
+    new_entries: list[_AdmittedSignalItem] = []
+    neighbor_items = [
+        discovery.neighbor_items[item_id]
+        for item_id in sorted(new_neighbor_ids)
+        if item_id in discovery.neighbor_items
+    ]
+    if neighbor_items:
+        # One bounded bulk resolution for the whole newly discovered neighbor
+        # set (issue #190's no-N+1 contract): support + selection + one
+        # latest-row lookup, query count constant in neighbor count.
+        neighbor_bindings = await recall_signals.load_admission_bindings(
+            session, tenant_id=str(memory_context.tenant_id), items=neighbor_items
+        )
+        from engram.admission_shadow import resolve_bulk_v2_decisions
+
+        neighbor_resolution = await resolve_bulk_v2_decisions(
+            session,
+            items=neighbor_items,
+            context=memory_context,
+            evaluation_time=now,
+        )
+        neighbor_summary = neighbor_resolution.summary()
+        for item in neighbor_items:
+            decision = recall_signals.decide_recall_admission(
+                item,
+                profile=profile,
+                stay_kinds=stay_kinds,
+                assessment=neighbor_bindings.get(item.id),
+                v2_resolution=neighbor_resolution.items.get(item.id),
+            )
+            if decision.decision == "withhold":
+                code = decision.reason_codes[0]
+                omitted[code] = omitted.get(code, 0) + 1
+                diagnostics.append(
+                    _admission_diagnostic(
+                        item,
+                        profile=profile,
+                        decision=decision,
+                        assessment=neighbor_bindings.get(item.id),
+                        origin=_expansion_origin(item.id, discovery),
+                    )
+                )
+                continue
+            relevance = _candidate_relevance(
+                item_id=item.id,
+                similarity=None,
+                discovery=discovery,
+                seed_similarity=seed_similarity,
+                best_seed_score=best_seed_score,
+            )
+            item_dict = _semantic_base_item_fields(item, distance=None, similarity=None)
+            item_dict.update(
+                recall_signals.signal_item_fields(
+                    item, decision=decision, now=now, relevance=relevance.relevance_score
+                )
+            )
+            item_dict["reasons"].extend(_relationship_reason_lines(discovery, item.id))
+            item_dict["relationship"] = relevance.payload()
+            new_entries.append(
+                _AdmittedSignalItem(
+                    item=item,
+                    item_dict=item_dict,
+                    similarity=None,
+                    distance=None,
+                    created_ts=(
+                        item.created_at.timestamp() if item.created_at is not None else 0.0
+                    ),
+                )
+            )
+
+    # Origin-merging enrichment: an admitted direct seed that is itself a
+    # discovered neighbor keeps its direct fields (distance/similarity,
+    # admission, evidence — all unchanged) and gains the structured
+    # relationship block plus the merged relevance. Links can only raise a
+    # direct hit's relevance (max floor in the relevance contract), never
+    # demote it or touch its admission/evidence identity.
+    for entry in admitted:
+        linked = entry.item.id in discovery.graph_links or entry.item.id in discovery.tunnel_links
+        if not linked:
+            continue
+        relevance = _candidate_relevance(
+            item_id=entry.item.id,
+            similarity=entry.similarity,
+            discovery=discovery,
+            seed_similarity=seed_similarity,
+            best_seed_score=best_seed_score,
+        )
+        entry.item_dict["relevance_score"] = relevance.relevance_score
+        entry.item_dict["score"] = recall_signals.compute_signal_rank_score(
+            similarity=relevance.relevance_score, utility=entry.item_dict["utility_score"]
+        )
+        # Refresh the relevance reason line signal_item_fields built —
+        # matched by its prefix rather than position so a reason reorder
+        # upstream can never rewrite the wrong line.
+        reasons = entry.item_dict["reasons"]
+        relevance_reason = f"relevance {relevance.relevance_score:.2f}"
+        for index, reason in enumerate(reasons):
+            if reason.startswith("relevance "):
+                reasons[index] = relevance_reason
+                break
+        else:
+            reasons.insert(0, relevance_reason)
+        entry.item_dict["reasons"].extend(_relationship_reason_lines(discovery, entry.item.id))
+        entry.item_dict["relationship"] = relevance.payload()
+
+    expansion_summary = {
+        "version": relationship_recall.RELATIONSHIP_RELEVANCE_VERSION,
+        "seed_count": len(seeds),
+        "discovered_neighbors": len(new_neighbor_ids),
+        "graph_neighbors": len(set(discovery.graph_links) - set(seed_ids)),
+        "tunnel_neighbors": len(discovery.tunnel_links),
+        "admitted_expanded": len(new_entries),
+        "withheld_expanded": len(diagnostics),
+    }
+    return _SignalExpansionOutcome(
+        admitted=admitted + new_entries,
+        omitted_by_admission=omitted,
+        admission_diagnostics=diagnostics,
+        v2_resolution=neighbor_summary,
+        expansion=expansion_summary,
     )
 
 
@@ -1185,6 +1528,7 @@ def _admission_diagnostic(
     profile: RecallProfileSpec,
     decision: recall_signals.RecallAdmissionDecision,
     assessment: recall_signals.AdmissionAssessmentBinding | None,
+    origin: str = "direct",
 ) -> dict[str, Any]:
     """One bounded, content-free withheld-candidate diagnostic.
 
@@ -1201,6 +1545,10 @@ def _admission_diagnostic(
     would decide differently (unavailable V2 state is fail-closed
     unavailability, not a disagreement; the local hard gate is withhold-only,
     so "local would admit" means the lifecycle/#159 layers had no objection).
+    ``origin`` names what surfaced the candidate — ``direct`` for the
+    semantic window, ``graph`` / ``tunnel`` / ``graph+tunnel`` for items
+    reached through relationship expansion (issue #190), keeping the
+    withholds distinguishable for #162 evaluation.
     """
     binding = decision.v2
     v2_status = binding.resolution_status if binding is not None else "missing"
@@ -1215,6 +1563,7 @@ def _admission_diagnostic(
     return {
         "item_id": str(item.id),
         "profile": profile.key,
+        "origin": origin,
         "decision": decision.decision,
         "reason_codes": list(decision.reason_codes),
         "surface": profile.v2_surface,
@@ -1251,6 +1600,11 @@ class SemanticPacketEvaluation:
     # diagnostics for withheld candidates, and the resolution summary.
     admission_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     v2_resolution: dict[str, Any] | None = None
+    # Admission-first relationship-expansion context (issue #190): the
+    # bounded summary of the expansion run (contract version, seed/neighbor/
+    # admission counts). None on the legacy profile and on packets that did
+    # not expand.
+    expansion: dict[str, Any] | None = None
 
     def finalize_counts(self) -> None:
         self.item_count = len(self.items)
@@ -1411,17 +1765,20 @@ async def evaluate_semantic_profile(
     omitted_by_admission: dict[str, int] = {}
     admission_diagnostics: list[dict[str, Any]] = []
     v2_resolution_summary: dict[str, Any] | None = None
+    expansion_summary: dict[str, Any] | None = None
     if profile.signals_enabled:
-        # 4. V2-bound admission + separated-signal ranking (issues #160/#186).
-        #    Relationship expansion deliberately does not run for signal
-        #    profiles: admission must be enforced before graph/tunnel
-        #    expansion, and the expansion rescorer still speaks the legacy
-        #    blended score. Teaching expansion the signal model is follow-up
-        #    work; until then these profiles serve only direct semantic hits.
+        # 4. V2-bound admission + separated-signal ranking (issues #160/#186),
+        #    with admission-first relationship expansion (issue #190): only
+        #    direct candidates the exact V2 surface admitted may seed bounded
+        #    graph/tunnel discovery, every expanded neighbor is independently
+        #    admitted through the same surface, and relationship-aware
+        #    relevance (versioned, importance-free) feeds the separated
+        #    utility ranking. Budget packing below is unchanged.
         admission_outcome = await _admit_and_rank_signal_items(
             session,
             profile=profile,
             memory_context=memory_context,
+            workspace_id=workspace_id,
             candidates=candidates,
             item_by_id=item_by_id,
             stay_kinds=stay_kinds,
@@ -1431,6 +1788,7 @@ async def evaluate_semantic_profile(
         omitted_by_admission = admission_outcome.omitted_by_admission
         admission_diagnostics = admission_outcome.admission_diagnostics
         v2_resolution_summary = admission_outcome.v2_resolution
+        expansion_summary = admission_outcome.expansion
     else:
         # 4. Build per-item response dicts in trust-weighted order (legacy
         #    profile — pre-#160 behavior, byte-for-byte). The candidate dicts
@@ -1503,6 +1861,7 @@ async def evaluate_semantic_profile(
         item_budget=item_budget,
         admission_diagnostics=admission_diagnostics,
         v2_resolution=v2_resolution_summary,
+        expansion=expansion_summary,
     )
     evaluation.finalize_counts()
     return evaluation
