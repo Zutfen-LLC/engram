@@ -1213,6 +1213,8 @@ def test_evidence_epistemic_states_each_carry_their_warning_code() -> None:
     evidence code — ``unknown``/``contested``/``insufficient_evidence`` —
     while ``supported`` carries no evidence-quality code at all."""
     item = _make_item(review_status="proposed")
+    from engram.recall_signals import _WARNING_TEXT
+
     expected_code = {
         "unknown": "evidence_unknown",
         "contested": "evidence_contested",
@@ -1241,8 +1243,6 @@ def test_evidence_epistemic_states_each_carry_their_warning_code() -> None:
                 assert candidate not in fields["warning_codes"], state
         # The human-readable mirror exists for every emitted code.
         for warning_code in fields["warning_codes"]:
-            from engram.recall_signals import _WARNING_TEXT
-
             assert warning_code in _WARNING_TEXT
 
 

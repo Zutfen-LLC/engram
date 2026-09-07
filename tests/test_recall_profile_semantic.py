@@ -722,22 +722,8 @@ async def test_governed_candidate_admits_only_v2_qualified_proposals(
     # current means the persisted identity and the fresh evaluation agree.
     assert v2["persisted"]["decision_hash"] == v2["fresh"]["decision_hash"]
     assert v2["persisted"]["policy_artifact_digest"] == v2["fresh"]["policy_artifact_digest"]
-    # The evidence block is an exact projection of the same binding.
-    evidence = served["evidence"]
-    assert evidence["source"] == "v2_fresh_evaluation"
-    assert evidence["profile_key"] == v2["profile_key"]
-    assert evidence["policy_version"] == v2["fresh"]["policy_version"]
-    assert evidence["policy_artifact_digest"] == v2["fresh"]["policy_artifact_digest"]
-    assert evidence["decision_hash"] == v2["fresh"]["decision_hash"]
-    assert evidence["v2_resolution_status"] == v2["resolution_status"]
-    assert evidence["epistemic_state"] == v2["fresh"]["epistemic_state"]
-    assert evidence["risk_state"] == v2["fresh"]["risk_state"]
-    assert evidence["retention_state"] == v2["fresh"]["retention_state"]
-    assert (
-        evidence["effective_assessment_refs"]
-        == v2["fresh"]["effective_assessment_refs"]
-    )
-    assert served["epistemic_state"] == evidence["epistemic_state"]
+    # The evidence block is an exact projection of that same binding.
+    _evidence_identity_asserts(served)
     from engram.recall_signals import compute_signal_rank_score
 
     assert served["score"] == compute_signal_rank_score(
@@ -1587,13 +1573,47 @@ async def test_evidence_presentation_adds_no_resolution_or_evaluation(
     # One shared query embedding for the whole comparison (legacy + both
     # candidates) — evidence presentation never calls a provider.
     assert provider_calls["count"] == 1
-    # Both candidate windows resolve with the same bounded query count:
-    # presentation is computed after resolution and adds none.
-    assert shadow["candidates"][0]["v2_resolution"]["query_count"] > 0
-    assert (
-        shadow["candidates"][0]["v2_resolution"]["query_count"]
-        == shadow["candidates"][1]["v2_resolution"]["query_count"]
-    )
+    # The per-window query count equals a standalone resolution of the same
+    # items: presentation happens after resolution and adds no query.
+    from sqlalchemy import select as sa_select
+
+    from engram.models import MemoryItem
+
+    async with _test_session_factory() as session:
+        from engram.db import apply_rls_context
+
+        ids = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT t.id::text AS tenant_id, p.id::text AS principal_id "
+                        "FROM tenants t JOIN principals p ON p.tenant_id = t.id "
+                        "WHERE t.slug = 'default' AND p.name = 'admin'"
+                    )
+                )
+            )
+            .mappings()
+            .one()
+        )
+        await apply_rls_context(
+            session, tenant_id=ids["tenant_id"], principal_id=ids["principal_id"]
+        )
+        window = list(
+            (
+                await session.scalars(
+                    sa_select(MemoryItem).where(MemoryItem.review_status == "proposed")
+                )
+            ).all()
+        )
+        context = _test_memory_context(ids["tenant_id"], ids["principal_id"])
+        standalone = await original_resolve(
+            session, items=window, context=context, evaluation_time=datetime.now(UTC)
+        )
+    packet_queries = {
+        c["v2_resolution"]["query_count"] for c in shadow["candidates"]
+    }
+    assert packet_queries == {standalone.query_count}
+    assert standalone.query_count > 0
 
 
 async def test_shadow_compare_with_evidence_remains_read_only(client, monkeypatch):

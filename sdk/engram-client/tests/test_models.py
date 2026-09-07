@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from engram_client.models import ClassifyResponse, RememberRequest
+from engram_client.models import ClassifyResponse, RecallResponse, RememberRequest
 
 
 def test_remember_request_accepts_restricted() -> None:
@@ -68,3 +68,45 @@ def test_classify_legacy_confidence_is_canonical_alias() -> None:
         }
     )
     assert response.confidence == response.taxonomy_confidence == 0.8
+
+
+def test_recall_response_accepts_structured_evidence_blocks() -> None:
+    """Issue #188: candidate-profile items carry the structured ``evidence``
+    block and mirrored top-level ``epistemic_state``. The untyped item dicts
+    must pass the model through unchanged — unknown/null states stay
+    structured, never flattened into a numeric confidence field."""
+    item = {
+        "id": "0197c0de-0000-7000-8000-000000000001",
+        "kind": "fact",
+        "content": "served candidate item",
+        "epistemic_state": "unknown",
+        "warning_codes": ["unreviewed", "evidence_unknown", "risk_unknown"],
+        "evidence": {
+            "source": "v2_fresh_evaluation",
+            "profile_key": "risk_aware_shadow_v1",
+            "policy_version": "risk-aware-shadow-v1",
+            "policy_artifact_digest": "sha256:" + "a" * 64,
+            "decision_hash": "sha256:" + "b" * 64,
+            "v2_resolution_status": "current",
+            "epistemic_state": "unknown",
+            "risk_state": "unknown",
+            "retention_state": "unknown",
+            "effective_assessment_refs": [],
+        },
+    }
+    response = RecallResponse(
+        working_set="[fact] served candidate item",
+        item_count=1,
+        byte_count=25,
+        omitted_count=0,
+        items=[item],
+        recall_profile="exploratory",
+        signals_version="recall-signals-v1",
+        omitted_by_admission={},
+    )
+    served = response.items[0]
+    assert served["evidence"]["epistemic_state"] == served["epistemic_state"]
+    assert served["evidence"]["source"] == "v2_fresh_evaluation"
+    # No numeric confidence was invented anywhere in the item.
+    assert "trust_score" not in served
+    assert "confidence" not in served
