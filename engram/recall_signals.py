@@ -96,7 +96,10 @@ _WARNING_TEXT: Final[dict[str, str]] = {
     "evidence_insufficient": "insufficient evidence",
     "conflict_unresolved": "unresolved conflicts",
     "disputed": "disputed — pending resolution",
-    "risk_high": "high risk — review required",
+    # Neutral by design: the exact exploratory surface may legitimately allow
+    # a high-risk item, so the mirror must not invent a review requirement
+    # the served decision never imposed (issue #188 review finding).
+    "risk_high": "high risk",
     "risk_unknown": "unknown risk",
     "admission_assessment_stale": "admission assessment stale",
     "admission_legacy_import": "legacy-imported admission state",

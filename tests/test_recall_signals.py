@@ -1250,9 +1250,12 @@ def test_high_and_unknown_risk_stay_unmistakable_on_admitted_exploratory() -> No
     """Required tests 5-6: an exploratory item the exact surface allowed is
     not silently de-risked — ``high``/``unknown`` V2 risk states surface both
     in the evidence block and as stable ``risk_high``/``risk_unknown`` codes;
-    low/medium need no generic risk code."""
+    low/medium need no generic risk code. The served packet stays internally
+    consistent: the exact surface decision is ``allow`` and the human-readable
+    risk warning stays neutral about it (no invented review requirement)."""
     item = _make_item(review_status="proposed")
     expected_code = {"high": "risk_high", "unknown": "risk_unknown", "low": None}
+    served: dict[str, dict[str, Any]] = {}
     for risk, code in expected_code.items():
         resolution = _current(
             _v2_decision_states(epistemic_state="supported", risk_state=risk)
@@ -1262,6 +1265,7 @@ def test_high_and_unknown_risk_stay_unmistakable_on_admitted_exploratory() -> No
         )
         assert decision.decision == "admit", risk
         fields = signal_item_fields(item, decision=decision, similarity=0.8, now=_NOW)
+        served[risk] = fields
         assert fields["evidence"]["risk_state"] == risk, risk
         assert fields["admission"]["v2"]["fresh"]["risk_state"] == risk, risk
         if code is None:
@@ -1269,6 +1273,15 @@ def test_high_and_unknown_risk_stay_unmistakable_on_admitted_exploratory() -> No
             assert "risk_unknown" not in fields["warning_codes"], risk
         else:
             assert code in fields["warning_codes"], risk
+        # The exact exploratory decision that admitted the item is ``allow``;
+        # the human-readable mirror must not contradict it by claiming a
+        # review requirement (issue #188 review finding).
+        assert fields["admission"]["v2"]["fresh"]["surface_decision"] == "allow", risk
+        assert "review required" not in " ".join(fields["warnings"]).lower(), risk
+
+    high = served["high"]
+    assert "risk_high" in high["warning_codes"]
+    assert "high risk" in high["warnings"]
 
 
 def test_local_heuristic_cannot_compete_with_the_v2_evidence_state() -> None:
