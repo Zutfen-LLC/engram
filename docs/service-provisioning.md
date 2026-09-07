@@ -11,11 +11,12 @@ Core exposes three generic external-control-plane operations:
   the fixed `read` + `write` ordinary API key for that workspace-agent pair.
 
 All accept `Authorization: Bearer engsvc_<key_id>_<secret>` and a required
-`Idempotency-Key`. Service permissions are `tenant.provision`,
-`principal.provision`, `workspace.provision`, `agent.provision`, and
-`api_key.provision`. The separate `delegation.issue` permission authorizes only
-the delegated read broker described in `docs/ops/service-delegation.md`; none
-of these are tenant API-key scopes. An `engsvc_`
+`Idempotency-Key`. Service permissions for these three routes are
+`tenant.provision`, `principal.provision`, `workspace.provision`,
+`agent.provision`, and `api_key.provision`. The separate `delegation.issue` and
+`delegation.review.issue` permissions authorize only the delegated read and
+purpose-bound review brokers described in `docs/ops/service-delegation.md`;
+none of these are tenant API-key scopes. An `engsvc_`
 credential cannot use ordinary Core routes, and an `eng_` credential cannot
 use service routes.
 

@@ -503,6 +503,20 @@ auto_promote_confidence_threshold
 auto_promote_min_age_hours
 ```
 
+#### Durable admission assessments (issue #159)
+
+Every promotion/admission decision Path A makes can be recorded as a durable, inspectable, versioned artifact instead of a transient calculation — an append-only `admission_assessments` row plus a one-row `admission_assessment_current` projection, keyed by `(tenant, item, policy profile)`. This does not change *what* gets promoted: `assess_promotion_candidate()` and `auto_promote_proposed_memories()` remain the sole production authority, and no threshold, weight, cooling period, or lane rule changes.
+
+Each recorded decision carries a canonical `decision_hash` (SHA-256 over RFC 8785 canonical JSON) binding the exact inputs, policy identity/config, and outcome — reproducible months later from the same state — plus a deterministic outcome (`admitted`, `cooling`, `review_required`, `blocked`, `insufficient_evidence`, `unknown`, `stale`, `not_applicable`) and next action (`wait_until`, `classification_required`, `human_review_required`, `conflict_resolution_required`, `new_evidence_required`, `policy_reconciliation_required`, `none`). `GET /v1/items/{item_id}/admission-assessment` resolves the current decision (`status='missing'` is distinct from a recorded `unknown` outcome); `GET /v1/items/{item_id}/admission-assessments` returns paginated immutable history; the review queue can filter by outcome, blocker code, next action, and due time.
+
+Capture is gated by `ENGRAM_ADMISSION_ASSESSMENT_CAPTURE_ENABLED` (default `false`); disabled, promotion behavior and audit JSON are byte-for-byte unchanged. `engram admission-assessments backfill --tenant <id> [--limit <n>] [--after <item-id>] [--dry-run]` performs a bounded, restartable, idempotent legacy import for tenants that enable capture after items already exist. See [`docs/adr-159-admission-assessments.md`](docs/adr-159-admission-assessments.md) for the full contract.
+
+#### Risk-aware shadow admission policy (issue #158)
+
+`risk_aware_shadow_v1` is a checked-in, declarative admission policy (`policies/admission/`) that evaluates each candidate against three recall surfaces (`startup`, `semantic_governed`, `semantic_exploratory`) using the effective #157 risk/epistemic/retention assessment — **shadow-only**: `path_a_compat` remains the sole authoritative profile, and nothing in this policy can promote, block, or otherwise mutate a memory item. The evaluator is pure and dependency-free (no database, settings, provider, or wall-clock access); it never infers risk from `kind` or source type, and missing/stale/uncalibrated evidence stays explicit rather than defaulting permissive.
+
+`POST /v1/items/{item_id}/admission-assessments/simulate`, `POST /v1/admission-assessments/simulate`, and `engram admission-assessments simulate --tenant <id> [...]` compare current Path A behavior against the shadow policy, read-only by default. An admin can explicitly request V2 shadow persistence — it only appends immutable `admission_assessments` history (`mode='shadow'`); existing projection guards refuse to let a shadow row become current, so it can never authorize `proposed -> active`. See [`docs/adr-158-risk-aware-admission-profiles.md`](docs/adr-158-risk-aware-admission-profiles.md) for the full rule matrix.
+
 ### Trust Model
 
 Trust is not binary. Every memory carries:
@@ -854,12 +868,14 @@ concurrency remediation, so those changes are not yet claimed as live-proven.
 | Memory hygiene (stale detection, bulk-archive, stats)                   |     yes     |       —          |
 | LLM + rule-based classification                                         |     yes     |       —          |
 | Auto-promotion — Path A (age + confidence + no conflict)                |     yes     |       —          |
-| CCA export + importers (CCA, MemPalace — dry-run/apply)                 |     yes     |       —          |
+| CCA export + importers (CCA, MemPalace — dry-run/apply)                 |     yes     |       yes        |
 | API-key auth + admin endpoints (scopes, bootstrap flow)                 |     yes     |       yes        |
 | Python SDK (async client over REST)                                     |     yes     |       yes        |
 | MCP adapter (stdio, all tools)                                          |     yes     |       yes        |
 | Profile-keyed embeddings + zero-downtime re-embedding                   |     yes     |    mocked only   |
 | Postgres job queue + `engram worker` (async embeddings, classification refine, conflict check) | yes |       —          |
+| Durable admission assessments (issue #159, behind capture flag)        |     yes     |       —          |
+| Risk-aware shadow admission policy (issue #158, shadow-only)           |     yes     |       —          |
 | Deployment artifacts (Compose, `.env.example`, backup, `init-db`)       |     yes     |       yes        |
 | **Dogfood deployment** (auth-enabled, network-reachable, backed up)     |     yes     |       yes        |
 
@@ -874,8 +890,6 @@ recorded-verified yet — see `docs/embeddings.md`.
 These are intentionally out of scope for the MVP and tracked in
 `docs/plans/engram-mvp-backlog.md`:
 
-* **Production data migration runs** (CCA + MemPalace `--apply` against the live
-  instance) — BL-011. The importers are built; only the operational import is pending.
 * **engram-hooks / Hermes automatic lifecycle capture** — BL-012 /
   ENG-HERMES-001. The compatibility shim (native-hook detection, monkey-patch,
   guard, idempotent `install()`, structured status) is implemented and unit

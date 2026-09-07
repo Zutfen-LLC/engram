@@ -40,6 +40,21 @@ provider was enabled (or whose generation crashed) have either no embedding
 row or a `pending`/`failed` row with no vector. The backfill command
 populates that backlog.
 
+### Validating configuration: `engram setup-embeddings`
+
+Run this after setting `ENGRAM_EMBEDDING_PROVIDER`/`ENGRAM_OPENAI_API_KEY`/
+`ENGRAM_OPENAI_BASE_URL` to catch misconfiguration before it surfaces as
+`failed` rows: it prints the resolved provider, a masked key preview, the
+base URL (warning if unset, since the OpenAI SDK then silently defaults to
+`api.openai.com`), and the configured dimension, then generates one test
+embedding. Exits `0` on success; `1` with a diagnostic (auth vs. connection
+guidance) on failure.
+
+```bash
+engram setup-embeddings
+engram setup-embeddings --text "custom probe text"   # default: a pangram
+```
+
 ### Status vocabulary
 
 `memory_embeddings.embedding_status` uses the live application vocabulary:
@@ -76,10 +91,13 @@ engram embedding-profiles activate openai:new-model:768
 Creating a candidate starts automatic dual writes for new memories. Backfill
 only enqueues durable, profile-bound jobs. Only the active profile participates
 in semantic search, recall, and conflict transitions. Activation requires a
-ready index and 95% ready coverage by default; `--force` is an explicit operator
-override. The previous profile and vectors remain retired and can be reactivated
-through the same validated command for rollback. At most one active plus two
-candidate profiles may be writable simultaneously.
+ready index and, by default, `ENGRAM_EMBEDDING_ACTIVATION_COVERAGE_THRESHOLD`
+percent ready coverage (`95.0` unless overridden); pass `embedding-profiles
+activate --threshold N` to check against a different percentage for one call,
+or `--force` to skip the coverage check entirely. The previous profile and
+vectors remain retired and can be reactivated through the same validated
+command for rollback. At most one active plus two candidate profiles may be
+writable simultaneously.
 
 Populate `pending`/`missing` embeddings for the configured model, across all
 tenants (or one with `--tenant`). Idempotent and safe to rerun.
@@ -108,6 +126,8 @@ ENGRAM_EMBEDDING_PROVIDER=openai ENGRAM_OPENAI_API_KEY=$KEY \
 | `--dry-run`     | off     | Report planned work without writing (returns `0`).                |
 | `--fail-fast`   | off     | Abort on the first failure instead of marking the row `failed`.   |
 | `--retry-failed`| off     | Re-attempt rows previously marked `failed`.                       |
+| `--profile KEY` | none    | Switch to queue-backed profile backfill (ENG-AUD-009, see above): creates placeholders and enqueues `embedding.generate` jobs for that profile only. No provider calls happen in this process, so `--batch-size`/`--dry-run`/`--fail-fast`/`--retry-failed` don't apply — run `engram worker --job-type embedding.generate` to generate the vectors. |
+| `--force`       | off     | With `--profile`, re-enqueue rows that already have a vector for that profile (default: only missing/failed rows are enqueued). Unrelated to `embedding-profiles activate --force` below. |
 
 ### Batching, memory, and concurrency
 

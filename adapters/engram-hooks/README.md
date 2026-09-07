@@ -213,6 +213,7 @@ through to spawned processes).
 | `ENGRAM_HOOKS_WORKSPACE` | no | — | Default workspace for writes. |
 | `ENGRAM_HOOKS_COMPAT_SHIM` | no | `true` | Apply the `prepare_memory_write` compat shim on install. Set `false` to disable automatic capture entirely (lifecycle hooks/MCP still work). |
 | `ENGRAM_HOOKS_REQUIRE_AUTOMATIC_CAPTURE` | no | `false` | If `true`, `install()` raises `AutomaticCaptureUnavailable` instead of degrading quietly when neither the native hook nor the compat shim ends up active. |
+| `ENGRAM_HOOKS_REPORT_LIFECYCLE_TELEMETRY` | no | `false` | Report one aggregate, best-effort lifecycle-summary event (counts/byte totals only, never candidate text) to `POST /v1/telemetry/lifecycle` after each hook invocation. Reporting failure never changes the returned `HookResult`. |
 | `ENGRAM_HOOKS_RECALL_ENABLED` | no | `false` | Enable safe automatic reads through the general `pre_llm_call` hook. |
 | `ENGRAM_HOOKS_RECALL_TIMEOUT` | no | `1.5` | Aggregate synchronous read deadline in seconds (clamped to `0.1`–`10.0`); independent of `ENGRAM_TIMEOUT`. |
 | `ENGRAM_HOOKS_RECALL_ITEM_BUDGET` | no | `5` | Local and semantic item cap (clamped to `1`–`20`). |
@@ -376,9 +377,11 @@ Set `ENGRAM_HOOKS_STRUCTURED_EXTRACTION=true` to send lifecycle messages to
 The server uses its configured classification provider for extraction.
 
 The hook preserves roles, message IDs, tool names, timestamps, and authorized
-source references. Missing roles remain unknown. The local guard runs before
-network submission. New writes report `written_proposed`. These writes do not
-mean promotion or admission.
+source references. Missing roles remain unknown. Every message is first
+screened for embedded secrets (AWS/GitHub/Slack tokens, private keys,
+password-like assignments); a match rejects the whole batch before the
+write-boundary guard runs or anything reaches the network. New writes report
+`written_proposed`. These writes do not mean promotion or admission.
 
 On provider or server failure, the volatile store retains the structured
 request and its retry key. Replay the request with that key to resolve an

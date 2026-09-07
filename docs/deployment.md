@@ -53,9 +53,11 @@ Service-to-service provisioning is off by default. To enable it, migrate first,
 set `ENGRAM_SERVICE_PROVISIONING_ENABLED=true`, and configure
 `ENGRAM_PROVISIONER_DATABASE_URL` for the dedicated `engram_provisioner` role.
 There is no fallback to either the app or owner URL. Readiness fails closed when
-the configured connection is not that role, the role has any elevated attribute
-or membership, schema CREATE privilege, or the service-provisioning tables and
-required function are absent. The worker does not need this URL.
+the configured connection's role name does not match
+`ENGRAM_PROVISIONER_DATABASE_ROLE` (default `engram_provisioner` — set this if
+your provisioner role uses a different name), the role has any elevated
+attribute or membership, schema CREATE privilege, or the service-provisioning
+tables and required function are absent. The worker does not need this URL.
 
 On a persisted Compose volume, `docker-entrypoint-initdb.d` does not run again.
 After applying migrations 027 and 028 as the owner, assign or rotate the provisioner
@@ -102,8 +104,10 @@ review broker when possible.
 ### Fixed Portal installation enrollment
 
 Migration 031 adds a fixed installation-enrollment endpoint. It does not add a
-general service-client administration API. Enrollment is disabled by default.
-The endpoint creates exactly one provisioning owner, one read broker, one review
+general service-client administration API. Enrollment is gated by
+`ENGRAM_PORTAL_ENROLLMENT_ENABLED` (default `false`; the Compose stack also
+flips it on when `ENGRAM_PORTAL_DEVELOPMENT_SETUP=true` — see below). The
+endpoint creates exactly one provisioning owner, one read broker, one review
 broker, and two 60-second grants. Core selects all slugs, permissions, authority
 classes, and TTL limits.
 
@@ -750,6 +754,69 @@ loop.
 
 ---
 
+## 7b. Recall tuning
+
+These are deployment-level safety caps and scoring knobs (`engram/config.py`),
+not part of the public recall API — callers cannot raise or lower them
+per-request.
+
+### Budgets and freshness
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ENGRAM_RECALL_BYTE_BUDGET` | `4096` | Byte budget for a startup recall response. |
+| `ENGRAM_RECALL_ITEM_BUDGET` | `50` | Max items returned by startup recall. |
+| `ENGRAM_MAX_PINNED_TOKENS` | `2048` | Hard ceiling for pinned items in startup recall. |
+| `ENGRAM_STALE_AFTER_DAYS` | `90` | Items not verified in N days are "stale". |
+| `ENGRAM_STARTUP_RECALL_CANDIDATE_LIMIT` | `500` | Coarse first-stage SQL candidate pool (across diversified sub-pools) that the detailed Python scorer then ranks. Clamped at settings load to `[ENGRAM_RECALL_ITEM_BUDGET, ENGRAM_STARTUP_RECALL_CANDIDATE_LIMIT_MAX]`. |
+| `ENGRAM_STARTUP_RECALL_CANDIDATE_LIMIT_MAX` | `5000` | Hard safety cap on the above regardless of misconfiguration. |
+
+### Anti-feedback-loop penalty (startup recall)
+
+Repeatedly recalling the same item without feedback decays its recency
+contribution, so a stale item that keeps surfacing does not permanently crowd
+out other memories:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ENGRAM_STARTUP_RECALL_PENALTY_THRESHOLD` | `5` | Apply the penalty after this many startup recalls without feedback. |
+| `ENGRAM_STARTUP_RECALL_PENALTY_FACTOR` | `0.5` | Multiplicative reduction to the recency bonus per excess recall. |
+| `ENGRAM_STARTUP_RECALL_PENALTY_FLOOR` | `0.1` | Recency component minimum — the penalty never zeroes it out. |
+| `ENGRAM_QUORUM_RESET_AGENT_COUNT` | `2` | Distinct non-author agents whose feedback partially resets the penalty. |
+
+The `recall.telemetry` worker job applies the counters that drive this penalty
+(see "Background worker" above); without a worker running, the penalty does
+not advance.
+
+### Relationship-aware recall expansion (ENG-AUD-012)
+
+Semantic recall (`mode=semantic`) expands its top candidates through depth-1
+`memory_edges` and tunnel membership before rescoring and budget packing (see
+`engram.relationship_recall`). This is **on by default** and changes semantic
+recall's result set out of the box; set
+`ENGRAM_RELATIONSHIP_EXPANSION_ENABLED=false` to disable it and fall back to
+plain semantic ranking. Startup recall is unaffected either way.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ENGRAM_RELATIONSHIP_EXPANSION_ENABLED` | `true` | Master switch for graph/tunnel expansion in semantic recall. |
+| `ENGRAM_RECALL_SEMANTIC_EXPANSION_SEED_LIMIT` | `50` | How many top semantic candidates are used as expansion seeds. |
+| `ENGRAM_MAX_GRAPH_NEIGHBORS_PER_ITEM` | `5` | Per-seed cap on graph-edge neighbors (a single highly-connected node cannot dominate). |
+| `ENGRAM_MAX_TUNNEL_NEIGHBORS_PER_ITEM` | `5` | Per-seed cap on tunnel-membership neighbors. |
+| `ENGRAM_MAX_GRAPH_EXPANDED_ITEMS` | `20` | Overall cap on items added by graph expansion, after eligibility filtering. |
+| `ENGRAM_MAX_TUNNEL_ADDITIONS` | `20` | Overall cap on items added by tunnel expansion. |
+| `ENGRAM_RECALL_CANDIDATE_CEILING` | `100` | Ceiling on the merged (semantic + graph + tunnel) set before rescoring/packing. |
+| `ENGRAM_RELATIONSHIP_SCORE_WEIGHT_SEMANTIC` | `0.70` | Blended-score weight for the original semantic relevance. |
+| `ENGRAM_RELATIONSHIP_SCORE_WEIGHT_RELATIONSHIP` | `0.15` | Blended-score weight for graph-edge relationship strength. |
+| `ENGRAM_RELATIONSHIP_SCORE_WEIGHT_TUNNEL` | `0.10` | Blended-score weight for tunnel-membership bonus. |
+| `ENGRAM_RELATIONSHIP_SCORE_WEIGHT_IMPORTANCE` | `0.05` | Blended-score weight for item importance. |
+
+Every expanded candidate is re-filtered through the same trust predicate
+semantic recall itself uses — expansion is never an eligibility bypass — and
+there is no recursive traversal (neighbors of neighbors are never expanded).
+
+---
+
 ## 8. Bare-metal / non-Compose deployment
 
 Without Compose, provide a Postgres 16 + pgvector ≥ 0.8 database and run the
@@ -775,6 +842,13 @@ engram init-db
 # Run the service (connects as the app role via ENGRAM_DATABASE_URL):
 engram serve
 ```
+
+> `ENGRAM_HOST` / `ENGRAM_PORT` are defined in `engram/config.py` but are
+> **not** currently applied by `engram serve` or the Docker image's `uvicorn`
+> CMD — both always bind `0.0.0.0:8000`. If you need a different bind address
+> or port, put a reverse proxy in front, or run
+> `uvicorn engram.api.app:app --host <host> --port <port>` directly instead of
+> `engram serve`.
 
 Both URLs must use the `postgresql+asyncpg://` scheme. Migrations require the
 owner role (they run DDL and `FORCE ROW LEVEL SECURITY`); the service requires

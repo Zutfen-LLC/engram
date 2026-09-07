@@ -39,9 +39,10 @@ All events share one table, `usage_events`, distinguished by `event_type` +
 | `candidate.observed` | `process_memory_candidate` | `accepted_for_processing` | One candidate memory entered the pipeline. New rows are recorded once per server-issued `ingest_id`. |
 | `candidate.outcome` | `process_memory_candidate` | `created` / `deduped` / `superseded` / `failed` | The terminal outcome of one `/v1/remember` attempt. Every invocation has a distinct server-issued attempt UUID used as the event ID. |
 | `candidate.ingest_reuse_rejected` | `process_memory_candidate` | `rejected` | Safe diagnostic for incompatible ingest reuse; it is not a processed candidate or successful attempt. |
-| `provider.call` | `classification`, `conflict_classification`, `embedding_document`, `embedding_backfill`, `embedding_query_recall`, `embedding_query_search`, `embedding_setup` | `succeeded` / `failed` / `disabled` | One instrumented provider operation. `external_call_attempted` distinguishes setup/preflight work from an external request. |
+| `provider.call` | `classification`, `conflict_classification`, `extraction`, `embedding_document`, `embedding_backfill`, `embedding_query_recall`, `embedding_query_search`, `embedding_setup` | `succeeded` / `failed` / `disabled` | One instrumented provider operation. `external_call_attempted` distinguishes setup/preflight work from an external request. |
 | `retrieval.request` | `startup_recall`, `semantic_recall`, `keyword_search`, `semantic_search`, `hybrid_search` | `succeeded` / `failed` | One recall/search request (success or failure), with result counts and the canonical embedding outcome described below. |
 | `client.lifecycle_summary` | `sync_turn`, `pre_compress`, `session_end` | `succeeded` / `partial` | A client-reported aggregate for one hooks-adapter lifecycle invocation. **Diagnostic and non-authoritative** — see below. |
+| `context_receipt.dark_write` | `startup_context_receipt` | `created` / `idempotent` / `failed` / `timed_out` | The ENG-CONTEXT-002B startup dark write, gated by this same `ENGRAM_USAGE_TELEMETRY_ENABLED` flag (and by `ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_ENABLED`, which must also be on — a `disabled` result from that flag never reaches this table). Bounded aggregate metadata only (mode, failure stage, exception type); see `docs/context-manifest-v1.md` for the full contract. Not included in `engram usage-report`'s sections. |
 
 ## Column meanings
 
@@ -288,9 +289,9 @@ migration and reporting access used elsewhere in Engram.
 - **`reported_cost_usd` is frequently `NULL`.** Not every OpenAI-compatible
   provider/proxy reports cost. `engram.usage.extract_openai_compatible_usage`
   looks in several plausible locations (`usage.cost`, `usage.total_cost`,
-  `usage.estimated_cost`, and the same names on the top-level response) but a
-  `NULL` here is an expected, valid outcome — token counts remain the durable
-  basis for later cost modeling.
+  `usage.estimated_cost`, `usage.cost_usd`, and the same names on the
+  top-level response) but a `NULL` here is an expected, valid outcome — token
+  counts remain the durable basis for later cost modeling.
 - **Client lifecycle summaries are diagnostic and untrusted.** They are
   reported by the hooks adapter based on its own local counts (extraction,
   guard-rejection, parking) that the server cannot independently observe or

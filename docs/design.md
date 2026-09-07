@@ -453,6 +453,115 @@ review/admin scope) and `engram doctor`'s bounded content-free
 evaluator as the mutation paths; neither ever runs the promotion-time conflict
 recheck, and both say so explicitly.
 
+#### Durable admission assessments (issue #159)
+
+> **Implementation status:** **Implemented behind a disabled capture flag**
+> (`ENGRAM_ADMISSION_ASSESSMENT_CAPTURE_ENABLED`, default `false`). Disabled,
+> Path A's mutation and audit-event behavior is byte-for-byte unchanged. This
+> is a durable *recording* of the decision current Path A policy makes — it
+> introduces no new promotion formula, threshold, weight, or lane rule. Full
+> contract: [`docs/adr-159-admission-assessments.md`](adr-159-admission-assessments.md).
+
+Every promotion/admission decision Path A makes — `admitted`, a block, a
+cooling wait, or an inconclusive read — becomes an append-only
+`admission_assessments` row, plus a mutable one-row
+`admission_assessment_current` projection keyed by
+`(tenant_id, memory_item_id, policy_profile_key)`. There is exactly one
+production policy profile: `policy_profile_key='path_a_compat'`,
+`policy_contract_version='path-a-compat-v1'`.
+
+* **`decision_hash`** — `sha256:<hex>` over the RFC 8785 (JCS) canonical bytes
+  of a deterministic envelope: schema version, tenant/item identity, mode,
+  content hash, input digest, resulting-state digest, policy identity/config
+  digest, selected basis, outcome, sorted blocker/reason codes, and the
+  deterministic cooling/eligibility/next-action values. It excludes assessment
+  ID, timestamps, and every other invocation-scoped value, so the same
+  decision over the same state hashes identically months apart.
+* **`input_digest`** binds the state actually evaluated, strictly
+  pre-mutation; **`resulting_state_digest`** binds the state an `admitted` or
+  conflict-blocked decision's own mutation was expected to produce (`NULL`
+  when nothing changed). Freshness resolves against the resulting state when
+  present, so a successful admission does not immediately read back as stale
+  because of its own effect.
+* **Outcome vocabulary:** `admitted`, `would_admit` (shadow-only), `cooling`,
+  `review_required`, `blocked`, `insufficient_evidence`, `unknown`, `stale`,
+  `not_applicable` — precedence `stale > blocked > review_required > cooling >
+  insufficient_evidence > unknown`. **Next-action vocabulary:** `wait_until`,
+  `classification_required`, `human_review_required`,
+  `conflict_resolution_required`, `new_evidence_required`,
+  `policy_reconciliation_required`, `none`.
+* #157 `memory_assessments` are recorded only as diagnostic
+  `available_memory_assessment_refs` — their epistemic/risk dimensions carry
+  no admission authority here and never enter `input_digest` or
+  `policy_config_digest`.
+
+**Operator surface:** `GET /v1/items/{item_id}/admission-assessment` (current,
+`status='missing'` distinct from a recorded `unknown` outcome),
+`GET /v1/items/{item_id}/admission-assessments` (paginated immutable history),
+`GET /v1/items/{item_id}/admission-assessments/{assessment_id}` (full detail —
+normalized decision inputs and evidence references, review/admin scope only),
+and the review-queue admission filters (`outcome`, blocker code, next action,
+assessment state, due-before), all `read`-scoped and following ordinary item
+read eligibility. `engram admission-assessments backfill --tenant <id> [--limit
+<n>] [--after <item-id>] [--dry-run]` performs a bounded, restartable,
+idempotent legacy import (`mode=legacy_import`) that snapshots currently
+observable state without fabricating history it cannot prove (e.g. an
+already-active item records `not_applicable` with no lane; conflict-recheck
+status is always `unavailable_legacy`).
+
+Writes are tenant-scoped (not owner-restricted) because capture runs under the
+worker's tenant app-role context and must record decisions for items it does
+not author; the app role has `UPDATE`/`DELETE` revoked on
+`admission_assessments` plus a no-rewrite trigger, so history cannot be
+rewritten even by a future privilege drift. Enabling capture requires the
+#159-capable worker/API rolled out together: with the flag on, a `proposed ->
+active` mutation fails closed if its assessment, linked audit event, and
+projection cannot commit atomically.
+
+#### Risk-aware shadow admission policy (issue #158)
+
+> **Implementation status:** **Implemented as a shadow-only policy.**
+> `path_a_compat` remains the only *authoritative* admission profile — nothing
+> in this section can promote, block, or otherwise mutate a memory item. Full
+> contract, rule matrix, and rollback:
+> [`docs/adr-158-risk-aware-admission-profiles.md`](adr-158-risk-aware-admission-profiles.md).
+
+`risk_aware_shadow_v1` is a checked-in, declarative policy artifact
+(`policies/admission/`, schema `engram.admission-policy.v1`) evaluated by a
+pure, dependency-free function in `engram.admission_policy` — no database,
+settings, provider, or wall-clock access; callers pass explicit item,
+effective-assessment, policy, and evaluation-time snapshots. `engram.
+admission_shadow` runs it read-only against real item state (bounded,
+read-only simulation — no mutation, no queue write, no provider call) for one
+item or one keyset page.
+
+The profile evaluates each of three surfaces (`startup`, `semantic_governed`,
+`semantic_exploratory`) independently to `allow` / `withhold` /
+`review_required` / `blocked` / `unknown`, consuming only the effective #157
+`combined` risk/epistemic/retention assessment selected under the configured
+selection contract (pinned contract hash and selection-policy version in the
+artifact) — it never infers risk from `kind` or source type, and disabled,
+missing, mismatched, stale, or uncalibrated assessment state stays explicit
+rather than defaulting to a permissive read. Governed surfaces require
+qualified low/medium risk to pass an elapsed-time observation window (0 hours
+low, 72 hours medium) unless the item already carries human-verified
+authority; high or unknown risk, or contested evidence, always requires
+review.
+
+**Operator surface (all read-only by default):**
+`POST /v1/items/{item_id}/admission-assessments/simulate` (one item),
+`POST /v1/admission-assessments/simulate` (one bounded keyset page), and
+`engram admission-assessments simulate --tenant <id> [...]` (same page result,
+scoped to an API key's tenant/principal/memory-profile boundary). An admin can
+explicitly request V2 shadow persistence, which only appends immutable
+`admission_assessments` history under `schema_version='engram.admission-
+assessment.v2'`, `mode='shadow'`, `policy_profile_key='risk_aware_shadow_v1'`
+— existing projection guards (and a database CHECK constraint) refuse to let a
+shadow row become `admission_assessment_current`, so a V2 row can never
+authorize `proposed -> active`. Rollback is simply "stop running the shadow
+profile": V1 Path A behavior is untouched throughout, and V2 shadow history
+remains immutable and attributable rather than deleted.
+
 #### Path B — Usage-validated quorum (deferred, unimplemented)
 
 > **Implementation status:** Path B is **not implemented** and no promotion lane
