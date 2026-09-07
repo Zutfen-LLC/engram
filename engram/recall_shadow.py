@@ -89,8 +89,10 @@ def _packet_payload(evaluation: recall_module.SemanticPacketEvaluation) -> dict[
     V2-bound candidate packets additionally carry the bounded admission
     diagnostics (one content-free entry per withheld candidate) and the V2
     resolution summary — the operator-facing evidence of exactly which #158
-    decisions admitted or withheld each candidate (issue #186). Legacy
-    evaluates to an empty diagnostics list / ``None`` summary.
+    decisions admitted or withheld each candidate (issue #186). Since issue
+    #190 each packet also carries the bounded relationship-expansion summary
+    (contract version, seed/neighbor/admission counts). Legacy evaluates to
+    an empty diagnostics list / ``None`` summaries.
     """
     profile = evaluation.profile
     return {
@@ -105,6 +107,7 @@ def _packet_payload(evaluation: recall_module.SemanticPacketEvaluation) -> dict[
         "omitted_by_admission": dict(sorted(evaluation.omitted_by_admission.items())),
         "admission_diagnostics": evaluation.admission_diagnostics,
         "v2_resolution": evaluation.v2_resolution,
+        "expansion": evaluation.expansion,
         "effective_byte_budget": evaluation.byte_budget,
         "effective_token_budget": evaluation.token_budget,
         "effective_item_budget": evaluation.item_budget,

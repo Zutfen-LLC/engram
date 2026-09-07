@@ -72,14 +72,18 @@ def test_classify_legacy_confidence_is_canonical_alias() -> None:
 
 def test_recall_response_accepts_structured_evidence_blocks() -> None:
     """Issue #188: candidate-profile items carry the structured ``evidence``
-    block and mirrored top-level ``epistemic_state``. The untyped item dicts
-    must pass the model through unchanged — unknown/null states stay
-    structured, never flattened into a numeric confidence field."""
+    block and mirrored top-level ``epistemic_state``. Issue #190 adds the
+    structured ``relationship`` relevance block on expansion-reached items.
+    The untyped item dicts must pass the model through unchanged —
+    unknown/null states stay structured, never flattened into a numeric
+    confidence field."""
     item = {
         "id": "0197c0de-0000-7000-8000-000000000001",
         "kind": "fact",
         "content": "served candidate item",
         "epistemic_state": "unknown",
+        "relevance_score": 0.735,
+        "utility_score": 0.6,
         "warning_codes": ["unreviewed", "evidence_unknown", "risk_unknown"],
         "evidence": {
             "source": "v2_fresh_evaluation",
@@ -92,6 +96,18 @@ def test_recall_response_accepts_structured_evidence_blocks() -> None:
             "risk_state": "unknown",
             "retention_state": "unknown",
             "effective_assessment_refs": [],
+        },
+        "relationship": {
+            "version": "relationship-relevance-v1",
+            "origins": ["graph"],
+            "direct": False,
+            "direct_semantic_score": None,
+            "source_seed_score": 0.9,
+            "graph_contribution": 0.9,
+            "graph_edge_types": ["derived_from"],
+            "tunnel_labels": [],
+            "relevance_score": 0.735,
+            "components": {"semantic": 0.63, "graph": 0.135, "tunnel": 0.0},
         },
     }
     response = RecallResponse(
@@ -107,6 +123,8 @@ def test_recall_response_accepts_structured_evidence_blocks() -> None:
     served = response.items[0]
     assert served["evidence"]["epistemic_state"] == served["epistemic_state"]
     assert served["evidence"]["source"] == "v2_fresh_evaluation"
+    assert served["relationship"]["version"] == "relationship-relevance-v1"
+    assert served["relevance_score"] == served["relationship"]["relevance_score"]
     # No numeric confidence was invented anywhere in the item.
     assert "trust_score" not in served
     assert "confidence" not in served

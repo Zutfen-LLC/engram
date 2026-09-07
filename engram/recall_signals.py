@@ -44,6 +44,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Final, Literal, Protocol, cast
 
+from sqlalchemy import ColumnElement, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.admission_policy import AdmissionPolicyDecision
@@ -59,6 +60,27 @@ RECALL_ADMISSION_POLICY_VERSION: Final[Literal["recall-admission-v2"]] = "recall
 # ``admission_shadow.SHADOW_PROFILE_KEY`` (the checked-in artifact's
 # ``profile_key``); pinned against drift by the unit tests.
 V2_ADMISSION_PROFILE_KEY: Final[Literal["risk_aware_shadow_v1"]] = "risk_aware_shadow_v1"
+
+
+def live_proposal_expression() -> ColumnElement[bool]:
+    """The mechanically-expressible domain of the #158 V2 admission policy.
+
+    ``risk_aware_shadow_v1`` decides over live proposals (an active,
+    superseded, or closed item is ``not_live`` and blocked on every surface),
+    and unresolved conflicts are blocked before any evidence is examined.
+    Both facts are pure SQL, so the V2-bound retrieval window applies them
+    *before* the bounded HNSW window (issue #186) — rows the V2 gate would
+    inevitably withhold can never occupy the candidate window and starve
+    eligible proposals. Issue #190 reuses the exact predicate as the
+    candidate-profile relationship-expansion discovery prefilter, so direct
+    retrieval and neighbor discovery can never disagree about the corpus.
+    """
+    return and_(
+        MemoryItem.review_status == "proposed",
+        MemoryItem.valid_to.is_(None),
+        MemoryItem.superseded_by.is_(None),
+        MemoryItem.conflict_resolution_status.is_distinct_from("unresolved"),
+    )
 
 EpistemicState = Literal["supported", "contested", "insufficient_evidence", "unknown"]
 
@@ -809,14 +831,24 @@ def signal_item_fields(
     item: MemoryItem,
     *,
     decision: RecallAdmissionDecision,
-    similarity: float,
+    similarity: float | None = None,
     now: datetime,
+    relevance: float | None = None,
 ) -> dict[str, Any]:
     """Build the additive per-item signal fields for an admitted item.
 
     Returns the separated-signal block (relevance/utility/epistemic/risk +
     the admission receipt) that ``execute_semantic_recall`` merges into the
     served item dict. No blended ``trust_score`` is produced or accepted here.
+
+    ``relevance`` is the item's final bounded relevance value. It defaults to
+    the direct semantic ``similarity``; relationship expansion (issue #190)
+    passes the versioned relationship-aware relevance for items reached
+    through graph/tunnel links (see
+    ``relationship_recall.compute_relationship_relevance``) — ranking
+    consumes the same value that is published as ``relevance_score``, so
+    every packet rank stays reproducible from the published relevance +
+    utility inputs.
 
     Evidence authority (issue #188): on a V2-bound profile
     (``decision.v2`` present) the served epistemic state and the structured
@@ -827,6 +859,10 @@ def signal_item_fields(
     derivation (no candidate profile uses it today; it exists for legacy
     local-profile compatibility and is byte-stable).
     """
+    if relevance is None:
+        if similarity is None:
+            raise ValueError("signal_item_fields requires similarity or relevance")
+        relevance = similarity
     utility = compute_utility_score(
         importance=item.importance,
         created_at=item.created_at,
@@ -852,15 +888,15 @@ def signal_item_fields(
         assessment_status=decision.assessment_status,
         risk_state=risk_state,
     )
-    rank = compute_signal_rank_score(similarity=similarity, utility=utility)
+    rank = compute_signal_rank_score(similarity=relevance, utility=utility)
     reasons = [
-        f"relevance {similarity:.2f}",
+        f"relevance {relevance:.2f}",
         f"utility {utility:.2f}",
         f"admission {decision.profile}:{','.join(decision.reason_codes)}",
     ]
     fields = {
         "score": rank,
-        "relevance_score": round(similarity, 4),
+        "relevance_score": round(relevance, 4),
         "utility_score": utility,
         "epistemic_state": epistemic_state,
         "warning_codes": codes,
@@ -933,6 +969,7 @@ __all__ = [
     "compute_utility_score",
     "decide_recall_admission",
     "derive_epistemic_state",
+    "live_proposal_expression",
     "load_admission_bindings",
     "signal_item_fields",
     "structured_warning_codes",
