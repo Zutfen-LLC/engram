@@ -161,6 +161,15 @@ class RecallRequest(BaseModel):
     byte_budget: int | None = None
     token_budget: int | None = None
     item_budget: int | None = None
+    # Recall admission profile (issue #160). None resolves to the safe tenant
+    # default (legacy). "governed"/"exploratory" apply to mode='semantic'
+    # only; "startup" is accepted (and implied) for mode='startup'. The union
+    # covers both modes; the per-mode contract is enforced by
+    # resolve_serving_profile in the route (HTTP 422). Until #162
+    # certification, governed/exploratory are NOT servable here — requesting
+    # them is a 422, and they can be evaluated only via the REVIEW_SCOPE +
+    # tenant-policy-gated POST /v1/recall/shadow-compare.
+    recall_profile: Literal["legacy", "governed", "exploratory", "startup"] | None = None
 
 
 class RecallResponse(BaseModel):
@@ -174,6 +183,13 @@ class RecallResponse(BaseModel):
     config_version: str = "v1"
     recall_log_id: str | None = None
     message: str | None = None
+    # Additive profile context (issue #160). recall_profile is the effective
+    # profile; signals_version is set when items carry the separated
+    # relevance/utility/epistemic/admission signal model; omitted_by_admission
+    # counts withheld candidates by reason code (their content is not kept).
+    recall_profile: str | None = None
+    signals_version: str | None = None
+    omitted_by_admission: dict[str, int] = Field(default_factory=dict)
 
 
 class SearchRequest(BaseModel):
@@ -1294,6 +1310,19 @@ async def recall(
             detail="mode='semantic' requires a non-empty query",
         )
 
+    # Validate the serving profile up front so an invalid, mode-incompatible,
+    # or uncertified-for-serving request fails before any embedding work
+    # (issue #160). Uncertified governed/exploratory raise
+    # RecallProfileNotServableError — a subclass of RecallProfileError — and
+    # are rejected: before #162 certification they may be evaluated only via
+    # the shadow comparison surface, never served.
+    from engram.recall_profiles import RecallProfileError, resolve_serving_profile
+
+    try:
+        resolve_serving_profile(req.recall_profile, mode=mode)
+    except RecallProfileError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     # Resolve RLS context
     tenant_id = memory_context.tenant_id
     principal_id = memory_context.principal_id
@@ -1311,6 +1340,7 @@ async def recall(
                 byte_budget=req.byte_budget,
                 token_budget=req.token_budget,
                 item_budget=req.item_budget,
+                recall_profile=req.recall_profile,
             )
         else:
             result = await execute_startup_recall(
@@ -1365,6 +1395,9 @@ async def recall(
         config_version=result.get("config_version", "v1"),
         recall_log_id=result.get("recall_log_id"),
         message=result.get("message"),
+        recall_profile=result.get("recall_profile"),
+        signals_version=result.get("signals_version"),
+        omitted_by_admission=result.get("omitted_by_admission") or {},
     )
 
     # Startup-only dark write (ENG-CONTEXT-002B). Runs BEFORE the retrieval

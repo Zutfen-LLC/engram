@@ -16,7 +16,7 @@ auth and typed exceptions for 4xx/5xx responses.
 from __future__ import annotations
 
 import warnings
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 from uuid import UUID
 
 import httpx
@@ -317,8 +317,18 @@ class EngramClient:
         byte_budget: int | None = None,
         token_budget: int | None = None,
         item_budget: int | None = None,
+        recall_profile: Literal["legacy", "governed", "exploratory", "startup"] | None = None,
     ) -> RecallResponse:
-        """Bounded recall: deterministic startup set or semantic query."""
+        """Bounded recall: deterministic startup set or semantic query.
+
+        ``recall_profile``: None resolves to the tenant default, and only
+        profiles certified for serving are accepted — currently ``legacy``
+        (plus ``startup`` for startup mode). Requesting ``governed`` or
+        ``exploratory`` is rejected with HTTP 422 until accepted #162
+        certification (issue #160): candidate profiles are evaluated on the
+        server's shadow-comparison surface only and can never be served or
+        selected through this method.
+        """
         req = RecallRequest(
             mode=mode,
             query=query,
@@ -326,6 +336,7 @@ class EngramClient:
             byte_budget=byte_budget,
             token_budget=token_budget,
             item_budget=item_budget,
+            recall_profile=recall_profile,
         )
         return await self._send(
             "POST",

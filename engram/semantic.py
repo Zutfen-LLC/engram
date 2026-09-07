@@ -10,10 +10,19 @@ active-only by default; semantic recall also includes proposed items
 Keeping this here (rather than in ``engram/api/routes/memory.py``) lets the
 recall engine depend on it without importing from the FastAPI route layer.
 
-Ranking (semantic-v2): candidates are pulled from the HNSW index ordered by
-cosine distance, then re-ranked by a deterministic trust-weighted score so a
-slightly-closer low-trust item cannot outrank a high-trust memory. See
-:func:`compute_semantic_trust_score`.
+Two retrieval primitives with deliberately separate contracts:
+
+* :func:`search` — the legacy trust-weighted wrapper. The HNSW index pulls the
+  ``limit`` nearest candidates by cosine distance, then each is re-ranked by
+  a deterministic trust blend (:func:`compute_semantic_trust_score`) so a
+  slightly-closer low-trust item cannot outrank a high-trust memory. Used by
+  ``/v1/search`` and the ``legacy`` recall profile; unchanged by #160.
+* :func:`retrieve_candidates` — the neutral primitive the separated-signal
+  path (issue #160) retrieves through. Returns id/distance/similarity and
+  embedding identity only — no ``trust_score``, no blended ``score`` — and
+  takes the caller's full corpus-eligibility predicate so mechanically
+  excludable rows (e.g. disputed items that are not governed stay kinds) are
+  filtered in SQL *before* the bounded HNSW window, never inside it.
 """
 
 from __future__ import annotations
@@ -21,7 +30,7 @@ from __future__ import annotations
 from typing import Any
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import and_, cast, func, literal_column, select, text
+from sqlalchemy import ColumnElement, and_, cast, func, literal_column, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.memory_access import read_eligibility_expression
@@ -94,25 +103,42 @@ async def candidate_count(
     *,
     memory_context: ResolvedMemoryContext,
     workspace_id: str | None = None,
-    review_statuses: tuple[str, ...] = ("active",),
+    review_statuses: tuple[str, ...] | None = ("active",),
     kind: str | None = None,
     wing: str | None = None,
     room: str | None = None,
     embedding_profile: EmbeddingProfile | None = None,
+    corpus_eligibility: ColumnElement[bool] | None = None,
 ) -> int:
     """Count recall/search-eligible embeddings currently in the corpus.
 
     An embedding is a candidate when its model matches, the vector is
-    populated, the parent item is in one of ``review_statuses`` with
-    ``valid_to IS NULL``, and the parent item belongs to ``tenant_id`` and is
-    eligible for ``principal_id`` under the shared visibility predicate
-    (see ``engram.memory_access``). Optional ``kind``/``wing``/``room``
-    filters further narrow the candidate set (matching :func:`search`).
+    populated, the parent item is eligible with ``valid_to IS NULL``, and the
+    parent item belongs to ``tenant_id`` and is eligible for ``principal_id``
+    under the shared visibility predicate (see ``engram.memory_access``).
+    Eligibility is expressed either as a ``review_statuses`` tuple (legacy
+    callers) or as an arbitrary SQL ``corpus_eligibility`` predicate (the
+    separated-signal path — must mirror the predicate its retrieval uses so
+    the count and the window can never disagree). Optional ``kind``/``wing``/
+    ``room`` filters further narrow the candidate set (matching
+    :func:`search`).
     """
     if embedding_profile is None:
         from engram.embedding_profiles import get_active_profile
 
         embedding_profile = await get_active_profile(session)
+    conditions: list[ColumnElement[bool]] = [
+        MemoryEmbedding.profile_id == embedding_profile.id,
+        MemoryEmbedding.embedding_dim == embedding_profile.dimensions,
+        MemoryEmbedding.embedding_status == "ready",
+        MemoryEmbedding.embedding.is_not(None),
+        MemoryItem.valid_to.is_(None),
+        read_eligibility_expression(memory_context),
+    ]
+    if review_statuses is not None:
+        conditions.append(MemoryItem.review_status.in_(review_statuses))
+    if corpus_eligibility is not None:
+        conditions.append(corpus_eligibility)
     stmt = (
         select(func.count())
         .select_from(MemoryEmbedding)
@@ -123,15 +149,7 @@ async def candidate_count(
                 MemoryItem.tenant_id == MemoryEmbedding.tenant_id,
             ),
         )
-        .where(
-            MemoryEmbedding.profile_id == embedding_profile.id,
-            MemoryEmbedding.embedding_dim == embedding_profile.dimensions,
-            MemoryEmbedding.embedding_status == "ready",
-            MemoryEmbedding.embedding.is_not(None),
-            MemoryItem.review_status.in_(review_statuses),
-            MemoryItem.valid_to.is_(None),
-            read_eligibility_expression(memory_context),
-        )
+        .where(*conditions)
     )
     if workspace_id is not None:
         stmt = stmt.where(MemoryItem.workspace_id == workspace_id)
@@ -279,6 +297,101 @@ async def search(
     # tiebreaker.
     results.sort(key=lambda r: (-r["score"], r["distance"], _sort_created_desc(r["created_at"])))
     return results
+
+
+async def retrieve_candidates(
+    session: AsyncSession,
+    query_embedding: list[float],
+    limit: int,
+    *,
+    memory_context: ResolvedMemoryContext,
+    corpus_eligibility: ColumnElement[bool],
+    workspace_id: str | None = None,
+    embedding_profile: EmbeddingProfile | None = None,
+) -> list[dict[str, Any]]:
+    """Return the ``limit`` nearest *eligible* candidates, neutrally.
+
+    The separated-signal retrieval primitive (issue #160): unlike
+    :func:`search`, it computes no trust blend, returns no ``trust_score`` and
+    no blended ``score`` — ranking belongs to the signal model
+    (``engram.recall_signals``), not to retrieval. Each row is returned as a
+    dict with ``id``, ``distance`` (cosine), ``similarity_score``
+    (``1 - distance``), embedding identity (``embedding_model``,
+    ``embedding_dim``, ``embedding_profile``) and ``created_at`` for stable
+    tie-breaking.
+
+    ``corpus_eligibility`` is the caller's complete mechanically-expressible
+    eligibility predicate (review-status/stay-kind policy). It is applied in
+    SQL *before* the HNSW ``LIMIT`` together with the shared
+    tenant/visibility/validity/embedding-profile constraints, so rows that can
+    never be admitted cannot occupy the bounded candidate window and displace
+    eligible rows that sit just outside it (the #160 "eligible corpus ->
+    admission policy -> relevance retrieval -> ranking" ordering). Anything
+    that cannot be expressed without examining relevance (per-item durable
+    admission digests) remains the admission gate's job, after retrieval.
+    """
+    if embedding_profile is None:
+        from engram.embedding_profiles import get_active_profile
+
+        embedding_profile = await get_active_profile(session)
+    if len(query_embedding) != embedding_profile.dimensions:
+        raise ValueError(
+            f"query vector dimension {len(query_embedding)} does not match active "
+            f"profile {embedding_profile.profile_key} ({embedding_profile.dimensions})"
+        )
+    # strict_order handles tenant-filtered queries without recall degradation.
+    await session.execute(text("SET LOCAL hnsw.iterative_scan = strict_order"))
+    typed_embedding = cast(MemoryEmbedding.embedding, Vector(embedding_profile.dimensions))
+    distance = typed_embedding.cosine_distance(query_embedding)
+    profile_id_sql: Any = literal_column(f"'{embedding_profile.id}'::uuid")
+    dimensions_sql: Any = literal_column(str(int(embedding_profile.dimensions)))
+    stmt = (
+        select(
+            MemoryItem.id.label("id"),
+            MemoryEmbedding.embedding_model.label("embedding_model"),
+            MemoryEmbedding.embedding_dim.label("embedding_dim"),
+            distance.label("distance"),
+            MemoryItem.created_at.label("created_at"),
+        )
+        .select_from(MemoryEmbedding)
+        .join(
+            MemoryItem,
+            and_(
+                MemoryItem.id == MemoryEmbedding.memory_item_id,
+                MemoryItem.tenant_id == MemoryEmbedding.tenant_id,
+            ),
+        )
+        .where(
+            MemoryEmbedding.profile_id == profile_id_sql,
+            MemoryEmbedding.embedding_dim == dimensions_sql,
+            MemoryEmbedding.embedding_status == "ready",
+            MemoryEmbedding.embedding.is_not(None),
+            MemoryItem.valid_to.is_(None),
+            corpus_eligibility,
+            read_eligibility_expression(memory_context),
+        )
+        # Nearest eligible candidates from the HNSW index; ranking is the
+        # signal model's job. Tie-breaks (distance asc, then newer first)
+        # mirror search's window ordering so behavior is reproducible.
+        .order_by(distance.asc(), MemoryItem.created_at.desc())
+        .limit(limit)
+    )
+    if workspace_id is not None:
+        stmt = stmt.where(MemoryItem.workspace_id == workspace_id)
+    rows = (await session.execute(stmt)).mappings().all()
+
+    return [
+        {
+            "id": str(row["id"]),
+            "distance": float(row["distance"] or 0.0),
+            "similarity_score": max(0.0, min(1.0, 1.0 - float(row["distance"] or 0.0))),
+            "embedding_model": row["embedding_model"],
+            "embedding_dim": row["embedding_dim"],
+            "embedding_profile": embedding_profile.profile_key,
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]
 
 
 def _sort_created_desc(created_at: Any) -> float:

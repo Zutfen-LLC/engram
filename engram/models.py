@@ -1209,6 +1209,13 @@ class RecallLog(Base):
     token_budget: Mapped[int | None] = mapped_column(nullable=True)
     scoring_version: Mapped[str] = mapped_column(String(20), default="v1")
     config_version: Mapped[str] = mapped_column(String(20), default="v1")
+    # Effective recall admission profile (issue #160). "legacy" is the
+    # pre-profile semantic behavior and also the backfilled value for
+    # historical rows; "startup" marks the startup pipeline; governed /
+    # exploratory are the profile-gated semantic paths.
+    recall_profile: Mapped[str] = mapped_column(
+        Text, default="legacy", server_default=text("'legacy'"), nullable=False
+    )
     memory_profile_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     memory_profile_revision_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
@@ -1280,6 +1287,15 @@ class TenantConfig(Base):
     startup_recall_penalty_threshold: Mapped[int] = mapped_column(Integer, default=5)
     startup_recall_penalty_factor: Mapped[float] = mapped_column(Float, default=0.5)
     feedback_daily_limit: Mapped[int] = mapped_column(Integer, default=500)
+
+    # Candidate recall-profile inspection policy (issue #160 rollout
+    # boundary). Explicit tenant allow for the REVIEW_SCOPE-gated shadow
+    # comparison surface that evaluates uncertified governed/exploratory
+    # packets. Fails closed: capability alone is never sufficient, and an
+    # absent/false policy denies inspection even for a capable caller. This
+    # never affects what POST /v1/recall serves (legacy until #162
+    # certification).
+    recall_profile_shadow_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
 
     # Source trust defaults
     trust_manual_user: Mapped[float] = mapped_column(Float, default=0.9)

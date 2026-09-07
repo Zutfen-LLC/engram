@@ -130,6 +130,7 @@ CREATE_STATEMENTS = [
         startup_recall_penalty_threshold INTEGER,
         startup_recall_penalty_factor REAL,
         feedback_daily_limit INTEGER,
+        recall_profile_shadow_enabled INTEGER,
         trust_manual_user REAL,
         trust_manual_agent REAL,
         trust_import REAL,

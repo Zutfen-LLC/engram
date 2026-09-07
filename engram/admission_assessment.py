@@ -954,6 +954,71 @@ def resolve_projection_status(
     return ResolvedAdmission("current", assessment)
 
 
+async def resolve_bulk_admissions(
+    session: AsyncSession,
+    items: list[MemoryItem],
+) -> dict[uuid.UUID, ResolvedAdmission]:
+    """Digest-verified current admission state for a bounded list of items.
+
+    One shared resolution path for every bulk consumer (review queue, recall
+    admission). Loads the ``admission_assessment_current`` projections for the
+    given items in one query, recomputes each item's input/policy digests the
+    same way the evaluator would (via promotion support), and resolves
+    current/stale/legacy_import exactly like :func:`resolve_projection_status`.
+
+    Items with no recorded projection are absent from the result — callers
+    render them as ``missing``. All items must belong to one tenant.
+    """
+    from engram.promotion import _config, _config_values, load_promotion_support
+
+    if not items:
+        return {}
+    tenant_id = items[0].tenant_id
+    rows = (
+        await session.scalars(
+            select(AdmissionAssessment)
+            .join(
+                AdmissionAssessmentCurrent,
+                AdmissionAssessmentCurrent.assessment_id == AdmissionAssessment.id,
+            )
+            .where(
+                AdmissionAssessmentCurrent.tenant_id == tenant_id,
+                AdmissionAssessmentCurrent.memory_item_id.in_([item.id for item in items]),
+                AdmissionAssessmentCurrent.policy_profile_key == POLICY_PROFILE_KEY,
+            )
+        )
+    ).all()
+    if not rows:
+        return {}
+    by_item = {row.memory_item_id: row for row in rows}
+    config = await _config(session, str(tenant_id))
+    _, threshold, min_age, evidence_enabled, evidence_threshold = _config_values(config)
+    support_map = await load_promotion_support(session, items)
+    resolved: dict[uuid.UUID, ResolvedAdmission] = {}
+    for item in items:
+        row = by_item.get(item.id)
+        if row is None:
+            continue
+        support = support_map[item.id]
+        kind = support.kind
+        resolved[item.id] = resolve_projection_status(
+            row,
+            current_input_digest=digest(input_state_payload(item, support.classification_run)),
+            current_policy_config_digest=digest(
+                policy_config_payload(
+                    confidence_threshold=threshold,
+                    min_age_hours=min_age,
+                    evidence_enabled=evidence_enabled,
+                    evidence_threshold=evidence_threshold,
+                    kind_auto_promote_allowed=bool(
+                        kind and kind.enabled and kind.auto_promote_from_inferred
+                    ),
+                )
+            ),
+        )
+    return resolved
+
+
 async def load_current_assessment(
     session: AsyncSession,
     *,
@@ -1063,5 +1128,6 @@ __all__ = [
     "project_current",
     "reason_codes_for",
     "resolve_projection_status",
+    "resolve_bulk_admissions",
     "summary_payload",
 ]

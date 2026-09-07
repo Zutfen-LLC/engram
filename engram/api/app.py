@@ -78,6 +78,7 @@ def create_app() -> FastAPI:
         memory,
         memory_profiles,
         portal_enrollment,
+        recall_shadow,
         review,
         service_delegation,
         service_provisioning,
@@ -97,6 +98,7 @@ def create_app() -> FastAPI:
     app.include_router(extract.router, prefix="/v1", tags=["extraction"])
     app.include_router(classify.router, prefix="/v1", tags=["classification"])
     app.include_router(review.router, prefix="/v1", tags=["review"])
+    app.include_router(recall_shadow.router, prefix="/v1", tags=["recall-shadow"])
     app.include_router(kg.router, prefix="/v1", tags=["knowledge-graph"])
     app.include_router(taxonomy.router, prefix="/v1", tags=["taxonomy"])
     app.include_router(diary.router, prefix="/v1", tags=["diary"])
