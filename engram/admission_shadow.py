@@ -1,8 +1,16 @@
-"""Bounded, read-only simulation for ``risk_aware_shadow_v1`` (issue #158)."""
+"""Bounded, read-only simulation for ``risk_aware_shadow_v1`` (issue #158).
+
+This module also owns the shared bulk V2 resolver (issue #186) —
+:func:`resolve_bulk_v2_decisions` — so the #158 simulator/operator surfaces
+and the #160 shadow-recall evaluator resolve "what is the effective V2
+decision?" through one code path and cannot drift.
+"""
 
 from __future__ import annotations
 
 import uuid
+from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Final, Literal, cast
@@ -12,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.admission_assessment import digest
 from engram.admission_policy import (
+    V2_SCHEMA_VERSION,
     AdmissionItemState,
     AdmissionPolicyDecision,
     EffectiveAssessmentState,
@@ -19,7 +28,10 @@ from engram.admission_policy import (
     evaluate_admission_profile,
     load_admission_policy,
 )
-from engram.assessments import effective_assessment_selection
+from engram.assessments import (
+    effective_assessment_selection,
+    effective_assessment_selection_bulk,
+)
 from engram.config import settings
 from engram.conflicts import check_promotion_conflict
 from engram.memory_access import read_eligibility_expression
@@ -43,6 +55,30 @@ SelectionStatus = Literal[
     "selected", "absent", "disabled", "stale", "mismatched", "failed", "uncalibrated"
 ]
 PolicyRiskState = Literal["low", "medium", "high", "unknown", "not_applicable"]
+
+# Canonical V2 resolution vocabulary (issue #186). ``current`` is the only
+# status that can carry positive admission authority:
+#
+# * ``missing``   — no V2 row has ever been persisted for the item;
+# * ``stale``     — the latest row's decision hash no longer matches the
+#                   exact current evaluation (item state, effective #157
+#                   selection, or time-dependent outcome changed since);
+# * ``mismatched``— the row was recorded under a different policy artifact
+#                   digest (the checked-in policy changed);
+# * ``unsupported``— the latest row under the profile key is not a V2 row.
+#
+# The fresh evaluation below IS the verification: the row is trusted only
+# when re-evaluating current state under the current artifact reproduces its
+# decision hash — never because a pointer says so.
+V2ResolutionStatus = Literal["current", "missing", "stale", "mismatched", "unsupported"]
+
+# ``load_promotion_support`` runs four bounded queries regardless of window
+# size; the bulk #157 selection runs at most two (assessment rows, then the
+# lateral evidence manifest for items that have rows); the latest-row lookup
+# is one. The resolver's query count is therefore constant in the window.
+_SUPPORT_QUERY_COUNT: Final[int] = 4
+_SELECTION_QUERY_COUNT: Final[int] = 2
+_LATEST_ROW_QUERY_COUNT: Final[int] = 1
 
 
 @dataclass(frozen=True)
@@ -100,6 +136,151 @@ class ShadowSimulationPage:
     changed_exclusions: int
     changed_review_routing: int
     strata_counts: dict[str, dict[str, int]]
+
+
+@dataclass(frozen=True)
+class ResolvedV2Decision:
+    """One item's effective V2 state under ``risk_aware_shadow_v1``.
+
+    ``decision`` is always the exact fresh evaluation against current item
+    state, the effective #157 selection, the loaded policy artifact, and the
+    caller's evaluation time — the same evaluation :func:`simulate_item`
+    produces, which is what makes #158/#160 parity mechanical rather than
+    aspirational. ``assessment`` is the latest persisted V2 shadow row (the
+    durable artifact the decision binds to), and ``status`` says whether that
+    row still *is* the fresh decision (``current``) or why it cannot carry
+    authority. Nothing here mutates: no projection is written, no review
+    status changes, no provider is called.
+    """
+
+    item_id: uuid.UUID
+    status: V2ResolutionStatus
+    decision: AdmissionPolicyDecision
+    assessment: AdmissionAssessment | None
+
+
+@dataclass(frozen=True)
+class BulkV2Resolution:
+    """The resolved V2 state for one bounded candidate window."""
+
+    policy: LoadedAdmissionPolicy
+    evaluation_time: datetime
+    query_count: int
+    items: Mapping[uuid.UUID, ResolvedV2Decision]
+
+    def summary(self) -> dict[str, Any]:
+        """Safe operator-facing resolution summary (no item identity)."""
+        counts = Counter(resolved.status for resolved in self.items.values())
+        return {
+            "profile_key": self.policy.profile_key,
+            "policy_version": self.policy.policy_version,
+            "policy_artifact_digest": self.policy.artifact_digest,
+            "evaluation_time": self.evaluation_time.isoformat(),
+            "resolved_count": len(self.items),
+            "resolution_status_counts": dict(sorted(counts.items())),
+            "query_count": self.query_count,
+        }
+
+
+def _evaluate_shadow_decision(
+    item: MemoryItem,
+    *,
+    support: PromotionSupport,
+    selection_values: dict[str, Any],
+    policy: LoadedAdmissionPolicy,
+    evaluation_time: datetime,
+) -> AdmissionPolicyDecision:
+    """The one shared #158 evaluation: snapshot in, exact decision out.
+
+    Both the simulator (:func:`simulate_item` / :func:`simulate_tenant_page`)
+    and the #186 bulk resolver evaluate through this helper, so per-surface
+    decisions and decision hashes are identical by construction.
+    """
+    assessment = _assessment_state(selection_values, policy)
+    return evaluate_admission_profile(
+        _item_state(item, support, assessment), assessment, policy, evaluation_time
+    )
+
+
+async def resolve_bulk_v2_decisions(
+    session: AsyncSession,
+    *,
+    items: list[MemoryItem],
+    context: ResolvedMemoryContext,
+    evaluation_time: datetime,
+    policy: LoadedAdmissionPolicy | None = None,
+) -> BulkV2Resolution:
+    """Resolve the effective V2 decision for a bounded window, in bulk.
+
+    The query count is constant in the window (support + bulk #157 selection
+    + one latest-row lookup); there is no per-item N-query resolution. Every
+    item gets an entry — an item with no persisted V2 row resolves
+    ``missing`` (explicit, distinguishable from a policy ``unknown``
+    decision), never as low-risk or review-active. The resolver reads only:
+    it never projects a shadow row current, mutates review state, enqueues
+    work, or calls a provider. All items must belong to one tenant and be
+    read-eligible for ``context`` (the caller's RLS session enforces this).
+    """
+    resolved_policy = policy or load_admission_policy(SHADOW_PROFILE_KEY)
+    if not items:
+        return BulkV2Resolution(resolved_policy, evaluation_time, 0, {})
+    query_count = _SUPPORT_QUERY_COUNT
+    support = await load_promotion_support(session, items)
+    selections: dict[uuid.UUID, dict[str, Any]] = {
+        item.id: {"selection_status": "disabled", "combined": None} for item in items
+    }
+    if settings.assessment_selection_enabled:
+        query_count += _SELECTION_QUERY_COUNT
+        selections = await effective_assessment_selection_bulk(session, items, context)
+    query_count += _LATEST_ROW_QUERY_COUNT
+    latest_rows = (
+        await session.scalars(
+            select(AdmissionAssessment)
+            .where(
+                AdmissionAssessment.tenant_id == items[0].tenant_id,
+                AdmissionAssessment.memory_item_id.in_([item.id for item in items]),
+                AdmissionAssessment.policy_profile_key == SHADOW_PROFILE_KEY,
+            )
+            .order_by(
+                AdmissionAssessment.memory_item_id,
+                AdmissionAssessment.evaluated_at.desc(),
+                AdmissionAssessment.id.desc(),
+            )
+            .distinct(AdmissionAssessment.memory_item_id)
+        )
+    ).all()
+    by_item = {row.memory_item_id: row for row in latest_rows}
+    resolved: dict[uuid.UUID, ResolvedV2Decision] = {}
+    for item in items:
+        decision = _evaluate_shadow_decision(
+            item,
+            support=support[item.id],
+            selection_values=selections.get(
+                item.id, {"selection_status": "disabled", "combined": None}
+            ),
+            policy=resolved_policy,
+            evaluation_time=evaluation_time,
+        )
+        row = by_item.get(item.id)
+        if row is None:
+            status: V2ResolutionStatus = "missing"
+        elif row.schema_version != V2_SCHEMA_VERSION:
+            status = "unsupported"
+        elif row.policy_config_digest != resolved_policy.artifact_digest:
+            status = "mismatched"
+        elif row.decision_hash != decision.decision_hash:
+            status = "stale"
+        else:
+            status = "current"
+        resolved[item.id] = ResolvedV2Decision(
+            item_id=item.id, status=status, decision=decision, assessment=row
+        )
+    return BulkV2Resolution(
+        policy=resolved_policy,
+        evaluation_time=evaluation_time,
+        query_count=query_count,
+        items=resolved,
+    )
 
 
 def _assessment_state(
@@ -278,11 +459,76 @@ async def simulate_item(
             path_a.would_promote = False
             path_a.blockers.append("conflict_recheck")
     values = await effective_assessment_selection(session, item, context)
-    assessment = _assessment_state(values, resolved_policy)
-    shadow = evaluate_admission_profile(
-        _item_state(item, item_support, assessment), assessment, resolved_policy, evaluation_time
+    shadow = _evaluate_shadow_decision(
+        item,
+        support=item_support,
+        selection_values=values,
+        policy=resolved_policy,
+        evaluation_time=evaluation_time,
     )
     return ShadowComparison(item.id, _compat_payload(path_a), shadow)
+
+
+async def simulate_items_preloaded(
+    session: AsyncSession,
+    *,
+    items: list[MemoryItem],
+    context: ResolvedMemoryContext,
+    evaluation_time: datetime,
+    policy: LoadedAdmissionPolicy | None = None,
+    config_values: tuple[bool, float, int, bool, float] | None = None,
+) -> tuple[ShadowComparison, ...]:
+    """Simulate a page with bulk-loaded support and #157 selection.
+
+    The same comparison :func:`simulate_item` produces per item — including
+    the shared ``_evaluate_shadow_decision`` core — but with promotion
+    support, tenant config, and effective #157 selection loaded in bulk (the
+    same bulk selection the #186 V2 resolver uses), instead of per-item
+    queries. Only the promotion-time conflict recheck remains per-item, and
+    only for items Path A would otherwise promote.
+    """
+    resolved_policy = policy or load_admission_policy(SHADOW_PROFILE_KEY)
+    if not items:
+        return ()
+    support = await load_promotion_support(session, items)
+    selections = await effective_assessment_selection_bulk(session, items, context)
+    if config_values is None:
+        config = await _config(session, str(items[0].tenant_id))
+        config_values = _config_values(config)
+    enabled, threshold, min_age, evidence_enabled, evidence_threshold = config_values
+    comparisons: list[ShadowComparison] = []
+    for item in items:
+        item_support = support[item.id]
+        path_a = assess_promotion_candidate(
+            item,
+            item_support,
+            confidence_threshold=threshold,
+            min_age_hours=min_age,
+            evidence_enabled=evidence_enabled,
+            evidence_threshold=evidence_threshold,
+            now=evaluation_time,
+            conflict_recheck_status="not_run",
+        )
+        if not enabled:
+            path_a.would_promote = False
+            path_a.blockers.append("promotion_disabled")
+        elif path_a.would_promote:
+            conflict = await check_promotion_conflict(session, item, memory_context=context)
+            path_a.conflict_recheck_status = "blocked" if conflict else "clear"
+            if conflict is not None:
+                path_a.would_promote = False
+                path_a.blockers.append("conflict_recheck")
+        shadow = _evaluate_shadow_decision(
+            item,
+            support=item_support,
+            selection_values=selections.get(
+                item.id, {"selection_status": "disabled", "combined": None}
+            ),
+            policy=resolved_policy,
+            evaluation_time=evaluation_time,
+        )
+        comparisons.append(ShadowComparison(item.id, _compat_payload(path_a), shadow))
+    return tuple(comparisons)
 
 
 async def simulate_tenant_page(
@@ -305,19 +551,12 @@ async def simulate_tenant_page(
     items = list((await session.scalars(query.order_by(MemoryItem.id).limit(limit + 1))).all())
     page_items = items[:limit]
     policy = load_admission_policy(SHADOW_PROFILE_KEY)
-    support = await load_promotion_support(session, page_items)
-    comparisons = tuple(
-        [
-            await simulate_item(
-                session,
-                item=item,
-                context=context,
-                evaluation_time=evaluation_time,
-                policy=policy,
-                support=support[item.id],
-            )
-            for item in page_items
-        ]
+    comparisons = await simulate_items_preloaded(
+        session,
+        items=page_items,
+        context=context,
+        evaluation_time=evaluation_time,
+        policy=policy,
     )
     changed_admissions = sum(
         comparison.path_a_compat["would_promote"]
@@ -445,9 +684,13 @@ async def persist_shadow_comparison(
 __all__ = [
     "MAX_SHADOW_SIMULATION_LIMIT",
     "SHADOW_PROFILE_KEY",
+    "BulkV2Resolution",
+    "ResolvedV2Decision",
     "ShadowComparison",
     "ShadowSimulationPage",
     "persist_shadow_comparison",
+    "resolve_bulk_v2_decisions",
     "simulate_item",
+    "simulate_items_preloaded",
     "simulate_tenant_page",
 ]

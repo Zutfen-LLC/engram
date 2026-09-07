@@ -26,12 +26,12 @@ telemetry-write failure never fails the read.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import ColumnElement, case, func, literal, or_, select, update
+from sqlalchemy import ColumnElement, and_, case, func, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram import db as db_module
@@ -1025,6 +1025,24 @@ def _semantic_base_item_fields(
     }
 
 
+def _live_proposal_expression() -> ColumnElement[bool]:
+    """The mechanically-expressible domain of the #158 V2 admission policy.
+
+    ``risk_aware_shadow_v1`` decides over live proposals (an active,
+    superseded, or closed item is ``not_live`` and blocked on every surface),
+    and unresolved conflicts are blocked before any evidence is examined.
+    Both facts are pure SQL, so they are applied *before* the bounded HNSW
+    window (issue #186) — rows the V2 gate would inevitably withhold can
+    never occupy the candidate window and starve eligible proposals.
+    """
+    return and_(
+        MemoryItem.review_status == "proposed",
+        MemoryItem.valid_to.is_(None),
+        MemoryItem.superseded_by.is_(None),
+        MemoryItem.conflict_resolution_status.is_distinct_from("unresolved"),
+    )
+
+
 def _signal_corpus_eligibility(
     profile: RecallProfileSpec,
     stay_kinds: set[str],
@@ -1032,66 +1050,106 @@ def _signal_corpus_eligibility(
     """The pre-retrieval corpus predicate for a signal profile (issue #160).
 
     Everything mechanically expressible without examining relevance is pushed
-    into SQL *before* the bounded HNSW window, so rows the admission gate
-    would inevitably withhold (e.g. disputed items whose kind is not a
-    governed stay kind) can never occupy the candidate window and starve
-    eligible rows sitting just outside it. For governed recall this is
-    exactly::
-
-        review_status = 'active'
-        OR (review_status = 'disputed' AND kind is governed to remain in
-        recall while disputed)
-
-    Per-item durable-admission freshness cannot be expressed without
-    examining state, so it remains the post-retrieval admission gate's job.
+    into SQL *before* the bounded HNSW window. Since issue #186 the signal
+    profiles are V2-bound: their admission authority is the exact #158
+    per-surface decision, whose expressible domain is the live-proposal
+    corpus (:func:`_live_proposal_expression`) — everything else (risk,
+    epistemic state, calibration, observation windows, external disputes) is
+    the post-retrieval V2 gate's job. ``stay_kinds`` is retained for
+    signature compatibility with future corpus doctrines; the disputed
+    stay-kind doctrine is not part of the V2-bound window (disputed items are
+    never live proposals).
     """
-    if "disputed" in profile.review_statuses:
-        return _review_status_clause(stay_kinds)
-    return MemoryItem.review_status.in_(profile.review_statuses)
+    return _live_proposal_expression()
+
+
+@dataclass
+class SignalAdmissionOutcome:
+    """What the V2-bound admission step produced for one candidate window.
+
+    ``admission_diagnostics`` carries one bounded, content-free entry per
+    withheld candidate — identity and codes only — so operators can see the
+    exact local-versus-V2 disagreement that withheld it (issue #186)."""
+
+    items: list[dict[str, Any]]
+    omitted_by_admission: dict[str, int]
+    admission_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    v2_resolution: dict[str, Any] | None = None
 
 
 async def _admit_and_rank_signal_items(
     session: AsyncSession,
     *,
     profile: RecallProfileSpec,
-    tenant_id: str,
+    memory_context: ResolvedMemoryContext,
     candidates: list[dict[str, Any]],
     item_by_id: dict[UUID, MemoryItem],
     stay_kinds: set[str],
     now: datetime,
-) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Governed admission + separated-signal ranking (issue #160).
+) -> SignalAdmissionOutcome:
+    """V2-bound admission + separated-signal ranking (issues #160 / #186).
 
     Admission runs on the retrieved candidate window — after relevance
     retrieval (whose SQL already excluded mechanically-ineligible rows — see
     :func:`_signal_corpus_eligibility`), before ranking, packing, and (by not
     running at all for signal profiles) before any graph/tunnel expansion, so
-    nothing ineligible can enter the packet through a side door. Withheld
-    items are counted by reason code (``omitted_by_admission``) without
-    retaining their content.
+    nothing ineligible can enter the packet through a side door.
 
-    Returns (admitted items sorted by signal rank, omission counts by code).
+    The positive admission authority is the exact #158 ``risk_aware_shadow_v1``
+    per-surface decision, resolved for the whole window by the shared bulk
+    resolver (``admission_shadow.resolve_bulk_v2_decisions`` — the same
+    evaluation the #158 simulator runs). Recall-local rules (the #159
+    blocked/stale binding, lifecycle facts) can only withhold. Withheld items
+    are counted by reason code (``omitted_by_admission``) and itemized
+    content-free in ``admission_diagnostics``.
+
+    Returns the admitted items sorted by signal rank plus the omission
+    counts, diagnostics, and V2 resolution summary.
     """
+    items = list(item_by_id.values())
     bindings = await recall_signals.load_admission_bindings(
-        session, tenant_id=tenant_id, items=list(item_by_id.values())
+        session, tenant_id=str(memory_context.tenant_id), items=items
     )
+    resolution = None
+    v2_summary: dict[str, Any] | None = None
+    if profile.v2_surface is not None and items:
+        from engram.admission_shadow import resolve_bulk_v2_decisions
+
+        resolution = await resolve_bulk_v2_decisions(
+            session,
+            items=items,
+            context=memory_context,
+            evaluation_time=now,
+        )
+        v2_summary = resolution.summary()
 
     admitted: list[tuple[dict[str, Any], float, float]] = []
     omitted: dict[str, int] = {}
+    diagnostics: list[dict[str, Any]] = []
     for cand in candidates:
         item = item_by_id.get(UUID(cand["id"]))
         if item is None:
             # Stale embedding whose item disappeared — skip.
             continue
+        resolved_v2 = resolution.items.get(item.id) if resolution is not None else None
         decision = recall_signals.decide_recall_admission(
             item,
             profile=profile,
             stay_kinds=stay_kinds,
             assessment=bindings.get(item.id),
+            v2_resolution=resolved_v2,
         )
         if decision.decision == "withhold":
             code = decision.reason_codes[0]
             omitted[code] = omitted.get(code, 0) + 1
+            diagnostics.append(
+                _admission_diagnostic(
+                    item,
+                    profile=profile,
+                    decision=decision,
+                    assessment=bindings.get(item.id),
+                )
+            )
             continue
 
         distance = float(cand.get("distance", 0.0))
@@ -1113,7 +1171,53 @@ async def _admit_and_rank_signal_items(
 
     # Deterministic order: signal rank desc, then closer vector, then newer.
     admitted.sort(key=lambda entry: (-entry[0]["score"], entry[1], -entry[2]))
-    return [entry[0] for entry in admitted], omitted
+    return SignalAdmissionOutcome(
+        items=[entry[0] for entry in admitted],
+        omitted_by_admission=omitted,
+        admission_diagnostics=diagnostics,
+        v2_resolution=v2_summary,
+    )
+
+
+def _admission_diagnostic(
+    item: MemoryItem,
+    *,
+    profile: RecallProfileSpec,
+    decision: recall_signals.RecallAdmissionDecision,
+    assessment: recall_signals.AdmissionAssessmentBinding | None,
+) -> dict[str, Any]:
+    """One bounded, content-free withheld-candidate diagnostic.
+
+    Identity and codes only: no content, no provider output. The item is
+    already read-eligible and relevance-retrieved for this caller, so its id
+    and reason codes leak nothing the caller cannot already see. The V2
+    facts come straight from the decision's own binding.
+    ``gates_disagree`` is the bounded mismatch diagnostic of issue #186 —
+    true exactly when a *current* V2 decision and the recall-local hard gate
+    would decide differently (unavailable V2 state is fail-closed
+    unavailability, not a disagreement; the local hard gate is withhold-only,
+    so "local would admit" means the lifecycle/#159 layers had no objection).
+    """
+    binding = decision.v2
+    v2_status = binding.resolution_status if binding is not None else "missing"
+    surface_decision = binding.surface_decision if binding is not None else None
+    local_would_admit = (
+        recall_signals.v2_local_gate_withhold_reason(
+            item, profile=profile, assessment=assessment
+        )
+        is None
+    )
+    v2_allows = v2_status == "current" and surface_decision == "allow"
+    return {
+        "item_id": str(item.id),
+        "profile": profile.key,
+        "decision": decision.decision,
+        "reason_codes": list(decision.reason_codes),
+        "surface": profile.v2_surface,
+        "v2_resolution_status": v2_status,
+        "v2_surface_decision": surface_decision,
+        "gates_disagree": v2_status == "current" and (local_would_admit != v2_allows),
+    }
 
 
 @dataclass
@@ -1138,6 +1242,10 @@ class SemanticPacketEvaluation:
     byte_budget: int | None = None
     token_budget: int | None = None
     item_budget: int | None = None
+    # V2-bound admission context (issue #186): bounded content-free
+    # diagnostics for withheld candidates, and the resolution summary.
+    admission_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    v2_resolution: dict[str, Any] | None = None
 
     def finalize_counts(self) -> None:
         self.item_count = len(self.items)
@@ -1296,22 +1404,28 @@ async def evaluate_semantic_profile(
         item_by_id = {item.id: item for item in rows.scalars().all()}
 
     omitted_by_admission: dict[str, int] = {}
+    admission_diagnostics: list[dict[str, Any]] = []
+    v2_resolution_summary: dict[str, Any] | None = None
     if profile.signals_enabled:
-        # 4. Governed admission + separated-signal ranking (issue #160).
+        # 4. V2-bound admission + separated-signal ranking (issues #160/#186).
         #    Relationship expansion deliberately does not run for signal
         #    profiles: admission must be enforced before graph/tunnel
         #    expansion, and the expansion rescorer still speaks the legacy
         #    blended score. Teaching expansion the signal model is follow-up
         #    work; until then these profiles serve only direct semantic hits.
-        enriched, omitted_by_admission = await _admit_and_rank_signal_items(
+        admission_outcome = await _admit_and_rank_signal_items(
             session,
             profile=profile,
-            tenant_id=str(memory_context.tenant_id),
+            memory_context=memory_context,
             candidates=candidates,
             item_by_id=item_by_id,
             stay_kinds=stay_kinds,
             now=now,
         )
+        enriched = admission_outcome.items
+        omitted_by_admission = admission_outcome.omitted_by_admission
+        admission_diagnostics = admission_outcome.admission_diagnostics
+        v2_resolution_summary = admission_outcome.v2_resolution
     else:
         # 4. Build per-item response dicts in trust-weighted order (legacy
         #    profile — pre-#160 behavior, byte-for-byte). The candidate dicts
@@ -1382,6 +1496,8 @@ async def evaluate_semantic_profile(
         byte_budget=byte_budget,
         token_budget=token_budget,
         item_budget=item_budget,
+        admission_diagnostics=admission_diagnostics,
+        v2_resolution=v2_resolution_summary,
     )
     evaluation.finalize_counts()
     return evaluation

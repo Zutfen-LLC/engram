@@ -1,21 +1,27 @@
-"""Unit tests for the separated recall signal model (issue #160 / ENG-RECALL-003).
+"""Unit tests for the separated recall signal model (issues #160 / #186).
 
-Pure-function contract tests — no DB. These pin the core ENG-RECALL-003
-invariants:
+Pure-function contract tests — no DB. These pin the core invariants:
 
 * relevance, utility, epistemic state, governance, and risk stay separate;
 * importance/utility can reorder admitted items but never change epistemic
   state or the admission decision;
 * unknown evidence is admitted-or-withheld-and-marked, never converted into a
-  numeric trust floor.
+  numeric trust floor;
+* for the V2-bound candidate profiles (issue #186) the admission authority is
+  the exact #158 ``risk_aware_shadow_v1`` per-surface decision — never
+  ``review_status``, and never a #159 Path-A binding. Missing, stale,
+  mismatched, or unsupported V2 state fails closed with an explicit code.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
+from engram.admission_policy import AdmissionPolicyDecision
 from engram.models import MemoryItem
 from engram.recall_profiles import EXPLORATORY_PROFILE, GOVERNED_PROFILE
 from engram.recall_signals import (
@@ -23,12 +29,14 @@ from engram.recall_signals import (
     SIGNALS_VERSION,
     AdmissionAssessmentBinding,
     RecallAdmissionDecision,
+    build_v2_surface_binding,
     compute_signal_rank_score,
     compute_utility_score,
     decide_recall_admission,
     derive_epistemic_state,
     signal_item_fields,
     structured_warning_codes,
+    v2_local_gate_withhold_reason,
 )
 
 _NOW = datetime(2026, 9, 6, tzinfo=UTC)
@@ -81,6 +89,55 @@ def _make_item(**overrides: Any) -> MemoryItem:
     }
     defaults.update(overrides)
     return MemoryItem(**defaults)
+
+
+@dataclass
+class _FakeResolution:
+    """The resolver result shape (``admission_shadow.ResolvedV2Decision``)."""
+
+    status: str
+    decision: AdmissionPolicyDecision
+    assessment: Any = None
+
+
+def _v2_decision(
+    *,
+    governed: str = "allow",
+    exploratory: str = "allow",
+    startup: str = "withhold",
+) -> AdmissionPolicyDecision:
+    """One representative #158 decision envelope with per-surface outputs."""
+    return AdmissionPolicyDecision(
+        schema_version="engram.admission-assessment.v2",
+        profile_key="risk_aware_shadow_v1",
+        policy_version="risk-aware-shadow-v1",
+        policy_config_digest="sha256:" + "a" * 64,
+        decision_hash="sha256:" + "b" * 64,
+        risk_state="low",
+        epistemic_state="supported",
+        retention_state="retain",
+        effective_assessment_refs=(
+            {"assessment_id": str(uuid4()), "purpose": "combined", "canonical_hash": "sha256:x"},
+        ),
+        highest_admission_tier="semantic_governed" if governed == "allow" else "none",
+        surface_decisions={
+            "semantic_exploratory": exploratory,
+            "semantic_governed": governed,
+            "startup": startup,
+        },
+        blocker_codes=(),
+        reason_codes=("governed_evidence_qualified",),
+        next_actions=("none",),
+        observation_window_hours=0,
+        eligible_at=None,
+        next_evaluation_at=None,
+    )
+
+
+def _current(decision: AdmissionPolicyDecision) -> _FakeResolution:
+    return _FakeResolution(
+        status="current", decision=decision, assessment=SimpleNamespace(id=uuid4())
+    )
 
 
 # ---- utility ----
@@ -151,9 +208,7 @@ def test_epistemic_state_matrix() -> None:
     )
     assert (
         derive_epistemic_state(
-            review_status="active",
-            human_verified=False,
-            conflict_resolution_status="unresolved",
+            review_status="active", human_verified=False, conflict_resolution_status="unresolved"
         )
         == "contested"
     )
@@ -210,254 +265,294 @@ def test_rank_is_deterministic_and_bounded() -> None:
     assert 0.0 <= a <= 1.0
 
 
-# ---- admission: governed ----
+# ---- admission: the V2 surface gate (issue #186) ----
 
 
-def test_governed_admits_active_item_without_assessment() -> None:
-    decision = decide_recall_admission(_make_item(), profile=GOVERNED_PROFILE, stay_kinds=set())
-    assert decision.decision == "admit"
-    assert decision.reason_codes == ("admitted_review_active",)
-    assert decision.assessment_id is None
-
-
-def test_governed_binds_current_admitted_assessment() -> None:
-    binding = AdmissionAssessmentBinding(
-        assessment_id=str(uuid4()), status="current", outcome="admitted"
-    )
+def test_governed_admits_only_on_current_v2_allow() -> None:
+    item = _make_item(review_status="proposed")
     decision = decide_recall_admission(
-        _make_item(), profile=GOVERNED_PROFILE, stay_kinds=set(), assessment=binding
+        item,
+        profile=GOVERNED_PROFILE,
+        stay_kinds=set(),
+        v2_resolution=_current(_v2_decision(governed="allow")),
     )
     assert decision.decision == "admit"
-    assert decision.assessment_id == binding.assessment_id
-    assert decision.assessment_status == "current"
-    assert decision.assessment_outcome == "admitted"
+    assert decision.reason_codes == ("admitted_v2_surface_allow",)
+    assert decision.surface == "semantic_governed"
+    assert decision.surface_decision == "allow"
+    assert decision.v2 is not None
+    assert decision.v2.resolution_status == "current"
+    assert decision.v2.profile_key == "risk_aware_shadow_v1"
+    assert decision.v2.decision_hash == "sha256:" + "b" * 64
 
 
-def test_governed_withholds_highly_important_proposal() -> None:
-    """Issue eval requirement 3: a highly similar (or important) proposal with
-    unknown evidence is excluded from governed mode — no numeric trust floor
-    lets it through."""
-    item = _make_item(review_status="proposed", importance=1.0)
+def test_admitted_item_carries_the_full_safe_v2_binding_block() -> None:
+    item = _make_item(review_status="proposed")
+    resolution = _current(_v2_decision(governed="allow"))
+    decision = decide_recall_admission(
+        item, profile=GOVERNED_PROFILE, stay_kinds=set(), v2_resolution=resolution
+    )
+    payload = decision.payload()
+    assert payload["surface"] == "semantic_governed"
+    assert payload["surface_decision"] == "allow"
+    v2 = payload["v2"]
+    assert v2["assessment_id"] == str(resolution.assessment.id)
+    assert v2["schema_version"] == "engram.admission-assessment.v2"
+    assert v2["policy_artifact_digest"] == "sha256:" + "a" * 64
+    assert v2["decision_hash"] == "sha256:" + "b" * 64
+    assert v2["resolution_status"] == "current"
+    assert v2["surface_decision"] == "allow"
+    assert v2["risk_state"] == "low"
+    assert v2["epistemic_state"] == "supported"
+    assert v2["retention_state"] == "retain"
+    assert v2["reason_codes"] == ["governed_evidence_qualified"]
+    # The binding is identity + codes only — never content or provider output.
+    assert set(v2) == {
+        "assessment_id",
+        "schema_version",
+        "profile_key",
+        "policy_version",
+        "policy_artifact_digest",
+        "decision_hash",
+        "resolution_status",
+        "surface",
+        "surface_decision",
+        "highest_admission_tier",
+        "risk_state",
+        "epistemic_state",
+        "retention_state",
+        "effective_assessment_refs",
+        "observation_window_hours",
+        "eligible_at",
+        "next_evaluation_at",
+        "blocker_codes",
+        "reason_codes",
+        "next_actions",
+    }
+
+
+def test_missing_v2_decision_fails_closed_explicitly() -> None:
+    """No resolution at all — the canonical no-V2-row case. Never a fallback
+    to review_status=active or low-risk defaults."""
+    item = _make_item(review_status="proposed")
     decision = decide_recall_admission(item, profile=GOVERNED_PROFILE, stay_kinds=set())
     assert decision.decision == "withhold"
-    assert "proposed_not_admitted" in decision.reason_codes
+    assert decision.reason_codes == ("v2_decision_missing",)
+    assert decision.v2 is not None
+    assert decision.v2.resolution_status == "missing"
+    assert decision.v2.assessment_id is None
 
 
-def test_governed_withholds_item_with_stale_assessment() -> None:
-    """Issue eval requirement 4: an active item under a stale policy
-    assessment is withheld, not silently served."""
-    binding = AdmissionAssessmentBinding(
-        assessment_id=str(uuid4()), status="stale", outcome="admitted"
-    )
+def test_noncurrent_v2_resolutions_each_withhold_with_their_own_code() -> None:
+    item = _make_item(review_status="proposed")
+    for status in ("stale", "mismatched", "unsupported"):
+        decision = decide_recall_admission(
+            item,
+            profile=GOVERNED_PROFILE,
+            stay_kinds=set(),
+            v2_resolution=_FakeResolution(status=status, decision=_v2_decision()),
+        )
+        assert decision.decision == "withhold", status
+        assert decision.reason_codes == (f"v2_decision_{status}",), status
+        assert decision.v2 is not None and decision.v2.resolution_status == status
+
+
+def test_unknown_resolver_status_fails_closed_as_unsupported() -> None:
+    item = _make_item(review_status="proposed")
     decision = decide_recall_admission(
-        _make_item(), profile=GOVERNED_PROFILE, stay_kinds=set(), assessment=binding
+        item,
+        profile=GOVERNED_PROFILE,
+        stay_kinds=set(),
+        v2_resolution=_FakeResolution(status="some_future_status", decision=_v2_decision()),
     )
     assert decision.decision == "withhold"
-    assert "admission_assessment_stale" in decision.reason_codes
+    assert decision.reason_codes == ("v2_decision_unsupported",)
 
 
-def test_governed_withholds_blocked_assessment() -> None:
-    binding = AdmissionAssessmentBinding(
-        assessment_id=str(uuid4()), status="current", outcome="blocked"
-    )
+def test_v2_surface_decisions_map_exactly_per_profile() -> None:
+    """withhold/review_required/blocked/unknown on the exact surface are
+    consumed as-is — distinct outcomes stay distinct, never flattened."""
+    item = _make_item(review_status="proposed")
+    for surface_value in ("withhold", "review_required", "blocked", "unknown"):
+        decision = decide_recall_admission(
+            item,
+            profile=GOVERNED_PROFILE,
+            stay_kinds=set(),
+            v2_resolution=_current(_v2_decision(governed=surface_value)),
+        )
+        assert decision.decision == "withhold", surface_value
+        assert decision.reason_codes == (f"v2_surface_{surface_value}",), surface_value
+        assert decision.surface_decision == surface_value
+
+
+def test_active_item_cannot_be_admitted_by_any_v2_output() -> None:
+    """review_status='active' is not a positive admission source (issue #186
+    test 3): an active item is outside the policy's live-proposal domain and
+    withholds as not-live even when a (stale, as it must be) row says allow."""
+    item = _make_item(review_status="active")
+    for governed in ("allow", "review_required"):
+        decision = decide_recall_admission(
+            item,
+            profile=GOVERNED_PROFILE,
+            stay_kinds=set(),
+            v2_resolution=_current(_v2_decision(governed=governed)),
+        )
+        assert decision.decision == "withhold", governed
+        assert decision.reason_codes == ("v2_item_not_live",)
+    # And with no V2 state at all, active is equally inadmissible.
+    decision = decide_recall_admission(item, profile=GOVERNED_PROFILE, stay_kinds=set())
+    assert decision.decision == "withhold"
+
+
+def test_unresolved_conflict_withholds_even_with_v2_allow() -> None:
+    item = _make_item(review_status="proposed", conflict_resolution_status="unresolved")
     decision = decide_recall_admission(
-        _make_item(), profile=GOVERNED_PROFILE, stay_kinds=set(), assessment=binding
+        item,
+        profile=GOVERNED_PROFILE,
+        stay_kinds=set(),
+        v2_resolution=_current(_v2_decision(governed="allow")),
     )
     assert decision.decision == "withhold"
-    assert "admission_blocked" in decision.reason_codes
+    assert decision.reason_codes == ("conflict_unresolved",)
 
 
-def test_governed_admits_but_marks_legacy_import_assessment() -> None:
-    binding = AdmissionAssessmentBinding(
-        assessment_id=str(uuid4()), status="legacy_import", outcome="admitted"
+def test_governed_and_exploratory_consume_their_own_exact_surfaces() -> None:
+    """One decision, two surfaces: exploratory may allow exactly what governed
+    routes to review — never by inheriting governed semantics or vice versa."""
+    item = _make_item(review_status="proposed")
+    resolution = _current(_v2_decision(governed="review_required", exploratory="allow"))
+    governed = decide_recall_admission(
+        item, profile=GOVERNED_PROFILE, stay_kinds=set(), v2_resolution=resolution
     )
-    decision = decide_recall_admission(
-        _make_item(), profile=GOVERNED_PROFILE, stay_kinds=set(), assessment=binding
+    exploratory = decide_recall_admission(
+        item, profile=EXPLORATORY_PROFILE, stay_kinds=set(), v2_resolution=resolution
     )
-    assert decision.decision == "admit"
-    assert "admission_legacy_import" in decision.reason_codes
+    assert governed.decision == "withhold"
+    assert governed.reason_codes == ("v2_surface_review_required",)
+    assert exploratory.decision == "admit"
+    assert exploratory.surface == "semantic_exploratory"
+    assert exploratory.surface_decision == "allow"
 
 
-def test_governed_disputed_follows_stay_kind_policy() -> None:
-    stay_item = _make_item(review_status="disputed", kind="doctrine")
-    decision = decide_recall_admission(
-        stay_item, profile=GOVERNED_PROFILE, stay_kinds={"doctrine"}
-    )
-    assert decision.decision == "admit"
-    assert "admitted_disputed_stay_kind" in decision.reason_codes
-
-    leave_item = _make_item(review_status="disputed", kind="whisper")
-    decision = decide_recall_admission(
-        leave_item, profile=GOVERNED_PROFILE, stay_kinds={"doctrine"}
-    )
-    assert decision.decision == "withhold"
-    assert "review_status_ineligible" in decision.reason_codes
+def test_blocked_surface_withholds_on_both_candidate_profiles() -> None:
+    item = _make_item(review_status="proposed")
+    resolution = _current(_v2_decision(governed="blocked", exploratory="blocked"))
+    for profile in (GOVERNED_PROFILE, EXPLORATORY_PROFILE):
+        decision = decide_recall_admission(
+            item, profile=profile, stay_kinds=set(), v2_resolution=resolution
+        )
+        assert decision.decision == "withhold"
+        assert decision.reason_codes == ("v2_surface_blocked",)
 
 
-def test_disputed_stay_kind_admission_binds_assessment() -> None:
-    """An admitted disputed stay-kind item carries its assessment binding —
-    served items must be bound to the decision that authorized them."""
+def test_path_a_binding_never_fabricates_v2_authority() -> None:
+    """A current #159 Path-A assessment cannot admit anything on its own
+    (issue #186 test 7) — without a current V2 decision the item withholds."""
+    item = _make_item(review_status="proposed")
     binding = AdmissionAssessmentBinding(
         assessment_id=str(uuid4()), status="current", outcome="admitted"
     )
     decision = decide_recall_admission(
-        _make_item(review_status="disputed", kind="doctrine"),
-        profile=GOVERNED_PROFILE,
-        stay_kinds={"doctrine"},
-        assessment=binding,
-    )
-    assert decision.decision == "admit"
-    assert decision.assessment_id == binding.assessment_id
-    assert decision.assessment_status == "current"
-
-
-def test_disputed_stay_kind_blocked_assessment_withholds_in_every_profile() -> None:
-    """An explicit policy block wins even for a governed stay kind — a
-    disputed stay-kind item must not slip past a blocked assessment."""
-    binding = AdmissionAssessmentBinding(
-        assessment_id=str(uuid4()), status="current", outcome="blocked"
-    )
-    for profile in (GOVERNED_PROFILE, EXPLORATORY_PROFILE):
-        decision = decide_recall_admission(
-            _make_item(review_status="disputed", kind="doctrine"),
-            profile=profile,
-            stay_kinds={"doctrine"},
-            assessment=binding,
-        )
-        assert decision.decision == "withhold"
-        assert "admission_blocked" in decision.reason_codes
-
-
-def test_governed_disputed_stay_kind_with_stale_assessment_withholds() -> None:
-    """Correctness regression (issue #160 correction): a stale assessment
-    cannot authorize serving a disputed stay-kind item either — governed
-    recall fails closed on stale durable admission state for *every*
-    governance-compatible review status, not just active items."""
-    binding = AdmissionAssessmentBinding(
-        assessment_id=str(uuid4()), status="stale", outcome="admitted"
-    )
-    decision = decide_recall_admission(
-        _make_item(review_status="disputed", kind="doctrine"),
-        profile=GOVERNED_PROFILE,
-        stay_kinds={"doctrine"},
-        assessment=binding,
+        item, profile=GOVERNED_PROFILE, stay_kinds=set(), assessment=binding
     )
     assert decision.decision == "withhold"
-    assert decision.reason_codes == ("admission_assessment_stale",)
-    assert decision.assessment_id == binding.assessment_id
+    assert decision.reason_codes == ("v2_decision_missing",)
 
 
-def test_exploratory_disputed_stay_kind_with_stale_assessment_marks_not_trusts() -> None:
-    """Exploratory keeps admitting the disputed stay kind but carries the
-    staleness as a mark — the candidate policy for non-strict profiles."""
-    binding = AdmissionAssessmentBinding(
-        assessment_id=str(uuid4()), status="stale", outcome="admitted"
-    )
-    decision = decide_recall_admission(
-        _make_item(review_status="disputed", kind="doctrine"),
-        profile=EXPLORATORY_PROFILE,
-        stay_kinds={"doctrine"},
-        assessment=binding,
-    )
-    assert decision.decision == "admit"
-    assert "admitted_disputed_stay_kind" in decision.reason_codes
-    assert "admission_assessment_stale" in decision.reason_codes
-
-
-def test_stale_assessment_withholds_for_every_governed_review_status() -> None:
-    """The governed stale-withhold is applied centrally, so it cannot drift
-    per review-status branch — including future governance-compatible
-    states added to the window."""
-    binding = AdmissionAssessmentBinding(
-        assessment_id=str(uuid4()), status="stale", outcome="admitted"
-    )
-    for review_status, kind in (("active", "fact"), ("disputed", "doctrine")):
-        decision = decide_recall_admission(
-            _make_item(review_status=review_status, kind=kind),
-            profile=GOVERNED_PROFILE,
-            stay_kinds={"doctrine"},
-            assessment=binding,
-        )
-        assert decision.decision == "withhold"
-        assert decision.reason_codes == ("admission_assessment_stale",)
-
-
-def test_blocked_assessment_wins_on_every_candidate_profile_branch() -> None:
-    """A blocked outcome withholds for every (profile, review-status) pair —
-    including combinations each branch used to decide separately, and even
-    when the row is simultaneously stale (blocked outranks the stale mark
-    because both withhold, and the explicit policy outcome is the louder
-    reason)."""
+def test_path_a_blocked_and_stale_bindings_withhold_despite_v2_allow() -> None:
+    """Recall-local defense in depth can only withhold: a #159 blocked
+    outcome (every profile) or stale projection (strict profiles) wins over a
+    V2 allow — the local boundaries stay stronger than any V2 decision."""
     blocked = AdmissionAssessmentBinding(
         assessment_id=str(uuid4()), status="current", outcome="blocked"
     )
-    stale_blocked = AdmissionAssessmentBinding(
-        assessment_id=str(uuid4()), status="stale", outcome="blocked"
-    )
-    cases = (
-        _make_item(review_status="active"),
-        _make_item(review_status="disputed", kind="doctrine"),
-        _make_item(review_status="proposed"),
-    )
-    for binding in (blocked, stale_blocked):
-        for profile in (GOVERNED_PROFILE, EXPLORATORY_PROFILE):
-            for item in cases:
-                decision = decide_recall_admission(
-                    item,
-                    profile=profile,
-                    stay_kinds={"doctrine"},
-                    assessment=binding,
-                )
-                assert decision.decision == "withhold", (profile, item.review_status, binding)
-                assert decision.reason_codes == ("admission_blocked",)
-
-
-# ---- admission: exploratory ----
-
-
-def test_exploratory_admits_proposal_as_unknown_evidence() -> None:
-    decision = decide_recall_admission(
-        _make_item(review_status="proposed"), profile=EXPLORATORY_PROFILE, stay_kinds=set()
-    )
-    assert decision.decision == "admit"
-    assert "exploratory_proposal" in decision.reason_codes
-
-
-def test_exploratory_admits_but_marks_stale_assessment() -> None:
-    """Exploratory marks stale assessments instead of withholding — its whole
-    purpose is structured uncertainty — but a hard policy block still wins."""
-    binding = AdmissionAssessmentBinding(
+    stale = AdmissionAssessmentBinding(
         assessment_id=str(uuid4()), status="stale", outcome="admitted"
     )
-    decision = decide_recall_admission(
-        _make_item(), profile=EXPLORATORY_PROFILE, stay_kinds=set(), assessment=binding
-    )
-    assert decision.decision == "admit"
-    assert "admission_assessment_stale" in decision.reason_codes
-
-
-def test_exploratory_withholds_blocked_assessment() -> None:
-    binding = AdmissionAssessmentBinding(
-        assessment_id=str(uuid4()), status="current", outcome="blocked"
-    )
-    for review_status in ("active", "proposed"):
+    item = _make_item(review_status="proposed")
+    allow = _current(_v2_decision(governed="allow", exploratory="allow"))
+    for profile in (GOVERNED_PROFILE, EXPLORATORY_PROFILE):
         decision = decide_recall_admission(
-            _make_item(review_status=review_status),
-            profile=EXPLORATORY_PROFILE,
-            stay_kinds=set(),
-            assessment=binding,
+            item, profile=profile, stay_kinds=set(), assessment=blocked, v2_resolution=allow
         )
         assert decision.decision == "withhold"
-        assert "admission_blocked" in decision.reason_codes
-
-
-def test_exploratory_disputed_non_stay_kind_withheld() -> None:
-    decision = decide_recall_admission(
-        _make_item(review_status="disputed", kind="whisper"),
-        profile=EXPLORATORY_PROFILE,
-        stay_kinds={"doctrine"},
+        assert decision.reason_codes == ("admission_blocked",)
+    governed_stale = decide_recall_admission(
+        item, profile=GOVERNED_PROFILE, stay_kinds=set(), assessment=stale, v2_resolution=allow
     )
-    assert decision.decision == "withhold"
+    assert governed_stale.decision == "withhold"
+    assert governed_stale.reason_codes == ("admission_assessment_stale",)
+
+
+def test_exploratory_admits_with_v2_allow_and_marks_stale_path_a_binding() -> None:
+    """Non-strict profiles carry the stale Path-A snapshot as a mark —
+    reported, never trusted as authorization."""
+    stale = AdmissionAssessmentBinding(
+        assessment_id=str(uuid4()), status="stale", outcome="admitted"
+    )
+    item = _make_item(review_status="proposed")
+    decision = decide_recall_admission(
+        item,
+        profile=EXPLORATORY_PROFILE,
+        stay_kinds=set(),
+        assessment=stale,
+        v2_resolution=_current(_v2_decision(exploratory="allow")),
+    )
+    assert decision.decision == "admit"
+    assert decision.reason_codes == ("admitted_v2_surface_allow", "admission_assessment_stale")
+    # The legacy payload fields keep their #159 meaning; V2 identity is separate.
+    assert decision.assessment_id == stale.assessment_id
+    assert decision.v2 is not None and decision.v2.resolution_status == "current"
+
+
+def test_local_gate_helper_reports_only_withholds() -> None:
+    item = _make_item(review_status="proposed")
+    assert v2_local_gate_withhold_reason(item, profile=GOVERNED_PROFILE, assessment=None) is None
+    assert (
+        v2_local_gate_withhold_reason(
+            _make_item(review_status="active"), profile=GOVERNED_PROFILE, assessment=None
+        )
+        == "v2_item_not_live"
+    )
+    assert (
+        v2_local_gate_withhold_reason(
+            _make_item(review_status="proposed", conflict_resolution_status="unresolved"),
+            profile=GOVERNED_PROFILE,
+            assessment=None,
+        )
+        == "conflict_unresolved"
+    )
+    blocked = AdmissionAssessmentBinding(
+        assessment_id=str(uuid4()), status="current", outcome="blocked"
+    )
+    assert (
+        v2_local_gate_withhold_reason(item, profile=GOVERNED_PROFILE, assessment=blocked)
+        == "admission_blocked"
+    )
+
+
+def test_missing_binding_builder_is_explicit_not_silent() -> None:
+    binding = build_v2_surface_binding(None, surface="semantic_governed")
+    payload = binding.payload()
+    assert payload["resolution_status"] == "missing"
+    assert payload["surface"] == "semantic_governed"
+    assert payload["assessment_id"] is None
+    assert payload["surface_decision"] is None
+    # Even with no row, the binding names the policy profile that would own
+    # the decision — a withheld item never reads as "no policy ran".
+    assert payload["profile_key"] == "risk_aware_shadow_v1"
+
+
+def test_v2_vocabulary_cannot_drift_from_the_resolver() -> None:
+    """The gate's status tuple and profile key mirror the #158 resolver's
+    canonical vocabulary; a change on either side must land on both."""
+    from typing import get_args
+
+    from engram.admission_shadow import SHADOW_PROFILE_KEY, V2ResolutionStatus
+    from engram.recall_signals import V2_ADMISSION_PROFILE_KEY, V2_RESOLUTION_STATUSES
+
+    assert set(V2_RESOLUTION_STATUSES) == set(get_args(V2ResolutionStatus))
+    assert V2_ADMISSION_PROFILE_KEY == SHADOW_PROFILE_KEY
 
 
 # ---- admission invariants ----
@@ -475,16 +570,27 @@ def test_admission_ignores_relevance_and_utility_inputs() -> None:
 
 
 def test_importance_never_changes_admission() -> None:
+    resolution = _current(_v2_decision(governed="allow", exploratory="allow"))
     for importance in (0.0, 1.0):
-        item = _make_item(review_status="proposed", importance=importance)
+        proposed = _make_item(review_status="proposed", importance=importance)
         assert (
-            decide_recall_admission(item, profile=GOVERNED_PROFILE, stay_kinds=set()).decision
-            == "withhold"
-        )
-        item = _make_item(review_status="active", importance=importance)
-        assert (
-            decide_recall_admission(item, profile=GOVERNED_PROFILE, stay_kinds=set()).decision
+            decide_recall_admission(
+                proposed,
+                profile=GOVERNED_PROFILE,
+                stay_kinds=set(),
+                v2_resolution=resolution,
+            ).decision
             == "admit"
+        )
+        active = _make_item(review_status="active", importance=importance)
+        assert (
+            decide_recall_admission(
+                active,
+                profile=GOVERNED_PROFILE,
+                stay_kinds=set(),
+                v2_resolution=resolution,
+            ).decision
+            == "withhold"
         )
 
 
@@ -505,7 +611,12 @@ def test_warning_codes_are_machine_readable_and_mirror_warnings() -> None:
 
 def test_signal_item_fields_expose_separate_signals_with_versions() -> None:
     item = _make_item(review_status="proposed", importance=0.8)
-    decision = decide_recall_admission(item, profile=EXPLORATORY_PROFILE, stay_kinds=set())
+    decision = decide_recall_admission(
+        item,
+        profile=EXPLORATORY_PROFILE,
+        stay_kinds=set(),
+        v2_resolution=_current(_v2_decision(exploratory="allow")),
+    )
     fields = signal_item_fields(
         item, decision=decision, similarity=0.9, now=_NOW
     )
@@ -517,6 +628,7 @@ def test_signal_item_fields_expose_separate_signals_with_versions() -> None:
     assert fields["admission"]["profile"] == "exploratory"
     assert fields["admission"]["decision"] == "admit"
     assert fields["admission"]["policy_version"] == RECALL_ADMISSION_POLICY_VERSION
+    assert fields["admission"]["v2"]["resolution_status"] == "current"
     assert "unreviewed" in fields["warnings"]
     # The rank score is reproducible from its published inputs.
     assert fields["score"] == compute_signal_rank_score(
@@ -525,7 +637,9 @@ def test_signal_item_fields_expose_separate_signals_with_versions() -> None:
 
 
 def test_signal_item_fields_never_expose_a_blended_trust_score() -> None:
-    decision = decide_recall_admission(_make_item(), profile=GOVERNED_PROFILE, stay_kinds=set())
+    decision = RecallAdmissionDecision(
+        profile="governed", decision="admit", reason_codes=("admitted_v2_surface_allow",)
+    )
     fields = signal_item_fields(_make_item(), decision=decision, similarity=0.5, now=_NOW)
     assert "trust_score" not in fields
 
@@ -550,24 +664,31 @@ def test_changing_memory_confidence_changes_no_signal_output() -> None:
     separated-signal output — most importantly no generic warning that a
     caller could reasonably read as a factual/epistemic confidence claim
     (the ``low_confidence`` conflation #160 removes)."""
+    resolution = _current(_v2_decision(governed="allow"))
     low = signal_item_fields(
-        _make_item(memory_confidence=0.1),
+        _make_item(review_status="proposed", memory_confidence=0.1),
         decision=decide_recall_admission(
-            _make_item(memory_confidence=0.1), profile=GOVERNED_PROFILE, stay_kinds=set()
+            _make_item(review_status="proposed", memory_confidence=0.1),
+            profile=GOVERNED_PROFILE,
+            stay_kinds=set(),
+            v2_resolution=resolution,
         ),
         similarity=0.8,
         now=_NOW,
     )
     high = signal_item_fields(
-        _make_item(memory_confidence=0.95),
+        _make_item(review_status="proposed", memory_confidence=0.95),
         decision=decide_recall_admission(
-            _make_item(memory_confidence=0.95), profile=GOVERNED_PROFILE, stay_kinds=set()
+            _make_item(review_status="proposed", memory_confidence=0.95),
+            profile=GOVERNED_PROFILE,
+            stay_kinds=set(),
+            v2_resolution=resolution,
         ),
         similarity=0.8,
         now=_NOW,
     )
     assert low == high
-    assert low["epistemic_state"] == "insufficient_evidence"
+    assert low["epistemic_state"] == "unknown"
     assert "low_confidence" not in low["warning_codes"]
     assert "low confidence" not in [w.lower() for w in low["warnings"]]
     # The misleading code is gone from the vocabulary entirely.
@@ -584,14 +705,22 @@ def test_exposure_counters_change_no_signal_output() -> None:
     telemetry only — a heavily-served item must be indistinguishable from a
     never-served one in utility, epistemic state, admission, and warnings
     (feedback-loop safeguard)."""
-    fresh = _make_item(recall_count=0, startup_recall_count=0, last_recalled_at=None)
+    resolution = _current(_v2_decision(governed="allow"))
+    fresh = _make_item(
+        review_status="proposed", recall_count=0, startup_recall_count=0, last_recalled_at=None
+    )
     hot = _make_item(
-        recall_count=10_000, startup_recall_count=10_000, last_recalled_at=_NOW
+        review_status="proposed",
+        recall_count=10_000,
+        startup_recall_count=10_000,
+        last_recalled_at=_NOW,
     )
     decision_fresh = decide_recall_admission(
-        fresh, profile=GOVERNED_PROFILE, stay_kinds=set()
+        fresh, profile=GOVERNED_PROFILE, stay_kinds=set(), v2_resolution=resolution
     )
-    decision_hot = decide_recall_admission(hot, profile=GOVERNED_PROFILE, stay_kinds=set())
+    decision_hot = decide_recall_admission(
+        hot, profile=GOVERNED_PROFILE, stay_kinds=set(), v2_resolution=resolution
+    )
     assert decision_fresh == decision_hot
     fields_fresh = signal_item_fields(fresh, decision=decision_fresh, similarity=0.7, now=_NOW)
     fields_hot = signal_item_fields(hot, decision=decision_hot, similarity=0.7, now=_NOW)
@@ -605,14 +734,17 @@ def test_importance_changes_utility_and_rank_but_not_admission_or_epistemic() ->
     """Importance is the caller's explicit priority: among admitted items it
     moves utility and therefore rank, but it can never change the admission
     decision or the epistemic state at any value."""
+    resolution = _current(_v2_decision(governed="allow", exploratory="allow"))
     low_item = _make_item(review_status="proposed", importance=0.0)
     high_item = _make_item(review_status="proposed", importance=1.0)
     for item in (low_item, high_item):
-        governed = decide_recall_admission(item, profile=GOVERNED_PROFILE, stay_kinds=set())
-        assert governed.decision == "withhold"
-        assert governed.reason_codes == ("proposed_not_admitted",)
+        governed = decide_recall_admission(
+            item, profile=GOVERNED_PROFILE, stay_kinds=set(), v2_resolution=resolution
+        )
+        assert governed.decision == "admit"
+        assert governed.reason_codes == ("admitted_v2_surface_allow",)
         exploratory = decide_recall_admission(
-            item, profile=EXPLORATORY_PROFILE, stay_kinds=set()
+            item, profile=EXPLORATORY_PROFILE, stay_kinds=set(), v2_resolution=resolution
         )
         assert exploratory.decision == "admit"
 
@@ -630,4 +762,3 @@ def test_importance_changes_utility_and_rank_but_not_admission_or_epistemic() ->
     )
     assert high_fields["utility_score"] > low_fields["utility_score"]
     assert high_fields["score"] > low_fields["score"]
-    assert high_fields["epistemic_state"] == low_fields["epistemic_state"] == "unknown"
