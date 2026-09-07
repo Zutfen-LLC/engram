@@ -172,15 +172,28 @@ async def _fetch_graph_neighbors(
     workspace_id: str | None,
     seed_ids: list[UUID],
     corpus_eligibility: ColumnElement[bool] | None = None,
+    enrichment_ids: set[UUID] | None = None,
 ) -> dict[UUID, list[_GraphLink]]:
     """Depth-1, bounded, deterministic graph expansion.
 
     Returns eligible neighbor_id -> list of links (a neighbor can be reached
     via more than one edge/seed; all are kept for explainability, but scoring
     uses only the strongest — see :func:`_relationship_bonus`).
+
+    ``enrichment_ids`` (the candidate-profile path passes the whole direct
+    candidate window, seeds included) splits two concerns the legacy path
+    never had: links to already-evaluated items are *enrichment* — recorded
+    for origin-merging at zero capacity cost, since the caller already
+    admission-evaluated them and never re-evaluates them here — while only
+    genuinely new neighbor ids compete for ``max_graph_neighbors_per_item``
+    and ``max_graph_expanded_items``. Without that split, a direct candidate
+    (including one the exact V2 surface withheld) could occupy a bounded
+    graph slot purely because it was semantically near the query and suppress
+    a genuinely new expansion candidate (issue #190).
     """
     if not seed_ids:
         return {}
+    enrichment = enrichment_ids or None
 
     seed_id_set = set(seed_ids)
     stmt = select(MemoryEdge).where(
@@ -225,6 +238,9 @@ async def _fetch_graph_neighbors(
     # just because it was already found semantically (requirement 5: origin
     # tags like "semantic+graph") — it simply doesn't count against the
     # max_graph_expanded_items budget below, since it's not a *new* addition.
+    # On the candidate-profile path (enrichment set present) that zero-cost
+    # treatment extends to every already-evaluated direct candidate, and the
+    # per-seed cap counts only genuinely new neighbors.
     per_seed: dict[UUID, list[tuple[float, str, UUID]]] = defaultdict(list)
     for edge in edges:
         weight = effective_edge_weight(edge.edge_type, edge.weight)
@@ -236,7 +252,18 @@ async def _fetch_graph_neighbors(
     candidate_links: dict[UUID, list[_GraphLink]] = defaultdict(list)
     for seed_id in seed_ids:
         bucket = sorted(per_seed.get(seed_id, []), key=lambda t: (-t[0], t[1], str(t[2])))
-        for weight, edge_type, neighbor_id in bucket[: settings.max_graph_neighbors_per_item]:
+        if enrichment is None:
+            selected = bucket[: settings.max_graph_neighbors_per_item]
+        else:
+            selected = []
+            new_taken = 0
+            for weight, edge_type, neighbor_id in bucket:
+                if neighbor_id in enrichment:
+                    selected.append((weight, edge_type, neighbor_id))
+                elif new_taken < settings.max_graph_neighbors_per_item:
+                    selected.append((weight, edge_type, neighbor_id))
+                    new_taken += 1
+        for weight, edge_type, neighbor_id in selected:
             candidate_links[neighbor_id].append(
                 _GraphLink(
                     neighbor_id=neighbor_id, edge_type=edge_type, weight=weight, seed_id=seed_id
@@ -249,18 +276,25 @@ async def _fetch_graph_neighbors(
     # Existing semantic seeds are enriched unconditionally (no budget cost —
     # they're already part of the result set). Only genuinely new neighbors
     # compete for the max_graph_expanded_items cap, strongest first
-    # (requirement 8: bounded graph additions).
+    # (requirement 8: bounded graph additions). With an enrichment set, the
+    # unconditional tier is the whole already-evaluated direct window; the
+    # caps then bound genuinely new neighbors only.
     linked_ids = set(candidate_links)
-    seed_neighbor_ids = linked_ids & seed_id_set
+    if enrichment is None:
+        enriched_ids = linked_ids & seed_id_set
+        capped_ids = linked_ids - seed_id_set
+    else:
+        enriched_ids = linked_ids & enrichment
+        capped_ids = linked_ids - enrichment
     new_neighbor_ids = sorted(
-        linked_ids - seed_id_set,
+        capped_ids,
         key=lambda nid: (
             -max(link.weight for link in candidate_links[nid]),
             str(nid),
         ),
     )[: settings.max_graph_expanded_items]
 
-    return {nid: candidate_links[nid] for nid in (*seed_neighbor_ids, *new_neighbor_ids)}
+    return {nid: candidate_links[nid] for nid in (*enriched_ids, *new_neighbor_ids)}
 
 
 async def _tunnel_targets(
@@ -375,6 +409,7 @@ async def _fetch_candidate_tunnel_neighbors(
     workspace_id: str | None,
     seed_items: list[MemoryItem],
     exclude_ids: set[UUID],
+    enrichment_ids: set[UUID] | None = None,
 ) -> dict[UUID, list[_TunnelLink]]:
     """Bounded, deterministic tunnel discovery for V2-bound profiles (#190).
 
@@ -384,6 +419,16 @@ async def _fetch_candidate_tunnel_neighbors(
     importance-free (``created_at desc, id asc``): utility signals may order
     only already-admitted items, never influence which neighbors a candidate
     profile discovers within its bounded window.
+
+    ``enrichment_ids`` (the whole direct candidate window) receives the same
+    direct-vs-new split the graph fetcher applies: already-evaluated direct
+    items sitting in a tunneled (wing, room) collect tunnel-origin metadata
+    for origin-merging at zero budget cost — no second admission, no
+    consumption of the new-neighbor tunnel caps — while genuinely new
+    neighbors keep competing inside the bounded per-target/total windows
+    (issue #190: ``semantic+tunnel`` and ``semantic+graph+tunnel`` origins
+    must be representable). Enrichment queries apply the identical
+    eligibility predicates, so tunnel visibility is never broadened.
 
     Deliberately a near-sibling of :func:`_fetch_tunnel_neighbors` rather
     than a parameterized shared helper: the legacy fetcher is frozen for
@@ -400,8 +445,35 @@ async def _fetch_candidate_tunnel_neighbors(
     for (target_wing, target_room), label in sorted(
         targets.items(), key=lambda kv: (kv[0][0], kv[0][1] or "")
     ):
+        if enrichment_ids:
+            # Direct-item enrichment: bounded by the already-evaluated direct
+            # window itself, so it needs no LIMIT and never touches the
+            # new-neighbor budget. Same predicates as the discovery query —
+            # enrichment is not an eligibility bypass.
+            enrich_filters: list[Any] = [
+                MemoryItem.id.in_(enrichment_ids),
+                MemoryItem.wing == target_wing,
+                live_proposal_expression(),
+                read_eligibility_expression(memory_context),
+            ]
+            if target_room is not None:
+                enrich_filters.append(MemoryItem.room == target_room)
+            if workspace_id is not None:
+                enrich_filters.append(MemoryItem.workspace_id == workspace_id)
+            enrich_stmt = (
+                select(MemoryItem)
+                .where(*enrich_filters)
+                .order_by(MemoryItem.created_at.desc(), MemoryItem.id.asc())
+            )
+            for row in (await session.execute(enrich_stmt)).scalars().all():
+                if row.id in candidate_links:
+                    continue
+                candidate_links[row.id].append(_TunnelLink(neighbor_id=row.id, tunnel_label=label))
         if remaining <= 0:
-            break
+            # Enrichment is budget-free, so later targets still get their
+            # enrichment pass; with no enrichment set the rest of this loop
+            # body is a no-op from here on, exactly like the legacy break.
+            continue
         filters: list[Any] = [
             MemoryItem.wing == target_wing,
             live_proposal_expression(),
@@ -617,13 +689,14 @@ def compute_relationship_relevance(
 class CandidateNeighborDiscovery:
     """Bounded graph+tunnel neighbor discovery for one candidate packet.
 
-    ``graph_links`` includes admitted seed items that are themselves
-    endpoints of discovered edges (origin-merging enrichment); tunnel
-    discovery never returns the excluded ids. ``neighbor_items`` carries the
-    backing ``MemoryItem`` rows for every discovered non-seed id — fetched
-    in one bounded bulk query with read-eligibility defense in depth.
-    Discovery confers no admission: every discovered neighbor must be
-    independently admitted by the caller through the exact V2 surface.
+    ``graph_links`` / ``tunnel_links`` include already-evaluated direct
+    candidates reachable from an admitted seed (origin-merging enrichment —
+    zero capacity cost, never re-admitted). ``neighbor_items`` carries the
+    backing ``MemoryItem`` rows for every *genuinely new* discovered id only
+    (never the seeds or the enrichment window) — fetched in one bounded bulk
+    query with read-eligibility defense in depth. Discovery confers no
+    admission: every discovered neighbor must be independently admitted by
+    the caller through the exact V2 surface.
     """
 
     graph_links: dict[UUID, list[_GraphLink]]
@@ -639,6 +712,7 @@ async def discover_candidate_neighbors(
     seed_ids: list[UUID],
     seed_items: list[MemoryItem],
     exclude_ids: set[UUID],
+    enrichment_ids: set[UUID] | None = None,
 ) -> CandidateNeighborDiscovery:
     """Admission-first bounded neighbor discovery for a V2-bound profile.
 
@@ -650,10 +724,16 @@ async def discover_candidate_neighbors(
     workspace restriction with no unscoped fallback, and the V2
     live-proposal corpus window as the discovery prefilter (the exact window
     the profile's own direct retrieval uses — it can never widen or hide
-    policy-relevant candidate state). ``exclude_ids`` (the direct candidate
-    window) are excluded from tunnel fetches and from the returned
-    neighbor rows: they were already admission-evaluated as direct
-    candidates, so expansion never re-evaluates or double-diagnoses them.
+    policy-relevant candidate state).
+
+    ``exclude_ids`` (the direct candidate window) are excluded from tunnel
+    fetches and from the returned neighbor rows: they were already
+    admission-evaluated as direct candidates, so expansion never
+    re-evaluates or double-diagnoses them. ``enrichment_ids`` (normally the
+    same direct window) additionally lets those already-evaluated items
+    collect graph/tunnel origin metadata from admitted seeds — the
+    direct-vs-new split that keeps every bounded window reserved for
+    genuinely new neighbors (issue #190).
     """
     graph_links = await _fetch_graph_neighbors(
         session,
@@ -661,6 +741,7 @@ async def discover_candidate_neighbors(
         workspace_id=workspace_id,
         seed_ids=seed_ids,
         corpus_eligibility=live_proposal_expression(),
+        enrichment_ids=enrichment_ids,
     )
     tunnel_links = await _fetch_candidate_tunnel_neighbors(
         session,
@@ -668,9 +749,12 @@ async def discover_candidate_neighbors(
         workspace_id=workspace_id,
         seed_items=seed_items,
         exclude_ids=exclude_ids,
+        enrichment_ids=enrichment_ids,
     )
 
     discovered_ids = (set(graph_links) | set(tunnel_links)) - set(seed_ids) - exclude_ids
+    if enrichment_ids:
+        discovered_ids -= enrichment_ids
     neighbor_items: dict[UUID, MemoryItem] = {}
     if discovered_ids:
         neighbor_stmt = select(MemoryItem).where(

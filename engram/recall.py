@@ -1365,17 +1365,20 @@ async def _expand_signal_candidates(
 
     ``admitted`` are the direct candidates the exact V2 surface already
     admitted, in retrieval order (the final signal-rank sort runs after
-    expansion) — only they may seed discovery. Newly discovered neighbors
-    (outside the direct candidate window, which was already
-    admission-evaluated) are resolved through the same shared bulk resolver
-    in ONE bounded call and admitted through the same
-    ``decide_recall_admission`` gate: no per-neighbor lookup, no provider
-    call, no second policy. Every linked admitted item — enriched direct
-    seeds and admitted neighbors alike — is re-scored through the versioned
-    relationship-relevance contract (``relationship-relevance-v1``) feeding
-    the unchanged separated-utility rank; utility (importance/freshness) is
-    computed by the signal model exactly as for direct items and never
-    enters relevance.
+    expansion) — only they may seed discovery. The whole direct candidate
+    window is passed as the enrichment set: already-evaluated direct items
+    linked to an admitted seed gain graph/tunnel origin metadata (no second
+    admission, no capacity cost), so a direct candidate — including one the
+    exact V2 surface withheld on the direct path — can never occupy a
+    bounded expansion slot. Newly discovered neighbors (outside that
+    window) are resolved through the same shared bulk resolver in ONE
+    bounded call and admitted through the same ``decide_recall_admission``
+    gate: no per-neighbor lookup, no provider call, no second policy. Every
+    linked admitted item — enriched direct items and admitted neighbors
+    alike — is re-scored through the versioned relationship-relevance
+    contract (``relationship-relevance-v1``) feeding the unchanged
+    separated-utility rank; utility (importance/freshness) is computed by
+    the signal model exactly as for direct items and never enters relevance.
     """
     seeds = admitted[: settings.recall_semantic_expansion_seed_limit]
     seed_ids = [entry.item.id for entry in seeds]
@@ -1391,6 +1394,7 @@ async def _expand_signal_candidates(
         seed_ids=seed_ids,
         seed_items=[entry.item for entry in seeds],
         exclude_ids=direct_candidate_ids,
+        enrichment_ids=direct_candidate_ids,
     )
 
     new_neighbor_ids = (set(discovery.graph_links) | set(discovery.tunnel_links)) - set(seed_ids)
@@ -1469,8 +1473,8 @@ async def _expand_signal_candidates(
                 )
             )
 
-    # Origin-merging enrichment: an admitted direct seed that is itself a
-    # discovered neighbor keeps its direct fields (distance/similarity,
+    # Origin-merging enrichment: an admitted direct item (seed or not) that
+    # discovery linked keeps its direct fields (distance/similarity,
     # admission, evidence — all unchanged) and gains the structured
     # relationship block plus the merged relevance. Links can only raise a
     # direct hit's relevance (max floor in the relevance contract), never
@@ -1504,12 +1508,16 @@ async def _expand_signal_candidates(
         entry.item_dict["reasons"].extend(_relationship_reason_lines(discovery, entry.item.id))
         entry.item_dict["relationship"] = relevance.payload()
 
+    # Accounting describes genuinely new expansion candidates only: every
+    # count below excludes the already-evaluated direct window (seeds and
+    # withheld direct candidates alike), which received enrichment links at
+    # zero capacity cost and is never re-admitted here.
     expansion_summary = {
         "version": relationship_recall.RELATIONSHIP_RELEVANCE_VERSION,
         "seed_count": len(seeds),
         "discovered_neighbors": len(new_neighbor_ids),
-        "graph_neighbors": len(set(discovery.graph_links) - set(seed_ids)),
-        "tunnel_neighbors": len(discovery.tunnel_links),
+        "graph_neighbors": len(set(discovery.graph_links) - direct_candidate_ids),
+        "tunnel_neighbors": len(set(discovery.tunnel_links) - direct_candidate_ids),
         "admitted_expanded": len(new_entries),
         "withheld_expanded": len(diagnostics),
     }

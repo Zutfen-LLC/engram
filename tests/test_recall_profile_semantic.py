@@ -1946,6 +1946,65 @@ async def test_admitted_seed_discovers_qualified_tunnel_neighbor(client, monkeyp
     assert governed["expansion"]["admitted_expanded"] == 1
 
 
+async def test_withheld_direct_candidate_does_not_consume_graph_capacity(
+    client, monkeypatch
+):
+    """The direct-vs-new capacity split (#191 fix 1), mechanically: with a
+    one-slot graph window, a V2-withheld direct candidate holding the
+    strongest edge (A -> B, weight 1.0) must not consume the bounded slot —
+    the genuinely new, weaker-edge neighbor (A -> C, weight 0.9) is still
+    discovered and independently admitted."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+    monkeypatch.setattr(settings, "max_graph_neighbors_per_item", 1)
+    monkeypatch.setattr(settings, "max_graph_expanded_items", 1)
+
+    seed_a = await _seed_qualified(client, "semantic target capacity seed")
+    direct_b = await _remember(client, "semantic target withheld direct", source_type="extraction")
+    await _persist_v2_row(direct_b["id"], risk=None)  # governed: review_required
+    neighbor_c = await _seed_qualified(client, "capacity expansion neighbor")
+    await _make_expansion_only(neighbor_c["id"])
+    await _link_items(seed_a["id"], direct_b["id"], "derived_from", weight=1.0)
+    await _link_items(seed_a["id"], neighbor_c["id"], "derived_from", weight=0.9)
+
+    governed = await _candidate_packet(client)
+    by_id = {item["id"]: item for item in governed["items"]}
+    # B is represented only by its direct-path withhold diagnostic.
+    assert direct_b["id"] not in by_id
+    b_diagnostics = [
+        d for d in governed["admission_diagnostics"] if d["item_id"] == direct_b["id"]
+    ]
+    assert len(b_diagnostics) == 1
+    assert b_diagnostics[0]["origin"] == "direct"
+    assert b_diagnostics[0]["v2_surface_decision"] == "review_required"
+    # B consumed no expansion capacity: C was discovered through the one-slot
+    # window despite B's stronger edge, and is served on its own exact V2
+    # admission (current + allow).
+    expanded_c = by_id[neighbor_c["id"]]
+    assert _relationship(expanded_c)["origins"] == ["graph"]
+    assert expanded_c["admission"]["surface_decision"] == "allow"
+    assert expanded_c["admission"]["v2"]["resolution_status"] == "current"
+    assert expanded_c["distance"] is None  # expansion-only: never vector-scored
+    _evidence_identity_asserts(expanded_c)
+    # Accounting counts genuinely new expansion candidates only — B is not a
+    # graph neighbor despite being edge-linked to the seed.
+    assert governed["expansion"] == {
+        "version": "relationship-relevance-v1",
+        "seed_count": 1,
+        "discovered_neighbors": 1,
+        "graph_neighbors": 1,
+        "tunnel_neighbors": 0,
+        "admitted_expanded": 1,
+        "withheld_expanded": 0,
+    }
+    # Direct window (A + B) plus the one neighbor window (C): B was never
+    # resolved a second time through expansion.
+    assert governed["v2_resolution"]["resolved_count"] == 3
+    assert governed["v2_resolution"]["resolution_status_counts"] == {"current": 3}
+
+
 # ---- independent neighbor admission ----
 
 
@@ -2270,6 +2329,98 @@ async def test_direct_and_expanded_origin_merge_is_deterministic(client, monkeyp
     # Deterministic: identical packet on re-evaluation.
     assert first["items"] == second["items"]
     assert [i["id"] for i in first["items"]] == [i["id"] for i in second["items"]]
+
+
+async def test_direct_candidate_merges_semantic_tunnel_origin(client, monkeypatch):
+    """The ``semantic+tunnel`` origin merge (#191 fix 2): an admitted direct
+    item sitting in a tunnel-linked wing collects tunnel-origin metadata
+    through another admitted seed's tunnel membership — direct fields,
+    admission, and evidence identity unchanged, no second V2 admission, and
+    no tunnel new-neighbor accounting."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    seed = await _seed_qualified(
+        client, "semantic target tunnel origin seed", wing="OrigSeed", room="src"
+    )
+    direct = await _seed_qualified(
+        client, "semantic target tunnel origin direct", wing="OrigFar", room="dst"
+    )
+    await _mk_tunnel("OrigSeed", "OrigFar", label="origin-link")
+
+    governed = await _candidate_packet(client)
+    by_id = {item["id"]: item for item in governed["items"]}
+    assert set(by_id) == {seed["id"], direct["id"]}
+    item = by_id[direct["id"]]
+    relationship = _relationship(item)
+    assert relationship["origins"] == ["semantic", "tunnel"]
+    assert relationship["direct"] is True
+    assert relationship["tunnel_labels"] == ["origin-link"]
+    assert relationship["graph_edge_types"] == []
+    assert any('same tunnel "origin-link"' in r for r in item["reasons"])
+    # The direct identity is retained untouched.
+    assert item["distance"] is not None
+    assert item["similarity_score"] is not None
+    assert relationship["direct_semantic_score"] == item["similarity_score"]
+    assert item["admission"]["surface_decision"] == "allow"
+    _evidence_identity_asserts(item)
+    # No second V2 admission for the direct item: the neighbor window is
+    # empty (nothing genuinely new was discovered), so exactly the two
+    # direct candidates were resolved.
+    assert governed["v2_resolution"]["resolved_count"] == 2
+    assert governed["v2_resolution"]["resolution_status_counts"] == {"current": 2}
+    # And the direct item never counts toward the new-neighbor totals.
+    assert governed["expansion"] == {
+        "version": "relationship-relevance-v1",
+        "seed_count": 2,
+        "discovered_neighbors": 0,
+        "graph_neighbors": 0,
+        "tunnel_neighbors": 0,
+        "admitted_expanded": 0,
+        "withheld_expanded": 0,
+    }
+
+
+async def test_direct_candidate_merges_semantic_graph_tunnel_origin(client, monkeypatch):
+    """The ``semantic+graph+tunnel`` merge: pins the complete origin-merging
+    contract — one admitted direct item reached by an edge from another
+    admitted seed AND sitting in that seed's tunneled wing carries all three
+    origins while keeping its direct admission/evidence identity."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    seed = await _seed_qualified(
+        client, "semantic target triple origin seed", wing="TriSeed", room="src"
+    )
+    direct = await _seed_qualified(
+        client, "semantic target triple origin direct", wing="TriFar", room="dst"
+    )
+    await _link_items(seed["id"], direct["id"], "supports", weight=0.7)
+    await _mk_tunnel("TriSeed", "TriFar", label="tri-link")
+
+    governed = await _candidate_packet(client)
+    by_id = {item["id"]: item for item in governed["items"]}
+    assert set(by_id) == {seed["id"], direct["id"]}
+    item = by_id[direct["id"]]
+    relationship = _relationship(item)
+    assert relationship["origins"] == ["semantic", "graph", "tunnel"]
+    assert relationship["direct"] is True
+    assert relationship["graph_edge_types"] == ["supports"]
+    assert relationship["tunnel_labels"] == ["tri-link"]
+    assert set(relationship["components"]) == {"semantic", "graph", "tunnel"}
+    assert any("linked via supports" in r for r in item["reasons"])
+    assert any('same tunnel "tri-link"' in r for r in item["reasons"])
+    assert item["distance"] is not None
+    assert item["admission"]["surface_decision"] == "allow"
+    _evidence_identity_asserts(item)
+    assert governed["v2_resolution"]["resolved_count"] == 2
+    assert governed["expansion"]["graph_neighbors"] == 0
+    assert governed["expansion"]["tunnel_neighbors"] == 0
+    assert governed["expansion"]["admitted_expanded"] == 0
 
 
 async def test_candidate_rank_reproducible_from_published_inputs(client, monkeypatch):
