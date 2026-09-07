@@ -1,9 +1,9 @@
 # ADR-160: Recall admission profiles and separated recall signals
 
 Status: Proposed (implementation landed; candidate profiles shadow-only until
-#162 certification)
+#162 certification; candidate admission is V2-bound since issue #186)
 Date: 2026-09-06
-Issue: #160 (ENG-RECALL-003), parent #153
+Issue: #160 (ENG-RECALL-003), parent #153; supplement: #186 (ENG-RECALL-003B)
 Depends on: #157 (versioned memory assessments), #158 (risk-aware admission
 policy), #159 (durable admission assessments)
 
@@ -163,6 +163,110 @@ recall.
    certification); the MCP tool intentionally does not expose a profile
    parameter, so exploratory cannot be smuggled through MCP defaults.
 
+## Supplement (issue #186, ENG-RECALL-003B): V2-bound candidate admission
+
+Issue #186 changed the canonical admission authority for the **shadow**
+governed/exploratory packets. Decision 6 above (review-status + #159
+projection as the admission policy) is superseded for candidate evaluation by
+the exact #158 per-surface decisions; the text above is retained as the
+historical record of the first slice.
+
+1. **Canonical admission authority.** For `governed` and `exploratory`,
+   admission is the exact `risk_aware_shadow_v1` per-surface decision
+   (`RecallProfileSpec.v2_surface`: governed → `semantic_governed`,
+   exploratory → `semantic_exploratory` — never `startup`, never
+   `highest_admission_tier`). `review_status` is no longer a positive
+   admission source: the #158 policy's domain is **live proposals**
+   (`not_live` → blocked on every surface), so active items are not
+   admissible into candidate packets no matter how similar or important.
+   Both candidate corpus windows are therefore the mechanically-expressible
+   live-proposal predicate (`review_status='proposed' AND valid_to IS NULL
+   AND superseded_by IS NULL AND conflict_resolution_status IS DISTINCT FROM
+   'unresolved'` — NULL-safe) applied before the bounded HNSW window — rows
+   the V2 gate would inevitably withhold (active, conflicted, closed) can
+   never starve eligible proposals.
+
+2. **Shared bulk resolver** (`engram/admission_shadow.py`
+   `resolve_bulk_v2_decisions`). One bounded resolution for the whole
+   candidate window (support + bulk #157 selection + one latest-row lookup;
+   query count constant in window size), owned by the #158 module so the
+   simulator, the operator simulate surfaces, and #160 recall cannot drift
+   on "what is the effective V2 decision?". For each item it re-evaluates
+   the exact decision from current state (the same evaluation
+   `simulate_item` produces — mechanical parity, pinned by tests) and
+   resolves the latest persisted V2 shadow row against it:
+
+   | Resolution | Meaning |
+   |---|---|
+   | `current` | the row's `decision_hash` equals the fresh evaluation — the row IS the decision |
+   | `missing` | no V2 row persisted for the item |
+   | `stale` | the row's input no longer matches: state, effective #157 selection, content identity, or a time-dependent outcome changed since it was recorded (input-digest mismatch, in #159 vocabulary) |
+   | `mismatched` | row recorded under a different policy artifact digest |
+   | `unsupported` | latest row under the profile key is not a V2 row |
+
+   Only `current` carries positive authority; every other status withholds
+   with its own reason code (`v2_decision_missing` / `_stale` /
+   `_mismatched` / `_unsupported`). The resolver reads only — it never
+   projects a shadow row current, mutates review state, enqueues work, or
+   calls a provider.
+
+3. **Fail-closed surface gate** (`engram/recall_signals.py`, admission
+   policy version `recall-admission-v2`). An item enters a candidate packet
+   only when the exact surface decision is `allow` under a `current`
+   resolution. `withhold` / `review_required` / `blocked` / `unknown` are
+   consumed as-is (distinct outcomes never flattened); governed and
+   exploratory may differ only per their own exact surface decisions.
+   Recall-local rules survive as **withhold-only** defense in depth: the
+   #159 `blocked` outcome (every profile) and strict-stale binding
+   (governed), plus the lifecycle facts the window already enforces. A
+   local/V2 disagreement always withholds, keeps the local reason code as
+   the primary reason, and is itemized in the packet's bounded,
+   content-free `admission_diagnostics` — each entry carrying the reason
+   codes, the V2 resolution status and exact surface decision,
+   `gates_disagree`, and the same full `v2` binding block admitted items
+   carry (see below), so an operator can tell exactly which V2 decision a
+   local boundary overrode.
+
+4. **Payload contract** (additive; `recall-shadow-compare-v2`). Admitted
+   candidate items carry the full V2 binding block (`admission.v2`),
+   and — since the #186 review correction — withheld candidates expose the
+   same block through `admission_diagnostics`. The binding keeps the
+   persisted row's identity and the fresh evaluation's identity separate
+   and never collapses them:
+
+   * `persisted` — what the durable row says about itself (assessment id,
+     schema version, policy contract version, artifact digest, decision
+     hash), read from the row's own columns; `null` when no row exists;
+   * `fresh` — what re-evaluating now under the current policy produces
+     (schema version, policy version + artifact digest, decision hash, the
+     exact surface decision, risk/epistemic/retention state, effective
+     #157 assessment refs, observation-window/eligible/next-evaluation,
+     bounded code sets).
+
+   For `current` the two agree; for `stale` both decision hashes stay
+   visible, for `mismatched` both artifact digests, for `unsupported` the
+   row's non-V2 schema next to the fresh V2 one, for `missing` there is no
+   persisted identity while `fresh` still describes the current
+   evaluation. Each candidate packet also carries a `v2_resolution`
+   summary (policy identity, per-status counts, the number of queries the
+   resolver actually executed — constant in window size, never a ceiling).
+   The pre-existing `admission.assessment_*` fields keep their #159
+   Path-A meaning.
+
+5. **Boundary unchanged.** This remains a shadow-only integration:
+   `CERTIFIED_SERVING_PROFILES` is still `{"legacy"}`, `POST /v1/recall`
+   still serves only the certified legacy packet, shadow comparison still
+   writes nothing (no recall logs, no exposure counters, no promotion or
+   evidence inputs), and an accepted #162 certification is still required
+   before any serving-default change. Nothing here authorizes #161/#162
+   production enablement.
+
+Operational consequence: a candidate packet contains only items whose V2
+rows were persisted (via the #158 simulate + persist surfaces) and are still
+current — an unqualified or never-simulated corpus evaluates to explicit
+`v2_decision_missing` withholdings, which is the certification-honest
+behavior #186 requires.
+
 ## Feedback-loop safeguards (issue #160)
 
 * utility excludes exposure counters (`recall_count`,
@@ -175,16 +279,18 @@ recall.
 
 ## Known limitations / follow-ups (issue #160 remains open)
 
-This ADR records one slice of #160. Deliberately deferred, tracked by the
-issue:
+This ADR records the #160 slice plus the #186 V2-binding supplement.
+Deliberately deferred, tracked by the issue:
 
 * **Signal-aware graph/tunnel expansion** — expansion is legacy-only;
   admission must precede expansion and the rescorer still speaks the blended
   score. Governed/exploratory evaluate direct semantic hits only until
   expansion learns the signal model.
-* **#157 bulk epistemic enrichment in the recall hot path** — per-item
-  effective selection is N-queries today; epistemic state derives from
-  item-level review/conflict/verification state until a bulk helper lands.
+* **#157 bulk epistemic enrichment beyond V2** — the V2 resolver supplies
+  risk/epistemic/retention state for candidate admission in bulk
+  (`effective_assessment_selection_bulk`); enriching the *served item*
+  epistemic fields beyond the item-level derivation, where V2 does not
+  already carry it, is follow-up.
 * **Evidence-root diversity / redundancy packing** — packing is purely
   rank-ordered; evidence-root grouping (via the #157 evidence manifest) is
   follow-up.
@@ -198,11 +304,15 @@ issue:
 * **Review/historical recall surfaces** — not selectable; they need their own
   capability contracts.
 * **Dogfood evaluation + exposure-concentration analysis** — run on the
-  shadow-comparison surface (the reason it exists).
+  shadow-comparison surface (the reason it exists). Since #186 this includes
+  keeping the V2 row corpus fresh: candidate packets bind only to *current*
+  persisted decisions, so dogfooding pairs the #158 simulate+persist pass
+  with the #160 comparison.
 * **Certification/default cutover** — flipping `CERTIFIED_SERVING_PROFILES`
-  (and then `recall_default_profile`) is gated on accepted #162
-  certification; per-tenant profile policy beyond the shadow allow is part
-  of that rollout work.
+  (and then `recall_default_profile`) is gated on a *fresh* accepted #162
+  certification of the now-integrated policy (V2-bound admission); #162D/#176
+  terminated NOT_CERTIFIED against the pre-#186 integration and nothing here
+  authorizes #161/#162 production enablement.
 * **`omitted_by_admission` is response-only** — gate-level withholding counts
   by reason code are returned to the caller and logged; `recall_logs` has no
   JSON omission column yet (note: under shadow-only rollout these counts

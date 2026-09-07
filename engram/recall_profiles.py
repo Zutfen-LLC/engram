@@ -113,6 +113,12 @@ class RecallProfileSpec:
     # or just get marked (exploratory)? An explicit "blocked" outcome
     # withholds in every profile regardless of this flag.
     strict_stale: bool = True
+    # The exact #158 V2 admission surface this profile consumes
+    # (``risk_aware_shadow_v1`` per-surface decisions). None for profiles
+    # whose admission is not V2-bound (legacy). Governed recall reads
+    # ``semantic_governed``; exploratory reads ``semantic_exploratory`` —
+    # never ``startup`` and never ``highest_admission_tier``.
+    v2_surface: str | None = None
     item_budget_cap: int | None = None
     byte_budget_cap: int | None = None
     token_budget_cap: int | None = None
@@ -133,30 +139,39 @@ LEGACY_PROFILE: Final = RecallProfileSpec(
 GOVERNED_PROFILE: Final = RecallProfileSpec(
     key="governed",
     description=(
-        "Ordinary operational recall: admission-gated reviewed corpus; disputed "
-        "items only for governed stay kinds; each served item bound to its "
-        "admission decision."
+        "Ordinary operational recall, V2-bound (issue #186): admission is the "
+        "exact #158 risk_aware_shadow_v1 semantic_governed surface decision — "
+        "evidence-qualified live proposals — never review_status. Local rules "
+        "(#159 blocked/stale, lifecycle, conflict) remain fail-closed "
+        "defense in depth."
     ),
     ranking_version=SIGNALS_RANKING_VERSION,
-    # Disputed items enter the window so governed stay kinds survive; the
-    # admission gate withholds disputed items whose kind is not a stay kind.
-    review_statuses=("active", "disputed"),
+    # The V2 policy's domain is the live-proposal corpus (active items are
+    # not_live -> blocked on every surface), so the pre-retrieval window is
+    # the live-proposal predicate: never let inevitably-withheld rows occupy
+    # the bounded HNSW window (see _signal_corpus_eligibility).
+    review_statuses=("proposed",),
     signals_enabled=True,
     admits_proposals=False,
     strict_stale=True,
+    v2_surface="semantic_governed",
 )
 
 EXPLORATORY_PROFILE: Final = RecallProfileSpec(
     key="exploratory",
     description=(
-        "Explicit opt-in discovery recall: proposals and marked uncertainty are "
-        "admitted with machine-readable epistemic state under tighter budgets."
+        "Explicit opt-in discovery recall, V2-bound (issue #186): admission is "
+        "the exact #158 risk_aware_shadow_v1 semantic_exploratory surface "
+        "decision (allow everywhere the policy does not block), with marked "
+        "uncertainty and machine-readable epistemic state under tighter "
+        "budgets."
     ),
     ranking_version=SIGNALS_RANKING_VERSION,
-    review_statuses=("active", "proposed"),
+    review_statuses=("proposed",),
     signals_enabled=True,
     admits_proposals=True,
     strict_stale=False,
+    v2_surface="semantic_exploratory",
     # Tighter than the default recall budgets (settings.recall_item_budget=50,
     # recall_byte_budget=4096): an exploratory packet must never crowd a
     # governed packet's budget for the same request.

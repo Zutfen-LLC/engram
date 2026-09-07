@@ -48,8 +48,10 @@ from engram.recall_profiles import (
 )
 
 # Version identity of the comparison surface itself (distinct from the signal
-# model / admission policy versions carried per packet).
-SHADOW_COMPARISON_VERSION: Final = "recall-shadow-compare-v1"
+# model / admission policy versions carried per packet). v2 (issue #186):
+# candidate packets are bound to the exact #158 V2 per-surface admission
+# decisions and carry the bounded admission diagnostics + resolution summary.
+SHADOW_COMPARISON_VERSION: Final = "recall-shadow-compare-v2"
 
 # Candidate profiles that may be *evaluated* here. This is deliberately not
 # derived from SEMANTIC_PROFILES: it must never contain a certified profile
@@ -82,7 +84,14 @@ async def tenant_allows_candidate_profile_inspection(
 
 
 def _packet_payload(evaluation: recall_module.SemanticPacketEvaluation) -> dict[str, Any]:
-    """One evaluated packet, in the same item shape /v1/recall serves."""
+    """One evaluated packet, in the same item shape /v1/recall serves.
+
+    V2-bound candidate packets additionally carry the bounded admission
+    diagnostics (one content-free entry per withheld candidate) and the V2
+    resolution summary — the operator-facing evidence of exactly which #158
+    decisions admitted or withheld each candidate (issue #186). Legacy
+    evaluates to an empty diagnostics list / ``None`` summary.
+    """
     profile = evaluation.profile
     return {
         "profile": profile.key,
@@ -94,6 +103,8 @@ def _packet_payload(evaluation: recall_module.SemanticPacketEvaluation) -> dict[
         "byte_count": evaluation.byte_count,
         "candidate_count": evaluation.candidate_count,
         "omitted_by_admission": dict(sorted(evaluation.omitted_by_admission.items())),
+        "admission_diagnostics": evaluation.admission_diagnostics,
+        "v2_resolution": evaluation.v2_resolution,
         "effective_byte_budget": evaluation.byte_budget,
         "effective_token_budget": evaluation.token_budget,
         "effective_item_budget": evaluation.item_budget,

@@ -39,27 +39,36 @@ def test_legacy_profile_preserves_current_semantic_behavior() -> None:
     assert LEGACY_PROFILE.token_budget_cap is None
 
 
-def test_governed_profile_admits_only_reviewed_corpus() -> None:
-    """governed = ordinary operational recall: no proposed items, admission
-    gate on, separated signals on."""
+def test_governed_profile_is_v2_bound_over_the_live_proposal_corpus() -> None:
+    """governed since issue #186: admission is the exact #158 V2
+    ``semantic_governed`` surface decision over the live-proposal corpus —
+    the policy's mechanically-expressible domain — not a review-status
+    window."""
     assert GOVERNED_PROFILE.key == "governed"
-    assert "proposed" not in GOVERNED_PROFILE.review_statuses
-    assert "active" in GOVERNED_PROFILE.review_statuses
-    # Disputed items enter the window but must survive the stay-kind gate.
-    assert "disputed" in GOVERNED_PROFILE.review_statuses
+    assert GOVERNED_PROFILE.review_statuses == ("proposed",)
     assert GOVERNED_PROFILE.signals_enabled is True
     assert GOVERNED_PROFILE.ranking_version == "semantic-signals-v1"
+    assert GOVERNED_PROFILE.v2_surface == "semantic_governed"
 
 
-def test_exploratory_profile_includes_proposals_with_lower_budgets() -> None:
+def test_exploratory_profile_binds_its_own_v2_surface_with_lower_budgets() -> None:
     assert EXPLORATORY_PROFILE.key == "exploratory"
-    assert EXPLORATORY_PROFILE.review_statuses == ("active", "proposed")
+    assert EXPLORATORY_PROFILE.review_statuses == ("proposed",)
     assert EXPLORATORY_PROFILE.signals_enabled is True
+    assert EXPLORATORY_PROFILE.v2_surface == "semantic_exploratory"
     # Exploratory packets are bounded tighter than governed ones.
     assert EXPLORATORY_PROFILE.item_budget_cap is not None
     assert EXPLORATORY_PROFILE.item_budget_cap < 50
     assert EXPLORATORY_PROFILE.byte_budget_cap is not None
     assert EXPLORATORY_PROFILE.byte_budget_cap < 4096
+
+
+def test_candidate_profiles_never_bind_the_startup_surface() -> None:
+    """The surface mapping is exact: governed/exploratory read their own
+    semantic surface decisions, never startup and never a tier shortcut."""
+    for spec in (GOVERNED_PROFILE, EXPLORATORY_PROFILE):
+        assert spec.v2_surface in {"semantic_governed", "semantic_exploratory"}
+    assert LEGACY_PROFILE.v2_surface is None
 
 
 # ---- resolution ----
