@@ -47,7 +47,7 @@ def test_governed_profile_is_v2_bound_over_the_live_proposal_corpus() -> None:
     assert GOVERNED_PROFILE.key == "governed"
     assert GOVERNED_PROFILE.review_statuses == ("proposed",)
     assert GOVERNED_PROFILE.signals_enabled is True
-    assert GOVERNED_PROFILE.ranking_version == "semantic-signals-v1"
+    assert GOVERNED_PROFILE.ranking_version == "semantic-signals-v2"
     assert GOVERNED_PROFILE.v2_surface == "semantic_governed"
 
 

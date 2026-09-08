@@ -908,6 +908,7 @@ async def _remember_impl(
         source_confidence_prior=default_confidence,
         authority=authority,
         importance=req.importance,
+        explicit_priority=req.importance,
         source_type=req.source_type,
         source_session=req.source_session,
         sensitivity=req.sensitivity,
@@ -2332,8 +2333,11 @@ async def update_item_metadata(
         # mutated before we write the event.
         # Use IS NOT DISTINCT FROM (not =) so NULL old values match correctly
         # (wing/room are nullable; = NULL always returns NULL, not true).
+        assignments = f"{field} = :new_value"
+        if field == "importance":
+            assignments += ", explicit_priority = :new_value"
         guard_stmt = text(
-            f"UPDATE memory_items SET {field} = :new_value "
+            f"UPDATE memory_items SET {assignments} "
             "WHERE (id = :item_id OR id = :item_id_hex) "
             "AND tenant_id = :tenant_id "
             f"AND {field} IS NOT DISTINCT FROM :old_value "
@@ -2369,6 +2373,8 @@ async def update_item_metadata(
         events.append(event)
 
         item[field] = new_val
+        if field == "importance":
+            item["explicit_priority"] = new_val
 
     await session.commit()
     return {"item": item, "event": events[0] if events else None, "events": events}

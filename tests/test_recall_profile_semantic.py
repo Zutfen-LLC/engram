@@ -709,8 +709,8 @@ async def test_governed_candidate_admits_only_v2_qualified_proposals(
 
     shadow = await _shadow_compare(client, profiles=["governed", "exploratory"])
     governed = shadow["candidates"][0]
-    assert governed["scoring_version"] == "semantic-signals-v1"
-    assert governed["signals_version"] == "recall-signals-v1"
+    assert governed["scoring_version"] == "semantic-signals-v2"
+    assert governed["signals_version"] == "recall-signals-v2"
     assert {i["id"] for i in governed["items"]} == {qualified_id}
     # The active item never entered the pre-LIMIT eligible window (the V2
     # domain is live proposals); the unqualified proposal was retrieved and
@@ -2413,8 +2413,74 @@ async def test_high_importance_neighbor_cannot_bypass_v2_withholding(
 # ---- relevance/utility separation ----
 
 
-async def test_importance_moves_utility_and_rank_but_not_relevance(client, monkeypatch):
-    """Required test 11: changing only the neighbor's importance changes its
+async def test_shadow_profiles_expose_utility_v2_from_bound_external_feedback(client, monkeypatch):
+    """Candidate feedback is post-admission, root-agnostic, and read-only."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+    item = await _seed_qualified(client, "semantic target usefulness", importance=0.5)
+
+    external_id, recall_log_id = uuid4(), uuid4()
+    async with _test_engine.begin() as conn:
+        tenant_id = await conn.scalar(text("SELECT id FROM tenants WHERE slug = 'default'"))
+        assert tenant_id is not None
+        await conn.execute(
+            text(
+                "INSERT INTO principals(id, tenant_id, name, type) "
+                "VALUES (:id, :tenant_id, 'exp190-usefulness-feedback', 'agent')"
+            ),
+            {"id": external_id, "tenant_id": tenant_id},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO recall_logs(id, tenant_id, principal_id, mode, item_ids) "
+                "VALUES (:id, :tenant_id, :principal_id, 'semantic', CAST(:item_ids AS uuid[]))"
+            ),
+            {
+                "id": recall_log_id,
+                "tenant_id": tenant_id,
+                "principal_id": external_id,
+                "item_ids": [item["id"]],
+            },
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO feedback_events(tenant_id, item_id, principal_id, verdict, "
+                "recall_log_id) "
+                "VALUES (:tenant_id, :item_id, :principal_id, 'useful', :recall_log_id)"
+            ),
+            {
+                "tenant_id": tenant_id,
+                "item_id": item["id"],
+                "principal_id": external_id,
+                "recall_log_id": recall_log_id,
+            },
+        )
+
+    for profile in ("governed", "exploratory"):
+        packet = await _candidate_packet(client, profile=profile)
+        candidate = next(row for row in packet["items"] if row["id"] == item["id"])
+        utility = candidate["utility"]
+        usefulness = utility["demonstrated_usefulness"]
+        assert utility["contract_version"] == "recall-utility-v2"
+        assert utility["explicit_priority"] == pytest.approx(0.5)
+        assert usefulness == {
+            "version": "demonstrated-usefulness-v1",
+            "state": "positive",
+            "adjustment": 0.10,
+            "qualifying_useful_actor_count": 1,
+            "qualifying_noise_actor_count": 0,
+            "excluded_self_or_author_count": 0,
+            "excluded_unbound_exposure_count": 0,
+        }
+        assert candidate["utility_score"] == pytest.approx(utility["base_utility"] + 0.10)
+        assert str(external_id) not in str(utility)
+        assert str(recall_log_id) not in str(utility)
+
+
+async def test_explicit_priority_moves_utility_and_rank_but_not_relevance(client, monkeypatch):
+    """Required test 11: changing only the neighbor's explicit priority changes its
     utility and final rank, never its relationship relevance, evidence
     state, or admission."""
     await _skip_without_db()
@@ -2439,7 +2505,7 @@ async def test_importance_moves_utility_and_rank_but_not_relevance(client, monke
         }
 
     before = _snapshot(await _candidate_packet(client, profile="exploratory"))
-    await _update_item(neighbor["id"], importance=0.9)
+    await _update_item(neighbor["id"], explicit_priority=0.9)
     after = _snapshot(await _candidate_packet(client, profile="exploratory"))
 
     assert before["relevance"] == after["relevance"]

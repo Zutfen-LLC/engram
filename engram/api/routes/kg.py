@@ -210,6 +210,7 @@ async def add_triple(
             source_trust=source_trust,
             source_confidence_prior=source_prior,
             importance=0.5,
+            explicit_priority=0.5,
             source_type="extraction",
             authority=MemoryAuthority.INFERRED,
             sensitivity="normal",

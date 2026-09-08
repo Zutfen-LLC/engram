@@ -179,6 +179,47 @@ async def test_feedback_noise_lowers_importance(client):
     assert resp.json()["status"] == "recorded"
 
 
+async def test_explicit_priority_dual_writes_but_feedback_keeps_it_stable(client):
+    """The public edit path changes both fields; feedback changes legacy only."""
+    if not await _db_ok():
+        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+    item = await _create_item(client, "Explicit priority API contract", importance=0.4)
+    async with _test_session_factory() as session:
+        created = (
+            await session.execute(
+                text("SELECT importance, explicit_priority FROM memory_items WHERE id = :id"),
+                {"id": item["id"]},
+            )
+        ).one()
+    assert created.importance == created.explicit_priority == pytest.approx(0.4)
+
+    patched = await client.patch(f"/v1/items/{item['id']}", json={"importance": 0.8})
+    assert patched.status_code == 200
+    assert patched.json()["item"]["explicit_priority"] == pytest.approx(0.8)
+    async with _test_session_factory() as session:
+        edited = (
+            await session.execute(
+                text("SELECT importance, explicit_priority FROM memory_items WHERE id = :id"),
+                {"id": item["id"]},
+            )
+        ).one()
+    assert edited.importance == edited.explicit_priority == pytest.approx(0.8)
+
+    feedback = await client.post(
+        "/v1/feedback", json={"item_id": item["id"], "feedback": "noise"}
+    )
+    assert feedback.status_code == 201
+    async with _test_session_factory() as session:
+        after_feedback = (
+            await session.execute(
+                text("SELECT importance, explicit_priority FROM memory_items WHERE id = :id"),
+                {"id": item["id"]},
+            )
+        ).one()
+    assert after_feedback.importance == pytest.approx(0.7)
+    assert after_feedback.explicit_priority == pytest.approx(0.8)
+
+
 async def test_feedback_accepts_recall_log_id(client):
     """Feedback endpoint accepts and stores recall_log_id from a real recall run."""
     if not await _db_ok():

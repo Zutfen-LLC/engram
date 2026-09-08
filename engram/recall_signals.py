@@ -5,7 +5,8 @@ distinct, inspectable signal families that never feed each other:
 
 * **Relevance** — semantic similarity (and, in the legacy profile only,
   relationship/tunnel bonuses). Computed by retrieval, untouched here.
-* **Utility** — explicit importance plus freshness. Affects ordering of
+* **Utility** — explicit priority, freshness, and bounded demonstrated
+  usefulness. Affects ordering of
   already-admitted items only. Deliberately excludes ``source_trust``,
   ``memory_confidence``, ``human_verified`` (epistemic inputs) and
   ``recall_count`` / exposure counters (feedback-loop safeguard: prior serving
@@ -48,10 +49,15 @@ from sqlalchemy import ColumnElement, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.admission_policy import AdmissionPolicyDecision
+from engram.demonstrated_usefulness import (
+    DemonstratedUsefulnessSummary,
+    summarize_demonstrated_usefulness,
+)
 from engram.models import MemoryItem
 from engram.recall_profiles import RecallProfileSpec
 
-SIGNALS_VERSION: Final[Literal["recall-signals-v1"]] = "recall-signals-v1"
+SIGNALS_VERSION: Final[Literal["recall-signals-v2"]] = "recall-signals-v2"
+RECALL_UTILITY_VERSION: Final[Literal["recall-utility-v2"]] = "recall-utility-v2"
 # v2 (issue #186): candidate admission consumes the exact #158 V2 per-surface
 # decision instead of reconstructing policy from review status.
 RECALL_ADMISSION_POLICY_VERSION: Final[Literal["recall-admission-v2"]] = "recall-admission-v2"
@@ -99,11 +105,11 @@ WarningCode = Literal[
 
 # ---- utility weights ----
 #
-# utility = 0.7 * importance + 0.3 * freshness   (30-day linear decay, anchored
-# on valid_from/created_at). Importance is the caller's explicit priority;
-# freshness is task/context fit. Both are ordering signals among admitted
-# items — never admission or epistemic evidence.
-_UTILITY_W_IMPORTANCE: Final = 0.7
+# base utility = 0.7 * explicit_priority + 0.3 * freshness (30-day linear
+# decay, anchored on valid_from/created_at); demonstrated usefulness then adds
+# exactly -0.10, 0.00, or 0.10 before clamping. Every input is an ordering
+# signal among admitted items — never admission or epistemic evidence.
+_UTILITY_W_EXPLICIT_PRIORITY: Final = 0.7
 _UTILITY_W_FRESHNESS: Final = 0.3
 _UTILITY_FRESHNESS_HALFLIFE_DAYS: Final = 30.0
 
@@ -349,24 +355,99 @@ class RecallAdmissionDecision:
 
 def compute_utility_score(
     *,
-    importance: float,
+    explicit_priority: float,
     created_at: datetime | None,
     valid_from: datetime | None,
     now: datetime,
+    demonstrated_usefulness_adjustment: float = 0.0,
 ) -> float:
-    """Explicit priority plus freshness, bounded to ``[0, 1]``.
+    """Explicit priority, freshness, and bounded usefulness, clamped to ``[0, 1]``.
 
     Epistemic inputs (source trust, confidence, verification) and exposure
     counters (recall counts) are deliberately not parameters — they must never
     move utility.
     """
-    anchor = valid_from or created_at
-    freshness = 0.0
-    if anchor is not None:
-        days = max(0.0, (now - anchor).total_seconds() / 86400.0)
-        freshness = max(0.0, 1.0 - days / _UTILITY_FRESHNESS_HALFLIFE_DAYS)
-    utility = _UTILITY_W_IMPORTANCE * importance + _UTILITY_W_FRESHNESS * freshness
+    freshness = utility_freshness(created_at=created_at, valid_from=valid_from, now=now)
+    utility = (
+        _UTILITY_W_EXPLICIT_PRIORITY * explicit_priority
+        + _UTILITY_W_FRESHNESS * freshness
+        + demonstrated_usefulness_adjustment
+    )
     return round(max(0.0, min(1.0, utility)), 4)
+
+
+def utility_freshness(
+    *, created_at: datetime | None, valid_from: datetime | None, now: datetime
+) -> float:
+    """Deterministic freshness input shared by utility diagnostics and scoring."""
+    anchor = valid_from or created_at
+    if anchor is None:
+        return 0.0
+    days = max(0.0, (now - anchor).total_seconds() / 86400.0)
+    return round(max(0.0, 1.0 - days / _UTILITY_FRESHNESS_HALFLIFE_DAYS), 4)
+
+
+def _explicit_priority(item: MemoryItem) -> float:
+    """Return the durable candidate baseline without consulting legacy importance."""
+    return float(item.explicit_priority) if item.explicit_priority is not None else 0.5
+
+
+def _utility_payload(
+    *, item: MemoryItem, now: datetime, usefulness: DemonstratedUsefulnessSummary
+) -> tuple[float, dict[str, Any]]:
+    priority = _explicit_priority(item)
+    freshness = utility_freshness(created_at=item.created_at, valid_from=item.valid_from, now=now)
+    base_utility = compute_utility_score(
+        explicit_priority=priority,
+        created_at=item.created_at,
+        valid_from=item.valid_from,
+        now=now,
+    )
+    utility = compute_utility_score(
+        explicit_priority=priority,
+        created_at=item.created_at,
+        valid_from=item.valid_from,
+        now=now,
+        demonstrated_usefulness_adjustment=usefulness.adjustment,
+    )
+    return utility, {
+        "contract_version": RECALL_UTILITY_VERSION,
+        "explicit_priority": round(priority, 4),
+        "freshness": freshness,
+        "base_utility": base_utility,
+        "demonstrated_usefulness": {
+            "version": usefulness.version,
+            "state": usefulness.state,
+            "adjustment": usefulness.adjustment,
+            "qualifying_useful_actor_count": usefulness.qualifying_useful_actor_count,
+            "qualifying_noise_actor_count": usefulness.qualifying_noise_actor_count,
+            "excluded_self_or_author_count": usefulness.excluded_self_or_author_count,
+            "excluded_unbound_exposure_count": usefulness.excluded_unbound_exposure_count,
+        },
+        "utility_score": utility,
+    }
+
+
+def apply_demonstrated_usefulness(
+    fields: dict[str, Any],
+    *,
+    item: MemoryItem,
+    now: datetime,
+    usefulness: DemonstratedUsefulnessSummary,
+) -> None:
+    """Update an admitted item's post-admission utility and rank diagnostics."""
+    utility, payload = _utility_payload(item=item, now=now, usefulness=usefulness)
+    fields["utility_score"] = utility
+    fields["utility"] = payload
+    fields["score"] = compute_signal_rank_score(
+        similarity=float(fields["relevance_score"]), utility=utility
+    )
+    reasons = cast(list[str], fields["reasons"])
+    utility_reason = f"utility {utility:.2f}"
+    for index, reason in enumerate(reasons):
+        if reason.startswith("utility "):
+            reasons[index] = utility_reason
+            break
 
 
 # ---- epistemic state ----
@@ -876,12 +957,6 @@ def signal_item_fields(
         if similarity is None:
             raise ValueError("signal_item_fields requires similarity or relevance")
         relevance = similarity
-    utility = compute_utility_score(
-        importance=item.importance,
-        created_at=item.created_at,
-        valid_from=item.valid_from,
-        now=now,
-    )
     evidence: dict[str, Any] | None = None
     risk_state: str | None = None
     if decision.v2 is not None:
@@ -901,16 +976,15 @@ def signal_item_fields(
         assessment_status=decision.assessment_status,
         risk_state=risk_state,
     )
-    rank = compute_signal_rank_score(similarity=relevance, utility=utility)
     reasons = [
         f"relevance {relevance:.2f}",
-        f"utility {utility:.2f}",
+        "utility 0.00",
         f"admission {decision.profile}:{','.join(decision.reason_codes)}",
     ]
     fields = {
-        "score": rank,
+        "score": 0.0,
         "relevance_score": round(relevance, 4),
-        "utility_score": utility,
+        "utility_score": 0.0,
         "epistemic_state": epistemic_state,
         "warning_codes": codes,
         "warnings": [_WARNING_TEXT[code] for code in codes],
@@ -918,6 +992,12 @@ def signal_item_fields(
         "admission": decision.payload(),
         "signals_version": SIGNALS_VERSION,
     }
+    apply_demonstrated_usefulness(
+        fields,
+        item=item,
+        now=now,
+        usefulness=summarize_demonstrated_usefulness(()),
+    )
     if evidence is not None:
         # The canonical evidence block: an exact mirror of the V2 fresh
         # evaluation admission consumed — including the top-level
@@ -978,6 +1058,7 @@ __all__ = [
     "RecallAdmissionDecision",
     "build_v2_evidence_fields",
     "build_v2_surface_binding",
+    "apply_demonstrated_usefulness",
     "compute_signal_rank_score",
     "compute_utility_score",
     "decide_recall_admission",
@@ -986,5 +1067,6 @@ __all__ = [
     "load_admission_bindings",
     "signal_item_fields",
     "structured_warning_codes",
+    "utility_freshness",
     "v2_local_gate_withhold_reason",
 ]

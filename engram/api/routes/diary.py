@@ -295,6 +295,7 @@ async def write_diary(
         source_trust=source_trust,
         source_confidence_prior=confidence,
         importance=0.4,
+        explicit_priority=0.4,
         source_type=source_type,
         authority=authority,
         sensitivity="normal",

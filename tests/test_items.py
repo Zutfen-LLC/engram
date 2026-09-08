@@ -101,6 +101,7 @@ CREATE_STATEMENTS = [
         verified_at TEXT,
         review_notes TEXT,
         importance REAL NOT NULL,
+        explicit_priority REAL,
         pinned INTEGER NOT NULL,
         last_recalled_at TEXT,
         recall_count INTEGER NOT NULL,

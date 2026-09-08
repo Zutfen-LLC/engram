@@ -651,8 +651,8 @@ async def test_conflict_pair_preserved_end_to_end(client, monkeypatch) -> None:
 
     # Required test 7: reverse the ranks — the (now lower-ranked) alpha side
     # is still preserved.
-    await _update_item(side_a["id"], importance=0.3)
-    await _update_item(side_c["id"], importance=0.95)
+    await _update_item(side_a["id"], explicit_priority=0.3)
+    await _update_item(side_c["id"], explicit_priority=0.95)
     reversed_packet = await _candidate_packet(client, item_budget=2)
     assert set(_packet_ids(reversed_packet)) == {side_a["id"], side_c["id"]}
     reasons = {item["id"]: item["packing_reason"] for item in reversed_packet["items"]}
