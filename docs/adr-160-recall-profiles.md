@@ -437,12 +437,15 @@ production serving, no #161 corroboration, and no #162 certification/cutover.
    *whether* an admitted item is selected, never *what that item claims about
    itself*.
 
-2. **Diversity uses only mechanically-known shared-root identities.** Two
-   durable facts create a redundancy group, nothing else: an explicit
-   `derived_from` edge between two admitted candidates, and an exact
-   `content_hash` duplicate (the same identity `idx_memitems_dedup` encodes —
-   legal only across principal/workspace scope boundaries). Vector similarity
-   alone is relevance, never root identity: two merely similar items are never
+2. **Diversity uses only mechanically-known shared-root identities.** Exactly
+   one durable fact creates a redundancy group: an explicit `derived_from`
+   edge between two admitted candidates (transitively, through chains of such
+   edges). Canonical content equality is not provenance — an equal
+   `content_hash` proves only equal canonicalized text, and the write-path
+   dedup index (`idx_memitems_dedup`, scoped over tenant/workspace/principal/
+   hash) is scoped duplicate prevention, not a global root assertion — so it
+   is not a v1 root signal and never groups. Vector similarity alone is
+   relevance, never root identity: two merely similar items are never
    grouped, and absent root knowledge is **unknown** — never coerced to
    "independent" (independence/quorum/corroboration semantics remain #161's
    sole property). Packing never manufactures corroboration or support state.
@@ -513,10 +516,11 @@ Deliberately deferred, tracked by the issue:
   future non-V2 profile still use their own item-level derivation; enriching
   *those* served fields from #157 is follow-up.
 * **Evidence-root-aware packing inputs** — since #192 packing groups only
-  mechanically-known root identities (`derived_from` edges, exact
-  `content_hash` duplicates) and preserves explicit conflicts; richer
+  mechanically-known root identities (explicit `derived_from` edges among
+  admitted candidates) and preserves explicit conflicts; canonical content
+  equality alone is not treated as provenance/root identity, and richer
   evidence-root identity from the #157 evidence manifest would be #161-owned
-  follow-up and must not be inferred from similarity.
+  follow-up and must not be inferred from similarity or content equality.
 * **Demonstrated-usefulness feedback in utility** — utility-v1 is importance
   + freshness only; versioned, bounded feedback with actor/root provenance is
   follow-up.

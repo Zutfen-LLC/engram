@@ -87,14 +87,21 @@ def _cand(
     content: str = "content",
     *,
     conflicts_with: UUID | None = None,
-    content_hash: str | None = None,
 ) -> PackCandidate:
     return PackCandidate(
         item_id=_cid(name),
         content=content,
         conflicts_with=conflicts_with,
-        content_hash=content_hash,
     )
+
+
+def _derived_family(*ids: UUID) -> PackingRelations:
+    """One explicit derivation family: every member derives from the first."""
+    root, *members = ids
+    links: dict[UUID, frozenset[UUID]] = {root: frozenset(members)}
+    for member in members:
+        links[member] = frozenset({root})
+    return PackingRelations(derived_links=links)
 
 
 def _pack(
@@ -128,13 +135,15 @@ def _assert_reconciles(
 
 def test_known_root_family_yields_to_distinct_context() -> None:
     """Required test 1: under an item budget of 2, three same-root siblings
-    plus one distinct item select the family representative + the distinct
-    item — never two same-root siblings."""
-    a1 = _cand("a1", "alpha one", content_hash="root-a")
-    a2 = _cand("a2", "alpha two", content_hash="root-a")
-    a3 = _cand("a3", "alpha three", content_hash="root-a")
+    (one explicit ``derived_from`` family) plus one distinct item select the
+    family representative + the distinct item — never two same-root
+    siblings."""
+    a1 = _cand("a1", "alpha one")
+    a2 = _cand("a2", "alpha two")
+    a3 = _cand("a3", "alpha three")
     distinct = _cand("distinct", "distinct fact")
-    result = _pack([a1, a2, a3, distinct], item_budget=2)
+    relations = _derived_family(a1.item_id, a2.item_id, a3.item_id)
+    result = _pack([a1, a2, a3, distinct], relations=relations, item_budget=2)
 
     assert result.selected == [a1.item_id, distinct.item_id]
     assert result.reasons[a1.item_id] == "ranked"
@@ -147,16 +156,17 @@ def test_representative_selection_is_deterministic_by_rank() -> None:
     """Required test 2 (+30): the family representative is the highest-ranked
     member — list position is the rank the separated ranking produced — and
     identical inputs always produce identical outputs."""
-    a1 = _cand("a1", "alpha one", content_hash="root-a")
-    a2 = _cand("a2", "alpha two", content_hash="root-a")
-    a3 = _cand("a3", "alpha three", content_hash="root-a")
+    a1 = _cand("a1", "alpha one")
+    a2 = _cand("a2", "alpha two")
+    a3 = _cand("a3", "alpha three")
     distinct = _cand("distinct", "distinct fact")
+    relations = _derived_family(a1.item_id, a2.item_id, a3.item_id)
 
-    reordered = _pack([a2, a1, a3, distinct], item_budget=2)
+    reordered = _pack([a2, a1, a3, distinct], relations=relations, item_budget=2)
     assert reordered.selected == [a2.item_id, distinct.item_id]
 
-    original = _pack([a1, a2, a3, distinct], item_budget=2)
-    again = _pack([a1, a2, a3, distinct], item_budget=2)
+    original = _pack([a1, a2, a3, distinct], relations=relations, item_budget=2)
+    again = _pack([a1, a2, a3, distinct], relations=relations, item_budget=2)
     assert again.selected == original.selected
     assert again.reasons == original.reasons
     assert again.omitted == original.omitted
@@ -167,11 +177,12 @@ def test_representative_selection_is_deterministic_by_rank() -> None:
 def test_same_root_siblings_fill_remaining_space() -> None:
     """Required test 3: siblings are crowd-out protected, not forbidden —
     after distinct groups are represented they fill leftover capacity."""
-    a1 = _cand("a1", "alpha one", content_hash="root-a")
-    a2 = _cand("a2", "alpha two", content_hash="root-a")
-    a3 = _cand("a3", "alpha three", content_hash="root-a")
+    a1 = _cand("a1", "alpha one")
+    a2 = _cand("a2", "alpha two")
+    a3 = _cand("a3", "alpha three")
     distinct = _cand("distinct", "distinct fact")
-    result = _pack([a1, a2, a3, distinct], item_budget=3)
+    relations = _derived_family(a1.item_id, a2.item_id, a3.item_id)
+    result = _pack([a1, a2, a3, distinct], relations=relations, item_budget=3)
 
     # Rendered order stays the rank order: the fill sibling ranks above the
     # distinct item even though it was selected after it.
@@ -184,9 +195,12 @@ def test_same_root_siblings_fill_remaining_space() -> None:
 
 
 def test_similar_items_without_root_identity_are_not_grouped() -> None:
-    """Required test 4: no explicit root fact (no derived edge, different
-    content hashes) means *unknown* — never grouped, never labeled
-    redundant; ordinary rank/budget behavior applies."""
+    """Required test 4: no explicit root fact (no derived edge) means
+    *unknown* — never grouped, never labeled redundant; ordinary rank/budget
+    behavior applies even for identical canonical content (equal
+    ``content_hash``), which is not a v1 root signal (see
+    ``test_packer_input_surface_excludes_content_identity`` and the
+    same-hash/different-scope integration regression)."""
     x = _cand("x", "looks very similar indeed")
     y = _cand("y", "looks very similar too!")
     result = _pack([x, y], item_budget=2)
@@ -195,18 +209,29 @@ def test_similar_items_without_root_identity_are_not_grouped() -> None:
     assert result.omitted == {}
 
 
-def test_derived_edge_and_hash_families_compose() -> None:
-    """Redundancy inputs compose via union-find: an explicit ``derived_from``
-    edge and an exact content-hash duplicate identity form one family of
-    three; two merely similar items stay separate."""
+def test_packer_input_surface_excludes_content_identity() -> None:
+    """The packer's input surface carries no content-identity fact at all:
+    ``PackCandidate`` is exactly ``{item_id, content, conflicts_with}``, so
+    canonical content equality (``content_hash``) cannot even reach the
+    grouping logic — known-root diversity is explicit ``derived_from``
+    connectivity only."""
+    assert set(PackCandidate.__dataclass_fields__) == {"item_id", "content", "conflicts_with"}
+
+
+def test_derivation_chains_form_transitive_families() -> None:
+    """Redundancy inputs compose via union-find over explicit ``derived_from``
+    edges: a two-edge chain (A derives from B, B derives from C) is one
+    family of three; a merely similar item with no explicit relation stays
+    separate."""
     a = _cand("a", "derived child")
-    b = PackCandidate(item_id=_cid("b"), content="derived parent", content_hash="h-parent")
-    c = _cand("c", "hash duplicate of parent", content_hash="h-parent")
-    similar = _cand("similar", "derived parent but no identity", content_hash="h-other")
+    b = _cand("b", "derived parent")
+    c = _cand("c", "derived grandparent")
+    similar = _cand("similar", "derived parent but no relation")
     relations = PackingRelations(
         derived_links={
             a.item_id: frozenset({b.item_id}),
-            b.item_id: frozenset({a.item_id}),
+            b.item_id: frozenset({a.item_id, c.item_id}),
+            c.item_id: frozenset({b.item_id}),
         }
     )
     result = _pack([a, b, c, similar], relations=relations, item_budget=2)
@@ -251,11 +276,13 @@ def test_relation_metadata_changes_selection_only() -> None:
 
 def test_conflict_pair_preserved_over_redundant_sibling() -> None:
     """Required test 6: both sides of an explicit conflict are selected even
-    though a known-redundant sibling ranks between them."""
-    side_a = _cand("side-a", "claim alpha", content_hash="fam")
-    sibling = _cand("sibling", "claim alpha restated", content_hash="fam")
+    though a known-redundant sibling (explicit derivation family member)
+    ranks between them."""
+    side_a = _cand("side-a", "claim alpha")
+    sibling = _cand("sibling", "claim alpha restated")
     side_c = _cand("side-c", "claim contra", conflicts_with=side_a.item_id)
-    result = _pack([side_a, sibling, side_c], item_budget=2)
+    relations = _derived_family(side_a.item_id, sibling.item_id)
+    result = _pack([side_a, sibling, side_c], relations=relations, item_budget=2)
 
     assert result.selected == [side_a.item_id, side_c.item_id]
     assert result.reasons[side_a.item_id] == "ranked"
@@ -294,10 +321,11 @@ def test_conflict_counterpart_budget_omission_is_bounded_and_honest() -> None:
     """Required test 11: when the hard byte budget cannot fit both sides the
     packet stays within budget and records ``conflict_counterpart_budget``
     instead of pretending the conflict was resolved."""
-    side_a = PackCandidate(item_id=_cid("side-a"), content="aaaa", content_hash="fam-a")
-    sibling = _cand("sibling", "ss", content_hash="fam-a")
+    side_a = _cand("side-a", "aaaa")
+    sibling = _cand("sibling", "ss")
     side_c = _cand("side-c", "cc", conflicts_with=side_a.item_id)
-    result = _pack([side_a, sibling, side_c], byte_budget=5, item_budget=3)
+    relations = _derived_family(side_a.item_id, sibling.item_id)
+    result = _pack([side_a, sibling, side_c], relations=relations, byte_budget=5, item_budget=3)
 
     # 4 bytes fit; neither 2-byte item fits alongside (4+2 > 5).
     assert result.selected == [side_a.item_id]
@@ -392,10 +420,11 @@ def test_token_budget_boundary_is_deterministic() -> None:
 def test_summary_is_bounded_counts_only() -> None:
     """Diagnostics boundedness: the packing summary is a fixed key set of
     counts — no ids, no counterpart identities, no rejected content."""
-    side_a = _cand("side-a", "claim alpha", content_hash="fam")
-    sibling = _cand("sibling", "restated", content_hash="fam")
+    side_a = _cand("side-a", "claim alpha")
+    sibling = _cand("sibling", "restated")
     side_c = _cand("side-c", "contra", conflicts_with=side_a.item_id)
-    result = _pack([side_a, sibling, side_c], item_budget=2)
+    relations = _derived_family(side_a.item_id, sibling.item_id)
+    result = _pack([side_a, sibling, side_c], relations=relations, item_budget=2)
     summary = result.summary()
 
     assert set(summary) == {"version", "selected_count", "conflict_pairs_preserved", "omitted"}
@@ -453,12 +482,13 @@ async def _seed_packing_item(
     """A live proposal for the candidate packets, V2-qualified by default.
 
     ``root_hash`` rewrites the durable content-hash identity BEFORE the V2
-    row is persisted. Same-scope exact duplicates are impossible by design
-    (the ``idx_memitems_dedup`` unique index), so hash families are only
-    built for cross-scope members (e.g. a sibling in another workspace);
-    same-scope families in these tests use explicit ``derived_from`` edges —
-    the other mechanically-known root identity. ``qualified=False`` leaves
-    the item without a V2 row so governed recall withholds it.
+    row is persisted. It exists only for the same-hash/different-scope
+    negative regression: equal canonical content must NOT group candidates
+    (the dedup identity is scoped over tenant/workspace/principal, and
+    content equality is not provenance). Known-root families in these tests
+    are built exclusively from explicit ``derived_from`` edges — the only
+    mechanically-known root identity v1 recognizes. ``qualified=False``
+    leaves the item without a V2 row so governed recall withholds it.
     """
     item = await _remember(
         client, content, source_type="extraction", importance=importance, **payload
@@ -845,28 +875,11 @@ async def test_conflict_preservation_direct_vs_graph_expanded(client, monkeypatc
     assert _immutable_fields(tight_by_id[direct["id"]]) == _immutable_fields(direct_item)
 
 
-async def test_known_root_diversity_direct_and_tunnel_expanded(client, monkeypatch) -> None:
-    """Required test 13: a known-root family spanning a direct hit and a
-    tunnel-expanded sibling yields its extra members to distinct context."""
-    await _skip_without_db()
-    from engram.config import settings
-
-    settings.embedding_provider = "openai"
-    _patch_embeddings(monkeypatch)
-    await _enable_tenant_shadow_policy()
-
-    direct = await _seed_packing_item(
-        client,
-        "semantic target tunnel family direct",
-        importance=0.9,
-        root_hash="pack-root-t",
-        wing="PackFar",
-        room="dst",
-    )
-    # The sibling lives in another workspace (of which the caller is a
-    # member), so an identical content hash is a legal durable duplicate
-    # identity — and keeps the sibling tunnel-reachable rather than
-    # graph-reachable (no edge involved).
+async def _mk_member_workspace() -> str:
+    """A fresh workspace in the default tenant with the seeded admin as a
+    member: workspace-visible items there sit inside the caller's read
+    boundary while remaining a different dedup scope (tenant + workspace +
+    principal + hash), so identical content hashes are legal durable rows."""
     async with _test_engine.begin() as conn:
         tenant_id = await conn.scalar(text("SELECT id::text FROM tenants WHERE slug = 'default'"))
         admin_id = await conn.scalar(
@@ -891,11 +904,37 @@ async def test_known_root_diversity_direct_and_tunnel_expanded(client, monkeypat
             ),
             {"ws": workspace_id, "pid": admin_id},
         )
+        return workspace_slug
+
+
+async def test_known_root_diversity_direct_and_tunnel_expanded(client, monkeypatch) -> None:
+    """Required test 13: a known-root family spanning a direct hit and an
+    expansion-only sibling in another workspace — linked by an explicit
+    ``derived_from`` edge, the only mechanically-known root identity —
+    yields its extra members to distinct context."""
+    await _skip_without_db()
+    from engram.config import settings
+
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    direct = await _seed_packing_item(
+        client,
+        "semantic target tunnel family direct",
+        importance=0.9,
+        wing="PackFar",
+        room="dst",
+    )
+    # The sibling lives in another workspace (of which the caller is a
+    # member) and is expansion-only (no embedding): the explicit
+    # ``derived_from`` edge below is both its graph reachability and its
+    # durable root identity — equal canonical content plays no part.
+    workspace_slug = await _mk_member_workspace()
     tunnel_sibling = await _seed_packing_item(
         client,
         "tunnel family sibling",
         importance=0.5,
-        root_hash="pack-root-t",
         wing="PackSrc",
         room="s",
         workspace=workspace_slug,
@@ -904,12 +943,61 @@ async def test_known_root_diversity_direct_and_tunnel_expanded(client, monkeypat
     distinct = await _seed_packing_item(client, "semantic query tunnel distinct", importance=0.6)
     await _make_expansion_only(tunnel_sibling["id"])
     await _mk_tunnel("PackSrc", "PackFar")
+    await _link_items(direct["id"], tunnel_sibling["id"], "derived_from")
 
     governed = await _candidate_packet(client, item_budget=2)
     assert set(_packet_ids(governed)) == {direct["id"], distinct["id"]}
     assert governed["packing"]["omitted"] == {"redundant_known_root": 1}
     reasons = {item["id"]: item["packing_reason"] for item in governed["items"]}
     assert set(reasons.values()) == {"ranked"}
+
+
+async def test_same_hash_different_scope_is_not_a_known_root(client, monkeypatch) -> None:
+    """Same-hash/different-scope regression (#192's boundary with #161): two
+    admitted candidates with an identical durable ``content_hash`` in
+    different workspaces and NO explicit derivation relation are NOT one
+    redundancy family. Equal canonical content proves only equal
+    canonicalized text — the root relationship stays unknown — so under a
+    budget where both high-ranked same-content items would normally occupy
+    the packet, both are selected by ordinary rank and the distinct item
+    loses to the budget alone, never to a fabricated
+    ``redundant_known_root``."""
+    await _skip_without_db()
+    from engram.config import settings
+
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+
+    workspace_slug = await _mk_member_workspace()
+    # A ranks first, B (same rewritten hash, different workspace) ranks
+    # second, C is the lower-ranked distinct item; no edges anywhere.
+    a = await _seed_packing_item(
+        client, "semantic target same hash alpha", importance=0.9, root_hash="pack-neg-h"
+    )
+    b = await _seed_packing_item(
+        client,
+        "semantic target same hash sibling",
+        importance=0.8,
+        root_hash="pack-neg-h",
+        workspace=workspace_slug,
+        visibility="workspace",
+    )
+    c = await _seed_packing_item(client, "semantic query same hash distinct", importance=0.6)
+
+    governed = await _candidate_packet(client, item_budget=2)
+    # NOT [A, C] with B omitted as redundant_known_root: same hash is not a
+    # root fact, so A and B stay ungrouped and both take slots by rank.
+    assert _packet_ids(governed) == [a["id"], b["id"]]
+    assert c["id"] not in _packet_ids(governed)
+    assert governed["packing"]["omitted"] == {"budget": 1}
+    assert "redundant_known_root" not in governed["packing"]["omitted"]
+    reasons = {item["id"]: item["packing_reason"] for item in governed["items"]}
+    assert reasons == {a["id"]: "ranked", b["id"]: "ranked"}
+    assert governed["packing"]["conflict_pairs_preserved"] == 0
+    # Reconciliation over the three admitted candidates.
+    packing = governed["packing"]
+    assert packing["selected_count"] + sum(packing["omitted"].values()) == 3
 
 
 # ---- integration: security / RLS / scope (required tests 23, 24) ---------------

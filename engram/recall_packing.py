@@ -21,14 +21,17 @@ Doctrine (each rule is structural in :func:`pack_admitted_candidates`):
   relevance, utility, epistemic state, risk, warning codes, admission
   decisions, or the ``evidence`` block.
 * **Known shared origin may suppress redundancy; unknown independence may
-  not.** Redundancy groups use exclusively durable, explicit identities
-  Engram already records mechanically — explicit ``derived_from`` edges and
-  exact ``content_hash`` duplicates (the same durable duplicate identity the
-  ``idx_memitems_dedup`` unique index encodes). Vector similarity alone is
-  relevance, never root identity: two merely similar items are never grouped,
-  and two items with no explicit shared-root fact are *unknown*, never
-  "independent" (independence/quorum semantics belong to #161, which stays
-  the sole owner of evidence-root-aware corroboration).
+  not.** Known-root diversity uses explicit durable derivation relationships
+  already present among admitted candidates — union-find over explicit
+  ``derived_from`` edges, and nothing else. Canonical content equality (an
+  equal ``content_hash``) proves only equal canonicalized text, never shared
+  provenance/root identity — the write-path dedup index is scoped duplicate
+  prevention, not a global root assertion — so it is not a v1 root signal.
+  Vector similarity alone is relevance, never root identity: two merely
+  similar items are never grouped, and two items with no explicit
+  shared-root fact are *unknown*, never "independent" (independence/quorum
+  semantics belong to #161, which stays the sole owner of
+  evidence-root-aware corroboration).
 * **Conflict preservation is representation, not resolution.** When both
   sides of an explicit conflict (``conflicts_with_item_id`` linkage or a
   ``contradicts`` edge) are admitted candidates, selecting one side creates a
@@ -90,15 +93,15 @@ class PackCandidate:
     List position carries the rank: the caller passes candidates in the exact
     deterministic order the separated ranking produced (signal rank desc,
     then the ranking's stable tie-breaks), and the packer never re-sorts.
-    ``conflicts_with`` and ``content_hash`` are the item's own durable
-    identity facts (``memory_items.conflicts_with_item_id`` /
-    ``content_hash``), not packer derivations.
+    ``conflicts_with`` is the item's own durable identity fact
+    (``memory_items.conflicts_with_item_id``), not a packer derivation.
+    Content-identity inputs such as ``content_hash`` are deliberately absent:
+    canonical content equality is not a v1 root signal (see module doctrine).
     """
 
     item_id: UUID
     content: str
     conflicts_with: UUID | None = None
-    content_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -221,27 +224,18 @@ def _known_root_groups(
 ) -> dict[UUID, UUID]:
     """Map every candidate to its mechanically-known redundancy group root.
 
-    Two durable identity facts create a group, and nothing else does:
-
-    * an explicit ``derived_from`` edge between the two items;
-    * identical ``content_hash`` — the exact-duplicate identity the dedup
-      unique index (``idx_memitems_dedup``) already encodes, so only items
-      the model itself calls duplicates are grouped.
+    Exactly one durable fact creates a group: an explicit ``derived_from``
+    edge between two admitted items (transitively, chains of such edges).
+    Canonical content equality is not provenance — an equal ``content_hash``
+    across workspace/principal scope boundaries proves only equal
+    canonicalized text, and the write-path dedup index is scoped duplicate
+    prevention, not a root assertion — so it never groups.
 
     Semantically similar-but-distinct items land in different groups by
     construction; ``unknown`` is never coerced to either redundant or
     independent.
     """
     groups = _UnionFind(cand.item_id for cand in candidates)
-    by_hash: dict[str, UUID] = {}
-    for cand in candidates:
-        if cand.content_hash is None:
-            continue
-        first = by_hash.get(cand.content_hash)
-        if first is None:
-            by_hash[cand.content_hash] = cand.item_id
-        else:
-            groups.union(first, cand.item_id)
     for item_id, neighbors in sorted(
         relations.derived_links.items(), key=lambda pair: str(pair[0])
     ):

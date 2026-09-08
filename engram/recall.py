@@ -1065,8 +1065,8 @@ class SignalAdmissionOutcome:
     (contract version, seed/neighbor/admission counts). Since issue #192
     ``admitted_entries`` exposes the ranked admitted items (ORM object +
     served dict) so the packing stage can consume their durable identity
-    facts (``conflicts_with_item_id``, ``content_hash``) without widening
-    anything the item dicts publish."""
+    facts (``conflicts_with_item_id``) without widening anything the item
+    dicts publish."""
 
     items: list[dict[str, Any]]
     omitted_by_admission: dict[str, int]
@@ -1697,17 +1697,18 @@ def _packing_candidates(
     """Project ranked admitted entries into the pure packer's input shape.
 
     Only the durable identity facts the packing contract consumes — content
-    (for rendered budget accounting), ``conflicts_with_item_id``, and
-    ``content_hash`` — cross this boundary; scores, admission, evidence, and
-    relationship metadata stay behind, where packing cannot touch them. List
-    position carries the rank exactly as the admission step sorted it.
+    (for rendered budget accounting) and ``conflicts_with_item_id`` — cross
+    this boundary; scores, admission, evidence, relationship metadata, and
+    content-identity facts such as ``content_hash`` stay behind, where
+    packing cannot touch them (canonical content equality is not a v1 root
+    signal). List position carries the rank exactly as the admission step
+    sorted it.
     """
     return [
         recall_packing.PackCandidate(
             item_id=entry.item.id,
             content=entry.item_dict["content"],
             conflicts_with=entry.item.conflicts_with_item_id,
-            content_hash=entry.item.content_hash,
         )
         for entry in entries
     ]
