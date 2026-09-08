@@ -1,0 +1,207 @@
+{
+  "name": "reordered-ordinals",
+  "parse_as": "semantic",
+  "input": {
+    "query": "ordered",
+    "context": {
+      "tenant_id": "00000000-0000-0000-0000-000000000001",
+      "principal_id": "00000000-0000-0000-0000-000000000002",
+      "workspace_id": null,
+      "memory_context_version": "memory-context-v2",
+      "memory_profile_id": null,
+      "memory_profile_revision_id": null,
+      "memory_profile_version": null,
+      "workspace_supplied": false,
+      "requested_byte_budget": null,
+      "requested_token_budget": null,
+      "requested_item_budget": null,
+      "effective_byte_budget": 4096,
+      "effective_token_budget": 1024,
+      "effective_item_budget": 20,
+      "recall_profile": "legacy",
+      "recall_profile_contract_version": "recall-profiles-v1",
+      "scoring_version": "semantic-v3",
+      "signals_version": null,
+      "admission_policy": null,
+      "relationship_relevance_version": null,
+      "packing_version": null,
+      "config_version": "v1"
+    },
+    "packet": {
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-000000000010",
+          "kind": "fact",
+          "content": "alpha",
+          "review_status": "active",
+          "authority": 10,
+          "visibility": "private",
+          "workspace_id": null,
+          "pinned": false,
+          "score": 0.8,
+          "trust_score": 0.9,
+          "relevance_score": null,
+          "utility_score": null,
+          "reasons": [
+            "semantic similarity 0.90"
+          ],
+          "warnings": [],
+          "warning_codes": null,
+          "conflict_type": null,
+          "conflict_resolution_status": null,
+          "admission": null,
+          "evidence": null,
+          "relationship": null,
+          "packing_reason": null
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000011",
+          "kind": "fact",
+          "content": "beta",
+          "review_status": "active",
+          "authority": 10,
+          "visibility": "private",
+          "workspace_id": null,
+          "pinned": false,
+          "score": 0.8,
+          "trust_score": 0.9,
+          "relevance_score": null,
+          "utility_score": null,
+          "reasons": [
+            "semantic similarity 0.90"
+          ],
+          "warnings": [],
+          "warning_codes": null,
+          "conflict_type": null,
+          "conflict_resolution_status": null,
+          "admission": null,
+          "evidence": null,
+          "relationship": null,
+          "packing_reason": null
+        }
+      ],
+      "working_set": "[fact] alpha\n[fact] beta",
+      "item_count": 2,
+      "byte_count": 9,
+      "candidate_count": 2,
+      "omitted_count": 0,
+      "omitted_by_admission": {},
+      "expansion": null,
+      "packing": null,
+      "message": null
+    }
+  },
+  "manifest": {
+    "schema": "engram.semantic-context-manifest",
+    "schema_version": "1.0",
+    "canonicalization": "rfc8785",
+    "mode": "semantic",
+    "subject": {
+      "tenant_id": "00000000-0000-0000-0000-000000000001",
+      "principal_id": "00000000-0000-0000-0000-000000000002",
+      "workspace_id": null,
+      "memory_context_version": "memory-context-v2",
+      "memory_profile_id": null,
+      "memory_profile_revision_id": null,
+      "memory_profile_version": null
+    },
+    "request": {
+      "requested": {
+        "workspace_supplied": false,
+        "byte_budget": null,
+        "token_budget": null,
+        "item_budget": null
+      },
+      "effective": {
+        "workspace_id": null,
+        "byte_budget": 4096,
+        "token_budget": 1024,
+        "item_budget": 20
+      },
+      "query_digest": "sha256:a4dd38b67d593eaa47f0ea93a83d20ba4edda4233d7c29569b6e37213c856c96",
+      "request_digest": "sha256:ab40ddf11a6a98070924a46a98aab2dc574901130e1acd9ead391770e8fc6713"
+    },
+    "versions": {
+      "recall_profile": "legacy",
+      "recall_profile_contract_version": "recall-profiles-v1",
+      "scoring_version": "semantic-v3",
+      "signals_version": null,
+      "admission_policy": null,
+      "relationship_relevance_version": null,
+      "packing_version": null,
+      "config_version": "v1",
+      "manifest_contract_version": "semantic-context-manifest-v1",
+      "packet_render_version": "working-set-v1"
+    },
+    "result": {
+      "item_count": 2,
+      "served_content_byte_count": 9,
+      "rendered_packet_byte_count": 24,
+      "candidate_count": 2,
+      "omitted_count": 0,
+      "omitted_by_admission": {},
+      "expansion": null,
+      "packing": null,
+      "message": null
+    },
+    "packet": {
+      "media_type": "text/plain; charset=utf-8",
+      "render_version": "working-set-v1",
+      "hash": "sha256:bd716392cac14b42909c2e5d7c9ab0e676ff712741a5a3d0d2028723f84e83b4"
+    },
+    "items": [
+      {
+        "ordinal": 1,
+        "item_id": "00000000-0000-0000-0000-000000000010",
+        "kind": "fact",
+        "served_content_hash": "sha256:8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8",
+        "review_status": "active",
+        "authority": 10,
+        "visibility": "private",
+        "workspace_id": null,
+        "pinned": false,
+        "score": 0.8,
+        "trust_score": 0.9,
+        "relevance_score": null,
+        "utility_score": null,
+        "reasons": [
+          "semantic similarity 0.90"
+        ],
+        "warnings": [],
+        "warning_codes": null,
+        "conflict_type": null,
+        "conflict_resolution_status": null,
+        "admission": null,
+        "evidence": null,
+        "relationship": null,
+        "packing_reason": null
+      },
+      {
+        "ordinal": 1,
+        "item_id": "00000000-0000-0000-0000-000000000011",
+        "kind": "fact",
+        "served_content_hash": "sha256:f44e64e75f3948e9f73f8dfa94721c4ce8cbb4f265c4790c702b2d41cfbf2753",
+        "review_status": "active",
+        "authority": 10,
+        "visibility": "private",
+        "workspace_id": null,
+        "pinned": false,
+        "score": 0.8,
+        "trust_score": 0.9,
+        "relevance_score": null,
+        "utility_score": null,
+        "reasons": [
+          "semantic similarity 0.90"
+        ],
+        "warnings": [],
+        "warning_codes": null,
+        "conflict_type": null,
+        "conflict_resolution_status": null,
+        "admission": null,
+        "evidence": null,
+        "relationship": null,
+        "packing_reason": null
+      }
+    ]
+  }
+}

@@ -155,6 +155,9 @@ class Settings(BaseSettings):
     # returned unchanged. The timeout bounds the whole enabled attempt. Not
     # propagated to the worker (API-only).
     context_receipt_dark_write_enabled: bool = False
+    # Semantic receipts have a separate rollout switch.  Startup behavior is
+    # unchanged when this is false (the default).
+    semantic_context_receipt_dark_write_enabled: bool = False
     # Strictly positive; invalid (<=0) configuration fails settings
     # validation with no silent negative-to-positive coercion. Covers manifest
     # construction, persistence, reload, verification, and commit.

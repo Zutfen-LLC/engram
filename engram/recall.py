@@ -57,6 +57,7 @@ from engram.recall_profiles import (
     resolve_serving_profile,
 )
 from engram.relationship_recall import expand_recall_candidates
+from engram.semantic_budget import semantic_item_byte_count, semantic_item_token_cost
 
 logger = logging.getLogger(__name__)
 
@@ -977,8 +978,8 @@ def _enforce_semantic_budget(
     for cand in candidates:
         if item_budget is not None and len(result) >= item_budget:
             break
-        item_bytes = len(cand["content"].encode())
-        item_tokens = max(1, item_bytes // 4)
+        item_bytes = semantic_item_byte_count(cand["content"])
+        item_tokens = semantic_item_token_cost(cand["content"])
 
         # Skip oversized items and keep scanning lower-ranked ones that fit.
         if byte_budget is not None and bytes_used + item_bytes > byte_budget:
@@ -2044,6 +2045,7 @@ async def execute_semantic_recall(
             query=query,
             byte_budget=byte_budget,
             token_budget=token_budget,
+            item_budget=item_budget,
             item_ids=[],
             scoring_version=profile.ranking_version,
             config_version=config_version,
@@ -2054,6 +2056,17 @@ async def execute_semantic_recall(
         )
         session.add(recall_log)
         await session.commit()
+        empty_evaluation = SemanticPacketEvaluation(
+            profile=profile,
+            items=[],
+            working_set="",
+            candidate_count=candidate_total,
+            omitted_by_admission={},
+            byte_budget=byte_budget,
+            token_budget=token_budget,
+            item_budget=item_budget,
+        )
+        empty_evaluation.finalize_counts()
         return {
             "working_set": "",
             "item_count": 0,
@@ -2075,6 +2088,12 @@ async def execute_semantic_recall(
                 recall_signals.SIGNALS_VERSION if profile.signals_enabled else None
             ),
             "omitted_by_admission": {},
+            # Receipt-only finalized packet handoff. This is not exposed by
+            # RecallResponse and avoids replaying any semantic work.
+            "_semantic_evaluation": empty_evaluation,
+            "effective_byte_budget": byte_budget,
+            "effective_token_budget": token_budget,
+            "effective_item_budget": item_budget,
         }
 
     # 2. Evaluate the certified (legacy) packet — read-only core; the audit
@@ -2105,6 +2124,7 @@ async def execute_semantic_recall(
         query=query,
         byte_budget=byte_budget,
         token_budget=token_budget,
+        item_budget=evaluation.item_budget,
         item_ids=selected_ids,
         scoring_version=profile.ranking_version,
         config_version=config_version,
@@ -2155,4 +2175,8 @@ async def execute_semantic_recall(
             recall_signals.SIGNALS_VERSION if profile.signals_enabled else None
         ),
         "omitted_by_admission": evaluation.omitted_by_admission,
+        "_semantic_evaluation": evaluation,
+        "effective_byte_budget": evaluation.byte_budget,
+        "effective_token_budget": evaluation.token_budget,
+        "effective_item_budget": evaluation.item_budget,
     }

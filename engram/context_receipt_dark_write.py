@@ -500,6 +500,8 @@ def _verify_reloaded_record(
         )
 
     verified_manifest = verify_context_receipt_record(stored_result.receipt)
+    if not isinstance(verified_manifest, ContextManifestV1):
+        raise ContextReceiptIntegrityError("startup receipt parsed as a non-startup manifest")
 
     recomputed_hash = compute_manifest_hash(verified_manifest)
     if recomputed_hash != stored_result.receipt.manifest_hash:

@@ -82,7 +82,20 @@ def live_proposal_expression() -> ColumnElement[bool]:
         MemoryItem.conflict_resolution_status.is_distinct_from("unresolved"),
     )
 
+
 EpistemicState = Literal["supported", "contested", "insufficient_evidence", "unknown"]
+WarningCode = Literal[
+    "unreviewed",
+    "evidence_unknown",
+    "evidence_contested",
+    "evidence_insufficient",
+    "conflict_unresolved",
+    "disputed",
+    "risk_high",
+    "risk_unknown",
+    "admission_assessment_stale",
+    "admission_legacy_import",
+]
 
 # ---- utility weights ----
 #
@@ -111,7 +124,7 @@ _UTILITY_RANK_FLOOR: Final = 0.5
 # confidence (issue #160), and a generic "low confidence" warning on this path
 # would reintroduce exactly the conflation #160 removes. Epistemic state stays
 # ``unknown``/``insufficient_evidence`` until #157 enrichment lands.
-_WARNING_TEXT: Final[dict[str, str]] = {
+_WARNING_TEXT: Final[dict[WarningCode, str]] = {
     "unreviewed": "unreviewed",
     "evidence_unknown": "evidence state unknown",
     "evidence_contested": "evidence contested",
@@ -401,7 +414,7 @@ def structured_warning_codes(
     epistemic_state: str | None = None,
     assessment_status: str | None = None,
     risk_state: str | None = None,
-) -> list[str]:
+) -> list[WarningCode]:
     """Machine-readable handling codes for one admitted item.
 
     Codes are the contract (SDK/MCP render or branch on them); the free-text
@@ -420,7 +433,7 @@ def structured_warning_codes(
     epistemic confidence, and must never produce a warning that reads as a
     factual-confidence claim.
     """
-    codes: list[str] = []
+    codes: list[WarningCode] = []
     if review_status == "proposed":
         codes.append("unreviewed")
     if epistemic_state == "unknown":

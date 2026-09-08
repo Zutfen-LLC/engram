@@ -292,10 +292,19 @@ jobs:
       - name: Verify vectors (JavaScript, independent RFC 8785 + SHA-256)
         run: node conformance/context-manifest-v1/verify.mjs
 
+      - name: Verify semantic vectors (Python)
+        run: .venv/bin/python scripts/verify_semantic_context_manifest_vectors.py
+
+      - name: Verify semantic vectors (JavaScript, independent reconstruction)
+        run: node conformance/semantic-context-manifest-v1/verify.mjs
+
       # The driver invokes each negative verifier exactly once and checks that
       # both languages reject the same non-empty fixture set.
       - name: Verify negative fixtures cross-language
         run: .venv/bin/python conformance/context-manifest-v1/run_cross_language.py
+
+      - name: Verify semantic negative fixtures cross-language
+        run: .venv/bin/python conformance/semantic-context-manifest-v1/run_cross_language.py
 
   # Keep the existing required-check name stable. This job also ensures the
   # DB-free checks remain part of the same merge gate as the real-DB shards.

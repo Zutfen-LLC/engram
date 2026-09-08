@@ -64,7 +64,11 @@ async def _get_test_session() -> AsyncSession:
     async with _test_session_factory() as session:
         from sqlalchemy import text as sa_text
 
-        from engram.db import _DEFAULT_PRINCIPAL_NAME, _DEFAULT_TENANT_SLUG, apply_rls_context
+        from engram.db import (
+            _DEFAULT_PRINCIPAL_NAME,
+            _DEFAULT_TENANT_SLUG,
+            apply_rls_context,
+        )
 
         row = (
             (
@@ -75,7 +79,10 @@ async def _get_test_session() -> AsyncSession:
                         "JOIN principals p ON p.tenant_id = t.id AND p.name = :principal "
                         "WHERE t.slug = :slug"
                     ),
-                    {"slug": _DEFAULT_TENANT_SLUG, "principal": _DEFAULT_PRINCIPAL_NAME},
+                    {
+                        "slug": _DEFAULT_TENANT_SLUG,
+                        "principal": _DEFAULT_PRINCIPAL_NAME,
+                    },
                 )
             )
             .mappings()
@@ -106,6 +113,7 @@ async def _clean_db():
     if not await _db_ok():
         return
     async with _test_engine.begin() as conn:
+        await conn.execute(text("DELETE FROM context_receipts"))
         await conn.execute(text("DELETE FROM usage_events"))
         await conn.execute(text("DELETE FROM feedback_events"))
         await conn.execute(text("DELETE FROM recall_logs"))
@@ -139,12 +147,14 @@ def _reset_embedding_provider():
     original_conflict = settings.conflict_check_on_write
     original_capture = settings.admission_assessment_capture_enabled
     original_default_profile = settings.recall_default_profile
+    original_semantic_receipts = settings.semantic_context_receipt_dark_write_enabled
     settings.conflict_check_on_write = False
     yield
     settings.embedding_provider = original_provider
     settings.conflict_check_on_write = original_conflict
     settings.admission_assessment_capture_enabled = original_capture
     settings.recall_default_profile = original_default_profile
+    settings.semantic_context_receipt_dark_write_enabled = original_semantic_receipts
 
 
 _TARGET_VEC = [1.0] + [0.0] * 1535
@@ -163,7 +173,9 @@ def _fake_embedding_for(text_value: str) -> list[float]:
     return _DISTRACTOR_VEC
 
 
-async def _remember(client: AsyncClient, content: str, **payload: Any) -> dict[str, Any]:
+async def _remember(
+    client: AsyncClient, content: str, **payload: Any
+) -> dict[str, Any]:
     body: dict[str, Any] = {"content": content, "source_type": "manual"}
     body.update(payload)
     resp = await client.post("/v1/remember", json=body)
@@ -249,7 +261,9 @@ async def _seed_active_and_proposed(client: AsyncClient) -> tuple[str, str]:
 
 async def _skip_without_db() -> None:
     if not await _db_ok():
-        pytest.skip("requires a live PostgreSQL with the v2 schema (run docker compose up)")
+        pytest.skip(
+            "requires a live PostgreSQL with the v2 schema (run docker compose up)"
+        )
 
 
 async def _recall_log_count() -> int:
@@ -260,7 +274,7 @@ async def _recall_log_count() -> int:
 async def _recall_counts(item_ids: list[str]) -> list[int]:
     async with _test_session_factory() as session:
         rows = (
-            
+            (
                 await session.execute(
                     text(
                         "SELECT recall_count FROM memory_items "
@@ -268,8 +282,10 @@ async def _recall_counts(item_ids: list[str]) -> list[int]:
                     ),
                     {"ids": item_ids},
                 )
-            
-        ).scalars().all()
+            )
+            .scalars()
+            .all()
+        )
         return list(rows)
 
 
@@ -375,9 +391,7 @@ async def _persist_v2_row(
         await apply_rls_context(
             session, tenant_id=ids["tenant_id"], principal_id=ids["principal_id"]
         )
-        item = await session.scalar(
-            select(MemoryItem).where(MemoryItem.id == item_id)
-        )
+        item = await session.scalar(select(MemoryItem).where(MemoryItem.id == item_id))
         assert item is not None
         if created_hours_ago is not None:
             item.created_at = datetime.now(UTC) - timedelta(hours=created_hours_ago)
@@ -517,7 +531,8 @@ async def test_requesting_governed_cannot_change_the_served_packet(client, monke
     await _seed_active_and_proposed(client)
 
     resp = await client.post(
-        "/v1/recall", json={"mode": "semantic", "query": "q", "recall_profile": "governed"}
+        "/v1/recall",
+        json={"mode": "semantic", "query": "q", "recall_profile": "governed"},
     )
     assert resp.status_code == 422
     detail = str(resp.json()["detail"])
@@ -529,7 +544,9 @@ async def test_requesting_governed_cannot_change_the_served_packet(client, monke
     assert body["scoring_version"] == "semantic-v3"
 
 
-async def test_requesting_exploratory_cannot_change_the_served_packet(client, monkeypatch):
+async def test_requesting_exploratory_cannot_change_the_served_packet(
+    client, monkeypatch
+):
     """Requirement 3: merely requesting exploratory is refused (422) before
     certification — no broader working memory for any caller of /v1/recall."""
     await _skip_without_db()
@@ -624,9 +641,7 @@ async def test_shadow_comparison_evaluates_candidates_without_mutating_serving(
     expl_by_id = {i["id"]: i for i in exploratory["items"]}
     assert proposed_id in expl_by_id
     assert expl_by_id[proposed_id]["epistemic_state"] == "supported"
-    assert (
-        expl_by_id[proposed_id]["evidence"]["epistemic_state"] == "supported"
-    )
+    assert expl_by_id[proposed_id]["evidence"]["epistemic_state"] == "supported"
     assert "unreviewed" in expl_by_id[proposed_id]["warning_codes"]
 
     # Read-only proof: no audit row, no exposure counters, serving unchanged.
@@ -636,9 +651,7 @@ async def test_shadow_comparison_evaluates_candidates_without_mutating_serving(
     assert {i["id"] for i in after["items"]} == served_ids
 
 
-async def test_shadow_runs_when_the_candidate_corpus_is_empty(
-    client, monkeypatch
-):
+async def test_shadow_runs_when_the_candidate_corpus_is_empty(client, monkeypatch):
     """Preflight regression: the comparison must run whenever ANY requested
     packet has an eligible corpus. A tenant whose only item is ACTIVE has a
     non-empty legacy corpus (active + proposed window) but an EMPTY candidate
@@ -729,7 +742,10 @@ async def test_governed_candidate_admits_only_v2_qualified_proposals(
     assert v2["fresh"]["decision_hash"].startswith("sha256:")
     # current means the persisted identity and the fresh evaluation agree.
     assert v2["persisted"]["decision_hash"] == v2["fresh"]["decision_hash"]
-    assert v2["persisted"]["policy_artifact_digest"] == v2["fresh"]["policy_artifact_digest"]
+    assert (
+        v2["persisted"]["policy_artifact_digest"]
+        == v2["fresh"]["policy_artifact_digest"]
+    )
     # The evidence block is an exact projection of that same binding.
     _evidence_identity_asserts(served)
     from engram.recall_signals import compute_signal_rank_score
@@ -740,9 +756,7 @@ async def test_governed_candidate_admits_only_v2_qualified_proposals(
 
     # Exploratory consumes its own exact surface: both proposals' decisions
     # say semantic_exploratory=allow.
-    exploratory = next(
-        c for c in shadow["candidates"] if c["profile"] == "exploratory"
-    )
+    exploratory = next(c for c in shadow["candidates"] if c["profile"] == "exploratory")
     assert {i["id"] for i in exploratory["items"]} == {qualified_id, unqualified["id"]}
 
 
@@ -829,9 +843,10 @@ async def test_governed_candidate_withholds_item_with_stale_assessment(
     shadow = await _shadow_compare(client, profiles=["governed", "exploratory"])
     by_profile = {c["profile"]: c for c in shadow["candidates"]}
     assert by_profile["governed"]["item_count"] == 0
-    assert by_profile["governed"]["omitted_by_admission"].get(
-        "admission_assessment_stale"
-    ) == 1
+    assert (
+        by_profile["governed"]["omitted_by_admission"].get("admission_assessment_stale")
+        == 1
+    )
 
     expl = by_profile["exploratory"]
     assert expl["item_count"] == 1
@@ -855,7 +870,9 @@ async def test_governed_candidate_ordering_is_deterministic(client, monkeypatch)
         ("semantic target two", 0.1),
         ("semantic target three", 0.5),
     ):
-        item = await _remember(client, content, importance=importance, source_type="extraction")
+        item = await _remember(
+            client, content, importance=importance, source_type="extraction"
+        )
         await _persist_v2_row(item["id"])
 
     first = await _shadow_compare(client, profiles=["governed"])
@@ -923,9 +940,7 @@ async def test_shadow_denies_ordinary_read_caller(client, app, monkeypatch):
     assert resp.status_code == 403
 
 
-async def test_shadow_tenant_denial_wins_even_for_a_capable_caller(
-    client, monkeypatch
-):
+async def test_shadow_tenant_denial_wins_even_for_a_capable_caller(client, monkeypatch):
     """Requirement 7a: reviewer capability is not sufficient — the tenant's
     policy allow is required, and its denial wins."""
     await _skip_without_db()
@@ -997,7 +1012,8 @@ async def test_inevitably_withheld_rows_cannot_consume_the_bounded_window(
 
     # Manual captures land active; extraction captures land proposed.
     active_ids = [
-        (await _remember(client, f"ineligible active row {i:02d}"))["id"] for i in range(4)
+        (await _remember(client, f"ineligible active row {i:02d}"))["id"]
+        for i in range(4)
     ]
     conflicted_ids = [
         (
@@ -1096,7 +1112,8 @@ async def test_capture_disabled_preserves_stale_assessment_enforcement(
     assert result.promoted == 0
     async with _test_session_factory() as session:
         status = await session.scalar(
-            text("SELECT review_status FROM memory_items WHERE id = :id"), {"id": item["id"]}
+            text("SELECT review_status FROM memory_items WHERE id = :id"),
+            {"id": item["id"]},
         )
         assert status == "proposed"
         outcome = await session.scalar(
@@ -1193,7 +1210,9 @@ async def _seed_path_a_blocked(item_id: str) -> None:
         item = await session.scalar(select(MemoryItem).where(MemoryItem.id == item_id))
         assert item is not None
         config = await _config(session, str(item.tenant_id))
-        _, threshold, min_age, evidence_enabled, evidence_threshold = _config_values(config)
+        _, threshold, min_age, evidence_enabled, evidence_threshold = _config_values(
+            config
+        )
         support = (await load_promotion_support(session, [item]))[item.id]
         kind = support.kind
         decision = AdmissionDecision(
@@ -1277,9 +1296,10 @@ async def test_blocked_path_a_binding_withholds_with_truthful_v2_disagreement(
         assert v2["fresh"]["surface_decision"] == "allow"
         assert v2["persisted"]["assessment_id"] is not None
         assert v2["persisted"]["decision_hash"] == v2["fresh"]["decision_hash"]
-        assert v2["persisted"]["policy_artifact_digest"] == v2["fresh"][
-            "policy_artifact_digest"
-        ]
+        assert (
+            v2["persisted"]["policy_artifact_digest"]
+            == v2["fresh"]["policy_artifact_digest"]
+        )
 
 
 # ---- audit ----
@@ -1316,7 +1336,11 @@ async def test_recall_log_records_only_servable_profiles(client, monkeypatch):
             .all()
         )
         all_profiles = (
-            (await session.execute(text("SELECT DISTINCT recall_profile FROM recall_logs")))
+            (
+                await session.execute(
+                    text("SELECT DISTINCT recall_profile FROM recall_logs")
+                )
+            )
             .scalars()
             .all()
         )
@@ -1413,7 +1437,9 @@ async def test_served_evidence_state_is_the_exact_v2_fresh_evaluation(
     await _enable_tenant_shadow_policy()
 
     fixtures: dict[str, dict[str, Any]] = {}
-    supported = await _remember(client, "evidence matrix supported", source_type="extraction")
+    supported = await _remember(
+        client, "evidence matrix supported", source_type="extraction"
+    )
     await _persist_v2_row(supported["id"], risk="low", epistemic_state="supported")
     fixtures[supported["id"]] = {
         "epistemic_state": "supported",
@@ -1432,7 +1458,9 @@ async def test_served_evidence_state_is_the_exact_v2_fresh_evaluation(
         # unknown risk hits the risk_unknown rule -> review_required output.
         "governed_surface_decision": "review_required",
     }
-    contested = await _remember(client, "evidence matrix contested", source_type="extraction")
+    contested = await _remember(
+        client, "evidence matrix contested", source_type="extraction"
+    )
     await _persist_v2_row(contested["id"], risk="low", epistemic_state="contested")
     fixtures[contested["id"]] = {
         "epistemic_state": "contested",
@@ -1444,7 +1472,9 @@ async def test_served_evidence_state_is_the_exact_v2_fresh_evaluation(
     insufficient = await _remember(
         client, "evidence matrix insufficient", source_type="extraction"
     )
-    await _persist_v2_row(insufficient["id"], risk="low", epistemic_state="insufficient_evidence")
+    await _persist_v2_row(
+        insufficient["id"], risk="low", epistemic_state="insufficient_evidence"
+    )
     fixtures[insufficient["id"]] = {
         "epistemic_state": "insufficient_evidence",
         "risk_state": "low",
@@ -1453,7 +1483,9 @@ async def test_served_evidence_state_is_the_exact_v2_fresh_evaluation(
         # epistemic_insufficient (low risk) -> withhold output on governed.
         "governed_surface_decision": "withhold",
     }
-    high = await _remember(client, "evidence matrix high risk", source_type="extraction")
+    high = await _remember(
+        client, "evidence matrix high risk", source_type="extraction"
+    )
     await _persist_v2_row(high["id"], risk="high", epistemic_state="supported")
     fixtures[high["id"]] = {
         "epistemic_state": "supported",
@@ -1477,8 +1509,13 @@ async def test_served_evidence_state_is_the_exact_v2_fresh_evaluation(
         assert item["evidence"]["epistemic_state"] == expected["epistemic_state"]
         assert item["evidence"]["risk_state"] == expected["risk_state"]
         codes = item["warning_codes"]
-        for code in ("evidence_unknown", "evidence_contested", "evidence_insufficient",
-                     "risk_high", "risk_unknown"):
+        for code in (
+            "evidence_unknown",
+            "evidence_contested",
+            "evidence_insufficient",
+            "risk_high",
+            "risk_unknown",
+        ):
             if expected["warning_code"] and code in expected["warning_code"]:
                 assert code in codes, (item_id, code)
             else:
@@ -1495,7 +1532,9 @@ async def test_served_evidence_state_is_the_exact_v2_fresh_evaluation(
     # served for withheld candidates, and their diagnostic V2 identity stays
     # intact (required test 10).
     assert {i["id"] for i in governed["items"]} == {
-        item_id for item_id, expected in fixtures.items() if expected["governed_admitted"]
+        item_id
+        for item_id, expected in fixtures.items()
+        if expected["governed_admitted"]
     }
     for item in governed["items"]:
         _evidence_identity_asserts(item)
@@ -1558,7 +1597,9 @@ async def test_evidence_presentation_adds_no_resolution_or_evaluation(
 
     provider_calls = {"count": 0}
 
-    async def counting_embedding(text_value: str, *_args: object, **kwargs: object) -> Any:
+    async def counting_embedding(
+        text_value: str, *_args: object, **kwargs: object
+    ) -> Any:
         provider_calls["count"] += 1
         return _fake_embedding_for(text_value)
 
@@ -1617,9 +1658,7 @@ async def test_evidence_presentation_adds_no_resolution_or_evaluation(
         standalone = await original_resolve(
             session, items=window, context=context, evaluation_time=datetime.now(UTC)
         )
-    packet_queries = {
-        c["v2_resolution"]["query_count"] for c in shadow["candidates"]
-    }
+    packet_queries = {c["v2_resolution"]["query_count"] for c in shadow["candidates"]}
     assert packet_queries == {standalone.query_count}
     assert standalone.query_count > 0
 
@@ -1633,14 +1672,19 @@ async def test_shadow_compare_with_evidence_remains_read_only(client, monkeypatc
     _patch_embeddings(monkeypatch)
     await _enable_tenant_shadow_policy()
 
-    item = await _remember(client, "evidence read-only target", source_type="extraction")
+    item = await _remember(
+        client, "evidence read-only target", source_type="extraction"
+    )
     await _persist_v2_row(item["id"])
     logs_before = await _recall_log_count()
     counts_before = await _recall_counts([item["id"]])
 
     shadow = await _shadow_compare(client, profiles=["governed", "exploratory"])
     assert shadow["candidates"][0]["items"]
-    assert shadow["candidates"][0]["items"][0]["evidence"]["source"] == "v2_fresh_evaluation"
+    assert (
+        shadow["candidates"][0]["items"][0]["evidence"]["source"]
+        == "v2_fresh_evaluation"
+    )
 
     assert await _recall_log_count() == logs_before
     assert await _recall_counts([item["id"]]) == counts_before
@@ -1663,7 +1707,8 @@ async def _link_items(
 ) -> None:
     async with _test_engine.begin() as conn:
         tenant_id = await conn.scalar(
-            text("SELECT tenant_id::text FROM memory_items WHERE id = :id"), {"id": source_id}
+            text("SELECT tenant_id::text FROM memory_items WHERE id = :id"),
+            {"id": source_id},
         )
         await conn.execute(
             text(
@@ -1671,7 +1716,13 @@ async def _link_items(
                 "edge_type, weight) "
                 "VALUES (gen_random_uuid(), :tenant, :src, :tgt, :et, :w)"
             ),
-            {"tenant": tenant_id, "src": source_id, "tgt": target_id, "et": edge_type, "w": weight},
+            {
+                "tenant": tenant_id,
+                "src": source_id,
+                "tgt": target_id,
+                "et": edge_type,
+                "w": weight,
+            },
         )
 
 
@@ -1685,9 +1736,13 @@ async def _unlink_items(source_id: str, target_id: str) -> None:
         )
 
 
-async def _mk_tunnel(source_wing: str, target_wing: str, *, label: str | None = None) -> None:
+async def _mk_tunnel(
+    source_wing: str, target_wing: str, *, label: str | None = None
+) -> None:
     async with _test_engine.begin() as conn:
-        tenant_id = await conn.scalar(text("SELECT id::text FROM tenants WHERE slug = 'default'"))
+        tenant_id = await conn.scalar(
+            text("SELECT id::text FROM tenants WHERE slug = 'default'")
+        )
         await conn.execute(
             text(
                 "INSERT INTO tunnels (id, tenant_id, source_wing, target_wing, label) "
@@ -1701,7 +1756,8 @@ async def _make_expansion_only(item_id: str) -> None:
     """Remove the item's embedding so only relationship expansion can reach it."""
     async with _test_engine.begin() as conn:
         await conn.execute(
-            text("DELETE FROM memory_embeddings WHERE memory_item_id = :id"), {"id": item_id}
+            text("DELETE FROM memory_embeddings WHERE memory_item_id = :id"),
+            {"id": item_id},
         )
 
 
@@ -1844,7 +1900,9 @@ async def _candidate_packet(
 
 def _relationship(item: dict[str, Any]) -> dict[str, Any]:
     relationship = item.get("relationship")
-    assert relationship is not None, "admitted expanded item must carry the relationship block"
+    assert relationship is not None, (
+        "admitted expanded item must carry the relationship block"
+    )
     return relationship
 
 
@@ -1862,7 +1920,9 @@ async def test_withheld_direct_candidate_cannot_seed_graph_expansion(
     _patch_embeddings(monkeypatch)
     await _enable_tenant_shadow_policy()
 
-    seed = await _remember(client, "semantic target withheld seed", source_type="extraction")
+    seed = await _remember(
+        client, "semantic target withheld seed", source_type="extraction"
+    )
     await _persist_v2_row(seed["id"], risk=None)  # governed: review_required
     neighbor = await _seed_qualified(client, "graph neighbor of withheld seed")
     await _make_expansion_only(neighbor["id"])
@@ -2104,9 +2164,10 @@ async def test_tunnel_multi_seed_source_attribution_strongest_connected_wins(
     after = await _candidate_packet(client)
     by_id_after = {item["id"]: item for item in after["items"]}
     relationship_after = _relationship(by_id_after[neighbor["id"]])
-    assert relationship_after["source_seed_score"] == by_id_after[weak["id"]][
-        "similarity_score"
-    ]
+    assert (
+        relationship_after["source_seed_score"]
+        == by_id_after[weak["id"]]["similarity_score"]
+    )
     assert relationship_after["relevance_score"] < relationship["relevance_score"]
 
 
@@ -2126,7 +2187,9 @@ async def test_withheld_direct_candidate_does_not_consume_graph_capacity(
     monkeypatch.setattr(settings, "max_graph_expanded_items", 1)
 
     seed_a = await _seed_qualified(client, "semantic target capacity seed")
-    direct_b = await _remember(client, "semantic target withheld direct", source_type="extraction")
+    direct_b = await _remember(
+        client, "semantic target withheld direct", source_type="extraction"
+    )
     await _persist_v2_row(direct_b["id"], risk=None)  # governed: review_required
     neighbor_c = await _seed_qualified(client, "capacity expansion neighbor")
     await _make_expansion_only(neighbor_c["id"])
@@ -2182,7 +2245,9 @@ async def test_neighbor_withheld_by_surface_despite_strongest_edge(client, monke
     await _enable_tenant_shadow_policy()
 
     seed = await _seed_qualified(client, "semantic target strong edge seed")
-    neighbor = await _remember(client, "review routed graph neighbor", source_type="extraction")
+    neighbor = await _remember(
+        client, "review routed graph neighbor", source_type="extraction"
+    )
     await _persist_v2_row(neighbor["id"], risk=None)  # governed: review_required
     await _make_expansion_only(neighbor["id"])
     await _link_items(seed["id"], neighbor["id"], "supports", weight=1.0)
@@ -2211,7 +2276,9 @@ async def test_exploratory_high_risk_neighbor_admitted_on_its_own_surface(
     await _enable_tenant_shadow_policy()
 
     seed = await _seed_qualified(client, "semantic target risk seed")
-    neighbor = await _remember(client, "high risk graph neighbor", source_type="extraction")
+    neighbor = await _remember(
+        client, "high risk graph neighbor", source_type="extraction"
+    )
     await _persist_v2_row(neighbor["id"], risk="high", epistemic_state="supported")
     await _make_expansion_only(neighbor["id"])
     await _link_items(seed["id"], neighbor["id"], "references")
@@ -2244,7 +2311,9 @@ async def test_noncurrent_expanded_neighbors_fail_closed_with_diagnostics(
 
     seed = await _seed_qualified(client, "semantic target noncurrent seed")
 
-    missing = await _remember(client, "never assessed neighbor", source_type="extraction")
+    missing = await _remember(
+        client, "never assessed neighbor", source_type="extraction"
+    )
     await _make_expansion_only(missing["id"])
     await _link_items(seed["id"], missing["id"], "references")
 
@@ -2254,13 +2323,19 @@ async def test_noncurrent_expanded_neighbors_fail_closed_with_diagnostics(
     await _make_expansion_only(stale["id"])
     await _link_items(seed["id"], stale["id"], "references")
 
-    unsupported = await _remember(client, "unsupported neighbor", source_type="extraction")
+    unsupported = await _remember(
+        client, "unsupported neighbor", source_type="extraction"
+    )
     await _persist_v2_row(unsupported["id"])
-    await _fabricate_v2_row(unsupported["id"], schema_version="engram.admission-assessment.v1")
+    await _fabricate_v2_row(
+        unsupported["id"], schema_version="engram.admission-assessment.v1"
+    )
     await _make_expansion_only(unsupported["id"])
     await _link_items(seed["id"], unsupported["id"], "references")
 
-    mismatched = await _remember(client, "mismatched neighbor", source_type="extraction")
+    mismatched = await _remember(
+        client, "mismatched neighbor", source_type="extraction"
+    )
     await _persist_v2_row(mismatched["id"])
     await _fabricate_v2_row(mismatched["id"], policy_config_digest="sha256:" + "f" * 64)
     await _make_expansion_only(mismatched["id"])
@@ -2292,7 +2367,9 @@ async def test_supports_edge_cannot_upgrade_epistemic_state(client, monkeypatch)
     await _enable_tenant_shadow_policy()
 
     seed = await _seed_qualified(client, "semantic target epistemic seed")
-    neighbor = await _remember(client, "unknown evidence neighbor", source_type="extraction")
+    neighbor = await _remember(
+        client, "unknown evidence neighbor", source_type="extraction"
+    )
     await _persist_v2_row(neighbor["id"], risk=None)  # epistemic: unknown
     await _make_expansion_only(neighbor["id"])
     await _link_items(seed["id"], neighbor["id"], "supports", weight=1.0)
@@ -2319,7 +2396,10 @@ async def test_high_importance_neighbor_cannot_bypass_v2_withholding(
 
     seed = await _seed_qualified(client, "semantic target importance seed")
     neighbor = await _remember(
-        client, "important but unqualified neighbor", source_type="extraction", importance=1.0
+        client,
+        "important but unqualified neighbor",
+        source_type="extraction",
+        importance=1.0,
     )
     await _persist_v2_row(neighbor["id"], risk=None)
     await _make_expansion_only(neighbor["id"])
@@ -2547,7 +2627,9 @@ async def test_direct_candidate_merges_semantic_tunnel_origin(client, monkeypatc
     }
 
 
-async def test_direct_candidate_merges_semantic_graph_tunnel_origin(client, monkeypatch):
+async def test_direct_candidate_merges_semantic_graph_tunnel_origin(
+    client, monkeypatch
+):
     """The ``semantic+graph+tunnel`` merge: pins the complete origin-merging
     contract — one admitted direct item reached by an edge from another
     admitted seed AND sitting in that seed's tunneled wing carries all three
@@ -2654,7 +2736,9 @@ async def test_cross_tenant_neighbor_is_never_discoverable(client, monkeypatch):
     assert foreign_id not in {d["item_id"] for d in governed["admission_diagnostics"]}
 
 
-async def test_private_neighbor_is_undiscoverable_and_undiagnosable(client, monkeypatch):
+async def test_private_neighbor_is_undiscoverable_and_undiagnosable(
+    client, monkeypatch
+):
     """Required test 17: another principal's private neighbor is invisible —
     not in the packet, not even diagnosable by identity."""
     await _skip_without_db()
@@ -2674,7 +2758,8 @@ async def test_private_neighbor_is_undiscoverable_and_undiagnosable(client, monk
         other_principal = str(uuid4())
         principal_name = f"exp190-private-{other_principal[:8]}"
         tenant_id = await conn.scalar(
-            text("SELECT tenant_id::text FROM memory_items WHERE id = :id"), {"id": seed["id"]}
+            text("SELECT tenant_id::text FROM memory_items WHERE id = :id"),
+            {"id": seed["id"]},
         )
         await conn.execute(
             text(
@@ -2691,7 +2776,9 @@ async def test_private_neighbor_is_undiscoverable_and_undiagnosable(client, monk
 
     governed = await _candidate_packet(client)
     assert neighbor["id"] not in {item["id"] for item in governed["items"]}
-    assert neighbor["id"] not in {d["item_id"] for d in governed["admission_diagnostics"]}
+    assert neighbor["id"] not in {
+        d["item_id"] for d in governed["admission_diagnostics"]
+    }
     # An inaccessible seed reveals nothing either: the only admitted item is
     # the seed itself (required test 19's non-disclosure property).
     assert governed["expansion"]["discovered_neighbors"] == 0
@@ -2706,10 +2793,14 @@ async def test_out_of_workspace_neighbor_unreachable_through_edge(client, monkey
     await _enable_tenant_shadow_policy()
 
     async with _test_engine.begin() as conn:
-        tenant_id = await conn.scalar(text("SELECT id::text FROM tenants WHERE slug = 'default'"))
+        tenant_id = await conn.scalar(
+            text("SELECT id::text FROM tenants WHERE slug = 'default'")
+        )
         admin_id = await conn.scalar(
-            text("SELECT p.id::text FROM principals p JOIN tenants t ON t.id = p.tenant_id "
-                 "WHERE t.slug = 'default' AND p.name = 'admin'")
+            text(
+                "SELECT p.id::text FROM principals p JOIN tenants t ON t.id = p.tenant_id "
+                "WHERE t.slug = 'default' AND p.name = 'admin'"
+            )
         )
         workspace_id = str(uuid4())
         workspace_slug = f"exp190-ws-{workspace_id[:8]}"
@@ -2763,7 +2854,8 @@ async def test_inaccessible_item_cannot_be_used_to_infer_neighbors(client, monke
     async with _test_engine.begin() as conn:
         other_principal = str(uuid4())
         tenant_id = await conn.scalar(
-            text("SELECT tenant_id::text FROM memory_items WHERE id = :id"), {"id": seed["id"]}
+            text("SELECT tenant_id::text FROM memory_items WHERE id = :id"),
+            {"id": seed["id"]},
         )
         await conn.execute(
             text(
@@ -2818,7 +2910,9 @@ async def test_expansion_adds_no_provider_call(client, monkeypatch):
     # Seed first, THEN start counting: only the comparison itself is measured.
     provider_calls = {"count": 0}
 
-    async def counting_embedding(text_value: str, *_args: object, **_kwargs: object) -> list[float]:
+    async def counting_embedding(
+        text_value: str, *_args: object, **_kwargs: object
+    ) -> list[float]:
         provider_calls["count"] += 1
         return _fake_embedding_for(text_value)
 
@@ -2851,7 +2945,9 @@ async def test_expanded_neighbor_resolution_is_bulk_without_nplus1(client, monke
         resolve_calls["count"] += 1
         return await original_resolve(*args, **kwargs)
 
-    monkeypatch.setattr(admission_shadow_mod, "resolve_bulk_v2_decisions", counting_resolve)
+    monkeypatch.setattr(
+        admission_shadow_mod, "resolve_bulk_v2_decisions", counting_resolve
+    )
     monkeypatch.setattr(settings, "max_graph_neighbors_per_item", 10)
 
     seed = await _seed_qualified(client, "semantic target bulk seed")
@@ -2877,9 +2973,10 @@ async def test_expanded_neighbor_resolution_is_bulk_without_nplus1(client, monke
     # packet regardless of neighbor count.
     assert resolve_calls["count"] == 4  # two packets x two windows
     # Merged per-packet query count is constant in neighbor count.
-    assert packet_few["v2_resolution"]["query_count"] == packet_many[
-        "v2_resolution"
-    ]["query_count"]
+    assert (
+        packet_few["v2_resolution"]["query_count"]
+        == packet_many["v2_resolution"]["query_count"]
+    )
     assert packet_many["v2_resolution"]["resolved_count"] == 7  # 1 direct + 6 neighbors
 
 
@@ -2898,7 +2995,9 @@ async def test_graph_and_tunnel_caps_remain_enforced(client, monkeypatch):
     for i in range(4):
         neighbor = await _seed_qualified(client, f"caps graph neighbor {i}")
         await _make_expansion_only(neighbor["id"])
-        await _link_items(seed["id"], neighbor["id"], "derived_from", weight=0.9 - i * 0.1)
+        await _link_items(
+            seed["id"], neighbor["id"], "derived_from", weight=0.9 - i * 0.1
+        )
     tunnel_extra = await _seed_qualified(
         client, "caps tunnel neighbor", wing="CapsWing", room="src"
     )
@@ -2930,7 +3029,9 @@ async def test_equal_score_tie_ordering_is_deterministic(client, monkeypatch):
     anchors = datetime.now(UTC) - timedelta(days=7)
     neighbors = []
     for i in range(2):
-        neighbor = await _remember(client, f"tie neighbor {i}", source_type="extraction")
+        neighbor = await _remember(
+            client, f"tie neighbor {i}", source_type="extraction"
+        )
         await _make_expansion_only(neighbor["id"])
         await _link_items(seed["id"], neighbor["id"], "references", weight=0.5)
         # Identical timestamps/weights/importance BEFORE persisting the V2
@@ -2964,6 +3065,7 @@ async def test_expansion_shadow_comparison_remains_read_only(client, monkeypatch
     unchanged."""
     await _skip_without_db()
     settings.embedding_provider = "openai"
+    settings.semantic_context_receipt_dark_write_enabled = True
     _patch_embeddings(monkeypatch)
     await _enable_tenant_shadow_policy()
 
@@ -2972,9 +3074,19 @@ async def test_expansion_shadow_comparison_remains_read_only(client, monkeypatch
     await _make_expansion_only(neighbor["id"])
     await _link_items(seed["id"], neighbor["id"], "derived_from")
 
-    async def _snapshot_state() -> tuple[int, list[int], dict[str, Any], int]:
+    async def _snapshot_state() -> tuple[
+        int,
+        int,
+        list[int],
+        dict[str, Any],
+        int,
+        dict[str, str | None],
+    ]:
         async with _test_session_factory() as session:
             logs = int(await session.scalar(text("SELECT count(*) FROM recall_logs")))
+            receipts = int(
+                await session.scalar(text("SELECT count(*) FROM context_receipts"))
+            )
             counts = list(
                 (
                     await session.execute(
@@ -2998,13 +3110,42 @@ async def test_expansion_shadow_comparison_remains_read_only(client, monkeypatch
             assessments = int(
                 await session.scalar(text("SELECT count(*) FROM admission_assessments"))
             )
-        return logs, counts, reviews, assessments
+            mutation_tables = (
+                "admission_assessment_current",
+                "feedback_events",
+                "item_events",
+                "promotion_reconciliation_state",
+                "promotion_startup_shadow_state",
+                "promotion_reconcile_state",
+                "promotion_reconcile_chains",
+                "promotion_reconcile_terminal",
+                "promotion_reconcile_scheduler_state",
+            )
+            mutations = {
+                table: await session.scalar(
+                    text(
+                        "SELECT jsonb_agg(to_jsonb(snapshot) "
+                        "ORDER BY to_jsonb(snapshot)::text)::text "
+                        f"FROM {table} AS snapshot"
+                    )
+                )
+                for table in mutation_tables
+            }
+        return logs, receipts, counts, reviews, assessments, mutations
 
     before = await _snapshot_state()
     shadow = await _shadow_compare(client, profiles=["governed", "exploratory"])
     after = await _snapshot_state()
     assert before == after
+    shadow_text = str(shadow)
+    assert "receipt_id" not in shadow_text
+    assert "manifest_hash" not in shadow_text
+    assert "packet_hash" not in shadow_text
 
+    # Receipt capture stayed enabled for the complete shadow request. Disable
+    # it before the separate authoritative compatibility check so this test
+    # does not leave an unrelated durable receipt for later test modules.
+    settings.semantic_context_receipt_dark_write_enabled = False
     legacy_served = await _recall(client)
     # The authoritative legacy write path is the only one that may write;
     # its counts prove the comparison itself wrote nothing (the shadow left
@@ -3025,7 +3166,7 @@ async def test_expansion_shadow_comparison_remains_read_only(client, monkeypatch
             .all()
         )
     assert logs == before[0] + 1
-    assert counts == [count + 1 for count in before[1]]
+    assert counts == [count + 1 for count in before[2]]
     # The candidate packet did expand (the boundary under test is real).
     governed = next(c for c in shadow["candidates"] if c["profile"] == "governed")
     assert governed["expansion"]["admitted_expanded"] == 1

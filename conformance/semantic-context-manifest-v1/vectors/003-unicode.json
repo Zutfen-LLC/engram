@@ -1,0 +1,166 @@
+{
+  "name": "003-unicode",
+  "description": "Unicode query and content.",
+  "input": {
+    "query": "記憶 café",
+    "context": {
+      "tenant_id": "00000000-0000-0000-0000-000000000001",
+      "principal_id": "00000000-0000-0000-0000-000000000002",
+      "workspace_id": null,
+      "memory_context_version": "memory-context-v2",
+      "memory_profile_id": null,
+      "memory_profile_revision_id": null,
+      "memory_profile_version": null,
+      "workspace_supplied": false,
+      "requested_byte_budget": null,
+      "requested_token_budget": null,
+      "requested_item_budget": null,
+      "effective_byte_budget": 4096,
+      "effective_token_budget": 1024,
+      "effective_item_budget": 20,
+      "recall_profile": "legacy",
+      "recall_profile_contract_version": "recall-profiles-v1",
+      "scoring_version": "semantic-v3",
+      "signals_version": null,
+      "admission_policy": null,
+      "relationship_relevance_version": null,
+      "packing_version": null,
+      "config_version": "v1"
+    },
+    "packet": {
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-000000000012",
+          "kind": "fact",
+          "content": "naïve 雪",
+          "review_status": "active",
+          "authority": 10,
+          "visibility": "private",
+          "workspace_id": null,
+          "pinned": false,
+          "score": 0.8,
+          "trust_score": 0.9,
+          "relevance_score": null,
+          "utility_score": null,
+          "reasons": [
+            "semantic similarity 0.90"
+          ],
+          "warnings": [],
+          "warning_codes": null,
+          "conflict_type": null,
+          "conflict_resolution_status": null,
+          "admission": null,
+          "evidence": null,
+          "relationship": null,
+          "packing_reason": null
+        }
+      ],
+      "working_set": "[fact] naïve 雪",
+      "item_count": 1,
+      "byte_count": 10,
+      "candidate_count": 1,
+      "omitted_count": 0,
+      "omitted_by_admission": {},
+      "expansion": null,
+      "packing": null,
+      "message": null
+    }
+  },
+  "expected": {
+    "manifest": {
+      "schema": "engram.semantic-context-manifest",
+      "schema_version": "1.0",
+      "canonicalization": "rfc8785",
+      "mode": "semantic",
+      "subject": {
+        "tenant_id": "00000000-0000-0000-0000-000000000001",
+        "principal_id": "00000000-0000-0000-0000-000000000002",
+        "workspace_id": null,
+        "memory_context_version": "memory-context-v2",
+        "memory_profile_id": null,
+        "memory_profile_revision_id": null,
+        "memory_profile_version": null
+      },
+      "request": {
+        "requested": {
+          "workspace_supplied": false,
+          "byte_budget": null,
+          "token_budget": null,
+          "item_budget": null
+        },
+        "effective": {
+          "workspace_id": null,
+          "byte_budget": 4096,
+          "token_budget": 1024,
+          "item_budget": 20
+        },
+        "query_digest": "sha256:4906c5cfbe4d0a39b3862094a073028352a891d2c76b0bfa969df1c6baf29ab8",
+        "request_digest": "sha256:4e2d2dc6a7ed265acb567b8f5aa8c71da13679137b02c7341e009e0c5eed7506"
+      },
+      "versions": {
+        "recall_profile": "legacy",
+        "recall_profile_contract_version": "recall-profiles-v1",
+        "scoring_version": "semantic-v3",
+        "signals_version": null,
+        "admission_policy": null,
+        "relationship_relevance_version": null,
+        "packing_version": null,
+        "config_version": "v1",
+        "manifest_contract_version": "semantic-context-manifest-v1",
+        "packet_render_version": "working-set-v1"
+      },
+      "result": {
+        "item_count": 1,
+        "served_content_byte_count": 10,
+        "rendered_packet_byte_count": 17,
+        "candidate_count": 1,
+        "omitted_count": 0,
+        "omitted_by_admission": {},
+        "expansion": null,
+        "packing": null,
+        "message": null
+      },
+      "packet": {
+        "media_type": "text/plain; charset=utf-8",
+        "render_version": "working-set-v1",
+        "hash": "sha256:3962cc0e1ed333f39b22e2762e04181bef74f18b9b99ce574ec930fe1735b8cc"
+      },
+      "items": [
+        {
+          "ordinal": 0,
+          "item_id": "00000000-0000-0000-0000-000000000012",
+          "kind": "fact",
+          "served_content_hash": "sha256:0df25995f549579f731d7e11f0d53c0c3561e82780fa2369bc7cd7f31e32c48a",
+          "review_status": "active",
+          "authority": 10,
+          "visibility": "private",
+          "workspace_id": null,
+          "pinned": false,
+          "score": 0.8,
+          "trust_score": 0.9,
+          "relevance_score": null,
+          "utility_score": null,
+          "reasons": [
+            "semantic similarity 0.90"
+          ],
+          "warnings": [],
+          "warning_codes": null,
+          "conflict_type": null,
+          "conflict_resolution_status": null,
+          "admission": null,
+          "evidence": null,
+          "relationship": null,
+          "packing_reason": null
+        }
+      ]
+    },
+    "canonical_json": "{\"canonicalization\":\"rfc8785\",\"items\":[{\"admission\":null,\"authority\":10,\"conflict_resolution_status\":null,\"conflict_type\":null,\"evidence\":null,\"item_id\":\"00000000-0000-0000-0000-000000000012\",\"kind\":\"fact\",\"ordinal\":0,\"packing_reason\":null,\"pinned\":false,\"reasons\":[\"semantic similarity 0.90\"],\"relationship\":null,\"relevance_score\":null,\"review_status\":\"active\",\"score\":0.8,\"served_content_hash\":\"sha256:0df25995f549579f731d7e11f0d53c0c3561e82780fa2369bc7cd7f31e32c48a\",\"trust_score\":0.9,\"utility_score\":null,\"visibility\":\"private\",\"warning_codes\":null,\"warnings\":[],\"workspace_id\":null}],\"mode\":\"semantic\",\"packet\":{\"hash\":\"sha256:3962cc0e1ed333f39b22e2762e04181bef74f18b9b99ce574ec930fe1735b8cc\",\"media_type\":\"text/plain; charset=utf-8\",\"render_version\":\"working-set-v1\"},\"request\":{\"effective\":{\"byte_budget\":4096,\"item_budget\":20,\"token_budget\":1024,\"workspace_id\":null},\"query_digest\":\"sha256:4906c5cfbe4d0a39b3862094a073028352a891d2c76b0bfa969df1c6baf29ab8\",\"request_digest\":\"sha256:4e2d2dc6a7ed265acb567b8f5aa8c71da13679137b02c7341e009e0c5eed7506\",\"requested\":{\"byte_budget\":null,\"item_budget\":null,\"token_budget\":null,\"workspace_supplied\":false}},\"result\":{\"candidate_count\":1,\"expansion\":null,\"item_count\":1,\"message\":null,\"omitted_by_admission\":{},\"omitted_count\":0,\"packing\":null,\"rendered_packet_byte_count\":17,\"served_content_byte_count\":10},\"schema\":\"engram.semantic-context-manifest\",\"schema_version\":\"1.0\",\"subject\":{\"memory_context_version\":\"memory-context-v2\",\"memory_profile_id\":null,\"memory_profile_revision_id\":null,\"memory_profile_version\":null,\"principal_id\":\"00000000-0000-0000-0000-000000000002\",\"tenant_id\":\"00000000-0000-0000-0000-000000000001\",\"workspace_id\":null},\"versions\":{\"admission_policy\":null,\"config_version\":\"v1\",\"manifest_contract_version\":\"semantic-context-manifest-v1\",\"packet_render_version\":\"working-set-v1\",\"packing_version\":null,\"recall_profile\":\"legacy\",\"recall_profile_contract_version\":\"recall-profiles-v1\",\"relationship_relevance_version\":null,\"scoring_version\":\"semantic-v3\",\"signals_version\":null}}",
+    "manifest_hash": "sha256:2b3ec18edbe90cbb70e810e45a643723975d6e51fcfe6c04329569adc3030bfc",
+    "packet_hash": "sha256:3962cc0e1ed333f39b22e2762e04181bef74f18b9b99ce574ec930fe1735b8cc",
+    "query_digest": "sha256:4906c5cfbe4d0a39b3862094a073028352a891d2c76b0bfa969df1c6baf29ab8",
+    "request_digest": "sha256:4e2d2dc6a7ed265acb567b8f5aa8c71da13679137b02c7341e009e0c5eed7506",
+    "served_content_hashes": [
+      "sha256:0df25995f549579f731d7e11f0d53c0c3561e82780fa2369bc7cd7f31e32c48a"
+    ]
+  }
+}

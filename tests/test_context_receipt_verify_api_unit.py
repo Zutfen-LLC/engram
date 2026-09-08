@@ -23,6 +23,7 @@ import copy
 import json
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -41,6 +42,7 @@ from engram.context_receipts import (
     VERIFICATION_FAILURE_PACKET_HASH_BINDING_MISMATCH,
     VERIFICATION_FAILURE_SUBJECT_OWNERSHIP_MISMATCH,
     VERIFICATION_FAILURE_UNKNOWN,
+    VERIFICATION_FAILURE_UNSUPPORTED_MANIFEST_CONTRACT,
     ContextReceiptIntegrityError,
     ContextReceiptVerificationResult,
     InvalidCursorError,
@@ -135,6 +137,14 @@ def test_each_defect_maps_to_stable_failure_code() -> None:
     assert result.failure_code == VERIFICATION_FAILURE_MANIFEST_PARSE_FAILED
     assert result.manifest is None
 
+    # unsupported_manifest_contract
+    receipt = _make_receipt()
+    receipt.manifest["schema_version"] = "2.0"
+    result = _verify_stored_record(receipt)
+    assert result.status == "invalid"
+    assert result.failure_code == VERIFICATION_FAILURE_UNSUPPORTED_MANIFEST_CONTRACT
+    assert result.manifest is None
+
     # manifest_hash_mismatch
     receipt = _make_receipt()
     receipt.manifest_hash = "sha256:" + "0" * 64
@@ -181,6 +191,43 @@ def test_each_defect_maps_to_stable_failure_code() -> None:
     receipt.manifest = tampered
     result = _verify_stored_record(receipt)
     assert result.failure_code == VERIFICATION_FAILURE_EMBEDDED_MANIFEST_HASH_FORBIDDEN
+
+
+@pytest.mark.parametrize("identity", ["schema", "schema_version", "contract_version"])
+def test_unsupported_semantic_identity_has_stable_failure_code(identity: str) -> None:
+    vector = json.loads(
+        Path(
+            "conformance/semantic-context-manifest-v1/vectors/001-legacy-single.json"
+        ).read_text()
+    )
+    payload = copy.deepcopy(vector["expected"]["manifest"])
+    if identity == "schema":
+        payload["schema"] = "engram.unknown-context-manifest"
+    elif identity == "schema_version":
+        payload["schema_version"] = "2.0"
+    else:
+        payload["versions"]["manifest_contract_version"] = (
+            "semantic-context-manifest-v2"
+        )
+
+    expected = vector["expected"]
+    receipt = ContextReceipt(
+        id=uuid.uuid4(),
+        tenant_id=uuid.UUID(payload["subject"]["tenant_id"]),
+        principal_id=uuid.UUID(payload["subject"]["principal_id"]),
+        recall_log_id=uuid.uuid4(),
+        manifest_schema="engram.semantic-context-manifest",
+        manifest_schema_version="1.0",
+        canonicalization="rfc8785",
+        mode="semantic",
+        manifest=payload,
+        manifest_hash=expected["manifest_hash"],
+        packet_hash=expected["packet_hash"],
+        created_at=datetime.now(UTC),
+    )
+    result = _verify_stored_record(receipt)
+    assert result.status == "invalid"
+    assert result.failure_code == VERIFICATION_FAILURE_UNSUPPORTED_MANIFEST_CONTRACT
 
 
 def test_manifest_parse_failure_does_not_leak_exception_text() -> None:

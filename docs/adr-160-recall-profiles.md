@@ -524,10 +524,11 @@ Deliberately deferred, tracked by the issue:
 * **Demonstrated-usefulness feedback in utility** — utility-v1 is importance
   + freshness only; versioned, bounded feedback with actor/root provenance is
   follow-up.
-* **Semantic Context Ledger receipts** — receipts remain startup-only;
-  since #188 the candidate packet's `evidence` block is receipt-ready (the
-  receipt slice can copy/bind it without reconstructing it), and binding
-  per-item admission evidence into receipts lands with semantic receipts.
+* **Semantic Context Ledger receipts** — `semantic-context-manifest-v1` can
+  bind a finalized served packet without reevaluation. Its default-off dark
+  write applies only to authoritative legacy semantic recall. Candidate
+  packets remain receipt-ready but shadow-only. This does not certify a
+  candidate profile or add usefulness/corroboration behavior.
 * **Review/historical recall surfaces** — not selectable; they need their own
   capability contracts.
 * **Dogfood evaluation + exposure-concentration analysis** — run on the

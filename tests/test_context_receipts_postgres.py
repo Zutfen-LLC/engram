@@ -639,6 +639,7 @@ async def test_required_constraints_exist() -> None:
             "chk_context_receipts_schema_version",
             "chk_context_receipts_canonicalization",
             "chk_context_receipts_mode",
+            "chk_context_receipts_schema_mode_pair",
             "chk_context_receipts_manifest_hash",
             "chk_context_receipts_packet_hash",
             "chk_context_receipts_manifest_is_object",
@@ -728,6 +729,77 @@ async def test_valid_row_satisfies_all_checks() -> None:
         assert row is not None
         assert row["manifest_schema"] == "engram.context-manifest"
         assert row["mode"] == "startup"
+    finally:
+        with contextlib.suppress(Exception):
+            await owner.execute(
+                "DELETE FROM context_receipts WHERE tenant_id = $1", tenant_id
+            )
+        with contextlib.suppress(Exception):
+            await owner.execute("DELETE FROM tenants WHERE id = $1", tenant_id)
+        await owner.close()
+
+
+async def test_startup_and_semantic_schema_mode_cross_pairs_are_rejected() -> None:
+    owner = await _owner_with_026()
+    tenant_id = uuid.uuid4()
+    principal_id = uuid.uuid4()
+    recall_log_id = uuid.uuid4()
+    receipt_id = uuid.uuid4()
+    item_ids = [uuid.uuid4()]
+    try:
+        await _seed_tenant_principal(
+            owner,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            label="schemamodepair",
+        )
+        await _insert_recall_log(
+            owner,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            recall_log_id=recall_log_id,
+            item_ids=item_ids,
+        )
+        await _owner_insert_valid_receipt(
+            owner,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            recall_log_id=recall_log_id,
+            receipt_id=receipt_id,
+            item_ids=item_ids,
+        )
+        import asyncpg
+
+        with pytest.raises(asyncpg.PostgresError) as startup_schema:
+            await owner.execute(
+                "UPDATE context_receipts "
+                "SET mode = 'semantic', "
+                "manifest = jsonb_set(manifest, '{mode}', $$\"semantic\"$$::jsonb) "
+                "WHERE id = $1",
+                receipt_id,
+            )
+        assert _check_violation(startup_schema.value)
+
+        with pytest.raises(asyncpg.PostgresError) as semantic_schema:
+            await owner.execute(
+                "UPDATE context_receipts "
+                "SET manifest_schema = 'engram.semantic-context-manifest', "
+                "manifest = jsonb_set("
+                "manifest, '{schema}', "
+                "$$\"engram.semantic-context-manifest\"$$::jsonb"
+                ") WHERE id = $1",
+                receipt_id,
+            )
+        assert _check_violation(semantic_schema.value)
+
+        row = await owner.fetchrow(
+            "SELECT manifest_schema, mode FROM context_receipts WHERE id = $1",
+            receipt_id,
+        )
+        assert dict(row) == {
+            "manifest_schema": "engram.context-manifest",
+            "mode": "startup",
+        }
     finally:
         with contextlib.suppress(Exception):
             await owner.execute(

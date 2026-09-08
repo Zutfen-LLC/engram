@@ -604,7 +604,7 @@ async def record_context_receipt_dark_write(
 ) -> UUID | None:
     """Record one ``context_receipt.dark_write`` event (ENG-CONTEXT-002B).
 
-    Narrow, privacy-preserving observability for the startup receipt dark
+    Narrow, privacy-preserving observability for a Context Receipt dark
     write. Stores only bounded aggregate metadata: mode, status, item/byte
     counts from the finalized response, latency, and bounded failure
     diagnostics (failure stage + exception *type*, never exception messages,
@@ -629,7 +629,7 @@ async def record_context_receipt_dark_write(
         principal_id=principal_id,
         workspace_id=None,
         event_type="context_receipt.dark_write",
-        operation="startup_context_receipt",
+        operation=f"{mode}_context_receipt",
         status=status,
         usage_class="request",
         input_count=max(0, item_count),

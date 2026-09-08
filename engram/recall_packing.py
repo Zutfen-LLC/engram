@@ -63,6 +63,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.models import MemoryEdge
+from engram.semantic_budget import semantic_item_byte_count, semantic_item_token_cost
 
 # Contract identity for the packing stage. Mirrored into every candidate
 # packet's ``packing`` summary; bump/branch only with an ADR (see
@@ -283,8 +284,7 @@ def _rendered_size(content: str) -> tuple[int, int]:
     ``recall._enforce_semantic_budget`` (item content bytes; the fixed
     ``bytes // 4`` token heuristic with a 1-token floor).
     """
-    item_bytes = len(content.encode())
-    return item_bytes, max(1, item_bytes // 4)
+    return semantic_item_byte_count(content), semantic_item_token_cost(content)
 
 
 def pack_admitted_candidates(

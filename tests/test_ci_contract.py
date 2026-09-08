@@ -84,6 +84,12 @@ def test_hosted_workflow_runs_one_pinned_conformance_and_lock_gate() -> None:
     assert ".venv/bin/python scripts/verify_context_manifest_vectors.py" in workflow
     assert "node conformance/context-manifest-v1/verify.mjs" in workflow
     assert ".venv/bin/python conformance/context-manifest-v1/run_cross_language.py" in workflow
+    assert ".venv/bin/python scripts/verify_semantic_context_manifest_vectors.py" in workflow
+    assert "node conformance/semantic-context-manifest-v1/verify.mjs" in workflow
+    assert (
+        ".venv/bin/python conformance/semantic-context-manifest-v1/run_cross_language.py"
+        in workflow
+    )
     # The driver owns both negative verifier executions; calling either directly
     # here would run the same fixture set twice.
     assert "scripts/verify_context_manifest_negatives.py" not in workflow

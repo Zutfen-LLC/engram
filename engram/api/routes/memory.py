@@ -73,6 +73,9 @@ from engram.models import (
     Principal,
 )
 from engram.safety import has_secrets
+from engram.semantic_context_receipt_dark_write import (
+    write_semantic_context_receipt_best_effort,
+)
 from engram.source_types import SourceType
 from engram.trust_policy import resolve_trust_defaults
 from engram.usage import (
@@ -1404,8 +1407,8 @@ async def recall(
     # telemetry record so the retrieval latency metric includes the enabled
     # dark-write time (the client waits for the attempt before receiving the
     # response). The dedicated receipt event records the dark-write latency
-    # separately. Semantic recall never invokes the dark write. A receipt
-    # failure must never fail recall or modify the response.
+    # separately. Semantic capture uses the separate dark write below. A
+    # receipt failure must never fail recall or modify the response.
     #
     # The OUTER guard checks the feature flag before ANY receipt-specific
     # work: no manifest work, no decision-context parsing, no receipt DB
@@ -1439,6 +1442,30 @@ async def recall(
             logger.warning(
                 "context_receipt_dark_write helper raised unexpectedly "
                 "mode=startup exc_type=%s",
+                type(exc).__name__,
+            )
+
+    # Semantic receipt capture is a separate, default-off rollout.  It only
+    # runs after authoritative semantic serving has committed its recall log.
+    # Candidate profiles cannot reach this route while uncertified; shadow
+    # comparison remains read-only.
+    if settings.semantic_context_receipt_dark_write_enabled and mode == "semantic":
+        try:
+            await write_semantic_context_receipt_best_effort(
+                raw_result=result,
+                memory_context=memory_context,
+                query=req.query or "",
+                workspace_supplied=req.workspace is not None,
+                requested_byte_budget=req.byte_budget,
+                requested_token_budget=req.token_budget,
+                requested_item_budget=req.item_budget,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - response-neutral guard
+            logger.warning(
+                "semantic_context_receipt_dark_write helper raised unexpectedly "
+                "exc_type=%s",
                 type(exc).__name__,
             )
 
