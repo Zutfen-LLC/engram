@@ -7,6 +7,13 @@
 ALTER TABLE memory_items
     ADD COLUMN IF NOT EXISTS explicit_priority REAL;
 
+-- `importance` was historically nullable even though normal creation used
+-- its 0.5 database default. Normalize only those impossible legacy gaps to
+-- that pre-existing creation value before taking the one-time snapshot.
+UPDATE memory_items
+SET importance = 0.5
+WHERE importance IS NULL;
+
 UPDATE memory_items
 SET explicit_priority = importance
 WHERE explicit_priority IS NULL;
@@ -17,7 +24,7 @@ WHERE explicit_priority IS NULL;
 CREATE OR REPLACE FUNCTION memory_items_default_explicit_priority() RETURNS TRIGGER AS $$
 BEGIN
     IF NEW.explicit_priority IS NULL THEN
-        NEW.explicit_priority := NEW.importance;
+        NEW.explicit_priority := COALESCE(NEW.importance, 0.5);
     END IF;
     RETURN NEW;
 END;
@@ -27,3 +34,6 @@ DROP TRIGGER IF EXISTS trg_memory_items_default_explicit_priority ON memory_item
 CREATE TRIGGER trg_memory_items_default_explicit_priority
     BEFORE INSERT ON memory_items
     FOR EACH ROW EXECUTE FUNCTION memory_items_default_explicit_priority();
+
+ALTER TABLE memory_items
+    ALTER COLUMN explicit_priority SET NOT NULL;

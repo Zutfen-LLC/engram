@@ -44,16 +44,17 @@ def test_demonstrated_usefulness_v1_is_non_amplifying(
 
 @pytest.mark.asyncio
 async def test_bulk_loader_qualifies_current_bound_external_feedback_once() -> None:
-    """The admitted-set loader fails closed on self and invalid exposure bindings."""
-    tenant_id, item_id, author_id, external_id = uuid4(), uuid4(), uuid4(), uuid4()
-    noise_actor_id = uuid4()
+    """The admitted-set loader maps SQL aggregate diagnostics without identities."""
+    tenant_id, item_id, author_id = uuid4(), uuid4(), uuid4()
     item = MemoryItem(id=item_id, tenant_id=tenant_id, principal_id=author_id)
     rows = [
-        _feedback_row(item_id, "useful", external_id, tenant_id, external_id, [item_id]),
-        _feedback_row(item_id, "noise", noise_actor_id, tenant_id, noise_actor_id, [item_id]),
-        _feedback_row(item_id, "useful", author_id, tenant_id, author_id, [item_id]),
-        _feedback_row(item_id, "useful", uuid4(), None, None, None),
-        _feedback_row(item_id, "noise", uuid4(), tenant_id, uuid4(), [uuid4()]),
+        _aggregate_row(
+            item_id,
+            qualifying_useful_count=1,
+            qualifying_noise_count=1,
+            excluded_self_or_author_count=1,
+            excluded_unbound_exposure_count=2,
+        )
     ]
     result = MagicMock()
     result.mappings.return_value.all.return_value = rows
@@ -69,6 +70,8 @@ async def test_bulk_loader_qualifies_current_bound_external_feedback_once() -> N
     statement = str(session.execute.await_args.args[0])
     assert "feedback_events.tenant_id" in statement
     assert "feedback_events.superseded_at IS NULL" in statement
+    assert "GROUP BY memory_items.id" in statement
+    assert "FILTER" in statement
     assert summary.state == "mixed"
     assert summary.adjustment == 0.00
     assert summary.qualifying_useful_actor_count == 1
@@ -77,19 +80,47 @@ async def test_bulk_loader_qualifies_current_bound_external_feedback_once() -> N
     assert summary.excluded_unbound_exposure_count == 2
 
 
-def _feedback_row(
+@pytest.mark.asyncio
+async def test_bulk_loader_result_cardinality_is_bounded_by_admitted_items() -> None:
+    """Many actors produce one SQL aggregate row for each admitted item."""
+    tenant_id = uuid4()
+    items = [
+        MemoryItem(id=uuid4(), tenant_id=tenant_id, principal_id=uuid4()),
+        MemoryItem(id=uuid4(), tenant_id=tenant_id, principal_id=uuid4()),
+    ]
+    rows = [
+        _aggregate_row(items[0].id, qualifying_useful_count=10_000),
+        _aggregate_row(items[1].id, qualifying_noise_count=7_000),
+    ]
+    result = MagicMock()
+    result.mappings.return_value.all.return_value = rows
+    session = MagicMock()
+    session.execute = AsyncMock(return_value=result)
+
+    summaries = await load_demonstrated_usefulness(
+        cast(AsyncSession, session), tenant_id=tenant_id, items=items
+    )
+
+    assert len(rows) <= len(items)
+    assert len(summaries) == len(items)
+    assert summaries[items[0].id].adjustment == 0.10
+    assert summaries[items[1].id].adjustment == -0.10
+    statement = str(session.execute.await_args.args[0])
+    assert "GROUP BY memory_items.id" in statement
+
+
+def _aggregate_row(
     item_id: UUID,
-    verdict: str,
-    actor_id: UUID,
-    log_tenant_id: UUID | None,
-    log_principal_id: UUID | None,
-    log_item_ids: list[UUID] | None,
+    *,
+    qualifying_useful_count: int = 0,
+    qualifying_noise_count: int = 0,
+    excluded_self_or_author_count: int = 0,
+    excluded_unbound_exposure_count: int = 0,
 ) -> dict[str, object]:
     return {
         "item_id": item_id,
-        "verdict": verdict,
-        "actor_id": actor_id,
-        "recall_log_tenant_id": log_tenant_id,
-        "recall_log_principal_id": log_principal_id,
-        "recall_log_item_ids": log_item_ids,
+        "qualifying_useful_count": qualifying_useful_count,
+        "qualifying_noise_count": qualifying_noise_count,
+        "excluded_self_or_author_count": excluded_self_or_author_count,
+        "excluded_unbound_exposure_count": excluded_unbound_exposure_count,
     }

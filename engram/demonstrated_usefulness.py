@@ -5,9 +5,9 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Final, Literal, cast
+from typing import Final, Literal
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, any_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.feedback import current_feedback_predicate
@@ -48,8 +48,22 @@ def summarize_demonstrated_usefulness(
     excluded_unbound_exposure_count: int = 0,
 ) -> DemonstratedUsefulnessSummary:
     """Classify qualifying verdicts with the deliberately non-amplifying v1 table."""
-    useful_count = sum(entry.verdict == "useful" for entry in feedback)
-    noise_count = sum(entry.verdict == "noise" for entry in feedback)
+    return summarize_demonstrated_usefulness_counts(
+        useful_count=sum(entry.verdict == "useful" for entry in feedback),
+        noise_count=sum(entry.verdict == "noise" for entry in feedback),
+        excluded_self_or_author_count=excluded_self_or_author_count,
+        excluded_unbound_exposure_count=excluded_unbound_exposure_count,
+    )
+
+
+def summarize_demonstrated_usefulness_counts(
+    *,
+    useful_count: int,
+    noise_count: int,
+    excluded_self_or_author_count: int = 0,
+    excluded_unbound_exposure_count: int = 0,
+) -> DemonstratedUsefulnessSummary:
+    """Classify bounded SQL aggregate counts with the v1 adjustment table."""
     if useful_count and noise_count:
         state: DemonstratedUsefulnessState = "mixed"
         adjustment = 0.0
@@ -90,22 +104,36 @@ async def load_demonstrated_usefulness(
     if not candidate_by_id:
         return {}
 
-    qualifying: dict[uuid.UUID, list[QualifyingFeedback]] = {
-        item_id: [] for item_id in candidate_by_id
-    }
-    excluded_self: dict[uuid.UUID, int] = {item_id: 0 for item_id in candidate_by_id}
-    excluded_unbound: dict[uuid.UUID, int] = {item_id: 0 for item_id in candidate_by_id}
+    is_self_or_author = FeedbackEvent.principal_id == MemoryItem.principal_id
+    has_bound_exposure = and_(
+        RecallLog.tenant_id == tenant_id,
+        RecallLog.principal_id == FeedbackEvent.principal_id,
+        MemoryItem.id == any_(RecallLog.item_ids),
+    )
+    is_qualified = and_(~is_self_or_author, has_bound_exposure)
     rows = (
         await session.execute(
             select(
-                FeedbackEvent.item_id.label("item_id"),
-                FeedbackEvent.verdict.label("verdict"),
-                FeedbackEvent.principal_id.label("actor_id"),
-                RecallLog.tenant_id.label("recall_log_tenant_id"),
-                RecallLog.principal_id.label("recall_log_principal_id"),
-                RecallLog.item_ids.label("recall_log_item_ids"),
+                MemoryItem.id.label("item_id"),
+                func.count()
+                .filter(and_(is_qualified, FeedbackEvent.verdict == "useful"))
+                .label("qualifying_useful_count"),
+                func.count()
+                .filter(and_(is_qualified, FeedbackEvent.verdict == "noise"))
+                .label("qualifying_noise_count"),
+                func.count().filter(is_self_or_author).label("excluded_self_or_author_count"),
+                func.count()
+                .filter(and_(~is_self_or_author, ~has_bound_exposure))
+                .label("excluded_unbound_exposure_count"),
             )
             .select_from(FeedbackEvent)
+            .join(
+                MemoryItem,
+                and_(
+                    MemoryItem.id == FeedbackEvent.item_id,
+                    MemoryItem.tenant_id == tenant_id,
+                ),
+            )
             .join(
                 Principal,
                 and_(
@@ -119,38 +147,24 @@ async def load_demonstrated_usefulness(
                 FeedbackEvent.item_id.in_(candidate_by_id),
                 current_feedback_predicate(),
             )
+            .group_by(MemoryItem.id)
         )
     ).mappings().all()
-    for raw_row in rows:
-        row = cast(dict[str, Any], raw_row)
-        item_id = cast(uuid.UUID, row["item_id"])
-        candidate = candidate_by_id.get(item_id)
-        if candidate is None:
-            continue
-        actor_id = cast(uuid.UUID, row["actor_id"])
-        if actor_id == candidate.principal_id:
-            excluded_self[item_id] += 1
-            continue
-        exposed_item_ids = cast(Sequence[uuid.UUID] | None, row["recall_log_item_ids"])
-        if (
-            row["recall_log_tenant_id"] != tenant_id
-            or row["recall_log_principal_id"] != actor_id
-            or exposed_item_ids is None
-            or item_id not in exposed_item_ids
-        ):
-            excluded_unbound[item_id] += 1
-            continue
-        qualifying[item_id].append(
-            QualifyingFeedback(verdict=cast(FeedbackVerdict, row["verdict"]))
-        )
-    return {
-        item_id: summarize_demonstrated_usefulness(
-            feedback,
-            excluded_self_or_author_count=excluded_self[item_id],
-            excluded_unbound_exposure_count=excluded_unbound[item_id],
-        )
-        for item_id, feedback in qualifying.items()
+    summaries = {
+        item_id: summarize_demonstrated_usefulness_counts(useful_count=0, noise_count=0)
+        for item_id in candidate_by_id
     }
+    for row in rows:
+        item_id = row["item_id"]
+        if item_id not in candidate_by_id:
+            continue
+        summaries[item_id] = summarize_demonstrated_usefulness_counts(
+            useful_count=int(row["qualifying_useful_count"]),
+            noise_count=int(row["qualifying_noise_count"]),
+            excluded_self_or_author_count=int(row["excluded_self_or_author_count"]),
+            excluded_unbound_exposure_count=int(row["excluded_unbound_exposure_count"]),
+        )
+    return summaries
 
 
 __all__ = [
@@ -161,4 +175,5 @@ __all__ = [
     "QualifyingFeedback",
     "load_demonstrated_usefulness",
     "summarize_demonstrated_usefulness",
+    "summarize_demonstrated_usefulness_counts",
 ]

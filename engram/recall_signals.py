@@ -389,7 +389,9 @@ def utility_freshness(
 
 def _explicit_priority(item: MemoryItem) -> float:
     """Return the durable candidate baseline without consulting legacy importance."""
-    return float(item.explicit_priority) if item.explicit_priority is not None else 0.5
+    if item.explicit_priority is None:
+        raise RuntimeError("memory item has no explicit_priority")
+    return float(item.explicit_priority)
 
 
 def _utility_payload(

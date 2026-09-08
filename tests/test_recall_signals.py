@@ -21,6 +21,8 @@ from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
+import pytest
+
 from engram.admission_policy import AdmissionPolicyDecision
 from engram.demonstrated_usefulness import QualifyingFeedback, summarize_demonstrated_usefulness
 from engram.models import MemoryItem
@@ -251,6 +253,20 @@ def test_utility_v2_reads_explicit_priority_and_exposes_bounded_usefulness() -> 
         now=_NOW,
     )
     assert after_legacy_feedback["utility_score"] == fields["utility"]["base_utility"]
+
+
+def test_utility_v2_fails_closed_when_explicit_priority_is_impossibly_null() -> None:
+    item = _make_item(explicit_priority=None)
+
+    with pytest.raises(RuntimeError, match="no explicit_priority"):
+        signal_item_fields(
+            item,
+            decision=RecallAdmissionDecision(
+                profile="exploratory", decision="admit", reason_codes=()
+            ),
+            similarity=0.8,
+            now=_NOW,
+        )
 
 
 # ---- epistemic state ----
