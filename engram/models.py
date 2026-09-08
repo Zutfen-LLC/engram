@@ -1207,6 +1207,9 @@ class RecallLog(Base):
     )
     byte_budget: Mapped[int | None] = mapped_column(nullable=True)
     token_budget: Mapped[int | None] = mapped_column(nullable=True)
+    # Semantic receipts bind the effective item cap as well as byte/token
+    # budgets. Historical rows are honestly NULL.
+    item_budget: Mapped[int | None] = mapped_column(nullable=True)
     scoring_version: Mapped[str] = mapped_column(String(20), default="v1")
     config_version: Mapped[str] = mapped_column(String(20), default="v1")
     # Effective recall admission profile (issue #160). "legacy" is the
@@ -1892,7 +1895,7 @@ class ContextReceipt(Base):
         # wrapped in ``IS TRUE`` to reject an absent contract field. These
         # keep SQLAlchemy metadata aligned with the migration schema.
         CheckConstraint(
-            "manifest_schema = 'engram.context-manifest'",
+            "manifest_schema IN ('engram.context-manifest', 'engram.semantic-context-manifest')",
             name="chk_context_receipts_schema",
         ),
         CheckConstraint(
@@ -1903,7 +1906,7 @@ class ContextReceipt(Base):
             "canonicalization = 'rfc8785'",
             name="chk_context_receipts_canonicalization",
         ),
-        CheckConstraint("mode = 'startup'", name="chk_context_receipts_mode"),
+        CheckConstraint("mode IN ('startup', 'semantic')", name="chk_context_receipts_mode"),
         CheckConstraint(
             "manifest_hash ~ '^sha256:[0-9a-f]{64}$'",
             name="chk_context_receipts_manifest_hash",

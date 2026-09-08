@@ -29,12 +29,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram.auth import READ_SCOPE
-from engram.context_manifest import ContextManifestV1
 from engram.context_receipts import (
     InvalidCursorError,
     PartialProfileContextError,
     get_context_receipt,
     list_context_receipts,
+    parse_context_receipt_manifest,
     profile_eligible,
     verify_context_receipt_with_recall_log,
 )
@@ -109,7 +109,7 @@ def _try_parse_manifest_summary(
     manifest-derived fields are ``None``.
     """
     try:
-        manifest = ContextManifestV1.model_validate(receipt.manifest)
+        manifest = parse_context_receipt_manifest(receipt.manifest)
     except Exception:  # noqa: BLE001 — malformed manifest is a listable state
         return {
             "manifest_parse_status": "invalid",
@@ -248,6 +248,7 @@ async def list_receipts(
     limit: int = Query(default=50, ge=1, le=100),  # noqa: B008
     cursor: str | None = Query(default=None),  # noqa: B008
     recall_log_id: UUID | None = Query(default=None),  # noqa: B008
+    mode: Literal["startup", "semantic"] | None = Query(default=None),  # noqa: B008
     session: AsyncSession = Depends(get_session),  # noqa: B008
     memory_context: ResolvedMemoryContext = Depends(resolve_memory_context),  # noqa: B008
 ) -> ReceiptListResponse:
@@ -262,6 +263,7 @@ async def list_receipts(
             limit=limit,
             cursor=cursor,
             recall_log_id=recall_log_id,
+            mode=mode,
             memory_profile_id=memory_context.memory_profile_id,
             memory_profile_revision_id=memory_context.memory_profile_revision_id,
         )
@@ -316,7 +318,7 @@ async def get_receipt(
         raise _NON_DISCLOSED_404
 
     try:
-        ContextManifestV1.model_validate(receipt.manifest)
+        parse_context_receipt_manifest(receipt.manifest)
         parse_status: Literal["valid", "invalid"] = "valid"
     except Exception:  # noqa: BLE001 — inspection remains possible for invalid rows
         parse_status = "invalid"

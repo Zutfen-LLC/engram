@@ -1837,7 +1837,10 @@ Auditability is part of the trust model, not a compliance afterthought.
 > verification with stable check/failure codes (see
 > `docs/ops/context-receipt-inspection.md`). No production recall or
 > receipt-write behavior changed. Only `mode="startup"` is supported;
-> semantic recall creates no receipt while the feature is enabled.
+> semantic recall may persist the separate `semantic-context-manifest-v1`
+> contract only behind its own default-off dark-write flag. Startup
+> `context-manifest-v1` remains frozen and startup-only. Candidate shadow
+> packets do not persist receipts.
 
 The context manifest is the deterministic, content-addressed artifact that
 lets Engram prove **what context it served and which policy/version admitted

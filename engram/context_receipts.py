@@ -30,7 +30,7 @@ import base64
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Literal, TypeAlias
 from uuid import UUID
 
 from sqlalchemy import or_, select
@@ -48,6 +48,14 @@ from engram.context_manifest import (
     compute_manifest_hash,
 )
 from engram.models import ContextReceipt, RecallLog
+from engram.semantic_context_manifest import (
+    SEMANTIC_MANIFEST_CONTRACT_VERSION,
+    SEMANTIC_MODE,
+    SEMANTIC_SCHEMA,
+    SEMANTIC_SCHEMA_VERSION,
+    SemanticContextManifestV1,
+    semantic_query_digest,
+)
 
 __all__ = [
     "ContextReceiptConflictError",
@@ -66,11 +74,23 @@ __all__ = [
     "get_context_receipt",
     "get_context_receipt_for_recall_log",
     "list_context_receipts",
+    "parse_context_receipt_manifest",
     "profile_eligible",
     "store_context_receipt",
     "verify_context_receipt_record",
     "verify_context_receipt_with_recall_log",
 ]
+
+ReceiptManifest: TypeAlias = ContextManifestV1 | SemanticContextManifestV1
+
+
+def parse_context_receipt_manifest(payload: object) -> ReceiptManifest:
+    """Dispatch only to the declared, supported manifest family."""
+    if not isinstance(payload, dict):
+        raise ValueError("manifest must be an object")
+    if payload.get("schema") == SEMANTIC_SCHEMA:
+        return SemanticContextManifestV1.model_validate(payload)
+    return ContextManifestV1.model_validate(payload)
 
 
 # ─── Public types ──────────────────────────────────────────────────────
@@ -204,7 +224,7 @@ class ContextReceiptVerificationResult:
     status: Literal["valid", "invalid"]
     checks: list[ContextReceiptVerificationCheck] = field(default_factory=list)
     failure_code: str | None = None
-    manifest: ContextManifestV1 | None = None
+    manifest: ReceiptManifest | None = None
     recomputed_manifest_hash: str | None = None
     manifest_packet_hash: str | None = None
 
@@ -216,7 +236,7 @@ def _validate_manifest_identity(
     *,
     tenant_id: UUID,
     principal_id: UUID,
-    manifest: ContextManifestV1,
+    manifest: ReceiptManifest,
 ) -> None:
     """Require the manifest to describe the caller-supplied identity and protocol.
 
@@ -233,11 +253,23 @@ def _validate_manifest_identity(
             "manifest subject principal_id does not match the caller-supplied "
             "principal_id"
         )
-    if manifest.schema_name != SCHEMA:
+    supported = isinstance(manifest, (ContextManifestV1, SemanticContextManifestV1))
+    if not supported:
+        raise ContextReceiptConflictError("unsupported manifest family")
+    semantic_manifest = isinstance(manifest, SemanticContextManifestV1)
+    expected_schema = SEMANTIC_SCHEMA if semantic_manifest else SCHEMA
+    expected_version = SEMANTIC_SCHEMA_VERSION if semantic_manifest else SCHEMA_VERSION
+    expected_mode = SEMANTIC_MODE if semantic_manifest else STARTUP_MODE
+    expected_contract = (
+        SEMANTIC_MANIFEST_CONTRACT_VERSION
+        if semantic_manifest
+        else MANIFEST_CONTRACT_VERSION
+    )
+    if manifest.schema_name != expected_schema:
         raise ContextReceiptConflictError(
             f"manifest schema must be {SCHEMA!r}, got {manifest.schema_name!r}"
         )
-    if manifest.schema_version != SCHEMA_VERSION:
+    if manifest.schema_version != expected_version:
         raise ContextReceiptConflictError(
             f"manifest schema_version must be {SCHEMA_VERSION!r}, "
             f"got {manifest.schema_version!r}"
@@ -247,11 +279,11 @@ def _validate_manifest_identity(
             f"manifest canonicalization must be {CANONICALIZATION!r}, "
             f"got {manifest.canonicalization!r}"
         )
-    if manifest.mode != STARTUP_MODE:
+    if manifest.mode != expected_mode:
         raise ContextReceiptConflictError(
             f"manifest mode must be {STARTUP_MODE!r}, got {manifest.mode!r}"
         )
-    if manifest.versions.manifest_contract_version != MANIFEST_CONTRACT_VERSION:
+    if manifest.versions.manifest_contract_version != expected_contract:
         raise ContextReceiptConflictError(
             "manifest versions.manifest_contract_version must be "
             f"{MANIFEST_CONTRACT_VERSION!r}"
@@ -324,7 +356,7 @@ def _profiles_match(
 def _validate_recall_log_overlap(
     *,
     recall_log: RecallLog,
-    manifest: ContextManifestV1,
+    manifest: ReceiptManifest,
 ) -> None:
     """Validate every trustworthy overlap between the recall log and the manifest.
 
@@ -379,13 +411,25 @@ def _validate_recall_log_overlap(
             "recall log token_budget does not match manifest effective token_budget"
         )
 
-    # Startup query data must remain absent. A startup recall log with a
-    # non-null query cannot be the parent of a startup manifest (which has no
-    # query).
-    if recall_log.query is not None:
-        raise ContextReceiptConflictError(
-            "recall log query must be null for a startup receipt"
-        )
+    if isinstance(manifest, SemanticContextManifestV1):
+        if (
+            recall_log.query is None
+            or semantic_query_digest(recall_log.query) != manifest.request.query_digest
+        ):
+            raise ContextReceiptConflictError(
+                "recall log query digest does not match semantic manifest"
+            )
+        if recall_log.recall_profile != manifest.versions.recall_profile:
+            raise ContextReceiptConflictError(
+                "recall log recall_profile does not match semantic manifest"
+            )
+        log_item_budget = getattr(recall_log, "item_budget", None)
+        if log_item_budget != manifest.request.effective.item_budget:
+            raise ContextReceiptConflictError(
+                "recall log item_budget does not match semantic manifest"
+            )
+    elif recall_log.query is not None:
+        raise ContextReceiptConflictError("recall log query must be null for a startup receipt")
 
     # Decision versions.
     if recall_log.scoring_version != manifest.versions.scoring_version:
@@ -442,7 +486,7 @@ def _verify_stored_record(receipt: ContextReceipt) -> ContextReceiptVerification
     """
     checks: list[ContextReceiptVerificationCheck] = []
     failure_code: str | None = None
-    manifest: ContextManifestV1 | None = None
+    manifest: ReceiptManifest | None = None
     recomputed_hash: str | None = None
     packet_hash: str | None = None
 
@@ -453,7 +497,7 @@ def _verify_stored_record(receipt: ContextReceipt) -> ContextReceiptVerification
 
     # 1. manifest_parse
     try:
-        manifest = ContextManifestV1.model_validate(receipt.manifest)
+        manifest = parse_context_receipt_manifest(receipt.manifest)
         checks.append(
             ContextReceiptVerificationCheck(
                 VERIFICATION_CHECK_MANIFEST_PARSE, True
@@ -598,7 +642,7 @@ def _verify_stored_record(receipt: ContextReceipt) -> ContextReceiptVerification
     )
 
 
-def verify_context_receipt_record(receipt: ContextReceipt) -> ContextManifestV1:
+def verify_context_receipt_record(receipt: ContextReceipt) -> ReceiptManifest:
     """Verify the integrity of a stored receipt and return its parsed manifest.
 
     Steps:
@@ -627,7 +671,7 @@ def verify_context_receipt_record(receipt: ContextReceipt) -> ContextManifestV1:
 # ─── Idempotent insertion ──────────────────────────────────────────────
 
 
-def _manifest_payload(manifest: ContextManifestV1) -> dict[str, object]:
+def _manifest_payload(manifest: ReceiptManifest) -> dict[str, object]:
     """The JSONB payload: the manifest's normative wire shape."""
     return manifest.model_dump(mode="json", by_alias=True, exclude_none=False)
 
@@ -635,7 +679,7 @@ def _manifest_payload(manifest: ContextManifestV1) -> dict[str, object]:
 def _existing_matches(
     existing: ContextReceipt,
     *,
-    manifest: ContextManifestV1,
+    manifest: ReceiptManifest,
     manifest_hash: str,
     packet_hash: str,
     tenant_id: UUID,
@@ -661,7 +705,7 @@ def _existing_matches(
     # the model so JSONB key ordering / number formatting differences cannot
     # mask a real content change.
     try:
-        stored_manifest = ContextManifestV1.model_validate(existing.manifest)
+        stored_manifest = parse_context_receipt_manifest(existing.manifest)
     except Exception:  # noqa: BLE001 — a corrupt stored row is not an identical retry
         return False
     return _manifest_payload(stored_manifest) == _manifest_payload(manifest)
@@ -696,7 +740,7 @@ async def store_context_receipt(
     tenant_id: UUID,
     principal_id: UUID,
     recall_log_id: UUID,
-    manifest: ContextManifestV1,
+    manifest: ReceiptManifest,
     retention_expires_at: datetime | None = None,
     receipt_id: UUID | None = None,
 ) -> ContextReceiptStoreResult:
@@ -1039,6 +1083,7 @@ async def list_context_receipts(
     limit: int = 50,
     cursor: str | None = None,
     recall_log_id: UUID | None = None,
+    mode: Literal["startup", "semantic"] | None = None,
     memory_profile_id: UUID | None = None,
     memory_profile_revision_id: UUID | None = None,
 ) -> ContextReceiptListResult:
@@ -1085,6 +1130,8 @@ async def list_context_receipts(
 
     if recall_log_id is not None:
         stmt = stmt.where(ContextReceipt.recall_log_id == recall_log_id)
+    if mode is not None:
+        stmt = stmt.where(ContextReceipt.mode == mode)
 
     # Apply profile narrowing as a SQL filter BEFORE pagination so that
     # an empty page means there are genuinely no more eligible rows.
@@ -1189,13 +1236,13 @@ async def verify_context_receipt_with_recall_log(
     # established (no manifest to compare), but recall_log_exists must still
     # be checked truthfully.
 
-    manifest: ContextManifestV1 | None = stored_result.manifest
+    manifest: ReceiptManifest | None = stored_result.manifest
 
     # If _verify_stored_record set manifest=None due to a non-parse failure
     # (hash/envelope/ownership), re-parse so we can attempt recall-log binding.
     if manifest is None and not _manifest_failed_parse(stored_result):
         try:
-            manifest = ContextManifestV1.model_validate(receipt.manifest)
+            manifest = parse_context_receipt_manifest(receipt.manifest)
         except Exception:  # noqa: BLE001
             manifest = None
 
