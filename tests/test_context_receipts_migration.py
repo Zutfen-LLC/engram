@@ -255,6 +255,7 @@ def test_orm_metadata_aligned_with_migration_constraints() -> None:
         "chk_context_receipts_schema_version",
         "chk_context_receipts_canonicalization",
         "chk_context_receipts_mode",
+        "chk_context_receipts_schema_mode_pair",
         "chk_context_receipts_manifest_hash",
         "chk_context_receipts_packet_hash",
         "chk_context_receipts_manifest_is_object",

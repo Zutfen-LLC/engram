@@ -67,6 +67,7 @@ __all__ = [
     "ContextReceiptVerificationResult",
     "InvalidCursorError",
     "PartialProfileContextError",
+    "UnsupportedManifestContractError",
     "VERIFICATION_CHECK_CODES",
     "VERIFICATION_FAILURE_CODES",
     "decode_receipt_cursor",
@@ -84,13 +85,44 @@ __all__ = [
 ReceiptManifest: TypeAlias = ContextManifestV1 | SemanticContextManifestV1
 
 
+class UnsupportedManifestContractError(ValueError):
+    """The manifest declares an unknown family or unsupported version."""
+
+
+def _require_contract_identity(
+    payload: dict[object, object], *, schema_version: str, contract_version: str
+) -> None:
+    if payload.get("schema_version") != schema_version:
+        raise UnsupportedManifestContractError("unsupported manifest schema version")
+    versions = payload.get("versions")
+    if not isinstance(versions, dict):
+        return
+    if versions.get("manifest_contract_version") != contract_version:
+        raise UnsupportedManifestContractError("unsupported manifest contract version")
+
+
 def parse_context_receipt_manifest(payload: object) -> ReceiptManifest:
     """Dispatch only to the declared, supported manifest family."""
     if not isinstance(payload, dict):
         raise ValueError("manifest must be an object")
-    if payload.get("schema") == SEMANTIC_SCHEMA:
+    schema = payload.get("schema")
+    if schema is None:
+        raise ValueError("manifest schema is required")
+    if schema == SCHEMA:
+        _require_contract_identity(
+            payload,
+            schema_version=SCHEMA_VERSION,
+            contract_version=MANIFEST_CONTRACT_VERSION,
+        )
+        return ContextManifestV1.model_validate(payload)
+    if schema == SEMANTIC_SCHEMA:
+        _require_contract_identity(
+            payload,
+            schema_version=SEMANTIC_SCHEMA_VERSION,
+            contract_version=SEMANTIC_MANIFEST_CONTRACT_VERSION,
+        )
         return SemanticContextManifestV1.model_validate(payload)
-    return ContextManifestV1.model_validate(payload)
+    raise UnsupportedManifestContractError("unsupported manifest schema")
 
 
 # ─── Public types ──────────────────────────────────────────────────────
@@ -182,6 +214,7 @@ VERIFICATION_CHECK_CODES: tuple[str, ...] = (
 
 # Stable failure codes (``failure_code`` in the verify response).
 VERIFICATION_FAILURE_MANIFEST_PARSE_FAILED = "MANIFEST_PARSE_FAILED"
+VERIFICATION_FAILURE_UNSUPPORTED_MANIFEST_CONTRACT = "UNSUPPORTED_MANIFEST_CONTRACT"
 VERIFICATION_FAILURE_MANIFEST_HASH_MISMATCH = "MANIFEST_HASH_MISMATCH"
 VERIFICATION_FAILURE_PACKET_HASH_BINDING_MISMATCH = "PACKET_HASH_BINDING_MISMATCH"
 VERIFICATION_FAILURE_ENVELOPE_PROTOCOL_MISMATCH = "ENVELOPE_PROTOCOL_MISMATCH"
@@ -193,6 +226,7 @@ VERIFICATION_FAILURE_UNKNOWN = "UNKNOWN"
 
 VERIFICATION_FAILURE_CODES: tuple[str, ...] = (
     VERIFICATION_FAILURE_MANIFEST_PARSE_FAILED,
+    VERIFICATION_FAILURE_UNSUPPORTED_MANIFEST_CONTRACT,
     VERIFICATION_FAILURE_MANIFEST_HASH_MISMATCH,
     VERIFICATION_FAILURE_PACKET_HASH_BINDING_MISMATCH,
     VERIFICATION_FAILURE_ENVELOPE_PROTOCOL_MISMATCH,
@@ -503,7 +537,7 @@ def _verify_stored_record(receipt: ContextReceipt) -> ContextReceiptVerification
                 VERIFICATION_CHECK_MANIFEST_PARSE, True
             )
         )
-    except Exception:  # noqa: BLE001 — any parse failure is an integrity defect
+    except Exception as exc:  # noqa: BLE001 — any parse failure is an integrity defect
         # Parse failure: record manifest_parse=False and set failure code.
         checks.append(
             ContextReceiptVerificationCheck(
@@ -515,6 +549,8 @@ def _verify_stored_record(receipt: ContextReceipt) -> ContextReceiptVerification
         # extra fields, so this path is reachable when the field is smuggled.
         if embedded_hash_forbidden:
             failure_code = VERIFICATION_FAILURE_EMBEDDED_MANIFEST_HASH_FORBIDDEN
+        elif isinstance(exc, UnsupportedManifestContractError):
+            failure_code = VERIFICATION_FAILURE_UNSUPPORTED_MANIFEST_CONTRACT
         else:
             failure_code = VERIFICATION_FAILURE_MANIFEST_PARSE_FAILED
 
@@ -1194,6 +1230,7 @@ def _manifest_failed_parse(result: ContextReceiptVerificationResult) -> bool:
     """
     return result.failure_code is not None and result.failure_code in (
         VERIFICATION_FAILURE_MANIFEST_PARSE_FAILED,
+        VERIFICATION_FAILURE_UNSUPPORTED_MANIFEST_CONTRACT,
         VERIFICATION_FAILURE_EMBEDDED_MANIFEST_HASH_FORBIDDEN,
     )
 

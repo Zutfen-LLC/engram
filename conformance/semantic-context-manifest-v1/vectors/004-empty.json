@@ -1,0 +1,111 @@
+{
+  "name": "004-empty",
+  "description": "Valid empty semantic packet.",
+  "input": {
+    "query": "nothing",
+    "context": {
+      "tenant_id": "00000000-0000-0000-0000-000000000001",
+      "principal_id": "00000000-0000-0000-0000-000000000002",
+      "workspace_id": null,
+      "memory_context_version": "memory-context-v2",
+      "memory_profile_id": null,
+      "memory_profile_revision_id": null,
+      "memory_profile_version": null,
+      "workspace_supplied": false,
+      "requested_byte_budget": null,
+      "requested_token_budget": null,
+      "requested_item_budget": null,
+      "effective_byte_budget": 4096,
+      "effective_token_budget": 1024,
+      "effective_item_budget": 20,
+      "recall_profile": "legacy",
+      "recall_profile_contract_version": "recall-profiles-v1",
+      "scoring_version": "semantic-v3",
+      "signals_version": null,
+      "admission_policy": null,
+      "relationship_relevance_version": null,
+      "packing_version": null,
+      "config_version": "v1"
+    },
+    "packet": {
+      "items": [],
+      "working_set": "",
+      "item_count": 0,
+      "byte_count": 0,
+      "candidate_count": 0,
+      "omitted_count": 0,
+      "omitted_by_admission": {},
+      "expansion": null,
+      "packing": null,
+      "message": "No matching memories found."
+    }
+  },
+  "expected": {
+    "manifest": {
+      "schema": "engram.semantic-context-manifest",
+      "schema_version": "1.0",
+      "canonicalization": "rfc8785",
+      "mode": "semantic",
+      "subject": {
+        "tenant_id": "00000000-0000-0000-0000-000000000001",
+        "principal_id": "00000000-0000-0000-0000-000000000002",
+        "workspace_id": null,
+        "memory_context_version": "memory-context-v2",
+        "memory_profile_id": null,
+        "memory_profile_revision_id": null,
+        "memory_profile_version": null
+      },
+      "request": {
+        "requested": {
+          "workspace_supplied": false,
+          "byte_budget": null,
+          "token_budget": null,
+          "item_budget": null
+        },
+        "effective": {
+          "workspace_id": null,
+          "byte_budget": 4096,
+          "token_budget": 1024,
+          "item_budget": 20
+        },
+        "query_digest": "sha256:213c88e17041a593bce48db84f1cfd76733b2f3f7d29588aed878e7d59f61801",
+        "request_digest": "sha256:e94c6d7a7f7e138e56c55e2a35b09fd8bcbeb48807f5dfeef1bd3365c1d2fc70"
+      },
+      "versions": {
+        "recall_profile": "legacy",
+        "recall_profile_contract_version": "recall-profiles-v1",
+        "scoring_version": "semantic-v3",
+        "signals_version": null,
+        "admission_policy": null,
+        "relationship_relevance_version": null,
+        "packing_version": null,
+        "config_version": "v1",
+        "manifest_contract_version": "semantic-context-manifest-v1",
+        "packet_render_version": "working-set-v1"
+      },
+      "result": {
+        "item_count": 0,
+        "served_content_byte_count": 0,
+        "rendered_packet_byte_count": 0,
+        "candidate_count": 0,
+        "omitted_count": 0,
+        "omitted_by_admission": {},
+        "expansion": null,
+        "packing": null,
+        "message": "No matching memories found."
+      },
+      "packet": {
+        "media_type": "text/plain; charset=utf-8",
+        "render_version": "working-set-v1",
+        "hash": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "items": []
+    },
+    "canonical_json": "{\"canonicalization\":\"rfc8785\",\"items\":[],\"mode\":\"semantic\",\"packet\":{\"hash\":\"sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\",\"media_type\":\"text/plain; charset=utf-8\",\"render_version\":\"working-set-v1\"},\"request\":{\"effective\":{\"byte_budget\":4096,\"item_budget\":20,\"token_budget\":1024,\"workspace_id\":null},\"query_digest\":\"sha256:213c88e17041a593bce48db84f1cfd76733b2f3f7d29588aed878e7d59f61801\",\"request_digest\":\"sha256:e94c6d7a7f7e138e56c55e2a35b09fd8bcbeb48807f5dfeef1bd3365c1d2fc70\",\"requested\":{\"byte_budget\":null,\"item_budget\":null,\"token_budget\":null,\"workspace_supplied\":false}},\"result\":{\"candidate_count\":0,\"expansion\":null,\"item_count\":0,\"message\":\"No matching memories found.\",\"omitted_by_admission\":{},\"omitted_count\":0,\"packing\":null,\"rendered_packet_byte_count\":0,\"served_content_byte_count\":0},\"schema\":\"engram.semantic-context-manifest\",\"schema_version\":\"1.0\",\"subject\":{\"memory_context_version\":\"memory-context-v2\",\"memory_profile_id\":null,\"memory_profile_revision_id\":null,\"memory_profile_version\":null,\"principal_id\":\"00000000-0000-0000-0000-000000000002\",\"tenant_id\":\"00000000-0000-0000-0000-000000000001\",\"workspace_id\":null},\"versions\":{\"admission_policy\":null,\"config_version\":\"v1\",\"manifest_contract_version\":\"semantic-context-manifest-v1\",\"packet_render_version\":\"working-set-v1\",\"packing_version\":null,\"recall_profile\":\"legacy\",\"recall_profile_contract_version\":\"recall-profiles-v1\",\"relationship_relevance_version\":null,\"scoring_version\":\"semantic-v3\",\"signals_version\":null}}",
+    "manifest_hash": "sha256:b3418dc314f9dcb090df824b5548a854f612a82fb009572f488b9ad81583a62b",
+    "packet_hash": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "query_digest": "sha256:213c88e17041a593bce48db84f1cfd76733b2f3f7d29588aed878e7d59f61801",
+    "request_digest": "sha256:e94c6d7a7f7e138e56c55e2a35b09fd8bcbeb48807f5dfeef1bd3365c1d2fc70",
+    "served_content_hashes": []
+  }
+}

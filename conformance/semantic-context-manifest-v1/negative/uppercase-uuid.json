@@ -1,0 +1,156 @@
+{
+  "name": "uppercase-uuid",
+  "parse_as": "semantic",
+  "input": {
+    "query": "alpha query",
+    "context": {
+      "tenant_id": "00000000-0000-0000-0000-000000000001",
+      "principal_id": "00000000-0000-0000-0000-000000000002",
+      "workspace_id": null,
+      "memory_context_version": "memory-context-v2",
+      "memory_profile_id": null,
+      "memory_profile_revision_id": null,
+      "memory_profile_version": null,
+      "workspace_supplied": false,
+      "requested_byte_budget": null,
+      "requested_token_budget": null,
+      "requested_item_budget": null,
+      "effective_byte_budget": 4096,
+      "effective_token_budget": 1024,
+      "effective_item_budget": 20,
+      "recall_profile": "legacy",
+      "recall_profile_contract_version": "recall-profiles-v1",
+      "scoring_version": "semantic-v3",
+      "signals_version": null,
+      "admission_policy": null,
+      "relationship_relevance_version": null,
+      "packing_version": null,
+      "config_version": "v1"
+    },
+    "packet": {
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-000000000010",
+          "kind": "fact",
+          "content": "alpha",
+          "review_status": "active",
+          "authority": 10,
+          "visibility": "private",
+          "workspace_id": null,
+          "pinned": false,
+          "score": 0.8,
+          "trust_score": 0.9,
+          "relevance_score": null,
+          "utility_score": null,
+          "reasons": [
+            "semantic similarity 0.90"
+          ],
+          "warnings": [],
+          "warning_codes": null,
+          "conflict_type": null,
+          "conflict_resolution_status": null,
+          "admission": null,
+          "evidence": null,
+          "relationship": null,
+          "packing_reason": null
+        }
+      ],
+      "working_set": "[fact] alpha",
+      "item_count": 1,
+      "byte_count": 5,
+      "candidate_count": 1,
+      "omitted_count": 0,
+      "omitted_by_admission": {},
+      "expansion": null,
+      "packing": null,
+      "message": null
+    }
+  },
+  "manifest": {
+    "schema": "engram.semantic-context-manifest",
+    "schema_version": "1.0",
+    "canonicalization": "rfc8785",
+    "mode": "semantic",
+    "subject": {
+      "tenant_id": "00000000-0000-0000-0000-00000000000A",
+      "principal_id": "00000000-0000-0000-0000-000000000002",
+      "workspace_id": null,
+      "memory_context_version": "memory-context-v2",
+      "memory_profile_id": null,
+      "memory_profile_revision_id": null,
+      "memory_profile_version": null
+    },
+    "request": {
+      "requested": {
+        "workspace_supplied": false,
+        "byte_budget": null,
+        "token_budget": null,
+        "item_budget": null
+      },
+      "effective": {
+        "workspace_id": null,
+        "byte_budget": 4096,
+        "token_budget": 1024,
+        "item_budget": 20
+      },
+      "query_digest": "sha256:cdb51ba4654a10c5fb4ce503144cf19192e05ce5e6d46cff366ce8b90b9efcfc",
+      "request_digest": "sha256:d7e285b19232e2312b3ebac0434e5e46401430b567a91cf4da3c115915c59a1e"
+    },
+    "versions": {
+      "recall_profile": "legacy",
+      "recall_profile_contract_version": "recall-profiles-v1",
+      "scoring_version": "semantic-v3",
+      "signals_version": null,
+      "admission_policy": null,
+      "relationship_relevance_version": null,
+      "packing_version": null,
+      "config_version": "v1",
+      "manifest_contract_version": "semantic-context-manifest-v1",
+      "packet_render_version": "working-set-v1"
+    },
+    "result": {
+      "item_count": 1,
+      "served_content_byte_count": 5,
+      "rendered_packet_byte_count": 12,
+      "candidate_count": 1,
+      "omitted_count": 0,
+      "omitted_by_admission": {},
+      "expansion": null,
+      "packing": null,
+      "message": null
+    },
+    "packet": {
+      "media_type": "text/plain; charset=utf-8",
+      "render_version": "working-set-v1",
+      "hash": "sha256:62e184cc0551b35e7b53d08be2b0b5e33a229f7f416f56b9259411365314b059"
+    },
+    "items": [
+      {
+        "ordinal": 0,
+        "item_id": "00000000-0000-0000-0000-000000000010",
+        "kind": "fact",
+        "served_content_hash": "sha256:8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8",
+        "review_status": "active",
+        "authority": 10,
+        "visibility": "private",
+        "workspace_id": null,
+        "pinned": false,
+        "score": 0.8,
+        "trust_score": 0.9,
+        "relevance_score": null,
+        "utility_score": null,
+        "reasons": [
+          "semantic similarity 0.90"
+        ],
+        "warnings": [],
+        "warning_codes": null,
+        "conflict_type": null,
+        "conflict_resolution_status": null,
+        "admission": null,
+        "evidence": null,
+        "relationship": null,
+        "packing_reason": null
+      }
+    ]
+  }
+}

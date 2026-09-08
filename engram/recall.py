@@ -57,6 +57,7 @@ from engram.recall_profiles import (
     resolve_serving_profile,
 )
 from engram.relationship_recall import expand_recall_candidates
+from engram.semantic_budget import semantic_item_byte_count, semantic_item_token_cost
 
 logger = logging.getLogger(__name__)
 
@@ -977,8 +978,8 @@ def _enforce_semantic_budget(
     for cand in candidates:
         if item_budget is not None and len(result) >= item_budget:
             break
-        item_bytes = len(cand["content"].encode())
-        item_tokens = max(1, item_bytes // 4)
+        item_bytes = semantic_item_byte_count(cand["content"])
+        item_tokens = semantic_item_token_cost(cand["content"])
 
         # Skip oversized items and keep scanning lower-ranked ones that fit.
         if byte_budget is not None and bytes_used + item_bytes > byte_budget:

@@ -1,0 +1,380 @@
+{
+  "name": "008-relationship",
+  "description": "Candidate relationship-expanded item.",
+  "input": {
+    "query": "linked",
+    "context": {
+      "tenant_id": "00000000-0000-0000-0000-000000000001",
+      "principal_id": "00000000-0000-0000-0000-000000000002",
+      "workspace_id": null,
+      "memory_context_version": "memory-context-v2",
+      "memory_profile_id": "00000000-0000-0000-0000-000000000004",
+      "memory_profile_revision_id": "00000000-0000-0000-0000-000000000005",
+      "memory_profile_version": 3,
+      "workspace_supplied": false,
+      "requested_byte_budget": null,
+      "requested_token_budget": null,
+      "requested_item_budget": null,
+      "effective_byte_budget": 4096,
+      "effective_token_budget": 1024,
+      "effective_item_budget": 20,
+      "recall_profile": "governed",
+      "recall_profile_contract_version": "recall-profiles-v1",
+      "scoring_version": "signals-v1",
+      "signals_version": "recall-signals-v1",
+      "admission_policy": "recall-admission-v2",
+      "relationship_relevance_version": "relationship-relevance-v1",
+      "packing_version": "recall-packing-v1",
+      "config_version": "v1"
+    },
+    "packet": {
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-000000000015",
+          "kind": "fact",
+          "content": "linked fact",
+          "review_status": "active",
+          "authority": 10,
+          "visibility": "private",
+          "workspace_id": null,
+          "pinned": false,
+          "score": 0.8,
+          "trust_score": null,
+          "relevance_score": 0.8,
+          "utility_score": 0.7,
+          "reasons": [
+            "semantic similarity 0.90"
+          ],
+          "warnings": [],
+          "warning_codes": [],
+          "conflict_type": null,
+          "conflict_resolution_status": null,
+          "admission": {
+            "profile": "governed",
+            "decision": "admit",
+            "policy_version": "recall-admission-v2",
+            "reason_codes": [
+              "admitted_v2_surface_allow"
+            ],
+            "assessment_id": "00000000-0000-0000-0000-000000000006",
+            "assessment_status": "current",
+            "assessment_outcome": "qualified",
+            "surface": "semantic_governed",
+            "surface_decision": "allow",
+            "v2": {
+              "profile_key": "risk-aware-shadow-v1",
+              "resolution_status": "current",
+              "surface": "semantic_governed",
+              "surface_decision": "allow",
+              "persisted": {
+                "assessment_id": "00000000-0000-0000-0000-000000000006",
+                "schema_version": "engram.admission-assessment.v2",
+                "policy_contract_version": "risk-aware-shadow-v1",
+                "policy_artifact_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "decision_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+              },
+              "fresh": {
+                "schema_version": "engram.admission-assessment.v2",
+                "policy_version": "risk-aware-shadow-v1",
+                "policy_artifact_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "decision_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "surface_decision": "allow",
+                "highest_admission_tier": "semantic_governed",
+                "risk_state": "low",
+                "epistemic_state": "supported",
+                "retention_state": "retain",
+                "effective_assessment_refs": [
+                  {
+                    "assessment_id": "00000000-0000-0000-0000-000000000006",
+                    "contract_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "canonical_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "purpose": "combined",
+                    "assertion_mode": "explicit",
+                    "origin": "user"
+                  }
+                ],
+                "observation_window_hours": 24,
+                "eligible_at": "2026-09-08T12:00:00+00:00",
+                "next_evaluation_at": null,
+                "blocker_codes": [],
+                "reason_codes": [
+                  "evidence_supported"
+                ],
+                "next_actions": []
+              }
+            }
+          },
+          "evidence": {
+            "source": "v2_fresh_evaluation",
+            "profile_key": "risk-aware-shadow-v1",
+            "policy_version": "risk-aware-shadow-v1",
+            "policy_artifact_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "decision_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "v2_resolution_status": "current",
+            "epistemic_state": "supported",
+            "risk_state": "low",
+            "retention_state": "retain",
+            "effective_assessment_refs": [
+              {
+                "assessment_id": "00000000-0000-0000-0000-000000000006",
+                "contract_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "canonical_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "purpose": "combined",
+                "assertion_mode": "explicit",
+                "origin": "user"
+              }
+            ]
+          },
+          "relationship": {
+            "version": "relationship-relevance-v1",
+            "origins": [
+              "semantic",
+              "graph"
+            ],
+            "direct": true,
+            "direct_semantic_score": 0.7,
+            "source_seed_score": 0.9,
+            "graph_contribution": 0.5,
+            "graph_edge_types": [
+              "supports"
+            ],
+            "tunnel_labels": [],
+            "relevance_score": 0.8,
+            "components": {
+              "semantic": 0.6,
+              "graph": 0.2,
+              "tunnel": 0.0
+            }
+          },
+          "packing_reason": "ranked"
+        }
+      ],
+      "working_set": "[fact] linked fact",
+      "item_count": 1,
+      "byte_count": 11,
+      "candidate_count": 1,
+      "omitted_count": 0,
+      "omitted_by_admission": {},
+      "expansion": {
+        "version": "relationship-relevance-v1",
+        "seed_count": 1,
+        "discovered_neighbors": 1,
+        "graph_neighbors": 1,
+        "tunnel_neighbors": 0,
+        "admitted_expanded": 1,
+        "withheld_expanded": 0
+      },
+      "packing": {
+        "version": "recall-packing-v1",
+        "selected_count": 1,
+        "conflict_pairs_preserved": 0,
+        "omitted": {}
+      },
+      "message": null
+    }
+  },
+  "expected": {
+    "manifest": {
+      "schema": "engram.semantic-context-manifest",
+      "schema_version": "1.0",
+      "canonicalization": "rfc8785",
+      "mode": "semantic",
+      "subject": {
+        "tenant_id": "00000000-0000-0000-0000-000000000001",
+        "principal_id": "00000000-0000-0000-0000-000000000002",
+        "workspace_id": null,
+        "memory_context_version": "memory-context-v2",
+        "memory_profile_id": "00000000-0000-0000-0000-000000000004",
+        "memory_profile_revision_id": "00000000-0000-0000-0000-000000000005",
+        "memory_profile_version": 3
+      },
+      "request": {
+        "requested": {
+          "workspace_supplied": false,
+          "byte_budget": null,
+          "token_budget": null,
+          "item_budget": null
+        },
+        "effective": {
+          "workspace_id": null,
+          "byte_budget": 4096,
+          "token_budget": 1024,
+          "item_budget": 20
+        },
+        "query_digest": "sha256:6dd42305952fad3ce9e52975262fc10242d3347fb098e35b9181c0db28903b7f",
+        "request_digest": "sha256:a1f0a723ae9622c71a86e3eba2c4485218722039868caa5d21731931b46c6e6b"
+      },
+      "versions": {
+        "recall_profile": "governed",
+        "recall_profile_contract_version": "recall-profiles-v1",
+        "scoring_version": "signals-v1",
+        "signals_version": "recall-signals-v1",
+        "admission_policy": "recall-admission-v2",
+        "relationship_relevance_version": "relationship-relevance-v1",
+        "packing_version": "recall-packing-v1",
+        "config_version": "v1",
+        "manifest_contract_version": "semantic-context-manifest-v1",
+        "packet_render_version": "working-set-v1"
+      },
+      "result": {
+        "item_count": 1,
+        "served_content_byte_count": 11,
+        "rendered_packet_byte_count": 18,
+        "candidate_count": 1,
+        "omitted_count": 0,
+        "omitted_by_admission": {},
+        "expansion": {
+          "version": "relationship-relevance-v1",
+          "seed_count": 1,
+          "discovered_neighbors": 1,
+          "graph_neighbors": 1,
+          "tunnel_neighbors": 0,
+          "admitted_expanded": 1,
+          "withheld_expanded": 0
+        },
+        "packing": {
+          "version": "recall-packing-v1",
+          "selected_count": 1,
+          "conflict_pairs_preserved": 0,
+          "omitted": {}
+        },
+        "message": null
+      },
+      "packet": {
+        "media_type": "text/plain; charset=utf-8",
+        "render_version": "working-set-v1",
+        "hash": "sha256:1a817f932ff5a69d22b10be0928bb1c3129e861b5b052e0be598e7c4566c3ac2"
+      },
+      "items": [
+        {
+          "ordinal": 0,
+          "item_id": "00000000-0000-0000-0000-000000000015",
+          "kind": "fact",
+          "served_content_hash": "sha256:6c63dedca3822056299fa5ba2d3a46d2d537072f0d54443403d333631c13c717",
+          "review_status": "active",
+          "authority": 10,
+          "visibility": "private",
+          "workspace_id": null,
+          "pinned": false,
+          "score": 0.8,
+          "trust_score": null,
+          "relevance_score": 0.8,
+          "utility_score": 0.7,
+          "reasons": [
+            "semantic similarity 0.90"
+          ],
+          "warnings": [],
+          "warning_codes": [],
+          "conflict_type": null,
+          "conflict_resolution_status": null,
+          "admission": {
+            "profile": "governed",
+            "decision": "admit",
+            "policy_version": "recall-admission-v2",
+            "reason_codes": [
+              "admitted_v2_surface_allow"
+            ],
+            "assessment_id": "00000000-0000-0000-0000-000000000006",
+            "assessment_status": "current",
+            "assessment_outcome": "qualified",
+            "surface": "semantic_governed",
+            "surface_decision": "allow",
+            "v2": {
+              "profile_key": "risk-aware-shadow-v1",
+              "resolution_status": "current",
+              "surface": "semantic_governed",
+              "surface_decision": "allow",
+              "persisted": {
+                "assessment_id": "00000000-0000-0000-0000-000000000006",
+                "schema_version": "engram.admission-assessment.v2",
+                "policy_contract_version": "risk-aware-shadow-v1",
+                "policy_artifact_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "decision_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+              },
+              "fresh": {
+                "schema_version": "engram.admission-assessment.v2",
+                "policy_version": "risk-aware-shadow-v1",
+                "policy_artifact_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "decision_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "surface_decision": "allow",
+                "highest_admission_tier": "semantic_governed",
+                "risk_state": "low",
+                "epistemic_state": "supported",
+                "retention_state": "retain",
+                "effective_assessment_refs": [
+                  {
+                    "assessment_id": "00000000-0000-0000-0000-000000000006",
+                    "contract_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "canonical_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "purpose": "combined",
+                    "assertion_mode": "explicit",
+                    "origin": "user"
+                  }
+                ],
+                "observation_window_hours": 24,
+                "eligible_at": "2026-09-08T12:00:00+00:00",
+                "next_evaluation_at": null,
+                "blocker_codes": [],
+                "reason_codes": [
+                  "evidence_supported"
+                ],
+                "next_actions": []
+              }
+            }
+          },
+          "evidence": {
+            "source": "v2_fresh_evaluation",
+            "profile_key": "risk-aware-shadow-v1",
+            "policy_version": "risk-aware-shadow-v1",
+            "policy_artifact_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "decision_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "v2_resolution_status": "current",
+            "epistemic_state": "supported",
+            "risk_state": "low",
+            "retention_state": "retain",
+            "effective_assessment_refs": [
+              {
+                "assessment_id": "00000000-0000-0000-0000-000000000006",
+                "contract_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "canonical_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "purpose": "combined",
+                "assertion_mode": "explicit",
+                "origin": "user"
+              }
+            ]
+          },
+          "relationship": {
+            "version": "relationship-relevance-v1",
+            "origins": [
+              "semantic",
+              "graph"
+            ],
+            "direct": true,
+            "direct_semantic_score": 0.7,
+            "source_seed_score": 0.9,
+            "graph_contribution": 0.5,
+            "graph_edge_types": [
+              "supports"
+            ],
+            "tunnel_labels": [],
+            "relevance_score": 0.8,
+            "components": {
+              "semantic": 0.6,
+              "graph": 0.2,
+              "tunnel": 0.0
+            }
+          },
+          "packing_reason": "ranked"
+        }
+      ]
+    },
+    "canonical_json": "{\"canonicalization\":\"rfc8785\",\"items\":[{\"admission\":{\"assessment_id\":\"00000000-0000-0000-0000-000000000006\",\"assessment_outcome\":\"qualified\",\"assessment_status\":\"current\",\"decision\":\"admit\",\"policy_version\":\"recall-admission-v2\",\"profile\":\"governed\",\"reason_codes\":[\"admitted_v2_surface_allow\"],\"surface\":\"semantic_governed\",\"surface_decision\":\"allow\",\"v2\":{\"fresh\":{\"blocker_codes\":[],\"decision_hash\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"effective_assessment_refs\":[{\"assertion_mode\":\"explicit\",\"assessment_id\":\"00000000-0000-0000-0000-000000000006\",\"canonical_hash\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"contract_hash\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"origin\":\"user\",\"purpose\":\"combined\"}],\"eligible_at\":\"2026-09-08T12:00:00+00:00\",\"epistemic_state\":\"supported\",\"highest_admission_tier\":\"semantic_governed\",\"next_actions\":[],\"next_evaluation_at\":null,\"observation_window_hours\":24,\"policy_artifact_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policy_version\":\"risk-aware-shadow-v1\",\"reason_codes\":[\"evidence_supported\"],\"retention_state\":\"retain\",\"risk_state\":\"low\",\"schema_version\":\"engram.admission-assessment.v2\",\"surface_decision\":\"allow\"},\"persisted\":{\"assessment_id\":\"00000000-0000-0000-0000-000000000006\",\"decision_hash\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"policy_artifact_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policy_contract_version\":\"risk-aware-shadow-v1\",\"schema_version\":\"engram.admission-assessment.v2\"},\"profile_key\":\"risk-aware-shadow-v1\",\"resolution_status\":\"current\",\"surface\":\"semantic_governed\",\"surface_decision\":\"allow\"}},\"authority\":10,\"conflict_resolution_status\":null,\"conflict_type\":null,\"evidence\":{\"decision_hash\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"effective_assessment_refs\":[{\"assertion_mode\":\"explicit\",\"assessment_id\":\"00000000-0000-0000-0000-000000000006\",\"canonical_hash\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"contract_hash\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"origin\":\"user\",\"purpose\":\"combined\"}],\"epistemic_state\":\"supported\",\"policy_artifact_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policy_version\":\"risk-aware-shadow-v1\",\"profile_key\":\"risk-aware-shadow-v1\",\"retention_state\":\"retain\",\"risk_state\":\"low\",\"source\":\"v2_fresh_evaluation\",\"v2_resolution_status\":\"current\"},\"item_id\":\"00000000-0000-0000-0000-000000000015\",\"kind\":\"fact\",\"ordinal\":0,\"packing_reason\":\"ranked\",\"pinned\":false,\"reasons\":[\"semantic similarity 0.90\"],\"relationship\":{\"components\":{\"graph\":0.2,\"semantic\":0.6,\"tunnel\":0},\"direct\":true,\"direct_semantic_score\":0.7,\"graph_contribution\":0.5,\"graph_edge_types\":[\"supports\"],\"origins\":[\"semantic\",\"graph\"],\"relevance_score\":0.8,\"source_seed_score\":0.9,\"tunnel_labels\":[],\"version\":\"relationship-relevance-v1\"},\"relevance_score\":0.8,\"review_status\":\"active\",\"score\":0.8,\"served_content_hash\":\"sha256:6c63dedca3822056299fa5ba2d3a46d2d537072f0d54443403d333631c13c717\",\"trust_score\":null,\"utility_score\":0.7,\"visibility\":\"private\",\"warning_codes\":[],\"warnings\":[],\"workspace_id\":null}],\"mode\":\"semantic\",\"packet\":{\"hash\":\"sha256:1a817f932ff5a69d22b10be0928bb1c3129e861b5b052e0be598e7c4566c3ac2\",\"media_type\":\"text/plain; charset=utf-8\",\"render_version\":\"working-set-v1\"},\"request\":{\"effective\":{\"byte_budget\":4096,\"item_budget\":20,\"token_budget\":1024,\"workspace_id\":null},\"query_digest\":\"sha256:6dd42305952fad3ce9e52975262fc10242d3347fb098e35b9181c0db28903b7f\",\"request_digest\":\"sha256:a1f0a723ae9622c71a86e3eba2c4485218722039868caa5d21731931b46c6e6b\",\"requested\":{\"byte_budget\":null,\"item_budget\":null,\"token_budget\":null,\"workspace_supplied\":false}},\"result\":{\"candidate_count\":1,\"expansion\":{\"admitted_expanded\":1,\"discovered_neighbors\":1,\"graph_neighbors\":1,\"seed_count\":1,\"tunnel_neighbors\":0,\"version\":\"relationship-relevance-v1\",\"withheld_expanded\":0},\"item_count\":1,\"message\":null,\"omitted_by_admission\":{},\"omitted_count\":0,\"packing\":{\"conflict_pairs_preserved\":0,\"omitted\":{},\"selected_count\":1,\"version\":\"recall-packing-v1\"},\"rendered_packet_byte_count\":18,\"served_content_byte_count\":11},\"schema\":\"engram.semantic-context-manifest\",\"schema_version\":\"1.0\",\"subject\":{\"memory_context_version\":\"memory-context-v2\",\"memory_profile_id\":\"00000000-0000-0000-0000-000000000004\",\"memory_profile_revision_id\":\"00000000-0000-0000-0000-000000000005\",\"memory_profile_version\":3,\"principal_id\":\"00000000-0000-0000-0000-000000000002\",\"tenant_id\":\"00000000-0000-0000-0000-000000000001\",\"workspace_id\":null},\"versions\":{\"admission_policy\":\"recall-admission-v2\",\"config_version\":\"v1\",\"manifest_contract_version\":\"semantic-context-manifest-v1\",\"packet_render_version\":\"working-set-v1\",\"packing_version\":\"recall-packing-v1\",\"recall_profile\":\"governed\",\"recall_profile_contract_version\":\"recall-profiles-v1\",\"relationship_relevance_version\":\"relationship-relevance-v1\",\"scoring_version\":\"signals-v1\",\"signals_version\":\"recall-signals-v1\"}}",
+    "manifest_hash": "sha256:f5bdf640ffe631837099b57684f4e9123a0d45dc6c644a4f4d5329aca1f8234b",
+    "packet_hash": "sha256:1a817f932ff5a69d22b10be0928bb1c3129e861b5b052e0be598e7c4566c3ac2",
+    "query_digest": "sha256:6dd42305952fad3ce9e52975262fc10242d3347fb098e35b9181c0db28903b7f",
+    "request_digest": "sha256:a1f0a723ae9622c71a86e3eba2c4485218722039868caa5d21731931b46c6e6b",
+    "served_content_hashes": [
+      "sha256:6c63dedca3822056299fa5ba2d3a46d2d537072f0d54443403d333631c13c717"
+    ]
+  }
+}

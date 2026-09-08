@@ -7,6 +7,8 @@ from typing import Any, Literal
 import pytest
 
 from engram.context_manifest import compute_manifest_hash, sha256_digest
+from engram.recall import _enforce_semantic_budget
+from engram.semantic_budget import semantic_item_token_cost
 from engram.semantic_context_manifest import (
     SEMANTIC_MANIFEST_CONTRACT_VERSION,
     SemanticManifestDecisionContextV1,
@@ -21,7 +23,9 @@ ITEM_B = "00000000-0000-0000-0000-000000000011"
 
 
 def _context(
-    *, profile: Literal["legacy", "governed", "exploratory"] = "legacy"
+    *,
+    profile: Literal["legacy", "governed", "exploratory"] = "legacy",
+    token_budget: int | None = None,
 ) -> SemanticManifestDecisionContextV1:
     return SemanticManifestDecisionContextV1(
         tenant_id=TENANT,
@@ -35,7 +39,7 @@ def _context(
         requested_token_budget=None,
         requested_item_budget=None,
         effective_byte_budget=1000,
-        effective_token_budget=None,
+        effective_token_budget=token_budget,
         effective_item_budget=10,
         recall_profile=profile,
         recall_profile_contract_version="recall-profiles-v1",
@@ -68,7 +72,7 @@ def _item(item_id: str, content: str) -> dict[str, object]:
 
 
 def _build(*, query: str = "find café", items: list[dict[str, object]] | None = None) -> Any:
-    selected = items or [_item(ITEM_A, "alpha")]
+    selected = [_item(ITEM_A, "alpha")] if items is None else items
     working_set = "\n".join(f"[{item['kind']}] {item['content']}" for item in selected)
     return build_semantic_context_manifest_v1(
         items=selected,
@@ -141,7 +145,7 @@ def test_builder_rejects_incomplete_v2_decision_identity() -> None:
             "packing_reason": None,
         }
     )
-    with pytest.raises(ValueError, match="packing_reason"):
+    with pytest.raises(ValueError, match="admission"):
         build_semantic_context_manifest_v1(
             items=[candidate],
             working_set="[fact] alpha",
@@ -151,7 +155,12 @@ def test_builder_rejects_incomplete_v2_decision_identity() -> None:
             omitted_count=0,
             omitted_by_admission={},
             expansion=None,
-            packing={"version": "recall-packing-v1", "selected_count": 1},
+            packing={
+                "version": "recall-packing-v1",
+                "selected_count": 1,
+                "conflict_pairs_preserved": 0,
+                "omitted": {},
+            },
             message=None,
             query="q",
             context=_context(profile="governed"),
@@ -171,3 +180,99 @@ def test_builder_rejects_incomplete_v2_decision_identity() -> None:
             query="q",
             context=_context(),
         )
+
+
+def test_exact_four_byte_content_fits_one_token_in_serving_and_manifest() -> None:
+    candidate = _item(ITEM_A, "abcd")
+    selected = _enforce_semantic_budget(
+        [candidate], byte_budget=None, token_budget=1, item_budget=None
+    )
+
+    assert selected == [candidate]
+    assert semantic_item_token_cost("abcd") == 1
+    manifest = build_semantic_context_manifest_v1(
+        items=selected,
+        working_set="[fact] abcd",
+        item_count=1,
+        byte_count=4,
+        candidate_count=1,
+        omitted_count=0,
+        omitted_by_admission={},
+        expansion=None,
+        packing=None,
+        message=None,
+        query="q",
+        context=_context(token_budget=1),
+    )
+    assert manifest.result.item_count == 1
+
+
+def test_manifest_sums_the_same_per_item_token_cost_as_serving() -> None:
+    candidates = [_item(ITEM_A, "abcde"), _item(ITEM_B, "abcdefg")]
+    selected = _enforce_semantic_budget(
+        candidates, byte_budget=None, token_budget=2, item_budget=None
+    )
+    assert selected == candidates
+    assert sum(semantic_item_token_cost(str(item["content"])) for item in selected) == 2
+    working_set = "\n".join(f"[{item['kind']}] {item['content']}" for item in selected)
+    build_semantic_context_manifest_v1(
+        items=selected,
+        working_set=working_set,
+        item_count=2,
+        byte_count=12,
+        candidate_count=2,
+        omitted_count=0,
+        omitted_by_admission={},
+        expansion=None,
+        packing=None,
+        message=None,
+        query="q",
+        context=_context(token_budget=2),
+    )
+
+
+def test_skipped_oversized_item_and_later_selected_item_pass_manifest() -> None:
+    oversized = _item(ITEM_A, "abcdefgh")
+    smaller = _item(ITEM_B, "abcd")
+    selected = _enforce_semantic_budget(
+        [oversized, smaller], byte_budget=None, token_budget=1, item_budget=None
+    )
+    assert selected == [smaller]
+    build_semantic_context_manifest_v1(
+        items=selected,
+        working_set="[fact] abcd",
+        item_count=1,
+        byte_count=4,
+        candidate_count=2,
+        omitted_count=1,
+        omitted_by_admission={},
+        expansion=None,
+        packing=None,
+        message=None,
+        query="q",
+        context=_context(token_budget=1),
+    )
+
+
+@pytest.mark.parametrize("budget,accepted", [(2, True), (1, False)])
+def test_manifest_token_budget_exact_boundary_and_one_below(budget: int, accepted: bool) -> None:
+    items = [_item(ITEM_A, "abcdefgh")]
+    kwargs = dict(
+        items=items,
+        working_set="[fact] abcdefgh",
+        item_count=1,
+        byte_count=8,
+        candidate_count=1,
+        omitted_count=0,
+        omitted_by_admission={},
+        expansion=None,
+        packing=None,
+        message=None,
+        query="q",
+        context=_context(token_budget=budget),
+    )
+    if accepted:
+        build_semantic_context_manifest_v1(**kwargs)
+    else:
+        with pytest.raises(ValueError, match="token budget"):
+            build_semantic_context_manifest_v1(**kwargs)

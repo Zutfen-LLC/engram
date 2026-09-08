@@ -1407,8 +1407,8 @@ async def recall(
     # telemetry record so the retrieval latency metric includes the enabled
     # dark-write time (the client waits for the attempt before receiving the
     # response). The dedicated receipt event records the dark-write latency
-    # separately. Semantic recall never invokes the dark write. A receipt
-    # failure must never fail recall or modify the response.
+    # separately. Semantic capture uses the separate dark write below. A
+    # receipt failure must never fail recall or modify the response.
     #
     # The OUTER guard checks the feature flag before ANY receipt-specific
     # work: no manifest work, no decision-context parsing, no receipt DB

@@ -28,6 +28,7 @@ from engram.context_manifest import (
     reconstruct_working_set_v1,
     sha256_digest,
 )
+from engram.semantic_budget import semantic_item_byte_count, semantic_item_token_cost
 
 __all__ = [
     "SEMANTIC_MANIFEST_CONTRACT_VERSION",
@@ -109,6 +110,39 @@ class SemanticVersionsV1(_StrictModel):
     packet_render_version: Literal["working-set-v1"]
 
 
+class SemanticExpansionV1(_StrictModel):
+    """The bounded relationship-expansion summary produced by issue #190."""
+
+    version: Literal["relationship-relevance-v1"]
+    seed_count: NonNegativeIntV1
+    discovered_neighbors: NonNegativeIntV1
+    graph_neighbors: NonNegativeIntV1
+    tunnel_neighbors: NonNegativeIntV1
+    admitted_expanded: NonNegativeIntV1
+    withheld_expanded: NonNegativeIntV1
+
+
+class SemanticPackingOmittedV1(_StrictModel):
+    """Sparse omission counts from ``recall-packing-v1``."""
+
+    redundant_known_root: NonNegativeIntV1 | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    conflict_counterpart_budget: NonNegativeIntV1 | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    budget: NonNegativeIntV1 | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
+class SemanticPackingV1(_StrictModel):
+    """The bounded packet summary produced by issue #192."""
+
+    version: Literal["recall-packing-v1"]
+    selected_count: NonNegativeIntV1
+    conflict_pairs_preserved: NonNegativeIntV1
+    omitted: SemanticPackingOmittedV1
+
+
 class SemanticResultV1(_StrictModel):
     item_count: NonNegativeIntV1
     served_content_byte_count: NonNegativeIntV1
@@ -116,8 +150,8 @@ class SemanticResultV1(_StrictModel):
     candidate_count: NonNegativeIntV1
     omitted_count: NonNegativeIntV1
     omitted_by_admission: dict[str, NonNegativeIntV1]
-    expansion: dict[str, Any] | None
-    packing: dict[str, Any] | None
+    expansion: SemanticExpansionV1 | None
+    packing: SemanticPackingV1 | None
     message: str | None
 
 
@@ -125,6 +159,137 @@ class SemanticPacketV1(_StrictModel):
     media_type: Literal["text/plain; charset=utf-8"]
     render_version: Literal["working-set-v1"]
     hash: Sha256DigestV1
+
+
+class SemanticAssessmentRefV1(_StrictModel):
+    """One effective #157 assessment reference used by V2."""
+
+    assessment_id: CanonicalUuidV1
+    contract_hash: Sha256DigestV1
+    canonical_hash: Sha256DigestV1
+    purpose: Literal["combined"]
+    assertion_mode: str
+    origin: str
+
+
+class SemanticV2PersistedV1(_StrictModel):
+    """The persisted V2 decision identity used by candidate admission."""
+
+    assessment_id: CanonicalUuidV1
+    schema_version: Literal["engram.admission-assessment.v2"]
+    policy_contract_version: str
+    policy_artifact_digest: Sha256DigestV1
+    decision_hash: Sha256DigestV1
+
+
+class SemanticV2FreshV1(_StrictModel):
+    """The exact safe fresh V2 decision identity from issue #186."""
+
+    schema_version: Literal["engram.admission-assessment.v2"]
+    policy_version: str
+    policy_artifact_digest: Sha256DigestV1
+    decision_hash: Sha256DigestV1
+    surface_decision: Literal["allow"]
+    highest_admission_tier: str | None
+    risk_state: str | None
+    epistemic_state: Literal["supported", "contested", "insufficient_evidence", "unknown"]
+    retention_state: str | None
+    effective_assessment_refs: list[SemanticAssessmentRefV1]
+    observation_window_hours: NonNegativeIntV1 | None
+    eligible_at: str | None
+    next_evaluation_at: str | None
+    blocker_codes: list[str]
+    reason_codes: list[str]
+    next_actions: list[str]
+
+
+class SemanticV2BindingV1(_StrictModel):
+    """The V2 resolution identity consumed by the admission decision."""
+
+    profile_key: str
+    resolution_status: Literal["current"]
+    surface: Literal["semantic_governed", "semantic_exploratory"]
+    surface_decision: Literal["allow"]
+    persisted: SemanticV2PersistedV1
+    fresh: SemanticV2FreshV1
+
+    @model_validator(mode="after")
+    def persisted_and_fresh_agree(self) -> SemanticV2BindingV1:
+        if self.surface_decision != self.fresh.surface_decision:
+            raise ValueError("V2 surface decision does not match fresh decision")
+        for persisted_name, fresh_name in (
+            ("schema_version", "schema_version"),
+            ("policy_contract_version", "policy_version"),
+            ("policy_artifact_digest", "policy_artifact_digest"),
+            ("decision_hash", "decision_hash"),
+        ):
+            if getattr(self.persisted, persisted_name) != getattr(self.fresh, fresh_name):
+                raise ValueError("current V2 persisted and fresh identities must match")
+        return self
+
+
+class SemanticAdmissionV1(_StrictModel):
+    """The safe candidate admission receipt from issues #186 and #188."""
+
+    profile: Literal["governed", "exploratory"]
+    decision: Literal["admit"]
+    policy_version: Literal["recall-admission-v2"]
+    reason_codes: list[str]
+    assessment_id: CanonicalUuidV1 | None
+    assessment_status: Literal["current", "stale", "legacy_import"] | None
+    assessment_outcome: str | None
+    surface: Literal["semantic_governed", "semantic_exploratory"]
+    surface_decision: Literal["allow"]
+    v2: SemanticV2BindingV1
+
+    @model_validator(mode="after")
+    def identity_is_coherent(self) -> SemanticAdmissionV1:
+        expected_surface = (
+            "semantic_governed" if self.profile == "governed" else "semantic_exploratory"
+        )
+        if self.surface != expected_surface or self.v2.surface != expected_surface:
+            raise ValueError("admission profile and V2 surface do not match")
+        if self.surface_decision != self.v2.surface_decision:
+            raise ValueError("admission and V2 surface decisions do not match")
+        if self.assessment_id is not None and self.assessment_id != self.v2.persisted.assessment_id:
+            raise ValueError("admission assessment identity does not match V2")
+        return self
+
+
+class SemanticEvidenceV1(_StrictModel):
+    """The canonical issue #188 evidence projection."""
+
+    source: Literal["v2_fresh_evaluation"]
+    profile_key: str
+    policy_version: str
+    policy_artifact_digest: Sha256DigestV1
+    decision_hash: Sha256DigestV1
+    v2_resolution_status: Literal["current"]
+    epistemic_state: Literal["supported", "contested", "insufficient_evidence", "unknown"]
+    risk_state: str | None
+    retention_state: str | None
+    effective_assessment_refs: list[SemanticAssessmentRefV1]
+
+
+class SemanticRelationshipComponentsV1(_StrictModel):
+    semantic: FiniteFloatV1
+    graph: FiniteFloatV1
+    tunnel: FiniteFloatV1
+
+
+class SemanticRelationshipV1(_StrictModel):
+    """The finalized ``relationship-relevance-v1`` item block."""
+
+    version: Literal["relationship-relevance-v1"]
+    origins: list[Literal["semantic", "graph", "tunnel"]]
+    direct: bool
+    direct_semantic_score: FiniteFloatV1 | None
+    source_seed_score: FiniteFloatV1
+    graph_contribution: FiniteFloatV1
+    graph_edge_types: list[str]
+    tunnel_labels: list[str]
+    relevance_score: FiniteFloatV1
+    components: SemanticRelationshipComponentsV1
 
 
 class SemanticItemV1(_StrictModel):
@@ -146,10 +311,10 @@ class SemanticItemV1(_StrictModel):
     warning_codes: list[str] | None
     conflict_type: str | None
     conflict_resolution_status: str | None
-    admission: dict[str, Any] | None
-    evidence: dict[str, Any] | None
-    relationship: dict[str, Any] | None
-    packing_reason: str | None
+    admission: SemanticAdmissionV1 | None
+    evidence: SemanticEvidenceV1 | None
+    relationship: SemanticRelationshipV1 | None
+    packing_reason: Literal["ranked", "conflict_pair_preserved", "diversity_fill"] | None
 
     @model_validator(mode="after")
     def profile_facts_are_coherent(self) -> SemanticItemV1:
@@ -167,34 +332,10 @@ class SemanticItemV1(_StrictModel):
             return self
         if not self.packing_reason:
             raise ValueError("V2 item requires an exact packing_reason")
-        required_admission = {
-            "profile",
-            "decision",
-            "policy_version",
-            "surface",
-            "surface_decision",
-            "v2",
-        }
-        if not required_admission.issubset(self.admission):
-            raise ValueError("V2 admission is missing required decision identity")
-        v2 = self.admission["v2"]
-        if not isinstance(v2, dict) or not isinstance(v2.get("fresh"), dict):
-            raise ValueError("V2 admission requires a fresh decision identity")
-        fresh = v2["fresh"]
-        required_fresh = {
-            "policy_version",
-            "policy_artifact_digest",
-            "decision_hash",
-            "epistemic_state",
-            "risk_state",
-            "retention_state",
-            "effective_assessment_refs",
-        }
-        if not required_fresh.issubset(fresh):
-            raise ValueError("V2 fresh decision is missing required identity")
+        v2 = self.admission.v2
+        fresh = v2.fresh
         assert self.evidence is not None
-        evidence_keys = {
-            "profile_key",
+        for name in (
             "policy_version",
             "policy_artifact_digest",
             "decision_hash",
@@ -202,16 +343,18 @@ class SemanticItemV1(_StrictModel):
             "risk_state",
             "retention_state",
             "effective_assessment_refs",
-        }
-        if not evidence_keys.issubset(self.evidence):
-            raise ValueError("V2 evidence is missing required identity")
-        for key in evidence_keys - {"profile_key"}:
-            if self.evidence[key] != fresh[key]:
+        ):
+            if getattr(self.evidence, name) != getattr(fresh, name):
                 raise ValueError("V2 evidence must mirror the fresh decision identity")
-        if self.evidence["profile_key"] != v2.get("profile_key"):
+        if self.evidence.profile_key != v2.profile_key:
             raise ValueError("V2 evidence profile_key must mirror admission")
-        if self.relationship is not None and not {"version", "origins"}.issubset(self.relationship):
-            raise ValueError("relationship binding is missing version or origins")
+        if self.evidence.v2_resolution_status != v2.resolution_status:
+            raise ValueError("V2 evidence resolution status must mirror admission")
+        if (
+            self.relationship is not None
+            and self.relationship.relevance_score != self.relevance_score
+        ):
+            raise ValueError("relationship relevance must match the served relevance score")
         return self
 
 
@@ -233,9 +376,35 @@ class SemanticContextManifestV1(_StrictModel):
     def coherent(self) -> SemanticContextManifestV1:
         if self.result.item_count != len(self.items):
             raise ValueError("result.item_count does not match items")
+        if self.result.packing is not None and self.result.packing.selected_count != len(
+            self.items
+        ):
+            raise ValueError("packing selected_count does not match items")
+        if (self.result.expansion is None) != (
+            self.versions.relationship_relevance_version is None
+        ):
+            raise ValueError("expansion and relationship version must be present together")
+        if self.result.expansion is not None and (
+            self.versions.relationship_relevance_version != self.result.expansion.version
+        ):
+            raise ValueError("expansion relationship version does not match versions")
+        if (self.result.packing is None) != (self.versions.packing_version is None):
+            raise ValueError("packing and packing version must be present together")
+        if self.result.packing is not None and (
+            self.versions.packing_version != self.result.packing.version
+        ):
+            raise ValueError("packing version does not match versions")
         for ordinal, item in enumerate(self.items):
             if item.ordinal != ordinal:
                 raise ValueError("item ordinal does not match array order")
+            if item.admission is not None and (
+                item.admission.profile != self.versions.recall_profile
+            ):
+                raise ValueError("item admission profile does not match manifest profile")
+            if item.relationship is not None and (
+                item.relationship.version != self.versions.relationship_relevance_version
+            ):
+                raise ValueError("item relationship contract does not match versions")
         return self
 
 
@@ -317,7 +486,7 @@ def build_semantic_context_manifest_v1(
     """Build a semantic manifest only from a finalized packet snapshot."""
     if item_count != len(items):
         raise ValueError("finalized item_count does not match items")
-    actual_bytes = sum(len(item["content"].encode("utf-8")) for item in items)
+    actual_bytes = sum(semantic_item_byte_count(item["content"]) for item in items)
     if byte_count != actual_bytes:
         raise ValueError("finalized byte_count does not match item content")
     if reconstruct_working_set_v1(items) != working_set:
@@ -328,10 +497,10 @@ def build_semantic_context_manifest_v1(
     ):
         if budget is not None and actual > budget:
             raise ValueError(f"finalized packet exceeds effective {name} budget")
-    rendered_token_count = (len(working_set.encode("utf-8")) + 3) // 4
+    selected_token_count = sum(semantic_item_token_cost(item["content"]) for item in items)
     if (
         context.effective_token_budget is not None
-        and rendered_token_count > context.effective_token_budget
+        and selected_token_count > context.effective_token_budget
     ):
         raise ValueError("finalized packet exceeds effective token budget")
     if context.recall_profile == "legacy" and any(
@@ -400,8 +569,10 @@ def build_semantic_context_manifest_v1(
             candidate_count=candidate_count,
             omitted_count=omitted_count,
             omitted_by_admission=omitted_by_admission,
-            expansion=expansion,
-            packing=packing,
+            expansion=(
+                SemanticExpansionV1.model_validate(expansion) if expansion is not None else None
+            ),
+            packing=(SemanticPackingV1.model_validate(packing) if packing is not None else None),
             message=message,
         ),
         packet=SemanticPacketV1(

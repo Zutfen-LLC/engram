@@ -1,4 +1,4 @@
-"""Real-PostgreSQL tests for the startup context-receipt dark write (ENG-CONTEXT-002B).
+"""Real-PostgreSQL tests for startup and semantic Context Receipt dark writes.
 
 Exercises the full orchestrator and the production ``POST /v1/recall`` route
 against a live PostgreSQL, proving:
@@ -11,7 +11,9 @@ against a live PostgreSQL, proving:
 - empty startup recall creates a valid empty receipt;
 - requested budgets are preserved; effective budgets reflect actual execution;
 - workspace-scoped startup records the resolved workspace ID;
-- semantic recall creates no receipt while the feature is enabled;
+- semantic capture has an independent default-off flag;
+- enabled semantic recall creates and verifies one exact semantic receipt;
+- semantic failures preserve the response and committed recall log;
 - existing RecallResponse JSON is identical with the feature on and off
   (excluding naturally unique recall_log_id);
 - no receipt fields appear in the public response;
@@ -73,11 +75,18 @@ from engram.context_receipt_dark_write import (
 from engram.context_receipts import (
     ContextReceiptConflictError,
     ContextReceiptIntegrityError,
+    ContextReceiptStoreResult,
     get_context_receipt_for_recall_log,
+    store_context_receipt,
 )
+from engram.db import apply_rls_context
 from engram.memory_context import MEMORY_CONTEXT_VERSION as MC_VERSION
 from engram.memory_context import ResolvedMemoryContext
-from engram.models import ContextReceipt, UsageEvent
+from engram.models import ContextReceipt, MemoryItem, RecallLog, UsageEvent
+from engram.semantic_context_manifest import (
+    SemanticContextManifestV1,
+    semantic_query_digest,
+)
 
 _test_engine = create_async_engine(settings.database_url, poolclass=NullPool)
 _test_session_factory = async_sessionmaker(
@@ -240,6 +249,10 @@ def _patch_orchestrator_app_factory(monkeypatch: pytest.MonkeyPatch) -> None:
             "engram.context_receipt_dark_write.async_session_factory",
             _app_session_factory,
         )
+        monkeypatch.setattr(
+            "engram.semantic_context_receipt_dark_write.async_session_factory",
+            _app_session_factory,
+        )
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -398,7 +411,9 @@ def _raw_result_from_response(
 
 async def _count_receipts() -> int:
     async with _test_session_factory() as session:
-        return await session.scalar(select(func.count()).select_from(ContextReceipt)) or 0
+        return (
+            await session.scalar(select(func.count()).select_from(ContextReceipt)) or 0
+        )
 
 
 async def _receipt_for_recall_log(
@@ -449,7 +464,9 @@ async def test_disabled_startup_invokes_no_receipt_work(
 
     # Each receipt-specific callable must raise if invoked while disabled.
     def _boom_parse(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("parse_startup_executed_context must not run when disabled")
+        raise AssertionError(
+            "parse_startup_executed_context must not run when disabled"
+        )
 
     def _boom_build(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("_build_manifest must not run when disabled")
@@ -458,7 +475,9 @@ async def test_disabled_startup_invokes_no_receipt_work(
         raise AssertionError("async_session_factory must not run when disabled")
 
     async def _boom_telemetry(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("record_context_receipt_dark_write must not run when disabled")
+        raise AssertionError(
+            "record_context_receipt_dark_write must not run when disabled"
+        )
 
     monkeypatch.setattr(
         "engram.context_receipt_dark_write.parse_startup_executed_context", _boom_parse
@@ -488,7 +507,9 @@ async def test_disabled_startup_invokes_no_receipt_work(
     assert await _count_usage_events("context_receipt.dark_write") == 0
 
 
-async def test_disabled_startup_creates_no_receipt(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_disabled_startup_creates_no_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     if not await _db_ok() or not await _receipts_table_exists():
         _require_db()
     monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", False)
@@ -506,17 +527,23 @@ async def test_disabled_startup_creates_no_receipt(monkeypatch: pytest.MonkeyPat
     assert await _count_receipts() == 0
 
 
-async def test_enabled_startup_creates_one_receipt(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_enabled_startup_creates_one_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     if not await _db_ok() or not await _receipts_table_exists():
         _require_db()
     monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
     monkeypatch.setattr(settings, "context_receipt_dark_write_timeout_seconds", 5.0)
     tenant_id, principal_id = await _default_tenant_principal()
     await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id, content=f"{_NAME_PREFIX}enabled-a"
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content=f"{_NAME_PREFIX}enabled-a",
     )
     await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id, content=f"{_NAME_PREFIX}enabled-b"
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        content=f"{_NAME_PREFIX}enabled-b",
     )
     async with AsyncClient(
         transport=ASGITransport(app=create_app()), base_url="http://test"
@@ -563,9 +590,10 @@ async def test_stored_manifest_matches_exact_http_response(
     assert receipt is not None
     manifest = ContextManifestV1.model_validate(receipt.manifest)
     # Packet hash matches the exact served working_set.
-    assert manifest.packet.hash == "sha256:" + hashlib.sha256(
-        response.working_set.encode("utf-8")
-    ).hexdigest()
+    assert (
+        manifest.packet.hash
+        == "sha256:" + hashlib.sha256(response.working_set.encode("utf-8")).hexdigest()
+    )
     # Ordered item IDs match the response exactly.
     assert [i.item_id for i in manifest.items] == [it["id"] for it in response.items]
 
@@ -756,9 +784,7 @@ async def test_response_json_identical_on_and_off_excluding_recall_log_id(
     tenant_id, principal_id = await _default_tenant_principal()
     content = f"{_NAME_PREFIX}parity-item"
     # Insert ONE item before either recall; do not insert again between them.
-    await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id, content=content
-    )
+    await _insert_item(tenant_id=tenant_id, principal_id=principal_id, content=content)
 
     async def _recall() -> dict[str, Any]:
         async with AsyncClient(
@@ -778,6 +804,200 @@ async def test_response_json_identical_on_and_off_excluding_recall_log_id(
     off_cmp = {k: v for k, v in off.items() if k != "recall_log_id"}
     on_cmp = {k: v for k, v in on.items() if k != "recall_log_id"}
     assert off_cmp == on_cmp
+
+
+async def test_semantic_response_is_identical_with_receipt_capture_on_and_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Semantic capture does not change the public response schema or bytes."""
+    if not await _db_ok() or not await _receipts_table_exists():
+        _require_db()
+    if _app_session_factory is None:
+        _require_app_role()
+    monkeypatch.setattr(settings, "embedding_provider", "none")
+    monkeypatch.setattr(settings, "usage_telemetry_enabled", False)
+
+    async def _recall() -> dict[str, Any]:
+        async with AsyncClient(
+            transport=ASGITransport(app=create_app()), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/v1/recall",
+                json={"mode": "semantic", "query": "fixed parity query"},
+            )
+        assert response.status_code == 200, response.text
+        return dict(response.json())
+
+    monkeypatch.setattr(settings, "semantic_context_receipt_dark_write_enabled", False)
+    disabled = await _recall()
+    monkeypatch.setattr(settings, "semantic_context_receipt_dark_write_enabled", True)
+    monkeypatch.setattr(settings, "context_receipt_dark_write_timeout_seconds", 5.0)
+    enabled = await _recall()
+
+    disabled["recall_log_id"] = "<recall-log-id>"
+    enabled["recall_log_id"] = "<recall-log-id>"
+    assert disabled == enabled
+    assert "_semantic_evaluation" not in enabled
+    assert all(field not in enabled for field in _FORBIDDEN_RESPONSE_FIELDS)
+
+    properties = create_app().openapi()["components"]["schemas"]["RecallResponse"][
+        "properties"
+    ]
+    assert "_semantic_evaluation" not in properties
+    assert all(field not in properties for field in _FORBIDDEN_RESPONSE_FIELDS)
+
+
+async def test_semantic_route_failures_keep_response_and_recall_log(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each semantic receipt stage is fail-open at the HTTP boundary."""
+    if not await _db_ok() or not await _receipts_table_exists():
+        _require_db()
+    monkeypatch.setattr(settings, "embedding_provider", "none")
+    monkeypatch.setattr(settings, "usage_telemetry_enabled", False)
+
+    async def _recall() -> dict[str, Any]:
+        async with AsyncClient(
+            transport=ASGITransport(app=create_app()), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/v1/recall",
+                json={"mode": "semantic", "query": "fixed failure query"},
+            )
+        assert response.status_code == 200, response.text
+        return dict(response.json())
+
+    monkeypatch.setattr(settings, "semantic_context_receipt_dark_write_enabled", False)
+    expected = await _recall()
+    expected["recall_log_id"] = "<recall-log-id>"
+    async with _test_engine.begin() as connection:
+        await connection.execute(text("DELETE FROM recall_logs"))
+
+    class _FailureSession:
+        def __init__(self, stage: str) -> None:
+            self.stage = stage
+
+        async def __aenter__(self) -> _FailureSession:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def flush(self) -> None:
+            if self.stage == "flush":
+                raise RuntimeError("private flush value")
+
+        async def refresh(self, value: Any) -> None:
+            if self.stage == "reload":
+                raise RuntimeError("private reload value")
+
+        async def commit(self) -> None:
+            if self.stage == "commit":
+                raise RuntimeError("private commit value")
+
+    stages = (
+        "build_manifest",
+        "open_session",
+        "apply_rls",
+        "store",
+        "flush",
+        "reload",
+        "verify",
+        "commit",
+        "timeout",
+    )
+    monkeypatch.setattr(settings, "semantic_context_receipt_dark_write_enabled", True)
+    for stage in stages:
+        async with _test_engine.begin() as connection:
+            await connection.execute(text("DELETE FROM context_receipts"))
+            await connection.execute(text("DELETE FROM recall_logs"))
+
+        with monkeypatch.context() as stage_patch:
+            stage_patch.setattr(
+                settings,
+                "context_receipt_dark_write_timeout_seconds",
+                0.01 if stage == "timeout" else 5.0,
+            )
+
+            if stage == "build_manifest":
+                stage_patch.setattr(
+                    "engram.semantic_context_receipt_dark_write."
+                    "build_semantic_context_manifest_v1",
+                    lambda **kwargs: (_ for _ in ()).throw(
+                        RuntimeError("private manifest value")
+                    ),
+                )
+            elif stage == "open_session":
+                stage_patch.setattr(
+                    "engram.semantic_context_receipt_dark_write.async_session_factory",
+                    lambda: (_ for _ in ()).throw(RuntimeError("private session value")),
+                )
+            else:
+                stage_patch.setattr(
+                    "engram.semantic_context_receipt_dark_write.async_session_factory",
+                    lambda _stage=stage: _FailureSession(_stage),
+                )
+
+                async def fail_rls(
+                    *args: Any, _stage: str = stage, **kwargs: Any
+                ) -> None:
+                    if _stage == "apply_rls":
+                        raise RuntimeError("private RLS value")
+
+                async def fail_store(
+                    *args: Any, _stage: str = stage, **kwargs: Any
+                ) -> ContextReceiptStoreResult:
+                    if _stage == "store":
+                        raise RuntimeError("private store value")
+                    if _stage == "timeout":
+                        await asyncio.sleep(10)
+                    receipt = type(
+                        "Receipt",
+                        (),
+                        {"id": uuid.uuid4()},
+                    )()
+                    return ContextReceiptStoreResult(
+                        receipt=receipt,  # type: ignore[arg-type]
+                        created=True,
+                    )
+
+                def fail_verify(
+                    *args: Any, _stage: str = stage, **kwargs: Any
+                ) -> None:
+                    if _stage == "verify":
+                        raise RuntimeError("private verify value")
+
+                stage_patch.setattr(
+                    "engram.semantic_context_receipt_dark_write.apply_rls_context",
+                    fail_rls,
+                )
+                stage_patch.setattr(
+                    "engram.semantic_context_receipt_dark_write.store_context_receipt",
+                    fail_store,
+                )
+                stage_patch.setattr(
+                    "engram.semantic_context_receipt_dark_write._verify_reloaded",
+                    fail_verify,
+                )
+
+            actual = await _recall()
+
+        assert actual["recall_log_id"] is not None
+        actual["recall_log_id"] = "<recall-log-id>"
+        assert actual == expected
+        assert "_semantic_evaluation" not in actual
+        async with _test_session_factory() as session:
+            assert (
+                int(
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(RecallLog)
+                        .where(RecallLog.mode == "semantic")
+                    )
+                )
+                == 1
+            )
+            assert int(await session.scalar(select(func.count()).select_from(ContextReceipt))) == 0
 
 
 async def test_retrieval_telemetry_status_succeeded_after_receipt_failure(
@@ -812,19 +1032,16 @@ async def test_retrieval_telemetry_status_succeeded_after_receipt_failure(
     # The retrieval.request telemetry must still record status=succeeded.
     async with _test_session_factory() as session:
         row = (
-            (
-                await session.execute(
-                    select(UsageEvent)
-                    .where(
-                        UsageEvent.event_type == "retrieval.request",
-                        UsageEvent.operation == "startup_recall",
-                    )
-                    .order_by(UsageEvent.created_at.desc())
-                    .limit(1)
+            await session.execute(
+                select(UsageEvent)
+                .where(
+                    UsageEvent.event_type == "retrieval.request",
+                    UsageEvent.operation == "startup_recall",
                 )
+                .order_by(UsageEvent.created_at.desc())
+                .limit(1)
             )
-            .scalar_one_or_none()
-        )
+        ).scalar_one_or_none()
     assert row is not None
     assert row.status == "succeeded"
 
@@ -906,6 +1123,199 @@ async def test_semantic_recall_creates_no_receipt_when_enabled(
     assert await _count_receipts() == 0
 
 
+async def test_enabled_authoritative_semantic_recall_creates_exact_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The served legacy packet and its one recall log bind to one receipt."""
+    if not await _db_ok() or not await _receipts_table_exists():
+        _require_db()
+    if _app_session_factory is None:
+        _require_app_role()
+    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", False)
+    monkeypatch.setattr(settings, "semantic_context_receipt_dark_write_enabled", True)
+    monkeypatch.setattr(settings, "context_receipt_dark_write_timeout_seconds", 5.0)
+    monkeypatch.setattr(settings, "embedding_provider", "openai")
+    monkeypatch.setattr(settings, "usage_telemetry_enabled", False)
+
+    vector = [1.0] + [0.0] * 1535
+
+    async def fake_embedding(*args: Any, **kwargs: Any) -> list[float]:
+        return vector
+
+    from engram import embeddings as embeddings_module
+    from engram import recall as recall_module
+    from engram.api.routes import memory as memory_routes
+
+    monkeypatch.setattr(recall_module, "generate_embedding", fake_embedding)
+    monkeypatch.setattr(memory_routes, "generate_embedding", fake_embedding)
+    monkeypatch.setattr(embeddings_module, "generate_embedding", fake_embedding)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=create_app()), base_url="http://test"
+    ) as client:
+        remembered = await client.post(
+            "/v1/remember",
+            json={
+                "content": f"{_NAME_PREFIX}semantic exact",
+                "source_type": "manual",
+                "visibility": "private",
+            },
+        )
+        assert remembered.status_code == 201, remembered.text
+
+        from engram.worker import process_one_job
+
+        assert await process_one_job(
+            worker_id="semantic-receipt-test",
+            session_factory=_test_session_factory,
+            app_session_factory=_test_session_factory,
+            job_types=["embedding.generate"],
+        )
+        query = "semantic exact"
+        response = await client.post(
+            "/v1/recall",
+            json={
+                "mode": "semantic",
+                "query": query,
+                "byte_budget": 4096,
+                "token_budget": 1024,
+                "item_budget": 5,
+            },
+        )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert "_semantic_evaluation" not in body
+    assert all(field not in body for field in _FORBIDDEN_RESPONSE_FIELDS)
+
+    async with _test_session_factory() as session:
+        logs = (
+            await session.scalars(select(RecallLog).where(RecallLog.mode == "semantic"))
+        ).all()
+        receipts = (await session.scalars(select(ContextReceipt))).all()
+        served_item = await session.scalar(
+            select(MemoryItem).where(
+                MemoryItem.id == uuid.UUID(body["items"][0]["id"])
+            )
+        )
+    assert len(logs) == 1
+    assert len(receipts) == 1
+    assert served_item is not None
+    assert served_item.visibility == "private"
+    log = logs[0]
+    receipt = receipts[0]
+    assert receipt.recall_log_id == log.id == uuid.UUID(body["recall_log_id"])
+    assert receipt.mode == "semantic"
+    assert receipt.manifest_schema == "engram.semantic-context-manifest"
+
+    from engram.context_receipts import verify_context_receipt_record
+
+    manifest = verify_context_receipt_record(receipt)
+    assert isinstance(manifest, SemanticContextManifestV1)
+    assert manifest.versions.manifest_contract_version == "semantic-context-manifest-v1"
+    assert [item.item_id for item in manifest.items] == [
+        item["id"] for item in body["items"]
+    ]
+    assert manifest.request.query_digest == semantic_query_digest(query)
+    assert manifest.request.effective.byte_budget == log.byte_budget == 4096
+    assert manifest.request.effective.token_budget == log.token_budget == 1024
+    assert manifest.request.effective.item_budget == log.item_budget == 5
+    assert (
+        manifest.packet.hash
+        == "sha256:" + hashlib.sha256(body["working_set"].encode("utf-8")).hexdigest()
+    )
+    assert [item.served_content_hash for item in manifest.items] == [
+        "sha256:" + hashlib.sha256(item["content"].encode("utf-8")).hexdigest()
+        for item in body["items"]
+    ]
+
+    assert _app_session_factory is not None
+    async with _app_session_factory() as session:
+        await apply_rls_context(
+            session,
+            tenant_id=log.tenant_id,
+            principal_id=uuid.uuid4(),
+        )
+        assert await session.scalar(
+            select(ContextReceipt).where(ContextReceipt.id == receipt.id)
+        ) is None
+
+    async with _app_session_factory() as session:
+        await apply_rls_context(
+            session,
+            tenant_id=uuid.uuid4(),
+            principal_id=log.principal_id,
+        )
+        assert await session.scalar(
+            select(ContextReceipt).where(ContextReceipt.id == receipt.id)
+        ) is None
+
+    async with _app_session_factory() as session:
+        await apply_rls_context(
+            session,
+            tenant_id=log.tenant_id,
+            principal_id=log.principal_id,
+        )
+        retry = await store_context_receipt(
+            session,
+            tenant_id=log.tenant_id,
+            principal_id=log.principal_id,
+            recall_log_id=log.id,
+            manifest=manifest,
+        )
+        assert retry.created is False
+        assert retry.receipt.id == receipt.id
+
+        conflict = manifest.model_copy(
+            update={
+                "result": manifest.result.model_copy(
+                    update={"message": "different finalized result"}
+                )
+            }
+        )
+        with pytest.raises(ContextReceiptConflictError):
+            await store_context_receipt(
+                session,
+                tenant_id=log.tenant_id,
+                principal_id=log.principal_id,
+                recall_log_id=log.id,
+                manifest=conflict,
+            )
+
+    # Add a newer startup receipt. The semantic mode filter must run before
+    # limit=1. The same caller must inspect and verify both manifest families.
+    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
+    async with AsyncClient(
+        transport=ASGITransport(app=create_app()), base_url="http://test"
+    ) as client:
+        startup = await client.post("/v1/recall", json={"mode": "startup"})
+        assert startup.status_code == 200, startup.text
+
+        newest = await client.get("/v1/context-receipts?limit=1")
+        assert newest.status_code == 200, newest.text
+        assert newest.json()["items"][0]["mode"] == "startup"
+
+        semantic_list = await client.get("/v1/context-receipts?mode=semantic&limit=1")
+        assert semantic_list.status_code == 200, semantic_list.text
+        assert [item["id"] for item in semantic_list.json()["items"]] == [str(receipt.id)]
+
+        semantic_detail = await client.get(f"/v1/context-receipts/{receipt.id}")
+        assert semantic_detail.status_code == 200, semantic_detail.text
+        assert semantic_detail.json()["manifest_parse_status"] == "valid"
+        assert semantic_detail.json()["mode"] == "semantic"
+
+        semantic_verify = await client.get(f"/v1/context-receipts/{receipt.id}/verify")
+        assert semantic_verify.status_code == 200, semantic_verify.text
+        assert semantic_verify.json()["status"] == "valid"
+
+        startup_id = newest.json()["items"][0]["id"]
+        startup_detail = await client.get(f"/v1/context-receipts/{startup_id}")
+        assert startup_detail.status_code == 200, startup_detail.text
+        assert startup_detail.json()["manifest_parse_status"] == "valid"
+        startup_verify = await client.get(f"/v1/context-receipts/{startup_id}/verify")
+        assert startup_verify.status_code == 200, startup_verify.text
+        assert startup_verify.json()["status"] == "valid"
+
+
 # ─── Direct orchestrator: idempotency, dedicated session, RLS ───────────
 
 
@@ -929,9 +1339,7 @@ async def _build_real_response_and_raw_result(
     saved = settings.context_receipt_dark_write_enabled
     monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", False)
     tenant_id, principal_id = await _default_tenant_principal()
-    await _insert_item(
-        tenant_id=tenant_id, principal_id=principal_id, content=content
-    )
+    await _insert_item(tenant_id=tenant_id, principal_id=principal_id, content=content)
     request_json: dict[str, Any] = {"mode": "startup"}
     if byte_budget is not None:
         request_json["byte_budget"] = byte_budget
@@ -942,9 +1350,7 @@ async def _build_real_response_and_raw_result(
     ) as client:
         resp = await client.post("/v1/recall", json=request_json)
     # Restore the prior value so callers control the feature state.
-    monkeypatch.setattr(
-        settings, "context_receipt_dark_write_enabled", saved
-    )
+    monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", saved)
     assert resp.status_code == 200
     response = RecallResponse(**resp.json())
     assert response.recall_log_id is not None
@@ -989,9 +1395,12 @@ async def test_idempotent_retry_returns_created_then_idempotent(
         _require_db()
     if _app_session_factory is None:
         _require_app_role()
-    response, raw_result, tenant_id, principal_id = (
-        await _build_real_response_and_raw_result(monkeypatch)
-    )
+    (
+        response,
+        raw_result,
+        tenant_id,
+        principal_id,
+    ) = await _build_real_response_and_raw_result(monkeypatch)
     first = await _direct_best_effort(
         monkeypatch, response, raw_result, tenant_id, principal_id
     )
@@ -1022,9 +1431,12 @@ async def test_receipt_written_through_app_role_subject_to_rls(
         _require_db()
     if _app_session_factory is None or _app_role_name is None:
         _require_app_role()
-    response, raw_result, tenant_id, principal_id = (
-        await _build_real_response_and_raw_result(monkeypatch)
-    )
+    (
+        response,
+        raw_result,
+        tenant_id,
+        principal_id,
+    ) = await _build_real_response_and_raw_result(monkeypatch)
     result = await _direct_best_effort(
         monkeypatch, response, raw_result, tenant_id, principal_id
     )
@@ -1037,16 +1449,15 @@ async def test_receipt_written_through_app_role_subject_to_rls(
         from engram.db import apply_rls_context
 
         await apply_rls_context(
-            session, tenant_id=uuid.UUID(tenant_id), principal_id=uuid.UUID(principal_id)
+            session,
+            tenant_id=uuid.UUID(tenant_id),
+            principal_id=uuid.UUID(principal_id),
         )
-        current_user = (
-            await session.execute(text("SELECT current_user"))
-        ).scalar()
+        current_user = (await session.execute(text("SELECT current_user"))).scalar()
         role_flags = (
             await session.execute(
                 text(
-                    "SELECT rolsuper, rolbypassrls FROM pg_roles "
-                    "WHERE rolname = current_user"
+                    "SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user"
                 )
             )
         ).one()
@@ -1080,7 +1491,9 @@ async def test_receipt_written_through_app_role_subject_to_rls(
                 recall_log_id=uuid.UUID(str(response.recall_log_id)),
             )
 
-    receipt_owned = await _app_get_receipt(uuid.UUID(tenant_id), uuid.UUID(principal_id))
+    receipt_owned = await _app_get_receipt(
+        uuid.UUID(tenant_id), uuid.UUID(principal_id)
+    )
     assert receipt_owned is not None
     receipt_other = await _app_get_receipt(uuid.UUID(tenant_id), other_principal)
     assert receipt_other is None
@@ -1187,10 +1600,13 @@ async def test_verification_failure_rolls_back_new_receipt(
 ) -> None:
     if not await _db_ok() or not await _receipts_table_exists():
         _require_db()
-    response, raw_result, tenant_id, principal_id = (
-        await _build_real_response_and_raw_result(
-            monkeypatch, content=f"{_NAME_PREFIX}verify-fail-item"
-        )
+    (
+        response,
+        raw_result,
+        tenant_id,
+        principal_id,
+    ) = await _build_real_response_and_raw_result(
+        monkeypatch, content=f"{_NAME_PREFIX}verify-fail-item"
     )
 
     def _raise_integrity(*args: Any, **kwargs: Any) -> Any:
@@ -1215,10 +1631,13 @@ async def test_manifest_construction_failure_leaves_recall_log_committed(
 ) -> None:
     if not await _db_ok() or not await _receipts_table_exists():
         _require_db()
-    response, raw_result, tenant_id, principal_id = (
-        await _build_real_response_and_raw_result(
-            monkeypatch, content=f"{_NAME_PREFIX}manifest-fail-item"
-        )
+    (
+        response,
+        raw_result,
+        tenant_id,
+        principal_id,
+    ) = await _build_real_response_and_raw_result(
+        monkeypatch, content=f"{_NAME_PREFIX}manifest-fail-item"
     )
 
     def _raise_build(*args: Any, **kwargs: Any) -> Any:
@@ -1249,10 +1668,13 @@ async def test_receipt_insertion_failure_leaves_recall_log_committed(
 ) -> None:
     if not await _db_ok() or not await _receipts_table_exists():
         _require_db()
-    response, raw_result, tenant_id, principal_id = (
-        await _build_real_response_and_raw_result(
-            monkeypatch, content=f"{_NAME_PREFIX}insert-fail-item"
-        )
+    (
+        response,
+        raw_result,
+        tenant_id,
+        principal_id,
+    ) = await _build_real_response_and_raw_result(
+        monkeypatch, content=f"{_NAME_PREFIX}insert-fail-item"
     )
 
     async def _raise_conflict(*args: Any, **kwargs: Any) -> Any:
@@ -1280,10 +1702,13 @@ async def test_timeout_leaves_recall_log_committed(
 ) -> None:
     if not await _db_ok() or not await _receipts_table_exists():
         _require_db()
-    response, raw_result, tenant_id, principal_id = (
-        await _build_real_response_and_raw_result(
-            monkeypatch, content=f"{_NAME_PREFIX}timeout-item"
-        )
+    (
+        response,
+        raw_result,
+        tenant_id,
+        principal_id,
+    ) = await _build_real_response_and_raw_result(
+        monkeypatch, content=f"{_NAME_PREFIX}timeout-item"
     )
     # Now set a very short timeout and patch store to hang.
     monkeypatch.setattr(settings, "context_receipt_dark_write_enabled", True)
@@ -1354,9 +1779,7 @@ async def test_malformed_provenance_leaves_recall_log_committed_no_receipt(
         result.pop("candidate_strategy_version", None)
         return result
 
-    monkeypatch.setattr(
-        recall_module, "execute_startup_recall", _stripped_execute
-    )
+    monkeypatch.setattr(recall_module, "execute_startup_recall", _stripped_execute)
 
     with caplog.at_level(logging.INFO, logger="engram.context_receipt_dark_write"):
         async with AsyncClient(

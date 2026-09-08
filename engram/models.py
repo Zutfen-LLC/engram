@@ -1908,6 +1908,11 @@ class ContextReceipt(Base):
         ),
         CheckConstraint("mode IN ('startup', 'semantic')", name="chk_context_receipts_mode"),
         CheckConstraint(
+            "(manifest_schema = 'engram.context-manifest' AND mode = 'startup') OR "
+            "(manifest_schema = 'engram.semantic-context-manifest' AND mode = 'semantic')",
+            name="chk_context_receipts_schema_mode_pair",
+        ),
+        CheckConstraint(
             "manifest_hash ~ '^sha256:[0-9a-f]{64}$'",
             name="chk_context_receipts_manifest_hash",
         ),

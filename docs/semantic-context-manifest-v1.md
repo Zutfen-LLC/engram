@@ -22,6 +22,17 @@ does not invent V2 admission or evidence data. The `governed` and
 relationship, relevance, utility, and packing facts. This support is for
 in-memory conformance only while those profiles remain shadow-only.
 
+The token budget uses one cost for each selected item. The item cost is
+`max(1, len(content.encode("utf-8")) // 4)`. The total token cost is the sum of
+the item costs. The rendered `[kind] ` prefix and the newline separator do not
+consume this token budget. The byte budget uses the exact UTF-8 content byte
+count for each selected item.
+
+The manifest models reject unknown fields at every modeled level. They also
+validate identity agreement, V2 projection agreement, packing counts, and
+profile-specific admission fields. The parser rejects unsupported schema,
+schema-version, and manifest-contract combinations.
+
 `ENGRAM_SEMANTIC_CONTEXT_RECEIPT_DARK_WRITE_ENABLED=false` is the default.
 When enabled, only authoritative semantic recall can persist a receipt after
 the recall log commits. The writer uses a separate application-role session
@@ -31,3 +42,18 @@ counters. Shadow comparison does not call the writer.
 
 A semantic receipt proves what Engram served and which recorded policy facts
 authorized it. It does not prove truth, reliance, usefulness, or causality.
+
+## Deployment and rollback
+
+Migration 042 widens Context Receipt storage for semantic rows. This widening
+is forward-only. The downgrade removes `recall_logs.item_budget`. It retains
+semantic receipt rows and the widened receipt constraints.
+
+Keep `ENGRAM_SEMANTIC_CONTEXT_RECEIPT_DARK_WRITE_ENABLED=false` until all API
+instances understand migration 042 and the semantic manifest parser. Do not
+deploy an old startup-only receipt reader after semantic rows exist.
+
+To roll back the feature, disable semantic capture first. Existing semantic
+history remains available to compatible readers. The system does not backfill
+historical semantic recalls. Startup receipt capture and rollback behavior do
+not change.

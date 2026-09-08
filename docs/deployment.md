@@ -1159,8 +1159,19 @@ When the primary operation exhausts the deadline, the wrapper records
 `telemetry_status=skipped_deadline` in the structured log and writes **no**
 usage-event row.
 
-Semantic recall (`mode=semantic`) **never** invokes the dark write. No
-semantic Context Manifest support is implemented in this slice.
+`ENGRAM_CONTEXT_RECEIPT_DARK_WRITE_ENABLED` applies only to startup recall.
+Semantic recall uses the separate
+`ENGRAM_SEMANTIC_CONTEXT_RECEIPT_DARK_WRITE_ENABLED` flag and the independent
+`semantic-context-manifest-v1` contract. Both flags are default-off. Candidate
+shadow packets never invoke either writer.
+
+Migration 042 widens the receipt schema for semantic rows and adds
+`recall_logs.item_budget`. Keep semantic capture disabled until all API
+instances understand migration 042 and semantic receipt parsing. Do not run
+old startup-only readers after semantic rows exist. A rollback disables
+semantic capture and retains semantic history. The downgrade removes the
+item-budget column, but it does not narrow receipt constraints or delete
+semantic rows. The system does not backfill historical semantic recalls.
 
 ### Fail-open contract
 
