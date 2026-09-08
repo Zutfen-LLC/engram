@@ -105,12 +105,17 @@ async def load_demonstrated_usefulness(
         return {}
 
     is_self_or_author = FeedbackEvent.principal_id == MemoryItem.principal_id
-    has_bound_exposure = and_(
-        RecallLog.tenant_id == tenant_id,
-        RecallLog.principal_id == FeedbackEvent.principal_id,
-        MemoryItem.id == any_(RecallLog.item_ids),
+    bound_exposure = func.coalesce(
+        and_(
+            RecallLog.id.is_not(None),
+            RecallLog.tenant_id == tenant_id,
+            RecallLog.principal_id == FeedbackEvent.principal_id,
+            RecallLog.item_ids.is_not(None),
+            MemoryItem.id == any_(RecallLog.item_ids),
+        ),
+        False,
     )
-    is_qualified = and_(~is_self_or_author, has_bound_exposure)
+    is_qualified = and_(~is_self_or_author, bound_exposure)
     rows = (
         await session.execute(
             select(
@@ -123,7 +128,7 @@ async def load_demonstrated_usefulness(
                 .label("qualifying_noise_count"),
                 func.count().filter(is_self_or_author).label("excluded_self_or_author_count"),
                 func.count()
-                .filter(and_(~is_self_or_author, ~has_bound_exposure))
+                .filter(and_(~is_self_or_author, ~bound_exposure))
                 .label("excluded_unbound_exposure_count"),
             )
             .select_from(FeedbackEvent)
