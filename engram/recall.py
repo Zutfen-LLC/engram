@@ -36,7 +36,7 @@ from sqlalchemy import ColumnElement, case, func, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from engram import db as db_module
-from engram import recall_signals, relationship_recall, semantic
+from engram import recall_packing, recall_signals, relationship_recall, semantic
 from engram.config import settings
 from engram.embeddings import generate_embedding
 from engram.jobs import enqueue_job
@@ -1062,13 +1062,18 @@ class SignalAdmissionOutcome:
     issue #190 each entry also names the ``origin`` that surfaced the
     candidate (direct semantic hit vs graph/tunnel expansion), and
     ``expansion`` summarizes the admission-first expansion run itself
-    (contract version, seed/neighbor/admission counts)."""
+    (contract version, seed/neighbor/admission counts). Since issue #192
+    ``admitted_entries`` exposes the ranked admitted items (ORM object +
+    served dict) so the packing stage can consume their durable identity
+    facts (``conflicts_with_item_id``) without widening anything the item
+    dicts publish."""
 
     items: list[dict[str, Any]]
     omitted_by_admission: dict[str, int]
     admission_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     v2_resolution: dict[str, Any] | None = None
     expansion: dict[str, Any] | None = None
+    admitted_entries: list[_AdmittedSignalItem] = field(default_factory=list)
 
 
 @dataclass
@@ -1117,7 +1122,8 @@ async def _admit_and_rank_signal_items(
     4. exact V2 admission on every expanded neighbor — seed admission never
        transfers;
     5. relationship-aware relevance (versioned, importance-free) feeds the
-       separated utility ranking; budget packing follows unchanged.
+       separated utility ranking; the conflict/diversity-aware packing stage
+       (issue #192) then selects among the finished admitted/ranked list.
 
     Withheld items (direct and expanded) are counted by reason code
     (``omitted_by_admission``) and itemized content-free in
@@ -1239,6 +1245,7 @@ async def _admit_and_rank_signal_items(
         admission_diagnostics=diagnostics,
         v2_resolution=v2_summary,
         expansion=expansion_summary,
+        admitted_entries=admitted,
     )
 
 
@@ -1562,9 +1569,7 @@ def _admission_diagnostic(
     v2_status = binding.resolution_status if binding is not None else "missing"
     surface_decision = binding.surface_decision if binding is not None else None
     local_would_admit = (
-        recall_signals.v2_local_gate_withhold_reason(
-            item, profile=profile, assessment=assessment
-        )
+        recall_signals.v2_local_gate_withhold_reason(item, profile=profile, assessment=assessment)
         is None
     )
     v2_allows = v2_status == "current" and surface_decision == "allow"
@@ -1613,6 +1618,13 @@ class SemanticPacketEvaluation:
     # admission counts). None on the legacy profile and on packets that did
     # not expand.
     expansion: dict[str, Any] | None = None
+    # Conflict-preserving, diversity-aware packing context (issue #192): the
+    # bounded ``recall-packing-v1`` summary (version, selected count,
+    # preserved conflict pairs, omission counts by reason). Present on every
+    # signal-profile packet that reached the admission step (as a zero-count
+    # summary when nothing was admitted); None on the legacy profile and on
+    # the empty-corpus early return, which never reach packing.
+    packing: dict[str, Any] | None = None
 
     def finalize_counts(self) -> None:
         self.item_count = len(self.items)
@@ -1677,6 +1689,29 @@ async def _profile_candidate_count(
         review_statuses=profile.review_statuses,
         embedding_profile=embedding_profile,
     )
+
+
+def _packing_candidates(
+    entries: list[_AdmittedSignalItem],
+) -> list[recall_packing.PackCandidate]:
+    """Project ranked admitted entries into the pure packer's input shape.
+
+    Only the durable identity facts the packing contract consumes — content
+    (for rendered budget accounting) and ``conflicts_with_item_id`` — cross
+    this boundary; scores, admission, evidence, relationship metadata, and
+    content-identity facts such as ``content_hash`` stay behind, where
+    packing cannot touch them (canonical content equality is not a v1 root
+    signal). List position carries the rank exactly as the admission step
+    sorted it.
+    """
+    return [
+        recall_packing.PackCandidate(
+            item_id=entry.item.id,
+            content=entry.item_dict["content"],
+            conflicts_with=entry.item.conflicts_with_item_id,
+        )
+        for entry in entries
+    ]
 
 
 async def evaluate_semantic_profile(
@@ -1774,6 +1809,7 @@ async def evaluate_semantic_profile(
     admission_diagnostics: list[dict[str, Any]] = []
     v2_resolution_summary: dict[str, Any] | None = None
     expansion_summary: dict[str, Any] | None = None
+    signal_admission: SignalAdmissionOutcome | None = None
     if profile.signals_enabled:
         # 4. V2-bound admission + separated-signal ranking (issues #160/#186),
         #    with admission-first relationship expansion (issue #190): only
@@ -1781,8 +1817,9 @@ async def evaluate_semantic_profile(
         #    graph/tunnel discovery, every expanded neighbor is independently
         #    admitted through the same surface, and relationship-aware
         #    relevance (versioned, importance-free) feeds the separated
-        #    utility ranking. Budget packing below is unchanged.
-        admission_outcome = await _admit_and_rank_signal_items(
+        #    utility ranking. Packing below (issue #192) consumes that
+        #    finished admitted/ranked list.
+        signal_admission = await _admit_and_rank_signal_items(
             session,
             profile=profile,
             memory_context=memory_context,
@@ -1792,11 +1829,11 @@ async def evaluate_semantic_profile(
             stay_kinds=stay_kinds,
             now=now,
         )
-        enriched = admission_outcome.items
-        omitted_by_admission = admission_outcome.omitted_by_admission
-        admission_diagnostics = admission_outcome.admission_diagnostics
-        v2_resolution_summary = admission_outcome.v2_resolution
-        expansion_summary = admission_outcome.expansion
+        enriched = signal_admission.items
+        omitted_by_admission = signal_admission.omitted_by_admission
+        admission_diagnostics = signal_admission.admission_diagnostics
+        v2_resolution_summary = signal_admission.v2_resolution
+        expansion_summary = signal_admission.expansion
     else:
         # 4. Build per-item response dicts in trust-weighted order (legacy
         #    profile — pre-#160 behavior, byte-for-byte). The candidate dicts
@@ -1816,9 +1853,7 @@ async def evaluate_semantic_profile(
             warnings: list[str] = []
             if item.review_status == "proposed":
                 warnings.append("unreviewed")
-            item_dict = _semantic_base_item_fields(
-                item, distance=distance, similarity=similarity
-            )
+            item_dict = _semantic_base_item_fields(item, distance=distance, similarity=similarity)
             item_dict.update(
                 {
                     "score": round(semantic_score, 4),
@@ -1849,13 +1884,43 @@ async def evaluate_semantic_profile(
             now=now,
         )
 
-    # 5. Enforce item/byte/token budgets.
-    selected = _enforce_semantic_budget(
-        enriched,
-        byte_budget=byte_budget,
-        token_budget=token_budget,
-        item_budget=item_budget,
-    )
+    # 5. Pack to the hard item/byte/token budgets. Signal profiles use the
+    #    versioned conflict-preserving, diversity-aware packer (issue #192):
+    #    known-root representatives outrank redundant siblings and explicit
+    #    conflict pairs are co-packed when budgets permit — selection only,
+    #    never a change to any candidate's scores, admission, or evidence.
+    #    The legacy profile keeps its byte-for-byte rank-then-truncate
+    #    behavior untouched.
+    packing_summary: dict[str, Any] | None = None
+    if signal_admission is not None:
+        entries = signal_admission.admitted_entries
+        relations = await recall_packing.load_packing_relations(
+            session,
+            tenant_id=memory_context.tenant_id,
+            item_ids={entry.item.id for entry in entries},
+        )
+        packing = recall_packing.pack_admitted_candidates(
+            _packing_candidates(entries),
+            relations=relations,
+            byte_budget=byte_budget,
+            token_budget=token_budget,
+            item_budget=item_budget,
+        )
+        selected_ids = set(packing.selected)
+        selected = []
+        for entry in entries:
+            if entry.item.id not in selected_ids:
+                continue
+            entry.item_dict["packing_reason"] = packing.reasons[entry.item.id]
+            selected.append(entry.item_dict)
+        packing_summary = packing.summary()
+    else:
+        selected = _enforce_semantic_budget(
+            enriched,
+            byte_budget=byte_budget,
+            token_budget=token_budget,
+            item_budget=item_budget,
+        )
 
     working_set = "\n".join(f"[{item['kind']}] {item['content']}" for item in selected)
     evaluation = SemanticPacketEvaluation(
@@ -1870,6 +1935,7 @@ async def evaluate_semantic_profile(
         admission_diagnostics=admission_diagnostics,
         v2_resolution=v2_resolution_summary,
         expansion=expansion_summary,
+        packing=packing_summary,
     )
     evaluation.finalize_counts()
     return evaluation
