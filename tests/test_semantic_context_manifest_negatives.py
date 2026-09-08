@@ -9,9 +9,25 @@ import pytest
 
 from scripts.verify_semantic_context_manifest_negatives import NEGATIVES, ROOT, main
 
+REQUIRED_CLOSURE_NEGATIVES = {
+    "invalid-risk-state.json",
+    "invalid-retention-state.json",
+    "invalid-admission-tier.json",
+    "invalid-assertion-mode.json",
+    "invalid-origin.json",
+    "invalid-next-action.json",
+    "legacy-with-admission-policy.json",
+    "legacy-with-packing-version.json",
+    "legacy-with-v2-item.json",
+    "governed-without-admission-policy.json",
+    "governed-without-packing-version.json",
+}
+
 
 def test_semantic_negative_count_and_python_rejection() -> None:
-    assert len(list(NEGATIVES.glob("*.json"))) >= 25
+    paths = list(NEGATIVES.glob("*.json"))
+    assert len(paths) >= 48
+    assert {path.name for path in paths} >= REQUIRED_CLOSURE_NEGATIVES
     main()
 
 

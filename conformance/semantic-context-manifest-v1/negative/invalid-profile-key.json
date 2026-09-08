@@ -1,5 +1,5 @@
 {
-  "name": "extra-admission-field",
+  "name": "invalid-profile-key",
   "parse_as": "semantic",
   "input": {
     "query": "governed",
@@ -243,7 +243,7 @@
           "surface": "semantic_governed",
           "surface_decision": "allow",
           "v2": {
-            "profile_key": "risk_aware_shadow_v1",
+            "profile_key": "future_profile",
             "resolution_status": "current",
             "surface": "semantic_governed",
             "surface_decision": "allow",
@@ -283,12 +283,11 @@
               ],
               "next_actions": []
             }
-          },
-          "raw_query": "x"
+          }
         },
         "evidence": {
           "source": "v2_fresh_evaluation",
-          "profile_key": "risk_aware_shadow_v1",
+          "profile_key": "future_profile",
           "policy_version": "risk-aware-shadow-v1",
           "policy_artifact_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           "decision_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",

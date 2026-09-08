@@ -58,7 +58,7 @@ def assessment_ref() -> dict[str, Any]:
         "contract_hash": DIGEST_C,
         "canonical_hash": DIGEST_B,
         "purpose": "combined",
-        "assertion_mode": "explicit",
+        "assertion_mode": "direct_statement",
         "origin": "user",
     }
 
@@ -84,7 +84,7 @@ def candidate_item(item_id: int, content: str, *, relationship: bool = False) ->
         "next_actions": [],
     }
     v2 = {
-        "profile_key": "risk-aware-shadow-v1",
+        "profile_key": "risk_aware_shadow_v1",
         "resolution_status": "current",
         "surface": "semantic_governed",
         "surface_decision": "allow",
@@ -110,14 +110,14 @@ def candidate_item(item_id: int, content: str, *, relationship: bool = False) ->
                 "reason_codes": ["admitted_v2_surface_allow"],
                 "assessment_id": ASSESSMENT,
                 "assessment_status": "current",
-                "assessment_outcome": "qualified",
+                "assessment_outcome": "would_admit",
                 "surface": "semantic_governed",
                 "surface_decision": "allow",
                 "v2": v2,
             },
             "evidence": {
                 "source": "v2_fresh_evaluation",
-                "profile_key": "risk-aware-shadow-v1",
+                "profile_key": "risk_aware_shadow_v1",
                 "policy_version": "risk-aware-shadow-v1",
                 "policy_artifact_digest": DIGEST_A,
                 "decision_hash": DIGEST_B,

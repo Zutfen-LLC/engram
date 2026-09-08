@@ -1,5 +1,5 @@
 {
-  "name": "extra-admission-field",
+  "name": "invalid-admission-tier",
   "parse_as": "semantic",
   "input": {
     "query": "governed",
@@ -260,7 +260,7 @@
               "policy_artifact_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
               "decision_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "surface_decision": "allow",
-              "highest_admission_tier": "semantic_governed",
+              "highest_admission_tier": "super_trusted",
               "risk_state": "low",
               "epistemic_state": "supported",
               "retention_state": "retain",
@@ -283,8 +283,7 @@
               ],
               "next_actions": []
             }
-          },
-          "raw_query": "x"
+          }
         },
         "evidence": {
           "source": "v2_fresh_evaluation",

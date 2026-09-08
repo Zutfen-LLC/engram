@@ -48,8 +48,8 @@ def verify_one(fixture: dict[str, Any]) -> None:
 
 def main() -> None:
     paths = sorted(NEGATIVES.glob("*.json"))
-    if len(paths) < 25:
-        raise SystemExit(f"expected at least 25 semantic negatives, found {len(paths)}")
+    if len(paths) < 48:
+        raise SystemExit(f"expected at least 48 semantic negatives, found {len(paths)}")
     for path in paths:
         fixture = json.loads(path.read_text())
         try:

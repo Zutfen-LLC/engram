@@ -1,5 +1,5 @@
 {
-  "name": "extra-admission-field",
+  "name": "invalid-assessment-outcome",
   "parse_as": "semantic",
   "input": {
     "query": "governed",
@@ -239,7 +239,7 @@
           ],
           "assessment_id": "00000000-0000-0000-0000-000000000006",
           "assessment_status": "current",
-          "assessment_outcome": "would_admit",
+          "assessment_outcome": "qualified",
           "surface": "semantic_governed",
           "surface_decision": "allow",
           "v2": {
@@ -283,8 +283,7 @@
               ],
               "next_actions": []
             }
-          },
-          "raw_query": "x"
+          }
         },
         "evidence": {
           "source": "v2_fresh_evaluation",

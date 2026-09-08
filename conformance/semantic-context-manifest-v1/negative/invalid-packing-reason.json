@@ -1,5 +1,5 @@
 {
-  "name": "extra-admission-field",
+  "name": "invalid-packing-reason",
   "parse_as": "semantic",
   "input": {
     "query": "governed",
@@ -283,8 +283,7 @@
               ],
               "next_actions": []
             }
-          },
-          "raw_query": "x"
+          }
         },
         "evidence": {
           "source": "v2_fresh_evaluation",
@@ -308,7 +307,7 @@
           ]
         },
         "relationship": null,
-        "packing_reason": "ranked"
+        "packing_reason": "lucky"
       }
     ]
   }

@@ -1,5 +1,5 @@
 {
-  "name": "extra-admission-field",
+  "name": "invalid-risk-state",
   "parse_as": "semantic",
   "input": {
     "query": "governed",
@@ -261,7 +261,7 @@
               "decision_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "surface_decision": "allow",
               "highest_admission_tier": "semantic_governed",
-              "risk_state": "low",
+              "risk_state": "probably_safe",
               "epistemic_state": "supported",
               "retention_state": "retain",
               "effective_assessment_refs": [
@@ -283,8 +283,7 @@
               ],
               "next_actions": []
             }
-          },
-          "raw_query": "x"
+          }
         },
         "evidence": {
           "source": "v2_fresh_evaluation",
@@ -294,7 +293,7 @@
           "decision_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
           "v2_resolution_status": "current",
           "epistemic_state": "supported",
-          "risk_state": "low",
+          "risk_state": "probably_safe",
           "retention_state": "retain",
           "effective_assessment_refs": [
             {

@@ -1,5 +1,5 @@
 {
-  "name": "extra-admission-field",
+  "name": "invalid-origin",
   "parse_as": "semantic",
   "input": {
     "query": "governed",
@@ -271,7 +271,7 @@
                   "canonical_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                   "purpose": "combined",
                   "assertion_mode": "direct_statement",
-                  "origin": "user"
+                  "origin": "external"
                 }
               ],
               "observation_window_hours": 24,
@@ -283,8 +283,7 @@
               ],
               "next_actions": []
             }
-          },
-          "raw_query": "x"
+          }
         },
         "evidence": {
           "source": "v2_fresh_evaluation",
@@ -303,7 +302,7 @@
               "canonical_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "purpose": "combined",
               "assertion_mode": "direct_statement",
-              "origin": "user"
+              "origin": "external"
             }
           ]
         },

@@ -1,5 +1,5 @@
 {
-  "name": "extra-admission-field",
+  "name": "invalid-warning-code",
   "parse_as": "semantic",
   "input": {
     "query": "governed",
@@ -227,7 +227,9 @@
           "semantic similarity 0.90"
         ],
         "warnings": [],
-        "warning_codes": [],
+        "warning_codes": [
+          "probably_safe"
+        ],
         "conflict_type": null,
         "conflict_resolution_status": null,
         "admission": {
@@ -283,8 +285,7 @@
               ],
               "next_actions": []
             }
-          },
-          "raw_query": "x"
+          }
         },
         "evidence": {
           "source": "v2_fresh_evaluation",

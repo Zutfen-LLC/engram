@@ -1,5 +1,5 @@
 {
-  "name": "extra-admission-field",
+  "name": "invalid-next-action",
   "parse_as": "semantic",
   "input": {
     "query": "governed",
@@ -281,10 +281,11 @@
               "reason_codes": [
                 "evidence_supported"
               ],
-              "next_actions": []
+              "next_actions": [
+                "retry_later"
+              ]
             }
-          },
-          "raw_query": "x"
+          }
         },
         "evidence": {
           "source": "v2_fresh_evaluation",

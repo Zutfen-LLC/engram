@@ -1,5 +1,5 @@
 {
-  "name": "extra-admission-field",
+  "name": "invalid-assertion-mode",
   "parse_as": "semantic",
   "input": {
     "query": "governed",
@@ -270,7 +270,7 @@
                   "contract_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                   "canonical_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                   "purpose": "combined",
-                  "assertion_mode": "direct_statement",
+                  "assertion_mode": "explicit",
                   "origin": "user"
                 }
               ],
@@ -283,8 +283,7 @@
               ],
               "next_actions": []
             }
-          },
-          "raw_query": "x"
+          }
         },
         "evidence": {
           "source": "v2_fresh_evaluation",
@@ -302,7 +301,7 @@
               "contract_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
               "canonical_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               "purpose": "combined",
-              "assertion_mode": "direct_statement",
+              "assertion_mode": "explicit",
               "origin": "user"
             }
           ]

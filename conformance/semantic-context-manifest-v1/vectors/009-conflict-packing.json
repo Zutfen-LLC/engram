@@ -58,11 +58,11 @@
             ],
             "assessment_id": "00000000-0000-0000-0000-000000000006",
             "assessment_status": "current",
-            "assessment_outcome": "qualified",
+            "assessment_outcome": "would_admit",
             "surface": "semantic_governed",
             "surface_decision": "allow",
             "v2": {
-              "profile_key": "risk-aware-shadow-v1",
+              "profile_key": "risk_aware_shadow_v1",
               "resolution_status": "current",
               "surface": "semantic_governed",
               "surface_decision": "allow",
@@ -89,7 +89,7 @@
                     "contract_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                     "canonical_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                     "purpose": "combined",
-                    "assertion_mode": "explicit",
+                    "assertion_mode": "direct_statement",
                     "origin": "user"
                   }
                 ],
@@ -106,7 +106,7 @@
           },
           "evidence": {
             "source": "v2_fresh_evaluation",
-            "profile_key": "risk-aware-shadow-v1",
+            "profile_key": "risk_aware_shadow_v1",
             "policy_version": "risk-aware-shadow-v1",
             "policy_artifact_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "decision_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -120,7 +120,7 @@
                 "contract_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                 "canonical_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 "purpose": "combined",
-                "assertion_mode": "explicit",
+                "assertion_mode": "direct_statement",
                 "origin": "user"
               }
             ]
@@ -157,11 +157,11 @@
             ],
             "assessment_id": "00000000-0000-0000-0000-000000000006",
             "assessment_status": "current",
-            "assessment_outcome": "qualified",
+            "assessment_outcome": "would_admit",
             "surface": "semantic_governed",
             "surface_decision": "allow",
             "v2": {
-              "profile_key": "risk-aware-shadow-v1",
+              "profile_key": "risk_aware_shadow_v1",
               "resolution_status": "current",
               "surface": "semantic_governed",
               "surface_decision": "allow",
@@ -188,7 +188,7 @@
                     "contract_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                     "canonical_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                     "purpose": "combined",
-                    "assertion_mode": "explicit",
+                    "assertion_mode": "direct_statement",
                     "origin": "user"
                   }
                 ],
@@ -205,7 +205,7 @@
           },
           "evidence": {
             "source": "v2_fresh_evaluation",
-            "profile_key": "risk-aware-shadow-v1",
+            "profile_key": "risk_aware_shadow_v1",
             "policy_version": "risk-aware-shadow-v1",
             "policy_artifact_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "decision_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -219,7 +219,7 @@
                 "contract_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                 "canonical_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 "purpose": "combined",
-                "assertion_mode": "explicit",
+                "assertion_mode": "direct_statement",
                 "origin": "user"
               }
             ]
@@ -343,11 +343,11 @@
             ],
             "assessment_id": "00000000-0000-0000-0000-000000000006",
             "assessment_status": "current",
-            "assessment_outcome": "qualified",
+            "assessment_outcome": "would_admit",
             "surface": "semantic_governed",
             "surface_decision": "allow",
             "v2": {
-              "profile_key": "risk-aware-shadow-v1",
+              "profile_key": "risk_aware_shadow_v1",
               "resolution_status": "current",
               "surface": "semantic_governed",
               "surface_decision": "allow",
@@ -374,7 +374,7 @@
                     "contract_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                     "canonical_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                     "purpose": "combined",
-                    "assertion_mode": "explicit",
+                    "assertion_mode": "direct_statement",
                     "origin": "user"
                   }
                 ],
@@ -391,7 +391,7 @@
           },
           "evidence": {
             "source": "v2_fresh_evaluation",
-            "profile_key": "risk-aware-shadow-v1",
+            "profile_key": "risk_aware_shadow_v1",
             "policy_version": "risk-aware-shadow-v1",
             "policy_artifact_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "decision_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -405,7 +405,7 @@
                 "contract_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                 "canonical_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 "purpose": "combined",
-                "assertion_mode": "explicit",
+                "assertion_mode": "direct_statement",
                 "origin": "user"
               }
             ]
@@ -443,11 +443,11 @@
             ],
             "assessment_id": "00000000-0000-0000-0000-000000000006",
             "assessment_status": "current",
-            "assessment_outcome": "qualified",
+            "assessment_outcome": "would_admit",
             "surface": "semantic_governed",
             "surface_decision": "allow",
             "v2": {
-              "profile_key": "risk-aware-shadow-v1",
+              "profile_key": "risk_aware_shadow_v1",
               "resolution_status": "current",
               "surface": "semantic_governed",
               "surface_decision": "allow",
@@ -474,7 +474,7 @@
                     "contract_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                     "canonical_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                     "purpose": "combined",
-                    "assertion_mode": "explicit",
+                    "assertion_mode": "direct_statement",
                     "origin": "user"
                   }
                 ],
@@ -491,7 +491,7 @@
           },
           "evidence": {
             "source": "v2_fresh_evaluation",
-            "profile_key": "risk-aware-shadow-v1",
+            "profile_key": "risk_aware_shadow_v1",
             "policy_version": "risk-aware-shadow-v1",
             "policy_artifact_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "decision_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -505,7 +505,7 @@
                 "contract_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                 "canonical_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 "purpose": "combined",
-                "assertion_mode": "explicit",
+                "assertion_mode": "direct_statement",
                 "origin": "user"
               }
             ]
@@ -515,8 +515,8 @@
         }
       ]
     },
-    "canonical_json": "{\"canonicalization\":\"rfc8785\",\"items\":[{\"admission\":{\"assessment_id\":\"00000000-0000-0000-0000-000000000006\",\"assessment_outcome\":\"qualified\",\"assessment_status\":\"current\",\"decision\":\"admit\",\"policy_version\":\"recall-admission-v2\",\"profile\":\"governed\",\"reason_codes\":[\"admitted_v2_surface_allow\"],\"surface\":\"semantic_governed\",\"surface_decision\":\"allow\",\"v2\":{\"fresh\":{\"blocker_codes\":[],\"decision_hash\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"effective_assessment_refs\":[{\"assertion_mode\":\"explicit\",\"assessment_id\":\"00000000-0000-0000-0000-000000000006\",\"canonical_hash\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"contract_hash\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"origin\":\"user\",\"purpose\":\"combined\"}],\"eligible_at\":\"2026-09-08T12:00:00+00:00\",\"epistemic_state\":\"supported\",\"highest_admission_tier\":\"semantic_governed\",\"next_actions\":[],\"next_evaluation_at\":null,\"observation_window_hours\":24,\"policy_artifact_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policy_version\":\"risk-aware-shadow-v1\",\"reason_codes\":[\"evidence_supported\"],\"retention_state\":\"retain\",\"risk_state\":\"low\",\"schema_version\":\"engram.admission-assessment.v2\",\"surface_decision\":\"allow\"},\"persisted\":{\"assessment_id\":\"00000000-0000-0000-0000-000000000006\",\"decision_hash\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"policy_artifact_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policy_contract_version\":\"risk-aware-shadow-v1\",\"schema_version\":\"engram.admission-assessment.v2\"},\"profile_key\":\"risk-aware-shadow-v1\",\"resolution_status\":\"current\",\"surface\":\"semantic_governed\",\"surface_decision\":\"allow\"}},\"authority\":10,\"conflict_resolution_status\":null,\"conflict_type\":null,\"evidence\":{\"decision_hash\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"effective_assessment_refs\":[{\"assertion_mode\":\"explicit\",\"assessment_id\":\"00000000-0000-0000-0000-000000000006\",\"canonical_hash\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"contract_hash\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"origin\":\"user\",\"purpose\":\"combined\"}],\"epistemic_state\":\"supported\",\"policy_artifact_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policy_version\":\"risk-aware-shadow-v1\",\"profile_key\":\"risk-aware-shadow-v1\",\"retention_state\":\"retain\",\"risk_state\":\"low\",\"source\":\"v2_fresh_evaluation\",\"v2_resolution_status\":\"current\"},\"item_id\":\"00000000-0000-0000-0000-000000000016\",\"kind\":\"fact\",\"ordinal\":0,\"packing_reason\":\"ranked\",\"pinned\":false,\"reasons\":[\"semantic similarity 0.90\"],\"relationship\":null,\"relevance_score\":0.8,\"review_status\":\"active\",\"score\":0.8,\"served_content_hash\":\"sha256:d40e0b58c6ef23c3834ebdecdbbcb50109f25fae6ec40a3de6e5f0414f2ce790\",\"trust_score\":null,\"utility_score\":0.7,\"visibility\":\"private\",\"warning_codes\":[],\"warnings\":[],\"workspace_id\":null},{\"admission\":{\"assessment_id\":\"00000000-0000-0000-0000-000000000006\",\"assessment_outcome\":\"qualified\",\"assessment_status\":\"current\",\"decision\":\"admit\",\"policy_version\":\"recall-admission-v2\",\"profile\":\"governed\",\"reason_codes\":[\"admitted_v2_surface_allow\"],\"surface\":\"semantic_governed\",\"surface_decision\":\"allow\",\"v2\":{\"fresh\":{\"blocker_codes\":[],\"decision_hash\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"effective_assessment_refs\":[{\"assertion_mode\":\"explicit\",\"assessment_id\":\"00000000-0000-0000-0000-000000000006\",\"canonical_hash\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"contract_hash\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"origin\":\"user\",\"purpose\":\"combined\"}],\"eligible_at\":\"2026-09-08T12:00:00+00:00\",\"epistemic_state\":\"supported\",\"highest_admission_tier\":\"semantic_governed\",\"next_actions\":[],\"next_evaluation_at\":null,\"observation_window_hours\":24,\"policy_artifact_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policy_version\":\"risk-aware-shadow-v1\",\"reason_codes\":[\"evidence_supported\"],\"retention_state\":\"retain\",\"risk_state\":\"low\",\"schema_version\":\"engram.admission-assessment.v2\",\"surface_decision\":\"allow\"},\"persisted\":{\"assessment_id\":\"00000000-0000-0000-0000-000000000006\",\"decision_hash\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"policy_artifact_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policy_contract_version\":\"risk-aware-shadow-v1\",\"schema_version\":\"engram.admission-assessment.v2\"},\"profile_key\":\"risk-aware-shadow-v1\",\"resolution_status\":\"current\",\"surface\":\"semantic_governed\",\"surface_decision\":\"allow\"}},\"authority\":10,\"conflict_resolution_status\":null,\"conflict_type\":null,\"evidence\":{\"decision_hash\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"effective_assessment_refs\":[{\"assertion_mode\":\"explicit\",\"assessment_id\":\"00000000-0000-0000-0000-000000000006\",\"canonical_hash\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"contract_hash\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"origin\":\"user\",\"purpose\":\"combined\"}],\"epistemic_state\":\"supported\",\"policy_artifact_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policy_version\":\"risk-aware-shadow-v1\",\"profile_key\":\"risk-aware-shadow-v1\",\"retention_state\":\"retain\",\"risk_state\":\"low\",\"source\":\"v2_fresh_evaluation\",\"v2_resolution_status\":\"current\"},\"item_id\":\"00000000-0000-0000-0000-000000000017\",\"kind\":\"fact\",\"ordinal\":1,\"packing_reason\":\"conflict_pair_preserved\",\"pinned\":false,\"reasons\":[\"semantic similarity 0.90\"],\"relationship\":null,\"relevance_score\":0.8,\"review_status\":\"active\",\"score\":0.8,\"served_content_hash\":\"sha256:ce210af912423d98bce96a64cad9f7503f0d0101d0ab31b1b7422c988fd95758\",\"trust_score\":null,\"utility_score\":0.7,\"visibility\":\"private\",\"warning_codes\":[],\"warnings\":[],\"workspace_id\":null}],\"mode\":\"semantic\",\"packet\":{\"hash\":\"sha256:a3aa1497bc67420c27e719a3f299a998b01b486dd8c77355b1672c34986ea7dd\",\"media_type\":\"text/plain; charset=utf-8\",\"render_version\":\"working-set-v1\"},\"request\":{\"effective\":{\"byte_budget\":4096,\"item_budget\":20,\"token_budget\":1024,\"workspace_id\":null},\"query_digest\":\"sha256:a757278fca98b82f772c3350a7fdfdeda28bb7a5f9f6f9f49eef8efe06e64d54\",\"request_digest\":\"sha256:0ece66fe4db4bb3982bfb981801bb0b9a8249f2f9fa7ddf7d0c2a553f54f93ee\",\"requested\":{\"byte_budget\":null,\"item_budget\":null,\"token_budget\":null,\"workspace_supplied\":false}},\"result\":{\"candidate_count\":3,\"expansion\":null,\"item_count\":2,\"message\":null,\"omitted_by_admission\":{},\"omitted_count\":0,\"packing\":{\"conflict_pairs_preserved\":1,\"omitted\":{\"budget\":1},\"selected_count\":2,\"version\":\"recall-packing-v1\"},\"rendered_packet_byte_count\":29,\"served_content_byte_count\":14},\"schema\":\"engram.semantic-context-manifest\",\"schema_version\":\"1.0\",\"subject\":{\"memory_context_version\":\"memory-context-v2\",\"memory_profile_id\":\"00000000-0000-0000-0000-000000000004\",\"memory_profile_revision_id\":\"00000000-0000-0000-0000-000000000005\",\"memory_profile_version\":3,\"principal_id\":\"00000000-0000-0000-0000-000000000002\",\"tenant_id\":\"00000000-0000-0000-0000-000000000001\",\"workspace_id\":null},\"versions\":{\"admission_policy\":\"recall-admission-v2\",\"config_version\":\"v1\",\"manifest_contract_version\":\"semantic-context-manifest-v1\",\"packet_render_version\":\"working-set-v1\",\"packing_version\":\"recall-packing-v1\",\"recall_profile\":\"governed\",\"recall_profile_contract_version\":\"recall-profiles-v1\",\"relationship_relevance_version\":null,\"scoring_version\":\"signals-v1\",\"signals_version\":\"recall-signals-v1\"}}",
-    "manifest_hash": "sha256:e9e061e62a05c99dd7aeb090527e7ee8e2b16d62a7aa7f728bc4797a6aabef39",
+    "canonical_json": "{\"canonicalization\":\"rfc8785\",\"items\":[{\"admission\":{\"assessment_id\":\"00000000-0000-0000-0000-000000000006\",\"assessment_outcome\":\"would_admit\",\"assessment_status\":\"current\",\"decision\":\"admit\",\"policy_version\":\"recall-admission-v2\",\"profile\":\"governed\",\"reason_codes\":[\"admitted_v2_surface_allow\"],\"surface\":\"semantic_governed\",\"surface_decision\":\"allow\",\"v2\":{\"fresh\":{\"blocker_codes\":[],\"decision_hash\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"effective_assessment_refs\":[{\"assertion_mode\":\"direct_statement\",\"assessment_id\":\"00000000-0000-0000-0000-000000000006\",\"canonical_hash\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"contract_hash\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"origin\":\"user\",\"purpose\":\"combined\"}],\"eligible_at\":\"2026-09-08T12:00:00+00:00\",\"epistemic_state\":\"supported\",\"highest_admission_tier\":\"semantic_governed\",\"next_actions\":[],\"next_evaluation_at\":null,\"observation_window_hours\":24,\"policy_artifact_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policy_version\":\"risk-aware-shadow-v1\",\"reason_codes\":[\"evidence_supported\"],\"retention_state\":\"retain\",\"risk_state\":\"low\",\"schema_version\":\"engram.admission-assessment.v2\",\"surface_decision\":\"allow\"},\"persisted\":{\"assessment_id\":\"00000000-0000-0000-0000-000000000006\",\"decision_hash\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"policy_artifact_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policy_contract_version\":\"risk-aware-shadow-v1\",\"schema_version\":\"engram.admission-assessment.v2\"},\"profile_key\":\"risk_aware_shadow_v1\",\"resolution_status\":\"current\",\"surface\":\"semantic_governed\",\"surface_decision\":\"allow\"}},\"authority\":10,\"conflict_resolution_status\":null,\"conflict_type\":null,\"evidence\":{\"decision_hash\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"effective_assessment_refs\":[{\"assertion_mode\":\"direct_statement\",\"assessment_id\":\"00000000-0000-0000-0000-000000000006\",\"canonical_hash\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"contract_hash\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"origin\":\"user\",\"purpose\":\"combined\"}],\"epistemic_state\":\"supported\",\"policy_artifact_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policy_version\":\"risk-aware-shadow-v1\",\"profile_key\":\"risk_aware_shadow_v1\",\"retention_state\":\"retain\",\"risk_state\":\"low\",\"source\":\"v2_fresh_evaluation\",\"v2_resolution_status\":\"current\"},\"item_id\":\"00000000-0000-0000-0000-000000000016\",\"kind\":\"fact\",\"ordinal\":0,\"packing_reason\":\"ranked\",\"pinned\":false,\"reasons\":[\"semantic similarity 0.90\"],\"relationship\":null,\"relevance_score\":0.8,\"review_status\":\"active\",\"score\":0.8,\"served_content_hash\":\"sha256:d40e0b58c6ef23c3834ebdecdbbcb50109f25fae6ec40a3de6e5f0414f2ce790\",\"trust_score\":null,\"utility_score\":0.7,\"visibility\":\"private\",\"warning_codes\":[],\"warnings\":[],\"workspace_id\":null},{\"admission\":{\"assessment_id\":\"00000000-0000-0000-0000-000000000006\",\"assessment_outcome\":\"would_admit\",\"assessment_status\":\"current\",\"decision\":\"admit\",\"policy_version\":\"recall-admission-v2\",\"profile\":\"governed\",\"reason_codes\":[\"admitted_v2_surface_allow\"],\"surface\":\"semantic_governed\",\"surface_decision\":\"allow\",\"v2\":{\"fresh\":{\"blocker_codes\":[],\"decision_hash\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"effective_assessment_refs\":[{\"assertion_mode\":\"direct_statement\",\"assessment_id\":\"00000000-0000-0000-0000-000000000006\",\"canonical_hash\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"contract_hash\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"origin\":\"user\",\"purpose\":\"combined\"}],\"eligible_at\":\"2026-09-08T12:00:00+00:00\",\"epistemic_state\":\"supported\",\"highest_admission_tier\":\"semantic_governed\",\"next_actions\":[],\"next_evaluation_at\":null,\"observation_window_hours\":24,\"policy_artifact_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policy_version\":\"risk-aware-shadow-v1\",\"reason_codes\":[\"evidence_supported\"],\"retention_state\":\"retain\",\"risk_state\":\"low\",\"schema_version\":\"engram.admission-assessment.v2\",\"surface_decision\":\"allow\"},\"persisted\":{\"assessment_id\":\"00000000-0000-0000-0000-000000000006\",\"decision_hash\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"policy_artifact_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policy_contract_version\":\"risk-aware-shadow-v1\",\"schema_version\":\"engram.admission-assessment.v2\"},\"profile_key\":\"risk_aware_shadow_v1\",\"resolution_status\":\"current\",\"surface\":\"semantic_governed\",\"surface_decision\":\"allow\"}},\"authority\":10,\"conflict_resolution_status\":null,\"conflict_type\":null,\"evidence\":{\"decision_hash\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"effective_assessment_refs\":[{\"assertion_mode\":\"direct_statement\",\"assessment_id\":\"00000000-0000-0000-0000-000000000006\",\"canonical_hash\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"contract_hash\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"origin\":\"user\",\"purpose\":\"combined\"}],\"epistemic_state\":\"supported\",\"policy_artifact_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policy_version\":\"risk-aware-shadow-v1\",\"profile_key\":\"risk_aware_shadow_v1\",\"retention_state\":\"retain\",\"risk_state\":\"low\",\"source\":\"v2_fresh_evaluation\",\"v2_resolution_status\":\"current\"},\"item_id\":\"00000000-0000-0000-0000-000000000017\",\"kind\":\"fact\",\"ordinal\":1,\"packing_reason\":\"conflict_pair_preserved\",\"pinned\":false,\"reasons\":[\"semantic similarity 0.90\"],\"relationship\":null,\"relevance_score\":0.8,\"review_status\":\"active\",\"score\":0.8,\"served_content_hash\":\"sha256:ce210af912423d98bce96a64cad9f7503f0d0101d0ab31b1b7422c988fd95758\",\"trust_score\":null,\"utility_score\":0.7,\"visibility\":\"private\",\"warning_codes\":[],\"warnings\":[],\"workspace_id\":null}],\"mode\":\"semantic\",\"packet\":{\"hash\":\"sha256:a3aa1497bc67420c27e719a3f299a998b01b486dd8c77355b1672c34986ea7dd\",\"media_type\":\"text/plain; charset=utf-8\",\"render_version\":\"working-set-v1\"},\"request\":{\"effective\":{\"byte_budget\":4096,\"item_budget\":20,\"token_budget\":1024,\"workspace_id\":null},\"query_digest\":\"sha256:a757278fca98b82f772c3350a7fdfdeda28bb7a5f9f6f9f49eef8efe06e64d54\",\"request_digest\":\"sha256:0ece66fe4db4bb3982bfb981801bb0b9a8249f2f9fa7ddf7d0c2a553f54f93ee\",\"requested\":{\"byte_budget\":null,\"item_budget\":null,\"token_budget\":null,\"workspace_supplied\":false}},\"result\":{\"candidate_count\":3,\"expansion\":null,\"item_count\":2,\"message\":null,\"omitted_by_admission\":{},\"omitted_count\":0,\"packing\":{\"conflict_pairs_preserved\":1,\"omitted\":{\"budget\":1},\"selected_count\":2,\"version\":\"recall-packing-v1\"},\"rendered_packet_byte_count\":29,\"served_content_byte_count\":14},\"schema\":\"engram.semantic-context-manifest\",\"schema_version\":\"1.0\",\"subject\":{\"memory_context_version\":\"memory-context-v2\",\"memory_profile_id\":\"00000000-0000-0000-0000-000000000004\",\"memory_profile_revision_id\":\"00000000-0000-0000-0000-000000000005\",\"memory_profile_version\":3,\"principal_id\":\"00000000-0000-0000-0000-000000000002\",\"tenant_id\":\"00000000-0000-0000-0000-000000000001\",\"workspace_id\":null},\"versions\":{\"admission_policy\":\"recall-admission-v2\",\"config_version\":\"v1\",\"manifest_contract_version\":\"semantic-context-manifest-v1\",\"packet_render_version\":\"working-set-v1\",\"packing_version\":\"recall-packing-v1\",\"recall_profile\":\"governed\",\"recall_profile_contract_version\":\"recall-profiles-v1\",\"relationship_relevance_version\":null,\"scoring_version\":\"signals-v1\",\"signals_version\":\"recall-signals-v1\"}}",
+    "manifest_hash": "sha256:cac5a1780724ecab7c0b1cc7afc33f3d42e9ee05ee5cc7d4d2d0b7e1d80e15a8",
     "packet_hash": "sha256:a3aa1497bc67420c27e719a3f299a998b01b486dd8c77355b1672c34986ea7dd",
     "query_digest": "sha256:a757278fca98b82f772c3350a7fdfdeda28bb7a5f9f6f9f49eef8efe06e64d54",
     "request_digest": "sha256:0ece66fe4db4bb3982bfb981801bb0b9a8249f2f9fa7ddf7d0c2a553f54f93ee",

@@ -30,8 +30,14 @@ count for each selected item.
 
 The manifest models reject unknown fields at every modeled level. They also
 validate identity agreement, V2 projection agreement, packing counts, and
-profile-specific admission fields. The parser rejects unsupported schema,
-schema-version, and manifest-contract combinations.
+profile-specific admission fields. Canonical V2 risk, retention, tier,
+next-action, assertion-mode, origin, outcome, profile-key, warning, review,
+conflict, relationship-origin, and packing-reason vocabularies are closed at
+this contract version. Legacy manifests reject candidate protocol identities
+and per-item candidate facts; governed and exploratory manifests require exact
+`recall-admission-v2` and `recall-packing-v1` identities and complete selected
+item bindings. The parser rejects unsupported schema, schema-version, and
+manifest-contract combinations.
 
 `ENGRAM_SEMANTIC_CONTEXT_RECEIPT_DARK_WRITE_ENABLED=false` is the default.
 When enabled, only authoritative semantic recall can persist a receipt after

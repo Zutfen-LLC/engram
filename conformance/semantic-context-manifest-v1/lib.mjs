@@ -27,6 +27,34 @@ export const SCHEMA_VERSION = "1.0";
 export const CONTRACT_VERSION = "semantic-context-manifest-v1";
 const QUERY_DOMAIN = "engram.semantic-context-manifest-v1/query\0";
 
+const ADMISSION_TIERS = ["none", "semantic_exploratory", "semantic_governed", "startup"];
+const RISK_STATES = ["low", "medium", "high", "unknown", "not_applicable"];
+const RETENTION_STATES = ["retain", "transient", "noise", "uncertain", "unknown"];
+const ASSERTION_MODES = [
+  "direct_statement", "tool_observation", "quoted_source", "derived_summary", "inference",
+  "unknown",
+];
+const ORIGINS = ["user", "assistant", "system", "tool", "unknown"];
+const NEXT_ACTIONS = [
+  "wait_until", "classification_required", "human_review_required",
+  "conflict_resolution_required", "new_evidence_required",
+  "policy_reconciliation_required", "none",
+];
+const ADMISSION_OUTCOMES = [
+  "admitted", "would_admit", "cooling", "review_required", "blocked",
+  "insufficient_evidence", "unknown", "stale", "not_applicable",
+];
+const WARNING_CODES = [
+  "unreviewed", "evidence_unknown", "evidence_contested", "evidence_insufficient",
+  "conflict_unresolved", "disputed", "risk_high", "risk_unknown",
+  "admission_assessment_stale", "admission_legacy_import",
+];
+const REVIEW_STATUSES = ["proposed", "active", "disputed", "rejected", "archived"];
+const CONFLICT_TYPES = ["contradiction", "stale", "duplicate", "scope_overlap"];
+const CONFLICT_RESOLUTION_STATUSES = ["unresolved", "accepted", "rejected", "merged"];
+const PACKING_REASONS = ["ranked", "conflict_pair_preserved", "diversity_fill"];
+const RELATIONSHIP_ORIGINS = ["semantic", "graph", "tunnel"];
+
 function exact(value, keys, where) {
   if (value === null || Array.isArray(value) || typeof value !== "object") {
     throw new Error(`${where} must be an object`);
@@ -41,6 +69,21 @@ function exact(value, keys, where) {
 
 function optional(value, validator, where) {
   return value === null ? null : validator(value, where);
+}
+
+function enumValue(value, allowed, where) {
+  if (!allowed.includes(value)) throw new Error(`${where} is outside the frozen vocabulary`);
+  return value;
+}
+
+function optionalEnum(value, allowed, where) {
+  return value === null ? null : enumValue(value, allowed, where);
+}
+
+function enumList(value, allowed, where) {
+  requireStrList(value, where);
+  value.forEach((entry) => enumValue(entry, allowed, where));
+  return value;
 }
 
 function profile(subject, where) {
@@ -78,8 +121,8 @@ function assessmentRef(ref, where) {
   requireSha256(ref.contract_hash, `${where}.contract_hash`);
   requireSha256(ref.canonical_hash, `${where}.canonical_hash`);
   if (ref.purpose !== "combined") throw new Error(`${where}.purpose mismatch`);
-  requireStr(ref.assertion_mode, `${where}.assertion_mode`);
-  requireStr(ref.origin, `${where}.origin`);
+  enumValue(ref.assertion_mode, ASSERTION_MODES, `${where}.assertion_mode`);
+  enumValue(ref.origin, ORIGINS, `${where}.origin`);
   return ref;
 }
 
@@ -117,19 +160,19 @@ function fresh(value, where) {
   requireSha256(value.policy_artifact_digest, `${where}.policy_artifact_digest`);
   requireSha256(value.decision_hash, `${where}.decision_hash`);
   if (value.surface_decision !== "allow") throw new Error(`${where}.surface_decision`);
-  requireOptionalString(value.highest_admission_tier, `${where}.highest_admission_tier`);
-  requireOptionalString(value.risk_state, `${where}.risk_state`);
+  optionalEnum(value.highest_admission_tier, ADMISSION_TIERS, `${where}.highest_admission_tier`);
+  optionalEnum(value.risk_state, RISK_STATES, `${where}.risk_state`);
   if (!["supported", "contested", "insufficient_evidence", "unknown"].includes(value.epistemic_state)) {
     throw new Error(`${where}.epistemic_state mismatch`);
   }
-  requireOptionalString(value.retention_state, `${where}.retention_state`);
+  optionalEnum(value.retention_state, RETENTION_STATES, `${where}.retention_state`);
   refs(value.effective_assessment_refs, `${where}.effective_assessment_refs`);
   requireOptionalNonNegativeInt(value.observation_window_hours, `${where}.observation_window_hours`);
   requireOptionalString(value.eligible_at, `${where}.eligible_at`);
   requireOptionalString(value.next_evaluation_at, `${where}.next_evaluation_at`);
   requireStrList(value.blocker_codes, `${where}.blocker_codes`);
   requireStrList(value.reason_codes, `${where}.reason_codes`);
-  requireStrList(value.next_actions, `${where}.next_actions`);
+  enumList(value.next_actions, NEXT_ACTIONS, `${where}.next_actions`);
   return value;
 }
 
@@ -164,7 +207,7 @@ const V2_KEYS = [
 
 function v2(value, where) {
   exact(value, V2_KEYS, where);
-  requireStr(value.profile_key, `${where}.profile_key`);
+  if (value.profile_key !== "risk_aware_shadow_v1") throw new Error(`${where}.profile_key`);
   if (value.resolution_status !== "current") throw new Error(`${where}.resolution_status`);
   if (!["semantic_governed", "semantic_exploratory"].includes(value.surface)) {
     throw new Error(`${where}.surface`);
@@ -206,7 +249,7 @@ function admission(value, where) {
   if (value.assessment_status !== null && !["current", "stale", "legacy_import"].includes(value.assessment_status)) {
     throw new Error(`${where}.assessment_status`);
   }
-  requireOptionalString(value.assessment_outcome, `${where}.assessment_outcome`);
+  optionalEnum(value.assessment_outcome, ADMISSION_OUTCOMES, `${where}.assessment_outcome`);
   v2(value.v2, `${where}.v2`);
   if (value.surface !== value.v2.surface || value.surface_decision !== value.v2.surface_decision) {
     throw new Error(`${where} V2 identity mismatch`);
@@ -230,7 +273,7 @@ const EVIDENCE_KEYS = [
 function evidence(value, where) {
   exact(value, EVIDENCE_KEYS, where);
   if (value.source !== "v2_fresh_evaluation") throw new Error(`${where}.source`);
-  requireStr(value.profile_key, `${where}.profile_key`);
+  if (value.profile_key !== "risk_aware_shadow_v1") throw new Error(`${where}.profile_key`);
   requireStr(value.policy_version, `${where}.policy_version`);
   requireSha256(value.policy_artifact_digest, `${where}.policy_artifact_digest`);
   requireSha256(value.decision_hash, `${where}.decision_hash`);
@@ -238,8 +281,8 @@ function evidence(value, where) {
   if (!["supported", "contested", "insufficient_evidence", "unknown"].includes(value.epistemic_state)) {
     throw new Error(`${where}.epistemic_state`);
   }
-  requireOptionalString(value.risk_state, `${where}.risk_state`);
-  requireOptionalString(value.retention_state, `${where}.retention_state`);
+  optionalEnum(value.risk_state, RISK_STATES, `${where}.risk_state`);
+  optionalEnum(value.retention_state, RETENTION_STATES, `${where}.retention_state`);
   refs(value.effective_assessment_refs, `${where}.effective_assessment_refs`);
   return value;
 }
@@ -261,9 +304,7 @@ function relationship(value, where) {
   exact(value, RELATIONSHIP_KEYS, where);
   if (value.version !== "relationship-relevance-v1") throw new Error(`${where}.version`);
   requireStrList(value.origins, `${where}.origins`);
-  if (value.origins.some((origin) => !["semantic", "graph", "tunnel"].includes(origin))) {
-    throw new Error(`${where}.origins`);
-  }
+  enumList(value.origins, RELATIONSHIP_ORIGINS, `${where}.origins`);
   requireBool(value.direct, `${where}.direct`);
   requireOptionalFiniteFloat(value.direct_semantic_score, `${where}.direct_semantic_score`);
   requireFiniteFloat(value.source_seed_score, `${where}.source_seed_score`);
@@ -325,15 +366,16 @@ function item(raw, ordinal, where) {
   if (relationshipValue !== null && relationshipValue.relevance_score !== raw.relevance_score) {
     throw new Error(`${where} relationship relevance mismatch`);
   }
-  if (raw.packing_reason !== null && !["ranked", "conflict_pair_preserved", "diversity_fill"].includes(raw.packing_reason)) {
-    throw new Error(`${where}.packing_reason`);
+  optionalEnum(raw.packing_reason, PACKING_REASONS, `${where}.packing_reason`);
+  if (admissionValue !== null && raw.packing_reason === null) {
+    throw new Error(`${where} V2 item requires a packing reason`);
   }
   return {
     ordinal,
     item_id: requireCanonicalUuid(raw.id, `${where}.id`),
     kind: requireStr(raw.kind, `${where}.kind`),
     served_content_hash: sha256Hex(requireStr(raw.content, `${where}.content`)),
-    review_status: requireStr(raw.review_status, `${where}.review_status`),
+    review_status: enumValue(raw.review_status, REVIEW_STATUSES, `${where}.review_status`),
     authority: requireInt(raw.authority, `${where}.authority`),
     visibility: requireVisibility(raw.visibility, `${where}.visibility`),
     workspace_id: requireOptionalCanonicalUuid(raw.workspace_id, `${where}.workspace_id`),
@@ -344,9 +386,9 @@ function item(raw, ordinal, where) {
     utility_score: requireOptionalFiniteFloat(raw.utility_score, `${where}.utility_score`),
     reasons: requireStrList(raw.reasons, `${where}.reasons`),
     warnings: requireStrList(raw.warnings, `${where}.warnings`),
-    warning_codes: raw.warning_codes === null ? null : requireStrList(raw.warning_codes, `${where}.warning_codes`),
-    conflict_type: requireOptionalString(raw.conflict_type, `${where}.conflict_type`),
-    conflict_resolution_status: requireOptionalString(raw.conflict_resolution_status, `${where}.conflict_resolution_status`),
+    warning_codes: raw.warning_codes === null ? null : enumList(raw.warning_codes, WARNING_CODES, `${where}.warning_codes`),
+    conflict_type: optionalEnum(raw.conflict_type, CONFLICT_TYPES, `${where}.conflict_type`),
+    conflict_resolution_status: optionalEnum(raw.conflict_resolution_status, CONFLICT_RESOLUTION_STATUSES, `${where}.conflict_resolution_status`),
     admission: admissionValue,
     evidence: evidenceValue,
     relationship: relationshipValue,
@@ -383,7 +425,10 @@ export function buildManifestFromInput(name, input) {
   }
   if (!["legacy", "governed", "exploratory"].includes(ctx.recall_profile)) throw new Error(`${name}.recall_profile`);
   for (const key of ["recall_profile_contract_version", "scoring_version", "config_version"]) requireStr(ctx[key], `${name}.${key}`);
-  for (const key of ["signals_version", "admission_policy", "relationship_relevance_version", "packing_version"]) requireOptionalString(ctx[key], `${name}.${key}`);
+  requireOptionalString(ctx.signals_version, `${name}.signals_version`);
+  optionalEnum(ctx.admission_policy, ["recall-admission-v2"], `${name}.admission_policy`);
+  optionalEnum(ctx.relationship_relevance_version, ["relationship-relevance-v1"], `${name}.relationship_relevance_version`);
+  optionalEnum(ctx.packing_version, ["recall-packing-v1"], `${name}.packing_version`);
   if (!Array.isArray(pkt.items)) throw new Error(`${name}.items`);
   requireNonNegativeInt(pkt.item_count, `${name}.item_count`);
   requireNonNegativeInt(pkt.byte_count, `${name}.byte_count`);
@@ -465,7 +510,58 @@ export function buildManifestFromInput(name, input) {
     },
     items,
   };
+  validateProfileCoherence(name, manifest);
   return manifest;
+}
+
+function validateProfileCoherence(name, manifest) {
+  const profileName = manifest.versions.recall_profile;
+  const candidateVersions = [
+    manifest.versions.admission_policy,
+    manifest.versions.relationship_relevance_version,
+    manifest.versions.packing_version,
+  ];
+  if (profileName === "legacy") {
+    if (candidateVersions.some((value) => value !== null)) {
+      throw new Error(`${name} legacy profile declares candidate protocol versions`);
+    }
+  } else if (
+    manifest.versions.admission_policy !== "recall-admission-v2" ||
+    manifest.versions.packing_version !== "recall-packing-v1"
+  ) {
+    throw new Error(`${name} candidate profile lacks exact protocol versions`);
+  }
+  if ((manifest.result.expansion === null) !== (manifest.versions.relationship_relevance_version === null)) {
+    throw new Error(`${name} relationship expansion/version mismatch`);
+  }
+  if (manifest.result.expansion !== null && manifest.result.expansion.version !== manifest.versions.relationship_relevance_version) {
+    throw new Error(`${name} relationship expansion version mismatch`);
+  }
+  if ((manifest.result.packing === null) !== (manifest.versions.packing_version === null)) {
+    throw new Error(`${name} packing summary/version mismatch`);
+  }
+  if (manifest.result.packing !== null && manifest.result.packing.version !== manifest.versions.packing_version) {
+    throw new Error(`${name} packing summary version mismatch`);
+  }
+  manifest.items.forEach((value) => {
+    const candidateFields = [
+      value.admission, value.evidence, value.relevance_score, value.utility_score,
+      value.packing_reason,
+    ];
+    if (profileName === "legacy") {
+      if ([...candidateFields, value.relationship].some((entry) => entry !== null)) {
+        throw new Error(`${name} legacy item carries candidate profile facts`);
+      }
+    } else if (candidateFields.some((entry) => entry === null)) {
+      throw new Error(`${name} candidate item lacks exact V2 or packing facts`);
+    }
+    if (value.admission !== null && value.admission.profile !== profileName) {
+      throw new Error(`${name} item admission profile mismatch`);
+    }
+    if (value.relationship !== null && value.relationship.version !== manifest.versions.relationship_relevance_version) {
+      throw new Error(`${name} item relationship version mismatch`);
+    }
+  });
 }
 
 export function validateManifest(name, manifest) {
@@ -483,12 +579,18 @@ export function validateManifest(name, manifest) {
     if (value.admission !== null) admission(value.admission, `${name}.admission`);
     if (value.evidence !== null) evidence(value.evidence, `${name}.evidence`);
     if (value.relationship !== null) relationship(value.relationship, `${name}.relationship`);
+    enumValue(value.review_status, REVIEW_STATUSES, `${name}.review_status`);
+    if (value.warning_codes !== null) enumList(value.warning_codes, WARNING_CODES, `${name}.warning_codes`);
+    optionalEnum(value.conflict_type, CONFLICT_TYPES, `${name}.conflict_type`);
+    optionalEnum(value.conflict_resolution_status, CONFLICT_RESOLUTION_STATUSES, `${name}.conflict_resolution_status`);
+    optionalEnum(value.packing_reason, PACKING_REASONS, `${name}.packing_reason`);
   });
   if (manifest.result.expansion !== null) expansion(manifest.result.expansion, `${name}.expansion`);
   if (manifest.result.packing !== null) {
     packing(manifest.result.packing, `${name}.packing`);
     if (manifest.result.packing.selected_count !== manifest.items.length) throw new Error(`${name} packing selected count mismatch`);
   }
+  validateProfileCoherence(name, manifest);
   canonicalize(manifest);
   return manifest;
 }

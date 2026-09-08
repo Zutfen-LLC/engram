@@ -1,5 +1,5 @@
 {
-  "name": "extra-admission-field",
+  "name": "governed-without-admission-policy",
   "parse_as": "semantic",
   "input": {
     "query": "governed",
@@ -180,7 +180,7 @@
       "recall_profile_contract_version": "recall-profiles-v1",
       "scoring_version": "signals-v1",
       "signals_version": "recall-signals-v1",
-      "admission_policy": "recall-admission-v2",
+      "admission_policy": null,
       "relationship_relevance_version": null,
       "packing_version": "recall-packing-v1",
       "config_version": "v1",
@@ -283,8 +283,7 @@
               ],
               "next_actions": []
             }
-          },
-          "raw_query": "x"
+          }
         },
         "evidence": {
           "source": "v2_fresh_evaluation",

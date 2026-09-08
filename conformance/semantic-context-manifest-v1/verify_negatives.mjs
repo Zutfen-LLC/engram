@@ -6,7 +6,7 @@ import { buildManifestFromInput, canonicalize, validateManifest } from "./lib.mj
 const root = dirname(fileURLToPath(import.meta.url));
 const negativeDir = join(root, "negative");
 const paths = (await readdir(negativeDir)).filter((name) => name.endsWith(".json")).sort();
-if (paths.length < 25) throw new Error(`expected at least 25 negatives, found ${paths.length}`);
+if (paths.length < 48) throw new Error(`expected at least 48 negatives, found ${paths.length}`);
 for (const path of paths) {
   let rejected = false;
   try {

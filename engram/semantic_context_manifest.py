@@ -12,6 +12,13 @@ from typing import Any, Final, Literal
 
 from pydantic import Field, model_validator
 
+from engram.admission_assessment import AdmissionNextAction, AdmissionOutcome
+from engram.admission_assessment_schema import (
+    AdmissionRetentionState,
+    AdmissionRiskState,
+    AdmissionTier,
+)
+from engram.assessment_schema import AssertionMode, Origin
 from engram.context_manifest import (
     CANONICALIZATION,
     MEMORY_CONTEXT_VERSION,
@@ -28,6 +35,12 @@ from engram.context_manifest import (
     reconstruct_working_set_v1,
     sha256_digest,
 )
+from engram.recall_packing import RECALL_PACKING_VERSION, PackingReason
+from engram.recall_signals import (
+    RECALL_ADMISSION_POLICY_VERSION,
+    WarningCode,
+)
+from engram.review_policy import ReviewStatus
 from engram.semantic_budget import semantic_item_byte_count, semantic_item_token_cost
 
 __all__ = [
@@ -48,6 +61,16 @@ SEMANTIC_MANIFEST_CONTRACT_VERSION: Literal["semantic-context-manifest-v1"] = (
     "semantic-context-manifest-v1"
 )
 _QUERY_DOMAIN = b"engram.semantic-context-manifest-v1/query\x00"
+
+# These receipt aliases mirror database CHECK constraints that predate a
+# shared Python type. Tests bind the sets mechanically to migrations/001_init.sql.
+SemanticConflictTypeV1 = Literal["contradiction", "stale", "duplicate", "scope_overlap"]
+SemanticConflictResolutionStatusV1 = Literal["unresolved", "accepted", "rejected", "merged"]
+
+# The V2 evaluator supports exactly one policy profile. Keep this receipt wire
+# alias local so importing this pure contract does not depend on admission_shadow.
+# A focused anti-drift test binds it to recall_signals.V2_ADMISSION_PROFILE_KEY.
+SemanticV2ProfileKeyV1 = Literal["risk_aware_shadow_v1"]
 
 
 def semantic_query_digest(query: str) -> str:
@@ -102,9 +125,9 @@ class SemanticVersionsV1(_StrictModel):
     recall_profile_contract_version: str
     scoring_version: str
     signals_version: str | None
-    admission_policy: str | None
-    relationship_relevance_version: str | None
-    packing_version: str | None
+    admission_policy: Literal["recall-admission-v2"] | None
+    relationship_relevance_version: Literal["relationship-relevance-v1"] | None
+    packing_version: Literal["recall-packing-v1"] | None
     config_version: str
     manifest_contract_version: Literal["semantic-context-manifest-v1"]
     packet_render_version: Literal["working-set-v1"]
@@ -168,8 +191,8 @@ class SemanticAssessmentRefV1(_StrictModel):
     contract_hash: Sha256DigestV1
     canonical_hash: Sha256DigestV1
     purpose: Literal["combined"]
-    assertion_mode: str
-    origin: str
+    assertion_mode: AssertionMode
+    origin: Origin
 
 
 class SemanticV2PersistedV1(_StrictModel):
@@ -190,23 +213,23 @@ class SemanticV2FreshV1(_StrictModel):
     policy_artifact_digest: Sha256DigestV1
     decision_hash: Sha256DigestV1
     surface_decision: Literal["allow"]
-    highest_admission_tier: str | None
-    risk_state: str | None
+    highest_admission_tier: AdmissionTier | None
+    risk_state: AdmissionRiskState | None
     epistemic_state: Literal["supported", "contested", "insufficient_evidence", "unknown"]
-    retention_state: str | None
+    retention_state: AdmissionRetentionState | None
     effective_assessment_refs: list[SemanticAssessmentRefV1]
     observation_window_hours: NonNegativeIntV1 | None
     eligible_at: str | None
     next_evaluation_at: str | None
     blocker_codes: list[str]
     reason_codes: list[str]
-    next_actions: list[str]
+    next_actions: list[AdmissionNextAction]
 
 
 class SemanticV2BindingV1(_StrictModel):
     """The V2 resolution identity consumed by the admission decision."""
 
-    profile_key: str
+    profile_key: SemanticV2ProfileKeyV1
     resolution_status: Literal["current"]
     surface: Literal["semantic_governed", "semantic_exploratory"]
     surface_decision: Literal["allow"]
@@ -237,7 +260,7 @@ class SemanticAdmissionV1(_StrictModel):
     reason_codes: list[str]
     assessment_id: CanonicalUuidV1 | None
     assessment_status: Literal["current", "stale", "legacy_import"] | None
-    assessment_outcome: str | None
+    assessment_outcome: AdmissionOutcome | None
     surface: Literal["semantic_governed", "semantic_exploratory"]
     surface_decision: Literal["allow"]
     v2: SemanticV2BindingV1
@@ -260,14 +283,14 @@ class SemanticEvidenceV1(_StrictModel):
     """The canonical issue #188 evidence projection."""
 
     source: Literal["v2_fresh_evaluation"]
-    profile_key: str
+    profile_key: SemanticV2ProfileKeyV1
     policy_version: str
     policy_artifact_digest: Sha256DigestV1
     decision_hash: Sha256DigestV1
     v2_resolution_status: Literal["current"]
     epistemic_state: Literal["supported", "contested", "insufficient_evidence", "unknown"]
-    risk_state: str | None
-    retention_state: str | None
+    risk_state: AdmissionRiskState | None
+    retention_state: AdmissionRetentionState | None
     effective_assessment_refs: list[SemanticAssessmentRefV1]
 
 
@@ -297,7 +320,7 @@ class SemanticItemV1(_StrictModel):
     item_id: CanonicalUuidV1
     kind: str
     served_content_hash: Sha256DigestV1
-    review_status: str
+    review_status: ReviewStatus
     authority: int
     visibility: VisibilityV1
     workspace_id: OptionalCanonicalUuidV1
@@ -308,13 +331,13 @@ class SemanticItemV1(_StrictModel):
     utility_score: FiniteFloatV1 | None
     reasons: list[str]
     warnings: list[str]
-    warning_codes: list[str] | None
-    conflict_type: str | None
-    conflict_resolution_status: str | None
+    warning_codes: list[WarningCode] | None
+    conflict_type: SemanticConflictTypeV1 | None
+    conflict_resolution_status: SemanticConflictResolutionStatusV1 | None
     admission: SemanticAdmissionV1 | None
     evidence: SemanticEvidenceV1 | None
     relationship: SemanticRelationshipV1 | None
-    packing_reason: Literal["ranked", "conflict_pair_preserved", "diversity_fill"] | None
+    packing_reason: PackingReason | None
 
     @model_validator(mode="after")
     def profile_facts_are_coherent(self) -> SemanticItemV1:
@@ -394,6 +417,21 @@ class SemanticContextManifestV1(_StrictModel):
             self.versions.packing_version != self.result.packing.version
         ):
             raise ValueError("packing version does not match versions")
+        if self.versions.recall_profile == "legacy":
+            if any(
+                value is not None
+                for value in (
+                    self.versions.admission_policy,
+                    self.versions.relationship_relevance_version,
+                    self.versions.packing_version,
+                )
+            ):
+                raise ValueError("legacy profile must not declare candidate protocol versions")
+        elif (
+            self.versions.admission_policy != RECALL_ADMISSION_POLICY_VERSION
+            or self.versions.packing_version != RECALL_PACKING_VERSION
+        ):
+            raise ValueError("candidate profile requires exact admission and packing versions")
         for ordinal, item in enumerate(self.items):
             if item.ordinal != ordinal:
                 raise ValueError("item ordinal does not match array order")
@@ -405,6 +443,21 @@ class SemanticContextManifestV1(_StrictModel):
                 item.relationship.version != self.versions.relationship_relevance_version
             ):
                 raise ValueError("item relationship contract does not match versions")
+            candidate_values = (
+                item.admission,
+                item.evidence,
+                item.relevance_score,
+                item.utility_score,
+                item.packing_reason,
+            )
+            if self.versions.recall_profile == "legacy" and any(
+                value is not None for value in (*candidate_values, item.relationship)
+            ):
+                raise ValueError("legacy item must not carry candidate profile facts")
+            if self.versions.recall_profile != "legacy" and any(
+                value is None for value in candidate_values
+            ):
+                raise ValueError("candidate item requires exact V2 and packing facts")
         return self
 
 
@@ -429,9 +482,9 @@ class SemanticManifestDecisionContextV1(_StrictModel):
     recall_profile_contract_version: str
     scoring_version: str
     signals_version: str | None
-    admission_policy: str | None
-    relationship_relevance_version: str | None
-    packing_version: str | None
+    admission_policy: Literal["recall-admission-v2"] | None
+    relationship_relevance_version: Literal["relationship-relevance-v1"] | None
+    packing_version: Literal["recall-packing-v1"] | None
     config_version: str
 
 
@@ -503,10 +556,31 @@ def build_semantic_context_manifest_v1(
         and selected_token_count > context.effective_token_budget
     ):
         raise ValueError("finalized packet exceeds effective token budget")
-    if context.recall_profile == "legacy" and any(
-        item.get("admission") is not None or item.get("evidence") is not None for item in items
+    if context.recall_profile == "legacy":
+        if any(
+            value is not None
+            for value in (
+                context.admission_policy,
+                context.relationship_relevance_version,
+                context.packing_version,
+            )
+        ):
+            raise ValueError("legacy semantic packet must not declare candidate versions")
+        candidate_fields = (
+            "admission",
+            "evidence",
+            "relationship",
+            "packing_reason",
+            "relevance_score",
+            "utility_score",
+        )
+        if any(item.get(field) is not None for item in items for field in candidate_fields):
+            raise ValueError("legacy semantic packet must not fabricate candidate facts")
+    elif (
+        context.admission_policy != RECALL_ADMISSION_POLICY_VERSION
+        or context.packing_version != RECALL_PACKING_VERSION
     ):
-        raise ValueError("legacy semantic packet must not fabricate V2 facts")
+        raise ValueError("candidate packet requires exact admission and packing versions")
     if context.recall_profile != "legacy" and (
         packing is None or packing.get("selected_count") != item_count
     ):

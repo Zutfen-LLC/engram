@@ -66,6 +66,58 @@ def write(
     )
 
 
+def add_legacy_v2_item(governed: dict[str, Any]) -> Callable[[dict[str, Any]], None]:
+    """Copy one otherwise-valid candidate item projection onto a legacy item."""
+
+    candidate = governed["expected"]["manifest"]["items"][0]
+
+    def mutate(manifest: dict[str, Any]) -> None:
+        item = manifest["items"][0]
+        for field in (
+            "admission",
+            "evidence",
+            "relevance_score",
+            "utility_score",
+            "packing_reason",
+        ):
+            item[field] = deepcopy(candidate[field])
+
+    return mutate
+
+
+def set_mirrored_v2_field(field: str, value: Any) -> Callable[[dict[str, Any]], None]:
+    """Set one V2 fact in both receipt projections so only its vocabulary is invalid."""
+
+    def mutate(manifest: dict[str, Any]) -> None:
+        item = manifest["items"][0]
+        item["admission"]["v2"]["fresh"][field] = value
+        item["evidence"][field] = value
+
+    return mutate
+
+
+def set_mirrored_assessment_ref_field(field: str, value: str) -> Callable[[dict[str, Any]], None]:
+    """Set one assessment-ref fact in both receipt projections."""
+
+    def mutate(manifest: dict[str, Any]) -> None:
+        item = manifest["items"][0]
+        item["admission"]["v2"]["fresh"]["effective_assessment_refs"][0][field] = value
+        item["evidence"]["effective_assessment_refs"][0][field] = value
+
+    return mutate
+
+
+def set_mirrored_profile_key(value: str) -> Callable[[dict[str, Any]], None]:
+    """Set the V2 profile key in both receipt projections."""
+
+    def mutate(manifest: dict[str, Any]) -> None:
+        item = manifest["items"][0]
+        item["admission"]["v2"]["profile_key"] = value
+        item["evidence"]["profile_key"] = value
+
+    return mutate
+
+
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     legacy = load("001-legacy-single.json")
@@ -181,6 +233,121 @@ def main() -> None:
             "wrong-relationship-contract",
             relationship,
             set_value(("items", 0, "relationship", "version"), "relationship-relevance-v2"),
+            "semantic",
+        ),
+        (
+            "invalid-risk-state",
+            governed,
+            set_mirrored_v2_field("risk_state", "probably_safe"),
+            "semantic",
+        ),
+        (
+            "invalid-retention-state",
+            governed,
+            set_mirrored_v2_field("retention_state", "forever"),
+            "semantic",
+        ),
+        (
+            "invalid-admission-tier",
+            governed,
+            set_value(
+                ("items", 0, "admission", "v2", "fresh", "highest_admission_tier"),
+                "super_trusted",
+            ),
+            "semantic",
+        ),
+        (
+            "invalid-assertion-mode",
+            governed,
+            set_mirrored_assessment_ref_field("assertion_mode", "explicit"),
+            "semantic",
+        ),
+        (
+            "invalid-origin",
+            governed,
+            set_mirrored_assessment_ref_field("origin", "external"),
+            "semantic",
+        ),
+        (
+            "invalid-next-action",
+            governed,
+            set_value(
+                ("items", 0, "admission", "v2", "fresh", "next_actions"),
+                ["retry_later"],
+            ),
+            "semantic",
+        ),
+        (
+            "invalid-assessment-outcome",
+            governed,
+            set_value(("items", 0, "admission", "assessment_outcome"), "qualified"),
+            "semantic",
+        ),
+        (
+            "invalid-profile-key",
+            governed,
+            set_mirrored_profile_key("future_profile"),
+            "semantic",
+        ),
+        (
+            "invalid-warning-code",
+            governed,
+            set_value(("items", 0, "warning_codes"), ["probably_safe"]),
+            "semantic",
+        ),
+        (
+            "invalid-review-status",
+            legacy,
+            set_value(("items", 0, "review_status"), "pending_forever"),
+            "semantic",
+        ),
+        (
+            "invalid-conflict-type",
+            legacy,
+            set_value(("items", 0, "conflict_type"), "ambiguous"),
+            "semantic",
+        ),
+        (
+            "invalid-conflict-resolution-status",
+            legacy,
+            set_value(("items", 0, "conflict_resolution_status"), "ignored"),
+            "semantic",
+        ),
+        (
+            "invalid-packing-reason",
+            governed,
+            set_value(("items", 0, "packing_reason"), "lucky"),
+            "semantic",
+        ),
+        (
+            "invalid-relationship-origin",
+            relationship,
+            set_value(("items", 0, "relationship", "origins"), ["semantic", "future"]),
+            "semantic",
+        ),
+        (
+            "legacy-with-admission-policy",
+            legacy,
+            set_value(("versions", "admission_policy"), "recall-admission-v2"),
+            "semantic",
+        ),
+        (
+            "legacy-with-packing-version",
+            legacy,
+            set_value(("versions", "packing_version"), "recall-packing-v1"),
+            "semantic",
+        ),
+        ("legacy-with-v2-item", legacy, add_legacy_v2_item(governed), "semantic"),
+        (
+            "governed-without-admission-policy",
+            governed,
+            set_value(("versions", "admission_policy"), None),
+            "semantic",
+        ),
+        (
+            "governed-without-packing-version",
+            governed,
+            set_value(("versions", "packing_version"), None),
             "semantic",
         ),
     ]

@@ -1,5 +1,5 @@
 {
-  "name": "extra-admission-field",
+  "name": "invalid-retention-state",
   "parse_as": "semantic",
   "input": {
     "query": "governed",
@@ -263,7 +263,7 @@
               "highest_admission_tier": "semantic_governed",
               "risk_state": "low",
               "epistemic_state": "supported",
-              "retention_state": "retain",
+              "retention_state": "forever",
               "effective_assessment_refs": [
                 {
                   "assessment_id": "00000000-0000-0000-0000-000000000006",
@@ -283,8 +283,7 @@
               ],
               "next_actions": []
             }
-          },
-          "raw_query": "x"
+          }
         },
         "evidence": {
           "source": "v2_fresh_evaluation",
@@ -295,7 +294,7 @@
           "v2_resolution_status": "current",
           "epistemic_state": "supported",
           "risk_state": "low",
-          "retention_state": "retain",
+          "retention_state": "forever",
           "effective_assessment_refs": [
             {
               "assessment_id": "00000000-0000-0000-0000-000000000006",
