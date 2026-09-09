@@ -1,0 +1,114 @@
+{
+  "campaign_id": "eng-calibration-001f",
+  "floors": {
+    "campaign_id": "eng-calibration-001f",
+    "dual_review_high_consequence": true,
+    "floors_schema": "engram-calibration-floors-v1",
+    "high_consequence_reviewed_min": 20,
+    "holdout_min": 100,
+    "per_bin_support_min": 50,
+    "per_dimension_labeled_min": 150,
+    "per_stratum_min": 10,
+    "total_reviewed_min": 300
+  },
+  "identity": {
+    "assessment_code_version": "assessment-engine-v1",
+    "assessment_policy_version": "assessment-selection-v1",
+    "assessment_schema_version": "engram.assessment.v1",
+    "calibration_artifact_schema_version": "engram.calibration-profiles-v1",
+    "calibration_dataset_version": "calibration-157-dogfood-v1",
+    "campaign_id": "eng-calibration-001f",
+    "campaign_schema": "engram-calibration-campaign-v1",
+    "canonicalization_version": "assessment-evidence-manifest-v1",
+    "dimensions": [
+      "taxonomy",
+      "retention",
+      "epistemic"
+    ],
+    "label_guide_version": "engram-calibration-guide-157-v1",
+    "prompt_version": "engram.assess.1",
+    "provider_adapter": "openai",
+    "provider_config_digest": "725ee055ce830509e21b3cfd9c9ee4ee99bc327d1fa2906ef6e463c071fc20ae",
+    "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+    "provider_params": {
+      "input_limit": 16000,
+      "max_tokens": 1024,
+      "temperature": 0
+    },
+    "repo_sha": "3d17923e6553a5a633a819682f9ffad8423cd8ef"
+  },
+  "identity_digest": "78d45df3b89261bc95adcf4fdaf4eeb3b54784c5dc4d5cea1fbd85a57b8f3093",
+  "note": "Public-safe #202 campaign manifests: digests, counts, and rules only. Raw content, packets, and reviewer material live in protected storage.",
+  "sampling": {
+    "exclusion_rules": [
+      "kind=diary_entry: governed not_applicable epistemic, no calibration signal",
+      "content > 16000 bytes: exceeds the provider input bound",
+      "secret-scanner match on content"
+    ],
+    "inclusion_rules": [
+      "live item: valid_to IS NULL and review_status NOT IN (rejected, archived)",
+      "tenant dogfood corpus only",
+      "content present and passes the production secret denylist"
+    ],
+    "sample_count": 402,
+    "sampling_seed": "202-sample-v1",
+    "selection_method": "stratified_hash",
+    "snapshot_as_of": "2026-09-09T19:43:04.195204Z",
+    "snapshot_sha256": "cc172a6f7c2780784ef0ce5686772a72324d1398976fc117da637df2a88fbdb0",
+    "source_row_counts": {
+      "excluded_total": 0,
+      "frame": 624
+    },
+    "stratum_counts": {
+      "decision/import/active": 5,
+      "decision/manual/active": 1,
+      "decision/migration/active": 2,
+      "decision/session_end/active": 2,
+      "decision/sync_turn/active": 2,
+      "doctrine/import/active": 8,
+      "doctrine/migration/proposed": 10,
+      "doctrine/session_end/active": 1,
+      "doctrine/sync_turn/proposed": 3,
+      "fact/extraction/proposed": 70,
+      "fact/import/active": 16,
+      "fact/manual/active": 4,
+      "fact/manual/proposed": 11,
+      "fact/migration/active": 178,
+      "fact/migration/proposed": 3,
+      "fact/pre_compress/proposed": 1,
+      "fact/session_end/active": 5,
+      "fact/session_end/proposed": 8,
+      "fact/sync_turn/active": 8,
+      "fact/sync_turn/proposed": 43,
+      "invariant/migration/proposed": 1,
+      "invariant/sync_turn/proposed": 2,
+      "observation/manual/active": 3,
+      "observation/manual/proposed": 1,
+      "observation/session_end/proposed": 1,
+      "observation/sync_turn/proposed": 2,
+      "preference/manual/active": 1,
+      "preference/sync_turn/proposed": 3,
+      "procedure/import/active": 3,
+      "procedure/manual/proposed": 1,
+      "summary/import/active": 2,
+      "summary/session_end/active": 1
+    }
+  },
+  "sampling_manifest_digest": "27de308acfac24f4a9292cf93d022f333277f1a080b529cbe74e665f64ec8475",
+  "split": {
+    "dev_count": 362,
+    "dev_fraction": 0.6,
+    "duplicate_group_count": 30,
+    "grouping": [
+      "content_hash",
+      "normalized_text"
+    ],
+    "holdout_count": 262,
+    "leakage_checks": {
+      "cross_split_shared_hash_groups": 0,
+      "duplicate_groups": 30
+    },
+    "split_seed": "202-split-v1"
+  },
+  "split_manifest_digest": "2f2b7ec5dccb0ab4882fa66906b5e9e4136c54632b0d44ef06fc3ec49ffeed73"
+}
