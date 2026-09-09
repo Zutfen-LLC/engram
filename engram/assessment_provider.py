@@ -12,6 +12,7 @@ from pydantic import Field
 
 from engram.assessment_schema import StrictModel
 from engram.provider_clients import resolve_classification_provider
+from engram.provider_observer import record_provider_invocation
 from engram.safety import has_secrets
 
 
@@ -30,6 +31,7 @@ class ProviderAssessment:
 
 async def assess_content(content: str, kind: str) -> ProviderAssessment:
     """Make one bounded call. Store only validated numeric and taxonomy outputs."""
+    record_provider_invocation("assessment")
     if len(content.encode()) > 16000 or has_secrets(content):
         raise ValueError("assessment input rejected")
     config = resolve_classification_provider()

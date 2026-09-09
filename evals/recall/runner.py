@@ -15,7 +15,7 @@ from typing import Any
 from sqlalchemy import event, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from engram import recall_shadow
+from engram import memory_kinds, recall_shadow
 from engram.demonstrated_usefulness import DEMONSTRATED_USEFULNESS_VERSION
 from engram.embedding_profiles import get_active_profile
 from engram.models import (
@@ -28,10 +28,15 @@ from engram.models import (
     MemoryEdge,
     MemoryEmbedding,
     MemoryItem,
+    MemoryKind,
+    Principal,
     RecallLog,
     TenantConfig,
     Tunnel,
+    Workspace,
+    WorkspaceMember,
 )
+from engram.provider_observer import observe_provider_calls
 from engram.recall_packing import RECALL_PACKING_VERSION
 from engram.recall_profiles import (
     CERTIFIED_SERVING_PROFILES,
@@ -45,8 +50,8 @@ from evals.recall.contracts import usefulness_perturbation_report
 from evals.recall.metrics import build_profile_metrics
 from evals.recall.schema import RecallEvaluationManifest
 
-RUNNER_VERSION = "engram-recall-evaluation-runner-v1"
-REPORT_SCHEMA_VERSION = "engram-recall-evaluation-report-v1"
+RUNNER_VERSION = "engram-recall-evaluation-runner-v2"
+REPORT_SCHEMA_VERSION = "engram-recall-evaluation-report-v2"
 _MUTATION_TABLES = (
     "memory_items",
     "recall_logs",
@@ -95,6 +100,12 @@ async def evaluation_state_identity(
     function; memory content is represented by its stored content hash.
     """
     tenant_id = manifest.memory_context.tenant_id
+    # This is a closed set traced from the shared legacy/candidate comparison:
+    # visibility reads principals/workspace_members; explicit workspace
+    # resolution reads workspaces; disputed-kind selection reads memory_kinds;
+    # and the remaining models are read by retrieval, V2 admission, evidence,
+    # usefulness, relationship expansion, or packing. Do not add rows only
+    # because their table names look recall-related.
     scoped_models = (
         MemoryItem,
         MemoryEmbedding,
@@ -106,6 +117,9 @@ async def evaluation_state_identity(
         KgTriple,
         MemoryEdge,
         Tunnel,
+        Principal,
+        Workspace,
+        MemoryKind,
     )
     tables: dict[str, list[dict[str, Any]]] = {}
     for model in scoped_models:
@@ -121,6 +135,19 @@ async def evaluation_state_identity(
             (_row_identity(row, excluded=excluded) for row in rows),
             key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":")),
         )
+    membership_rows = list(
+        (
+            await session.scalars(
+                select(WorkspaceMember)
+                .join(Workspace, Workspace.id == WorkspaceMember.workspace_id)
+                .where(Workspace.tenant_id == tenant_id)
+            )
+        ).all()
+    )
+    tables[WorkspaceMember.__tablename__] = sorted(
+        (_row_identity(row) for row in membership_rows),
+        key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":")),
+    )
     config_rows = list(
         (
             await session.scalars(select(TenantConfig).where(TenantConfig.tenant_id == tenant_id))
@@ -141,6 +168,21 @@ async def evaluation_state_identity(
             key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":")),
         ),
         "tables": tables,
+        "coverage": {
+            "includes": [
+                "retrieval_and_embedding_state",
+                "principal_visibility_and_feedback_actor_state",
+                "workspace_resolution_and_membership_state",
+                "disputed_kind_registry_state",
+                "v2_admission_evidence_and_relationship_state",
+                "tenant_configuration_and_embedding_profiles",
+            ],
+            "does_not_prove": [
+                "historical_state_reconstruction",
+                "external_provider_response_reproducibility",
+                "deployment_settings_not_stored_in_postgresql",
+            ],
+        },
     }
 
 
@@ -223,8 +265,19 @@ def _safe_packet(packet: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _concentration(packets: list[dict[str, Any]]) -> dict[str, Any]:
-    exposures = Counter(str(item["id"]) for packet in packets for item in packet["items"])
+def _reset_evaluation_kind_cache(tenant_id: Any) -> None:
+    """Ensure evaluation uses database-authoritative kind rows.
+
+    The production TTL cache remains unchanged. The evaluator clears only its
+    tenant entry before capture/replay so a process-local pre-existing value
+    cannot make a manifest digest describe one kind registry and replay use
+    another.
+    """
+    memory_kinds.invalidate_memory_kind_cache(tenant_id)
+
+
+def _concentration_counts(exposures: Counter[str]) -> dict[str, Any]:
+    """Calculate exposure concentration for a privacy-safe categorical key."""
     total = sum(exposures.values())
     counts = sorted(exposures.values())
     if not total:
@@ -247,6 +300,59 @@ def _concentration(packets: list[dict[str, Any]]) -> dict[str, Any]:
         "top_10_share": sum(counts[-10:]) / total,
         "hhi": sum(share * share for share in shares),
         "gini": numerator / (len(counts) * total),
+    }
+
+
+def _concentration(packets: list[dict[str, Any]]) -> dict[str, Any]:
+    return _concentration_counts(
+        Counter(str(item["id"]) for packet in packets for item in packet["items"])
+    )
+
+
+def _grouped_exposure_concentration(
+    packets: list[dict[str, Any]], *, field: str
+) -> dict[str, Any]:
+    """Report shares and concentration across source/kind reporting strata."""
+    exposures = Counter(
+        str(item.get(field, item.get("evaluation_strata", {}).get(field, "unknown")))
+        for packet in packets
+        for item in packet["items"]
+    )
+    total = sum(exposures.values())
+    distribution = {
+        key: {"exposure_count": count, "exposure_share": count / total if total else None}
+        for key, count in sorted(exposures.items())
+    }
+    return {"distribution": distribution, "concentration": _concentration_counts(exposures)}
+
+
+def _admission_strata(packets: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+    """Aggregate the exact V2/withhold diagnostics bound by the packet."""
+    outcome: Counter[str] = Counter()
+    resolution: Counter[str] = Counter()
+    blocker: Counter[str] = Counter()
+    eligibility: Counter[str] = Counter()
+    for packet in packets:
+        if packet["profile"] == "legacy":
+            continue
+        for _item in packet["items"]:
+            outcome["admitted"] += 1
+            eligibility["eligible"] += 1
+        for diagnostic in packet.get("admission_diagnostics", []):
+            outcome[str(diagnostic.get("decision", "unknown"))] += 1
+            eligibility["withheld"] += 1
+            resolution[str(diagnostic.get("v2_resolution_status", "unknown"))] += 1
+            reasons = diagnostic.get("reason_codes") or ["unknown"]
+            blocker[str(reasons[0])] += 1
+        for status, count in (packet.get("v2_resolution") or {}).get(
+            "resolution_status_counts", {}
+        ).items():
+            resolution[str(status)] += int(count)
+    return {
+        "v2_admission_outcome": dict(sorted(outcome.items())),
+        "v2_resolution_state": dict(sorted(resolution.items())),
+        "primary_admission_blocker": dict(sorted(blocker.items())),
+        "candidate_eligibility": dict(sorted(eligibility.items())),
     }
 
 
@@ -361,6 +467,74 @@ def _budget_utilization(packets: list[dict[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _relationship_and_packing_metrics(packets: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate bounded production summaries without reconstructing recall."""
+    expansion: Counter[str] = Counter()
+    packing_omissions: Counter[str] = Counter()
+    selected_count = 0
+    conflict_pairs_preserved = 0
+    for packet in packets:
+        for key, value in (packet.get("expansion") or {}).items():
+            if isinstance(value, int):
+                expansion[key] += value
+        packing = packet.get("packing") or {}
+        selected_count += int(packing.get("selected_count", 0))
+        conflict_pairs_preserved += int(packing.get("conflict_pairs_preserved", 0))
+        packing_omissions.update(packing.get("omitted", {}))
+    return {
+        "relationship_expansion": dict(sorted(expansion.items())),
+        "selected_count": selected_count,
+        "conflict_pairs_preserved": conflict_pairs_preserved,
+        "packing_omission_reasons": dict(sorted(packing_omissions.items())),
+    }
+
+
+def _usefulness_impact(case_rows: list[dict[str, Any]], profile: str) -> dict[str, int]:
+    """Compare production packets with the evaluation-only neutral adjustment."""
+    impact: Counter[str] = Counter()
+    for row in case_rows:
+        actual = next(
+            candidate for candidate in row["candidates"] if candidate["profile"] == profile
+        )
+        neutral = next(
+            (
+                candidate
+                for candidate in row.get("neutral_usefulness_candidates", [])
+                if candidate["profile"] == profile
+            ),
+            None,
+        )
+        for item in actual["items"]:
+            adjustment = float(
+                ((item.get("utility") or {}).get("demonstrated_usefulness") or {}).get(
+                    "adjustment", 0.0
+                )
+            )
+            if adjustment:
+                impact["items_with_nonzero_adjustment"] += 1
+                direction = (
+                    "positive_adjustment_items" if adjustment > 0 else "negative_adjustment_items"
+                )
+                impact[direction] += 1
+        if neutral is None:
+            continue
+        actual_ids = [str(item["id"]) for item in actual["items"]]
+        neutral_ids = [str(item["id"]) for item in neutral["items"]]
+        actual_positions = {item_id: index for index, item_id in enumerate(actual_ids)}
+        neutral_positions = {item_id: index for index, item_id in enumerate(neutral_ids)}
+        changed = sum(
+            actual_positions[item_id] != neutral_positions[item_id]
+            for item_id in actual_positions.keys() & neutral_positions.keys()
+        )
+        impact["ordering_positions_changed"] += changed
+        if changed:
+            impact["packets_with_rank_change"] += 1
+        if actual_ids != neutral_ids:
+            impact["packets_with_packed_membership_change"] += 1
+            impact["packed_membership_changes"] += len(set(actual_ids) ^ set(neutral_ids))
+    return dict(sorted(impact.items()))
+
+
 @contextmanager
 def _statement_counter(session: AsyncSession) -> Any:
     """Measure statements issued by this evaluation transaction.
@@ -426,8 +600,17 @@ def _public_report(
         profile: {
             **build_profile_metrics(rows),
             "strata": _strata(packets[profile]),
+            "admission_strata": _admission_strata(packets[profile]),
             "budget_utilization": _budget_utilization(packets[profile]),
+            "relationship_and_packing": _relationship_and_packing_metrics(packets[profile]),
+            "demonstrated_usefulness_impact": _usefulness_impact(case_rows, profile),
             "exposure_concentration": _concentration(packets[profile]),
+            "exposure_by_source_type": _grouped_exposure_concentration(
+                packets[profile], field="source_type"
+            ),
+            "exposure_by_memory_kind": _grouped_exposure_concentration(
+                packets[profile], field="kind"
+            ),
         }
         for profile, rows in profile_rows.items()
     }
@@ -443,6 +626,12 @@ def _public_report(
             "strata": _strata(packets["legacy"]),
             "budget_utilization": _budget_utilization(packets["legacy"]),
             "exposure_concentration": _concentration(packets["legacy"]),
+            "exposure_by_source_type": _grouped_exposure_concentration(
+                packets["legacy"], field="source_type"
+            ),
+            "exposure_by_memory_kind": _grouped_exposure_concentration(
+                packets["legacy"], field="kind"
+            ),
         },
         "read_only_proof": mutation_proof,
         "usefulness_perturbation": usefulness_perturbation_report(),
@@ -452,7 +641,7 @@ def _public_report(
         },
         # #198 does not contain deterministic certification gates.  The
         # runner can only report that it completed its evidence collection.
-        "evaluation_status": "EVALUATION_COMPLETE",
+        "evaluation_status": "EVALUATION_EVIDENCE_COLLECTED",
         "limitations": [
             "Unknown labels stay unknown and are excluded from known-rate denominators.",
             "Usefulness is reported as utility evidence, not epistemic evidence.",
@@ -487,6 +676,7 @@ async def run_recall_evaluation(
     )
     if active_config is None or active_config.config_version != manifest.tenant_config_version:
         raise ValueError("tenant_config_identity_mismatch")
+    _reset_evaluation_kind_cache(manifest.memory_context.tenant_id)
     state = await evaluation_state_identity(session, manifest)
     if digest(state) != manifest.snapshot_digest:
         raise ValueError("evaluation_snapshot_identity_mismatch")
@@ -494,20 +684,27 @@ async def run_recall_evaluation(
     context = manifest.memory_context.resolve()
     case_rows: list[dict[str, Any]] = []
     timings_ms: list[float] = []
-    case_query_counts: dict[str, int] = {}
-    provider_calls = {
-        "semantic_query_embedding": 0,
-        "classification": 0,
-        "assessment": 0,
-        "usefulness": 0,
-        "relationship_expansion": 0,
-        "packing": 0,
-        "other": 0,
+    profile_timings_ms: dict[str, list[float]] = {
+        "legacy": [],
+        "governed": [],
+        "exploratory": [],
     }
-    with _statement_counter(session) as statement_count:
+    case_query_counts: dict[str, int] = {}
+    expected_query_embeddings = 0
+    with observe_provider_calls() as provider_calls, _statement_counter(session) as statement_count:
         for case in manifest.cases:
+            _reset_evaluation_kind_cache(manifest.memory_context.tenant_id)
             before_case = statement_count["total"]
             started = time.perf_counter()
+            def observe_profile_timing(profile: str, elapsed_ms: float) -> None:
+                profile_timings_ms[profile].append(elapsed_ms)
+
+            captured_embedding: list[float] | None = None
+
+            def capture_embedding(value: list[float]) -> None:
+                nonlocal captured_embedding
+                captured_embedding = value
+
             result = await recall_shadow.evaluate_recall_shadow_comparison(
                 session,
                 memory_context=context,
@@ -518,11 +715,13 @@ async def run_recall_evaluation(
                 token_budget=case.token_budget,
                 item_budget=case.item_budget,
                 now=manifest.evaluation_at,
+                timing_observer=observe_profile_timing,
+                query_embedding_observer=capture_embedding,
             )
+            if int(result["candidate_count"]) > 0:
+                expected_query_embeddings += 1
             timings_ms.append((time.perf_counter() - started) * 1000)
             case_query_counts[case.case_id] = statement_count["total"] - before_case
-            if result.get("embedding_outcome") in {"succeeded", "disabled"}:
-                provider_calls["semantic_query_embedding"] += 1
             if result["legacy"] is None:
                 if result["candidate_count"] == 0 and context.may_read_anything:
                     legacy = _empty_packet("legacy", case)
@@ -537,6 +736,24 @@ async def run_recall_evaluation(
             else:
                 legacy = _safe_packet(result["legacy"])
                 candidates = [_safe_packet(packet) for packet in result["candidates"]]
+            neutral_usefulness_candidates: list[dict[str, Any]] = []
+            if captured_embedding is not None:
+                neutral_result = await recall_shadow.evaluate_recall_shadow_comparison(
+                    session,
+                    memory_context=context,
+                    workspace=case.workspace,
+                    query=case.query,
+                    candidate_profiles=["governed", "exploratory"],
+                    byte_budget=case.byte_budget,
+                    token_budget=case.token_budget,
+                    item_budget=case.item_budget,
+                    now=manifest.evaluation_at,
+                    query_embedding_override=captured_embedding,
+                    neutralize_demonstrated_usefulness=True,
+                )
+                neutral_usefulness_candidates = [
+                    _safe_packet(packet) for packet in neutral_result["candidates"]
+                ]
             case_rows.append(
                 {
                     "case_id": case.case_id,
@@ -545,6 +762,7 @@ async def run_recall_evaluation(
                     "labels": case.labels.model_dump(mode="json"),
                     "legacy": legacy,
                     "candidates": candidates,
+                    "neutral_usefulness_candidates": neutral_usefulness_candidates,
                 }
             )
         before_metadata = statement_count["total"]
@@ -562,9 +780,21 @@ async def run_recall_evaluation(
         "total_db_statement_count": statement_count["total"],
         "case_db_statement_counts": case_query_counts,
         "metadata_query_count": metadata_query_count,
-        "provider_calls": provider_calls,
+        "provider_calls": dict(sorted(provider_calls.items())),
+        "provider_call_expectations": {
+            "semantic_query_embedding": expected_query_embeddings,
+            "classification": 0,
+            "assessment": 0,
+            "other_model": 0,
+        },
+        "provider_call_expectations_met": False,
         "candidate_receipts_persisted": 0,
     }
+    mutation_proof["provider_call_expectations_met"] = (
+        mutation_proof["provider_calls"] == mutation_proof["provider_call_expectations"]
+    )
+    if not mutation_proof["provider_call_expectations_met"]:
+        raise RuntimeError("recall_evaluation_unexpected_provider_invocation")
     public = _public_report(manifest, case_rows, mutation_proof=mutation_proof)
     private = {
         "private_report_schema_version": REPORT_SCHEMA_VERSION,
@@ -572,9 +802,11 @@ async def run_recall_evaluation(
         "case_rows": case_rows,
         "public_report_digest": public["report_digest"],
         "performance": {
-            "case_elapsed_ms": timings_ms,
+            "comparison_elapsed_ms": timings_ms,
+            "profile_elapsed_ms": profile_timings_ms,
             "p50_elapsed_ms": _percentile(timings_ms, 0.50),
             "p95_elapsed_ms": _percentile(timings_ms, 0.95),
+            "evaluation_report_overhead_ms": None,
             "timing_excluded_from_public_digest": True,
         },
     }
@@ -604,6 +836,7 @@ async def read_only_evaluation_session(
             text("SELECT set_config('app.principal_id', :principal_id, true)"),
             {"principal_id": str(manifest.memory_context.principal_id)},
         )
+        _reset_evaluation_kind_cache(manifest.memory_context.tenant_id)
         yield session
 
 

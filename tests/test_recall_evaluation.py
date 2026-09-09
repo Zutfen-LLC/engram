@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID
 
 import pytest
@@ -12,6 +14,11 @@ from engram.semantic_context_manifest import semantic_query_digest
 from evals.admission.schema import digest
 from evals.recall.contracts import usefulness_perturbation_report
 from evals.recall.metrics import build_packet_change_metrics, build_profile_metrics
+from evals.recall.runner import (
+    _grouped_exposure_concentration,
+    _public_report,
+    build_markdown_report,
+)
 from evals.recall.schema import RecallEvaluationManifest
 
 
@@ -205,3 +212,121 @@ def test_labels_are_neutral_and_profile_effects_are_derived_from_membership() ->
     assert governed_metrics["usefulness"]["legacy_useful_retained"] == 1
     assert exploratory_metrics["contamination"]["retained"] == 1
     assert exploratory_metrics["usefulness"]["legacy_useful_withheld"] == 1
+
+
+@pytest.mark.parametrize(
+    ("packets", "expected_count", "expected_hhi"),
+    [
+        ([], 0, None),
+        ([{"items": [{"kind": "fact", "evaluation_strata": {"source_type": "manual"}}]}], 1, 1.0),
+        (
+            [
+                {
+                    "items": [
+                        {"kind": "fact", "evaluation_strata": {"source_type": "manual"}},
+                        {"kind": "fact", "evaluation_strata": {"source_type": "manual"}},
+                        {"kind": "decision", "evaluation_strata": {"source_type": "import"}},
+                    ]
+                }
+            ],
+            3,
+            5 / 9,
+        ),
+    ],
+)
+def test_grouped_exposure_concentration_has_deterministic_boundaries(
+    packets: list[dict[str, Any]], expected_count: int, expected_hhi: float | None
+) -> None:
+    report = _grouped_exposure_concentration(packets, field="source_type")
+
+    assert report["concentration"]["exposure_count"] == expected_count
+    assert report["concentration"]["hhi"] == expected_hhi
+
+
+@pytest.mark.asyncio
+async def test_provider_observer_detects_an_actual_prohibited_gateway(monkeypatch) -> None:
+    """A call to the shared assessment gateway cannot be reported as zero."""
+    from engram import assessment_provider
+    from engram.provider_observer import observe_provider_calls
+
+    class RefusingClient:
+        def __init__(self, **_kwargs: object) -> None:
+            raise RuntimeError("test provider refused")
+
+    monkeypatch.setattr(assessment_provider, "AsyncOpenAI", RefusingClient)
+    with (
+        observe_provider_calls() as calls,
+        pytest.raises(RuntimeError, match="test provider refused"),
+    ):
+        await assessment_provider.assess_content("safe test input", "fact")
+    assert calls["assessment"] == 1
+
+
+def test_public_artifacts_exclude_all_protected_sentinels() -> None:
+    """Build the final JSON and Markdown artifacts, not a packet helper."""
+    manifest_payload = _manifest_payload()
+    protected = {
+        "query": "QUERY-SENTINEL-198",
+        "tenant": "00000000-0000-0000-0000-000000000198",
+        "principal": "00000000-0000-0000-0000-000000000199",
+        "workspace": "WORKSPACE-SENTINEL-198",
+        "content": "MEMORY-CONTENT-SENTINEL-198",
+        "label": "REVIEWER-SENTINEL-198",
+    }
+    manifest_payload["memory_context"] = {
+        **manifest_payload["memory_context"],
+        "tenant_id": protected["tenant"],
+        "principal_id": protected["principal"],
+    }
+    manifest_payload["cases"] = [
+        {
+            **manifest_payload["cases"][0],
+            "query": protected["query"],
+            "query_digest": semantic_query_digest(protected["query"]),
+            "workspace": protected["workspace"],
+            "labels": {
+                "case_id": "case-1",
+                "snapshot_digest": "c" * 64,
+                "contamination": {protected["label"]: "unknown"},
+                "usefulness": {},
+                "label_set_digest": digest(
+                    {"contamination": {protected["label"]: "unknown"}, "usefulness": {}}
+                ),
+            },
+        }
+    ]
+    manifest = RecallEvaluationManifest.model_validate(manifest_payload)
+    packet = {
+        "profile": "legacy",
+        "items": [
+            {
+                    "id": protected["label"],
+                    "content": protected["content"],
+                "kind": "fact",
+                "evaluation_strata": {"source_type": "manual"},
+            }
+        ],
+        "item_count": 1,
+        "byte_count": 1,
+        "token_count": 1,
+        "effective_item_budget": 2,
+        "effective_byte_budget": 2,
+        "effective_token_budget": 2,
+        "omitted_by_admission": {},
+    }
+    candidate = {**packet, "profile": "governed", "admission_diagnostics": []}
+    public = _public_report(
+        manifest,
+        [
+            {
+                "strata": {},
+                "labels": manifest.cases[0].labels.model_dump(mode="json"),
+                "legacy": packet,
+                "candidates": [candidate, {**candidate, "profile": "exploratory"}],
+            }
+        ],
+        mutation_proof={},
+    )
+    artifact = json.dumps(public, sort_keys=True) + build_markdown_report(public)
+    for sentinel in protected.values():
+        assert sentinel not in artifact

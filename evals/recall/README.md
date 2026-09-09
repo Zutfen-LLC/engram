@@ -13,9 +13,19 @@ terminal recommendation.
 `snapshot_digest` is a digest of a protected, repeatable-read capture of the
 live recall-relevant state. It includes the effective tenant configuration,
 embedding profiles, visible memory identities and content hashes, embeddings,
-feedback/exposure bindings, assessment/admission state, and graph/tunnel
-state. It does not claim that PostgreSQL can recreate a historical timestamp.
-The runner recomputes the digest and fails if the connected state differs.
+feedback/exposure bindings, assessment/admission state, graph/tunnel state,
+principals, workspaces, workspace membership, and the tenant memory-kind
+registry. Those rows cover the shared legacy/governed/exploratory path for
+visibility, explicit workspace resolution, feedback-actor qualification, and
+disputed-kind selection. The evaluator clears only its tenant memory-kind
+cache entry before capture and replay. This prevents a pre-existing process
+cache value from changing replay behavior. It does not change production cache
+semantics.
+
+The digest does not reconstruct a historical PostgreSQL state. It does not
+prove external provider responses are reproducible. It does not include
+deployment settings that PostgreSQL does not store. The runner recomputes the
+digest and fails if the connected state differs.
 
 Run the evaluator with a database URL for the application role.
 
@@ -44,15 +54,16 @@ Operational handoff for an authorized dogfood host:
    private output path outside the repository. It creates private files with
    mode `0600` and public files with exclusive creation.
 6. Check the read-only proof, DB statement counts, provider-call counts, and
-   the before/after mutation counters. Stop on any mismatch or provider call
-   other than semantic query embedding.
+   the before/after mutation counters. Provider counts come from observers at
+   the shared embedding, classification, and assessment gateways. Stop on any
+   mismatch or provider call other than the expected semantic query embedding.
 7. Re-run with the same manifest and state. Verify equal input and public
    report digests. Collect the public JSON, Markdown, protected private
    artifact, and command output as completion evidence.
 
 The framework status is `FRAMEWORK_COMPLETE — AUTHORIZED_DOGFOOD_RUN_PENDING`
-until an authorized evaluation is reviewed. Its only machine result is
-`EVALUATION_COMPLETE`; a later human adjudication must be a separate,
+until an authorized evaluation is reviewed. A run reports only
+`EVALUATION_EVIDENCE_COLLECTED`. A later human adjudication must be a separate,
 provenance-bound artifact.
 
 The runner opens a `REPEATABLE READ READ ONLY` transaction. It records before

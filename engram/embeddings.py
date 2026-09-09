@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from engram.config import settings
 from engram.embedding_profiles import LEGACY_MODEL
 from engram.models import EmbeddingProfile, MemoryEmbedding, MemoryItem
+from engram.provider_observer import record_provider_invocation
 from engram.usage import (
     Timer,
     extract_openai_compatible_usage,
@@ -77,6 +78,8 @@ async def generate_embeddings(
     ``embedding_setup``). Omitting ``tenant_id`` (the default) records
     nothing, so callers without tenant context are unaffected.
     """
+    if operation != "embedding_query_recall":
+        record_provider_invocation("other_model")
     provider = profile.provider if profile is not None else settings.embedding_provider
     model = profile.model if profile is not None else settings.embedding_model
     dimensions = profile.dimensions if profile is not None else settings.embedding_dim

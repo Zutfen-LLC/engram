@@ -1100,6 +1100,7 @@ async def _admit_and_rank_signal_items(
     item_by_id: dict[UUID, MemoryItem],
     stay_kinds: set[str],
     now: datetime,
+    demonstrated_usefulness_enabled: bool = True,
 ) -> SignalAdmissionOutcome:
     """V2-bound admission + separated-signal ranking (issues #160 / #186 / #190).
 
@@ -1230,11 +1231,19 @@ async def _admit_and_rank_signal_items(
     # it only contributes a bounded ordering adjustment to these entries.
     from engram.demonstrated_usefulness import load_demonstrated_usefulness
 
-    usefulness_by_item = await load_demonstrated_usefulness(
-        session,
-        tenant_id=memory_context.tenant_id,
-        items=[entry.item for entry in admitted],
-    )
+    if demonstrated_usefulness_enabled:
+        usefulness_by_item = await load_demonstrated_usefulness(
+            session,
+            tenant_id=memory_context.tenant_id,
+            items=[entry.item for entry in admitted],
+        )
+    else:
+        from engram.demonstrated_usefulness import summarize_demonstrated_usefulness_counts
+
+        usefulness_by_item = {
+            entry.item.id: summarize_demonstrated_usefulness_counts(useful_count=0, noise_count=0)
+            for entry in admitted
+        }
     for entry in admitted:
         recall_signals.apply_demonstrated_usefulness(
             entry.item_dict,
@@ -1664,6 +1673,13 @@ async def generate_query_embedding(
     """
     import inspect
 
+    from engram.provider_observer import record_provider_invocation
+
+    # This is the shared production boundary for semantic recall query
+    # embeddings. Recording here also observes test/runtime adapters that
+    # replace ``generate_embedding`` below.
+    record_provider_invocation("semantic_query_embedding")
+
     if len(inspect.signature(generate_embedding).parameters) >= 2:
         return await generate_embedding(
             query,
@@ -1746,6 +1762,7 @@ async def evaluate_semantic_profile(
     token_budget: int | None,
     item_budget: int | None,
     now: datetime,
+    demonstrated_usefulness_enabled: bool = True,
 ) -> SemanticPacketEvaluation:
     """Evaluate one profile's packet for a query embedding, writing nothing.
 
@@ -1847,6 +1864,7 @@ async def evaluate_semantic_profile(
             item_by_id=item_by_id,
             stay_kinds=stay_kinds,
             now=now,
+            demonstrated_usefulness_enabled=demonstrated_usefulness_enabled,
         )
         enriched = signal_admission.items
         omitted_by_admission = signal_admission.omitted_by_admission
