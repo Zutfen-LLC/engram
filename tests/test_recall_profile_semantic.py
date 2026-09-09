@@ -3400,9 +3400,17 @@ async def test_frozen_recall_evaluation_uses_shared_profiles_without_mutation(
 
     from engram.embedding_profiles import get_active_profile
     from engram.semantic_context_manifest import semantic_query_digest
-    from evals.recall.runner import read_only_evaluation_session, run_recall_evaluation
+    from evals.admission.schema import digest
+    from evals.recall.runner import (
+        current_repository_sha,
+        evaluation_state_identity,
+        read_only_evaluation_session,
+        run_recall_evaluation,
+    )
     from evals.recall.schema import RecallEvaluationManifest
 
+    repository_sha = "a" * 40
+    monkeypatch.setenv("ENGRAM_REPOSITORY_SHA", repository_sha)
     async with _test_session_factory() as session:
         identity = (
             await session.execute(
@@ -3414,16 +3422,23 @@ async def test_frozen_recall_evaluation_uses_shared_profiles_without_mutation(
             )
         ).mappings().one()
         embedding_profile = await get_active_profile(session)
+        tenant_config_version = await session.scalar(
+            text(
+                "SELECT config_version FROM tenant_config "
+                "WHERE tenant_id = :tenant_id AND active = TRUE"
+            ),
+            {"tenant_id": identity["tenant_id"]},
+        )
     frozen_at = datetime(2026, 9, 8, tzinfo=UTC)
     manifest = RecallEvaluationManifest.model_validate(
         {
             "schema_version": "engram-recall-evaluation-input-v1",
             "baseline_sha": "e20a62853be75916c6a890fd7876c7e14c2718fc",
-            "repository_sha": "e20a62853be75916c6a890fd7876c7e14c2718fc",
+            "repository_sha": current_repository_sha(),
             "snapshot_digest": "0" * 64,
             "snapshot_at": frozen_at,
             "evaluation_at": frozen_at,
-            "tenant_config_version": "test-v1",
+            "tenant_config_version": tenant_config_version,
             "embedding_profile_key": embedding_profile.profile_key,
             "memory_context": {
                 "version": "memory-context-v2",
@@ -3440,6 +3455,10 @@ async def test_frozen_recall_evaluation_uses_shared_profiles_without_mutation(
             ],
         }
     )
+
+    async with read_only_evaluation_session(_test_session_factory, manifest) as session:
+        snapshot_digest = digest(await evaluation_state_identity(session, manifest))
+    manifest = manifest.model_copy(update={"snapshot_digest": snapshot_digest})
 
     async with read_only_evaluation_session(_test_session_factory, manifest) as session:
         private_first, public_first = await run_recall_evaluation(session, manifest)

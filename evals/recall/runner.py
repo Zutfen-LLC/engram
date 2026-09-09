@@ -4,20 +4,34 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import time
 from collections import Counter
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import event, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from engram import recall_shadow
 from engram.demonstrated_usefulness import DEMONSTRATED_USEFULNESS_VERSION
 from engram.embedding_profiles import get_active_profile
-from engram.models import MemoryItem
+from engram.models import (
+    AdmissionAssessment,
+    AdmissionAssessmentCurrent,
+    EmbeddingProfile,
+    FeedbackEvent,
+    KgTriple,
+    MemoryAssessment,
+    MemoryEdge,
+    MemoryEmbedding,
+    MemoryItem,
+    RecallLog,
+    TenantConfig,
+    Tunnel,
+)
 from engram.recall_packing import RECALL_PACKING_VERSION
 from engram.recall_profiles import (
     CERTIFIED_SERVING_PROFILES,
@@ -42,6 +56,106 @@ _MUTATION_TABLES = (
     "admission_assessments",
     "admission_assessment_current",
 )
+
+
+def _canonical_value(value: Any) -> Any:
+    """Convert ORM values to a deterministic, private digest representation."""
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    if isinstance(value, bytes):
+        return value.hex()
+    if isinstance(value, (list, tuple)):
+        return [_canonical_value(entry) for entry in value]
+    if isinstance(value, dict):
+        return {str(key): _canonical_value(entry) for key, entry in sorted(value.items())}
+    # UUID, Decimal, and pgvector values all have stable textual forms.
+    if value is not None and not isinstance(value, (str, int, float, bool)):
+        return str(value)
+    return value
+
+
+def _row_identity(row: Any, *, excluded: frozenset[str] = frozenset()) -> dict[str, Any]:
+    """Capture every material stored field without retaining raw content."""
+    return {
+        column.name: _canonical_value(getattr(row, column.name))
+        for column in row.__table__.columns
+        if column.name not in excluded
+    }
+
+
+async def evaluation_state_identity(
+    session: AsyncSession, manifest: RecallEvaluationManifest
+) -> dict[str, Any]:
+    """Return the replay-relevant live state sealed by ``snapshot_digest``.
+
+    This is an explicit capture identity, not a claim that PostgreSQL can
+    reconstruct a historical snapshot from an arbitrary timestamp.  A replay
+    succeeds only while the connected state hashes to the frozen identity.
+    Raw memory content, recall queries, and review notes never leave this
+    function; memory content is represented by its stored content hash.
+    """
+    tenant_id = manifest.memory_context.tenant_id
+    scoped_models = (
+        MemoryItem,
+        MemoryEmbedding,
+        FeedbackEvent,
+        RecallLog,
+        MemoryAssessment,
+        AdmissionAssessment,
+        AdmissionAssessmentCurrent,
+        KgTriple,
+        MemoryEdge,
+        Tunnel,
+    )
+    tables: dict[str, list[dict[str, Any]]] = {}
+    for model in scoped_models:
+        rows = list(
+            (await session.scalars(select(model).where(model.tenant_id == tenant_id))).all()
+        )
+        excluded = (
+            frozenset({"content", "query", "review_notes"})
+            if model in (MemoryItem, RecallLog)
+            else frozenset()
+        )
+        tables[model.__tablename__] = sorted(
+            (_row_identity(row, excluded=excluded) for row in rows),
+            key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":")),
+        )
+    config_rows = list(
+        (
+            await session.scalars(select(TenantConfig).where(TenantConfig.tenant_id == tenant_id))
+        ).all()
+    )
+    profiles = list((await session.scalars(select(EmbeddingProfile))).all())
+    return {
+        "schema_version": "engram-recall-evaluation-state-v1",
+        "repository_sha": manifest.repository_sha,
+        "runtime_versions": _runtime_versions(),
+        "memory_context": manifest.memory_context.model_dump(mode="json"),
+        "tenant_config": sorted(
+            (_row_identity(row) for row in config_rows),
+            key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":")),
+        ),
+        "embedding_profiles": sorted(
+            (_row_identity(row) for row in profiles),
+            key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":")),
+        ),
+        "tables": tables,
+    }
+
+
+def current_repository_sha() -> str:
+    """Return the deployed source revision, or fail closed when unavailable."""
+    configured = os.environ.get("ENGRAM_REPOSITORY_SHA")
+    if configured:
+        return configured
+    repository = Path(__file__).resolve().parents[2]
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"], text=True
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError("recall_evaluation_repository_identity_unavailable") from error
 
 
 async def _mutation_snapshot(session: AsyncSession) -> dict[str, int]:
@@ -110,11 +224,7 @@ def _safe_packet(packet: dict[str, Any]) -> dict[str, Any]:
 
 
 def _concentration(packets: list[dict[str, Any]]) -> dict[str, Any]:
-    exposures = Counter(
-        str(item["id"])
-        for packet in packets
-        for item in packet["items"]
-    )
+    exposures = Counter(str(item["id"]) for packet in packets for item in packet["items"])
     total = sum(exposures.values())
     counts = sorted(exposures.values())
     if not total:
@@ -251,6 +361,48 @@ def _budget_utilization(packets: list[dict[str, Any]]) -> dict[str, Any]:
     return result
 
 
+@contextmanager
+def _statement_counter(session: AsyncSession) -> Any:
+    """Measure statements issued by this evaluation transaction.
+
+    The listener observes actual DBAPI executions.  It does not infer a query
+    count from an expected code path.
+    """
+    count = {"total": 0}
+    engine = session.sync_session.get_bind()
+
+    def observe(*_args: Any, **_kwargs: Any) -> None:
+        count["total"] += 1
+
+    event.listen(engine, "before_cursor_execute", observe)
+    try:
+        yield count
+    finally:
+        event.remove(engine, "before_cursor_execute", observe)
+
+
+def _empty_packet(profile: str, case: Any) -> dict[str, Any]:
+    """Represent a legitimate zero-eligible packet without provider work."""
+    return {
+        "profile": profile,
+        "scoring_version": None,
+        "signals_version": None,
+        "item_count": 0,
+        "byte_count": 0,
+        "candidate_count": 0,
+        "omitted_by_admission": {},
+        "admission_diagnostics": [],
+        "v2_resolution": None,
+        "expansion": None,
+        "packing": None,
+        "effective_byte_budget": case.byte_budget,
+        "effective_token_budget": case.token_budget,
+        "effective_item_budget": case.item_budget,
+        "items": [],
+        "token_count": 0,
+    }
+
+
 def _public_report(
     manifest: RecallEvaluationManifest,
     case_rows: list[dict[str, Any]],
@@ -298,7 +450,9 @@ def _public_report(
             "hhi": "sum((item_exposures / total_exposures)^2)",
             "gini": "sum((2*i-n-1)*x_i) / (n*sum(x_i)), sorted x_i ascending",
         },
-        "terminal_recommendation": manifest.terminal_recommendation,
+        # #198 does not contain deterministic certification gates.  The
+        # runner can only report that it completed its evidence collection.
+        "evaluation_status": "EVALUATION_COMPLETE",
         "limitations": [
             "Unknown labels stay unknown and are excluded from known-rate denominators.",
             "Usefulness is reported as utility evidence, not epistemic evidence.",
@@ -323,46 +477,92 @@ async def run_recall_evaluation(
     active_embedding = await get_active_profile(session)
     if active_embedding.profile_key != manifest.embedding_profile_key:
         raise ValueError("embedding_profile_identity_mismatch")
+    if current_repository_sha() != manifest.repository_sha:
+        raise ValueError("repository_identity_mismatch")
+    active_config = await session.scalar(
+        select(TenantConfig).where(
+            TenantConfig.tenant_id == manifest.memory_context.tenant_id,
+            TenantConfig.active.is_(True),
+        )
+    )
+    if active_config is None or active_config.config_version != manifest.tenant_config_version:
+        raise ValueError("tenant_config_identity_mismatch")
+    state = await evaluation_state_identity(session, manifest)
+    if digest(state) != manifest.snapshot_digest:
+        raise ValueError("evaluation_snapshot_identity_mismatch")
     before = await _mutation_snapshot(session)
     context = manifest.memory_context.resolve()
     case_rows: list[dict[str, Any]] = []
     timings_ms: list[float] = []
-    for case in manifest.cases:
-        started = time.perf_counter()
-        result = await recall_shadow.evaluate_recall_shadow_comparison(
-            session,
-            memory_context=context,
-            workspace=case.workspace,
-            query=case.query,
-            candidate_profiles=["governed", "exploratory"],
-            byte_budget=case.byte_budget,
-            token_budget=case.token_budget,
-            item_budget=case.item_budget,
-            now=manifest.evaluation_at,
-        )
-        timings_ms.append((time.perf_counter() - started) * 1000)
-        if result["legacy"] is None:
-            raise ValueError("recall_evaluation_requires_query_embedding")
-        case_rows.append(
-            {
-                "case_id": case.case_id,
-                "query_digest": case.query_digest,
-                "strata": case.strata,
-                "labels": case.labels.model_dump(mode="json"),
-                "legacy": _safe_packet(result["legacy"]),
-                "candidates": [_safe_packet(packet) for packet in result["candidates"]],
-            }
-        )
-    await _attach_item_strata(session, case_rows, manifest.evaluation_at)
+    case_query_counts: dict[str, int] = {}
+    provider_calls = {
+        "semantic_query_embedding": 0,
+        "classification": 0,
+        "assessment": 0,
+        "usefulness": 0,
+        "relationship_expansion": 0,
+        "packing": 0,
+        "other": 0,
+    }
+    with _statement_counter(session) as statement_count:
+        for case in manifest.cases:
+            before_case = statement_count["total"]
+            started = time.perf_counter()
+            result = await recall_shadow.evaluate_recall_shadow_comparison(
+                session,
+                memory_context=context,
+                workspace=case.workspace,
+                query=case.query,
+                candidate_profiles=["governed", "exploratory"],
+                byte_budget=case.byte_budget,
+                token_budget=case.token_budget,
+                item_budget=case.item_budget,
+                now=manifest.evaluation_at,
+            )
+            timings_ms.append((time.perf_counter() - started) * 1000)
+            case_query_counts[case.case_id] = statement_count["total"] - before_case
+            if result.get("embedding_outcome") in {"succeeded", "disabled"}:
+                provider_calls["semantic_query_embedding"] += 1
+            if result["legacy"] is None:
+                if result["candidate_count"] == 0 and context.may_read_anything:
+                    legacy = _empty_packet("legacy", case)
+                    candidates = [
+                        _empty_packet("governed", case),
+                        _empty_packet("exploratory", case),
+                    ]
+                elif result.get("embedding_outcome") == "disabled":
+                    raise ValueError("recall_evaluation_query_embedding_unavailable")
+                else:
+                    raise ValueError("recall_evaluation_inaccessible_or_invalid_corpus")
+            else:
+                legacy = _safe_packet(result["legacy"])
+                candidates = [_safe_packet(packet) for packet in result["candidates"]]
+            case_rows.append(
+                {
+                    "case_id": case.case_id,
+                    "query_digest": case.query_digest,
+                    "strata": case.strata,
+                    "labels": case.labels.model_dump(mode="json"),
+                    "legacy": legacy,
+                    "candidates": candidates,
+                }
+            )
+        before_metadata = statement_count["total"]
+        await _attach_item_strata(session, case_rows, manifest.evaluation_at)
+        metadata_query_count = statement_count["total"] - before_metadata
     after = await _mutation_snapshot(session)
     if before != after:
         raise RuntimeError("recall_evaluation_detected_production_mutation")
     mutation_proof = {
         "transaction": "REPEATABLE READ READ ONLY",
+        "snapshot_digest_verified": manifest.snapshot_digest,
         "before_after_equal": True,
         "tracked_tables": list(_MUTATION_TABLES),
         "tracked_counters": before,
-        "metadata_query_count": 1 if case_rows else 0,
+        "total_db_statement_count": statement_count["total"],
+        "case_db_statement_counts": case_query_counts,
+        "metadata_query_count": metadata_query_count,
+        "provider_calls": provider_calls,
         "candidate_receipts_persisted": 0,
     }
     public = _public_report(manifest, case_rows, mutation_proof=mutation_proof)
@@ -375,6 +575,7 @@ async def run_recall_evaluation(
             "case_elapsed_ms": timings_ms,
             "p50_elapsed_ms": _percentile(timings_ms, 0.50),
             "p95_elapsed_ms": _percentile(timings_ms, 0.95),
+            "timing_excluded_from_public_digest": True,
         },
     }
     return private, public
@@ -394,9 +595,7 @@ async def read_only_evaluation_session(
 ) -> AsyncIterator[AsyncSession]:
     """Open a tenant-scoped PostgreSQL transaction that rejects writes."""
     async with session_factory() as session, session.begin():
-        await session.execute(
-            text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-        )
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
         await session.execute(
             text("SELECT set_config('app.tenant_id', :tenant_id, true)"),
             {"tenant_id": str(manifest.memory_context.tenant_id)},
@@ -416,7 +615,7 @@ def build_markdown_report(report: dict[str, Any]) -> str:
         f"- Input digest: `{report['input_digest']}`",
         f"- Repository SHA: `{report['input']['repository_sha']}`",
         f"- Cases: {report['input']['case_count']}",
-        f"- Recommendation: `{report['terminal_recommendation']}`",
+        f"- Evaluation status: `{report['evaluation_status']}`",
         "- Privacy: aggregate-only; no memory or query content is included.",
         "",
         "## Packet comparison",
@@ -487,6 +686,8 @@ __all__ = [
     "REPORT_SCHEMA_VERSION",
     "RUNNER_VERSION",
     "build_markdown_report",
+    "current_repository_sha",
+    "evaluation_state_identity",
     "read_only_evaluation_session",
     "run_recall_evaluation",
     "write_reports",

@@ -30,6 +30,8 @@ def build_packet_change_metrics(
     membership_changed = legacy_set != candidate_set
     ordering_only = not membership_changed and legacy_ids != candidate_ids
     omissions = Counter(candidate.get("omitted_by_admission", {}))
+    packing = candidate.get("packing") or {}
+    packing_omissions = Counter(packing.get("omitted_by_reason", {}))
     return {
         "packet_count": 1,
         "identical_packet_rate": 1.0 if legacy_ids == candidate_ids else 0.0,
@@ -40,7 +42,10 @@ def build_packet_change_metrics(
         "removed_items": len(legacy_set - candidate_set),
         "item_count_delta": int(candidate["item_count"]) - int(legacy["item_count"]),
         "byte_count_delta": int(candidate["byte_count"]) - int(legacy["byte_count"]),
+        "token_count_delta": int(candidate.get("token_count", 0))
+        - int(legacy.get("token_count", 0)),
         "omission_reasons": dict(sorted(omissions.items())),
+        "packing_omission_reasons": dict(sorted(packing_omissions.items())),
     }
 
 
@@ -48,8 +53,10 @@ def _sum_packet_change(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
     rows = list(rows)
     count = len(rows)
     omission_reasons: Counter[str] = Counter()
+    packing_omission_reasons: Counter[str] = Counter()
     for row in rows:
         omission_reasons.update(row["omission_reasons"])
+        packing_omission_reasons.update(row["packing_omission_reasons"])
     return {
         "packet_count": count,
         "identical_packet_rate": _rate(
@@ -66,7 +73,9 @@ def _sum_packet_change(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "removed_items": sum(row["removed_items"] for row in rows),
         "item_count_delta": sum(row["item_count_delta"] for row in rows),
         "byte_count_delta": sum(row["byte_count_delta"] for row in rows),
+        "token_count_delta": sum(row["token_count_delta"] for row in rows),
         "omission_reasons": dict(sorted(omission_reasons.items())),
+        "packing_omission_reasons": dict(sorted(packing_omission_reasons.items())),
     }
 
 
@@ -75,10 +84,32 @@ def _classify_labels(rows: Iterable[dict[str, Any]]) -> tuple[dict[str, Any], di
     usefulness: Counter[str] = Counter()
     for row in rows:
         labels = row.get("labels", {})
-        contamination.update(labels.get("contamination", {}).values())
         legacy_ids = set(_item_ids(row["legacy"]))
         candidate_ids = set(_item_ids(row["candidate"]))
+        packet_ids = legacy_ids | candidate_ids
+        for item_id, label in labels.get("contamination", {}).items():
+            if item_id not in packet_ids:
+                raise ValueError("label_item_absent_from_compared_packets")
+            if label == "unknown":
+                contamination["unknown"] += 1
+            elif label == "contaminated":
+                if item_id in legacy_ids and item_id not in candidate_ids:
+                    contamination["avoided"] += 1
+                elif item_id not in legacy_ids and item_id in candidate_ids:
+                    contamination["introduced"] += 1
+                elif item_id in legacy_ids and item_id in candidate_ids:
+                    contamination["retained"] += 1
+                else:  # Defensive: packet_ids check above makes this unreachable.
+                    raise ValueError("label_item_membership_unresolvable")
+            elif label == "acceptable":
+                # An acceptable item removed is a coverage effect, never
+                # evidence that contamination was avoided.
+                contamination["acceptable"] += 1
+            else:
+                raise ValueError("malformed_contamination_label")
         for item_id, label in labels.get("usefulness", {}).items():
+            if item_id not in packet_ids:
+                raise ValueError("label_item_absent_from_compared_packets")
             if label == "unknown":
                 usefulness["unknown"] += 1
             elif label == "useful" and item_id in legacy_ids:
@@ -90,12 +121,16 @@ def _classify_labels(rows: Iterable[dict[str, Any]]) -> tuple[dict[str, Any], di
             elif label == "useful" and item_id in candidate_ids:
                 usefulness["candidate_only_useful"] += 1
             else:
-                usefulness["unknown"] += 1
+                raise ValueError("malformed_usefulness_label")
 
-    known_contamination = contamination["avoided"] + contamination["introduced"]
+    known_contamination = (
+        contamination["avoided"] + contamination["introduced"] + contamination["retained"]
+    )
     contamination_report = {
         "avoided": contamination["avoided"],
         "introduced": contamination["introduced"],
+        "retained": contamination["retained"],
+        "acceptable": contamination["acceptable"],
         "unknown": contamination["unknown"],
         "known_denominator": known_contamination,
         "avoided_rate": _rate(contamination["avoided"], known_contamination),

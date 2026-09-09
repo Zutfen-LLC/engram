@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
@@ -61,12 +61,44 @@ class MemoryContextSnapshot(_Record):
 
 
 class RecallCaseLabels(_Record):
-    """Optional reviewed labels. Unlabeled cases stay unknown."""
+    """Reviewed item state bound to one frozen case and snapshot.
 
-    contamination: dict[str, Literal["avoided", "introduced", "unknown"]] = Field(
+    The values describe the reviewed item, not a result for a recall profile.
+    Candidate-specific effects are derived from packet membership by the
+    metrics module.  Empty labels need no binding because they are not
+    evidence.
+    """
+
+    case_id: Token | None = None
+    snapshot_digest: Digest | None = None
+    label_set_digest: Digest | None = None
+    contamination: dict[str, Literal["contaminated", "acceptable", "unknown"]] = Field(
         default_factory=dict
     )
     usefulness: dict[str, Literal["useful", "unknown"]] = Field(default_factory=dict)
+
+    def canonical_identity(self) -> dict[str, Any]:
+        """Return the label content that the reviewer seals with a digest."""
+        return {
+            "contamination": dict(sorted(self.contamination.items())),
+            "usefulness": dict(sorted(self.usefulness.items())),
+        }
+
+    def is_empty(self) -> bool:
+        return not self.contamination and not self.usefulness
+
+    def validate_binding(self, *, case_id: str, snapshot_digest: str) -> None:
+        """Reject labels that cannot be tied to this frozen replay input."""
+        if self.is_empty():
+            if any((self.case_id, self.snapshot_digest, self.label_set_digest)):
+                raise ValueError("empty_labels_must_not_have_binding")
+            return
+        if self.case_id != case_id:
+            raise ValueError("label_case_id_mismatch")
+        if self.snapshot_digest != snapshot_digest:
+            raise ValueError("label_snapshot_digest_mismatch")
+        if self.label_set_digest != digest(self.canonical_identity()):
+            raise ValueError("label_set_digest_mismatch")
 
 
 class RecallQueryCase(_Record):
@@ -88,7 +120,12 @@ class RecallQueryCase(_Record):
 
 
 class RecallEvaluationManifest(_Record):
-    """Private replay manifest. Its digest omits query text and raw IDs."""
+    """Private replay manifest.
+
+    ``input_digest`` hashes the complete material input.  The public identity
+    intentionally does not: public artifacts expose that digest, rather than
+    tenant, principal, workspace, or query identity.
+    """
 
     schema_version: Literal["engram-recall-evaluation-input-v1"]
     baseline_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
@@ -100,17 +137,26 @@ class RecallEvaluationManifest(_Record):
     embedding_profile_key: Token
     memory_context: MemoryContextSnapshot
     cases: tuple[RecallQueryCase, ...] = Field(min_length=1)
-    terminal_recommendation: Literal[
-        "READY_FOR_162_RECALL_CERTIFICATION",
-        "RECALL_CORRECTION_REQUIRED",
-        "INCONCLUSIVE",
-    ] = "INCONCLUSIVE"
 
     @model_validator(mode="after")
     def unique_case_ids(self) -> RecallEvaluationManifest:
         if len({case.case_id for case in self.cases}) != len(self.cases):
             raise ValueError("duplicate_recall_case_id")
+        for case in self.cases:
+            case.labels.validate_binding(
+                case_id=case.case_id,
+                snapshot_digest=self.snapshot_digest,
+            )
         return self
+
+    def private_input_identity(self) -> dict[str, Any]:
+        """Return every input that can change a replay result.
+
+        This value is private because it includes the raw request boundary and
+        query text.  It is only ever used as digest input or in the protected
+        private artifact.
+        """
+        return self.model_dump(mode="json")
 
     def public_identity(self) -> dict[str, object]:
         """Return reproducibility metadata that cannot contain query text."""
@@ -121,12 +167,10 @@ class RecallEvaluationManifest(_Record):
             "snapshot_digest": self.snapshot_digest,
             "snapshot_at": self.snapshot_at.isoformat(),
             "evaluation_at": self.evaluation_at.isoformat(),
-            "tenant_config_version": self.tenant_config_version,
             "embedding_profile_key": self.embedding_profile_key,
             "case_count": len(self.cases),
-            "case_digests": [case.query_digest for case in self.cases],
         }
 
     @property
     def input_digest(self) -> str:
-        return digest(self.public_identity())
+        return digest(self.private_input_identity())
