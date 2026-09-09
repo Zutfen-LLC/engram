@@ -55,7 +55,7 @@ RECALL_PROFILE_CONTRACT_VERSION: Final[Literal["recall-profiles-v1"]] = "recall-
 # admission — see engram.recall_signals). Distinct from the legacy blend's
 # "semantic-v3" so recall_logs.scoring_version identifies which ranking
 # produced a given packet.
-SIGNALS_RANKING_VERSION: Final[Literal["semantic-signals-v1"]] = "semantic-signals-v1"
+SIGNALS_RANKING_VERSION: Final[Literal["semantic-signals-v2"]] = "semantic-signals-v2"
 
 STARTUP_PROFILE_KEY: Final[Literal["startup"]] = "startup"
 

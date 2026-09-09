@@ -40,8 +40,8 @@ recall.
    | Profile | Corpus window | Admission gate | Ranking | Budget caps | Expansion |
    |---|---|---|---|---|---|
    | `legacy` (default) | active + proposed | none | `semantic-v3` blend (unchanged) | none | yes |
-   | `governed` | active + disputed stay kinds | yes | `semantic-signals-v1` | none | no |
-   | `exploratory` | active + proposed | yes | `semantic-signals-v1` | item 20 / byte 2048 | no |
+   | `governed` | active + disputed stay kinds | yes | `semantic-signals-v2` | none | no |
+   | `exploratory` | active + proposed | yes | `semantic-signals-v2` | item 20 / byte 2048 | no |
 
    `review`/`historical-audit` from the issue's candidate list are
    deliberately not selectable yet: they are reviewer/operator surfaces with
@@ -92,7 +92,7 @@ recall.
    exploratory nor governed can be smuggled through MCP defaults.
 
 4. **Separated signal model** (`engram/recall_signals.py`, version
-   `recall-signals-v1`, admission policy version `recall-admission-v1`).
+   `recall-signals-v2`, admission policy version `recall-admission-v2`).
    Items under governed/exploratory expose distinct fields:
    `relevance_score`, `utility_score`, `epistemic_state`
    (`supported|contested|insufficient_evidence|unknown`), structured
@@ -109,8 +109,9 @@ recall.
    ranking — it reads governance state only (review status, disputed
    stay-kind doctrine, durable admission outcome), never similarity,
    importance, or exposure. Among admitted items,
-   `rank = similarity * (0.5 + 0.5 * utility)` where
-   `utility = 0.7 * importance + 0.3 * freshness`. Relevance dominates;
+   `rank = similarity * (0.5 + 0.5 * utility)` where the current
+   utility contract is documented in the issue #196 supplement below.
+   Relevance dominates;
    utility orders; unknown evidence is admitted-or-withheld-and-marked, never
    converted into a numeric trust floor.
 
@@ -489,15 +490,63 @@ production serving, no #161 corroboration, and no #162 certification/cutover.
    summary, no per-item `packing_reason` keys on legacy items);
    `CERTIFIED_SERVING_PROFILES` stays `{"legacy"}`.
 
-Context Ledger receipt binding, demonstrated-usefulness feedback,
-dogfood/exposure evaluation, and #162 certification/cutover remain follow-up.
+Context Ledger receipt binding, dogfood/exposure evaluation, and #162
+certification/cutover remain follow-up.
+
+## Supplement (issue #196): explicit priority and demonstrated usefulness
+
+Candidate utility has a separately-versioned contract, `recall-utility-v2`,
+and candidate signal/ranking identity `recall-signals-v2` /
+`semantic-signals-v2`:
+
+```text
+base_utility = 0.7 * explicit_priority + 0.3 * freshness
+utility_v2 = clamp01(base_utility + demonstrated_usefulness_adjustment)
+```
+
+`explicit_priority` is the durable caller/operator-selected priority baseline.
+New writers and explicit-priority edits maintain it alongside legacy
+`importance`; the migration snapshots each existing row's current
+`importance` exactly. That snapshot cannot retrospectively decompose prior
+feedback deltas or clamps, and intentionally makes no such claim.
+
+Legacy `importance` remains the compatibility surface until #162: canonical
+feedback keeps applying its existing importance deltas and startup-counter
+behavior, but never changes `explicit_priority`. Candidate profiles read only
+`explicit_priority` for the priority component.
+
+`demonstrated-usefulness-v1` is a root-agnostic, post-admission-only input.
+It loads only current canonical feedback from resolvable actors whose bound
+recall log proves that same actor was exposed to that admitted item. Author
+feedback and missing/mismatched exposure bindings are excluded fail-closed.
+It reports diagnostic counts but no identities, and its adjustment is
+deliberately non-amplifying:
+
+| State | Current qualifying external verdicts | Adjustment |
+| --- | --- | --- |
+| `none` | neither kind | `0.00` |
+| `positive` | useful only | `+0.10` |
+| `negative` | noise only | `-0.10` |
+| `mixed` | both kinds | `0.00` |
+
+Actor count never raises the adjustment magnitude. The evaluator does not
+load or infer evidence roots, actor independence, corroboration, reputation,
+or promotion authority; those questions remain exclusively #161 work.
+Usefulness cannot change admission, assessment/evidence state, review,
+promotion, or relationship relevance, and it cannot resurrect a withheld
+item. It affects only the final ordering of already-admitted shadow items.
+
+`semantic-context-manifest-v1` remains frozen. It may bind the final utility
+score and the existing scoring identity in memory, but the additive shadow
+utility diagnostics do not widen the manifest or authorize receipts.
 
 ## Feedback-loop safeguards (issue #160)
 
 * utility excludes exposure counters (`recall_count`,
   `startup_recall_count`) — repeated serving cannot raise rank through
   utility, admission, or epistemic state;
-* admission ignores similarity/importance — popularity cannot buy admission;
+* admission ignores similarity/explicit priority/usefulness — popularity
+  cannot buy admission;
 * semantic telemetry still increments only `recall_count`/`last_recalled_at`
   on served packets, unchanged from legacy; the shadow surface increments
   nothing.
@@ -521,9 +570,9 @@ Deliberately deferred, tracked by the issue:
   equality alone is not treated as provenance/root identity, and richer
   evidence-root identity from the #157 evidence manifest would be #161-owned
   follow-up and must not be inferred from similarity or content equality.
-* **Demonstrated-usefulness feedback in utility** — utility-v1 is importance
-  + freshness only; versioned, bounded feedback with actor/root provenance is
-  follow-up.
+* **Evidence-root-aware usefulness/corroboration** — usefulness-v1 is
+  deliberately root-agnostic and non-amplifying. Root identity, independence,
+  corroboration, and any richer usefulness lane belong to #161.
 * **Semantic Context Ledger receipts** — `semantic-context-manifest-v1` can
   bind a finalized served packet without reevaluation. Its default-off dark
   write applies only to authoritative legacy semantic recall. Candidate

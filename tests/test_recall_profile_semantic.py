@@ -31,7 +31,7 @@ from __future__ import annotations
 import math
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -44,6 +44,8 @@ from engram.api.app import create_app
 from engram.api.routes import memory as memory_routes
 from engram.config import settings
 from engram.db import get_session
+from engram.demonstrated_usefulness import load_demonstrated_usefulness
+from engram.models import MemoryItem
 
 _test_engine = create_async_engine(settings.database_url, poolclass=NullPool)
 _test_session_factory = async_sessionmaker(
@@ -709,8 +711,8 @@ async def test_governed_candidate_admits_only_v2_qualified_proposals(
 
     shadow = await _shadow_compare(client, profiles=["governed", "exploratory"])
     governed = shadow["candidates"][0]
-    assert governed["scoring_version"] == "semantic-signals-v1"
-    assert governed["signals_version"] == "recall-signals-v1"
+    assert governed["scoring_version"] == "semantic-signals-v2"
+    assert governed["signals_version"] == "recall-signals-v2"
     assert {i["id"] for i in governed["items"]} == {qualified_id}
     # The active item never entered the pre-LIMIT eligible window (the V2
     # domain is live proposals); the unqualified proposal was retrieved and
@@ -2413,8 +2415,202 @@ async def test_high_importance_neighbor_cannot_bypass_v2_withholding(
 # ---- relevance/utility separation ----
 
 
-async def test_importance_moves_utility_and_rank_but_not_relevance(client, monkeypatch):
-    """Required test 11: changing only the neighbor's importance changes its
+async def test_shadow_profiles_expose_utility_v2_from_bound_external_feedback(client, monkeypatch):
+    """Candidate feedback is post-admission, root-agnostic, and read-only."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+    item = await _seed_qualified(client, "semantic target usefulness", importance=0.5)
+
+    external_id, recall_log_id = uuid4(), uuid4()
+    async with _test_engine.begin() as conn:
+        tenant_id = await conn.scalar(text("SELECT id FROM tenants WHERE slug = 'default'"))
+        assert tenant_id is not None
+        await conn.execute(
+            text(
+                "INSERT INTO principals(id, tenant_id, name, type) "
+                "VALUES (:id, :tenant_id, 'exp190-usefulness-feedback', 'agent')"
+            ),
+            {"id": external_id, "tenant_id": tenant_id},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO recall_logs(id, tenant_id, principal_id, mode, item_ids) "
+                "VALUES (:id, :tenant_id, :principal_id, 'semantic', CAST(:item_ids AS uuid[]))"
+            ),
+            {
+                "id": recall_log_id,
+                "tenant_id": tenant_id,
+                "principal_id": external_id,
+                "item_ids": [item["id"]],
+            },
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO feedback_events(tenant_id, item_id, principal_id, verdict, "
+                "recall_log_id) "
+                "VALUES (:tenant_id, :item_id, :principal_id, 'useful', :recall_log_id)"
+            ),
+            {
+                "tenant_id": tenant_id,
+                "item_id": item["id"],
+                "principal_id": external_id,
+                "recall_log_id": recall_log_id,
+            },
+        )
+
+    for profile in ("governed", "exploratory"):
+        packet = await _candidate_packet(client, profile=profile)
+        candidate = next(row for row in packet["items"] if row["id"] == item["id"])
+        utility = candidate["utility"]
+        usefulness = utility["demonstrated_usefulness"]
+        assert utility["contract_version"] == "recall-utility-v2"
+        assert utility["explicit_priority"] == pytest.approx(0.5)
+        assert usefulness == {
+            "version": "demonstrated-usefulness-v1",
+            "state": "positive",
+            "adjustment": 0.10,
+            "qualifying_useful_actor_count": 1,
+            "qualifying_noise_actor_count": 0,
+            "excluded_self_or_author_count": 0,
+            "excluded_unbound_exposure_count": 0,
+        }
+        assert candidate["utility_score"] == pytest.approx(utility["base_utility"] + 0.10)
+        assert str(external_id) not in str(utility)
+        assert str(recall_log_id) not in str(utility)
+
+
+async def test_shadow_profiles_exclude_invalid_feedback_exposures_with_diagnostics(
+    client, monkeypatch
+):
+    """Every malformed exposure fails closed and remains in diagnostics."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+    item = await _seed_qualified(client, "semantic target invalid usefulness", importance=0.5)
+
+    actors = {name: uuid4() for name in (
+        "valid",
+        "no_recall_log",
+        "null_item_ids",
+        "wrong_log_principal",
+        "wrong_tenant",
+        "missing_item",
+        "other_log_principal",
+    )}
+    other_tenant_id = uuid4()
+    async with _test_engine.begin() as conn:
+        default_tenant_id = await conn.scalar(
+            text("SELECT id FROM tenants WHERE slug = 'default'")
+        )
+        author_id = await conn.scalar(
+            text("SELECT principal_id FROM memory_items WHERE id = :item_id"),
+            {"item_id": item["id"]},
+        )
+        assert default_tenant_id is not None
+        assert author_id is not None
+        await conn.execute(
+            text("INSERT INTO tenants(id, name, slug) VALUES (:id, :name, :slug)"),
+            {
+                "id": other_tenant_id,
+                "name": "exp190-usefulness-other",
+                "slug": "exp190-usefulness-other",
+            },
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO principals(id, tenant_id, name, type) "
+                "VALUES (:id, :tenant_id, :name, 'agent')"
+            ),
+            [
+                {
+                    "id": actor_id,
+                    "tenant_id": default_tenant_id,
+                    "name": f"exp190-usefulness-{name}",
+                }
+                for name, actor_id in actors.items()
+            ],
+        )
+        logs = {
+            "valid": (default_tenant_id, actors["valid"], [item["id"]]),
+            "null_item_ids": (default_tenant_id, actors["null_item_ids"], None),
+            "wrong_log_principal": (
+                default_tenant_id,
+                actors["other_log_principal"],
+                [item["id"]],
+            ),
+            "wrong_tenant": (other_tenant_id, actors["wrong_tenant"], [item["id"]]),
+            "missing_item": (default_tenant_id, actors["missing_item"], [str(uuid4())]),
+        }
+        log_ids = {name: uuid4() for name in logs}
+        await conn.execute(
+            text(
+                "INSERT INTO recall_logs(id, tenant_id, principal_id, mode, item_ids) "
+                "VALUES (:id, :tenant_id, :principal_id, 'semantic', "
+                "CAST(:item_ids AS uuid[]))"
+            ),
+            [
+                {
+                    "id": log_ids[name],
+                    "tenant_id": tenant_id,
+                    "principal_id": principal_id,
+                    "item_ids": item_ids,
+                }
+                for name, (tenant_id, principal_id, item_ids) in logs.items()
+            ],
+        )
+        feedback = [
+            (actors["valid"], "useful", log_ids["valid"]),
+            (actors["no_recall_log"], "noise", None),
+            (actors["null_item_ids"], "useful", log_ids["null_item_ids"]),
+            (actors["wrong_log_principal"], "useful", log_ids["wrong_log_principal"]),
+            (actors["wrong_tenant"], "useful", log_ids["wrong_tenant"]),
+            (actors["missing_item"], "useful", log_ids["missing_item"]),
+            (author_id, "useful", None),
+        ]
+        await conn.execute(
+            text(
+                "INSERT INTO feedback_events(tenant_id, item_id, principal_id, verdict, "
+                "recall_log_id) VALUES (:tenant_id, :item_id, :principal_id, :verdict, "
+                ":recall_log_id)"
+            ),
+            [
+                {
+                    "tenant_id": default_tenant_id,
+                    "item_id": item["id"],
+                    "principal_id": principal_id,
+                    "verdict": verdict,
+                    "recall_log_id": recall_log_id,
+                }
+                for principal_id, verdict, recall_log_id in feedback
+            ],
+        )
+
+    async for session in _get_test_session():
+        summaries = await load_demonstrated_usefulness(
+            session,
+            tenant_id=default_tenant_id,
+            items=[
+                MemoryItem(
+                    id=UUID(item["id"]),
+                    tenant_id=default_tenant_id,
+                    principal_id=author_id,
+                )
+            ],
+        )
+    usefulness = summaries[UUID(item["id"])]
+    assert usefulness.qualifying_useful_actor_count == 1
+    assert usefulness.qualifying_noise_actor_count == 0
+    assert usefulness.excluded_unbound_exposure_count == 5
+    assert usefulness.excluded_self_or_author_count == 1
+    assert usefulness.state == "positive"
+    assert usefulness.adjustment == 0.10
+
+
+async def test_explicit_priority_moves_utility_and_rank_but_not_relevance(client, monkeypatch):
+    """Required test 11: changing only the neighbor's explicit priority changes its
     utility and final rank, never its relationship relevance, evidence
     state, or admission."""
     await _skip_without_db()
@@ -2439,7 +2635,7 @@ async def test_importance_moves_utility_and_rank_but_not_relevance(client, monke
         }
 
     before = _snapshot(await _candidate_packet(client, profile="exploratory"))
-    await _update_item(neighbor["id"], importance=0.9)
+    await _update_item(neighbor["id"], explicit_priority=0.9)
     after = _snapshot(await _candidate_packet(client, profile="exploratory"))
 
     assert before["relevance"] == after["relevance"]

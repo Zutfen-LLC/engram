@@ -429,6 +429,9 @@ class MemoryItem(Base):
 
     # Recall ranking
     importance: Mapped[float] = mapped_column(Float, default=0.5)
+    # Candidate utility reads this caller-selected baseline. Legacy
+    # ``importance`` remains feedback-adjusted until the #162 cutover.
+    explicit_priority: Mapped[float] = mapped_column(Float, nullable=False)
     pinned: Mapped[bool] = mapped_column(Boolean, default=False)
     last_recalled_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

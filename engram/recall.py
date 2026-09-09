@@ -1225,6 +1225,24 @@ async def _admit_and_rank_signal_items(
             assert v2_summary is not None  # the direct window resolved above
             v2_summary = _merge_v2_resolution_summaries(v2_summary, expansion_run.v2_resolution)
 
+    # Utility is evaluated once, strictly after the complete admitted set is
+    # known. The bulk loader cannot observe or rescue withheld candidates;
+    # it only contributes a bounded ordering adjustment to these entries.
+    from engram.demonstrated_usefulness import load_demonstrated_usefulness
+
+    usefulness_by_item = await load_demonstrated_usefulness(
+        session,
+        tenant_id=memory_context.tenant_id,
+        items=[entry.item for entry in admitted],
+    )
+    for entry in admitted:
+        recall_signals.apply_demonstrated_usefulness(
+            entry.item_dict,
+            item=entry.item,
+            now=now,
+            usefulness=usefulness_by_item[entry.item.id],
+        )
+
     # Deterministic order: signal rank desc, then closer vector (direct hits
     # ahead of expansion-only items at equal rank), then newer, then id.
     admitted.sort(

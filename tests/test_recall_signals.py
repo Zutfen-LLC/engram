@@ -21,7 +21,10 @@ from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
+import pytest
+
 from engram.admission_policy import AdmissionPolicyDecision
+from engram.demonstrated_usefulness import QualifyingFeedback, summarize_demonstrated_usefulness
 from engram.models import MemoryItem
 from engram.recall_profiles import EXPLORATORY_PROFILE, GOVERNED_PROFILE
 from engram.recall_signals import (
@@ -30,6 +33,7 @@ from engram.recall_signals import (
     AdmissionAssessmentBinding,
     RecallAdmissionDecision,
     V2EvidenceContractError,
+    apply_demonstrated_usefulness,
     build_v2_evidence_fields,
     build_v2_surface_binding,
     compute_signal_rank_score,
@@ -61,6 +65,7 @@ def _make_item(**overrides: Any) -> MemoryItem:
         "verified_by": None,
         "verified_at": None,
         "importance": 0.5,
+        "explicit_priority": 0.5,
         "pinned": False,
         "last_recalled_at": None,
         "recall_count": 0,
@@ -90,6 +95,8 @@ def _make_item(**overrides: Any) -> MemoryItem:
         "subject_name": None,
     }
     defaults.update(overrides)
+    if "explicit_priority" not in overrides:
+        defaults["explicit_priority"] = defaults["importance"]
     return MemoryItem(**defaults)
 
 
@@ -180,22 +187,22 @@ def _current(decision: AdmissionPolicyDecision, **divergence: Any) -> _FakeResol
 # ---- utility ----
 
 
-def test_utility_is_monotonic_in_importance() -> None:
+def test_utility_is_monotonic_in_explicit_priority() -> None:
     low = compute_utility_score(
-        importance=0.1, created_at=_NOW, valid_from=_NOW, now=_NOW
+        explicit_priority=0.1, created_at=_NOW, valid_from=_NOW, now=_NOW
     )
     high = compute_utility_score(
-        importance=0.9, created_at=_NOW, valid_from=_NOW, now=_NOW
+        explicit_priority=0.9, created_at=_NOW, valid_from=_NOW, now=_NOW
     )
     assert 0.0 <= low < high <= 1.0
 
 
 def test_utility_decays_with_age_but_stays_nonnegative() -> None:
     fresh = compute_utility_score(
-        importance=0.5, created_at=_NOW, valid_from=_NOW, now=_NOW
+        explicit_priority=0.5, created_at=_NOW, valid_from=_NOW, now=_NOW
     )
     old = compute_utility_score(
-        importance=0.5,
+        explicit_priority=0.5,
         created_at=_NOW - timedelta(days=90),
         valid_from=_NOW - timedelta(days=90),
         now=_NOW,
@@ -210,10 +217,56 @@ def test_utility_ignores_epistemic_inputs() -> None:
     import inspect
 
     params = inspect.signature(compute_utility_score).parameters
+    assert "importance" not in params
     assert "source_trust" not in params
     assert "memory_confidence" not in params
     assert "human_verified" not in params
     assert "recall_count" not in params
+
+
+def test_utility_v2_reads_explicit_priority_and_exposes_bounded_usefulness() -> None:
+    item = _make_item(importance=0.1, explicit_priority=0.8)
+    fields = signal_item_fields(
+        item,
+        decision=RecallAdmissionDecision(profile="exploratory", decision="admit", reason_codes=()),
+        similarity=0.8,
+        now=_NOW,
+    )
+    apply_demonstrated_usefulness(
+        fields,
+        item=item,
+        now=_NOW,
+        usefulness=summarize_demonstrated_usefulness([QualifyingFeedback(verdict="useful")]),
+    )
+
+    assert fields["utility"]["contract_version"] == "recall-utility-v2"
+    assert fields["utility"]["explicit_priority"] == 0.8
+    assert fields["utility"]["demonstrated_usefulness"]["state"] == "positive"
+    assert fields["utility"]["demonstrated_usefulness"]["adjustment"] == 0.10
+    assert fields["utility_score"] == fields["utility"]["base_utility"] + 0.10
+
+    item.importance = 0.95
+    after_legacy_feedback = signal_item_fields(
+        item,
+        decision=RecallAdmissionDecision(profile="exploratory", decision="admit", reason_codes=()),
+        similarity=0.8,
+        now=_NOW,
+    )
+    assert after_legacy_feedback["utility_score"] == fields["utility"]["base_utility"]
+
+
+def test_utility_v2_fails_closed_when_explicit_priority_is_impossibly_null() -> None:
+    item = _make_item(explicit_priority=None)
+
+    with pytest.raises(RuntimeError, match="no explicit_priority"):
+        signal_item_fields(
+            item,
+            decision=RecallAdmissionDecision(
+                profile="exploratory", decision="admit", reason_codes=()
+            ),
+            similarity=0.8,
+            now=_NOW,
+        )
 
 
 # ---- epistemic state ----
@@ -1111,13 +1164,13 @@ def test_exposure_counters_change_no_signal_output() -> None:
 # ---- importance orders but never admits ----
 
 
-def test_importance_changes_utility_and_rank_but_not_admission_or_epistemic() -> None:
-    """Importance is the caller's explicit priority: among admitted items it
+def test_explicit_priority_changes_utility_and_rank_but_not_admission_or_epistemic() -> None:
+    """Explicit priority: among admitted items it
     moves utility and therefore rank, but it can never change the admission
     decision or the epistemic state at any value."""
     resolution = _current(_v2_decision(governed="allow", exploratory="allow"))
-    low_item = _make_item(review_status="proposed", importance=0.0)
-    high_item = _make_item(review_status="proposed", importance=1.0)
+    low_item = _make_item(review_status="proposed", importance=1.0, explicit_priority=0.0)
+    high_item = _make_item(review_status="proposed", importance=0.0, explicit_priority=1.0)
     for item in (low_item, high_item):
         governed = decide_recall_admission(
             item, profile=GOVERNED_PROFILE, stay_kinds=set(), v2_resolution=resolution
