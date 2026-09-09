@@ -199,7 +199,7 @@ def build_frame(
 
     from engram.safety import has_secrets
 
-    def _ts(value: Any):
+    def _ts(value: Any) -> datetime | None:
         if value is None or isinstance(value, datetime):
             return value
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
