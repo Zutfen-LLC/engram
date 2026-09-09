@@ -195,7 +195,14 @@ def build_frame(
     snapshot_as_of: Any,
 ) -> tuple[list[FrameRow], dict[str, int]]:
     """Apply inclusion/exclusion rules and return the eligible frame + counts."""
+    from datetime import datetime
+
     from engram.safety import has_secrets
+
+    def _ts(value: Any):
+        if value is None or isinstance(value, datetime):
+            return value
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
 
     excluded: dict[str, int] = defaultdict(int)
     frame: list[FrameRow] = []
@@ -219,9 +226,8 @@ def build_frame(
         if has_secrets(content):
             excluded["secret_scanner"] += 1
             continue
-        age_days = max(
-            0, (snapshot_as_of - row["created_at"]).days if row["created_at"] is not None else 0
-        )
+        created_at = _ts(row.get("created_at"))
+        age_days = max(0, (snapshot_as_of - created_at).days) if created_at else 0
         frame.append(
             FrameRow(
                 item_uuid=row["item_uuid"],
