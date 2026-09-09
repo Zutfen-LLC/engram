@@ -108,11 +108,14 @@ Operational handoff for an authorized dogfood host:
    public report digests. Collect the public JSON, Markdown, protected
    private artifact, and command output as completion evidence.
 
-The framework status is `RECALL_CORRECTION_REQUIRED` until every framework
-obligation passes; only then does it become
-`FRAMEWORK_COMPLETE — AUTHORIZED_DOGFOOD_RUN_PENDING` until an authorized
-evaluation is reviewed. A run reports only `EVALUATION_EVIDENCE_COLLECTED`. A
-later human adjudication must be a separate, provenance-bound artifact.
+The framework status is `FRAMEWORK_COMPLETE — AUTHORIZED_DOGFOOD_RUN_PENDING`:
+every framework obligation passes (repeated-exposure/usefulness matrix,
+bounded-query scaling, accounting reconciliation, packing-omission reporting,
+V2 resolution denominators, runtime-config binding, frozen-embedding
+determinism, public privacy sentinels), and an authorized dogfood evaluation
+is now the only outstanding step. A run reports only
+`EVALUATION_EVIDENCE_COLLECTED`. A later human adjudication must be a
+separate, provenance-bound artifact.
 
 The runner opens a `REPEATABLE READ READ ONLY` transaction. It records before
 and after tenant-visible mutation counters. It fails if the counters differ.
