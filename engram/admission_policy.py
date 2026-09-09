@@ -19,7 +19,10 @@ from typing import Any, Final, Literal
 import rfc8785
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-POLICY_DIRECTORY: Path = Path(__file__).resolve().parent.parent / "policies" / "admission"
+# Inside the package and shipped as package data: the deployed image's
+# ``engram`` console script imports from site-packages, where no repo checkout
+# (and therefore no repo-root ``policies/`` directory) exists (issue #201).
+POLICY_DIRECTORY: Path = Path(__file__).resolve().parent / "policies" / "admission"
 POLICY_SCHEMA_VERSION: Final[str] = "engram.admission-policy.v1"
 V2_SCHEMA_VERSION: Final[str] = "engram.admission-assessment.v2"
 SurfaceDecision = Literal["allow", "withhold", "review_required", "blocked", "unknown"]

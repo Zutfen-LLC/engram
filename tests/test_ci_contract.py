@@ -188,6 +188,12 @@ def test_hosted_workflow_smokes_the_production_runtime_image() -> None:
     assert "probe /health" in workflow
     assert "probe /ready" in workflow
     assert "import engram.api.app, engram.cli" in workflow
+    # Issue #201: the wheel must ship the admission-policy artifacts. The load
+    # runs with --workdir /tmp so the image's /app repo checkout cannot
+    # satisfy the import; only the site-packages install can answer.
+    assert "--workdir /tmp" in workflow
+    assert 'load_admission_policy("risk_aware_shadow_v1")' in workflow
+    assert 'assert p.profile_key == "risk_aware_shadow_v1"' in workflow
 
     # The smoke service is profile-gated so it never joins the default `up`
     # that runs the test suite.
