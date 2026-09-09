@@ -23,6 +23,7 @@ from engram.memory_kinds import DEFAULT_KIND_TAXONOMY as _DEFAULT_KIND_TAXONOMY
 from engram.memory_kinds import get_enabled_memory_kinds
 from engram.models import ClassificationRule, MemoryItem
 from engram.provider_clients import resolve_classification_provider
+from engram.provider_observer import record_provider_invocation
 from engram.usage import (
     Timer,
     extract_openai_compatible_usage,
@@ -714,6 +715,7 @@ async def _call_openai_classification(
     job_id: UUID | None = None,
     usage_class: Literal["request", "async_enrichment"] = "request",
 ) -> dict[str, Any]:
+    record_provider_invocation("classification")
     event_id = uuid4()
     timer = Timer()
     config = resolve_classification_provider()

@@ -27,7 +27,9 @@ alone is not sufficient, and tenant denial wins even for a capable caller.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
+from time import perf_counter
 from typing import Any, Final
 
 from sqlalchemy import select
@@ -129,6 +131,11 @@ async def evaluate_recall_shadow_comparison(
     byte_budget: int | None,
     token_budget: int | None,
     item_budget: int | None,
+    now: datetime | None = None,
+    timing_observer: Callable[[str, float], None] | None = None,
+    query_embedding_observer: Callable[[list[float]], None] | None = None,
+    query_embedding_override: list[float] | None = None,
+    neutralize_demonstrated_usefulness: bool = False,
 ) -> dict[str, Any]:
     """Evaluate legacy versus each requested candidate profile, writing nothing.
 
@@ -150,7 +157,10 @@ async def evaluate_recall_shadow_comparison(
         if key not in ordered:
             ordered.append(key)
 
-    now = datetime.now(UTC)
+    if now is None:
+        now = datetime.now(UTC)
+    elif now.tzinfo is None:
+        raise ValueError("shadow_evaluation_time_must_be_timezone_aware")
     tenant_id = str(memory_context.tenant_id)
     principal_id = str(memory_context.principal_id)
 
@@ -202,13 +212,19 @@ async def evaluate_recall_shadow_comparison(
     query_embedding = None
     embedding_outcome = "not_attempted"
     if eligible_total > 0:
-        query_embedding = await recall_module.generate_query_embedding(
-            query,
-            embedding_profile=embedding_profile,
-            tenant_id=tenant_id,
-            principal_id=principal_id,
-        )
-        embedding_outcome = "succeeded" if query_embedding is not None else "disabled"
+        if query_embedding_override is not None:
+            query_embedding = query_embedding_override
+            embedding_outcome = "supplied"
+        else:
+            query_embedding = await recall_module.generate_query_embedding(
+                query,
+                embedding_profile=embedding_profile,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+            )
+            embedding_outcome = "succeeded" if query_embedding is not None else "disabled"
+        if query_embedding is not None and query_embedding_observer is not None:
+            query_embedding_observer(query_embedding)
 
     payload: dict[str, Any] = {
         "shadow_comparison_version": SHADOW_COMPARISON_VERSION,
@@ -232,6 +248,7 @@ async def evaluate_recall_shadow_comparison(
         payload["message"] = recall_module._NO_EMBEDDINGS_MESSAGE
         return payload
 
+    started = perf_counter()
     legacy_evaluation = await recall_module.evaluate_semantic_profile(
         session,
         memory_context=memory_context,
@@ -244,12 +261,16 @@ async def evaluate_recall_shadow_comparison(
         token_budget=token_budget,
         item_budget=item_budget,
         now=now,
+        demonstrated_usefulness_enabled=not neutralize_demonstrated_usefulness,
     )
+    if timing_observer is not None:
+        timing_observer(LEGACY_PROFILE.key, (perf_counter() - started) * 1000)
     payload["legacy"] = _packet_payload(legacy_evaluation)
 
     legacy_ids = {item["id"] for item in legacy_evaluation.items}
     for key in ordered:
         profile: RecallProfileSpec = SEMANTIC_PROFILES[key]
+        started = perf_counter()
         evaluation = await recall_module.evaluate_semantic_profile(
             session,
             memory_context=memory_context,
@@ -262,7 +283,10 @@ async def evaluate_recall_shadow_comparison(
             token_budget=token_budget,
             item_budget=item_budget,
             now=now,
+            demonstrated_usefulness_enabled=not neutralize_demonstrated_usefulness,
         )
+        if timing_observer is not None:
+            timing_observer(profile.key, (perf_counter() - started) * 1000)
         candidate_ids = {item["id"] for item in evaluation.items}
         payload["candidates"].append(
             {
