@@ -205,6 +205,16 @@ jobs:
           docker run --rm --entrypoint engram "$ENGRAM_RUNTIME_IMAGE" --help > /dev/null
           echo "console script OK"
 
+      - name: Load the admission policy from the installed wheel
+        # The runtime image also copies the repo checkout to /app, and
+        # `python -c` resolves imports from the working directory first. Run
+        # from /tmp so only the site-packages install can answer: this proves
+        # the wheel itself ships the admission-policy artifacts (issue #201).
+        run: |
+          set -euo pipefail
+          docker run --rm --workdir /tmp --entrypoint python "$ENGRAM_RUNTIME_IMAGE" \
+            -c 'from engram.admission_policy import load_admission_policy; p = load_admission_policy("risk_aware_shadow_v1"); assert p.profile_key == "risk_aware_shadow_v1"; print("installed policy load OK:", p.profile_key, p.artifact_digest)'
+
       - name: Boot the runtime image against a real database
         run: |
           docker compose -f docker-compose.ci.yml --profile smoke up -d --wait \
