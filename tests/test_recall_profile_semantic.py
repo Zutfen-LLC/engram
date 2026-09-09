@@ -3386,3 +3386,69 @@ async def test_expansion_shadow_comparison_remains_read_only(client, monkeypatch
         json={"mode": "semantic", "query": "q", "recall_profile": "governed"},
     )
     assert resp.status_code == 422
+
+
+async def test_frozen_recall_evaluation_uses_shared_profiles_without_mutation(
+    client, monkeypatch
+):
+    """The evaluator replays the shared shadow core in a read-only transaction."""
+    await _skip_without_db()
+    settings.embedding_provider = "openai"
+    _patch_embeddings(monkeypatch)
+    await _enable_tenant_shadow_policy()
+    await _seed_qualified(client, "semantic target frozen evaluation")
+
+    from engram.embedding_profiles import get_active_profile
+    from engram.semantic_context_manifest import semantic_query_digest
+    from evals.recall.runner import read_only_evaluation_session, run_recall_evaluation
+    from evals.recall.schema import RecallEvaluationManifest
+
+    async with _test_session_factory() as session:
+        identity = (
+            await session.execute(
+                text(
+                    "SELECT t.id::text AS tenant_id, p.id::text AS principal_id "
+                    "FROM tenants t JOIN principals p ON p.tenant_id = t.id "
+                    "WHERE t.slug = 'default' AND p.name = 'admin'"
+                )
+            )
+        ).mappings().one()
+        embedding_profile = await get_active_profile(session)
+    frozen_at = datetime(2026, 9, 8, tzinfo=UTC)
+    manifest = RecallEvaluationManifest.model_validate(
+        {
+            "schema_version": "engram-recall-evaluation-input-v1",
+            "baseline_sha": "e20a62853be75916c6a890fd7876c7e14c2718fc",
+            "repository_sha": "e20a62853be75916c6a890fd7876c7e14c2718fc",
+            "snapshot_digest": "0" * 64,
+            "snapshot_at": frozen_at,
+            "evaluation_at": frozen_at,
+            "tenant_config_version": "test-v1",
+            "embedding_profile_key": embedding_profile.profile_key,
+            "memory_context": {
+                "version": "memory-context-v2",
+                "tenant_id": identity["tenant_id"],
+                "principal_id": identity["principal_id"],
+            },
+            "cases": [
+                {
+                    "case_id": "frozen-evaluation-case",
+                    "query": "semantic query",
+                    "query_digest": semantic_query_digest("semantic query"),
+                    "strata": {"source_type": "extraction"},
+                }
+            ],
+        }
+    )
+
+    async with read_only_evaluation_session(_test_session_factory, manifest) as session:
+        private_first, public_first = await run_recall_evaluation(session, manifest)
+    async with read_only_evaluation_session(_test_session_factory, manifest) as session:
+        private_second, public_second = await run_recall_evaluation(session, manifest)
+
+    assert public_first["report_digest"] == public_second["report_digest"]
+    assert private_first["case_rows"] == private_second["case_rows"]
+    assert public_first["runtime_versions"]["certified_serving_profiles"] == ["legacy"]
+    assert public_first["read_only_proof"]["before_after_equal"] is True
+    assert public_first["profiles"]["governed"]["packet_change"]["packet_count"] == 1
+    assert "semantic target frozen evaluation" not in str(public_first)

@@ -129,6 +129,7 @@ async def evaluate_recall_shadow_comparison(
     byte_budget: int | None,
     token_budget: int | None,
     item_budget: int | None,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """Evaluate legacy versus each requested candidate profile, writing nothing.
 
@@ -150,7 +151,10 @@ async def evaluate_recall_shadow_comparison(
         if key not in ordered:
             ordered.append(key)
 
-    now = datetime.now(UTC)
+    if now is None:
+        now = datetime.now(UTC)
+    elif now.tzinfo is None:
+        raise ValueError("shadow_evaluation_time_must_be_timezone_aware")
     tenant_id = str(memory_context.tenant_id)
     principal_id = str(memory_context.principal_id)
 
