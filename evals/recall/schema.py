@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -16,6 +17,61 @@ QueryDigest = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
 
 class _Record(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+def query_embedding_vector_digest(values: Sequence[float]) -> str:
+    """Protected digest of the exact captured query vector."""
+    return digest([float(value) for value in values])
+
+
+class FrozenQueryEmbedding(_Record):
+    """One query embedding captured through the real shared gateway.
+
+    The values are private: they exist so replay is byte-identical even if
+    the external provider later returns different vectors. The digest alone
+    is the identity used in protected reports; public artifacts never
+    contain either.
+    """
+
+    values: tuple[float, ...] = Field(min_length=1)
+    vector_digest: Digest
+
+    @model_validator(mode="after")
+    def digest_matches_values(self) -> FrozenQueryEmbedding:
+        if self.vector_digest != query_embedding_vector_digest(self.values):
+            raise ValueError("frozen_query_embedding_digest_mismatch")
+        return self
+
+    def protected_identity(self) -> dict[str, Any]:
+        """The digest-bound representation kept in protected artifacts."""
+        return {"dimension": len(self.values), "vector_digest": self.vector_digest}
+
+
+class RecallCaseStrata(_Record):
+    """Closed, public-safe categorical case strata.
+
+    Issue #198 requires stratified reporting, but arbitrary manifest tokens
+    must never become public report content. This is a deliberately closed
+    contract: unknown dimensions or values fail manifest validation instead
+    of being echoed into public artifacts. Richer item-level strata (source
+    type, kind, review state, V2 outcome, evidence state, age, usefulness)
+    are derived by the evaluator itself from packet state, never supplied by
+    the manifest author.
+    """
+
+    query_class: Literal["lookup", "exploration", "recap"] | None = None
+    corpus_scale: Literal["sparse", "typical", "dense"] | None = None
+
+    def public_counts_identity(self) -> dict[str, str]:
+        """Return only the populated approved dimensions for aggregate counts."""
+        return {
+            field: value
+            for field, value in (
+                ("corpus_scale", self.corpus_scale),
+                ("query_class", self.query_class),
+            )
+            if value is not None
+        }
 
 
 class MemoryContextSnapshot(_Record):
@@ -109,7 +165,8 @@ class RecallQueryCase(_Record):
     byte_budget: int | None = Field(default=None, ge=0)
     token_budget: int | None = Field(default=None, ge=0)
     item_budget: int | None = Field(default=None, ge=0)
-    strata: dict[Token, Token] = Field(default_factory=dict)
+    strata: RecallCaseStrata = Field(default_factory=RecallCaseStrata)
+    query_embedding: FrozenQueryEmbedding | None = None
     labels: RecallCaseLabels = Field(default_factory=RecallCaseLabels)
 
     @model_validator(mode="after")
@@ -122,12 +179,13 @@ class RecallQueryCase(_Record):
 class RecallEvaluationManifest(_Record):
     """Private replay manifest.
 
-    ``input_digest`` hashes the complete material input.  The public identity
+    ``input_digest`` hashes the complete material input, including each
+    case's frozen query embedding when one is bound. The public identity
     intentionally does not: public artifacts expose that digest, rather than
-    tenant, principal, workspace, or query identity.
+    tenant, principal, workspace, query, or vector identity.
     """
 
-    schema_version: Literal["engram-recall-evaluation-input-v1"]
+    schema_version: Literal["engram-recall-evaluation-input-v2"]
     baseline_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
     repository_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
     snapshot_digest: Digest

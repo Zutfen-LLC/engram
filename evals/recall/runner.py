@@ -48,9 +48,10 @@ from engram.semantic_context_manifest import SEMANTIC_MANIFEST_CONTRACT_VERSION
 from evals.admission.schema import digest
 from evals.recall.contracts import usefulness_perturbation_report
 from evals.recall.metrics import build_profile_metrics
+from evals.recall.runtime_config import runtime_config_digest, runtime_config_identity
 from evals.recall.schema import RecallEvaluationManifest
 
-RUNNER_VERSION = "engram-recall-evaluation-runner-v2"
+RUNNER_VERSION = "engram-recall-evaluation-runner-v3"
 REPORT_SCHEMA_VERSION = "engram-recall-evaluation-report-v2"
 _MUTATION_TABLES = (
     "memory_items",
@@ -158,6 +159,7 @@ async def evaluation_state_identity(
         "schema_version": "engram-recall-evaluation-state-v1",
         "repository_sha": manifest.repository_sha,
         "runtime_versions": _runtime_versions(),
+        "runtime_config": runtime_config_identity(),
         "memory_context": manifest.memory_context.model_dump(mode="json"),
         "tenant_config": sorted(
             (_row_identity(row) for row in config_rows),
@@ -176,11 +178,15 @@ async def evaluation_state_identity(
                 "disputed_kind_registry_state",
                 "v2_admission_evidence_and_relationship_state",
                 "tenant_configuration_and_embedding_profiles",
+                "outcome_affecting_deployment_settings",
             ],
             "does_not_prove": [
                 "historical_state_reconstruction",
+                # External provider responses are not reproducible, which is
+                # exactly why deterministic replay requires a frozen query
+                # embedding bound to the manifest: the frozen vector makes
+                # the replay itself independent of later provider output.
                 "external_provider_response_reproducibility",
-                "deployment_settings_not_stored_in_postgresql",
             ],
         },
     }
@@ -327,7 +333,16 @@ def _grouped_exposure_concentration(
 
 
 def _admission_strata(packets: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
-    """Aggregate the exact V2/withhold diagnostics bound by the packet."""
+    """Aggregate the exact V2/withhold diagnostics bound by the packet.
+
+    ``v2_resolution_state`` has exactly one authoritative source: the bulk
+    ``v2_resolution.resolution_status_counts`` the packet already carries,
+    which covers every resolved item — admitted and withheld alike. The
+    withheld diagnostics' ``v2_resolution_status`` is deliberately NOT added
+    to that counter: adding it and then adding the bulk summary again would
+    double count every withheld item. Diagnostics still feed the
+    outcome/blocker/eligibility counts, where they are the only source.
+    """
     outcome: Counter[str] = Counter()
     resolution: Counter[str] = Counter()
     blocker: Counter[str] = Counter()
@@ -341,7 +356,6 @@ def _admission_strata(packets: list[dict[str, Any]]) -> dict[str, dict[str, int]
         for diagnostic in packet.get("admission_diagnostics", []):
             outcome[str(diagnostic.get("decision", "unknown"))] += 1
             eligibility["withheld"] += 1
-            resolution[str(diagnostic.get("v2_resolution_status", "unknown"))] += 1
             reasons = diagnostic.get("reason_codes") or ["unknown"]
             blocker[str(reasons[0])] += 1
         for status, count in (packet.get("v2_resolution") or {}).get(
@@ -436,14 +450,22 @@ def _age_bucket(age_hours: float | None) -> str:
 
 
 def _case_strata(case_rows: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
-    """Report all manifest strata with their sample counts."""
-    fields = sorted({field for row in case_rows for field in row["strata"]})
-    return {
-        field: dict(
-            sorted(Counter(row["strata"].get(field, "unknown") for row in case_rows).items())
+    """Report the closed public-safe case strata with their sample counts.
+
+    Manifest strata are validated against the closed ``RecallCaseStrata``
+    contract, so only approved categorical dimensions and values can ever
+    reach this (and therefore the public) report.
+    """
+    result: dict[str, dict[str, int]] = {}
+    for field in ("corpus_scale", "query_class"):
+        counts = Counter(
+            str(row["strata"][field])
+            for row in case_rows
+            if row["strata"].get(field) is not None
         )
-        for field in fields
-    }
+        if counts:
+            result[field] = dict(sorted(counts.items()))
+    return result
 
 
 def _budget_utilization(packets: list[dict[str, Any]]) -> dict[str, Any]:
@@ -555,6 +577,75 @@ def _statement_counter(session: AsyncSession) -> Any:
         event.remove(engine, "before_cursor_execute", observe)
 
 
+def _aggregate_statement_stats(values: list[int]) -> dict[str, Any]:
+    """Aggregate query statistics without case identity."""
+    if not values:
+        return {"count": 0, "min": None, "max": None, "mean": None}
+    return {
+        "count": len(values),
+        "min": min(values),
+        "max": max(values),
+        "mean": round(sum(values) / len(values), 2),
+    }
+
+
+def _public_read_only_proof(proof: dict[str, Any]) -> dict[str, Any]:
+    """Project the read-only proof to aggregate-only public content.
+
+    Per-case statement counts stay in the protected private artifact: they
+    are keyed by ``case_id`` and could correlate query counts with reviewed
+    cases. The public projection keeps aggregate min/max/mean statistics and
+    the reconciliation statement only.
+    """
+    case_counts = proof.get("case_db_statement_counts") or {}
+    primary = [int(entry["primary_comparison"]) for entry in case_counts.values()]
+    neutral = [
+        int(entry["neutral_usefulness_counterfactual"]) for entry in case_counts.values()
+    ]
+    return {
+        "transaction": proof["transaction"],
+        "snapshot_digest_verified": proof["snapshot_digest_verified"],
+        "before_after_equal": proof["before_after_equal"],
+        "tracked_tables": proof["tracked_tables"],
+        "tracked_counters": proof["tracked_counters"],
+        "query_accounting": {
+            "case_count": len(case_counts),
+            "per_case_primary_comparison": _aggregate_statement_stats(primary),
+            "per_case_neutral_usefulness_counterfactual": _aggregate_statement_stats(
+                neutral
+            ),
+            "per_case_total": _aggregate_statement_stats(
+                [int(entry["total"]) for entry in case_counts.values()]
+            ),
+            "metadata_query_count": proof["metadata_query_count"],
+            "fixed_setup_statement_count": proof["fixed_setup_statement_count"],
+            "fixed_finalization_statement_count": proof[
+                "fixed_finalization_statement_count"
+            ],
+            "total_db_statement_count": proof["total_db_statement_count"],
+            "per_case_sums_reconcile_to_total": proof[
+                "per_case_sums_reconcile_to_total"
+            ],
+        },
+        "query_embedding_sources": dict(sorted(proof["query_embedding_sources"].items())),
+        "deterministic_replay": {
+            # Frozen-manifest vectors make replay independent of later
+            # external provider output; provider-capture cases relied on the
+            # live gateway during this run.
+            "frozen_embedding_case_count": proof["query_embedding_sources"].get(
+                "frozen_manifest", 0
+            ),
+            "provider_capture_case_count": proof["query_embedding_sources"].get(
+                "provider_capture", 0
+            ),
+        },
+        "provider_calls": proof["provider_calls"],
+        "provider_call_expectations": proof["provider_call_expectations"],
+        "provider_call_expectations_met": proof["provider_call_expectations_met"],
+        "candidate_receipts_persisted": proof["candidate_receipts_persisted"],
+    }
+
+
 def _empty_packet(profile: str, case: Any) -> dict[str, Any]:
     """Represent a legitimate zero-eligible packet without provider work."""
     return {
@@ -620,6 +711,7 @@ def _public_report(
         "input": manifest.public_identity(),
         "input_digest": manifest.input_digest,
         "runtime_versions": _runtime_versions(),
+        "runtime_config_digest": runtime_config_digest(),
         "profiles": profiles,
         "case_strata": _case_strata(case_rows),
         "legacy": {
@@ -659,43 +751,55 @@ async def run_recall_evaluation(
 
     The caller must use :func:`read_only_evaluation_session`. This function
     rejects a writable transaction before it evaluates a packet.
+
+    Query embedding is two-phase: a case whose manifest carries a frozen
+    query embedding replays through ``query_embedding_override`` and never
+    consults the provider; a case without one captures the real shared
+    gateway's vector and records it in the protected private artifact so it
+    can be frozen into the manifest for deterministic replay.
     """
-    read_only = await session.scalar(text("SHOW transaction_read_only"))
-    if read_only != "on":
-        raise ValueError("recall_evaluation_requires_read_only_transaction")
-    active_embedding = await get_active_profile(session)
-    if active_embedding.profile_key != manifest.embedding_profile_key:
-        raise ValueError("embedding_profile_identity_mismatch")
-    if current_repository_sha() != manifest.repository_sha:
-        raise ValueError("repository_identity_mismatch")
-    active_config = await session.scalar(
-        select(TenantConfig).where(
-            TenantConfig.tenant_id == manifest.memory_context.tenant_id,
-            TenantConfig.active.is_(True),
-        )
-    )
-    if active_config is None or active_config.config_version != manifest.tenant_config_version:
-        raise ValueError("tenant_config_identity_mismatch")
-    _reset_evaluation_kind_cache(manifest.memory_context.tenant_id)
-    state = await evaluation_state_identity(session, manifest)
-    if digest(state) != manifest.snapshot_digest:
-        raise ValueError("evaluation_snapshot_identity_mismatch")
-    before = await _mutation_snapshot(session)
-    context = manifest.memory_context.resolve()
-    case_rows: list[dict[str, Any]] = []
-    timings_ms: list[float] = []
-    profile_timings_ms: dict[str, list[float]] = {
-        "legacy": [],
-        "governed": [],
-        "exploratory": [],
-    }
-    case_query_counts: dict[str, int] = {}
+    case_query_counts: dict[str, dict[str, int]] = {}
     expected_query_embeddings = 0
-    with observe_provider_calls() as provider_calls, _statement_counter(session) as statement_count:
+    embedding_sources: Counter[str] = Counter()
+    with observe_provider_calls() as provider_calls, _statement_counter(
+        session
+    ) as statement_count:
+        setup_start = statement_count["total"]
+        read_only = await session.scalar(text("SHOW transaction_read_only"))
+        if read_only != "on":
+            raise ValueError("recall_evaluation_requires_read_only_transaction")
+        active_embedding = await get_active_profile(session)
+        if active_embedding.profile_key != manifest.embedding_profile_key:
+            raise ValueError("embedding_profile_identity_mismatch")
+        if current_repository_sha() != manifest.repository_sha:
+            raise ValueError("repository_identity_mismatch")
+        active_config = await session.scalar(
+            select(TenantConfig).where(
+                TenantConfig.tenant_id == manifest.memory_context.tenant_id,
+                TenantConfig.active.is_(True),
+            )
+        )
+        if active_config is None or active_config.config_version != manifest.tenant_config_version:
+            raise ValueError("tenant_config_identity_mismatch")
+        _reset_evaluation_kind_cache(manifest.memory_context.tenant_id)
+        state = await evaluation_state_identity(session, manifest)
+        if digest(state) != manifest.snapshot_digest:
+            raise ValueError("evaluation_snapshot_identity_mismatch")
+        before = await _mutation_snapshot(session)
+        fixed_setup_statement_count = statement_count["total"] - setup_start
+
+        context = manifest.memory_context.resolve()
+        case_rows: list[dict[str, Any]] = []
+        timings_ms: list[float] = []
+        profile_timings_ms: dict[str, list[float]] = {
+            "legacy": [],
+            "governed": [],
+            "exploratory": [],
+        }
+
         for case in manifest.cases:
             _reset_evaluation_kind_cache(manifest.memory_context.tenant_id)
-            before_case = statement_count["total"]
-            started = time.perf_counter()
+
             def observe_profile_timing(profile: str, elapsed_ms: float) -> None:
                 profile_timings_ms[profile].append(elapsed_ms)
 
@@ -705,23 +809,53 @@ async def run_recall_evaluation(
                 nonlocal captured_embedding
                 captured_embedding = value
 
-            result = await recall_shadow.evaluate_recall_shadow_comparison(
-                session,
-                memory_context=context,
-                workspace=case.workspace,
-                query=case.query,
-                candidate_profiles=["governed", "exploratory"],
-                byte_budget=case.byte_budget,
-                token_budget=case.token_budget,
-                item_budget=case.item_budget,
-                now=manifest.evaluation_at,
-                timing_observer=observe_profile_timing,
-                query_embedding_observer=capture_embedding,
-            )
-            if int(result["candidate_count"]) > 0:
-                expected_query_embeddings += 1
+            before_primary = statement_count["total"]
+            started = time.perf_counter()
+            frozen = case.query_embedding
+            if frozen is not None:
+                # Deterministic replay: the frozen vector bound to the
+                # manifest replaces any provider call.
+                result = await recall_shadow.evaluate_recall_shadow_comparison(
+                    session,
+                    memory_context=context,
+                    workspace=case.workspace,
+                    query=case.query,
+                    candidate_profiles=["governed", "exploratory"],
+                    byte_budget=case.byte_budget,
+                    token_budget=case.token_budget,
+                    item_budget=case.item_budget,
+                    now=manifest.evaluation_at,
+                    timing_observer=observe_profile_timing,
+                    query_embedding_override=list(frozen.values),
+                )
+                embedding_sources["frozen_manifest"] += 1
+                if int(result["candidate_count"]) > 0:
+                    captured_embedding = list(frozen.values)
+            else:
+                # Initial capture: the real shared semantic-query embedding
+                # gateway. The vector is recorded (protected) for freezing.
+                result = await recall_shadow.evaluate_recall_shadow_comparison(
+                    session,
+                    memory_context=context,
+                    workspace=case.workspace,
+                    query=case.query,
+                    candidate_profiles=["governed", "exploratory"],
+                    byte_budget=case.byte_budget,
+                    token_budget=case.token_budget,
+                    item_budget=case.item_budget,
+                    now=manifest.evaluation_at,
+                    timing_observer=observe_profile_timing,
+                    query_embedding_observer=capture_embedding,
+                )
+                if int(result["candidate_count"]) > 0:
+                    expected_query_embeddings += 1
+                if captured_embedding is not None:
+                    embedding_sources["provider_capture"] += 1
+                else:
+                    embedding_sources["not_generated"] += 1
+            primary_comparison = statement_count["total"] - before_primary
             timings_ms.append((time.perf_counter() - started) * 1000)
-            case_query_counts[case.case_id] = statement_count["total"] - before_case
+
             if result["legacy"] is None:
                 if result["candidate_count"] == 0 and context.may_read_anything:
                     legacy = _empty_packet("legacy", case)
@@ -736,6 +870,8 @@ async def run_recall_evaluation(
             else:
                 legacy = _safe_packet(result["legacy"])
                 candidates = [_safe_packet(packet) for packet in result["candidates"]]
+
+            before_neutral = statement_count["total"]
             neutral_usefulness_candidates: list[dict[str, Any]] = []
             if captured_embedding is not None:
                 neutral_result = await recall_shadow.evaluate_recall_shadow_comparison(
@@ -754,12 +890,24 @@ async def run_recall_evaluation(
                 neutral_usefulness_candidates = [
                     _safe_packet(packet) for packet in neutral_result["candidates"]
                 ]
+            neutral_usefulness_counterfactual = (
+                statement_count["total"] - before_neutral
+            )
+            case_query_counts[case.case_id] = {
+                "primary_comparison": primary_comparison,
+                "neutral_usefulness_counterfactual": neutral_usefulness_counterfactual,
+                "total": primary_comparison + neutral_usefulness_counterfactual,
+            }
             case_rows.append(
                 {
                     "case_id": case.case_id,
                     "query_digest": case.query_digest,
-                    "strata": case.strata,
+                    "strata": case.strata.model_dump(mode="json"),
                     "labels": case.labels.model_dump(mode="json"),
+                    "query_embedding_identity": (
+                        frozen.protected_identity() if frozen is not None else None
+                    ),
+                    "captured_query_embedding": captured_embedding,
                     "legacy": legacy,
                     "candidates": candidates,
                     "neutral_usefulness_candidates": neutral_usefulness_candidates,
@@ -768,9 +916,23 @@ async def run_recall_evaluation(
         before_metadata = statement_count["total"]
         await _attach_item_strata(session, case_rows, manifest.evaluation_at)
         metadata_query_count = statement_count["total"] - before_metadata
-    after = await _mutation_snapshot(session)
+
+        before_finalization = statement_count["total"]
+        after = await _mutation_snapshot(session)
+        fixed_finalization_statement_count = statement_count["total"] - before_finalization
+
     if before != after:
         raise RuntimeError("recall_evaluation_detected_production_mutation")
+    per_case_total = sum(entry["total"] for entry in case_query_counts.values())
+    per_case_sums_reconcile_to_total = (
+        fixed_setup_statement_count
+        + per_case_total
+        + metadata_query_count
+        + fixed_finalization_statement_count
+        == statement_count["total"]
+    )
+    if not per_case_sums_reconcile_to_total:
+        raise RuntimeError("recall_evaluation_statement_accounting_mismatch")
     mutation_proof = {
         "transaction": "REPEATABLE READ READ ONLY",
         "snapshot_digest_verified": manifest.snapshot_digest,
@@ -780,6 +942,11 @@ async def run_recall_evaluation(
         "total_db_statement_count": statement_count["total"],
         "case_db_statement_counts": case_query_counts,
         "metadata_query_count": metadata_query_count,
+        "fixed_setup_statement_count": fixed_setup_statement_count,
+        "fixed_finalization_statement_count": fixed_finalization_statement_count,
+        "per_case_sums_reconcile_to_total": per_case_sums_reconcile_to_total,
+        "query_embedding_sources": dict(sorted(embedding_sources.items())),
+        "runtime_config_digest": runtime_config_digest(),
         "provider_calls": dict(sorted(provider_calls.items())),
         "provider_call_expectations": {
             "semantic_query_embedding": expected_query_embeddings,
@@ -795,12 +962,17 @@ async def run_recall_evaluation(
     )
     if not mutation_proof["provider_call_expectations_met"]:
         raise RuntimeError("recall_evaluation_unexpected_provider_invocation")
-    public = _public_report(manifest, case_rows, mutation_proof=mutation_proof)
+    public = _public_report(
+        manifest,
+        case_rows,
+        mutation_proof=_public_read_only_proof(mutation_proof),
+    )
     private = {
         "private_report_schema_version": REPORT_SCHEMA_VERSION,
         "manifest": manifest.model_dump(mode="json"),
         "case_rows": case_rows,
         "public_report_digest": public["report_digest"],
+        "read_only_proof": mutation_proof,
         "performance": {
             "comparison_elapsed_ms": timings_ms,
             "profile_elapsed_ms": profile_timings_ms,
@@ -842,6 +1014,9 @@ async def read_only_evaluation_session(
 
 def build_markdown_report(report: dict[str, Any]) -> str:
     """Render a deterministic public-safe completion report."""
+    accounting = report["read_only_proof"]["query_accounting"]
+    per_case = accounting["per_case_total"]
+    replay = report["read_only_proof"]["deterministic_replay"]
     lines = [
         "# Recall shadow evaluation",
         "",
@@ -875,6 +1050,19 @@ def build_markdown_report(report: dict[str, Any]) -> str:
             "- Transaction: `REPEATABLE READ READ ONLY`.",
             "- Tracked mutation counters were equal before and after replay.",
             "- Candidate receipts were not persisted.",
+            "- Per-case statement sums reconcile with the transaction total.",
+            (
+                "- Aggregate per-case statements: "
+                f"min {per_case['min']}, mean {per_case['mean']}, "
+                f"max {per_case['max']} over {per_case['count']} cases."
+            ),
+            (
+                "- Query embeddings: "
+                f"{replay['frozen_embedding_case_count']} "
+                "frozen-manifest, "
+                f"{replay['provider_capture_case_count']} "
+                "provider-captured."
+            ),
             "",
         ]
     )

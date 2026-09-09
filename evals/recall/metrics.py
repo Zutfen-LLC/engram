@@ -30,8 +30,13 @@ def build_packet_change_metrics(
     membership_changed = legacy_set != candidate_set
     ordering_only = not membership_changed and legacy_ids != candidate_ids
     omissions = Counter(candidate.get("omitted_by_admission", {}))
+    # The exact frozen recall-packing-v1 summary vocabulary: packet packing
+    # summaries publish omission counts under "omitted" (see
+    # engram.recall_packing.PackingResult.summary). There is deliberately no
+    # production alias for "omitted_by_reason" — the evaluator consumes the
+    # frozen production contract as published.
     packing = candidate.get("packing") or {}
-    packing_omissions = Counter(packing.get("omitted_by_reason", {}))
+    packing_omissions = Counter(packing.get("omitted", {}))
     return {
         "packet_count": 1,
         "identical_packet_rate": 1.0 if legacy_ids == candidate_ids else 0.0,

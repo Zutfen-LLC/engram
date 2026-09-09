@@ -17,6 +17,7 @@ from evals.recall.runner import (
     run_recall_evaluation,
     write_reports,
 )
+from evals.recall.runtime_config import runtime_config_digest
 from evals.recall.schema import RecallEvaluationManifest
 
 
@@ -33,7 +34,8 @@ async def _run(args: argparse.Namespace) -> None:
                         {
                             "snapshot_digest": digest(
                                 await evaluation_state_identity(session, manifest)
-                            )
+                            ),
+                            "runtime_config_digest": runtime_config_digest(),
                         },
                         sort_keys=True,
                     )

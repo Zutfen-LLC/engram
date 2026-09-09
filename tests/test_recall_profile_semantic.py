@@ -3432,7 +3432,7 @@ async def test_frozen_recall_evaluation_uses_shared_profiles_without_mutation(
     frozen_at = datetime(2026, 9, 8, tzinfo=UTC)
     manifest = RecallEvaluationManifest.model_validate(
         {
-            "schema_version": "engram-recall-evaluation-input-v1",
+            "schema_version": "engram-recall-evaluation-input-v2",
             "baseline_sha": "e20a62853be75916c6a890fd7876c7e14c2718fc",
             "repository_sha": current_repository_sha(),
             "snapshot_digest": "0" * 64,
@@ -3450,7 +3450,7 @@ async def test_frozen_recall_evaluation_uses_shared_profiles_without_mutation(
                     "case_id": "frozen-evaluation-case",
                     "query": "semantic query",
                     "query_digest": semantic_query_digest("semantic query"),
-                    "strata": {"source_type": "extraction"},
+                    "strata": {"corpus_scale": "typical"},
                 }
             ],
         }
