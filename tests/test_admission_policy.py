@@ -11,6 +11,7 @@ import jsonschema  # type: ignore[import-untyped]
 import pytest
 
 from engram.admission_policy import (
+    POLICY_DIRECTORY,
     AdmissionItemState,
     EffectiveAssessmentState,
     PolicyLoadError,
@@ -73,9 +74,27 @@ def test_checked_in_candidate_policy_has_a_deterministic_digest() -> None:
     assert load_admission_policy("risk_aware_shadow_v1") == policy
 
 
+def test_policy_artifacts_live_inside_the_package() -> None:
+    # The deployed image runs the `engram` console script against a
+    # site-packages install where no repo checkout is on sys.path, so the
+    # artifacts must ship with the package rather than resolve through the
+    # checkout layout (issue #201).
+    from engram import admission_policy
+
+    assert admission_policy.__file__ is not None
+    package_root = Path(admission_policy.__file__).resolve().parent
+
+    assert admission_policy.POLICY_DIRECTORY.is_relative_to(package_root)
+    assert (admission_policy.POLICY_DIRECTORY / "risk_aware_shadow_v1.json").is_file()
+
+
 def test_checked_in_policy_validates_against_the_static_schema() -> None:
-    artifact = json.loads(Path("policies/admission/risk_aware_shadow_v1.json").read_text())
-    schema = json.loads(Path("schemas/admission-policy-v1.schema.json").read_text())
+    artifact = json.loads(
+        (POLICY_DIRECTORY / "risk_aware_shadow_v1.json").read_text(encoding="utf-8")
+    )
+    schema = json.loads(
+        Path("schemas/admission-policy-v1.schema.json").read_text(encoding="utf-8")
+    )
 
     jsonschema.Draft202012Validator(schema).validate(artifact)
 
@@ -292,7 +311,7 @@ def test_missing_policy_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyP
 def test_policy_digest_drift_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from engram import admission_policy
 
-    source = Path("policies/admission/risk_aware_shadow_v1.json")
+    source = POLICY_DIRECTORY / "risk_aware_shadow_v1.json"
     target = tmp_path / source.name
     target.write_text(source.read_text().replace("risk-aware-shadow-v1", "drifted-v1"))
     monkeypatch.setattr(admission_policy, "POLICY_DIRECTORY", tmp_path)
