@@ -16,7 +16,7 @@ from engram.assessment_calibration import (
     CalibrationProfile,
 )
 from engram.assessment_schema import AssessmentContract
-from evals.admission.schema import Record, digest
+from evals.admission.schema import LabelRecord, Record, digest
 from evals.calibration.freeze import (
     LABEL_GUIDE_VERSION,
     EvidenceFloors,
@@ -42,6 +42,7 @@ class LabeledObservation(Record):
     assertion_mode: str
     kind: str
     risk: str
+    consequence: Literal["low", "medium", "high", "unknown"] = "unknown"
 
     @classmethod
     def from_review(
@@ -76,6 +77,7 @@ class LabeledObservation(Record):
                 dimension="taxonomy",
                 outcome=outcome,
                 raw_value=raw_scores.get("taxonomy_value"),
+                consequence=dimensions.consequence,
                 **stratum,
             )
         )
@@ -90,6 +92,7 @@ class LabeledObservation(Record):
                 dimension="retention",
                 outcome=outcome,
                 raw_value=raw_scores.get("retention_value"),
+                consequence=dimensions.consequence,
                 **stratum,
             )
         )
@@ -98,8 +101,7 @@ class LabeledObservation(Record):
         else:
             outcome = (
                 "positive"
-                if dimensions.epistemic_state
-                in ("adequately_supported", "weakly_supported")
+                if dimensions.epistemic_state in ("adequately_supported", "weakly_supported")
                 else "negative"
             )
         out.append(
@@ -109,6 +111,7 @@ class LabeledObservation(Record):
                 dimension="epistemic",
                 outcome=outcome,
                 raw_value=raw_scores.get("epistemic_value"),
+                consequence=dimensions.consequence,
                 **stratum,
             )
         )
@@ -166,11 +169,7 @@ def fit_profiles(
             total[index] += 1
             if obs.outcome == "positive":
                 positive[index] += 1
-        supported = [
-            index
-            for index, count in enumerate(total)
-            if count >= MIN_CALIBRATION_SAMPLES
-        ]
+        supported = [index for index, count in enumerate(total) if count >= MIN_CALIBRATION_SAMPLES]
         if not supported:
             continue
         for index in supported:
@@ -236,13 +235,13 @@ def evaluate_holdout(
         ) in profile_keys
         if not labeled:
             metrics.append(
-                HoldoutMetrics(dimension=dimension, stratum=stratum, n=len(rows),
-                               covered_stratum=covered)
+                HoldoutMetrics(
+                    dimension=dimension, stratum=stratum, n=len(rows), covered_stratum=covered
+                )
             )
             continue
         brier = sum(
-            (raw - (1.0 if outcome == "positive" else 0.0)) ** 2
-            for raw, outcome in labeled
+            (raw - (1.0 if outcome == "positive" else 0.0)) ** 2 for raw, outcome in labeled
         ) / len(labeled)
         reliability: list[dict[str, float | int | None]] = []
         weighted = 0.0
@@ -300,6 +299,17 @@ def evaluate_holdout(
     return metrics
 
 
+class EvidenceFloorResult(Record):
+    """Evidence-derived result for every frozen floor, with partial support visible."""
+
+    checks: dict[str, bool]
+    dimension_support: dict[str, dict[str, Any]]
+    stratum_support: dict[str, dict[str, Any]]
+    bin_support: dict[str, dict[str, Any]]
+    failures: tuple[str, ...]
+    passed: bool
+
+
 class CalibrationArtifactBundle(Record):
     """The versioned artifact bundle. The profiles list is the exact payload the
     production loader consumes; everything else is provenance/binding."""
@@ -318,6 +328,7 @@ class CalibrationArtifactBundle(Record):
     profiles: list[dict[str, Any]]
     holdout_metrics: list[dict[str, Any]]
     unsupported_strata: list[str]
+    floor_results: dict[str, Any]
     floors_satisfied: bool
 
     def artifact_digest(self) -> str:
@@ -339,17 +350,11 @@ def build_artifact(
     floors: EvidenceFloors,
     profiles: list[CalibrationProfile],
     holdout_metrics: list[HoldoutMetrics],
-    floors_satisfied: bool,
+    floor_result: EvidenceFloorResult,
 ) -> CalibrationArtifactBundle:
-    {
-        (p.dimension, p.source_type, p.assertion_mode, p.kind, p.risk) for p in profiles
-    }
+    {(p.dimension, p.source_type, p.assertion_mode, p.kind, p.risk) for p in profiles}
     unsupported = sorted(
-        {
-            "/".join([m.dimension, m.stratum])
-            for m in holdout_metrics
-            if not m.covered_stratum
-        }
+        {"/".join([m.dimension, m.stratum]) for m in holdout_metrics if not m.covered_stratum}
     )
     return CalibrationArtifactBundle(
         fitting_method="exact-stratum-reliability-bins-v1",
@@ -362,34 +367,202 @@ def build_artifact(
         profiles=[p.model_dump(mode="json") for p in profiles],
         holdout_metrics=[m.model_dump(mode="json") for m in holdout_metrics],
         unsupported_strata=unsupported,
-        floors_satisfied=floors_satisfied,
+        floor_results=floor_result.model_dump(mode="json"),
+        floors_satisfied=floor_result.passed,
     )
+
+
+def _profile_key(profile: CalibrationProfile) -> tuple[str, str, str, str, str]:
+    return (
+        profile.dimension,
+        profile.source_type,
+        profile.assertion_mode,
+        profile.kind,
+        profile.risk,
+    )
+
+
+def _observation_key(obs: LabeledObservation) -> tuple[str, str, str, str, str]:
+    return (obs.dimension, obs.source_type, obs.assertion_mode, obs.kind, obs.risk)
 
 
 def check_floors(
     *,
     floors: EvidenceFloors,
+    reviewed_records: list[LabelRecord],
     observations: list[LabeledObservation],
-    high_consequence_count: int,
-) -> dict[str, bool]:
-    """Evaluate the frozen floors against reviewed evidence. Never lowered."""
-    labeled = [o for o in observations if o.outcome != "unknown"]
-    unique_samples = {o.sample_id for o in observations}
-    by_dimension: dict[str, int] = defaultdict(int)
-    for obs in labeled:
-        by_dimension[obs.dimension] += 1
-    holdout_samples = {o.sample_id for o in observations if o.split == "holdout"}
-    return {
-        "total_reviewed": len(unique_samples) >= floors.total_reviewed_min,
-        "per_dimension_labeled": all(
-            by_dimension.get(dimension, 0) >= floors.per_dimension_labeled_min
-            for dimension in ("taxonomy", "retention", "epistemic")
-        ),
-        "holdout_size": len(holdout_samples) >= floors.holdout_min,
-        "high_consequence": (
-            high_consequence_count >= floors.high_consequence_reviewed_min
-            if floors.high_consequence_reviewed_min
-            else True
-        ),
-        "bin_support": True,  # verified structurally: fit drops thin bins
+    profiles: list[CalibrationProfile],
+) -> EvidenceFloorResult:
+    """Evaluate every frozen floor from reviewer, split, and fitted-profile evidence."""
+    completed = [
+        record
+        for record in reviewed_records
+        if record.label_origin == "human_adjudicated"
+        and record.review_stage == "complete"
+        and record.final_dimensions() is not None
+    ]
+    completed_ids = {record.sample_id for record in completed}
+    labeled = [
+        obs
+        for obs in observations
+        if obs.sample_id in completed_ids and obs.outcome != "unknown" and obs.raw_value is not None
+    ]
+    by_dimension = {
+        dimension: len({obs.sample_id for obs in labeled if obs.dimension == dimension})
+        for dimension in ("taxonomy", "retention", "epistemic")
     }
+    non_unknown_fraction = {
+        dimension: (by_dimension[dimension] / len(completed_ids) if completed_ids else 0.0)
+        for dimension in ("taxonomy", "retention", "epistemic")
+    }
+    holdout_ids = {
+        obs.sample_id
+        for obs in observations
+        if obs.split == "holdout" and obs.sample_id in completed_ids
+    }
+    holdout_labeled = {
+        dimension: len(
+            {
+                obs.sample_id
+                for obs in labeled
+                if obs.split == "holdout" and obs.dimension == dimension
+            }
+        )
+        for dimension in ("taxonomy", "retention", "epistemic")
+    }
+    high_records = [
+        record
+        for record in reviewed_records
+        if (record.final_dimensions() or record.reviewer_a.dimensions).consequence == "high"
+    ]
+    high_completed = [record for record in completed if record in high_records]
+    dual_complete = all(
+        record.reviewer_b is not None
+        and record.reviewer_b.adjudicator_ref != record.reviewer_a.adjudicator_ref
+        and record.disagreement != "unresolved"
+        for record in high_records
+    )
+
+    stratum_support: dict[str, dict[str, Any]] = {}
+    bin_support: dict[str, dict[str, Any]] = {}
+    profile_keys = {_profile_key(profile) for profile in profiles}
+    observed_keys = {_observation_key(obs) for obs in labeled if obs.split == "dev"}
+    for key in sorted(profile_keys | observed_keys):
+        name = "/".join(key)
+        count = len(
+            {
+                obs.sample_id
+                for obs in labeled
+                if obs.split == "dev" and _observation_key(obs) == key
+            }
+        )
+        claimed_supported = key in profile_keys
+        stratum_support[name] = {
+            "labeled_dev": count,
+            "required": floors.per_stratum_min,
+            "claimed_supported": claimed_supported,
+            "supported": claimed_supported and count >= floors.per_stratum_min,
+        }
+    for profile in profiles:
+        name = "/".join(_profile_key(profile))
+        for index, bucket in enumerate(profile.bins):
+            bin_name = f"{name}/bin-{index}"
+            claimed_supported = bucket.count > 0
+            bin_support[bin_name] = {
+                "fitted_count": bucket.count,
+                "required": floors.per_bin_support_min,
+                "claimed_supported": claimed_supported,
+                "supported": claimed_supported and bucket.count >= floors.per_bin_support_min,
+            }
+
+    dimension_support: dict[str, dict[str, Any]] = {}
+    for dimension in ("taxonomy", "retention", "epistemic"):
+        names = [
+            name
+            for name, result in stratum_support.items()
+            if name.startswith(f"{dimension}/") and result["claimed_supported"]
+        ]
+        bins = [
+            name
+            for name, result in bin_support.items()
+            if name.startswith(f"{dimension}/") and result["claimed_supported"]
+        ]
+        supported = (
+            by_dimension[dimension] >= floors.per_dimension_labeled_min
+            and non_unknown_fraction[dimension] >= floors.per_dimension_non_unknown_fraction_min
+            and bool(names)
+            and bool(bins)
+            and all(stratum_support[name]["supported"] for name in names)
+            and all(bin_support[name]["supported"] for name in bins)
+        )
+        dimension_support[dimension] = {
+            "labeled": by_dimension[dimension],
+            "required": floors.per_dimension_labeled_min,
+            "non_unknown_fraction": non_unknown_fraction[dimension],
+            "non_unknown_fraction_required": floors.per_dimension_non_unknown_fraction_min,
+            "profile_count": sum(key[0] == dimension for key in profile_keys),
+            "supported": supported,
+        }
+
+    high_labeled_by_dimension = {
+        dimension: len(
+            {
+                obs.sample_id
+                for obs in labeled
+                if obs.split == "dev" and obs.consequence == "high" and obs.dimension == dimension
+            }
+        )
+        for dimension in ("taxonomy", "retention", "epistemic")
+    }
+    required_high_labeled = min(floors.high_consequence_reviewed_min, floors.per_stratum_min)
+    high_strata: dict[tuple[str, str, str, str, str], set[str]] = defaultdict(set)
+    for obs in labeled:
+        if (
+            obs.split == "dev"
+            and obs.consequence == "high"
+            and _observation_key(obs) in profile_keys
+        ):
+            high_strata[_observation_key(obs)].add(obs.sample_id)
+    high_strata_supported = floors.high_consequence_reviewed_min == 0 or (
+        bool(high_strata)
+        and all(len(sample_ids) >= floors.per_stratum_min for sample_ids in high_strata.values())
+    )
+    claimed_bins = [result for result in bin_support.values() if result["claimed_supported"]]
+    claimed_strata = [result for result in stratum_support.values() if result["claimed_supported"]]
+    holdout_support_required = min(floors.holdout_min, floors.per_stratum_min)
+
+    checks = {
+        "total_reviewed": len(completed_ids) >= floors.total_reviewed_min,
+        "per_dimension_labeled": all(
+            count >= floors.per_dimension_labeled_min for count in by_dimension.values()
+        ),
+        "per_dimension_non_unknown_fraction": all(
+            value >= floors.per_dimension_non_unknown_fraction_min
+            for value in non_unknown_fraction.values()
+        ),
+        "holdout_size": len(holdout_ids) >= floors.holdout_min,
+        "holdout_labeled_support": all(
+            count >= holdout_support_required for count in holdout_labeled.values()
+        ),
+        "high_consequence": len(high_completed) >= floors.high_consequence_reviewed_min,
+        "high_consequence_labeled_support": all(
+            count >= required_high_labeled for count in high_labeled_by_dimension.values()
+        ),
+        "dual_review_high_consequence": (not floors.dual_review_high_consequence) or dual_complete,
+        "bin_support": bool(claimed_bins) and all(result["supported"] for result in claimed_bins),
+        "per_stratum_support": bool(claimed_strata)
+        and all(result["supported"] for result in claimed_strata),
+        "high_consequence_strata_support": high_strata_supported,
+        "all_dimensions_explicitly_supported": all(
+            result["supported"] for result in dimension_support.values()
+        ),
+    }
+    failures = tuple(sorted(name for name, passed in checks.items() if not passed))
+    return EvidenceFloorResult(
+        checks=checks,
+        dimension_support=dimension_support,
+        stratum_support=stratum_support,
+        bin_support=bin_support,
+        failures=failures,
+        passed=not failures,
+    )

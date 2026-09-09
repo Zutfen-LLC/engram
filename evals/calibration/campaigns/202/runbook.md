@@ -1,36 +1,40 @@
 # ENG-CALIBRATION-001F (#202) operator runbook — review stage
 
-Status: STOPPED FOR HUMAN ADJUDICATION. Everything before human review is
-frozen and digest-bound; everything after it is blocked on the reviewed
-labels passing the frozen floors and gates.
+Status: PRE-REVIEW FREEZE INVALIDATED. Do not begin human review from the v1
+packets. The v1 split was incorrectly generated over all 624 eligible rows
+instead of the 402 sampled rows. No human labels were accepted before this
+invalidation. Corrected v2 artifacts are being frozen against corrected code.
 
-## Frozen so far (do not regenerate)
+## Invalidated v1 audit trail — do not use
 
-| Artifact | Where | Identity |
-| --- | --- | --- |
-| Campaign code | `evals/calibration/` @ PR #203 | branch `202-dogfood-157-calibration` |
-| Target identity | protected `identity-frozen.json` + public manifest | digest `78d45df3…f3093` |
-| Corpus snapshot | protected `raw-items-snapshot.json` (624 eligible rows) | sha256 `cc172a6f…8bdb0` |
-| Sampling manifest | protected; digest in public manifest | digest `27de308a…c8475` |
-| Split manifest | protected; digest in public manifest | digest `2f2b7ec5…ed73` |
-| Blind packets (A/B) | protected `eng-calibration-001f-blind-v1.*.json` | sha256 in `packets-manifest.json` |
-| Label guide | `evals/labeling/calibration-157-v1.md` | `engram-calibration-guide-157-v1` |
+| Artifact | Invalid identity |
+| --- | --- |
+| Campaign code | repository SHA `3d17923e6553a5a633a819682f9ffad8423cd8ef` |
+| Target identity | digest `78d45df3…f3093` |
+| Corpus snapshot | 624 eligible rows; sha256 `cc172a6f…8bdb0` |
+| Sampling manifest | 402 samples; digest `27de308a…c8475` |
+| Split manifest | 362 dev + 262 holdout; digest `2f2b7ec5…ed73` |
+| Blind packets | invalidated because their split/identity lineage used v1 |
 
-Protected root: `~/.local/share/engram/evals/202/` (0700, files 0600).
+The protected v1 directory is retained immutably for audit. The authorized raw
+snapshot may be copied byte-for-byte into the corrected v2 protected directory;
+all derived manifests and packets must be regenerated.
 
-## Sample achieved
+## Invalid v1 accounting
 
-402 samples / 624 eligible; dev 362 / holdout 262; 30 duplicate groups all
-contained within one split; per-stratum counts in the public manifest.
+The v1 sample had 402 members, but its split had 624 members (362 dev + 262
+holdout). This violates `sample_count == dev_count + holdout_count` and the
+stronger exact-membership partition invariant.
 
 ## What human review must do
 
-1. Reviewer A labels all 402 cases from the reviewer_a packet under the
-   frozen guide (label schema `engram-admission-label-v1`, dimensions per
-   the guide; `label_origin=human_adjudicated`).
-2. Reviewer B independently labels (at minimum) every case Reviewer A marks
-   `consequence=high`, plus the policy-disagreement set — derived AFTER A's
-   labels are frozen, never chosen by the reviewer.
+1. Reviewer A labels every corrected v2 case under the frozen guide (label
+   schema `engram-admission-label-v1`, dimensions per the guide;
+   `label_origin=human_adjudicated`).
+2. Reviewer B independently labels every corrected v2 case from the separate
+   full-population blind packet. This strict-superset strategy necessarily
+   dual-reviews all high-consequence and policy-disagreement cases without
+   selecting Reviewer B membership from provider or policy output.
 3. Operator adjudicates every substantive disagreement with a recorded
    reason; unresolved disagreement keeps `disagreement=unresolved` and the
    sample contributes no calibration support.

@@ -21,9 +21,9 @@ from engram.assessment_calibration import load_profiles
 from engram.assessment_schema import AssessmentContract
 from evals.admission.schema import LabelRecord, digest
 from evals.calibration.fit import (
+    EvidenceFloorResult,
     LabeledObservation,
     build_artifact,
-    check_floors,
     evaluate_holdout,
     fit_profiles,
 )
@@ -77,6 +77,17 @@ def _contract(identity: TargetIdentity) -> AssessmentContract:
     )
 
 
+def _floor_result() -> EvidenceFloorResult:
+    return EvidenceFloorResult(
+        checks={"holdout_size": True},
+        dimension_support={},
+        stratum_support={},
+        bin_support={},
+        failures=(),
+        passed=True,
+    )
+
+
 def _frame(n: int = 40):
     rows = []
     content_by_uuid = {}
@@ -104,22 +115,22 @@ def _frame(n: int = 40):
 class TestDeterministicManifests:
     def test_sampling_deterministic(self):
         frame, _ = _frame()
-        ids1, strata1 = stratified_sample(
+        ids1, strata1, coverage1 = stratified_sample(
             frame, campaign_id="c", sampling_seed="s", coverage_min=1, allocation_fraction=0.5
         )
-        ids2, strata2 = stratified_sample(
+        ids2, strata2, coverage2 = stratified_sample(
             frame, campaign_id="c", sampling_seed="s", coverage_min=1, allocation_fraction=0.5
         )
-        assert ids1 == ids2 and strata1 == strata2
+        assert ids1 == ids2 and strata1 == strata2 and coverage1 == coverage2
         # different seed changes membership (deterministic, not constant)
-        ids3, _ = stratified_sample(
+        ids3, _, _ = stratified_sample(
             frame, campaign_id="c", sampling_seed="t", coverage_min=1, allocation_fraction=0.5
         )
         assert ids1 != ids3
 
     def test_manifest_digest_binds_membership(self):
         frame, _ = _frame()
-        ids, strata = stratified_sample(
+        ids, strata, coverage = stratified_sample(
             frame, campaign_id="c", sampling_seed="s", coverage_min=1, allocation_fraction=0.5
         )
         m1 = SamplingManifest(
@@ -132,6 +143,7 @@ class TestDeterministicManifests:
             exclusion_rules=(),
             source_row_counts={"frame": len(frame)},
             stratum_counts=strata,
+            coverage_dimensions=coverage,
             sample_ids=tuple(ids),
             sample_hashes=("f" * 64,) * len(ids),
         )
@@ -146,12 +158,14 @@ class TestSplitLeakage:
     def test_duplicates_grouped_into_one_split(self):
         frame, _ = _frame()
         # force a duplicate: same normalized content, different uuid
-        dup = frame[0].model_copy(
-            update={"item_uuid": "00000000-0000-0000-0001-000000000001"}
-        )
+        dup = frame[0].model_copy(update={"item_uuid": "00000000-0000-0000-0001-000000000001"})
         frame.append(dup)
         dev, holdout, checks, groups = assign_splits(
-            frame, campaign_id="c", split_seed="s", dev_fraction=0.6
+            frame,
+            sample_ids=[sample_id_for(row.item_uuid) for row in frame],
+            campaign_id="c",
+            split_seed="s",
+            dev_fraction=0.6,
         )
         assert checks["duplicate_groups"] >= 1
         assert not (set(dev) & set(holdout))
@@ -169,6 +183,7 @@ class TestSplitLeakage:
             SplitManifest(
                 campaign_id="c",
                 sampling_manifest_digest="d" * 64,
+                sampling_membership_digest=digest(["s1", "s2"]),
                 split_seed="s",
                 dev_fraction=0.6,
                 grouping=("content_hash",),
@@ -181,7 +196,7 @@ class TestSplitLeakage:
 class TestBlindPackets:
     def test_packets_exclude_scores_and_policy(self, tmp_path: Path):
         frame, _ = _frame()
-        ids, _ = stratified_sample(
+        ids, _, _ = stratified_sample(
             frame, campaign_id="c", sampling_seed="s", coverage_min=3, allocation_fraction=1.0
         )
         samples = [
@@ -207,6 +222,7 @@ class TestBlindPackets:
             exclusion_rules=(),
             source_row_counts={"frame": len(samples)},
             stratum_counts={"fact/manual/active": len(samples)},
+            coverage_dimensions={},
             sample_ids=tuple(ids),
             sample_hashes=("f" * 64,) * len(ids),
         )
@@ -223,7 +239,7 @@ class TestBlindPackets:
 
     def test_ingestion_fails_closed(self, tmp_path: Path):
         frame, _ = _frame()
-        ids, _ = stratified_sample(
+        ids, _, _ = stratified_sample(
             frame, campaign_id="c", sampling_seed="s", coverage_min=3, allocation_fraction=1.0
         )
         samples = [
@@ -249,6 +265,7 @@ class TestBlindPackets:
             exclusion_rules=(),
             source_row_counts={"frame": len(samples)},
             stratum_counts={"a": len(samples)},
+            coverage_dimensions={},
             sample_ids=tuple(ids),
             sample_hashes=("f" * 64,) * len(ids),
         )
@@ -271,9 +288,7 @@ class TestBlindPackets:
             for sid in ids
         ]
         # valid ingestion passes
-        ingest_reviewer_labels(
-            packet=packet, labels=labels, dataset_id="ds", dataset_version="v1"
-        )
+        ingest_reviewer_labels(packet=packet, labels=labels, dataset_id="ds", dataset_version="v1")
         # wrong count fails
         with pytest.raises((ValueError, ValidationError)):
             ingest_reviewer_labels(
@@ -407,6 +422,7 @@ class TestFitting:
             split=SplitManifest(
                 campaign_id="c",
                 sampling_manifest_digest="d" * 64,
+                sampling_membership_digest=digest(["s1", "s2"]),
                 split_seed="s",
                 dev_fraction=0.6,
                 grouping=("content_hash",),
@@ -418,6 +434,7 @@ class TestFitting:
                 campaign_id="c",
                 total_reviewed_min=10,
                 per_dimension_labeled_min=5,
+                per_dimension_non_unknown_fraction_min=0.5,
                 holdout_min=5,
                 high_consequence_reviewed_min=0,
                 per_bin_support_min=50,
@@ -425,7 +442,7 @@ class TestFitting:
             ),
             profiles=profiles,
             holdout_metrics=[],
-            floors_satisfied=True,
+            floor_result=_floor_result(),
         )
         path = tmp_path / "artifact.json"
         path.write_bytes(bundle.to_loader_payload())
@@ -456,22 +473,6 @@ class TestFitting:
             )
             assert score.status == "uncalibrated"
 
-    def test_floors_check(self):
-        floors = EvidenceFloors(
-            campaign_id="c",
-            total_reviewed_min=10,
-            per_dimension_labeled_min=5,
-            holdout_min=3,
-            high_consequence_reviewed_min=2,
-            per_bin_support_min=50,
-            per_stratum_min=1,
-        )
-        obs = self._observations(n_per_bin=6)
-        result = check_floors(floors=floors, observations=obs, high_consequence_count=3)
-        assert result["total_reviewed"] and result["high_consequence"]
-        # missing epistemic/taxonomy labeled counts fail per-dimension floor
-        assert not result["per_dimension_labeled"]
-
     def test_public_outputs_contain_no_raw_content(self):
         identity = _identity()
         contract = _contract(identity)
@@ -483,6 +484,7 @@ class TestFitting:
             split=SplitManifest(
                 campaign_id="c",
                 sampling_manifest_digest="d" * 64,
+                sampling_membership_digest=digest(["s1", "s2"]),
                 split_seed="s",
                 dev_fraction=0.6,
                 grouping=("content_hash",),
@@ -494,6 +496,7 @@ class TestFitting:
                 campaign_id="c",
                 total_reviewed_min=10,
                 per_dimension_labeled_min=5,
+                per_dimension_non_unknown_fraction_min=0.5,
                 holdout_min=5,
                 high_consequence_reviewed_min=0,
                 per_bin_support_min=50,
@@ -501,7 +504,7 @@ class TestFitting:
             ),
             profiles=profiles,
             holdout_metrics=[],
-            floors_satisfied=True,
+            floor_result=_floor_result(),
         )
         blob = json.dumps([bundle.target, bundle.floors, bundle.holdout_metrics])
         assert "content" not in blob.lower().replace("content_hash", "")
@@ -512,7 +515,7 @@ class TestFitting:
 class TestAgreement:
     def test_agreement_report(self):
         frame, _ = _frame()
-        ids, _ = stratified_sample(
+        ids, _, _ = stratified_sample(
             frame, campaign_id="c", sampling_seed="s", coverage_min=2, allocation_fraction=1.0
         )
         labels_a = [

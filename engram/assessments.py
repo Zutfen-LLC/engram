@@ -34,7 +34,7 @@ from engram.provider_clients import resolve_classification_provider
 def current_contract() -> AssessmentContract:
     """Identify the deployed inference contract without including credentials."""
     provider = resolve_classification_provider()
-    from engram.assessment_calibration import load_profiles
+    from engram.assessment_calibration import calibration_profiles_digest, load_profiles
 
     profiles = load_profiles(settings.assessment_calibration_profiles_path)
     return AssessmentContract(
@@ -50,9 +50,7 @@ def current_contract() -> AssessmentContract:
             }
         ),
         calibration_version=settings.assessment_calibration_version,
-        calibration_digest=digest([p.model_dump(mode="json") for p in profiles])
-        if profiles
-        else None,
+        calibration_digest=calibration_profiles_digest(profiles),
     )
 
 
@@ -128,9 +126,7 @@ async def evidence_snapshot(
     )
     if len(rows) > 64:
         raise ValueError("assessment evidence exceeds 64 extraction links")
-    return _snapshot_payload(
-        item, context, [_snapshot_root(dict(row)) for row in rows]
-    )
+    return _snapshot_payload(item, context, [_snapshot_root(dict(row)) for row in rows])
 
 
 def live_item(item: MemoryItem) -> bool:

@@ -8,6 +8,7 @@ ledger is canonicalized, digested, and stored once outside the repository.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -39,13 +40,16 @@ def build_packets(
     """Build Reviewer-A and Reviewer-B packets from the frozen sample set.
 
     Cases are ordered by frozen sample order (NOT by any reviewer-visible
-    property) and numbered by packet order. Reviewer B sees the identical case
-    view; its queue is derived later from frozen high-consequence labels.
+    property) and numbered by packet order. Reviewer B sees and must label the
+    identical full case view independently. This deliberately exceeds the
+    issue's minimum dual-review set without selecting from model/policy output.
     """
     by_id = {s["sample_id"]: s for s in samples}
-    missing = [sid for sid in sampling.sample_ids if sid not in by_id]
-    if missing:
-        raise ValueError("packet_samples_missing_from_manifest")
+    if len(by_id) != len(samples):
+        raise ValueError("duplicate_packet_sample_id")
+    expected = set(sampling.sample_ids)
+    if set(by_id) != expected:
+        raise ValueError("packet_sample_membership_mismatch")
     case_view: list[dict[str, Any]] = []
     for sid in sampling.sample_ids:
         s = by_id[sid]
@@ -59,7 +63,11 @@ def build_packets(
                 "review_status": s["review_status"],
                 "assertion_mode": s["assertion_mode"],
                 "origin": s["origin"],
+                "risk": s.get("risk", "unavailable"),
+                "evidence_state": s.get("evidence_state", "unavailable"),
                 "age_days": s["age_days"],
+                "age_bucket": s.get("age_bucket", "unavailable"),
+                "input_size_bucket": s.get("input_size_bucket", "unavailable"),
             }
         )
     packets = [
@@ -74,24 +82,41 @@ def build_packets(
     return packets
 
 
+def write_protected_file(path: Path, payload: bytes) -> None:
+    """Exclusively create a sensitive file under forced 0700/0600 modes."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb", closefd=False) as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        os.close(fd)
+
+
 def write_packets(packets: list[BlindPacket], protected_dir: Path) -> dict[str, str]:
     """Persist packets + manifest to a 0700/0600 protected directory."""
-    import hashlib
-
-    protected_dir.mkdir(parents=True, exist_ok=True)
+    protected_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(protected_dir, 0o700)
     manifest: dict[str, str] = {}
     for packet in packets:
         name = f"{packet.packet_id}.{packet.reviewer_hint}.json"
         path = protected_dir / name
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            handle.write(json.dumps(json.loads(packet.model_dump_json()), indent=2, sort_keys=True))
-        manifest[name] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
-    (protected_dir / "packets-manifest.json").write_text(
-        json.dumps(manifest, sort_keys=True, indent=2)
+        payload = json.dumps(
+            json.loads(packet.model_dump_json()), indent=2, sort_keys=True
+        ).encode()
+        write_protected_file(path, payload)
+        manifest[name] = hashlib.sha256(payload).hexdigest()
+    write_protected_file(
+        protected_dir / "packets-manifest.json",
+        (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode(),
     )
-    os.chmod(protected_dir / "packets-manifest.json", 0o600)
     return manifest
 
 
@@ -175,12 +200,10 @@ def freeze_ledger(
         separators=(",", ":"),
     ).encode()
     ledger_path = protected_dir / f"{campaign_id}-label-ledger.json"
-    fd = os.open(ledger_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "wb") as handle:
-        handle.write(payload)
+    write_protected_file(ledger_path, payload)
     return {
         "path": str(ledger_path),
-        "sha256": digest(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
         "records": len(records),
         "high_consequence": sum(
             1
@@ -194,6 +217,6 @@ def freeze_ledger(
 def verify_ledger(path: Path, expected_sha256: str) -> list[LabelRecord]:
     """Verify digest before consuming; never mutate a reviewer record."""
     data = Path(path).read_bytes()
-    if digest(data) != expected_sha256:
+    if hashlib.sha256(data).hexdigest() != expected_sha256:
         raise ValueError("label_ledger_digest_mismatch")
     return [LabelRecord.model_validate(row) for row in json.loads(data)]
