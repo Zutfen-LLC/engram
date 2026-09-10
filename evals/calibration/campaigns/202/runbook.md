@@ -1,62 +1,170 @@
-# ENG-CALIBRATION-001F (#202) operator runbook — review stage
+# ENG-CALIBRATION-001F (#202) operator runbook — corrected pre-review stage
 
-Status: PRE-REVIEW FREEZE INVALIDATED. Do not begin human review from the v1
-packets. The v1 split was incorrectly generated over all 624 eligible rows
-instead of the 402 sampled rows. No human labels were accepted before this
-invalidation. Corrected v2 artifacts are being frozen against corrected code.
+Status: **STOPPED FOR HUMAN ADJUDICATION**. The corrected v2 preparation
+artifacts are frozen. No human calibration labels have been accepted. Do not
+fit, gate, enable selection, or claim the #202 terminal result before the full
+human review and adjudication contract is complete.
 
-## Invalidated v1 audit trail — do not use
+## Invalidated v1 pre-review freeze
 
-| Artifact | Invalid identity |
+The v1 freeze is invalid because it sampled 402 rows but split all 624 eligible
+rows into 362 development and 262 holdout cases. The split and every downstream
+artifact depending on it are superseded. The original protected directory was
+retained byte-for-byte with a protected invalidation record; it was not
+rewritten or remapped.
+
+No accepted reviewer result, frozen label ledger, or adjudication artifact
+existed before invalidation. Both old 402-row templates had empty response
+fields.
+
+| Invalid v1 identity | Digest/count |
 | --- | --- |
-| Campaign code | repository SHA `3d17923e6553a5a633a819682f9ffad8423cd8ef` |
-| Target identity | digest `78d45df3…f3093` |
-| Corpus snapshot | 624 eligible rows; sha256 `cc172a6f…8bdb0` |
-| Sampling manifest | 402 samples; digest `27de308a…c8475` |
-| Split manifest | 362 dev + 262 holdout; digest `2f2b7ec5…ed73` |
-| Blind packets | invalidated because their split/identity lineage used v1 |
+| Tooling repository SHA | `3d17923e6553a5a633a819682f9ffad8423cd8ef` |
+| Target identity | `78d45df3b89261bc95adcf4fdaf4eeb3b54784c5dc4d5cea1fbd85a57b8f3093` |
+| Sampling manifest | `27de308acfac24f4a9292cf93d022f333277f1a080b529cbe74e665f64ec8475` |
+| Split manifest | `2f2b7ec5dccb0ab4882fa66906b5e9e4136c54632b0d44ef06fc3ec49ffeed73` |
+| Reviewer A packet | `aae8e0bd84642fde28ced42c404cb1b32b7f9fd7323605c7cda6852ddfd7443f` |
+| Reviewer B packet | `d6dc1bb20372c7097d44be024ed03fdaad10174136ec4d548abb0f175ae3a021` |
 
-The protected v1 directory is retained immutably for audit. The authorized raw
-snapshot may be copied byte-for-byte into the corrected v2 protected directory;
-all derived manifests and packets must be regenerated.
+A preliminary v2 regeneration at tooling SHA
+`66b11a388bb4e7a2060efafa191df35b1f698cd7` was also superseded before review
+when final provenance, calibrated-holdout, and canonical content-hash hardening
+changed the tooling. Its protected bytes and invalidation record are retained;
+its identity (`ea8d5403f2ad0b0b93f1553fd7cfd7093de765104826d9b9af4a44e186ebbd4e`),
+sampling (`449197e8e19d25aba2d936e94bdb6f669890735cd74ee8d9d3e481e575c2e5e3`),
+and split (`dfd71510a58f4c35a4feed6a130351362521e43f380981ff0ea45be8fec5414b`)
+digests are audit history only.
 
-## Invalid v1 accounting
+## Corrected v2 freeze
 
-The v1 sample had 402 members, but its split had 624 members (362 dev + 262
-holdout). This violates `sample_count == dev_count + holdout_count` and the
-stronger exact-membership partition invariant.
+The unchanged authorized snapshot was copied byte-for-byte into a new protected
+root. Protected directories are mode `0700`; files are exclusively created at
+mode `0600`. Exact membership, content, duplicate groups, packets, and reviewer
+material remain outside Git.
 
-## What human review must do
+| Corrected identity | Digest/count |
+| --- | --- |
+| Corrected tooling SHA | `fd3ddf9c7429712af6c47680267742b421e43fbe` |
+| Snapshot | `cc172a6f7c2780784ef0ce5686772a72324d1398976fc117da637df2a88fbdb0` |
+| Target identity | `d36bc930d09ec906f17ff7a46bda59cb34297244ef7d2f820e0a8ae422aa748d` |
+| Sampling manifest | `533ee1e338c1985c943ef186d2bb2273740fc4dd61a43d20ca11d1031f288dfa` |
+| Split manifest | `ad248d6605c98b8c4a544d43219576af9a3058c813a99a27c5a082aa18ce79f6` |
+| Reviewer A packet | `9c5ef5e47950bbe035c9769663cefbc9e064f8bbb8fa423dba1bd7e54886920d` |
+| Reviewer B packet | `bc384a50f3dc5bbdb414c0d118a0b2c7d5ea3c6e10a7e6b7410798653a99c36c` |
 
-1. Reviewer A labels every corrected v2 case under the frozen guide (label
-   schema `engram-admission-label-v1`, dimensions per the guide;
-   `label_origin=human_adjudicated`).
-2. Reviewer B independently labels every corrected v2 case from the separate
-   full-population blind packet. This strict-superset strategy necessarily
-   dual-reviews all high-consequence and policy-disagreement cases without
-   selecting Reviewer B membership from provider or policy output.
-3. Operator adjudicates every substantive disagreement with a recorded
-   reason; unresolved disagreement keeps `disagreement=unresolved` and the
-   sample contributes no calibration support.
-4. Labels are ingested via `ingest_reviewer_labels` (fail-closed) and the
-   adjudicated ledger is frozen via `freeze_ledger`.
+Corrected counts:
 
-Reviewers must not see: provider scores, model suggestions, this runbook's
-outcome statistics, or each other's labels before adjudication.
+- eligible: 624
+- sampled: 402
+- development: 241
+- holdout: 161
+- duplicate groups: 27, all contained within one split
 
-## After review (blocked until labels exist)
+The public and protected invariants are:
 
-1. Capture provider scores for the 402 samples under the frozen contract
-   (frozen-clone discipline; never bulk-enqueue on production).
-2. Join labels+scores into `LabeledObservation`s via the frozen outcome
-   mapping; `check_floors` must pass or the campaign terminates
-   `CALIBRATION_EVIDENCE_INSUFFICIENT`.
-3. `fit_profiles` on DEV only; `evaluate_holdout`; `build_artifact`.
-4. `gate_checks` decides the selection-enable recommendation. Any failure
-   keeps `assessment_selection_enabled=false`.
+```text
+402 == 241 + 161
+dev ∪ holdout == exact sampled membership
+dev ∩ holdout == ∅
+```
 
-## Invariants (verified at every step)
+## Frozen sampling and coverage
 
-- `CERTIFIED_SERVING_PROFILES == {"legacy"}` — unchanged, asserted.
-- `assessment_selection_enabled` — false on engram01 throughout.
-- No serving/default/candidate-ranking change in this campaign.
+The methodology is frozen in `sampling-plan-v2.md`. Membership is deterministic
+for the snapshot, campaign identity, v2 seeds, and corrected tooling SHA. It
+does not consume provider output, policy results, reviewer labels, or reviewer
+agreement.
+
+Mechanically sampled axes available in the snapshot:
+
+- source type;
+- memory kind;
+- review status (`active` and `proposed`);
+- deterministic age bucket;
+- objective input-size bucket, reported as size rather than “difficulty.”
+
+Explicitly unavailable from the snapshot:
+
+- assertion mode and assertion origin;
+- direct-user versus inferred/extracted provenance;
+- risk/consequence state;
+- evidence/epistemic state;
+- ambiguous/contested state;
+- an objective easy/difficult classification.
+
+Retention disposition and consequence are post-review-only. Provider
+success/failure/abstention is post-selection-only and cannot influence sample
+membership. `unknown` remains distinct from absent `unavailable`. No evidence
+independence, consequence, epistemic truth, or origin is inferred from source,
+principal/session/model counts, or content similarity. This campaign does not
+implement #161.
+
+## Frozen evidence floors
+
+- 300 completed reviewed samples;
+- 150 non-unknown labels per calibrated dimension;
+- at least 50% non-unknown coverage per calibrated dimension;
+- 100 reviewed holdout samples, at least 10 calibrated holdout observations per
+  emitted profile, calibrated Brier no greater than 0.25, and calibrated ECE no
+  greater than 0.15;
+- 20 completed high-consequence reviews plus non-unknown development support in
+  every calibrated dimension;
+- 50 fitted observations per used reliability bin;
+- 10 reviewed/labeled observations per claimed supported stratum;
+- independent full-population dual review for every frozen sample.
+
+Every floor is evidence-derived. Empty/all-unknown holdout or high-consequence
+evidence cannot pass. Thin/unprofiled strata and unused bins remain explicitly
+unsupported; one dimension’s support cannot hide another dimension’s failure.
+
+## Human review stop point
+
+1. Reviewer A independently labels all 402 corrected v2 cases under
+   `engram-calibration-guide-157-v1`.
+2. Reviewer B independently labels all 402 corrected v2 cases from the separate
+   full-population packet. This strict superset necessarily dual-reviews every
+   high-consequence and policy-disagreement case without selecting membership
+   from model or policy output.
+3. Reviewers must not see provider scores, model suggestions, policy decisions,
+   or each other’s labels before adjudication.
+4. The operator adjudicates every substantive disagreement with a recorded
+   reason. Unresolved samples contribute no calibration support.
+5. Ingestion must match exact packet count, unique IDs, order, and dataset
+   identity before a protected ledger can be frozen.
+
+## Post-review library workflow — blocked now
+
+After real labels are frozen, and not before:
+
+1. Capture provider scores under the frozen target contract on the frozen clone.
+2. Verify the protected ledger bytes against an independently retained SHA-256,
+   both packet-file SHA-256 values, exact sampling membership/content hashes, and
+   dataset identity; then build labeled observations and run `check_floors`.
+   Insufficient or partial evidence stops without lowering any threshold.
+3. Reject duplicate profile keys. Fit development observations only, then evaluate
+   the untouched holdout; unsupported bins reduce calibrated support/coverage and
+   cannot borrow raw observations.
+4. Capture fresh (maximum 24 hours), bounded HTTP `/v1/recall` and MCP probe
+   evidence bound to the target, profile set, deployed contract, and policy.
+5. Freeze that probe's SHA-256 inside the immutable calibration artifact, then
+   build and load the artifact. The gate accepts no caller-supplied replacement
+   digest.
+6. Run production `calibrate()` mismatch proofs for provider, model, prompt,
+   schema, code, config, calibration version/digest, and profile-stratum fields.
+7. Missing, malformed, stale, failed, or mismatched recall evidence returns
+   `KEEP_DISABLED`.
+8. The gate may recommend only dogfood shadow assessment selection. It never
+   mutates configuration.
+
+The operator-facing CLI intentionally provides only `freeze-target`, `sample`,
+and `packets` at this pre-review stage. Ingestion, fitting, gating, and reporting
+remain library-only until reviewed evidence exists.
+
+## Serving invariants
+
+- `assessment_selection_enabled == false`
+- `CERTIFIED_SERVING_PROFILES == {"legacy"}`
+- ordinary `/v1/recall` remains legacy-authoritative
+- MCP recall remains legacy-authoritative
+- no serving default, recall score, ranking weight, lifecycle state, or candidate
+  authority changed
