@@ -17,20 +17,30 @@ Frozen values (protocol version ``eng-calibration-consensus-206-v1``):
   refusal, provider failure, any reviewer confidence below ``medium`` on its
   own judgment, and any reviewer assigning ``consequence=high``;
 - audit: 15% of otherwise consensus-accepted cases, selected deterministically
-  by frozen sample ID and seed ``202-model-consensus-audit-v1``;
+  by frozen sample ID and seed ``202-model-consensus-audit-v1`` with marginal
+  coverage of source type, kind, review status, and age bucket;
 - audit escalation threshold: material audit disagreement on any critical
-  field for more than 5% of audited cases, or any single audited
-  consensus error with adjudicated ``consequence=high`` or material
-  calibration reversal, escalates ALL remaining consensus cases to human
-  review;
+  field for more than 5% of audited cases, any single audited consensus error
+  with adjudicated ``consequence=high``, or any material calibration
+  reversal, escalates ALL remaining consensus cases to human review;
 - no majority voting: 2-of-3 agreement never qualifies as consensus;
 - model judgments are never stored or reported as ``human_adjudicated``.
+
+Failure semantics are orthogonal and truthful (FIX-6):
+
+- ``parse_status``: ``parsed`` (valid judgment parsed from response bytes),
+  ``malformed`` (response bytes exist but do not parse as a judgment),
+  ``absent`` (no model response exists — provider execution failed);
+- ``outcome_status``: ``judged``, ``refused`` (response received, explicit
+  refusal), ``malformed`` (response received, schema parse failed),
+  ``provider_error`` (no usable response / provider execution failed).
 """
 
 from __future__ import annotations
 
 import hashlib
 import hmac
+import math
 from collections.abc import Mapping, Sequence
 from typing import Annotated, Any, Literal, Self
 
@@ -38,7 +48,12 @@ import rfc8785
 from pydantic import AwareDatetime, Field, model_validator
 
 from evals.admission.schema import Digest, Record, Token
-from evals.calibration.freeze import LABEL_GUIDE_VERSION, SamplingManifest
+from evals.calibration.freeze import (
+    AUDIT_COVERAGE_AXES,
+    LABEL_GUIDE_VERSION,
+    FrameRow,
+    SamplingManifest,
+)
 
 CONSENSUS_PROTOCOL_VERSION: Literal["eng-calibration-consensus-206-v1"] = (
     "eng-calibration-consensus-206-v1"
@@ -86,8 +101,16 @@ REVIEWER_SLOTS: tuple[str, ...] = ("model_a", "model_b", "model_c")
 FAMILY_BY_SLOT: dict[str, str] = dict(zip(REVIEWER_SLOTS, REVIEWER_FAMILIES, strict=True))
 SlotName = Literal["model_a", "model_b", "model_c"]
 ModelIdentifier = Annotated[str, Field(min_length=1, max_length=256)]
-ParseStatus = Literal["parsed", "malformed"]
-OutcomeStatus = Literal["judged", "refused", "provider_error"]
+# Orthogonal failure semantics (FIX-6):
+#   parsed     -> response bytes parsed into a valid judgment
+#   malformed  -> response bytes exist, judgment-schema parse failed
+#   absent     -> NO response bytes exist (provider execution failed)
+ParseStatus = Literal["parsed", "malformed", "absent"]
+#   judged         -> valid parsed judgment
+#   refused        -> response received, explicit refusal / no judgment
+#   malformed      -> response received but schema parsing failed
+#   provider_error -> no model response / provider execution failed
+OutcomeStatus = Literal["judged", "refused", "malformed", "provider_error"]
 CriticalFieldVocabulary: dict[str, set[str]] = {
     "expected_kind": {
         "preference",
@@ -141,9 +164,37 @@ DIAGNOSTIC_FIELDS: tuple[str, ...] = (
     "expected_next_action",
 )
 
+# Frozen calibration-outcome polarity used ONLY by the material-calibration
+# reversal rule (FIX-3). The taxonomy dimension's outcome depends on the
+# provider's later ``suggested_kind``; that dependency is represented
+# explicitly and the rule fails closed until it can be evaluated.
+REVERSAL_POLARITY: dict[str, dict[str, str]] = {
+    "retention_value": {
+        "retain": "positive",
+        "do_not_retain": "negative",
+        "uncertain": "unknown",
+    },
+    "epistemic_state": {
+        "adequately_supported": "positive",
+        "weakly_supported": "positive",
+        "contradicted": "negative",
+        "contested": "negative",
+        "unverifiable": "negative",
+        "ambiguous": "unknown",
+        "unknown": "unknown",
+    },
+}
+
 
 def digest_of(value: Any) -> str:
     return hashlib.sha256(rfc8785.dumps(value)).hexdigest()
+
+
+def _audit_rank(sample_id: str, seed: str = AUDIT_SELECTION_SEED) -> tuple[str, str]:
+    return (
+        hmac.new(seed.encode(), sample_id.encode(), hashlib.sha256).hexdigest(),
+        sample_id,
+    )
 
 
 class ReviewerIdentity(Record):
@@ -195,6 +246,16 @@ class ModelReviewRecord(Record):
     Never interchangeable with a human judgment: distinct schema name, slot
     and family provenance required, and the frozen #202 ledger validators
     reject any attempt to feed these rows in as reviewer labels.
+
+    Failure semantics (orthogonal, FIX-6):
+
+    - ``(parsed, judged)``: valid judgment; raw response digest required.
+    - ``(malformed, refused)``: response received, explicit refusal; raw
+      response digest required; error code required.
+    - ``(malformed, malformed)``: response received, parse failed; raw
+      response digest required; error code required.
+    - ``(absent, provider_error)``: NO response bytes; raw response digest
+      must be ``None``; error code required.
     """
 
     review_schema: Literal["engram-calibration-model-review-206-v1"] = MODEL_REVIEW_SCHEMA
@@ -214,7 +275,7 @@ class ModelReviewRecord(Record):
     outcome_status: OutcomeStatus
     reviewer_confidence: Literal["low", "medium", "high", "unknown"] = "unknown"
     judgment: ModelJudgment | None = None
-    raw_response_digest: Digest
+    raw_response_digest: Digest | None = None
     error_code: Token | None = None
 
     @model_validator(mode="after")
@@ -226,21 +287,35 @@ class ModelReviewRecord(Record):
         if self.label_guide_version != LABEL_GUIDE_VERSION:
             raise ValueError("label_guide_version_mismatch")
         if self.parse_status == "parsed":
-            if self.judgment is None:
-                raise ValueError("parsed_review_requires_judgment")
             if self.outcome_status != "judged":
                 raise ValueError("parsed_review_requires_judged_outcome")
+            if self.judgment is None:
+                raise ValueError("parsed_review_requires_judgment")
             if self.error_code is not None:
                 raise ValueError("judged_review_must_not_carry_error_code")
             if self.judgment.reviewer_confidence != self.reviewer_confidence:
                 raise ValueError("reviewer_confidence_must_match_judgment")
-        else:
+            if self.raw_response_digest is None:
+                raise ValueError("parsed_review_requires_raw_response_digest")
+        elif self.parse_status == "malformed":
+            # Response bytes exist (refusal or unparseable output).
+            if self.outcome_status not in ("refused", "malformed"):
+                raise ValueError("malformed_response_requires_refused_or_malformed_outcome")
             if self.judgment is not None:
                 raise ValueError("unparseable_review_must_not_carry_judgment")
-            if self.outcome_status == "judged":
-                raise ValueError("non_parsed_review_cannot_be_judged")
             if self.error_code is None:
                 raise ValueError("failed_review_requires_error_code")
+            if self.raw_response_digest is None:
+                raise ValueError("response_received_requires_raw_response_digest")
+        else:  # absent: provider execution failed, no response bytes
+            if self.outcome_status != "provider_error":
+                raise ValueError("absent_response_requires_provider_error_outcome")
+            if self.judgment is not None:
+                raise ValueError("provider_error_must_not_carry_judgment")
+            if self.error_code is None:
+                raise ValueError("failed_review_requires_error_code")
+            if self.raw_response_digest is not None:
+                raise ValueError("provider_error_without_response_must_not_carry_digest")
         return self
 
     def record_digest(self) -> Digest:
@@ -315,6 +390,17 @@ def judgment_is_consensus_eligible(judgment: ModelJudgment) -> bool:
     return True
 
 
+def _outcome_reason(record: ModelReviewRecord) -> str | None:
+    """Escalation reason for a non-judged record (truthful, orthogonal)."""
+    if record.outcome_status == "refused":
+        return "refused"
+    if record.outcome_status == "provider_error":
+        return "provider_error"
+    if record.outcome_status == "malformed":
+        return "malformed_review"
+    return None
+
+
 def classify_case(records_by_slot: Mapping[str, ModelReviewRecord]) -> dict[str, Any]:
     """Classify one case from its three first-pass model records.
 
@@ -328,13 +414,10 @@ def classify_case(records_by_slot: Mapping[str, ModelReviewRecord]) -> dict[str,
     judgments: list[ModelJudgment] = []
     for slot in REVIEWER_SLOTS:
         record = records_by_slot[slot]
-        if record.parse_status != "parsed" or record.outcome_status != "judged":
-            if record.parse_status != "parsed":
-                reasons.append("malformed_review")
-            if record.outcome_status == "refused":
-                reasons.append("refused")
-            elif record.outcome_status == "provider_error":
-                reasons.append("provider_error")
+        if record.outcome_status != "judged" or record.parse_status != "parsed":
+            reason = _outcome_reason(record)
+            if reason is not None:
+                reasons.append(reason)
         elif record.judgment is not None:
             judgments.append(record.judgment)
     if len(judgments) == len(REVIEWER_SLOTS):
@@ -372,34 +455,219 @@ def classify_case(records_by_slot: Mapping[str, ModelReviewRecord]) -> dict[str,
     }
 
 
+def unanimous_consensus_critical(judgments: Sequence[ModelJudgment]) -> dict[str, Any] | None:
+    """Mechanically derive the unanimous consensus critical fields, or None."""
+    if len(judgments) != len(REVIEWER_SLOTS):
+        return None
+    criticals = [j.critical() for j in judgments]
+    first = criticals[0]
+    for critical in criticals[1:]:
+        if critical != first:
+            return None
+    return dict(first)
+
+
+def audit_target_count(population: int, *, rate: float = AUDIT_SAMPLE_RATE) -> int:
+    """Exact frozen audit size: ``ceil(rate * population)`` bounded by the pool."""
+    if population <= 0:
+        return 0
+    return min(math.ceil(rate * population), population)
+
+
 def select_audit_sample(
     consensus_sample_ids: Sequence[str],
     *,
+    frame_rows: Mapping[str, FrameRow] | None = None,
     rate: float = AUDIT_SAMPLE_RATE,
     seed: str = AUDIT_SELECTION_SEED,
 ) -> tuple[str, ...]:
     """Deterministically select ``ceil(rate * N)`` consensus cases for audit.
 
-    Selection ranks frozen sample IDs by HMAC-SHA256 under the frozen seed and
-    is label-blind: it never reads any judgment value, only membership
-    eligibility as a consensus case. Reproducible for fixed consensus
-    membership; changing membership changes the eligible pool only.
+    Label-blind: selection uses only consensus membership plus pre-existing
+    frozen frame metadata (FIX-2). It NEVER reads judgment values beyond the
+    binary fact that a case is consensus-eligible.
+
+    When ``frame_rows`` is supplied, the frozen marginal-coverage algorithm
+    runs (see ``select_audit_sample_with_coverage``): marginal cells across
+    ``source_type``, ``kind``, ``review_status`` and ``age_bucket`` are
+    covered first by frozen HMAC rank, then remaining slots fill globally by
+    rank — never exceeding the frozen target count. Without frame metadata
+    the selection is the pure global HMAC rank (usable only where no frame
+    exists, e.g. degenerate tests).
+    """
+    if frame_rows is None:
+        return _select_audit_sample_ranked(consensus_sample_ids, rate=rate, seed=seed)
+    return select_audit_sample_with_coverage(
+        consensus_sample_ids, frame_rows, rate=rate, seed=seed
+    ).selected
+
+
+def _select_audit_sample_ranked(
+    consensus_sample_ids: Sequence[str],
+    *,
+    rate: float,
+    seed: str,
+) -> tuple[str, ...]:
+    if not 0.0 < rate <= 1.0:
+        raise ValueError("audit_rate_out_of_range")
+    unique = sorted(set(consensus_sample_ids))
+    if len(unique) != len(consensus_sample_ids):
+        raise ValueError("audit_pool_membership_duplicate")
+    target = audit_target_count(len(unique), rate=rate)
+    ranked = sorted(unique, key=lambda sample_id: _audit_rank(sample_id, seed))
+    return tuple(ranked[:target])
+
+
+class AuditSelection(Record):
+    """Frozen marginal-coverage audit selection plus its coverage evidence."""
+
+    selected: tuple[str, ...]
+    target_count: int
+    population_count: int
+    covered_cells: tuple[str, ...]
+    uncovered_cells: tuple[str, ...]
+    algorithm: Literal["marginal-coverage-hmac-rank-v1"] = "marginal-coverage-hmac-rank-v1"
+
+
+def select_audit_sample_with_coverage(
+    consensus_sample_ids: Sequence[str],
+    frame_rows: Mapping[str, FrameRow],
+    *,
+    rate: float = AUDIT_SAMPLE_RATE,
+    seed: str = AUDIT_SELECTION_SEED,
+) -> AuditSelection:
+    """Frozen 15% audit selection WITH marginal coverage (FIX-2).
+
+    Deterministic, label-blind algorithm (``marginal-coverage-hmac-rank-v1``):
+
+    1. Required marginal cells are derived from the consensus population per
+       frozen axis (``source_type``, ``kind``, ``review_status``,
+       ``age_bucket``) using only pre-existing frozen frame metadata.
+    2. The frozen HMAC seed/rank is the ONLY ranking and tie-break primitive.
+    3. Phase A walks cases in ascending HMAC rank and selects each case that
+       covers at least one not-yet-covered marginal cell, until every cell is
+       covered or the target count is reached.
+    4. Phase B fills the remaining audit slots by global HMAC rank.
+    5. The selection never exceeds ``ceil(rate * N)``.
+
+    If the target is smaller than the number of coverable cells, Phase A's
+    rank-greedy order IS the documented deterministic prioritization: the
+    cells covered are exactly those owned by the globally highest-ranked
+    cases, and the uncovered cells are reported — coverage is never silently
+    claimed.
     """
     if not 0.0 < rate <= 1.0:
         raise ValueError("audit_rate_out_of_range")
     unique = sorted(set(consensus_sample_ids))
     if len(unique) != len(consensus_sample_ids):
         raise ValueError("audit_pool_membership_duplicate")
-    target = len(unique) - int(len(unique) * (1.0 - rate))
-    target = min(max(target, 1) if unique else 0, len(unique))
-    ranked = sorted(
-        unique,
-        key=lambda sample_id: (
-            hmac.new(seed.encode(), sample_id.encode(), hashlib.sha256).hexdigest(),
-            sample_id,
-        ),
+    missing = [sid for sid in unique if sid not in frame_rows]
+    if missing:
+        raise ValueError("audit_frame_membership_missing")
+    target = audit_target_count(len(unique), rate=rate)
+    if target == 0:
+        return AuditSelection(
+            selected=(),
+            target_count=0,
+            population_count=len(unique),
+            covered_cells=(),
+            uncovered_cells=(),
+        )
+    ranked = sorted(unique, key=lambda sample_id: _audit_rank(sample_id, seed))
+    cells: set[str] = set()
+    for sid in unique:
+        row = frame_rows[sid]
+        for axis in AUDIT_COVERAGE_AXES:
+            cells.add(f"{axis}={getattr(row, axis)}")
+    covered: set[str] = set()
+    selected: list[str] = []
+    # Phase A: rank-greedy marginal coverage.
+    for sid in ranked:
+        if len(selected) >= target:
+            break
+        if cells <= covered:
+            break
+        row = frame_rows[sid]
+        new_cells = {f"{axis}={getattr(row, axis)}" for axis in AUDIT_COVERAGE_AXES} - covered
+        if new_cells:
+            selected.append(sid)
+            covered |= new_cells
+    # Phase B: global rank fill.
+    chosen = set(selected)
+    for sid in ranked:
+        if len(selected) >= target:
+            break
+        if sid not in chosen:
+            selected.append(sid)
+            chosen.add(sid)
+    return AuditSelection(
+        selected=tuple(selected),
+        target_count=target,
+        population_count=len(unique),
+        covered_cells=tuple(sorted(covered)),
+        uncovered_cells=tuple(sorted(cells - covered)),
     )
-    return tuple(ranked[:target])
+
+
+def material_disagreement(
+    consensus_critical: Mapping[str, Any], human_final_critical: Mapping[str, Any]
+) -> bool:
+    """Material audit disagreement: human differs from unanimous model
+    consensus on ANY of the five critical fields."""
+    return any(
+        consensus_critical.get(field) != human_final_critical.get(field)
+        for field in CRITICAL_FIELDS
+    )
+
+
+def material_calibration_reversal(
+    consensus_critical: Mapping[str, Any],
+    human_final_critical: Mapping[str, Any],
+    *,
+    suggested_kind: str | None = None,
+) -> bool | None:
+    """Material calibration reversal (FIX-3), mechanically defined.
+
+    A material disagreement materially reverses a calibration outcome when it
+    flips the frozen calibration-outcome polarity (``REVERSAL_POLARITY``) of
+    at least one dimension:
+
+    - ``retention``: retain <-> do_not_retain (uncertain is unknown-polarity);
+    - ``epistemic``: supported <-> not-supported;
+    - ``taxonomy``: depends on the provider's later ``suggested_kind``; when
+      ``suggested_kind`` is unavailable the taxonomy dimension CANNOT be
+      evaluated and the rule FAILS CLOSED (returns True = treat as a
+      reversal) whenever the expected_kind values have opposite
+      correctness against the unavailable suggestion — i.e. whenever the
+      human and consensus ``expected_kind`` differ. Callers that possess the
+      later assessment evidence pass ``suggested_kind`` for exact evaluation.
+
+    Returns ``True`` (reversal), ``False`` (provably no reversal), or ``None``
+    only when there is no material disagreement at all.
+    """
+    if not material_disagreement(consensus_critical, human_final_critical):
+        return None
+    for field, polarity in REVERSAL_POLARITY.items():
+        consensus_polarity = polarity.get(str(consensus_critical.get(field)), "unknown")
+        human_polarity = polarity.get(str(human_final_critical.get(field)), "unknown")
+        if (
+            consensus_polarity != "unknown"
+            and human_polarity != "unknown"
+            and consensus_polarity != human_polarity
+        ):
+            return True
+    # taxonomy: exact evaluation requires the later suggested_kind.
+    if consensus_critical.get("expected_kind") != human_final_critical.get("expected_kind"):
+        if suggested_kind is None:
+            # Fail closed: cannot prove the taxonomy outcome did not reverse.
+            return True
+        if suggested_kind in ("", "unknown"):
+            return False  # both outcomes unknown-polarity under the frozen mapping
+        consensus_match = consensus_critical.get("expected_kind") == suggested_kind
+        human_match = human_final_critical.get("expected_kind") == suggested_kind
+        if consensus_match != human_match:
+            return True
+    return False
 
 
 def audit_outcome(
@@ -407,20 +675,120 @@ def audit_outcome(
     audited_count: int,
     material_disagreements: int,
     high_consequence_misses: int,
+    material_reversals: int = 0,
 ) -> dict[str, Any]:
-    """Apply the frozen audit escalation threshold. Fails toward escalation."""
-    escalate = (high_consequence_misses > 0) or (
-        audited_count > 0
-        and (material_disagreements / audited_count) > AUDIT_DISAGREEMENT_RATE_THRESHOLD
+    """Apply the frozen audit escalation thresholds. Fails toward escalation.
+
+    Escalation triggers (any one):
+
+    - material disagreement rate strictly greater than 5% of audited cases;
+    - any audited consensus error adjudicated ``consequence=high``;
+    - any material calibration reversal (``material_calibration_reversal``
+      returned True; fail-closed undeterminable cases must be passed here as
+      reversals by the caller).
+    """
+    escalate = (
+        (high_consequence_misses > 0)
+        or (material_reversals > 0)
+        or (
+            audited_count > 0
+            and (material_disagreements / audited_count) > AUDIT_DISAGREEMENT_RATE_THRESHOLD
+        )
     )
     return {
         "audited_count": audited_count,
         "material_disagreements": material_disagreements,
         "high_consequence_misses": high_consequence_misses,
+        "material_reversals": material_reversals,
         "material_disagreement_rate": (
             round(material_disagreements / audited_count, 4) if audited_count else None
         ),
         "escalate_full_human_review": escalate,
+    }
+
+
+def evaluate_audit_outcome(
+    *,
+    audit_results: Mapping[str, Mapping[str, Any]],
+    records_by_lane: Mapping[str, Mapping[str, ModelReviewRecord]],
+    suggested_kind_by_sample: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Derive the frozen audit outcome from audited-case human resolutions.
+
+    ``audit_results`` maps audited sample ID -> ``{"human_final_critical": …,
+    "consensus_critical": …}`` (the human FINAL resolution, not the initial
+    judgment). High-consequence misses are audited consensus errors the human
+    final resolution adjudicates as ``consequence=high``.
+    """
+    material = 0
+    high_misses = 0
+    reversals = 0
+    for sample_id, result in audit_results.items():
+        human_final = result["human_final_critical"]
+        consensus = result["consensus_critical"]
+        if not material_disagreement(consensus, human_final):
+            continue
+        material += 1
+        if human_final.get("consequence") == "high":
+            high_misses += 1
+        suggested = suggested_kind_by_sample.get(sample_id) if suggested_kind_by_sample else None
+        if material_calibration_reversal(consensus, human_final, suggested_kind=suggested):
+            reversals += 1
+    return audit_outcome(
+        audited_count=len(audit_results),
+        material_disagreements=material,
+        high_consequence_misses=high_misses,
+        material_reversals=reversals,
+    )
+
+
+def derive_final_human_population(
+    *,
+    initial_queue_ids: Sequence[str],
+    consensus_ids: Sequence[str],
+    audit_selected_ids: Sequence[str],
+    resolved_ids: Mapping[str, bool],
+    audit_escalated: bool,
+) -> dict[str, Any]:
+    """Derive the FINAL required human population (FIX-3).
+
+    Sequence enforced:
+
+        three frozen lanes -> initial human queue + audit sample
+          -> human audit/adjudication completed -> audit outcome evaluated
+          -> PASS: unaudited consensus may remain cross_model_consensus
+          -> ESCALATE: every remaining consensus case becomes human-required
+          -> all required human resolutions complete -> final ledger
+
+    ``resolved_ids`` maps required sample ID -> final resolution exists.
+    """
+    required: dict[str, tuple[str, ...]] = {}
+    for sample_id in initial_queue_ids:
+        required[sample_id] = ("initial_queue",)
+    audit_set = set(audit_selected_ids)
+    for sample_id in audit_selected_ids:
+        existing = required.get(sample_id, ())
+        required[sample_id] = existing + ("audit_selected",)
+    expanded: list[str] = []
+    if audit_escalated:
+        for sample_id in consensus_ids:
+            if sample_id in audit_set or sample_id in required:
+                # audit-selected rows are already required; escalated queue
+                # rows are already required
+                if sample_id not in required:
+                    required[sample_id] = ("audit_escalation_full_human_review",)
+                continue
+            required[sample_id] = ("audit_escalation_full_human_review",)
+            expanded.append(sample_id)
+    # unresolved = required cases lacking a final resolution
+    unresolved = sorted(sid for sid in required if not resolved_ids.get(sid))
+    return {
+        "required_ids": tuple(sorted(required)),
+        "reasons_by_sample": {sid: reason for sid, reason in sorted(required.items())},
+        "expanded_by_escalation": tuple(sorted(expanded)),
+        "escalated": audit_escalated,
+        "unresolved": tuple(unresolved),
+        "complete": not unresolved,
     }
 
 
@@ -482,11 +850,11 @@ class ReferenceLabel(Record):
     """One final reference label under the consensus protocol (#206).
 
     Carries exactly the five calibration-critical fields plus the campaign
-    provenance vocabulary. This is what ``check_floors`` and downstream
-    fitting consume — never majority votes or raw model judgments. The
-    ``final_label_origin`` vocabulary is deliberately disjoint from the
-    frozen #202 ``LabelRecord.label_origin`` values so a model-consensus row
-    can never masquerade as ``human_adjudicated``.
+    provenance vocabulary. NOTE (#206 correction): this type alone proves
+    NOTHING about provenance. The ONLY normal path into floors/fitting is a
+    ``VerifiedConsensusLedger`` produced by
+    ``evals.calibration.ledger.verify_consensus_ledger`` from protected
+    evidence; free-form lists of ``ReferenceLabel`` are rejected downstream.
     """
 
     label_schema: Literal["engram-calibration-reference-206-v1"] = (
@@ -508,12 +876,28 @@ class ReferenceLabel(Record):
         return self
 
 
+class AuditOutcomeRecord(Record):
+    """Frozen audit outcome bound into the final ledger."""
+
+    audited_count: int
+    material_disagreements: int
+    high_consequence_misses: int
+    material_reversals: int
+    material_disagreement_rate: float | None
+    escalate_full_human_review: bool
+
+
 class ConsensusLedger(Record):
     """Final reference-label ledger under the consensus protocol.
 
     Replaces full-population dual review for #202's corrected methodology.
-    ``check_floors`` consumes ONLY the final reference dimensions from these
-    wrappers — never majority votes or raw model judgments.
+    ``check_floors`` and downstream fitting consume ONLY the final reference
+    dimensions from these wrappers — never majority votes or raw model
+    judgments. The ledger binds campaign/protocol/sampling/packet identity,
+    all three lane digests, the human-queue evidence digest, the frozen audit
+    outcome, and the exact final sample membership. It is authoritative only
+    after ``verify_consensus_ledger`` re-derives every row from protected
+    evidence (see evals.calibration.ledger).
     """
 
     ledger_schema: Literal["engram-calibration-consensus-ledger-206-v1"] = CONSENSUS_LEDGER_SCHEMA
@@ -522,6 +906,9 @@ class ConsensusLedger(Record):
     sampling_manifest_digest: str
     source_packet_digest: str
     lane_digests: tuple[Digest, ...]  # exactly three, slot order
+    queue_evidence_sha256: str
+    audit_outcome: AuditOutcomeRecord
+    audit_selection: AuditSelection
     audit_seed: str = AUDIT_SELECTION_SEED
     audit_rate: float = AUDIT_SAMPLE_RATE
     wrappers: tuple[ConsensusProvenanceWrapper, ...]
@@ -583,6 +970,33 @@ class CorrelationReport(Record):
         return self
 
 
+def aggregate_by_axis_counts(
+    consensus_ids: Sequence[str],
+    audit_selected: Sequence[str],
+    frame_rows: Mapping[str, FrameRow],
+) -> dict[str, dict[str, dict[str, int]]]:
+    """Privacy-safe marginal aggregates for the frozen coverage axes.
+
+    Aggregate counts only — no sample IDs, no tenant content, no judgment
+    values.
+    """
+    audit_set = set(audit_selected)
+    result: dict[str, dict[str, dict[str, int]]] = {}
+    for axis in AUDIT_COVERAGE_AXES:
+        cells: dict[str, dict[str, int]] = {}
+        for sid in consensus_ids:
+            row = frame_rows.get(sid)
+            if row is None:
+                continue  # membership validated elsewhere; never guess a value
+            value = str(getattr(row, axis))
+            cell = cells.setdefault(value, {"consensus": 0, "audit_selected": 0})
+            cell["consensus"] += 1
+            if sid in audit_set:
+                cell["audit_selected"] += 1
+        result[axis] = dict(sorted(cells.items()))
+    return result
+
+
 def build_correlation_report(
     *,
     campaign_id: str,
@@ -590,13 +1004,18 @@ def build_correlation_report(
     records_by_lane: Mapping[str, Mapping[str, ModelReviewRecord]],
     sampling: SamplingManifest,
     source_packet_digest: str,
+    frame_rows: Mapping[str, FrameRow] | None = None,
     audit: Mapping[str, Any] | None = None,
 ) -> CorrelationReport:
     """Aggregate three frozen lanes into the public-safe correlation report.
 
     Must be called only after all three lanes are frozen. Produces counts and
     digests only — no tenant content, private IDs, reviewer rationales, or
-    protected labels.
+    protected labels. ``malformed_error_refusal_count`` counts UNIQUE
+    affected cases (a case with multiple failure reasons counts once); the
+    per-reason overlap is reported separately in ``queue_reason_overlap``.
+    ``aggregate_by_axis`` is populated from the protected frame when frame
+    rows are supplied (required for the real campaign).
     """
     audit = audit or {}
     validate_lane_isolation(lanes)
@@ -628,10 +1047,14 @@ def build_correlation_report(
     queue_ids = [sid for sid, c in classifications.items() if c["escalation_reasons"]]
     reason_counts: dict[str, int] = {}
     overlap_pairs: dict[str, int] = {}
-    for classification in classifications.values():
+    failure_case_ids: set[str] = set()
+    FAILURE_REASONS = {"malformed_review", "refused", "provider_error"}
+    for sample_id, classification in classifications.items():
         reasons = classification["escalation_reasons"]
         for reason in reasons:
             reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        if any(reason in FAILURE_REASONS for reason in reasons):
+            failure_case_ids.add(sample_id)
         ordered = sorted(reasons)
         for i, first in enumerate(ordered):
             for second in ordered[i + 1 :]:
@@ -669,7 +1092,13 @@ def build_correlation_report(
             if len(values) == 1:
                 three_agree += 1
         threeway[field_name] = three_agree
-    audit_selected = select_audit_sample(consensus_ids)
+    if frame_rows is not None:
+        selection = select_audit_sample_with_coverage(consensus_ids, frame_rows)
+        audit_selected = selection.selected
+        aggregate_axis = aggregate_by_axis_counts(consensus_ids, audit_selected, frame_rows)
+    else:
+        audit_selected = select_audit_sample(consensus_ids)
+        aggregate_axis = {}
     audit_payload = {
         "audit_selection_seed": AUDIT_SELECTION_SEED,
         "audit_rate": AUDIT_SAMPLE_RATE,
@@ -690,11 +1119,7 @@ def build_correlation_report(
         consensus_count=len(consensus_ids),
         disagreement_count=reason_counts.get("critical_field_disagreement", 0),
         uncertain_count=reason_counts.get("uncertain_unknown_or_ambiguous_critical_value", 0),
-        malformed_error_refusal_count=(
-            reason_counts.get("malformed_review", 0)
-            + reason_counts.get("refused", 0)
-            + reason_counts.get("provider_error", 0)
-        ),
+        malformed_error_refusal_count=len(failure_case_ids),
         mandatory_high_consequence_count=reason_counts.get("high_consequence_signal", 0),
         queue_reason_overlap=dict(sorted(overlap_pairs.items())),
         human_queue_count_before_audit=len(set(queue_ids)),
@@ -712,6 +1137,6 @@ def build_correlation_report(
         },
         pairwise_agreement=pairwise,
         threeway_agreement=threeway,
-        aggregate_by_axis={},  # axes live in the protected frame; see runbook
+        aggregate_by_axis=aggregate_axis,
         audit=audit_payload,
     )

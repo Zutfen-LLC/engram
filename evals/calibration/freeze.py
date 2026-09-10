@@ -22,6 +22,17 @@ CAMPAIGN_SCHEMA = "engram-calibration-campaign-v1"
 CALIBRATION_ARTIFACT_SCHEMA = "engram.calibration-profiles-v1"
 LABEL_GUIDE_VERSION = "engram-calibration-guide-157-v1"
 CANONICALIZATION_VERSION = "assessment-evidence-manifest-v1"
+# Frozen marginal-coverage axes for the #206 deterministic 15% audit
+# (issue #206 FIX-2). Selection is label-blind: it uses only consensus
+# eligibility plus these PRE-EXISTING frozen frame fields, never judgment
+# values. Stored here because the axes are frozen campaign constants, not
+# selection-policy knobs.
+AUDIT_COVERAGE_AXES: tuple[Literal["source_type", "kind", "review_status", "age_bucket"], ...] = (
+    "source_type",
+    "kind",
+    "review_status",
+    "age_bucket",
+)
 
 Sha1 = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
 # The exact representation emitted by engram.assessments.assessment_config_version

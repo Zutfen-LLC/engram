@@ -1,0 +1,1312 @@
+"""Adversarial provenance + workflow proofs for the #206 correction pass.
+
+Covers the six reviewed defects. The unifying theme: independently
+constructed objects that intentionally disagree must make unbound provenance
+FAIL, where mutually consistent fixtures previously made it look valid.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from evals.admission.schema import digest
+from evals.calibration.consensus import (
+    CONSENSUS_PROTOCOL_VERSION,
+    REVIEWER_FAMILIES,
+    REVIEWER_SLOTS,
+    AuditOutcomeRecord,
+    LaneFreeze,
+    ModelJudgment,
+    ModelReviewRecord,
+    ReferenceLabel,
+    ReviewerIdentity,
+    SamplingManifest,
+    audit_outcome,
+    build_correlation_report,
+    classify_case,
+    derive_final_human_population,
+    evaluate_audit_outcome,
+    material_calibration_reversal,
+    material_disagreement,
+    select_audit_sample_with_coverage,
+)
+from evals.calibration.freeze import FrameRow
+from evals.calibration.human_queue import (
+    HumanQueueJudgment,
+    HumanQueueManifest,
+    QueueEntry,
+    export_queue_evidence,
+    record_final_resolution,
+    reveal_model_votes,
+    save_initial_judgment,
+    write_queue,
+)
+from evals.calibration.ingestion import LaneSession
+from evals.calibration.lane_binding import (
+    validate_record_lane_binding,
+)
+from evals.calibration.model_lanes import (
+    append_review_record,
+    freeze_lane,
+    load_frozen_lanes,
+)
+
+NOW = datetime(2026, 9, 10, tzinfo=UTC)
+FAMILY_BY_SLOT = dict(zip(REVIEWER_SLOTS, REVIEWER_FAMILIES, strict=True))
+
+GOOD_CRITICAL = {
+    "expected_kind": "fact",
+    "retention_value": "retain",
+    "epistemic_state": "adequately_supported",
+    "consequence": "low",
+    "acceptable_abstention": "no",
+}
+
+
+def _judgment(**overrides: Any) -> ModelJudgment:
+    fields: dict[str, Any] = dict(GOOD_CRITICAL)
+    fields.update(overrides)
+    return ModelJudgment(fields=fields, reviewer_confidence="medium")
+
+
+def _reviewer(
+    slot: str, *, model: str | None = None, config: str | None = None
+) -> ReviewerIdentity:
+    family = FAMILY_BY_SLOT[slot]
+    return ReviewerIdentity(
+        reviewer_slot=slot,  # type: ignore[arg-type]
+        reviewer_family=family,
+        provider_model_identifier=model or f"{family}-exact-2026-09",
+        reviewer_config_digest=config or "a" * 64,
+        prompt_digest="b" * 64,
+    )
+
+
+def _record(
+    slot: str,
+    sample_id: str,
+    judgment: ModelJudgment | None,
+    *,
+    family: str | None = None,
+    model: str | None = None,
+    config: str | None = None,
+    prompt: str | None = None,
+    campaign: str | None = None,
+    sampling_digest: str | None = None,
+    packet_digest: str | None = None,
+    guide: str | None = None,
+    protocol: str | None = None,
+    parse_status: str = "parsed",
+    outcome_status: str = "judged",
+    error_code: str | None = None,
+    raw_digest: str | None = "c" * 64,
+) -> ModelReviewRecord:
+    fam = family or FAMILY_BY_SLOT[slot]
+    return ModelReviewRecord(
+        protocol_version=protocol or CONSENSUS_PROTOCOL_VERSION,  # type: ignore[arg-type]
+        campaign_id=campaign or "campaign",
+        sampling_manifest_digest=sampling_digest or "e" * 64,
+        source_packet_digest=packet_digest or "f" * 64,
+        sample_id=sample_id,
+        reviewer_slot=slot,  # type: ignore[arg-type]
+        reviewer_family=fam,
+        provider_model_identifier=model or f"{FAMILY_BY_SLOT[slot]}-exact-2026-09",
+        reviewer_config_digest=config or "a" * 64,
+        prompt_digest=prompt or "b" * 64,
+        label_guide_version=guide or "engram-calibration-guide-157-v1",
+        captured_at=NOW,
+        parse_status=parse_status,  # type: ignore[arg-type]
+        outcome_status=outcome_status,  # type: ignore[arg-type]
+        reviewer_confidence=judgment.reviewer_confidence if judgment else "unknown",
+        judgment=judgment,
+        raw_response_digest=raw_digest,  # type: ignore[arg-type]
+        error_code=error_code,
+    )
+
+
+def _sampling(ids: tuple[str, ...], *, campaign: str = "campaign") -> SamplingManifest:
+    return SamplingManifest(
+        campaign_id=campaign,  # type: ignore[arg-type]
+        target_identity_digest="1" * 64,
+        frame_digest="2" * 64,
+        snapshot_sha256="3" * 64,
+        snapshot_as_of=NOW,
+        sampling_seed="seed",
+        inclusion_rules=("rule",),
+        exclusion_rules=(),
+        source_row_counts={"eligible_frame": len(ids)},
+        stratum_counts={"all": len(ids)},
+        coverage_dimensions={},
+        sample_ids=ids,
+        sample_hashes=tuple(digest(sid) for sid in ids),
+    )
+
+
+def _frame_rows(ids: tuple[str, ...], *, variety: bool = True) -> dict[str, FrameRow]:
+    rows: dict[str, FrameRow] = {}
+    kinds = ["fact", "decision", "observation", "procedure"]
+    sources = ["manual", "sync_turn", "extraction"]
+    statuses = ["active", "proposed"]
+    buckets = ["lt_7d", "7_29d", "30_89d", "ge_90d"]
+    for index, sample_id in enumerate(ids):
+        if variety:
+            kind = kinds[index % len(kinds)]
+            source = sources[index % len(sources)]
+            status = statuses[index % len(statuses)]
+            bucket = buckets[index % len(buckets)]
+        else:
+            kind, source, status, bucket = "fact", "manual", "active", "lt_7d"
+        rows[sample_id] = FrameRow(
+            item_uuid=f"00000000-0000-0000-0000-{index:012d}",
+            sample_id=sample_id,
+            content_hash=digest(sample_id),
+            content_norm_hash=digest(["norm", sample_id]),
+            kind=kind,
+            source_type=source,
+            review_status=status,
+            assertion_mode="unknown",
+            origin="unknown",
+            risk="unknown",
+            age_bucket=bucket,
+            evidence_state="unknown",
+            content_bytes=10,
+            input_size_bucket="small",
+        )
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# FIX-1: record/lane provenance binding
+# ---------------------------------------------------------------------------
+
+
+class TestFix1LaneBinding:
+    """Every lane record is field-bound to the lane's exact ReviewerIdentity."""
+
+    IDS = ("s1", "s2", "s3")
+    SAMPLING = None  # built per-test (frozen Record classes make module-level awkward)
+
+    def _setup(self):
+        sampling = _sampling(self.IDS)
+        reviewer = _reviewer("model_a")
+        base = {
+            "reviewer": reviewer,
+            "campaign_id": "campaign",
+            "sampling": sampling,
+            "source_packet_digest": "f" * 64,
+        }
+        return sampling, reviewer, base
+
+    def _bound_record(self, base, sample_id: str, **overrides) -> ModelReviewRecord:
+        overrides.setdefault("sampling_digest", base["sampling"].manifest_digest())
+        return _record("model_a", sample_id, _judgment(), **overrides)
+
+    def test_positive_exact_binding(self):
+        _, _, base = self._setup()
+        record = self._bound_record(base, "s1")
+        validate_record_lane_binding(record, **base)
+
+    @pytest.mark.parametrize(
+        ("forgery", "expected_field"),
+        [
+            # wrong slot (forged record claims model_b under a model_a lane)
+            ({"reviewer_slot": "model_b"}, "reviewer_slot"),
+            # correct slot but wrong family
+            ({"reviewer_family": "gpt-astra"}, "reviewer_family"),
+            # wrong provider/model identifier
+            ({"provider_model_identifier": "some-other-model-v9"}, "provider_model_identifier"),
+            # wrong reviewer config digest
+            ({"reviewer_config_digest": "9" * 64}, "reviewer_config_digest"),
+            # wrong prompt digest
+            ({"prompt_digest": "8" * 64}, "prompt_digest"),
+            # wrong campaign
+            ({"campaign_id": "other-campaign"}, "campaign_id"),
+            # wrong sampling manifest
+            ({"sampling_manifest_digest": "7" * 64}, "sampling_manifest_digest"),
+            # wrong source packet digest
+            ({"source_packet_digest": "6" * 64}, "source_packet_digest"),
+            # wrong guide version
+            ({"label_guide_version": "engram-calibration-guide-999-v9"}, "label_guide_version"),
+            # wrong protocol version
+            ({"protocol_version": "eng-calibration-consensus-999-v9"}, "protocol_version"),
+        ],
+    )
+    def test_binding_rejects_each_identity_mismatch(self, forgery, expected_field):
+        """Forged records (constructed valid, then mutated past validators)
+        must be caught by the canonical lane-binding check, not trusted."""
+        _, _, base = self._setup()
+        record = self._bound_record(base, "s1").model_copy(update=forgery)
+        with pytest.raises(ValueError, match="record_lane_identity_mismatch"):
+            validate_record_lane_binding(record, **base)
+        # the error names the field
+        with pytest.raises(ValueError, match=expected_field):
+            validate_record_lane_binding(record, **base)
+
+    def test_binding_rejects_sample_outside_manifest(self):
+        _, _, base = self._setup()
+        record = _record(
+            "model_a", "sX", _judgment(), sampling_digest=base["sampling"].manifest_digest()
+        )
+        with pytest.raises(ValueError, match="record_sample_not_in_sampling_manifest"):
+            validate_record_lane_binding(record, **base)
+
+    def test_freeze_lane_rejects_records_from_another_model(self, tmp_path: Path):
+        """Lane freeze cannot attest another model's records (the core FIX-1 attack)."""
+        sampling, reviewer, _ = self._setup()
+        # records claim a DIFFERENT provider model identifier than the lane authority
+        for sample_id in self.IDS:
+            append_review_record(
+                _record(
+                    "model_a",
+                    sample_id,
+                    _judgment(),
+                    model="gpt-astra-impostor",
+                    sampling_digest=sampling.manifest_digest(),
+                ),
+                tmp_path,
+            )
+        with pytest.raises(ValueError, match="record_lane_identity_mismatch"):
+            freeze_lane(
+                protected_root=tmp_path,
+                reviewer=reviewer,
+                campaign_id="campaign",
+                sampling=sampling,
+                source_packet_digest="f" * 64,
+            )
+
+    def test_lane_freeze_rejects_mutated_record_after_freeze(self, tmp_path: Path):
+        sampling, reviewer, _ = self._setup()
+        for sample_id in self.IDS:
+            append_review_record(
+                _record(
+                    "model_a", sample_id, _judgment(), sampling_digest=sampling.manifest_digest()
+                ),
+                tmp_path,
+            )
+        freeze_lane(
+            protected_root=tmp_path,
+            reviewer=reviewer,
+            campaign_id="campaign",
+            sampling=sampling,
+            source_packet_digest="f" * 64,
+        )
+        # mutate a stored record after the freeze (simulate tampering)
+        path = tmp_path / "lanes" / "model_a" / "s2.json"
+        payload = json.loads(path.read_text())
+        payload["judgment"]["fields"]["expected_kind"] = "decision"
+        payload["reviewer_confidence"] = payload["judgment"]["reviewer_confidence"]
+        path.write_text(json.dumps(payload, sort_keys=True) + "\n")
+        with pytest.raises(ValueError, match="lane_record_digest_mismatch"):
+            load_frozen_lanes(
+                tmp_path,
+                campaign_id="campaign",
+                sampling=sampling,
+                source_packet_digest="f" * 64,
+                reviewers={
+                    "model_a": reviewer,
+                    "model_b": _reviewer("model_b"),
+                    "model_c": _reviewer("model_c"),
+                },
+            )
+
+
+# ---------------------------------------------------------------------------
+# FIX-2: marginal-coverage audit selection
+# ---------------------------------------------------------------------------
+
+
+class TestFix2AuditMarginalCoverage:
+    IDS = tuple(f"s{i}" for i in range(100))
+
+    def test_exact_ceil_count_with_coverage(self):
+        rows = _frame_rows(self.IDS)
+        selection = select_audit_sample_with_coverage(self.IDS, rows)
+        assert len(selection.selected) == 15  # ceil(0.15 * 100)
+        assert selection.target_count == 15
+
+    def test_exact_ceil_on_non_multiple(self):
+        ids = tuple(f"s{i}" for i in range(23))  # ceil(3.45) = 4
+        rows = _frame_rows(ids)
+        selection = select_audit_sample_with_coverage(ids, rows)
+        assert len(selection.selected) == 4
+
+    def test_deterministic_reproduction(self):
+        rows = _frame_rows(self.IDS)
+        first = select_audit_sample_with_coverage(self.IDS, rows)
+        second = select_audit_sample_with_coverage(self.IDS, rows)
+        assert first.selected == second.selected
+        assert first.model_dump(mode="json") == second.model_dump(mode="json")
+
+    def test_label_blind_identical_selection_regardless_of_frame_variety(self):
+        # selection uses frame metadata but is independent of any judgment
+        # values (which never enter this function). Same consensus membership
+        # + same frame => same selection; changing non-frame inputs cannot
+        # even be expressed.
+        rows = _frame_rows(self.IDS)
+        a = select_audit_sample_with_coverage(self.IDS, rows)
+        b = select_audit_sample_with_coverage(self.IDS, rows)
+        assert a.selected == b.selected
+
+    def test_marginal_cell_coverage_when_target_permits(self):
+        ids = tuple(f"s{i}" for i in range(60))  # target 9
+        rows = _frame_rows(ids)
+        selection = select_audit_sample_with_coverage(ids, rows)
+        # every source_type/kind/review_status/age_bucket cell in the
+        # population must be covered when the target permits
+        assert not selection.uncovered_cells
+        covered_values: dict[str, set[str]] = {}
+        for sample_id in selection.selected:
+            row = rows[sample_id]
+            for axis in ("source_type", "kind", "review_status", "age_bucket"):
+                covered_values.setdefault(axis, set()).add(getattr(row, axis))
+        for axis, values in covered_values.items():
+            population = {getattr(rows[sid], axis) for sid in ids}
+            assert values == population, axis
+
+    def test_deterministic_when_complete_coverage_impossible(self):
+        # target 1 (ceil(0.15*2)), but two cases carry disjoint marginal cells
+        rows = _frame_rows(("s1", "s2"))
+        rows["s2"] = rows["s2"].model_copy(
+            update={
+                "kind": "decision",
+                "source_type": "sync_turn",
+                "review_status": "proposed",
+                "age_bucket": "ge_90d",
+            }
+        )
+        selection = select_audit_sample_with_coverage(("s1", "s2"), rows)
+        assert len(selection.selected) == 1  # never exceeds target
+        assert selection.uncovered_cells  # honest: coverage not claimed
+        # deterministic: reproduces exactly, same uncovered set
+        again = select_audit_sample_with_coverage(("s1", "s2"), rows)
+        assert again.selected == selection.selected
+        assert again.uncovered_cells == selection.uncovered_cells
+
+    def test_selection_never_exceeds_target(self):
+        # many cells, small target
+        ids = tuple(f"s{i}" for i in range(10))  # target 2
+        rows = _frame_rows(ids)
+        selection = select_audit_sample_with_coverage(ids, rows)
+        assert len(selection.selected) == 2
+        assert len(set(selection.selected)) == 2
+
+    def test_no_audit_sample_outside_consensus_pool(self):
+        rows = _frame_rows(self.IDS)
+        consensus = self.IDS[:50]
+        selection = select_audit_sample_with_coverage(consensus, rows)
+        assert set(selection.selected) <= set(consensus)
+
+    def test_duplicate_pool_rejected(self):
+        rows = _frame_rows(("s1",))
+        with pytest.raises(ValueError, match="audit_pool_membership_duplicate"):
+            select_audit_sample_with_coverage(("s1", "s1"), rows)
+
+    def test_aggregate_by_axis_populated_privacy_safe(self):
+        from evals.calibration.consensus import aggregate_by_axis_counts
+
+        ids = tuple(f"s{i}" for i in range(40))
+        rows = _frame_rows(ids)
+        selection = select_audit_sample_with_coverage(ids, rows)
+        aggregates = aggregate_by_axis_counts(ids, selection.selected, rows)
+        assert set(aggregates) == {"source_type", "kind", "review_status", "age_bucket"}
+        payload = json.dumps(aggregates)
+        for sample_id in ids:
+            assert sample_id not in payload  # no sample IDs
+        assert "content-" not in payload  # no tenant content
+        # counts only
+        for _axis, cells in aggregates.items():
+            for _value, cell in cells.items():
+                assert set(cell) == {"consensus", "audit_selected"}
+                assert cell["audit_selected"] <= cell["consensus"]
+
+    def test_correlation_report_populates_aggregate_by_axis(self):
+        ids = tuple(f"s{i}" for i in range(20))
+        rows = _frame_rows(ids)
+        sampling = _sampling(ids)
+        records_by_lane = {slot: {} for slot in REVIEWER_SLOTS}
+        lanes = []
+        for slot in REVIEWER_SLOTS:
+            for sample_id in ids:
+                records_by_lane[slot][sample_id] = _record(slot, sample_id, _judgment())
+            lanes.append(
+                LaneFreeze(
+                    protocol_version=CONSENSUS_PROTOCOL_VERSION,
+                    campaign_id="campaign",
+                    reviewer=_reviewer(slot),
+                    sampling_manifest_digest=sampling.manifest_digest(),
+                    source_packet_digest="f" * 64,
+                    sample_ids=ids,
+                    record_digests=tuple(records_by_lane[slot][sid].record_digest() for sid in ids),
+                )
+            )
+        report = build_correlation_report(
+            campaign_id="campaign",
+            lanes=tuple(lanes),
+            records_by_lane=records_by_lane,
+            sampling=sampling,
+            source_packet_digest="f" * 64,
+            frame_rows=rows,
+        )
+        assert report.aggregate_by_axis  # NOT {}
+        assert set(report.aggregate_by_axis) == {
+            "source_type",
+            "kind",
+            "review_status",
+            "age_bucket",
+        }
+        payload = json.dumps(report.model_dump(mode="json"))
+        for sample_id in ids:
+            assert sample_id not in payload
+
+
+# ---------------------------------------------------------------------------
+# FIX-3: audit escalation + material calibration reversal
+# ---------------------------------------------------------------------------
+
+
+class TestFix3AuditEscalation:
+    def test_rate_boundary_strictly_above_five_percent(self):
+        at = audit_outcome(audited_count=20, material_disagreements=1, high_consequence_misses=0)
+        assert at["escalate_full_human_review"] is False  # 1/20 == 5% -> no
+        above = audit_outcome(audited_count=19, material_disagreements=1, high_consequence_misses=0)
+        assert above["escalate_full_human_review"] is True  # 1/19 > 5% -> yes
+
+    def test_high_consequence_miss_escalates(self):
+        outcome = audit_outcome(
+            audited_count=100, material_disagreements=0, high_consequence_misses=1
+        )
+        assert outcome["escalate_full_human_review"] is True
+
+    def test_clean_audit_passes(self):
+        outcome = audit_outcome(
+            audited_count=20, material_disagreements=0, high_consequence_misses=0
+        )
+        assert outcome["escalate_full_human_review"] is False
+
+    def test_material_reversal_escalates(self):
+        outcome = audit_outcome(
+            audited_count=100,
+            material_disagreements=1,
+            high_consequence_misses=0,
+            material_reversals=1,
+        )
+        assert outcome["escalate_full_human_review"] is True
+
+    def test_material_disagreement_definition(self):
+        assert not material_disagreement(GOOD_CRITICAL, GOOD_CRITICAL)
+        assert material_disagreement(GOOD_CRITICAL, {**GOOD_CRITICAL, "consequence": "medium"})
+
+    def test_material_reversal_rule_polarity(self):
+        # retention polarity flip IS a reversal
+        assert (
+            material_calibration_reversal(
+                GOOD_CRITICAL, {**GOOD_CRITICAL, "retention_value": "do_not_retain"}
+            )
+            is True
+        )
+        # epistemic supported -> not supported IS a reversal
+        assert (
+            material_calibration_reversal(
+                GOOD_CRITICAL, {**GOOD_CRITICAL, "epistemic_state": "contradicted"}
+            )
+            is True
+        )
+        # consequence low -> medium is material disagreement but NOT a reversal
+        assert (
+            material_calibration_reversal(GOOD_CRITICAL, {**GOOD_CRITICAL, "consequence": "medium"})
+            is False
+        )
+        # no disagreement -> None
+        assert material_calibration_reversal(GOOD_CRITICAL, GOOD_CRITICAL) is None
+        # expected_kind change with unavailable suggested_kind FAILS CLOSED
+        assert (
+            material_calibration_reversal(
+                GOOD_CRITICAL, {**GOOD_CRITICAL, "expected_kind": "decision"}
+            )
+            is True
+        )
+        # with suggested_kind available, evaluated exactly
+        reversal = material_calibration_reversal(
+            GOOD_CRITICAL,
+            {**GOOD_CRITICAL, "expected_kind": "decision"},
+            suggested_kind="fact",
+        )
+        assert reversal is True  # consensus matched suggestion, human didn't
+        no_reversal = material_calibration_reversal(
+            GOOD_CRITICAL,
+            {**GOOD_CRITICAL, "expected_kind": "decision"},
+            suggested_kind="observation",  # neither matches: both negative
+        )
+        assert no_reversal is False
+
+    def test_evaluate_audit_outcome_derivation(self):
+        consensus_case = GOOD_CRITICAL
+        human_flip = {**GOOD_CRITICAL, "retention_value": "do_not_retain"}
+        results = {
+            "s1": {"consensus_critical": consensus_case, "human_final_critical": human_flip},
+            "s2": {"consensus_critical": GOOD_CRITICAL, "human_final_critical": GOOD_CRITICAL},
+        }
+        outcome = evaluate_audit_outcome(audit_results=results, records_by_lane={})
+        assert outcome["material_disagreements"] == 1
+        assert outcome["material_reversals"] == 1
+        assert outcome["escalate_full_human_review"] is True
+
+    def test_escalation_expands_queue_to_every_remaining_consensus_case(self):
+        consensus_ids = [f"s{i}" for i in range(20)]
+        initial_queue = ["q1", "q2"]
+        audit_selected = ["s3", "s7"]
+        resolved = {sid: True for sid in [*initial_queue, *consensus_ids]}
+        result = derive_final_human_population(
+            initial_queue_ids=initial_queue,
+            consensus_ids=consensus_ids,
+            audit_selected_ids=audit_selected,
+            resolved_ids=resolved,
+            audit_escalated=True,
+        )
+        # every previously unaudited consensus case becomes human-required
+        expected_expansion = sorted(set(consensus_ids) - set(audit_selected))
+        assert list(result["expanded_by_escalation"]) == expected_expansion
+        assert set(result["required_ids"]) == set(initial_queue) | set(consensus_ids)
+        assert result["complete"] is True
+
+    def test_no_escalation_leaves_unaudited_consensus_out(self):
+        consensus_ids = [f"s{i}" for i in range(20)]
+        result = derive_final_human_population(
+            initial_queue_ids=["q1"],
+            consensus_ids=consensus_ids,
+            audit_selected_ids=["s3"],
+            resolved_ids={"q1": True, "s3": True},
+            audit_escalated=False,
+        )
+        assert set(result["required_ids"]) == {"q1", "s3"}
+
+    def test_ledger_fails_while_expanded_queue_unresolved(self):
+
+        # minimal scenario: unresolved human case blocks ledger (checked in
+        # TestFix4 via full fixtures); here assert the helper's completeness
+        result = derive_final_human_population(
+            initial_queue_ids=["q1"],
+            consensus_ids=["s1"],
+            audit_selected_ids=[],
+            resolved_ids={"q1": False},
+            audit_escalated=False,
+        )
+        assert result["unresolved"] == ("q1",)
+        assert result["complete"] is False
+
+
+# ---------------------------------------------------------------------------
+# FIX-4: verified consensus ledger authority
+# ---------------------------------------------------------------------------
+
+
+def _build_campaign(
+    tmp_path: Path,
+    *,
+    ids: tuple[str, ...],
+    escalate: bool = False,
+    high_consequence_sample: str | None = None,
+    audit_disagreement_sample: str | None = None,
+):
+    """Materialize a full synthetic campaign: lanes, queue, resolutions."""
+
+    sampling = _sampling(ids)
+    frame_rows = _frame_rows(ids)
+    records_by_lane = {slot: {} for slot in REVIEWER_SLOTS}
+    reviewers = {slot: _reviewer(slot) for slot in REVIEWER_SLOTS}
+    lanes = []
+    disagreement_sample = ids[0]  # always: one human-queue case per campaign
+    for slot in REVIEWER_SLOTS:
+        for sample_id in ids:
+            judgment = _judgment()
+            if sample_id == disagreement_sample and slot == "model_b":
+                judgment = _judgment(expected_kind="decision")
+            if (
+                high_consequence_sample
+                and slot == "model_b"
+                and sample_id == high_consequence_sample
+            ):
+                judgment = _judgment(consequence="high")
+            records_by_lane[slot][sample_id] = _record(
+                slot, sample_id, judgment, sampling_digest=sampling.manifest_digest()
+            )
+    # classify to find consensus/queue
+    classifications = {
+        sid: classify_case({slot: records_by_lane[slot][sid] for slot in REVIEWER_SLOTS})
+        for sid in ids
+    }
+    consensus_ids = [sid for sid, c in classifications.items() if c["consensus"]]
+    queue_ids = [sid for sid, c in classifications.items() if c["escalation_reasons"]]
+    selection = select_audit_sample_with_coverage(consensus_ids, frame_rows)
+    audit_ids = set(selection.selected)
+    # human queue dir
+    queue_dir = tmp_path / "queue"
+    entries = []
+    for sid in ids:
+        reasons = list(classifications[sid]["escalation_reasons"])
+        if sid in audit_ids:
+            reasons.append("audit_selected")
+        if escalate and classifications[sid]["consensus"]:
+            reasons.append("audit_escalation_full_human_review")
+        if not reasons:
+            continue
+        escalated_reason = "audit_escalation_full_human_review" in reasons
+        entries.append(
+            QueueEntry(
+                sample_id=sid,
+                reasons=tuple(sorted(reasons)),
+                audit_only=(
+                    not classifications[sid]["escalation_reasons"] and not escalated_reason
+                ),
+            )
+        )
+    write_queue(
+        HumanQueueManifest(
+            protocol_version=CONSENSUS_PROTOCOL_VERSION,
+            campaign_id="campaign",
+            sampling_manifest_digest=sampling.manifest_digest(),
+            source_packet_digest="f" * 64,
+            entries=tuple(entries),
+        ),
+        queue_dir,
+    )
+    # resolve every queued case
+    for entry in entries:
+        sid = entry.sample_id
+        payload = {
+            "protocol_version": CONSENSUS_PROTOCOL_VERSION,
+            "campaign_id": "campaign",
+            "sampling_manifest_digest": sampling.manifest_digest(),
+            "source_packet_digest": "f" * 64,
+            "sample_id": sid,
+            "adjudicator_ref": "human-1",
+            "queue_reasons": entry.reasons,
+            "audit_selected": "audit_selected" in entry.reasons,
+            "initial_critical": dict(GOOD_CRITICAL),
+            "initial_confidence": "medium",
+            "initial_captured_at": NOW,
+        }
+        save_initial_judgment(HumanQueueJudgment.model_validate(payload), queue_dir)
+        reveal_model_votes(
+            queue_dir,
+            sid,
+            current_records_by_slot={slot: records_by_lane[slot][sid] for slot in REVIEWER_SLOTS},
+            lane_digests=("4" * 64, "5" * 64, "6" * 64),
+            campaign_id="campaign",
+            sampling_manifest_digest=sampling.manifest_digest(),
+            source_packet_digest="f" * 64,
+        )
+        final = dict(GOOD_CRITICAL)
+        if audit_disagreement_sample and sid == audit_disagreement_sample:
+            final = {**GOOD_CRITICAL, "retention_value": "do_not_retain"}
+        record_final_resolution(
+            queue_dir,
+            sid,
+            final_critical=final,
+            final_confidence="high",
+            current_records_by_slot={slot: records_by_lane[slot][sid] for slot in REVIEWER_SLOTS},
+        )
+    for slot in REVIEWER_SLOTS:
+        for sid in ids:
+            append_review_record(records_by_lane[slot][sid], tmp_path)
+        lanes.append(
+            freeze_lane(
+                protected_root=tmp_path,
+                reviewer=reviewers[slot],
+                campaign_id="campaign",
+                sampling=sampling,
+                source_packet_digest="f" * 64,
+            )
+        )
+    return {
+        "sampling": sampling,
+        "frame_rows": frame_rows,
+        "records_by_lane": records_by_lane,
+        "reviewers": reviewers,
+        "lanes": tuple(lanes),
+        "queue_dir": queue_dir,
+        "consensus_ids": consensus_ids,
+        "queue_ids": queue_ids,
+        "audit_ids": audit_ids,
+    }
+
+
+def _audit_outcome_record(
+    escalate: bool, audited: int, disagreements: int = 0
+) -> AuditOutcomeRecord:
+    return AuditOutcomeRecord(
+        audited_count=audited,
+        material_disagreements=disagreements,
+        high_consequence_misses=0,
+        material_reversals=0,
+        material_disagreement_rate=(round(disagreements / audited, 4) if audited else None),
+        escalate_full_human_review=escalate,
+    )
+
+
+class TestFix4VerifiedLedger:
+    IDS = tuple(f"s{i}" for i in range(20))
+
+    def _verify(self, tmp_path, campaign, *, escalate=False):
+        from evals.calibration.ledger import verify_consensus_ledger
+
+        return verify_consensus_ledger(
+            campaign_id="campaign",
+            sampling=campaign["sampling"],
+            source_packet_digest="f" * 64,
+            lanes=campaign["lanes"],
+            records_by_lane=campaign["records_by_lane"],
+            queue_dir=campaign["queue_dir"],
+            frame_rows=campaign["frame_rows"],
+            audit_outcome_record=_audit_outcome_record(escalate, len(campaign["audit_ids"])),
+        )
+
+    def test_verified_ledger_derives_expected_origins(self, tmp_path: Path):
+        campaign = _build_campaign(tmp_path, ids=self.IDS)
+        verified = self._verify(tmp_path, campaign)
+        by_origin: dict[str, int] = {}
+        for wrapper in verified.ledger.wrappers:
+            by_origin[wrapper.final_label_origin] = by_origin.get(wrapper.final_label_origin, 0) + 1
+        assert by_origin["cross_model_consensus"] == len(campaign["consensus_ids"]) - len(
+            campaign["audit_ids"]
+        )
+        assert by_origin["human_audited_consensus"] == len(
+            campaign["audit_ids"] & set(campaign["consensus_ids"])
+        )
+        assert by_origin.get("human_adjudicated", 0) == len(campaign["queue_ids"])
+        # membership: exactly all samples once
+        ids = [w.sample_id for w in verified.ledger.wrappers]
+        assert sorted(ids) == sorted(self.IDS)
+        assert len(ids) == len(set(ids))
+
+    def test_escalation_removes_all_auto_consensus_rows(self, tmp_path: Path):
+        campaign = _build_campaign(tmp_path, ids=self.IDS, escalate=True)
+        verified = self._verify(tmp_path, campaign, escalate=True)
+        # every remaining consensus case was made human-required and resolved
+        origins = {w.final_label_origin for w in verified.ledger.wrappers}
+        assert "cross_model_consensus" not in origins
+
+    def test_unresolved_required_case_blocks_ledger(self, tmp_path: Path):
+        campaign = _build_campaign(tmp_path, ids=self.IDS)
+        # delete one final resolution
+        sid = campaign["queue_ids"][0]
+        (campaign["queue_dir"] / "judgments" / f"{sid}.final.json").unlink()
+        with pytest.raises(ValueError, match="ledger_requires_all_required_human_resolutions"):
+            self._verify(tmp_path, campaign)
+
+    def test_escalation_with_unresolved_expanded_case_blocks_ledger(self, tmp_path: Path):
+        campaign = _build_campaign(tmp_path, ids=self.IDS, escalate=True)
+        consensus_not_audited = sorted(set(campaign["consensus_ids"]) - campaign["audit_ids"])
+        # one expanded-queue consensus case left unresolved
+        (campaign["queue_dir"] / "judgments" / f"{consensus_not_audited[0]}.final.json").unlink()
+        with pytest.raises(ValueError, match="ledger_requires_all_required_human_resolutions"):
+            self._verify(tmp_path, campaign, escalate=True)
+
+    def test_fabricated_reference_labels_rejected_downstream(self):
+        from evals.calibration.fit import consensus_reference_observations
+
+        # no verified ledger and no legacy labels -> fail closed
+        with pytest.raises(ValueError, match="verified_ledger_required_for_consensus_path"):
+            consensus_reference_observations(
+                receipts=[],
+                target_identity=None,  # type: ignore[arg-type]
+                contract=None,  # type: ignore[arg-type]
+                split=None,  # type: ignore[arg-type]
+                frame=[],
+            )
+
+    def test_both_inputs_rejected(self):
+        from evals.calibration.fit import consensus_reference_completion
+
+        labels = [
+            ReferenceLabel(
+                sample_id="s1",
+                final_label_origin="cross_model_consensus",
+                critical=dict(GOOD_CRITICAL),
+            )
+        ]
+        with pytest.raises(ValueError, match="verified_ledger_and_reference_labels_exclusive"):
+            consensus_reference_completion(
+                verified_ledger=object(),  # type: ignore[arg-type]
+                reference_labels=labels,
+            )
+
+    def test_verified_ledger_feeds_observations(self, tmp_path: Path):
+        from engram.assessment_schema import AssessmentContract
+        from evals.calibration.fit import consensus_reference_observations
+        from tests.test_calibration_206_helpers import (
+            build_frame_rows,
+            build_identity,
+            build_receipts,
+            build_split,
+        )
+
+        campaign = _build_campaign(tmp_path, ids=tuple(f"s{i}" for i in range(3)))
+        verified = self._verify(tmp_path, campaign)
+        identity = build_identity()
+        contract = AssessmentContract(
+            provider="openai",
+            model="model",
+            config_version="sha256:" + "9" * 64,
+            calibration_version="dataset-v2",
+        )
+        frame = build_frame_rows(("s0", "s1", "s2"))
+        split = build_split(("s0", "s1", "s2"), dev=("s0", "s1"), holdout=("s2",))
+        receipts = build_receipts(("s0", "s1", "s2"), frame, identity, contract)
+        observations = consensus_reference_observations(
+            receipts=receipts,
+            verified_ledger=verified,
+            target_identity=identity,
+            contract=contract,
+            split=split,
+            frame=frame,
+        )
+        assert len(observations) == 9  # 3 samples x 3 dimensions
+
+
+class TestFix4AdversarialLedger:
+    """Independently constructed wrappers/records that disagree must fail."""
+
+    IDS = tuple(f"s{i}" for i in range(6))
+
+    def test_lane_rebinding_attack_fails_at_verify(self, tmp_path: Path):
+        """Records from lane B relabeled as lane A fail the FIX-1 validator."""
+        campaign = _build_campaign(tmp_path, ids=self.IDS)
+        # attempt: pass model_b records as if they were model_a's
+        tampered = dict(campaign["records_by_lane"])
+        tampered["model_a"] = campaign["records_by_lane"]["model_b"]
+        from evals.calibration.ledger import verify_consensus_ledger
+
+        with pytest.raises(ValueError, match="record_lane_identity_mismatch"):
+            verify_consensus_ledger(
+                campaign_id="campaign",
+                sampling=campaign["sampling"],
+                source_packet_digest="f" * 64,
+                lanes=campaign["lanes"],
+                records_by_lane=tampered,
+                queue_dir=campaign["queue_dir"],
+                frame_rows=campaign["frame_rows"],
+                audit_outcome_record=_audit_outcome_record(False, len(campaign["audit_ids"])),
+            )
+
+
+# ---------------------------------------------------------------------------
+# FIX-5: reveal/export evidence chain
+# ---------------------------------------------------------------------------
+
+
+class TestFix5RevealExport:
+    IDS = ("s1",)
+
+    def _records(self, sample_id: str) -> dict:
+        return {slot: _record(slot, sample_id, _judgment()) for slot in REVIEWER_SLOTS}
+
+    def _save_initial(self, tmp_path: Path, sample_id: str = "s1", *, mdig: str = "e" * 64) -> None:
+        save_initial_judgment(
+            HumanQueueJudgment.model_validate(
+                {
+                    "protocol_version": CONSENSUS_PROTOCOL_VERSION,
+                    "campaign_id": "campaign",
+                    "sampling_manifest_digest": mdig,
+                    "source_packet_digest": "f" * 64,
+                    "sample_id": sample_id,
+                    "adjudicator_ref": "human-1",
+                    "queue_reasons": ("critical_field_disagreement",),
+                    "initial_critical": dict(GOOD_CRITICAL),
+                    "initial_confidence": "medium",
+                    "initial_captured_at": NOW,
+                }
+            ),
+            tmp_path,
+        )
+
+    def test_reveal_before_initial_judgment_fails(self, tmp_path: Path):
+        from evals.calibration.human_queue import reveal_model_votes
+
+        with pytest.raises(ValueError, match="initial_judgment_required_before_reveal"):
+            reveal_model_votes(
+                tmp_path,
+                "s1",
+                current_records_by_slot=self._records("s1"),
+                lane_digests=("4" * 64, "5" * 64, "6" * 64),
+                campaign_id="campaign",
+                sampling_manifest_digest="e" * 64,
+                source_packet_digest="f" * 64,
+            )
+
+    def test_reveal_binds_exact_three_record_digests(self, tmp_path: Path):
+        self._save_initial(tmp_path)
+        records = self._records("s1")
+        event = reveal_model_votes(
+            tmp_path,
+            "s1",
+            current_records_by_slot=records,
+            lane_digests=("4" * 64, "5" * 64, "6" * 64),
+            campaign_id="campaign",
+            sampling_manifest_digest="e" * 64,
+            source_packet_digest="f" * 64,
+        )
+        assert event.revealed_record_digests == tuple(
+            records[slot].record_digest() for slot in REVIEWER_SLOTS
+        )
+
+    def test_final_before_reveal_fails(self, tmp_path: Path):
+        self._save_initial(tmp_path)
+        with pytest.raises(
+            ValueError, match="model_votes_must_be_revealed_before_final_resolution"
+        ):
+            record_final_resolution(
+                tmp_path, "s1", final_critical=dict(GOOD_CRITICAL), final_confidence="high"
+            )
+
+    def test_mutated_model_record_after_reveal_fails_resolution(self, tmp_path: Path):
+        self._save_initial(tmp_path)
+        records = self._records("s1")
+        reveal_model_votes(
+            tmp_path,
+            "s1",
+            current_records_by_slot=records,
+            lane_digests=("4" * 64, "5" * 64, "6" * 64),
+            campaign_id="campaign",
+            sampling_manifest_digest="e" * 64,
+            source_packet_digest="f" * 64,
+        )
+        # mutate the model evidence after the reveal
+        mutated = dict(records)
+        mutated["model_c"] = _record("model_c", "s1", _judgment(expected_kind="decision"))
+        with pytest.raises(ValueError, match="reveal_does_not_match_current_lane_evidence"):
+            record_final_resolution(
+                tmp_path,
+                "s1",
+                final_critical=dict(GOOD_CRITICAL),
+                final_confidence="high",
+                current_records_by_slot=mutated,
+            )
+
+    def test_initial_file_byte_identical_after_reveal_and_final(self, tmp_path: Path):
+        self._save_initial(tmp_path)
+        initial_path = tmp_path / "judgments" / "s1.json"
+        before = initial_path.read_bytes()
+        records = self._records("s1")
+        reveal_model_votes(
+            tmp_path,
+            "s1",
+            current_records_by_slot=records,
+            lane_digests=("4" * 64, "5" * 64, "6" * 64),
+            campaign_id="campaign",
+            sampling_manifest_digest="e" * 64,
+            source_packet_digest="f" * 64,
+        )
+        record_final_resolution(
+            tmp_path,
+            "s1",
+            final_critical=dict(GOOD_CRITICAL),
+            final_confidence="high",
+            current_records_by_slot=records,
+        )
+        assert initial_path.read_bytes() == before
+
+    def test_export_one_state_per_case_no_revealed_duplication(self, tmp_path: Path):
+        ids = ("s1", "s2")
+        sampling = _sampling(ids)
+        queue_dir = tmp_path
+        write_queue(
+            HumanQueueManifest(
+                protocol_version=CONSENSUS_PROTOCOL_VERSION,
+                campaign_id="campaign",
+                sampling_manifest_digest=sampling.manifest_digest(),
+                source_packet_digest="f" * 64,
+                entries=(
+                    QueueEntry(sample_id="s1", reasons=("critical_field_disagreement",)),
+                    QueueEntry(sample_id="s2", reasons=("audit_selected",), audit_only=True),
+                ),
+            ),
+            queue_dir,
+        )
+        for sample_id in ids:
+            self._save_initial(tmp_path, sample_id, mdig=sampling.manifest_digest())
+        # s1: reveal + final; s2: initial only
+        records = self._records("s1")
+        reveal_model_votes(
+            tmp_path,
+            "s1",
+            current_records_by_slot=records,
+            lane_digests=("4" * 64, "5" * 64, "6" * 64),
+            campaign_id="campaign",
+            sampling_manifest_digest=sampling.manifest_digest(),
+            source_packet_digest="f" * 64,
+        )
+        record_final_resolution(
+            tmp_path,
+            "s1",
+            final_critical=dict(GOOD_CRITICAL),
+            final_confidence="high",
+            current_records_by_slot=records,
+        )
+        exported = export_queue_evidence(tmp_path)
+        assert len(exported["case_states"]) == 2
+        sample_ids = [state["sample_id"] for state in exported["case_states"]]
+        assert sorted(sample_ids) == ["s1", "s2"]
+        # counts: 2 queue, 2 initial, 1 revealed, 1 final, 1 unresolved
+        counts = exported["counts"]
+        assert counts["queue_size"] == 2
+        assert counts["initial_judgments_complete"] == 2
+        assert counts["votes_revealed"] == 1
+        assert counts["final_resolutions_complete"] == 1
+        assert counts["unresolved"] == 1
+        # the completed final resolution appears in export
+        s1_state = next(s for s in exported["case_states"] if s["sample_id"] == "s1")
+        assert s1_state["final_resolution"] is not None
+        assert s1_state["final_resolution"]["final_critical"]["expected_kind"] == "fact"
+        # reveal event is a distinct field, not a second human case
+        assert s1_state["reveal_event"] is not None
+        s2_state = next(s for s in exported["case_states"] if s["sample_id"] == "s2")
+        assert s2_state["final_resolution"] is None
+
+
+# ---------------------------------------------------------------------------
+# FIX-6: lane execution/ingestion workflow
+# ---------------------------------------------------------------------------
+
+
+class TestFix6LaneWorkflow:
+    IDS = ("s1", "s2", "s3")
+
+    def _init_lane(self, tmp_path: Path) -> tuple[LaneSession, SamplingManifest]:
+        sampling = _sampling(self.IDS)
+        session = LaneSession.init(
+            tmp_path,
+            reviewer=_reviewer("model_a"),
+            campaign_id="campaign",
+            sampling=sampling,
+            source_packet_digest="f" * 64,
+        )
+        return session, sampling
+
+    def _judged_response(self, sample_id: str) -> dict:
+        return {
+            "sample_id": sample_id,
+            "outcome": "judged",
+            "judgment": {"fields": dict(GOOD_CRITICAL), "reviewer_confidence": "medium"},
+            "raw_response": f"model output for {sample_id}",
+        }
+
+    def test_init_binds_lane_exclusively(self, tmp_path: Path):
+        session, _ = self._init_lane(tmp_path)
+        assert session.reviewer.reviewer_slot == "model_a"
+        # re-init refuses (exclusive-create)
+        with pytest.raises(Exception, match="exists|already"):
+            LaneSession.init(
+                tmp_path,
+                reviewer=_reviewer("model_a"),
+                campaign_id="campaign",
+                sampling=_sampling(self.IDS),
+                source_packet_digest="f" * 64,
+            )
+
+    def test_requests_resume_from_next_missing(self, tmp_path: Path):
+        from evals.calibration.model_lanes import NeutralModelPacket
+
+        session, sampling = self._init_lane(tmp_path)
+        cases = [
+            {
+                "sample_id": sid,
+                "content": f"content-{sid}",
+                "governed_kind": "fact",
+                "source_type": "manual",
+                "review_status": "active",
+                "assertion_mode": "unknown",
+                "origin": "unknown",
+                "risk": "unknown",
+                "evidence_state": "unknown",
+                "age_days": 5,
+                "age_bucket": "lt_7d",
+                "input_size_bucket": "small",
+            }
+            for sid in self.IDS
+        ]
+        packet = NeutralModelPacket(
+            packet_id="campaign-blind-v2",
+            sampling_manifest_digest=sampling.manifest_digest(),
+            guide_version="engram-calibration-guide-157-v1",
+            reviewer_hint="neutral_model_review",
+            cases=cases,
+            source_packet_digest="f" * 64,
+        )
+        # ingest one record first
+        session.ingest_response(self._judged_response("s1"), sampling=sampling)
+        path = session.emit_requests(packet, sampling=sampling)
+        lines = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        assert [line["sample_id"] for line in lines] == ["s2", "s3"]  # s1 skipped
+        # requests carry lane identity + labeling instructions only
+        assert set(lines[0]) >= {"reviewer_slot", "labeling_instructions", "case"}
+        assert lines[0]["reviewer_slot"] == "model_a"
+
+    def test_batch_ingestion_and_duplicate_refusal(self, tmp_path: Path):
+        session, sampling = self._init_lane(tmp_path)
+        responses_file = tmp_path / "responses.jsonl"
+        payload = "\n".join(json.dumps(self._judged_response(sid)) for sid in ("s1", "s2"))
+        responses_file.write_text(payload + "\n")
+        result = session.ingest_jsonl(responses_file, sampling=sampling)
+        assert result["accepted_total"] == 2
+        assert result["duplicates_refused"] == 0
+        # duplicate ingestion is refused (already accepted)
+        result2 = session.ingest_jsonl(responses_file, sampling=sampling)
+        assert result2["accepted_total"] == 0
+        assert result2["duplicates_refused"] == 2
+
+    def test_raw_response_bytes_digest_bound(self, tmp_path: Path):
+        import hashlib
+
+        session, sampling = self._init_lane(tmp_path)
+        record = session.ingest_response(self._judged_response("s1"), sampling=sampling)
+        raw = (tmp_path / "lanes" / "model_a" / "raw" / "s1.resp").read_bytes()
+        assert record.raw_response_digest == hashlib.sha256(raw).hexdigest()
+
+    def test_identity_enforced_at_ingestion(self, tmp_path: Path):
+        """Wrong-lane output cannot be ingested into another lane."""
+        session, sampling = self._init_lane(tmp_path)  # lane bound to model_a/claude-opus
+        # response payload claiming another lane is IGNORED for identity; the
+        # record identity always comes from the lane authority. What IS
+        # rejected: responses for samples outside the manifest.
+        bad = self._judged_response("sX")
+        with pytest.raises(ValueError, match="record_sample_not_in_sampling_manifest"):
+            session.ingest_response(bad, sampling=sampling)
+
+    def test_failure_semantics_distinct(self, tmp_path: Path):
+        session, sampling = self._init_lane(tmp_path)
+        refused = {
+            "sample_id": "s1",
+            "outcome": "refused",
+            "raw_response": "I cannot judge this",
+            "error_code": "refusal",
+        }
+        record = session.ingest_response(refused, sampling=sampling)
+        assert record.outcome_status == "refused"
+        assert record.parse_status == "malformed"
+        malformed = {
+            "sample_id": "s2",
+            "outcome": "malformed",
+            "raw_response": "garbage not json",
+            "error_code": "schema-parse-failed",
+        }
+        record = session.ingest_response(malformed, sampling=sampling)
+        assert record.outcome_status == "malformed"
+        assert record.parse_status == "malformed"
+        provider_error = {
+            "sample_id": "s3",
+            "outcome": "provider_error",
+            "error_code": "http-503",
+        }
+        record = session.ingest_response(provider_error, sampling=sampling)
+        assert record.outcome_status == "provider_error"
+        assert record.parse_status == "absent"
+        assert record.raw_response_digest is None
+        # judged path on a fresh lane root
+        session2 = LaneSession.init(
+            tmp_path / "lanes2",
+            reviewer=_reviewer("model_a"),
+            campaign_id="campaign",
+            sampling=sampling,
+            source_packet_digest="f" * 64,
+        )
+        judged = session2.ingest_response(self._judged_response("s1"), sampling=sampling)
+        assert judged.parse_status == "parsed" and judged.outcome_status == "judged"
+
+    def test_status_counts(self, tmp_path: Path):
+        session, sampling = self._init_lane(tmp_path)
+        session.ingest_response(self._judged_response("s1"), sampling=sampling)
+        status = session.status(sampling)
+        assert status["accepted"] == 1
+        assert status["missing"] == 2
+        assert status["complete"] is False
+
+    def test_exact_membership_required_to_freeze(self, tmp_path: Path):
+        session, sampling = self._init_lane(tmp_path)
+        session.ingest_response(self._judged_response("s1"), sampling=sampling)
+        with pytest.raises(ValueError, match="lane_sample_membership_mismatch"):
+            session.freeze(sampling)
+        for sid in ("s2", "s3"):
+            session.ingest_response(self._judged_response(sid), sampling=sampling)
+        lane = session.freeze(sampling)
+        assert tuple(lane.sample_ids) == self.IDS
+
+
+# ---------------------------------------------------------------------------
+# FIX-6: unique-case failure aggregation
+# ---------------------------------------------------------------------------
+
+
+class TestUniqueCaseCounting:
+    def test_multi_reason_case_counts_once(self, tmp_path: Path):
+        ids = ("s1", "s2", "s3")
+        sampling = _sampling(ids)
+        records_by_lane = {slot: {} for slot in REVIEWER_SLOTS}
+        mdig = sampling.manifest_digest()
+        # s1: model_b refuses AND is malformed AND provider-errored is
+        # impossible for one record; instead give s1 two failure lanes and a
+        # third-lane disagreement -> multiple escalation reasons, one case.
+        records_by_lane["model_a"]["s1"] = _record(
+            "model_a", "s1", _judgment(), sampling_digest=mdig
+        )
+        records_by_lane["model_b"]["s1"] = _record(
+            "model_b",
+            "s1",
+            None,
+            parse_status="absent",
+            outcome_status="provider_error",
+            error_code="http-503",
+            raw_digest=None,
+        )
+        records_by_lane["model_c"]["s1"] = _record(
+            "model_c", "s1", _judgment(expected_kind="decision"), sampling_digest=mdig
+        )
+        # s2: clean consensus
+        for slot in REVIEWER_SLOTS:
+            records_by_lane[slot]["s2"] = _record(slot, "s2", _judgment(), sampling_digest=mdig)
+        # s3: one refusal only
+        records_by_lane["model_a"]["s3"] = _record(
+            "model_a", "s3", _judgment(), sampling_digest=mdig
+        )
+        records_by_lane["model_b"]["s3"] = _record(
+            "model_b",
+            "s3",
+            None,
+            parse_status="malformed",
+            outcome_status="refused",
+            error_code="refusal",
+        )
+        records_by_lane["model_c"]["s3"] = _record(
+            "model_c", "s3", _judgment(), sampling_digest=mdig
+        )
+        lanes = []
+        for slot in REVIEWER_SLOTS:
+            lanes.append(
+                LaneFreeze(
+                    protocol_version=CONSENSUS_PROTOCOL_VERSION,
+                    campaign_id="campaign",
+                    reviewer=_reviewer(slot),
+                    sampling_manifest_digest=sampling.manifest_digest(),
+                    source_packet_digest="f" * 64,
+                    sample_ids=ids,
+                    record_digests=tuple(records_by_lane[slot][sid].record_digest() for sid in ids),
+                )
+            )
+        report = build_correlation_report(
+            campaign_id="campaign",
+            lanes=tuple(lanes),
+            records_by_lane=records_by_lane,
+            sampling=sampling,
+            source_packet_digest="f" * 64,
+            frame_rows=_frame_rows(ids),
+        )
+        # s1 (provider_error + disagreement + missing_parsed) and s3 (refused)
+        # = 2 unique affected cases, NOT a sum of overlapping reason counters.
+        assert report.malformed_error_refusal_count == 2
+        # overlap diagnostics kept separately
+        assert report.queue_reason_overlap  # s1 contributes overlapping pairs

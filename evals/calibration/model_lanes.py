@@ -5,6 +5,15 @@ blind packet evidence (#202 Round-2): the exact same cases in the same order,
 with no reviewer hints, no provider scores, no policy outputs, and no labels.
 Each reviewer lane materializes under its own protected directory so no lane
 can read another lane's evidence through the harness.
+
+FIX-1: every accepted record and every frozen/loaded lane is validated by the
+canonical ``evals.calibration.lane_binding`` validator — a lane can never
+attest records that identify another slot, family, model version, config,
+prompt, guide, campaign, sampling manifest, or source packet.
+
+FIX-6: the practical lane execution/ingestion workflow lives in
+``evals.calibration.ingestion`` (request emission, structured JSONL
+ingestion, resume, status, raw-response preservation, exact-402 freeze gate).
 """
 
 from __future__ import annotations
@@ -20,9 +29,13 @@ from evals.calibration.consensus import (
     ModelReviewRecord,
     ReviewerIdentity,
     validate_lane_isolation,
-    validate_lane_membership,
 )
 from evals.calibration.freeze import LABEL_GUIDE_VERSION, SamplingManifest
+from evals.calibration.lane_binding import (
+    validate_lane_provenance,
+    validate_record_lane_binding,
+    validate_records_lane_binding,
+)
 from evals.calibration.review import (
     BlindPacket,
     _packet_file_payload,
@@ -108,12 +121,39 @@ def lane_directory(protected_root: Path, reviewer_slot: str) -> Path:
     return protected_root / "lanes" / reviewer_slot
 
 
-def append_review_record(record: ModelReviewRecord, protected_root: Path) -> Path:
+def append_review_record(
+    record: ModelReviewRecord,
+    protected_root: Path,
+    *,
+    reviewer: ReviewerIdentity | None = None,
+    campaign_id: str | None = None,
+    sampling: SamplingManifest | None = None,
+    source_packet_digest: str | None = None,
+) -> Path:
     """Append one review record to its lane, exclusively (resume-safe).
 
     Refuses to duplicate an already-accepted record for the same sample in
     the same lane: each (slot, sample_id) has at most one accepted record.
+
+    With the optional lane-authority arguments (the normal ingestion path),
+    the record is bound to the exact ``ReviewerIdentity`` BEFORE persistence
+    (FIX-1): any identity-field disagreement — slot, family, provider/model
+    identifier, config digest, prompt digest, guide version, campaign,
+    sampling manifest, or source packet — is rejected here, not at freeze
+    time.
     """
+    if reviewer is not None:
+        if campaign_id is None or sampling is None or source_packet_digest is None:
+            raise ValueError("lane_authority_args_required_together")
+        validate_record_lane_binding(
+            record,
+            reviewer=reviewer,
+            campaign_id=campaign_id,
+            sampling=sampling,
+            source_packet_digest=source_packet_digest,
+        )
+        if record.reviewer_slot != reviewer.reviewer_slot:
+            raise ValueError("record_slot_mismatch")
     lane_dir = lane_directory(protected_root, record.reviewer_slot)
     path = lane_dir / f"{record.sample_id}.json"
     if path.exists():
@@ -130,7 +170,7 @@ def load_lane_records(protected_root: Path, reviewer_slot: str) -> dict[str, Mod
     if not lane_dir.exists():
         return records
     for path in sorted(lane_dir.glob("*.json")):
-        if path.name in {"lane-freeze.json"}:
+        if path.name in {"lane-freeze.json", "lane.json"}:
             continue
         record = ModelReviewRecord.model_validate(json.loads(path.read_text()))
         if record.sample_id in records:
@@ -147,10 +187,23 @@ def freeze_lane(
     sampling: SamplingManifest,
     source_packet_digest: str,
 ) -> LaneFreeze:
-    """Freeze one completed lane after exact membership is proven."""
+    """Freeze one completed lane after exact membership is proven.
+
+    FIX-1: every record is validated against the exact reviewer identity and
+    campaign bindings via the canonical lane-binding validator BEFORE the
+    attestation is constructed, so the frozen digest list provably describes
+    records produced under this exact reviewer/lane authority.
+    """
     records = load_lane_records(protected_root, reviewer.reviewer_slot)
     if set(records) != set(sampling.sample_ids):
         raise ValueError("lane_sample_membership_mismatch")
+    validate_records_lane_binding(
+        records,
+        reviewer=reviewer,
+        campaign_id=campaign_id,
+        sampling=sampling,
+        source_packet_digest=source_packet_digest,
+    )
     ordered_ids = tuple(sampling.sample_ids)
     lane = LaneFreeze(
         protocol_version=CONSENSUS_PROTOCOL_VERSION,
@@ -182,12 +235,14 @@ def _load_one_frozen_lane(
     if lane.reviewer != reviewer:
         raise ValueError("lane_reviewer_identity_mismatch")
     records = load_lane_records(protected_root, reviewer.reviewer_slot)
-    if set(records) != set(sampling.sample_ids):
-        raise ValueError("lane_sample_membership_mismatch")
-    for sample_id, record_digest in zip(lane.sample_ids, lane.record_digests, strict=True):
-        if records[sample_id].record_digest() != record_digest:
-            raise ValueError("lane_record_digest_mismatch")
-    validate_lane_membership(lane, sampling, source_packet_digest=source_packet_digest)
+    # Full FIX-1 validation: identity binding + membership + live digests.
+    validate_lane_provenance(
+        lane,
+        records,
+        campaign_id=campaign_id,
+        sampling=sampling,
+        source_packet_digest=source_packet_digest,
+    )
     return lane
 
 

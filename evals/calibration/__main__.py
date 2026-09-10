@@ -5,6 +5,10 @@ Available subcommands:
   sample          write protected exact sampling/split artifacts and a public summary
   packets         emit blind reviewer packets from protected sample membership
   model-packet    project the frozen blind packet into a neutral model packet (#206)
+  model-lane-init    bind one lane to one frozen reviewer identity (#206 FIX-6)
+  model-lane-request emit only this lane's pending neutral case requests (#206 FIX-6)
+  model-lane-ingest  mechanically ingest structured model responses (#206 FIX-6)
+  model-lane-status  completion/missing/failure counts for one lane (#206 FIX-6)
   freeze-model-lane  freeze one completed frontier-model reviewer lane (#206)
   model-report    public-safe correlation report after all three lanes freeze (#206)
   human-queue     build the mandatory human queue from frozen lanes (#206)
@@ -32,6 +36,7 @@ from evals.calibration.freeze import (
     EXCLUSION_RULES,
     INCLUSION_RULES,
     EvidenceFloors,
+    FrameRow,
     SamplingManifest,
     SplitManifest,
     TargetIdentity,
@@ -44,6 +49,7 @@ from evals.calibration.freeze import (
     validate_split_membership,
 )
 from evals.calibration.human_queue import build_queue, write_queue
+from evals.calibration.ingestion import LaneSession
 from evals.calibration.model_lanes import (
     NeutralModelPacket,
     freeze_lane,
@@ -311,14 +317,96 @@ def cmd_human_queue(args: argparse.Namespace) -> int:
         reviewers=reviewers,
     )
     records_by_lane = records_by_lane_from_files(Path(args.protected_dir))
+    frame_rows = _load_frame_rows(args.frame, sampling)
     queue = build_queue(
         campaign_id=CAMPAIGN_ID,
         sampling=sampling,
         source_packet_digest=args.source_packet_digest,
         records_by_lane=records_by_lane,
+        frame_rows=frame_rows,
     )
     path = write_queue(queue, Path(args.queue_dir))
     print(json.dumps({"queue_path": str(path), "queue_size": len(queue.entries)}))
+    return 0
+
+
+def _load_frame_rows(
+    frame_path: str | None, sampling: SamplingManifest
+) -> dict[str, FrameRow] | None:
+    """Load protected frame rows for marginal-coverage audit selection."""
+    if not frame_path:
+        return None
+    rows = [FrameRow.model_validate(row) for row in json.loads(Path(frame_path).read_text())]
+    by_id: dict[str, FrameRow] = {}
+    for row in rows:
+        key = row.sample_id or sample_id_for(row.item_uuid)
+        by_id[key] = row
+    if set(sampling.sample_ids) <= set(by_id):
+        return by_id
+    return {sid: by_id[sid] for sid in sampling.sample_ids if sid in by_id}
+
+
+def _load_lane_session(args: argparse.Namespace) -> tuple[LaneSession, SamplingManifest]:
+    sampling = SamplingManifest.model_validate(json.loads(Path(args.sampling_manifest).read_text()))
+    session = LaneSession(Path(args.protected_dir), args.reviewer_slot)
+    return session, sampling
+
+
+def cmd_model_lane_init(args: argparse.Namespace) -> int:
+    """Bind one lane to one frozen ReviewerIdentity (FIX-6)."""
+    sampling = SamplingManifest.model_validate(json.loads(Path(args.sampling_manifest).read_text()))
+    reviewer = ReviewerIdentity.model_validate(json.loads(Path(args.reviewer_identity).read_text()))
+    LaneSession.init(
+        Path(args.protected_dir),
+        reviewer=reviewer,
+        campaign_id=CAMPAIGN_ID,
+        sampling=sampling,
+        source_packet_digest=args.source_packet_digest,
+    )
+    print(
+        json.dumps(
+            {
+                "reviewer_slot": reviewer.reviewer_slot,
+                "lane_identity_digest": reviewer.lane_identity_digest(),
+            }
+        )
+    )
+    return 0
+
+
+def cmd_model_lane_request(args: argparse.Namespace) -> int:
+    """Emit only this lane's pending neutral case requests (JSONL)."""
+    session, sampling = _load_lane_session(args)
+    packet = NeutralModelPacket.model_validate(json.loads(Path(args.neutral_packet).read_text()))
+    path = session.emit_requests(packet, sampling=sampling)
+    status = session.status(sampling)
+    print(
+        json.dumps(
+            {
+                "requests_path": str(path),
+                "pending": status["expected"] - status["accepted"],
+                "accepted": status["accepted"],
+                "expected": status["expected"],
+            }
+        )
+    )
+    return 0
+
+
+def cmd_model_lane_ingest(args: argparse.Namespace) -> int:
+    """Mechanically ingest structured model responses (JSONL) into the lane."""
+    session, sampling = _load_lane_session(args)
+    result = session.ingest_jsonl(Path(args.responses), sampling=sampling)
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+def cmd_model_lane_status(args: argparse.Namespace) -> int:
+    """Report completion / missing / failure counts for one lane."""
+    session, sampling = _load_lane_session(args)
+    status = session.status(sampling)
+    status.pop("next_missing")  # protected sample IDs: never print
+    print(json.dumps(status, sort_keys=True))
     return 0
 
 
@@ -394,7 +482,50 @@ def main() -> int:
     command.add_argument("--source-packet-digest", required=True)
     command.add_argument("--protected-dir", required=True)
     command.add_argument("--queue-dir", required=True)
+    command.add_argument(
+        "--frame",
+        help="protected frame.json (enables frozen marginal-coverage audit selection)",
+    )
     command.set_defaults(func=cmd_human_queue)
+
+    command = sub.add_parser(
+        "model-lane-init", help="bind one lane to one frozen reviewer identity (#206 FIX-6)"
+    )
+    command.add_argument("--sampling-manifest", required=True)
+    command.add_argument("--reviewer-identity", required=True)
+    command.add_argument("--reviewer-slot", required=True, choices=list(REVIEWER_SLOTS))
+    command.add_argument("--source-packet-digest", required=True)
+    command.add_argument("--protected-dir", required=True)
+    command.set_defaults(func=cmd_model_lane_init)
+
+    command = sub.add_parser(
+        "model-lane-request", help="emit this lane's pending neutral case requests (#206 FIX-6)"
+    )
+    command.add_argument("--sampling-manifest", required=True)
+    command.add_argument("--reviewer-slot", required=True, choices=list(REVIEWER_SLOTS))
+    command.add_argument("--neutral-packet", required=True)
+    command.add_argument("--source-packet-digest", required=True)
+    command.add_argument("--protected-dir", required=True)
+    command.set_defaults(func=cmd_model_lane_request)
+
+    command = sub.add_parser(
+        "model-lane-ingest", help="ingest structured model responses as JSONL (#206 FIX-6)"
+    )
+    command.add_argument("--sampling-manifest", required=True)
+    command.add_argument("--reviewer-slot", required=True, choices=list(REVIEWER_SLOTS))
+    command.add_argument("--responses", required=True, help="JSONL of response objects")
+    command.add_argument("--source-packet-digest", required=True)
+    command.add_argument("--protected-dir", required=True)
+    command.set_defaults(func=cmd_model_lane_ingest)
+
+    command = sub.add_parser(
+        "model-lane-status", help="completion/missing/failure counts for one lane (#206 FIX-6)"
+    )
+    command.add_argument("--sampling-manifest", required=True)
+    command.add_argument("--reviewer-slot", required=True, choices=list(REVIEWER_SLOTS))
+    command.add_argument("--source-packet-digest", required=True)
+    command.add_argument("--protected-dir", required=True)
+    command.set_defaults(func=cmd_model_lane_status)
 
     args = parser.parse_args()
     return int(args.func(args) or 0)

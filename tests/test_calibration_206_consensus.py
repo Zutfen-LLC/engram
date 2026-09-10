@@ -90,6 +90,7 @@ def _record(
     outcome_status: str = "judged",
     family: str | None = None,
     error_code: str | None = None,
+    raw_digest: str | None = "c" * 64,
 ) -> ModelReviewRecord:
     fam = family or dict(zip(REVIEWER_SLOTS, REVIEWER_FAMILIES, strict=True))[slot]
     return ModelReviewRecord(
@@ -109,7 +110,7 @@ def _record(
         outcome_status=outcome_status,  # type: ignore[arg-type]
         reviewer_confidence=judgment.reviewer_confidence if judgment else "unknown",
         judgment=judgment,
-        raw_response_digest="c" * 64,
+        raw_response_digest=raw_digest,  # type: ignore[arg-type]
         error_code=error_code,
     )
 
@@ -433,22 +434,24 @@ class TestConsensusRules:
     def test_malformed_refusal_provider_error_escalate(self):
         for parse_status, outcome, code in (
             ("malformed", "refused", "refusal"),
-            ("malformed", "provider_error", "http-503"),
+            ("malformed", "malformed", "schema-parse-failed"),
+            ("absent", "provider_error", "http-503"),
             ("parsed", "judged", None),
         ):
             if parse_status == "parsed":
                 continue
-            malformed = _record(
+            failed = _record(
                 "model_b",
                 "s1",
                 None,
                 parse_status=parse_status,
                 outcome_status=outcome,
                 error_code=code,
+                raw_digest=None if parse_status == "absent" else "c" * 64,
             )
             result = _case(
                 _record("model_a", "s1", _judgment()),
-                malformed,
+                failed,
                 _record("model_c", "s1", _judgment()),
             )
             assert result["consensus"] is False
@@ -645,12 +648,28 @@ class TestFinalLedgerProvenance:
 
     def test_ledger_contract(self):
         wrapper = self._wrapper()
+        from evals.calibration.consensus import AuditOutcomeRecord, AuditSelection
+
+        audit_selection = AuditSelection(
+            selected=(), target_count=0, population_count=0, covered_cells=(), uncovered_cells=()
+        )
+        audit_outcome = AuditOutcomeRecord(
+            audited_count=0,
+            material_disagreements=0,
+            high_consequence_misses=0,
+            material_reversals=0,
+            material_disagreement_rate=None,
+            escalate_full_human_review=False,
+        )
         ledger = ConsensusLedger(
             protocol_version=CONSENSUS_PROTOCOL_VERSION,
             campaign_id="campaign",
             sampling_manifest_digest="e" * 64,
             source_packet_digest="f" * 64,
             lane_digests=("4" * 64, "5" * 64, "6" * 64),
+            queue_evidence_sha256="7" * 64,
+            audit_outcome=audit_outcome,
+            audit_selection=audit_selection,
             wrappers=(wrapper,),
         )
         assert ledger.final_dimensions_by_sample()["s1"]["expected_kind"] == "fact"
@@ -661,6 +680,9 @@ class TestFinalLedgerProvenance:
                 sampling_manifest_digest="e" * 64,
                 source_packet_digest="f" * 64,
                 lane_digests=("4" * 64,),
+                queue_evidence_sha256="7" * 64,
+                audit_outcome=audit_outcome,
+                audit_selection=audit_selection,
                 wrappers=(wrapper,),
             )
         with pytest.raises(Exception, match="audit_seed_frozen"):
@@ -670,6 +692,9 @@ class TestFinalLedgerProvenance:
                 sampling_manifest_digest="e" * 64,
                 source_packet_digest="f" * 64,
                 lane_digests=("4" * 64, "5" * 64, "6" * 64),
+                queue_evidence_sha256="7" * 64,
+                audit_outcome=audit_outcome,
+                audit_selection=audit_selection,
                 audit_seed="other-seed",
                 wrappers=(wrapper,),
             )
@@ -699,10 +724,10 @@ class TestFloorsConsumeOnlyFinalLabels:
                 critical=dict(GOOD_CRITICAL, consequence="high"),
             ),
         ]
-        completed = consensus_reference_completion(labels)
+        completed = consensus_reference_completion(reference_labels=labels)
         assert [label.sample_id for label in completed] == ["s1", "s2"]
         with pytest.raises(Exception, match="duplicate_reference_label"):
-            consensus_reference_completion([labels[0], labels[0]])
+            consensus_reference_completion(reference_labels=[labels[0], labels[0]])
 
     def test_observations_derive_from_reference_not_votes(self, tmp_path: Path):
         from engram.assessment_schema import AssessmentContract
@@ -982,22 +1007,27 @@ class TestHumanQueueWorkflow:
         with pytest.raises(Exception, match="initial_judgment_already_recorded"):
             save_initial_judgment(judgment, tmp_path)
 
+    def _judgment_payload(self, sample_id: str = "s0") -> dict:
+        return {
+            "protocol_version": CONSENSUS_PROTOCOL_VERSION,
+            "campaign_id": "campaign",
+            "sampling_manifest_digest": "e" * 64,
+            "source_packet_digest": "f" * 64,
+            "sample_id": sample_id,
+            "adjudicator_ref": "human-1",
+            "queue_reasons": ("critical_field_disagreement",),
+            "initial_critical": dict(GOOD_CRITICAL),
+            "initial_confidence": "medium",
+            "initial_captured_at": NOW,
+        }
+
+    def _lane_records(self, sample_id: str) -> dict:
+        return {slot: _record(slot, sample_id, _judgment()) for slot in REVIEWER_SLOTS}
+
     def test_final_resolution_requires_revealed_votes_and_preserves_initial(self, tmp_path: Path):
-        judgment = HumanQueueJudgment.model_validate(
-            {
-                "protocol_version": CONSENSUS_PROTOCOL_VERSION,
-                "campaign_id": "campaign",
-                "sampling_manifest_digest": "e" * 64,
-                "source_packet_digest": "f" * 64,
-                "sample_id": "s0",
-                "adjudicator_ref": "human-1",
-                "queue_reasons": ("critical_field_disagreement",),
-                "initial_critical": dict(GOOD_CRITICAL),
-                "initial_confidence": "medium",
-                "initial_captured_at": NOW,
-            }
-        )
+        judgment = HumanQueueJudgment.model_validate(self._judgment_payload())
         save_initial_judgment(judgment, tmp_path)
+        initial_bytes = (tmp_path / "judgments" / "s0.json").read_bytes()
         with pytest.raises(Exception, match="model_votes_must_be_revealed_before_final_resolution"):
             record_final_resolution(
                 tmp_path,
@@ -1007,16 +1037,31 @@ class TestHumanQueueWorkflow:
             )
         from evals.calibration.human_queue import reveal_model_votes
 
-        reveal_model_votes(tmp_path, "s0")
+        records = self._lane_records("s0")
+        event = reveal_model_votes(
+            tmp_path,
+            "s0",
+            current_records_by_slot=records,
+            lane_digests=("4" * 64, "5" * 64, "6" * 64),
+            campaign_id="campaign",
+            sampling_manifest_digest="e" * 64,
+            source_packet_digest="f" * 64,
+        )
+        assert event.revealed_record_digests == tuple(
+            records[slot].record_digest() for slot in REVIEWER_SLOTS
+        )
         resolved = record_final_resolution(
             tmp_path,
             "s0",
             final_critical=dict(GOOD_CRITICAL, expected_kind="decision"),
             final_confidence="high",
+            current_records_by_slot=records,
         )
         assert resolved.initial_critical["expected_kind"] == "fact"
         assert resolved.final_critical is not None
         assert resolved.final_critical["expected_kind"] == "decision"
+        # initial judgment stays byte-identical through reveal + final
+        assert (tmp_path / "judgments" / "s0.json").read_bytes() == initial_bytes
         with pytest.raises(Exception, match="final_resolution_already_recorded"):
             record_final_resolution(
                 tmp_path,
@@ -1026,20 +1071,7 @@ class TestHumanQueueWorkflow:
             )
 
     def test_export_counts(self, tmp_path: Path):
-        judgment = HumanQueueJudgment.model_validate(
-            {
-                "protocol_version": CONSENSUS_PROTOCOL_VERSION,
-                "campaign_id": "campaign",
-                "sampling_manifest_digest": "e" * 64,
-                "source_packet_digest": "f" * 64,
-                "sample_id": "s0",
-                "adjudicator_ref": "human-1",
-                "queue_reasons": ("critical_field_disagreement",),
-                "initial_critical": dict(GOOD_CRITICAL),
-                "initial_confidence": "medium",
-                "initial_captured_at": NOW,
-            }
-        )
+        judgment = HumanQueueJudgment.model_validate(self._judgment_payload())
         save_initial_judgment(judgment, tmp_path)
         from evals.calibration.human_queue import QueueEntry
 
@@ -1060,8 +1092,13 @@ class TestHumanQueueWorkflow:
         write_queue(queue, tmp_path)
         exported = export_queue_evidence(tmp_path)
         assert exported["counts"]["queue_size"] == 1
-        assert exported["counts"]["judgments_recorded"] == 1
-        assert exported["counts"]["missing_initial_judgments"] == 0
+        assert exported["counts"]["initial_judgments_complete"] == 1
+        assert exported["counts"]["votes_revealed"] == 0
+        assert exported["counts"]["final_resolutions_complete"] == 0
+        assert exported["counts"]["unresolved"] == 1
+        # exactly one coherent case state per queued sample
+        assert len(exported["case_states"]) == 1
+        assert exported["case_states"][0]["sample_id"] == "s0"
 
 
 class TestServingInvariantsUnchanged:

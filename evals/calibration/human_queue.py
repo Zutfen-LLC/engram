@@ -1,21 +1,26 @@
-"""Minimal protected human-adjudication queue workflow for #206 escalated cases.
+"""Protected human-adjudication queue workflow for #206 escalated cases.
 
 Scope is deliberately narrow (per the issue: no general Engram product UI):
 
-- the queue contains ONLY escalated/audit-selected cases, never the full 402;
+- the queue contains ONLY escalated/audit-selected/escalation-expanded
+  cases, never the full 402 (unless full audit escalation fires);
 - the human sees the original blind case evidence first (via the existing
   frozen #202 packets — nothing new is shown);
 - the human's independent initial judgment is captured and frozen BEFORE the
   three model votes are revealed for disagreement adjudication, and both are
   preserved separately;
 - judgments validate against the same frozen critical vocabulary;
-- state is append-only per sample and resumable (autosave = one protected
-  file per sample, exclusive-create);
-- export is mechanically ingestible protected evidence.
+- state is append-only per sample and resumable (one protected file per
+  sample state, exclusive-create);
+- export is mechanically ingestible protected evidence with ONE coherent
+  case state per queued sample (initial_judgment / reveal_event /
+  final_resolution kept distinct), never duplicated initial/revealed rows.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,8 +37,9 @@ from evals.calibration.consensus import (
     ModelReviewRecord,
     classify_case,
     select_audit_sample,
+    select_audit_sample_with_coverage,
 )
-from evals.calibration.freeze import SamplingManifest
+from evals.calibration.freeze import FrameRow, SamplingManifest
 from evals.calibration.review import write_protected_file
 
 QUEUE_SCHEMA: Literal["engram-calibration-human-queue-206-v1"] = (
@@ -41,6 +47,9 @@ QUEUE_SCHEMA: Literal["engram-calibration-human-queue-206-v1"] = (
 )
 QUEUE_JUDGMENT_SCHEMA: Literal["engram-calibration-human-queue-judgment-206-v1"] = (
     "engram-calibration-human-queue-judgment-206-v1"
+)
+REVEAL_EVENT_SCHEMA: Literal["engram-calibration-human-queue-reveal-206-v1"] = (
+    "engram-calibration-human-queue-reveal-206-v1"
 )
 
 
@@ -120,9 +129,37 @@ class HumanQueueJudgment(Record):
                 raise ValueError("final_resolution_requires_timestamp")
             if self.model_votes_revealed_at is None:
                 raise ValueError("final_resolution_requires_revealed_votes")
-        if self.model_votes_revealed_at is not None and self.final_critical is None:
-            # votes may be revealed for adjudication before the final call
-            pass
+        return self
+
+
+class VoteRevealEvent(Record):
+    """Protected evidence of exactly WHICH model votes were shown (#206 FIX-5A).
+
+    Binds the reveal to the case, campaign/protocol/sampling/packet identity,
+    the EXACT three first-pass model record digests in frozen slot order, the
+    three frozen lane digests, and the reveal timestamp. A later audit can
+    reconstruct precisely what evidence the human saw between the initial
+    judgment and the final resolution.
+    """
+
+    reveal_schema: Literal["engram-calibration-human-queue-reveal-206-v1"] = REVEAL_EVENT_SCHEMA
+    protocol_version: str
+    campaign_id: str
+    sampling_manifest_digest: str
+    source_packet_digest: str
+    sample_id: Token
+    revealed_record_digests: tuple[str, ...]  # exactly three, slot order
+    lane_digests: tuple[str, ...]  # exactly three, slot order
+    revealed_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def reveal_contract(self) -> Self:
+        if self.protocol_version != CONSENSUS_PROTOCOL_VERSION:
+            raise ValueError("protocol_version_mismatch")
+        if len(self.revealed_record_digests) != len(REVIEWER_SLOTS):
+            raise ValueError("reveal_requires_all_three_record_digests")
+        if len(self.lane_digests) != len(REVIEWER_SLOTS):
+            raise ValueError("reveal_requires_all_three_lane_digests")
         return self
 
 
@@ -132,8 +169,13 @@ def build_queue(
     sampling: SamplingManifest,
     source_packet_digest: str,
     records_by_lane: dict[str, dict[str, ModelReviewRecord]],
+    frame_rows: dict[str, FrameRow] | None = None,
 ) -> HumanQueueManifest:
-    """Build the mandatory human queue from classified lanes (pre-audit)."""
+    """Build the mandatory human queue from classified lanes (pre-audit).
+
+    With ``frame_rows`` (the real campaign path) audit selection uses the
+    frozen marginal-coverage algorithm (FIX-2).
+    """
     classifications = {
         sample_id: classify_case(
             {slot: records_by_lane[slot][sample_id] for slot in REVIEWER_SLOTS}
@@ -141,7 +183,10 @@ def build_queue(
         for sample_id in sampling.sample_ids
     }
     consensus_ids = [sid for sid, c in classifications.items() if c["consensus"]]
-    audit_ids = set(select_audit_sample(consensus_ids))
+    if frame_rows is not None:
+        audit_ids = set(select_audit_sample_with_coverage(consensus_ids, frame_rows).selected)
+    else:
+        audit_ids = set(select_audit_sample(consensus_ids))
     entries: list[QueueEntry] = []
     for sample_id in sampling.sample_ids:
         classification = classifications[sample_id]
@@ -182,6 +227,10 @@ def final_resolution_path(protected_dir: Path, sample_id: str) -> Path:
     return protected_dir / "judgments" / f"{sample_id}.final.json"
 
 
+def reveal_event_path(protected_dir: Path, sample_id: str) -> Path:
+    return protected_dir / "judgments" / f"{sample_id}.revealed.json"
+
+
 def save_initial_judgment(judgment: HumanQueueJudgment, protected_dir: Path) -> Path:
     """Persist the initial judgment; refuse to overwrite (independence proof)."""
     path = queue_judgment_path(protected_dir, judgment.sample_id)
@@ -193,25 +242,71 @@ def save_initial_judgment(judgment: HumanQueueJudgment, protected_dir: Path) -> 
     return path
 
 
-def revealed_judgment_path(protected_dir: Path, sample_id: str) -> Path:
-    return queue_judgment_path(protected_dir, sample_id).with_suffix(".revealed.json")
+def reveal_model_votes(
+    protected_dir: Path,
+    sample_id: str,
+    *,
+    current_records_by_slot: dict[str, ModelReviewRecord],
+    lane_digests: tuple[str, ...],
+    campaign_id: str,
+    sampling_manifest_digest: str,
+    source_packet_digest: str,
+) -> VoteRevealEvent:
+    """Persist the vote-reveal event binding the EXACT votes shown (FIX-5A).
 
+    Fails closed unless:
 
-def reveal_model_votes(protected_dir: Path, sample_id: str) -> HumanQueueJudgment:
-    """Persist the vote-reveal event (only after the initial judgment exists)."""
+    - the independent initial judgment exists (reveal before initial fails);
+    - records for all three frozen slots exist for this exact sample;
+    - the reveal binds the CURRENT record digests in frozen slot order;
+    - the case/campaign/sampling/packet identity matches the caller-supplied
+      frozen identity.
+
+    The initial judgment file is never mutated.
+    """
+    if set(current_records_by_slot) != set(REVIEWER_SLOTS):
+        raise ValueError("reveal_requires_all_three_lanes")
+    if len(lane_digests) != len(REVIEWER_SLOTS):
+        raise ValueError("reveal_requires_all_three_lane_digests")
     path = queue_judgment_path(protected_dir, sample_id)
     if not path.exists():
         raise ValueError("initial_judgment_required_before_reveal")
-    revealed_path = revealed_judgment_path(protected_dir, sample_id)
+    judgment = HumanQueueJudgment.model_validate(json.loads(path.read_text()))
+    if judgment.campaign_id != campaign_id:
+        raise ValueError("reveal_campaign_mismatch")
+    if judgment.sampling_manifest_digest != sampling_manifest_digest:
+        raise ValueError("reveal_sampling_manifest_mismatch")
+    if judgment.source_packet_digest != source_packet_digest:
+        raise ValueError("reveal_source_packet_mismatch")
+    record_digests = tuple(current_records_by_slot[slot].record_digest() for slot in REVIEWER_SLOTS)
+    for slot in REVIEWER_SLOTS:
+        if current_records_by_slot[slot].sample_id != sample_id:
+            raise ValueError("reveal_record_sample_mismatch")
+    revealed_path = reveal_event_path(protected_dir, sample_id)
     if revealed_path.exists():
         raise ValueError("model_votes_already_revealed")
-    judgment = HumanQueueJudgment.model_validate(json.loads(path.read_text()))
-    revealed = judgment.model_copy(update={"model_votes_revealed_at": datetime.now(UTC)})
+    event = VoteRevealEvent(
+        protocol_version=CONSENSUS_PROTOCOL_VERSION,
+        campaign_id=campaign_id,
+        sampling_manifest_digest=sampling_manifest_digest,
+        source_packet_digest=source_packet_digest,
+        sample_id=sample_id,
+        revealed_record_digests=record_digests,
+        lane_digests=tuple(lane_digests),
+        revealed_at=datetime.now(UTC),
+    )
     write_protected_file(
         revealed_path,
-        (json.dumps(revealed.model_dump(mode="json"), sort_keys=True) + "\n").encode(),
+        (json.dumps(event.model_dump(mode="json"), sort_keys=True) + "\n").encode(),
     )
-    return revealed
+    return event
+
+
+def load_reveal_event(protected_dir: Path, sample_id: str) -> VoteRevealEvent | None:
+    path = reveal_event_path(protected_dir, sample_id)
+    if not path.exists():
+        return None
+    return VoteRevealEvent.model_validate(json.loads(path.read_text()))
 
 
 def record_final_resolution(
@@ -221,24 +316,40 @@ def record_final_resolution(
     final_critical: dict[str, Any],
     final_confidence: Literal["low", "medium", "high", "unknown"],
     note: str | None = None,
+    current_records_by_slot: dict[str, ModelReviewRecord] | None = None,
 ) -> HumanQueueJudgment:
-    """Attach the final resolution to an existing initial judgment."""
+    """Attach the final resolution to an existing initial judgment.
+
+    FIX-5A: when the current lane records are supplied (the normal path), the
+    recorded reveal event is verified against them — the exact three record
+    digests the human saw must equal the CURRENT frozen lane evidence. A
+    model record mutated after the reveal fails resolution here, not later.
+    """
     path = queue_judgment_path(protected_dir, sample_id)
     if not path.exists():
         raise ValueError("initial_judgment_required_before_resolution")
     judgment = HumanQueueJudgment.model_validate(json.loads(path.read_text()))
     if judgment.final_critical is not None:
         raise ValueError("final_resolution_already_recorded")
-    revealed_path = queue_judgment_path(protected_dir, sample_id).with_suffix(".revealed.json")
-    revealed_at = None
-    if revealed_path.exists():
-        revealed_judgment = HumanQueueJudgment.model_validate(json.loads(revealed_path.read_text()))
-        revealed_at = revealed_judgment.model_votes_revealed_at
-    if revealed_at is None:
+    event = load_reveal_event(protected_dir, sample_id)
+    if event is None:
         raise ValueError("model_votes_must_be_revealed_before_final_resolution")
+    if event.sample_id != sample_id:
+        raise ValueError("reveal_event_sample_mismatch")
+    if current_records_by_slot is not None:
+        if set(current_records_by_slot) != set(REVIEWER_SLOTS):
+            raise ValueError("resolution_requires_all_three_lanes")
+        current_digests = tuple(
+            current_records_by_slot[slot].record_digest() for slot in REVIEWER_SLOTS
+        )
+        if not hmac.compare_digest(
+            hashlib.sha256(json.dumps(current_digests).encode()).hexdigest(),
+            hashlib.sha256(json.dumps(tuple(event.revealed_record_digests)).encode()).hexdigest(),
+        ):
+            raise ValueError("reveal_does_not_match_current_lane_evidence")
     updated = judgment.model_copy(
         update={
-            "model_votes_revealed_at": revealed_at,
+            "model_votes_revealed_at": event.revealed_at,
             "final_critical": dict(final_critical),
             "final_confidence": final_confidence,
             "final_adjudicated_at": datetime.now(UTC),
@@ -257,31 +368,76 @@ def record_final_resolution(
     return updated
 
 
+def load_final_resolution(protected_dir: Path, sample_id: str) -> HumanQueueJudgment | None:
+    path = final_resolution_path(protected_dir, sample_id)
+    if not path.exists():
+        return None
+    return HumanQueueJudgment.model_validate(json.loads(path.read_text()))
+
+
+def load_initial_judgment(protected_dir: Path, sample_id: str) -> HumanQueueJudgment | None:
+    path = queue_judgment_path(protected_dir, sample_id)
+    if not path.exists():
+        return None
+    return HumanQueueJudgment.model_validate(json.loads(path.read_text()))
+
+
 def export_queue_evidence(protected_dir: Path) -> dict[str, Any]:
-    """Export mechanically ingestible protected queue evidence."""
+    """Export ONE coherent protected case state per queued sample (FIX-5B).
+
+    For each queue entry, expose separately:
+
+        initial_judgment   (authoritative independent initial state)
+        reveal_event       (the VoteRevealEvent binding the exact votes shown)
+        final_resolution   (authoritative final state, when resolved)
+
+    The underlying artifacts stay distinct immutable files; the export never
+    emits initial/revealed files as separate human cases. Counts distinguish
+    queue size, initial judgments complete, votes revealed, final resolutions
+    complete, and unresolved cases.
+    """
     queue = HumanQueueManifest.model_validate(
         json.loads((protected_dir / "human-queue.json").read_text())
     )
-    judgments_dir = protected_dir / "judgments"
-    judgments = []
-    if judgments_dir.exists():
-        for path in sorted(judgments_dir.glob("*.json")):
-            if path.name.endswith(".final.json"):
-                continue
-            judgments.append(
-                HumanQueueJudgment.model_validate(json.loads(path.read_text())).model_dump(
-                    mode="json"
-                )
-            )
-    by_id = {j["sample_id"]: j for j in judgments}
-    missing_initial = [entry.sample_id for entry in queue.entries if entry.sample_id not in by_id]
+    case_states: list[dict[str, Any]] = []
+    initial_complete = 0
+    votes_revealed = 0
+    final_complete = 0
+    for entry in queue.entries:
+        sample_id = entry.sample_id
+        initial = load_initial_judgment(protected_dir, sample_id)
+        reveal = load_reveal_event(protected_dir, sample_id)
+        final = load_final_resolution(protected_dir, sample_id)
+        if initial is not None:
+            initial_complete += 1
+        if reveal is not None:
+            votes_revealed += 1
+        if final is not None and final.final_critical is not None:
+            final_complete += 1
+        case_states.append(
+            {
+                "sample_id": sample_id,
+                "queue_reasons": list(entry.reasons),
+                "audit_only": entry.audit_only,
+                "initial_judgment": (initial.model_dump(mode="json") if initial else None),
+                "reveal_event": reveal.model_dump(mode="json") if reveal else None,
+                "final_resolution": final.model_dump(mode="json") if final else None,
+            }
+        )
+    unresolved = [
+        entry.sample_id
+        for entry in queue.entries
+        if load_final_resolution(protected_dir, entry.sample_id) is None
+    ]
     return {
         "queue": queue.model_dump(mode="json"),
-        "judgments": judgments,
+        "case_states": case_states,
         "counts": {
             "queue_size": len(queue.entries),
-            "judgments_recorded": len(judgments),
-            "missing_initial_judgments": len(missing_initial),
-            "resolved": sum(1 for j in judgments if j["final_critical"] is not None),
+            "initial_judgments_complete": initial_complete,
+            "votes_revealed": votes_revealed,
+            "final_resolutions_complete": final_complete,
+            "unresolved": len(unresolved),
+            "unresolved_sample_ids": unresolved,
         },
     }
