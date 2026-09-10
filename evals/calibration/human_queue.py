@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Self
@@ -456,15 +457,30 @@ def export_queue_evidence(protected_dir: Path) -> dict[str, Any]:
     emits initial/revealed files as separate human cases. Counts distinguish
     queue size, initial judgments complete, votes revealed, final resolutions
     complete, and unresolved cases.
+
+    FIX-R3-9: if an audit-escalation overlay exists (written mechanically by
+    ``materialize_audit_escalation``), its entries are merged into the
+    exported queue so the ledger verifier sees the full required population.
     """
     queue = HumanQueueManifest.model_validate(
         json.loads((protected_dir / "human-queue.json").read_text())
     )
+    entries = list(queue.entries)
+    overlay_path = protected_dir / "human-queue-escalation.json"
+    if overlay_path.exists():
+        overlay = HumanQueueManifest.model_validate(json.loads(overlay_path.read_text()))
+        _validate_overlay_binding(queue, overlay)
+        existing = {entry.sample_id for entry in entries}
+        for entry in overlay.entries:
+            if entry.sample_id in existing:
+                raise ValueError("queue_overlay_duplicate_sample_id")
+            entries.append(entry)
+    merged = queue.model_copy(update={"entries": tuple(entries)})
     case_states: list[dict[str, Any]] = []
     initial_complete = 0
     votes_revealed = 0
     final_complete = 0
-    for entry in queue.entries:
+    for entry in merged.entries:
         sample_id = entry.sample_id
         initial = load_initial_judgment(protected_dir, sample_id)
         reveal = load_reveal_event(protected_dir, sample_id)
@@ -487,6 +503,153 @@ def export_queue_evidence(protected_dir: Path) -> dict[str, Any]:
         )
     unresolved = [
         entry.sample_id
+        for entry in merged.entries
+        if load_final_resolution(protected_dir, entry.sample_id) is None
+    ]
+    return {
+        "queue": merged.model_dump(mode="json"),
+        "case_states": case_states,
+        "counts": {
+            "queue_size": len(merged.entries),
+            "initial_judgments_complete": initial_complete,
+            "votes_revealed": votes_revealed,
+            "final_resolutions_complete": final_complete,
+            "unresolved": len(unresolved),
+            "unresolved_sample_ids": unresolved,
+        },
+    }
+
+
+def require_queued_sample(
+    protected_dir: Path,
+    sample_id: str,
+    *,
+    campaign_id: str,
+    sampling_manifest_digest: str,
+    source_packet_digest: str,
+) -> QueueEntry:
+    """Return one base/overlay queue entry or fail before any operator action."""
+    exported = export_queue_evidence(protected_dir)
+    queue = HumanQueueManifest.model_validate(exported["queue"])
+    if queue.campaign_id != campaign_id:
+        raise ValueError("queue_manifest_campaign_mismatch")
+    if queue.sampling_manifest_digest != sampling_manifest_digest:
+        raise ValueError("queue_manifest_sampling_mismatch")
+    if not hmac.compare_digest(queue.source_packet_digest, source_packet_digest):
+        raise ValueError("queue_manifest_source_packet_mismatch")
+    for entry in queue.entries:
+        if entry.sample_id == sample_id:
+            return entry
+    raise ValueError("sample_not_in_human_queue")
+
+
+def _validate_overlay_binding(base: HumanQueueManifest, overlay: HumanQueueManifest) -> None:
+    if overlay.protocol_version != base.protocol_version:
+        raise ValueError("queue_overlay_protocol_mismatch")
+    if overlay.campaign_id != base.campaign_id:
+        raise ValueError("queue_overlay_campaign_mismatch")
+    if overlay.sampling_manifest_digest != base.sampling_manifest_digest:
+        raise ValueError("queue_overlay_sampling_mismatch")
+    if overlay.source_packet_digest != base.source_packet_digest:
+        raise ValueError("queue_overlay_source_packet_mismatch")
+
+
+def materialize_audit_escalation(
+    protected_dir: Path,
+    *,
+    records_by_lane: dict[str, dict[str, ModelReviewRecord]],
+    consensus_ids: Sequence[str],
+    suggested_kind_by_sample: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Mechanically materialize the expanded full-human queue on escalation.
+
+    FIX-R3-9: when the frozen audit outcome escalates, the expanded
+    population must be materialized for review WITHOUT hand-authoring final
+    resolution files. This derives the audit outcome from the queue evidence
+    (audit-selected final resolutions) plus the frozen lane records, and —
+    if escalation fires — writes the append-only escalation overlay
+    (``human-queue-escalation.json``) containing every consensus case not
+    already queued. Idempotent: an existing overlay is returned as-is when
+    it matches the derived expansion, and refused when it does not.
+    """
+    export = export_queue_evidence_without_overlay(protected_dir)
+    base = HumanQueueManifest.model_validate(export["queue"])
+    audit_entries = [entry for entry in base.entries if "audit_selected" in entry.reasons]
+    final_resolutions: dict[str, dict[str, Any]] = {}
+    for entry in audit_entries:
+        final = load_final_resolution(protected_dir, entry.sample_id)
+        if final is None or final.final_critical is None:
+            raise ValueError("escalation_requires_completed_audit_resolutions")
+        final_resolutions[entry.sample_id] = dict(final.final_critical)
+    from evals.calibration.consensus import evaluate_audit_outcome
+
+    outcome = evaluate_audit_outcome(
+        audit_results={
+            sample_id: {"human_final_critical": critical}
+            for sample_id, critical in final_resolutions.items()
+        },
+        records_by_lane={
+            sample_id: {
+                slot: records_by_lane[slot][sample_id]
+                for slot in REVIEWER_SLOTS
+                if sample_id in records_by_lane.get(slot, {})
+            }
+            for sample_id in final_resolutions
+        },
+        suggested_kind_by_sample=suggested_kind_by_sample,
+    )
+    overlay_path = protected_dir / "human-queue-escalation.json"
+    if not outcome["escalate_full_human_review"]:
+        return {"escalated": False, "outcome": outcome, "overlay": None}
+    queued = {entry.sample_id for entry in base.entries}
+    expanded = sorted(set(consensus_ids) - queued)
+    if overlay_path.exists():
+        existing = HumanQueueManifest.model_validate(json.loads(overlay_path.read_text()))
+        _validate_overlay_binding(base, existing)
+        if {e.sample_id for e in existing.entries} != set(expanded):
+            raise ValueError("queue_escalation_overlay_mismatch")
+        return {"escalated": True, "outcome": outcome, "overlay": str(overlay_path)}
+    overlay = base.model_copy(
+        update={
+            "entries": tuple(
+                QueueEntry(
+                    sample_id=sample_id,
+                    reasons=("audit_escalation_full_human_review",),
+                    audit_only=False,
+                )
+                for sample_id in expanded
+            )
+        }
+    )
+    write_protected_file(
+        overlay_path,
+        (json.dumps(overlay.model_dump(mode="json"), sort_keys=True) + "\n").encode(),
+    )
+    return {"escalated": True, "outcome": outcome, "overlay": str(overlay_path)}
+
+
+def export_queue_evidence_without_overlay(protected_dir: Path) -> dict[str, Any]:
+    """Queue export limited to the base manifest (no escalation overlay)."""
+    queue = HumanQueueManifest.model_validate(
+        json.loads((protected_dir / "human-queue.json").read_text())
+    )
+    case_states: list[dict[str, Any]] = []
+    for entry in queue.entries:
+        initial = load_initial_judgment(protected_dir, entry.sample_id)
+        reveal = load_reveal_event(protected_dir, entry.sample_id)
+        final = load_final_resolution(protected_dir, entry.sample_id)
+        case_states.append(
+            {
+                "sample_id": entry.sample_id,
+                "queue_reasons": list(entry.reasons),
+                "audit_only": entry.audit_only,
+                "initial_judgment": (initial.model_dump(mode="json") if initial else None),
+                "reveal_event": reveal.model_dump(mode="json") if reveal else None,
+                "final_resolution": final.model_dump(mode="json") if final else None,
+            }
+        )
+    unresolved = [
+        entry.sample_id
         for entry in queue.entries
         if load_final_resolution(protected_dir, entry.sample_id) is None
     ]
@@ -495,9 +658,6 @@ def export_queue_evidence(protected_dir: Path) -> dict[str, Any]:
         "case_states": case_states,
         "counts": {
             "queue_size": len(queue.entries),
-            "initial_judgments_complete": initial_complete,
-            "votes_revealed": votes_revealed,
-            "final_resolutions_complete": final_complete,
             "unresolved": len(unresolved),
             "unresolved_sample_ids": unresolved,
         },

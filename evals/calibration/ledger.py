@@ -9,7 +9,7 @@ PROTECTED source evidence:
   provenance path (FIX-R2-1): lane identity, campaign/sampling/source packet,
   exact frozen membership/order, and current record digests equal to
   ``LaneFreeze.record_digests`` — plus raw-response evidence verification
-  (FIX-R2-4);
+  (FIX-R2-4), which is MANDATORY at this boundary (FIX-R3-2);
 - the initial classifications (``classify_case`` over the frozen records);
 - the deterministic audit selection (frozen marginal-coverage algorithm);
 - the completed human queue evidence (initial judgments, vote-reveal events,
@@ -19,6 +19,19 @@ PROTECTED source evidence:
   (FIX-R2-2) — a caller-supplied ``AuditOutcomeRecord`` is never authority;
   if one is supplied (audit provenance), it must compare field-exactly
   against the independently derived result.
+
+FIX-R3-1: ``VerifiedConsensusLedger`` is a PRIVATE-CAPABILITY type. It is a
+plain ``Record`` subclass, but its constructor requires an opaque
+``_VerificationCapability`` token that is ONLY created inside this module by
+``verify_consensus_ledger`` after every binding has been re-derived from
+protected evidence. A schema-valid-looking object constructed by an outside
+caller cannot carry the token, so it can never be manufactured through the
+public schema API and passed into ``consensus_reference_observations``,
+floor evaluation, or fitting. The preferred full-evidence design is also
+implemented: ``load_verified_ledger`` loads a frozen ledger file plus
+independently retained SHA-256 and re-verifies ALL underlying evidence
+(lanes loaded from the protected root with raw bytes, queue evidence, frame)
+before returning the capability-bearing object.
 
 For each sample the verifier RE-DERIVES the final state and rejects any
 wrapper that disagrees:
@@ -30,13 +43,15 @@ wrapper that disagrees:
   derived unanimous consensus critical fields;
 - ``human_audited_consensus``: deterministic-audit-selected, independent
   human initial judgment exists, reveal event bound to the exact current
-  frozen evidence, human final resolution exists, final dimensions EXACTLY
-  equal the authoritative human final resolution, and the audit outcome
-  permits this provenance state;
+  frozen evidence, human final resolution exists AND CONFIRMS the unanimous
+  model consensus on every critical field (FIX-R3-5), final dimensions
+  EXACTLY equal the authoritative human final resolution, and the audit
+  outcome permits this provenance state;
 - ``human_adjudicated``: the case was in the final required human queue
-  (initial queue or audit-escalation expansion), initial judgment exists,
-  reveal event bound to the exact current frozen evidence, final resolution
-  exists, final dimensions EXACTLY equal the human final resolution.
+  (initial queue, audit selection the human overrode, or audit-escalation
+  expansion), initial judgment exists, reveal event bound to the exact
+  current frozen evidence, final resolution exists, final dimensions EXACTLY
+  equal the human final resolution.
 
 If full audit escalation occurred, NO remaining automatically accepted
 ``cross_model_consensus`` row may survive. No ledger is accepted while any
@@ -77,12 +92,58 @@ from evals.calibration.human_queue import (
 )
 from evals.calibration.lane_binding import (
     audit_campaign_binding,
-    validate_lane_provenance,
 )
-from evals.calibration.raw_evidence import validate_lane_raw_evidence
+from evals.calibration.raw_evidence import (
+    validate_lane_provenance_with_raw,
+)
 from evals.calibration.review import write_protected_file
 
 LEDGER_FILE_SCHEMA = "engram-calibration-consensus-ledger-file-206-v1"
+
+
+class _CapabilityToken:
+    """Module-private issuance sentinel (never exported)."""
+
+    __slots__ = ()
+
+
+_CAPABILITY_SECRET = _CapabilityToken()
+
+
+class _VerificationCapability:
+    """Opaque verifier-issued seal bound to one exact ledger serialization."""
+
+    __slots__ = ("ledger_digest",)
+
+    def __init__(self, secret: object | None = None, ledger_digest: str = "") -> None:
+        if secret is not _CAPABILITY_SECRET:
+            raise RuntimeError(
+                "VerifiedConsensusLedger authority cannot be constructed outside "
+                "verify_consensus_ledger"
+            )
+        self.ledger_digest = ledger_digest
+
+
+def _ledger_digest(ledger: ConsensusLedger) -> str:
+    """Stable capability binding; changing any ledger field invalidates authority."""
+    return _sha256_bytes(
+        json.dumps(ledger.model_dump(mode="json"), sort_keys=True, separators=(",", ":")).encode()
+    )
+
+
+def require_verification_capability(verified: VerifiedConsensusLedger) -> None:
+    """Reject Pydantic construction/copy bypasses before consuming final labels.
+
+    ``model_construct`` bypasses ``__init__`` and ``model_copy`` preserves
+    private fields, so type identity alone is never authority. The seal must
+    both exist and bind the exact immutable ledger payload issued by the
+    canonical re-verifier.
+    """
+    capability = getattr(verified, "_verification_capability", None)
+    if not isinstance(capability, _VerificationCapability) or not hmac.compare_digest(
+        capability.ledger_digest, _ledger_digest(verified.ledger)
+    ):
+        raise ValueError("verified_consensus_ledger_capability_invalid")
 
 
 class QueueEvidenceBindings(Record):
@@ -100,6 +161,11 @@ class VerifiedConsensusLedger(Record):
     Carries the verified ledger plus the evidence it was derived from, so
     downstream consumers (``consensus_reference_observations`` and friends)
     receive provenance, not a bare label list.
+
+    FIX-R3-1: construction requires ``_capability`` — an opaque object only
+    this module can create. Pydantic validates it as an arbitrary object;
+    a fabricated payload cannot supply a genuine capability instance, and
+    copying/serializing one never transfers authority across processes.
     """
 
     ledger: ConsensusLedger
@@ -107,8 +173,19 @@ class VerifiedConsensusLedger(Record):
     records_by_lane: dict[str, dict[str, ModelReviewRecord]]
     lanes: tuple[LaneFreeze, ...]
 
+    def __init__(self, **data: Any) -> None:
+        capability = data.pop("verification_capability", None)
+        if not isinstance(capability, _VerificationCapability):
+            raise ValueError(
+                "VerifiedConsensusLedger cannot be constructed directly: authority "
+                "is issued only by verify_consensus_ledger from protected evidence"
+            )
+        super().__init__(**data)
+        object.__setattr__(self, "_verification_capability", capability)
+
     def reference_rows(self) -> list[dict[str, Any]]:
         """One authoritative final row per sample (origin + critical)."""
+        require_verification_capability(self)
         return [
             {
                 "sample_id": wrapper.sample_id,
@@ -132,9 +209,9 @@ def verify_consensus_ledger(
     records_by_lane: dict[str, dict[str, ModelReviewRecord]],
     queue_dir: Path,
     frame_rows: dict[str, FrameRow],
+    protected_root: Path,
     suggested_kind_by_sample: dict[str, str] | None = None,
     audit_outcome_record: AuditOutcomeRecord | None = None,
-    protected_root: Path | None = None,
 ) -> VerifiedConsensusLedger:
     """Re-derive every final state from protected evidence. Fail closed.
 
@@ -158,13 +235,16 @@ def verify_consensus_ledger(
     digests, three lane digests). The initial/final human artifacts are also
     validated against the same campaign/sample identities.
 
-    FIX-R2-4: when ``protected_root`` is supplied, every accepted record's
-    raw response bytes are verified to exist and hash to the claimed digest
-    (provider_error records must claim none).
+    FIX-R3-2: ``protected_root`` is MANDATORY. Every accepted record's raw
+    response bytes are verified to exist and hash to the claimed digest
+    (provider_error records must claim none) through the full canonical
+    ``validate_lane_provenance_with_raw`` verifier. There is no bypass.
     """
+    if not isinstance(protected_root, Path):
+        raise ValueError("ledger_requires_protected_root")
     if campaign_id != sampling.campaign_id:
         raise ValueError("ledger_campaign_mismatch")
-    # --- lanes: FULL canonical provenance path (FIX-R2-1) ---
+    # --- lanes: FULL canonical provenance path (FIX-R2-1 + FIX-R3-2) ---
     if len(lanes) != len(REVIEWER_SLOTS):
         raise ValueError("lane_count_mismatch")
     audit_campaign_binding(
@@ -175,26 +255,27 @@ def verify_consensus_ledger(
     )
     if set(records_by_lane) != set(REVIEWER_SLOTS):
         raise ValueError("records_lane_slot_mapping_ambiguous")
+    from evals.calibration.ingestion import verify_reviewer_prompt_binding
+
     for lane in lanes:
+        verify_reviewer_prompt_binding(lane.reviewer)
         slot_records = records_by_lane.get(lane.reviewer.reviewer_slot)
         if slot_records is None:
             raise ValueError("records_lane_slot_mapping_ambiguous")
-        validate_lane_provenance(
+        # FIX-R3-2: one full canonical verifier inside the ledger boundary —
+        # identity + membership + frozen digests PLUS raw-response evidence.
+        validate_lane_provenance_with_raw(
             lane,
             slot_records,
             campaign_id=campaign_id,
             sampling=sampling,
             source_packet_digest=source_packet_digest,
+            protected_root=protected_root,
         )
-        if protected_root is not None:
-            validate_lane_raw_evidence(
-                slot_records,
-                protected_root=protected_root,
-                reviewer_slot=lane.reviewer.reviewer_slot,
-            )
     lane_digests_by_slot: dict[str, str] = {
         lane.reviewer.reviewer_slot: lane.lane_digest() for lane in lanes
     }
+    canonical_lane_digests = tuple(lane_digests_by_slot[slot] for slot in REVIEWER_SLOTS)
     # --- classifications + audit selection ---
     classifications = {
         sample_id: classify_case(
@@ -210,7 +291,7 @@ def verify_consensus_ledger(
     queue_payload = json.dumps(queue_export["queue"], sort_keys=True).encode()
     queue_sha = _sha256_bytes(queue_payload)
     queue_ids = {entry["sample_id"] for entry in queue_export["queue"]["entries"]}
-    _queue_manifest_identities(queue_export, campaign_id, sampling)
+    _queue_manifest_identities(queue_export, campaign_id, sampling, source_packet_digest)
     # --- human final resolutions for audit-selected cases ---
     final_by_sample: dict[str, dict[str, Any]] = {}
     for sample_id in audit_ids:
@@ -292,7 +373,7 @@ def verify_consensus_ledger(
         validate_reveal_binding(
             reveal,
             current_records_by_slot=records,
-            lane_digests=tuple(lane_digests_by_slot[slot] for slot in REVIEWER_SLOTS),
+            lane_digests=canonical_lane_digests,
             protocol_version=CONSENSUS_PROTOCOL_VERSION,
             campaign_id=campaign_id,
             sampling_manifest_digest=sampling.manifest_digest(),
@@ -303,10 +384,26 @@ def verify_consensus_ledger(
             json.dumps(initial.model_dump(mode="json"), sort_keys=True).encode()
         ).hexdigest()
         if audit_selected and consensus_reached:
-            # An audit-selected consensus row stays human_audited_consensus
-            # even under full escalation: it WAS audit-selected and the human
-            # confirmed it; escalation expands the OTHER consensus rows.
-            origin = "human_audited_consensus"
+            # FIX-R3-5: only a CONFIRMED audited consensus is
+            # human_audited_consensus. If the human final resolution differs
+            # from the unanimous model consensus on ANY critical field, the
+            # row is human_adjudicated — even when the audit as a whole does
+            # not escalate. The final dimensions remain the human resolution.
+            derived = _unanimous_from_records(records)
+            if derived is None:
+                raise ValueError("audited_consensus_row_requires_unanimous_derivation")
+            human_final = dict(final.final_critical)
+            confirmed = all(
+                derived.get(field) == human_final.get(field)
+                for field in (
+                    "expected_kind",
+                    "retention_value",
+                    "epistemic_state",
+                    "consequence",
+                    "acceptable_abstention",
+                )
+            )
+            origin = "human_audited_consensus" if confirmed else "human_adjudicated"
         else:
             origin = "human_adjudicated"
         wrappers.append(
@@ -344,7 +441,9 @@ def verify_consensus_ledger(
         campaign_id=campaign_id,
         sampling_manifest_digest=sampling.manifest_digest(),
         source_packet_digest=source_packet_digest,
-        lane_digests=tuple(lane.lane_digest() for lane in lanes),
+        # FIX-R3 (lane order): canonical REVIEWER_SLOTS order, never the
+        # caller's input tuple order.
+        lane_digests=canonical_lane_digests,
         queue_evidence_sha256=queue_sha,
         audit_outcome=derived_outcome,
         audit_selection=selection,
@@ -358,7 +457,8 @@ def verify_consensus_ledger(
         ledger=ledger,
         queue_evidence_sha256=queue_sha,
         records_by_lane=records_by_lane,
-        lanes=lanes,
+        lanes=tuple(sorted(lanes, key=lambda lane: lane.reviewer.reviewer_slot)),
+        verification_capability=_VerificationCapability(_CAPABILITY_SECRET, _ledger_digest(ledger)),
     )
 
 
@@ -366,6 +466,7 @@ def _queue_manifest_identities(
     queue_export: dict[str, Any],
     campaign_id: str,
     sampling: SamplingManifest,
+    source_packet_digest: str,
 ) -> None:
     """Validate the stored queue manifest against campaign identities."""
     manifest = queue_export["queue"]
@@ -373,6 +474,10 @@ def _queue_manifest_identities(
         raise ValueError("queue_manifest_campaign_mismatch")
     if manifest.get("sampling_manifest_digest") != sampling.manifest_digest():
         raise ValueError("queue_manifest_sampling_mismatch")
+    # FIX-R3 (queue source packet): exact source-packet equality is required;
+    # a queue manifest from a different packet is never acceptable evidence.
+    if not hmac.compare_digest(str(manifest.get("source_packet_digest", "")), source_packet_digest):
+        raise ValueError("queue_manifest_source_packet_mismatch")
 
 
 def _validate_human_identity(
@@ -452,21 +557,29 @@ def load_verified_ledger(
     campaign_id: str,
     sampling: SamplingManifest,
     source_packet_digest: str,
-    lanes: tuple[LaneFreeze, ...],
-    records_by_lane: dict[str, dict[str, ModelReviewRecord]],
     queue_dir: Path,
     frame_rows: dict[str, FrameRow],
+    protected_root: Path,
     suggested_kind_by_sample: dict[str, str] | None = None,
-    protected_root: Path | None = None,
+    reviewers: dict[str, Any] | None = None,
 ) -> VerifiedConsensusLedger:
-    """Load a frozen ledger file and RE-VERIFY it against live evidence.
+    """Load a frozen ledger file and RE-VERIFY all underlying evidence.
 
-    The stored bytes are only a serialization convenience; authority always
-    comes from re-derivation (Pitfall: never let a caller-constructible
-    "verified" record be the authority). The stored audit outcome is passed
-    through as audit PROVENANCE and must match the independently derived
-    outcome field-exactly (FIX-R2-2).
+    FIX-R3-1 preferred design: the frozen ledger FILE is only a serialization
+    convenience plus an independently retained SHA-256; authority ALWAYS
+    comes from re-derivation. This function loads the three frozen lanes
+    (with their bound raw model evidence) and the human queue evidence from
+    the protected root, re-runs the full verifier, and requires the
+    re-derived ledger to equal the stored one field-exactly. The stored
+    audit outcome is passed through as audit PROVENANCE and must match the
+    independently derived outcome (FIX-R2-2).
+
+    ``reviewers`` is optional only when the caller has already loaded and
+    validated the lanes; when omitted, the lanes are loaded from
+    ``protected_root`` through ``load_frozen_lanes``-equivalent validation.
     """
+    from evals.calibration.model_lanes import load_frozen_lanes, records_by_lane_from_files
+
     payload = path.read_bytes()
     if not hmac.compare_digest(_sha256_bytes(payload), expected_sha256):
         raise ValueError("consensus_ledger_digest_mismatch")
@@ -474,6 +587,19 @@ def load_verified_ledger(
     if envelope.get("ledger_file_schema") != LEDGER_FILE_SCHEMA:
         raise ValueError("consensus_ledger_schema_mismatch")
     stored = ConsensusLedger.model_validate(envelope["ledger"])
+    if reviewers is not None:
+        lanes = load_frozen_lanes(
+            protected_root,
+            campaign_id=campaign_id,
+            sampling=sampling,
+            source_packet_digest=source_packet_digest,
+            reviewers=reviewers,
+        )
+    else:
+        lanes = _load_lanes_from_authorities(
+            protected_root, campaign_id=campaign_id, sampling=sampling
+        )
+    records_by_lane = records_by_lane_from_files(protected_root)
     reverified = verify_consensus_ledger(
         campaign_id=campaign_id,
         sampling=sampling,
@@ -489,3 +615,36 @@ def load_verified_ledger(
     if reverified.ledger.model_dump(mode="json") != stored.model_dump(mode="json"):
         raise ValueError("consensus_ledger_reverification_mismatch")
     return reverified
+
+
+def _load_lanes_from_authorities(
+    protected_root: Path,
+    *,
+    campaign_id: str,
+    sampling: SamplingManifest,
+) -> tuple[LaneFreeze, ...]:
+    """Load and fully validate the three frozen lanes from lane authorities."""
+    from evals.calibration.consensus import ReviewerIdentity
+    from evals.calibration.model_lanes import load_frozen_lanes
+
+    reviewers: dict[str, ReviewerIdentity] = {}
+    digests: set[str] = set()
+    for slot in REVIEWER_SLOTS:
+        authority_path = protected_root / "lanes" / slot / "lane.json"
+        if not authority_path.is_file():
+            raise ValueError("lane_not_initialized")
+        authority = json.loads(authority_path.read_text())
+        reviewers[slot] = ReviewerIdentity.model_validate(authority["reviewer"])
+        digests.add(str(authority.get("source_packet_digest", "")))
+    if len(digests) != 1:
+        raise ValueError("lane_authority_source_packet_inconsistent")
+    source_packet_digest = digests.pop()
+    if not source_packet_digest:
+        raise ValueError("lane_authority_source_packet_inconsistent")
+    return load_frozen_lanes(
+        protected_root,
+        campaign_id=campaign_id,
+        sampling=sampling,
+        source_packet_digest=source_packet_digest,
+        reviewers=reviewers,
+    )

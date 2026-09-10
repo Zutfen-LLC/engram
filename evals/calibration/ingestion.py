@@ -32,6 +32,7 @@ Guarantees:
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -64,6 +65,9 @@ LANE_AUTHORITY_SCHEMA: Literal["engram-calibration-model-lane-authority-206-v1"]
 LANE_REQUEST_SCHEMA: Literal["engram-calibration-model-lane-request-206-v1"] = (
     "engram-calibration-model-lane-request-206-v1"
 )
+LANE_REQUEST_BATCH_SCHEMA: Literal["engram-calibration-model-lane-request-batch-206-v2"] = (
+    "engram-calibration-model-lane-request-batch-206-v2"
+)
 RESPONSE_OUTCOMES: tuple[str, ...] = ("judged", "refused", "malformed", "provider_error")
 
 # The frozen labeling instruction block emitted with every request. The
@@ -90,6 +94,29 @@ LABELING_INSTRUCTIONS: dict[str, Any] = {
 }
 
 
+def labeling_instructions_digest() -> str:
+    """Digest of the EXACT frozen instruction material supplied to reviewers.
+
+    FIX-R3 (prompt provenance): ``ReviewerIdentity.prompt_digest`` must equal
+    this digest. A caller-provided digest cannot claim one prompt while
+    ``model-lane-request`` emits another: the lane refuses to initialize (and
+    refuses to load) against any reviewer identity whose prompt digest does
+    not match the canonical instructions actually embedded in every request.
+    """
+    from evals.calibration.consensus import digest_of
+
+    return digest_of(LABELING_INSTRUCTIONS)
+
+
+def verify_reviewer_prompt_binding(reviewer: ReviewerIdentity) -> None:
+    """Fail closed unless the reviewer identity binds the real frozen prompt."""
+    expected = labeling_instructions_digest()
+    if reviewer.prompt_digest != expected:
+        raise ValueError("reviewer_prompt_digest_does_not_match_frozen_instructions")
+    if reviewer.label_guide_version != LABEL_GUIDE_VERSION:
+        raise ValueError("reviewer_label_guide_version_mismatch")
+
+
 class LaneAuthority(Record):
     """The immutable lane binding written by ``model-lane-init``."""
 
@@ -101,6 +128,11 @@ class LaneAuthority(Record):
     reviewer: ReviewerIdentity
     sampling_manifest_digest: str
     source_packet_digest: str
+    # FIX-R3-3: the exact neutral packet bytes this lane may request against.
+    # Bound at init from the independently retained neutral packet manifest;
+    # request emission re-reads and re-hashes the packet file and refuses any
+    # byte disagreement BEFORE any reviewer request is emitted.
+    neutral_packet_sha256: str
 
     @model_validator(mode="after")
     def authority_contract(self) -> Self:
@@ -113,6 +145,38 @@ def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def load_neutral_packet_verified(
+    neutral_packet_path: Path,
+    *,
+    manifest_path: Path,
+    expected_packet_name: str | None = None,
+) -> tuple[NeutralModelPacket, str]:
+    """Load the neutral packet ONLY after byte-level manifest verification.
+
+    FIX-R3-3: the packet's own embedded metadata (``sampling_manifest_digest``,
+    ``source_packet_digest``) is NOT proof of its contents. Authority comes
+    from the independently retained ``neutral-packet-manifest.json`` mapping
+    the packet file name to its SHA-256: the exact file bytes are re-read and
+    re-hashed here, and any disagreement (edited case content, reordered /
+    missing / extra cases producing different bytes) fails closed.
+    """
+    import hashlib as _hashlib
+
+    payload = neutral_packet_path.read_bytes()
+    actual_digest = _hashlib.sha256(payload).hexdigest()
+    manifest = json.loads(manifest_path.read_text())
+    name = neutral_packet_path.name
+    if expected_packet_name is not None:
+        name = expected_packet_name
+    expected_digest = manifest.get(name)
+    if not isinstance(expected_digest, str) or not expected_digest:
+        raise ValueError("neutral_packet_manifest_missing_entry")
+    if not hmac.compare_digest(actual_digest, expected_digest):
+        raise ValueError("neutral_packet_sha_mismatch")
+    packet = NeutralModelPacket.model_validate(json.loads(payload))
+    return packet, actual_digest
+
+
 class LaneSession:
     """One reviewer lane bound to its frozen authority.
 
@@ -121,6 +185,18 @@ class LaneSession:
     ``lanes/<slot>/lane.json``. All operations derive the reviewer identity
     from the immutable authority — a record can never be persisted under a
     different identity through this session.
+
+    FIX-R3-3: the authority binds the exact neutral packet SHA-256 (from the
+    independently retained manifest). Every request emission re-reads the
+    packet bytes, re-hashes them against the authority digest, verifies the
+    sampling/source-packet binding, and proves EXACT frozen membership and
+    order — all BEFORE any reviewer request is emitted.
+
+    FIX-R3-6: request batches are immutable generations
+    (``lane-requests-000001.jsonl``, ``lane-requests-000002.jsonl``, ...).
+    Each emission writes the NEXT exclusive-create batch containing only the
+    still-pending cases; previous batches are never overwritten, so the real
+    resume sequence (emit -> partial ingest -> emit again) works.
     """
 
     def __init__(self, protected_root: Path, reviewer_slot: str):
@@ -132,10 +208,12 @@ class LaneSession:
         self.authority = LaneAuthority.model_validate(json.loads(authority_path.read_text()))
         if self.authority.reviewer.reviewer_slot != reviewer_slot:
             raise ValueError("lane_authority_slot_mismatch")
+        verify_reviewer_prompt_binding(self.authority.reviewer)
         self.reviewer = self.authority.reviewer
         self.campaign_id = self.authority.campaign_id
         self.sampling_manifest_digest = self.authority.sampling_manifest_digest
         self.source_packet_digest = self.authority.source_packet_digest
+        self.neutral_packet_sha256 = self.authority.neutral_packet_sha256
 
     @property
     def lane_root(self) -> Path:
@@ -150,14 +228,30 @@ class LaneSession:
         campaign_id: str,
         sampling: SamplingManifest,
         source_packet_digest: str,
+        neutral_packet_path: Path,
+        neutral_packet_manifest: Path,
     ) -> LaneSession:
-        """Bind one lane to one frozen reviewer identity (exclusive-create)."""
+        """Bind one lane to one frozen reviewer identity (exclusive-create).
+
+        FIX-R3 (prompt provenance): the reviewer identity must bind the exact
+        frozen labeling instructions (``prompt_digest`` ==
+        ``labeling_instructions_digest()``).
+
+        FIX-R3-3: the exact neutral packet bytes are verified against the
+        independently retained manifest and their SHA-256 is frozen into the
+        lane authority before anything else happens.
+        """
+        verify_reviewer_prompt_binding(reviewer)
+        _, packet_sha = load_neutral_packet_verified(
+            neutral_packet_path, manifest_path=neutral_packet_manifest
+        )
         authority = LaneAuthority(
             protocol_version=CONSENSUS_PROTOCOL_VERSION,
             campaign_id=campaign_id,
             reviewer=reviewer,
             sampling_manifest_digest=sampling.manifest_digest(),
             source_packet_digest=source_packet_digest,
+            neutral_packet_sha256=packet_sha,
         )
         payload = (json.dumps(authority.model_dump(mode="json"), sort_keys=True) + "\n").encode()
         lane_path = protected_root / "lanes" / reviewer.reviewer_slot / "lane.json"
@@ -166,32 +260,65 @@ class LaneSession:
 
     # -- request emission ---------------------------------------------------
 
-    def _check_packet(self, packet: NeutralModelPacket, sampling: SamplingManifest) -> None:
+    def _check_packet(
+        self, packet: NeutralModelPacket, sampling: SamplingManifest, packet_sha: str
+    ) -> None:
+        """FIX-R3-3: byte-level + binding + exact-membership/order checks."""
         if sampling.manifest_digest() != self.sampling_manifest_digest:
             raise ValueError("sampling_manifest_mismatch")
+        # the exact packet bytes must hash to the authority-frozen digest
+        if not hmac.compare_digest(packet_sha, self.neutral_packet_sha256):
+            raise ValueError("neutral_packet_sha_mismatch")
         if packet.sampling_manifest_digest != self.sampling_manifest_digest:
             raise ValueError("lane_packet_sampling_manifest_mismatch")
         if str(getattr(packet, "source_packet_digest", "")) != self.source_packet_digest:
             raise ValueError("lane_packet_source_packet_mismatch")
         if packet.guide_version != LABEL_GUIDE_VERSION:
             raise ValueError("lane_packet_guide_version_mismatch")
+        # EXACT frozen membership and order: the reviewer sees precisely the
+        # frozen sample sequence, no more, no less, in the frozen order.
+        packet_ids = tuple(str(case["sample_id"]) for case in packet.cases)
+        if packet_ids != tuple(sampling.sample_ids):
+            if len(packet_ids) == len(sampling.sample_ids):
+                raise ValueError("neutral_packet_membership_order_mismatch")
+            raise ValueError("neutral_packet_membership_mismatch")
+
+    def _next_request_batch_path(self) -> Path:
+        """Next immutable generation: lane-requests-000001.jsonl, -000002, ..."""
+        existing = sorted(self.lane_root.glob("lane-requests-*.jsonl"))
+        sequence = 0
+        for path in existing:
+            suffix = path.stem.split("-")[-1]
+            if suffix.isdigit():
+                sequence = max(sequence, int(suffix))
+        return self.lane_root / f"lane-requests-{sequence + 1:06d}.jsonl"
+
+    @staticmethod
+    def _request_batch_manifest_path(batch_path: Path) -> Path:
+        return batch_path.with_suffix(".manifest.json")
 
     def emit_requests(
         self,
-        packet: NeutralModelPacket,
+        packet_path: Path,
         *,
         sampling: SamplingManifest,
-        out_path: Path | None = None,
+        manifest_path: Path | None = None,
     ) -> Path:
-        """Emit ONLY this lane's neutral case requests (JSONL, resumable).
+        """Emit ONLY this lane's pending neutral case requests (JSONL).
 
-        One line per case still missing an accepted record. Each line is
-        self-describing: lane identity + case + frozen labeling instructions
-        + response schema. The external executor answers each line with one
-        response object of the documented shape. No other lane's evidence is
-        reachable through this emission.
+        FIX-R3-3: the neutral packet is loaded through byte-level manifest
+        verification (never trusting its embedded metadata), bound against
+        the lane authority digest, and proven to carry the EXACT frozen
+        membership and order — BEFORE any request line is constructed.
+
+        FIX-R3-6: writes the NEXT immutable batch generation containing only
+        cases still missing an accepted record. Earlier batches are never
+        touched, so partial ingestion followed by re-emission works.
         """
-        self._check_packet(packet, sampling)
+        if manifest_path is None:
+            manifest_path = packet_path.parent / "neutral-packet-manifest.json"
+        packet, packet_sha = load_neutral_packet_verified(packet_path, manifest_path=manifest_path)
+        self._check_packet(packet, sampling, packet_sha)
         accepted = load_lane_records(self.protected_root, self.reviewer.reviewer_slot)
         lines: list[str] = []
         for index, case in enumerate(packet.cases):
@@ -204,6 +331,7 @@ class LaneSession:
                 "campaign_id": self.campaign_id,
                 "sampling_manifest_digest": self.sampling_manifest_digest,
                 "source_packet_digest": self.source_packet_digest,
+                "neutral_packet_sha256": self.neutral_packet_sha256,
                 "reviewer_slot": self.reviewer.reviewer_slot,
                 "reviewer_family": self.reviewer.reviewer_family,
                 "provider_model_identifier": self.reviewer.provider_model_identifier,
@@ -216,8 +344,29 @@ class LaneSession:
                 "labeling_instructions": LABELING_INSTRUCTIONS,
             }
             lines.append(json.dumps(request, sort_keys=True))
-        out_path = out_path or (self.lane_root / f"lane-requests-{self.reviewer_slot}.jsonl")
-        write_protected_file(out_path, ("\n".join(lines) + "\n").encode() if lines else b"")
+        out_path = self._next_request_batch_path()
+        payload = ("\n".join(lines) + "\n").encode() if lines else b""
+        write_protected_file(out_path, payload)
+        # A request batch is immutable evidence too: bind the exact generation,
+        # reviewer authority, neutral packet, accepted state, pending membership
+        # and emitted bytes. This makes resume operational without permitting an
+        # old batch to be silently reinterpreted after partial ingestion.
+        generation = int(out_path.stem.rsplit("-", 1)[1])
+        manifest = {
+            "lane_request_batch_schema": LANE_REQUEST_BATCH_SCHEMA,
+            "generation": generation,
+            "reviewer_identity_digest": self.reviewer.lane_identity_digest(),
+            "neutral_packet_sha256": self.neutral_packet_sha256,
+            "accepted_record_digests": {
+                sample_id: accepted[sample_id].record_digest() for sample_id in sorted(accepted)
+            },
+            "pending_sample_ids": [json.loads(line)["sample_id"] for line in lines],
+            "request_sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        write_protected_file(
+            self._request_batch_manifest_path(out_path),
+            (json.dumps(manifest, sort_keys=True) + "\n").encode(),
+        )
         return out_path
 
     # -- record construction (single path) -----------------------------------

@@ -333,6 +333,9 @@ class LaneFreeze(Record):
     reviewer: ReviewerIdentity
     sampling_manifest_digest: str
     source_packet_digest: str
+    # FIX-R3-3: the exact neutral packet bytes the lane reviewed against,
+    # carried from the lane authority into the frozen attestation.
+    neutral_packet_sha256: str
     sample_ids: tuple[Token, ...]
     record_digests: tuple[Digest, ...]
 
@@ -378,6 +381,9 @@ def validate_lane_isolation(lanes: Sequence[LaneFreeze]) -> None:
         raise ValueError("duplicate_reviewer_identity")
     if set(slots) != set(REVIEWER_SLOTS):
         raise ValueError("missing_reviewer_lane")
+    neutral_packet_digests = {lane.neutral_packet_sha256 for lane in lanes}
+    if len(neutral_packet_digests) != 1:
+        raise ValueError("lane_neutral_packet_digest_divergence")
 
 
 def judgment_is_consensus_eligible(judgment: ModelJudgment) -> bool:
@@ -895,6 +901,18 @@ class ConsensusProvenanceWrapper(Record):
         if self.final_label_origin == "human_audited_consensus":
             if not self.audit_selected:
                 raise ValueError("audited_origin_requires_audit_selection")
+            if not self.consensus_reached:
+                raise ValueError("audited_consensus_requires_consensus")
+        elif self.final_label_origin == "human_adjudicated":
+            # FIX-R3-5: an audit-selected consensus row the human OVERRODE
+            # (final resolution differs on any critical field) is
+            # legitimately human_adjudicated — even when the audit as a
+            # whole does not escalate. Only a confirmed audited consensus
+            # may carry human_audited_consensus.
+            if self.audit_selected and not self.consensus_reached:
+                # audit selection only ever targets consensus-classified
+                # cases; a non-consensus audit-selected row cannot exist.
+                raise ValueError("audit_selected_case_requires_consensus_classification")
         elif self.audit_selected:
             raise ValueError("audited_case_must_use_audited_origin")
         return self

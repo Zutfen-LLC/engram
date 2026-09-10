@@ -171,7 +171,7 @@ def load_lane_records(protected_root: Path, reviewer_slot: str) -> dict[str, Mod
     if not lane_dir.exists():
         return records
     for path in sorted(lane_dir.glob("*.json")):
-        if path.name in {"lane-freeze.json", "lane.json"}:
+        if path.name in {"lane-freeze.json", "lane.json"} or path.name.endswith(".manifest.json"):
             continue
         record = ModelReviewRecord.model_validate(json.loads(path.read_text()))
         if record.sample_id in records:
@@ -187,6 +187,7 @@ def freeze_lane(
     campaign_id: str,
     sampling: SamplingManifest,
     source_packet_digest: str,
+    neutral_packet_sha256: str | None = None,
 ) -> LaneFreeze:
     """Freeze one completed lane after exact membership is proven.
 
@@ -194,10 +195,26 @@ def freeze_lane(
     campaign bindings via the canonical lane-binding validator BEFORE the
     attestation is constructed, so the frozen digest list provably describes
     records produced under this exact reviewer/lane authority.
+
+    FIX-R3-3: when the lane has an authority file (the real ingestion path),
+    the frozen attestation carries the authority's neutral packet SHA-256 and
+    is rejected if it disagrees with the caller-supplied value.
     """
     records = load_lane_records(protected_root, reviewer.reviewer_slot)
     if set(records) != set(sampling.sample_ids):
         raise ValueError("lane_sample_membership_mismatch")
+    # FIX-R3-3: the lane authority's neutral packet digest is authoritative.
+    authority_path = lane_directory(protected_root, reviewer.reviewer_slot) / "lane.json"
+    authority_neutral_sha: str | None = None
+    if authority_path.exists():
+        authority = json.loads(authority_path.read_text())
+        authority_neutral_sha = authority.get("neutral_packet_sha256")
+    if authority_neutral_sha is not None:
+        if neutral_packet_sha256 is not None and neutral_packet_sha256 != authority_neutral_sha:
+            raise ValueError("lane_neutral_packet_sha_mismatch")
+        neutral_packet_sha256 = authority_neutral_sha
+    if neutral_packet_sha256 is None:
+        raise ValueError("lane_freeze_requires_neutral_packet_sha256")
     validate_records_lane_binding(
         records,
         reviewer=reviewer,
@@ -220,6 +237,7 @@ def freeze_lane(
         reviewer=reviewer,
         sampling_manifest_digest=sampling.manifest_digest(),
         source_packet_digest=source_packet_digest,
+        neutral_packet_sha256=neutral_packet_sha256,
         sample_ids=ordered_ids,
         record_digests=tuple(records[sid].record_digest() for sid in ordered_ids),
     )
@@ -243,6 +261,15 @@ def _load_one_frozen_lane(
     lane = LaneFreeze.model_validate(json.loads(path.read_text()))
     if lane.reviewer != reviewer:
         raise ValueError("lane_reviewer_identity_mismatch")
+    # FIX-R3-3: the frozen neutral packet digest must equal the lane
+    # authority's binding; directory layout is never sufficient provenance.
+    authority_path = lane_directory(protected_root, reviewer.reviewer_slot) / "lane.json"
+    if authority_path.exists():
+        authority_neutral_sha = json.loads(authority_path.read_text()).get("neutral_packet_sha256")
+        if authority_neutral_sha is not None and lane.neutral_packet_sha256 != (
+            authority_neutral_sha
+        ):
+            raise ValueError("lane_neutral_packet_sha_mismatch")
     records = load_lane_records(protected_root, reviewer.reviewer_slot)
     # Full FIX-1 + FIX-R2-4 validation: identity binding, membership, live
     # digests, and bound raw-response evidence.
