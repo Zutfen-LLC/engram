@@ -677,7 +677,16 @@ def test_cli_help_advertises_only_implemented_pre_review_commands() -> None:
     assert "freeze-target" in result.stdout
     assert "sample" in result.stdout
     assert "packets" in result.stdout
-    for unavailable in ("ingest", "fit", "gate", "report"):
+    # #206 FIX-6 lane workflow commands are implemented
+    for available in (
+        "model-lane-init",
+        "model-lane-request",
+        "model-lane-ingest",
+        "model-lane-status",
+    ):
+        assert available in result.stdout
+    # unimplemented downstream commands must stay unadvertised
+    for unavailable in ("ledger-freeze", "fit", "gate", "final-report"):
         assert f"  {unavailable} " not in result.stdout
 
 

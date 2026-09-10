@@ -12,9 +12,9 @@ import hmac
 import json
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
-from pydantic import AwareDatetime
+from pydantic import AwareDatetime, model_validator
 
 from engram.assessment_calibration import (
     MIN_CALIBRATION_SAMPLES,
@@ -24,6 +24,8 @@ from engram.assessment_calibration import (
 )
 from engram.assessment_schema import AssessmentContract, AssessmentDimensions
 from evals.admission.schema import Digest, LabelRecord, Record, digest
+from evals.calibration.campaigns import EXPECTED_SPLIT_MANIFEST_DIGEST
+from evals.calibration.consensus import ReferenceLabel
 from evals.calibration.freeze import (
     LABEL_GUIDE_VERSION,
     EvidenceFloors,
@@ -35,7 +37,137 @@ from evals.calibration.freeze import (
     sample_id_for,
     validate_split_membership,
 )
+from evals.calibration.ledger import VerifiedConsensusLedger, require_verification_capability
 from evals.calibration.review import verify_ledger
+
+
+def _verified_ledger_rows(verified_ledger: VerifiedConsensusLedger) -> list[ReferenceLabel]:
+    """FIX-4/FIX-R2-5 boundary: the ONLY path into #206 consensus
+    observations/completion is a ``VerifiedConsensusLedger`` re-derived from
+    protected evidence by ``evals.calibration.ledger.verify_consensus_ledger``.
+
+    There is NO consensus fitting/completion API that accepts free-form
+    ``ReferenceLabel`` lists: the type alone proves nothing about provenance,
+    and the pre-#206 human dual-review workflow already has its own
+    ``LabelRecord``/verified human-ledger path.
+    """
+    require_verification_capability(verified_ledger)
+    return [
+        ReferenceLabel(
+            sample_id=row["sample_id"],
+            final_label_origin=row["final_label_origin"],
+            critical=row["critical"],
+        )
+        for row in verified_ledger.reference_rows()
+    ]
+
+
+class ConsensusDimensionsView:
+    """Adapter: expose five #206 critical fields through the Dimensions API.
+
+    ``LabeledObservation.from_review`` and the consequence floors read only
+    ``expected_kind``, ``retention_value``, ``epistemic_state``, and
+    ``consequence`` from this view. It contains no human-review provenance and
+    cannot be embedded in a ``LabelRecord``.
+    """
+
+    __slots__ = ("expected_kind", "retention_value", "epistemic_state", "consequence")
+
+    def __init__(self, critical: dict[str, Any]):
+        self.expected_kind = critical["expected_kind"]
+        self.retention_value = critical["retention_value"]
+        self.epistemic_state = critical["epistemic_state"]
+        self.consequence = critical["consequence"]
+
+
+def consensus_reference_observations(
+    *,
+    assessment_evidence_path: Path,
+    expected_assessment_evidence_sha256: str,
+    verified_ledger: VerifiedConsensusLedger,
+    sampling: SamplingManifest,
+    target_identity: TargetIdentity,
+    contract: AssessmentContract,
+    split: SplitManifest,
+    frame: list[FrameRow],
+    expected_split_digest: str | None = None,
+) -> list[LabeledObservation]:
+    """Derive observations from #206 FINAL reference labels (not raw votes).
+
+    FIX-R4-5: the provider-score evidence is the SAME protected
+    assessment-evidence contract the legacy #202 path consumes (Stage A
+    common verification: independently retained SHA-256, target identity,
+    full contract-identity axis checks, sampling/frame digests, exact
+    execution membership, unique execution IDs, receipt/request digests).
+    An arbitrary in-memory receipt list is no longer a parameter — fabricated
+    self-consistent receipts cannot feed consensus calibration. Stage B
+    joins the verified evidence to the verified ledger's FINAL reference
+    labels (never majority votes or individual model judgments).
+
+    FIX-R4-4: the supplied split is verified against the ledger's frozen
+    split binding (itself verified against the independently retained
+    campaign authority at ledger construction), or against a
+    caller-independently-retained expected digest for synthetic campaigns.
+
+    FIX-4 + FIX-R2-5: the ONLY label path is a ``VerifiedConsensusLedger``
+    (re-derived from protected evidence).
+    """
+    labels = _verified_ledger_rows(verified_ledger)
+    by_sample = {label.sample_id: label for label in labels}
+    if len(by_sample) != len(labels):
+        raise ValueError("duplicate_reference_label")
+    if verified_ledger.ledger.sampling_manifest_digest != sampling.manifest_digest():
+        raise ValueError("reference_label_membership_mismatch")
+    ledger_split = verified_ledger.ledger.split_manifest_digest
+    if expected_split_digest is not None and not hmac.compare_digest(
+        split.split_digest(), expected_split_digest
+    ):
+        raise ValueError("observation_split_digest_mismatch")
+    if ledger_split is None:
+        raise ValueError("observation_requires_split_bound_ledger")
+    if not hmac.compare_digest(split.split_digest(), ledger_split):
+        raise ValueError("observation_split_disagrees_with_ledger_split_binding")
+    receipts = _verify_stage_a_evidence(
+        assessment_evidence_path,
+        expected_assessment_evidence_sha256,
+        sampling=sampling,
+        target_identity=target_identity,
+        assessment_contract=contract,
+        split=split,
+        frame=frame,
+    )
+    membership = {receipt.sample_id for receipt in receipts}
+    if membership - set(by_sample):
+        raise ValueError("reference_label_membership_mismatch")
+    dimensions_by_sample = {
+        sample_id: ConsensusDimensionsView(by_sample[sample_id].critical) for sample_id in by_sample
+    }
+    return _join_verified_evidence_to_observations(
+        receipts,
+        split=split,
+        frame=frame,
+        dimensions_by_sample=dimensions_by_sample,
+    )
+
+
+def consensus_reference_completion(
+    *,
+    verified_ledger: VerifiedConsensusLedger,
+) -> list[ReferenceLabel]:
+    """Completed reference labels accepted for floor counting (#206 lanes).
+
+    FIX-4 + FIX-R2-5: the ONLY input path is a verified consensus ledger
+    whose rows were re-derived from protected evidence. There is no
+    ``reference_labels`` parameter and no other consensus completion API.
+    """
+    labels = _verified_ledger_rows(verified_ledger)
+    by_id: dict[str, ReferenceLabel] = {}
+    for label in labels:
+        if label.sample_id in by_id:
+            raise ValueError("duplicate_reference_label")
+        by_id[label.sample_id] = label
+    return list(labels)
+
 
 DimensionName = Literal["taxonomy", "retention", "epistemic"]
 BinEdges: tuple[float, ...] = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
@@ -178,7 +310,7 @@ def _validate_observation_membership(
             raise ValueError("observation_split_mismatch")
 
 
-def _verify_observation_evidence(
+def _verify_stage_a_evidence(
     path: Path,
     expected_sha256: str,
     *,
@@ -187,8 +319,27 @@ def _verify_observation_evidence(
     assessment_contract: AssessmentContract,
     split: SplitManifest,
     frame: list[FrameRow],
-    reviewed_records: list[LabelRecord],
-) -> list[LabeledObservation]:
+) -> list[AssessmentExecutionReceipt]:
+    """FIX-R4-5 Stage A: verify the COMMON immutable assessment evidence.
+
+    Both the legacy #202 dual-human path and the #206 consensus path consume
+    the SAME protected assessment-evidence contract. This stage proves:
+
+    - artifact SHA-256 exact against the independently retained digest;
+    - evidence schema exact;
+    - target identity exact (``target_identity.identity_digest() ==
+      sampling.target_identity_digest``);
+    - assessment contract identity exact on every frozen axis
+      (schema/prompt/code versions, provider, model, config version,
+      calibration version — the legacy checks, explicitly restored);
+    - sampling identity exact (manifest digest + frame digest);
+    - sample content hashes exact;
+    - exactly one execution per sampled item, unique execution IDs;
+    - every receipt digest self-verified, every provider request digest
+      re-derived from target+contract+input.
+
+    Returns the verified receipts; Stage B joins them to reference labels.
+    """
     payload = path.read_bytes()
     if not hmac.compare_digest(hashlib.sha256(payload).hexdigest(), expected_sha256):
         raise ValueError("assessment_evidence_digest_mismatch")
@@ -235,10 +386,6 @@ def _verify_observation_evidence(
         or len({receipt.execution_id for receipt in receipts}) != len(receipts)
     ):
         raise ValueError("assessment_evidence_membership_mismatch")
-    records_by_id = {record.sample_id: record for record in reviewed_records}
-    split_by_id = {sample_id: "dev" for sample_id in split.dev_ids}
-    split_by_id.update({sample_id: "holdout" for sample_id in split.holdout_ids})
-    observations: list[LabeledObservation] = []
     for receipt in receipts:
         if not hmac.compare_digest(receipt.verified_payload_digest(), receipt.receipt_digest):
             raise ValueError("assessment_execution_receipt_digest_mismatch")
@@ -261,10 +408,30 @@ def _verify_observation_evidence(
         )
         if any(score.status != "uncalibrated" for score in scores):
             raise ValueError("assessment_execution_must_capture_raw_scores")
+    return receipts
+
+
+def _join_verified_evidence_to_observations(
+    receipts: list[AssessmentExecutionReceipt],
+    *,
+    split: SplitManifest,
+    frame: list[FrameRow],
+    dimensions_by_sample: dict[str, Any],
+) -> list[LabeledObservation]:
+    """FIX-R4-5 Stage B: join verified execution evidence to reference labels.
+
+    ``dimensions_by_sample`` supplies the FINAL reference-label dimensions
+    view per sample (legacy: verified dual-human final labels; #206: verified
+    consensus/human final labels from a ``VerifiedConsensusLedger``). The
+    provider-score evidence is the same protected contract in both paths.
+    """
+    frame_by_id = {(row.sample_id or sample_id_for(row.item_uuid)): row for row in frame}
+    split_by_id = {sample_id: "dev" for sample_id in split.dev_ids}
+    split_by_id.update({sample_id: "holdout" for sample_id in split.holdout_ids})
+    observations: list[LabeledObservation] = []
+    for receipt in receipts:
         frozen = frame_by_id[receipt.sample_id]
-        dimensions = records_by_id[receipt.sample_id].final_dimensions()
-        if dimensions is None:
-            raise ValueError("assessment_evidence_requires_completed_review")
+        dimensions = dimensions_by_sample[receipt.sample_id]
         observations.extend(
             LabeledObservation.from_review(
                 sample_id=receipt.sample_id,
@@ -285,6 +452,41 @@ def _verify_observation_evidence(
             )
         )
     return observations
+
+
+def _verify_observation_evidence(
+    path: Path,
+    expected_sha256: str,
+    *,
+    sampling: SamplingManifest,
+    target_identity: TargetIdentity,
+    assessment_contract: AssessmentContract,
+    split: SplitManifest,
+    frame: list[FrameRow],
+    reviewed_records: list[LabelRecord],
+) -> list[LabeledObservation]:
+    receipts = _verify_stage_a_evidence(
+        path,
+        expected_sha256,
+        sampling=sampling,
+        target_identity=target_identity,
+        assessment_contract=assessment_contract,
+        split=split,
+        frame=frame,
+    )
+    records_by_id = {record.sample_id: record for record in reviewed_records}
+    dimensions_by_sample: dict[str, Any] = {}
+    for receipt in receipts:
+        dimensions = records_by_id[receipt.sample_id].final_dimensions()
+        if dimensions is None:
+            raise ValueError("assessment_evidence_requires_completed_review")
+        dimensions_by_sample[receipt.sample_id] = dimensions
+    return _join_verified_evidence_to_observations(
+        receipts,
+        split=split,
+        frame=frame,
+        dimensions_by_sample=dimensions_by_sample,
+    )
 
 
 def fit_profiles(
@@ -523,22 +725,44 @@ def evaluate_holdout(
 
 
 class EvidenceFloorResult(Record):
-    """Evidence-derived result for every frozen floor, with partial support visible."""
+    """Evidence-derived result for every frozen floor, with partial support visible.
+
+    FIX-R3-7: provenance is described truthfully. ``evidence_methodology``
+    discriminates the two valid front doors — the legacy pre-#206 dual-human
+    path and the #206 frontier-consensus path — which share ONE numeric floor
+    evaluator. ``full_population_dual_review`` is True only for the legacy
+    dual-human methodology; #206 consensus rows never claim it.
+    """
 
     sampling_manifest_digest: str
     split_manifest_digest: str
-    ledger_sha256: str
-    reviewer_a_packet_sha256: str
-    reviewer_b_packet_sha256: str
+    ledger_sha256: str = ""
+    reviewer_a_packet_sha256: str = ""
+    reviewer_b_packet_sha256: str = ""
     assessment_evidence_sha256: str
     assessment_contract_digest: str
-    full_population_dual_review: Literal[True]
+    evidence_methodology: Literal["dual_human_review", "frontier_consensus_206"] = (
+        "dual_human_review"
+    )
+    full_population_dual_review: bool = True
+    consensus_queue_evidence_sha256: str | None = None
     checks: dict[str, bool]
     dimension_support: dict[str, dict[str, Any]]
     stratum_support: dict[str, dict[str, Any]]
     bin_support: dict[str, dict[str, Any]]
     failures: tuple[str, ...]
     passed: bool
+
+    @model_validator(mode="after")
+    def provenance_truthfulness(self) -> Self:
+        # FIX-R3-7: model-consensus evidence never claims dual human review.
+        if self.evidence_methodology == "frontier_consensus_206":
+            if self.full_population_dual_review:
+                raise ValueError("consensus_evidence_must_not_claim_dual_human_review")
+        else:
+            if not self.full_population_dual_review:
+                raise ValueError("legacy_evidence_requires_dual_human_review")
+        return self
 
 
 class CalibrationArtifactBundle(Record):
@@ -642,7 +866,14 @@ def check_floors(
     sampling: SamplingManifest,
     split: SplitManifest,
 ) -> EvidenceFloorResult:
-    """Evaluate every frozen floor from reviewer, split, and fitted-profile evidence."""
+    """Evaluate every frozen floor from reviewer, split, and fitted-profile evidence.
+
+    FIX-R3-7: this is the LEGACY front door (verified pre-#206 dual-human
+    ledger). The numeric floor logic lives in the shared
+    ``_evaluate_floors_numeric`` evaluator, which the #206 consensus path
+    (``check_consensus_floors``) also feeds. No numeric rule differs between
+    the two provenance paths.
+    """
     validate_split_membership(sampling, split)
     verified_ledger = verify_ledger(
         ledger_path,
@@ -669,7 +900,6 @@ def check_floors(
         frame=frame,
         reviewed_records=reviewed_records,
     )
-    _validate_observation_membership(observations, split)
     completed = [
         record
         for record in reviewed_records
@@ -678,6 +908,192 @@ def check_floors(
         and record.final_dimensions() is not None
     ]
     completed_ids = {record.sample_id for record in completed}
+    high_records = [
+        record
+        for record in reviewed_records
+        if (record.final_dimensions() or record.reviewer_a.dimensions).consequence == "high"
+    ]
+    high_consequence_ids = {record.sample_id for record in high_records}
+    dual_complete = all(
+        record.reviewer_b is not None
+        and record.reviewer_b.adjudicator_ref != record.reviewer_a.adjudicator_ref
+        and record.disagreement != "unresolved"
+        for record in high_records
+    )
+    return _evaluate_floors_numeric(
+        floors=floors,
+        observations=observations,
+        completed_ids=completed_ids,
+        high_consequence_ids=high_consequence_ids,
+        dual_review_satisfied=(not floors.dual_review_high_consequence) or dual_complete,
+        sampling=sampling,
+        split=split,
+        profiles=profiles,
+        assessment_evidence_sha256=expected_assessment_evidence_sha256,
+        assessment_contract_digest=digest(assessment_contract.model_dump(mode="json")),
+        evidence_methodology="dual_human_review",
+        legacy_ledger_sha256=verified_ledger.ledger_sha256,
+        legacy_reviewer_a_packet_sha256=verified_ledger.reviewer_a_packet_sha256,
+        legacy_reviewer_b_packet_sha256=verified_ledger.reviewer_b_packet_sha256,
+    )
+
+
+def verify_fitting_campaign_binding(
+    *,
+    verified_ledger: VerifiedConsensusLedger,
+    sampling: SamplingManifest,
+    split: SplitManifest,
+    target_identity: TargetIdentity,
+    expected_split_digest: str | None = None,
+) -> None:
+    """FIX-R3 (fitting campaign binding): the ledger being fitted must belong
+    to the EXACT campaign/sampling/split/target under calibration.
+
+    A valid verified ledger from another campaign with overlapping sample IDs
+    is not substitutable at the fitting boundary.
+
+    FIX-R4-4: the expected split digest is NEVER computed from the split
+    object being verified. For the real campaign it comes from the
+    independently retained campaign authority
+    (``evals.calibration.campaigns.EXPECTED_SPLIT_MANIFEST_DIGEST``);
+    synthetic campaigns retain their own expected digest and pass it
+    explicitly. The supplied split must additionally equal the split digest
+    frozen into the verified ledger itself (the tautological
+    ``_frozen_split_digest_binding`` comparison is deleted).
+    """
+    require_verification_capability(verified_ledger)
+    ledger = verified_ledger.ledger
+    if ledger.campaign_id != sampling.campaign_id:
+        raise ValueError("fitting_campaign_mismatch")
+    if ledger.sampling_manifest_digest != sampling.manifest_digest():
+        raise ValueError("fitting_sampling_manifest_mismatch")
+    validate_split_membership(sampling, split)
+    frozen_expected = (
+        expected_split_digest
+        if expected_split_digest is not None
+        else EXPECTED_SPLIT_MANIFEST_DIGEST
+    )
+    actual = split.split_digest()
+    if not hmac.compare_digest(actual, frozen_expected):
+        raise ValueError("fitting_split_digest_mismatch")
+    if ledger.split_manifest_digest is None:
+        raise ValueError("fitting_requires_split_bound_ledger")
+    if not hmac.compare_digest(actual, ledger.split_manifest_digest):
+        raise ValueError("fitting_split_disagrees_with_ledger_split_binding")
+    if target_identity.identity_digest() != sampling.target_identity_digest:
+        raise ValueError("fitting_target_identity_mismatch")
+
+
+def check_consensus_floors(
+    *,
+    floors: EvidenceFloors,
+    verified_ledger: VerifiedConsensusLedger,
+    assessment_evidence_path: Path,
+    expected_assessment_evidence_sha256: str,
+    sampling: SamplingManifest,
+    target_identity: TargetIdentity,
+    assessment_contract: AssessmentContract,
+    frame: list[FrameRow],
+    profiles: list[CalibrationProfile],
+    split: SplitManifest,
+    expected_split_digest: str | None = None,
+) -> EvidenceFloorResult:
+    """Evaluate every frozen floor from #206 consensus evidence (FIX-R3-7).
+
+    The #206 front door: a ``VerifiedConsensusLedger`` (re-derived from
+    protected evidence — fabricated ledgers cannot reach this function)
+    flows through the SAME numeric floor evaluator as the legacy dual-human
+    path. Every final reference label counts (consensus rows are completed
+    reference labels under the frozen #206 methodology); high-consequence
+    support is counted from FINAL resolutions only, never raw model votes;
+    the result truthfully records ``evidence_methodology =
+    frontier_consensus_206`` and never claims ``full_population_dual_review``.
+
+    FIX-R4-5: the provider-score evidence is verified through the SAME
+    protected Stage-A contract as the legacy path — a protected
+    assessment-evidence artifact plus its independently retained SHA-256 —
+    never an arbitrary in-memory receipts list. Fabricated self-consistent
+    receipt lists cannot feed consensus calibration.
+    """
+    verify_fitting_campaign_binding(
+        verified_ledger=verified_ledger,
+        sampling=sampling,
+        split=split,
+        target_identity=target_identity,
+        expected_split_digest=expected_split_digest,
+    )
+    observations = consensus_reference_observations(
+        assessment_evidence_path=assessment_evidence_path,
+        expected_assessment_evidence_sha256=expected_assessment_evidence_sha256,
+        verified_ledger=verified_ledger,
+        sampling=sampling,
+        target_identity=target_identity,
+        contract=assessment_contract,
+        split=split,
+        frame=frame,
+        expected_split_digest=expected_split_digest,
+    )
+    _validate_observation_membership(observations, split)
+    completed_ids = {wrapper.sample_id for wrapper in verified_ledger.ledger.wrappers}
+    # High-consequence support counted from FINAL resolutions (human final
+    # resolutions for human rows; confirmed consensus criticals otherwise).
+    # No raw model vote contributes floor support: the wrappers carry only
+    # final reference dimensions.
+    high_consequence_ids = {
+        wrapper.sample_id
+        for wrapper in verified_ledger.ledger.wrappers
+        if wrapper.final_dimensions.get("consequence") == "high"
+    }
+    # High-consequence protocol guarantee: any high-consequence signal put the
+    # case in the human queue, so every high-consequence final row must carry
+    # a human-resolution origin. If one does not, the dual-review-equivalent
+    # floor fails honestly rather than being waived.
+    dual_review_satisfied = all(
+        wrapper.final_label_origin in ("human_adjudicated", "human_audited_consensus")
+        for wrapper in verified_ledger.ledger.wrappers
+        if wrapper.sample_id in high_consequence_ids
+    )
+    return _evaluate_floors_numeric(
+        floors=floors,
+        observations=observations,
+        completed_ids=completed_ids,
+        high_consequence_ids=high_consequence_ids,
+        dual_review_satisfied=(not floors.dual_review_high_consequence) or dual_review_satisfied,
+        sampling=sampling,
+        split=split,
+        profiles=profiles,
+        assessment_evidence_sha256=expected_assessment_evidence_sha256,
+        assessment_contract_digest=digest(assessment_contract.model_dump(mode="json")),
+        evidence_methodology="frontier_consensus_206",
+        consensus_queue_evidence_sha256=verified_ledger.queue_evidence_sha256,
+    )
+
+
+def _evaluate_floors_numeric(
+    *,
+    floors: EvidenceFloors,
+    observations: list[LabeledObservation],
+    completed_ids: set[str],
+    high_consequence_ids: set[str],
+    dual_review_satisfied: bool,
+    sampling: SamplingManifest,
+    split: SplitManifest,
+    profiles: list[CalibrationProfile],
+    assessment_evidence_sha256: str,
+    assessment_contract_digest: str,
+    evidence_methodology: Literal["dual_human_review", "frontier_consensus_206"],
+    legacy_ledger_sha256: str | None = None,
+    legacy_reviewer_a_packet_sha256: str | None = None,
+    legacy_reviewer_b_packet_sha256: str | None = None,
+    consensus_queue_evidence_sha256: str | None = None,
+) -> EvidenceFloorResult:
+    """The ONE shared numeric floor evaluator (FIX-R3-7).
+
+    Both provenance front doors feed exactly this logic. No floor threshold,
+    support rule, or check name differs between them; only the truthful
+    provenance descriptor on the result differs.
+    """
+    _validate_observation_membership(observations, split)
     labeled = [
         obs
         for obs in observations
@@ -706,18 +1122,7 @@ def check_floors(
         )
         for dimension in ("taxonomy", "retention", "epistemic")
     }
-    high_records = [
-        record
-        for record in reviewed_records
-        if (record.final_dimensions() or record.reviewer_a.dimensions).consequence == "high"
-    ]
-    high_completed = [record for record in completed if record in high_records]
-    dual_complete = all(
-        record.reviewer_b is not None
-        and record.reviewer_b.adjudicator_ref != record.reviewer_a.adjudicator_ref
-        and record.disagreement != "unresolved"
-        for record in high_records
-    )
+    high_completed_ids = completed_ids & high_consequence_ids
 
     stratum_support: dict[str, dict[str, Any]] = {}
     bin_support: dict[str, dict[str, Any]] = {}
@@ -820,11 +1225,11 @@ def check_floors(
         "holdout_labeled_support": all(
             count >= holdout_support_required for count in holdout_labeled.values()
         ),
-        "high_consequence": len(high_completed) >= floors.high_consequence_reviewed_min,
+        "high_consequence": len(high_completed_ids) >= floors.high_consequence_reviewed_min,
         "high_consequence_labeled_support": all(
             count >= required_high_labeled for count in high_labeled_by_dimension.values()
         ),
-        "dual_review_high_consequence": (not floors.dual_review_high_consequence) or dual_complete,
+        "dual_review_high_consequence": dual_review_satisfied,
         "bin_support": bool(claimed_bins) and all(result["supported"] for result in claimed_bins),
         "per_stratum_support": bool(claimed_strata)
         and all(result["supported"] for result in claimed_strata),
@@ -834,15 +1239,18 @@ def check_floors(
         ),
     }
     failures = tuple(sorted(name for name, passed in checks.items() if not passed))
+    is_legacy = evidence_methodology == "dual_human_review"
     return EvidenceFloorResult(
         sampling_manifest_digest=sampling.manifest_digest(),
         split_manifest_digest=split.split_digest(),
-        ledger_sha256=verified_ledger.ledger_sha256,
-        reviewer_a_packet_sha256=verified_ledger.reviewer_a_packet_sha256,
-        reviewer_b_packet_sha256=verified_ledger.reviewer_b_packet_sha256,
-        assessment_evidence_sha256=expected_assessment_evidence_sha256,
-        assessment_contract_digest=digest(assessment_contract.model_dump(mode="json")),
-        full_population_dual_review=True,
+        ledger_sha256=legacy_ledger_sha256 or "",
+        reviewer_a_packet_sha256=legacy_reviewer_a_packet_sha256 or "",
+        reviewer_b_packet_sha256=legacy_reviewer_b_packet_sha256 or "",
+        assessment_evidence_sha256=assessment_evidence_sha256,
+        assessment_contract_digest=assessment_contract_digest,
+        evidence_methodology=evidence_methodology,
+        full_population_dual_review=is_legacy,
+        consensus_queue_evidence_sha256=consensus_queue_evidence_sha256,
         checks=checks,
         dimension_support=dimension_support,
         stratum_support=stratum_support,
