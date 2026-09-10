@@ -154,22 +154,34 @@ CANONICAL_REQUEST_KEYS: frozenset[str] = frozenset(
 )
 
 
-# FIX-R6-1 performance guard: memoize the verified request registry keyed on
-# the exact file identity (path, mtime_ns, size) of every authority input —
-# the lane authority, the retained neutral packet, and every batch/manifest
-# pair. Protected artifacts are immutable (exclusive-create, never modified
-# in place), so any change appears as a NEW file identity and invalidates the
-# cached entry; a tampered rewrite (unlink + recreate) changes mtime/size and
-# is re-verified. Security is unchanged: a cache hit means the exact same
-# bytes were canonically verified in this process.
+# FIX-R6-1 performance guard (corrected per Round-6 NO-GO): memoize the
+# verified request registry keyed on the CONTENT-AUTHENTICATING identity
+# (stable path/role + SHA-256 of the current bytes) of every authority
+# input — the lane authority, the retained neutral packet, and every
+# batch/manifest pair. Stat identity (mtime_ns, size) is deliberately NOT
+# trusted: a file owner can rewrite same-length bytes and restore the
+# original mtime with os.utime(), leaving (path, mtime_ns, size) identical
+# while the bytes differ. The cache key therefore hashes the actual bytes
+# on every authority pass, so a changed byte makes a cache hit impossible
+# and full canonical verification always re-runs. Security claim: a cache
+# hit means the EXACT current bytes were canonically verified in this
+# process. The expensive work being memoized is repeated parsing and
+# reconstruction of the large embedded instruction bundles — not the
+# cheap read+hash that authenticates the bytes.
 _REGISTRY_CACHE: dict[
-    tuple[tuple[str, int, int], ...], dict[str, dict[int, tuple[str, str, str, dict[str, Any]]]]
+    tuple[tuple[str, str], ...], dict[str, dict[int, tuple[str, str, str, dict[str, Any]]]]
 ] = {}
 
+# Test-only instrumentation: counts authority-pass cache hits/misses so
+# tests prove the fast path is taken without relying on runtime timing.
+_REGISTRY_CACHE_STATS: dict[str, int] = {"hit": 0, "miss": 0}
 
-def _file_identity(path: Path) -> tuple[str, int, int]:
-    stat = path.stat()
-    return (str(path), stat.st_mtime_ns, stat.st_size)
+
+def _file_identity(path: Path) -> tuple[str, str]:
+    """Content-authenticating file identity: stable path + SHA-256 of the
+    CURRENT bytes. Never derived from (mtime, size) alone."""
+    payload = path.read_bytes()
+    return (str(path), hashlib.sha256(payload).hexdigest())
 
 
 def _load_request_registry(
@@ -199,7 +211,7 @@ def _load_request_registry(
     """
     authority: LaneAuthority | None = None
     packet: NeutralModelPacket | None = None
-    cache_key: tuple[tuple[str, int, int], ...] | None = None
+    cache_key: tuple[tuple[str, str], ...] | None = None
     authority_path = lane_root / "lane.json"
     if authority_path.is_file():
         retained = lane_root / "neutral-packet.json"
@@ -209,7 +221,9 @@ def _load_request_registry(
         cache_key = tuple(_file_identity(p) for p in input_paths if p.exists())
         cached = _REGISTRY_CACHE.get(cache_key)
         if cached is not None:
+            _REGISTRY_CACHE_STATS["hit"] += 1
             return cached
+        _REGISTRY_CACHE_STATS["miss"] += 1
         authority = LaneAuthority.model_validate(json.loads(authority_path.read_text()))
         if not retained.is_file():
             raise ValueError("lane_retained_neutral_packet_missing")

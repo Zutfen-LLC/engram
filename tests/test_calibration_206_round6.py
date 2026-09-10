@@ -806,9 +806,7 @@ class TestFixR63OutcomeReDerivation:
         fails to re-validate — equally a rejection at every boundary.)"""
         session, _ = self._completed_lane(tmp_path, "judged")
         self._mutate_record(session, "s2", outcome_status="malformed")
-        with pytest.raises(
-            Exception, match="parsed_review_requires_judged_outcome"
-        ):
+        with pytest.raises(Exception, match="parsed_review_requires_judged_outcome"):
             self._reload(session)
 
     def test_malformed_relabelled_refused_fails(self, tmp_path: Path):
@@ -955,3 +953,93 @@ class TestFixR6ServingInvariantsPreserved:
             EXPECTED_SPLIT_MANIFEST_DIGEST
             == "a2a27ed4c0152bf2d9b6c318bbfcfd6e5e20944184a0cc9df18cb2b4e3fbb72b"
         )
+
+
+# ---------------------------------------------------------------------------
+# Round-6 NO-GO correction: content-authenticating registry cache identity
+# ---------------------------------------------------------------------------
+
+
+class TestFixR6RegistryCacheContentAuthenticity:
+    """The registry memoization key must authenticate CONTENT, not stat
+    identity. A file owner can rewrite same-length bytes and restore the
+    original mtime with os.utime(), leaving (path, mtime_ns, size) identical
+    while the bytes differ — a stat-derived cache key would then serve the
+    previously verified registry without reading the new bytes."""
+
+    @staticmethod
+    def _stats() -> dict[str, int]:
+        from evals.calibration import ingestion
+
+        return dict(ingestion._REGISTRY_CACHE_STATS)
+
+    def test_same_stat_different_bytes_rewrite_is_rejected(self, tmp_path: Path):
+        """Exact bypass scenario: paired JSONL+manifest rewrite that is
+        internally self-consistent, byte-for-byte SAME LENGTH in both files,
+        with original mtimes restored — the stat tuples are identical, yet
+        the altered bytes must be re-read and rejected by the canonical
+        authority checks."""
+        import os
+
+        from evals.calibration.ingestion import _load_request_registry
+
+        session, _, _, _ = _setup_lane(tmp_path)
+        batch = session.lane_root / "lane-requests-000001.jsonl"
+        manifest_path = session.lane_root / "lane-requests-000001.manifest.json"
+
+        # Cache the valid registry through the real authority path.
+        registry = _load_request_registry(session.lane_root)
+        assert set(registry) == set(IDS)
+
+        # Record the original stat identity of the request evidence pair.
+        original_stats = {
+            p: (p.stat().st_mtime_ns, p.stat().st_size) for p in (batch, manifest_path)
+        }
+
+        # Unauthorized same-length modification: paired rewrite recomputes
+        # request_sha256 and every request_item_digest so the pair is fully
+        # self-consistent; only the frozen case content differs (case flip).
+        def mutate(line):
+            if line["sample_id"] == "s1":
+                return {**line, "case": {**line["case"], "content": "CONTENT-s1"}}
+            return line
+
+        _rewrite_batch(session.lane_root, 1, mutate)
+
+        # The replacement bytes must be exactly the original file lengths —
+        # the rejection below may NOT come from a size change.
+        for p, (_mtime_ns, size) in original_stats.items():
+            assert p.stat().st_size == size, "replacement bytes must keep exact length"
+
+        # Restore the original mtimes: stat tuples become identical.
+        for p, (mtime_ns, _size) in original_stats.items():
+            os.utime(p, ns=(mtime_ns, mtime_ns))
+        for p, ident in original_stats.items():
+            assert (p.stat().st_mtime_ns, p.stat().st_size) == ident
+
+        # The real authority path must re-read the bytes and reject them on
+        # canonical grounds (case content != frozen neutral-packet case).
+        stats_before = self._stats()
+        with pytest.raises(ValueError, match="request_line_case_not_frozen_neutral_case"):
+            _load_request_registry(session.lane_root)
+        stats_after = self._stats()
+        assert stats_after["miss"] == stats_before["miss"] + 1
+        assert stats_after["hit"] == stats_before["hit"]
+
+    def test_unchanged_bytes_reuse_memoized_verified_registry(self, tmp_path: Path):
+        """Positive control: genuinely unchanged bytes take the fast path —
+        the exact previously verified registry object is reused."""
+        from evals.calibration.ingestion import _load_request_registry
+
+        session, _, _, _ = _setup_lane(tmp_path)
+        stats0 = self._stats()
+        first = _load_request_registry(session.lane_root)
+        stats1 = self._stats()
+        assert stats1["miss"] == stats0["miss"] + 1
+        assert stats1["hit"] == stats0["hit"]
+
+        second = _load_request_registry(session.lane_root)
+        stats2 = self._stats()
+        assert stats2["hit"] == stats1["hit"] + 1
+        assert stats2["miss"] == stats1["miss"]
+        assert second is first
