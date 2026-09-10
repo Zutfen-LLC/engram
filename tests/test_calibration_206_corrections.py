@@ -46,7 +46,7 @@ from evals.calibration.human_queue import (
     save_initial_judgment,
     write_queue,
 )
-from evals.calibration.ingestion import LaneSession
+from evals.calibration.ingestion import LaneSession, labeling_instructions_digest
 from evals.calibration.lane_binding import (
     validate_record_lane_binding,
 )
@@ -89,13 +89,15 @@ def _judgment(**overrides: Any) -> ModelJudgment:
 def _reviewer(
     slot: str, *, model: str | None = None, config: str | None = None
 ) -> ReviewerIdentity:
+    from evals.calibration.ingestion import labeling_instructions_digest
+
     family = FAMILY_BY_SLOT[slot]
     return ReviewerIdentity(
         reviewer_slot=slot,  # type: ignore[arg-type]
         reviewer_family=family,
         provider_model_identifier=model or f"{family}-exact-2026-09",
         reviewer_config_digest=config or "a" * 64,
-        prompt_digest="b" * 64,
+        prompt_digest=labeling_instructions_digest(),
     )
 
 
@@ -131,7 +133,7 @@ def _record(
         reviewer_family=fam,
         provider_model_identifier=model or f"{FAMILY_BY_SLOT[slot]}-exact-2026-09",
         reviewer_config_digest=config or "a" * 64,
-        prompt_digest=prompt or "b" * 64,
+        prompt_digest=prompt or labeling_instructions_digest(),
         label_guide_version=guide or "engram-calibration-guide-157-v1",
         captured_at=NOW,
         parse_status=parse_status,  # type: ignore[arg-type]
@@ -290,6 +292,7 @@ class TestFix1LaneBinding:
                 campaign_id="campaign",
                 sampling=sampling,
                 source_packet_digest="f" * 64,
+                neutral_packet_sha256="8" * 64,
             )
 
     def test_lane_freeze_rejects_mutated_record_after_freeze(self, tmp_path: Path):
@@ -306,6 +309,7 @@ class TestFix1LaneBinding:
             campaign_id="campaign",
             sampling=sampling,
             source_packet_digest="f" * 64,
+            neutral_packet_sha256="8" * 64,
         )
         # mutate a stored record after the freeze (simulate tampering)
         path = tmp_path / "lanes" / "model_a" / "s2.json"
@@ -452,6 +456,7 @@ class TestFix2AuditMarginalCoverage:
                     reviewer=_reviewer(slot),
                     sampling_manifest_digest=sampling.manifest_digest(),
                     source_packet_digest="f" * 64,
+                    neutral_packet_sha256="8" * 64,
                     sample_ids=ids,
                     record_digests=tuple(records_by_lane[slot][sid].record_digest() for sid in ids),
                 )
@@ -738,6 +743,7 @@ def _build_campaign(
                 campaign_id="campaign",
                 sampling=sampling,
                 source_packet_digest="f" * 64,
+                neutral_packet_sha256="8" * 64,
             )
         )
     real_lane_digests = tuple(lane.lane_digest() for lane in lanes)
@@ -1386,42 +1392,28 @@ class TestFix5RevealExport:
 class TestFix6LaneWorkflow:
     IDS = ("s1", "s2", "s3")
 
-    def _init_lane(self, tmp_path: Path) -> tuple[LaneSession, SamplingManifest]:
+    def _init_lane(self, tmp_path: Path) -> tuple[LaneSession, SamplingManifest, Path, Path]:
         sampling = _sampling(self.IDS)
+        packet_path, manifest_path = self._neutral_packet_files(tmp_path, sampling)
         session = LaneSession.init(
             tmp_path,
             reviewer=_reviewer("model_a"),
             campaign_id="campaign",
             sampling=sampling,
             source_packet_digest="f" * 64,
+            neutral_packet_path=packet_path,
+            neutral_packet_manifest=manifest_path,
         )
-        return session, sampling
+        return session, sampling, packet_path, manifest_path
 
-    def _judged_response(self, sample_id: str) -> dict:
-        return {
-            "sample_id": sample_id,
-            "outcome": "judged",
-            "judgment": {"fields": dict(GOOD_CRITICAL), "reviewer_confidence": "medium"},
-            "raw_response": f"model output for {sample_id}",
-        }
+    def _neutral_packet_files(
+        self, tmp_path: Path, sampling: SamplingManifest
+    ) -> tuple[Path, Path]:
+        """Write a valid neutral packet + manifest for the frozen sample IDs."""
+        import hashlib as _h
 
-    def test_init_binds_lane_exclusively(self, tmp_path: Path):
-        session, _ = self._init_lane(tmp_path)
-        assert session.reviewer.reviewer_slot == "model_a"
-        # re-init refuses (exclusive-create)
-        with pytest.raises(Exception, match="exists|already"):
-            LaneSession.init(
-                tmp_path,
-                reviewer=_reviewer("model_a"),
-                campaign_id="campaign",
-                sampling=_sampling(self.IDS),
-                source_packet_digest="f" * 64,
-            )
-
-    def test_requests_resume_from_next_missing(self, tmp_path: Path):
         from evals.calibration.model_lanes import NeutralModelPacket
 
-        session, sampling = self._init_lane(tmp_path)
         cases = [
             {
                 "sample_id": sid,
@@ -1447,17 +1439,61 @@ class TestFix6LaneWorkflow:
             cases=cases,
             source_packet_digest="f" * 64,
         )
+        packet_dir = tmp_path / "packet"
+        packet_dir.mkdir(parents=True, exist_ok=True)
+        from evals.calibration.review import _packet_file_payload, write_protected_file
+
+        payload = _packet_file_payload(packet)
+        path = packet_dir / "campaign-blind-v2.neutral.json"
+        write_protected_file(path, payload)
+        manifest_path = packet_dir / "neutral-packet-manifest.json"
+        write_protected_file(
+            manifest_path,
+            (
+                json.dumps({path.name: _h.sha256(payload).hexdigest()}, sort_keys=True, indent=2)
+                + "\n"
+            ).encode(),
+        )
+        return path, manifest_path
+
+    def _judged_response(self, sample_id: str) -> dict:
+        return {
+            "sample_id": sample_id,
+            "outcome": "judged",
+            "judgment": {"fields": dict(GOOD_CRITICAL), "reviewer_confidence": "medium"},
+            "raw_response": f"model output for {sample_id}",
+        }
+
+    def test_init_binds_lane_exclusively(self, tmp_path: Path):
+        session, _, packet_path, manifest_path = self._init_lane(tmp_path)
+        assert session.reviewer.reviewer_slot == "model_a"
+        # re-init refuses (exclusive-create)
+        with pytest.raises(Exception, match="exists|already"):
+            LaneSession.init(
+                tmp_path,
+                reviewer=_reviewer("model_a"),
+                campaign_id="campaign",
+                sampling=_sampling(self.IDS),
+                source_packet_digest="f" * 64,
+                neutral_packet_path=packet_path,
+                neutral_packet_manifest=manifest_path,
+            )
+
+    def test_requests_resume_from_next_missing(self, tmp_path: Path):
+
+        session, sampling, packet_path, manifest_path = self._init_lane(tmp_path)
         # ingest one record first
         session.ingest_response(self._judged_response("s1"), sampling=sampling)
-        path = session.emit_requests(packet, sampling=sampling)
+        path = session.emit_requests(packet_path, sampling=sampling, manifest_path=manifest_path)
         lines = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
         assert [line["sample_id"] for line in lines] == ["s2", "s3"]  # s1 skipped
+        assert path.name == "lane-requests-000001.jsonl"  # FIX-R3-6 first generation
         # requests carry lane identity + labeling instructions only
         assert set(lines[0]) >= {"reviewer_slot", "labeling_instructions", "case"}
         assert lines[0]["reviewer_slot"] == "model_a"
 
     def test_batch_ingestion_and_duplicate_refusal(self, tmp_path: Path):
-        session, sampling = self._init_lane(tmp_path)
+        session, sampling, packet_path, manifest_path = self._init_lane(tmp_path)
         responses_file = tmp_path / "responses.jsonl"
         payload = "\n".join(json.dumps(self._judged_response(sid)) for sid in ("s1", "s2"))
         responses_file.write_text(payload + "\n")
@@ -1472,14 +1508,15 @@ class TestFix6LaneWorkflow:
     def test_raw_response_bytes_digest_bound(self, tmp_path: Path):
         import hashlib
 
-        session, sampling = self._init_lane(tmp_path)
+        session, sampling, packet_path, manifest_path = self._init_lane(tmp_path)
         record = session.ingest_response(self._judged_response("s1"), sampling=sampling)
         raw = (tmp_path / "lanes" / "model_a" / "raw" / "s1.resp").read_bytes()
         assert record.raw_response_digest == hashlib.sha256(raw).hexdigest()
 
     def test_identity_enforced_at_ingestion(self, tmp_path: Path):
         """Wrong-lane output cannot be ingested into another lane."""
-        session, sampling = self._init_lane(tmp_path)  # lane bound to model_a/claude-opus
+        # lane bound to model_a/claude-opus
+        session, sampling, packet_path, manifest_path = self._init_lane(tmp_path)
         # response payload claiming another lane is IGNORED for identity; the
         # record identity always comes from the lane authority. What IS
         # rejected: responses for samples outside the manifest.
@@ -1488,7 +1525,7 @@ class TestFix6LaneWorkflow:
             session.ingest_response(bad, sampling=sampling)
 
     def test_failure_semantics_distinct(self, tmp_path: Path):
-        session, sampling = self._init_lane(tmp_path)
+        session, sampling, packet_path, manifest_path = self._init_lane(tmp_path)
         refused = {
             "sample_id": "s1",
             "outcome": "refused",
@@ -1523,12 +1560,14 @@ class TestFix6LaneWorkflow:
             campaign_id="campaign",
             sampling=sampling,
             source_packet_digest="f" * 64,
+            neutral_packet_path=packet_path,
+            neutral_packet_manifest=manifest_path,
         )
         judged = session2.ingest_response(self._judged_response("s1"), sampling=sampling)
         assert judged.parse_status == "parsed" and judged.outcome_status == "judged"
 
     def test_status_counts(self, tmp_path: Path):
-        session, sampling = self._init_lane(tmp_path)
+        session, sampling, packet_path, manifest_path = self._init_lane(tmp_path)
         session.ingest_response(self._judged_response("s1"), sampling=sampling)
         status = session.status(sampling)
         assert status["accepted"] == 1
@@ -1536,7 +1575,7 @@ class TestFix6LaneWorkflow:
         assert status["complete"] is False
 
     def test_exact_membership_required_to_freeze(self, tmp_path: Path):
-        session, sampling = self._init_lane(tmp_path)
+        session, sampling, packet_path, manifest_path = self._init_lane(tmp_path)
         session.ingest_response(self._judged_response("s1"), sampling=sampling)
         with pytest.raises(ValueError, match="lane_sample_membership_mismatch"):
             session.freeze(sampling)
@@ -1602,6 +1641,7 @@ class TestUniqueCaseCounting:
                     reviewer=_reviewer(slot),
                     sampling_manifest_digest=sampling.manifest_digest(),
                     source_packet_digest="f" * 64,
+                    neutral_packet_sha256="8" * 64,
                     sample_ids=ids,
                     record_digests=tuple(records_by_lane[slot][sid].record_digest() for sid in ids),
                 )
@@ -1739,6 +1779,7 @@ class TestFixR2RawEvidence:
                 campaign_id="campaign",
                 sampling=sampling,
                 source_packet_digest="f" * 64,
+                neutral_packet_sha256="8" * 64,
             )
 
     def test_mutated_raw_file_fails_freeze_and_load(self, tmp_path: Path):
@@ -1749,6 +1790,7 @@ class TestFixR2RawEvidence:
             campaign_id="campaign",
             sampling=sampling,
             source_packet_digest="f" * 64,
+            neutral_packet_sha256="8" * 64,
         )
         # mutate raw bytes after freeze
         path = tmp_path / "lanes" / "model_a" / "raw" / "s2.resp"
@@ -1778,6 +1820,7 @@ class TestFixR2RawEvidence:
                 campaign_id="campaign",
                 sampling=sampling,
                 source_packet_digest="f" * 64,
+                neutral_packet_sha256="8" * 64,
             )
 
     def test_provider_error_without_raw_file_is_valid(self, tmp_path: Path):
@@ -1809,6 +1852,7 @@ class TestFixR2RawEvidence:
             campaign_id="campaign",
             sampling=sampling,
             source_packet_digest="f" * 64,
+            neutral_packet_sha256="8" * 64,
         )
         assert tuple(lane.sample_ids) == self.IDS
         records = load_lane_records(tmp_path, "model_a")
@@ -1849,6 +1893,7 @@ class TestFixR2RawEvidence:
                 campaign_id="campaign",
                 sampling=sampling,
                 source_packet_digest="f" * 64,
+                neutral_packet_sha256="8" * 64,
             )
 
     def test_crash_orphan_raw_file_not_a_completed_review(self, tmp_path: Path):
@@ -1888,13 +1933,60 @@ class TestFixR2RawEvidence:
             )
 
     def _init_session(self, tmp_path: Path):
+        import hashlib as _h
+
+        from evals.calibration.model_lanes import NeutralModelPacket
+        from evals.calibration.review import _packet_file_payload, write_protected_file
+
         sampling = _sampling(self.IDS)
+        cases = [
+            {
+                "sample_id": sid,
+                "content": f"content-{sid}",
+                "governed_kind": "fact",
+                "source_type": "manual",
+                "review_status": "active",
+                "assertion_mode": "unknown",
+                "origin": "unknown",
+                "risk": "unknown",
+                "evidence_state": "unknown",
+                "age_days": 5,
+                "age_bucket": "lt_7d",
+                "input_size_bucket": "small",
+            }
+            for sid in self.IDS
+        ]
+        packet = NeutralModelPacket(
+            packet_id="campaign-blind-v2",
+            sampling_manifest_digest=sampling.manifest_digest(),
+            guide_version="engram-calibration-guide-157-v1",
+            reviewer_hint="neutral_model_review",
+            cases=cases,
+            source_packet_digest="f" * 64,
+        )
+        packet_dir = tmp_path / "packet"
+        packet_dir.mkdir(parents=True, exist_ok=True)
+        payload = _packet_file_payload(packet)
+        packet_path = packet_dir / "campaign-blind-v2.neutral.json"
+        write_protected_file(packet_path, payload)
+        manifest_path = packet_dir / "neutral-packet-manifest.json"
+        write_protected_file(
+            manifest_path,
+            (
+                json.dumps(
+                    {packet_path.name: _h.sha256(payload).hexdigest()}, sort_keys=True, indent=2
+                )
+                + "\n"
+            ).encode(),
+        )
         session = LaneSession.init(
             tmp_path,
             reviewer=_reviewer("model_a"),
             campaign_id="campaign",
             sampling=sampling,
             source_packet_digest="f" * 64,
+            neutral_packet_path=packet_path,
+            neutral_packet_manifest=manifest_path,
         )
         return session, sampling
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime
 
 from engram.assessment_schema import AssessmentContract
@@ -114,68 +115,203 @@ def build_verified_ledger(
     critical_by_id: dict[str, dict],
     origin: str = "cross_model_consensus",
 ):
-    """Minimal VerifiedConsensusLedger for consumer-semantics unit tests.
+    """Genuine VerifiedConsensusLedger built through the REAL verifier.
 
-    NOTE: this bypasses verify_consensus_ledger (it is a test convenience for
-    exercising observation/floor semantics only). Provenance-enforcement tests
-    live in test_calibration_206_corrections.py and always go through the real
-    verifier.
+    FIX-R3-1: the capability-guarded constructor makes direct fabrication
+    impossible, so this helper materializes a minimal synthetic campaign
+    (lanes, raw evidence, queue evidence) and runs
+    ``verify_consensus_ledger``. ``origin="human_adjudicated"`` forces every
+    case into the human queue (one lane disagrees) and resolves each with
+    the caller's critical fields as the human final resolution.
     """
+    import tempfile
+    from pathlib import Path
+
+    from evals.admission.schema import digest as _digest
     from evals.calibration.consensus import (
         CONSENSUS_PROTOCOL_VERSION,
-        AuditOutcomeRecord,
-        AuditSelection,
-        ConsensusLedger,
-        ConsensusProvenanceWrapper,
+        REVIEWER_FAMILIES,
+        REVIEWER_SLOTS,
+        ModelJudgment,
+        ModelReviewRecord,
+        ReviewerIdentity,
+        classify_case,
+        select_audit_sample_with_coverage,
     )
-    from evals.calibration.ledger import VerifiedConsensusLedger
+    from evals.calibration.freeze import SamplingManifest
+    from evals.calibration.human_queue import (
+        HumanQueueJudgment,
+        HumanQueueManifest,
+        QueueEntry,
+        record_final_resolution,
+        reveal_model_votes,
+        save_initial_judgment,
+        write_queue,
+    )
+    from evals.calibration.ingestion import labeling_instructions_digest
+    from evals.calibration.model_lanes import append_review_record, freeze_lane
+    from evals.calibration.review import write_protected_file
 
-    wrappers = tuple(
-        ConsensusProvenanceWrapper(
-            protocol_version=CONSENSUS_PROTOCOL_VERSION,
-            campaign_id="campaign",
-            sampling_manifest_digest="e" * 64,
-            source_packet_digest="f" * 64,
-            sample_id=sample_id,
-            first_pass_record_digests=("1" * 64, "2" * 64, "3" * 64),
-            consensus_reached=True,
-            entered_human_queue=origin != "cross_model_consensus",
-            queue_reasons=()
-            if origin == "cross_model_consensus"
-            else ("critical_field_disagreement",),
-            final_label_origin=origin,  # type: ignore[arg-type]
-            final_dimensions=dict(critical_by_id[sample_id]),
-            audit_selected=False,
-        )
-        for sample_id in ids
-    )
-    ledger = ConsensusLedger(
-        protocol_version=CONSENSUS_PROTOCOL_VERSION,
+    prompt_digest = labeling_instructions_digest()
+    now = NOW
+    sampling = SamplingManifest(
         campaign_id="campaign",
-        sampling_manifest_digest="e" * 64,
-        source_packet_digest="f" * 64,
-        lane_digests=("4" * 64, "5" * 64, "6" * 64),
-        queue_evidence_sha256="7" * 64,
-        audit_outcome=AuditOutcomeRecord(
-            audited_count=0,
-            material_disagreements=0,
-            high_consequence_misses=0,
-            material_reversals=0,
-            material_disagreement_rate=None,
-            escalate_full_human_review=False,
-        ),
-        audit_selection=AuditSelection(
-            selected=(),
-            target_count=0,
-            population_count=len(ids),
-            covered_cells=(),
-            uncovered_cells=(),
-        ),
-        wrappers=wrappers,
+        target_identity_digest="1" * 64,
+        frame_digest="2" * 64,
+        snapshot_sha256="3" * 64,
+        snapshot_as_of=now,
+        sampling_seed="seed",
+        inclusion_rules=("rule",),
+        exclusion_rules=(),
+        source_row_counts={"eligible_frame": len(ids)},
+        stratum_counts={"all": len(ids)},
+        coverage_dimensions={},
+        sample_ids=ids,
+        sample_hashes=tuple(_digest(sid) for sid in ids),
     )
-    return VerifiedConsensusLedger(
-        ledger=ledger,
-        queue_evidence_sha256="7" * 64,
-        records_by_lane={},
-        lanes=(),
-    )
+    frame_rows = {str(row.sample_id): row for row in build_frame_rows(ids)}
+    adjudicate = origin != "cross_model_consensus"
+    family_by_slot = dict(zip(REVIEWER_SLOTS, REVIEWER_FAMILIES, strict=True))
+    reviewers = {
+        slot: ReviewerIdentity(
+            reviewer_slot=slot,  # type: ignore[arg-type]
+            reviewer_family=family_by_slot[slot],
+            provider_model_identifier=f"{family_by_slot[slot]}-exact-2026-09",
+            reviewer_config_digest="a" * 64,
+            prompt_digest=prompt_digest,
+        )
+        for slot in REVIEWER_SLOTS
+    }
+    records_by_lane: dict[str, dict[str, ModelReviewRecord]] = {slot: {} for slot in REVIEWER_SLOTS}
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        for slot in REVIEWER_SLOTS:
+            for sample_id in ids:
+                fields = dict(critical_by_id[sample_id])
+                if adjudicate and slot == "model_b":
+                    fields = dict(fields)
+                    fields["expected_kind"] = "decision"  # guaranteed disagreement
+                judgment = ModelJudgment(fields=fields, reviewer_confidence="medium")
+                raw = f"raw-model-output:{slot}:{sample_id}".encode()
+                record = ModelReviewRecord(
+                    protocol_version=CONSENSUS_PROTOCOL_VERSION,
+                    campaign_id="campaign",
+                    sampling_manifest_digest=sampling.manifest_digest(),
+                    source_packet_digest="f" * 64,
+                    sample_id=sample_id,
+                    reviewer_slot=slot,  # type: ignore[arg-type]
+                    reviewer_family=family_by_slot[slot],
+                    provider_model_identifier=reviewers[slot].provider_model_identifier,
+                    reviewer_config_digest="a" * 64,
+                    prompt_digest=prompt_digest,
+                    label_guide_version="engram-calibration-guide-157-v1",
+                    captured_at=now,
+                    parse_status="parsed",
+                    outcome_status="judged",
+                    reviewer_confidence="medium",
+                    judgment=judgment,
+                    raw_response_digest=hashlib.sha256(raw).hexdigest(),
+                    error_code=None,
+                )
+                records_by_lane[slot][sample_id] = record
+                write_protected_file(tmp_path / "lanes" / slot / "raw" / f"{sample_id}.resp", raw)
+                append_review_record(record, tmp_path)
+        classifications = {
+            sid: classify_case({slot: records_by_lane[slot][sid] for slot in REVIEWER_SLOTS})
+            for sid in ids
+        }
+        consensus_ids = [sid for sid, c in classifications.items() if c["consensus"]]
+        selection = select_audit_sample_with_coverage(consensus_ids, frame_rows)
+        audit_ids = set(selection.selected)
+        entries = []
+        for sid in ids:
+            reasons = list(classifications[sid]["escalation_reasons"])
+            if sid in audit_ids:
+                reasons.append("audit_selected")
+            if reasons:
+                entries.append(
+                    QueueEntry(
+                        sample_id=sid,
+                        reasons=tuple(sorted(reasons)),
+                        audit_only=not classifications[sid]["escalation_reasons"],
+                    )
+                )
+        queue_dir = tmp_path / "queue"
+        write_queue(
+            HumanQueueManifest(
+                protocol_version=CONSENSUS_PROTOCOL_VERSION,
+                campaign_id="campaign",
+                sampling_manifest_digest=sampling.manifest_digest(),
+                source_packet_digest="f" * 64,
+                entries=tuple(entries),
+            ),
+            queue_dir,
+        )
+        lanes = tuple(
+            freeze_lane(
+                protected_root=tmp_path,
+                reviewer=reviewers[slot],
+                campaign_id="campaign",
+                sampling=sampling,
+                source_packet_digest="f" * 64,
+                neutral_packet_sha256="8" * 64,
+            )
+            for slot in REVIEWER_SLOTS
+        )
+        lane_digests = tuple(lane.lane_digest() for lane in lanes)
+        for entry in entries:
+            sid = entry.sample_id
+            save_initial_judgment(
+                HumanQueueJudgment.model_validate(
+                    {
+                        "protocol_version": CONSENSUS_PROTOCOL_VERSION,
+                        "campaign_id": "campaign",
+                        "sampling_manifest_digest": sampling.manifest_digest(),
+                        "source_packet_digest": "f" * 64,
+                        "sample_id": sid,
+                        "adjudicator_ref": "human-1",
+                        "queue_reasons": entry.reasons,
+                        "audit_selected": "audit_selected" in entry.reasons,
+                        "initial_critical": dict(critical_by_id[sid]),
+                        "initial_confidence": "medium",
+                        "initial_captured_at": now.isoformat(),
+                    }
+                ),
+                queue_dir,
+            )
+            reveal_model_votes(
+                queue_dir,
+                sid,
+                current_records_by_slot={
+                    slot: records_by_lane[slot][sid] for slot in REVIEWER_SLOTS
+                },
+                lane_digests=lane_digests,
+                campaign_id="campaign",
+                sampling_manifest_digest=sampling.manifest_digest(),
+                source_packet_digest="f" * 64,
+            )
+            record_final_resolution(
+                queue_dir,
+                sid,
+                final_critical=dict(critical_by_id[sid]),
+                final_confidence="high",
+                current_records_by_slot={
+                    slot: records_by_lane[slot][sid] for slot in REVIEWER_SLOTS
+                },
+                lane_digests=lane_digests,
+                campaign_id="campaign",
+                sampling_manifest_digest=sampling.manifest_digest(),
+                source_packet_digest="f" * 64,
+            )
+        from evals.calibration.ledger import verify_consensus_ledger
+
+        return verify_consensus_ledger(
+            campaign_id="campaign",
+            sampling=sampling,
+            source_packet_digest="f" * 64,
+            lanes=lanes,
+            records_by_lane=records_by_lane,
+            queue_dir=queue_dir,
+            frame_rows=frame_rows,
+            protected_root=tmp_path,
+        )

@@ -47,6 +47,7 @@ from evals.calibration.human_queue import (
     record_final_resolution,
     save_initial_judgment,
 )
+from evals.calibration.ingestion import labeling_instructions_digest
 from evals.calibration.model_lanes import (
     NeutralModelPacket,
     append_review_record,
@@ -72,12 +73,14 @@ def _judgment(**overrides: object) -> ModelJudgment:
 
 
 def _reviewer(slot: str, family: str, *, model: str | None = None) -> ReviewerIdentity:
+    from evals.calibration.ingestion import labeling_instructions_digest
+
     return ReviewerIdentity(
         reviewer_slot=slot,  # type: ignore[arg-type]
         reviewer_family=family,
         provider_model_identifier=model or f"{family}-exact-2026-09",
         reviewer_config_digest="a" * 64,
-        prompt_digest="b" * 64,
+        prompt_digest=labeling_instructions_digest(),
     )
 
 
@@ -103,7 +106,7 @@ def _record(
         reviewer_family=fam,
         provider_model_identifier=f"{fam}-exact-2026-09",
         reviewer_config_digest="a" * 64,
-        prompt_digest="b" * 64,
+        prompt_digest=labeling_instructions_digest(),
         label_guide_version=LABEL_GUIDE_VERSION,
         captured_at=NOW,
         parse_status=parse_status,  # type: ignore[arg-type]
@@ -241,6 +244,7 @@ class TestLaneMembership:
             reviewer=_reviewer(slot, family),
             sampling_manifest_digest=manifest_digest,
             source_packet_digest="f" * 64,
+            neutral_packet_sha256="8" * 64,
             sample_ids=ids,
             record_digests=tuple(digest(f"{slot}:{sid}") for sid in ids),
         )
@@ -267,6 +271,7 @@ class TestLaneMembership:
                 reviewer=_reviewer("model_a", "claude-opus"),
                 sampling_manifest_digest=sampling.manifest_digest(),
                 source_packet_digest="f" * 64,
+                neutral_packet_sha256="8" * 64,
                 sample_ids=("s1", "s1"),
                 record_digests=("1" * 64, "2" * 64),
             )
@@ -277,6 +282,7 @@ class TestLaneMembership:
                 reviewer=_reviewer("model_a", "claude-opus"),
                 sampling_manifest_digest="e" * 64,
                 source_packet_digest="f" * 64,
+                neutral_packet_sha256="8" * 64,
                 sample_ids=("s1", "s2"),
                 record_digests=("1" * 64,),
             )
@@ -636,8 +642,20 @@ class TestFinalLedgerProvenance:
             )
         with pytest.raises(Exception, match="audited_case_must_use_audited_origin"):
             self._wrapper(final_label_origin="cross_model_consensus", audit_selected=True)
-        # a non-audit human-queue case with audit_selected=True is also invalid
-        with pytest.raises(Exception, match="audited_case_must_use_audited_origin"):
+        # FIX-R3-5: an audit-selected CONSENSUS row the human overrode is
+        # legitimately human_adjudicated
+        overridden = self._wrapper(
+            final_label_origin="human_adjudicated",
+            entered_human_queue=True,
+            queue_reasons=("audit_selected",),
+            consensus_reached=True,
+            audit_selected=True,
+        )
+        assert overridden.final_label_origin == "human_adjudicated"
+        # a non-consensus audit-selected row cannot exist at all
+        with pytest.raises(
+            Exception, match="audit_selected_case_requires_consensus_classification"
+        ):
             self._wrapper(
                 final_label_origin="human_adjudicated",
                 entered_human_queue=True,
@@ -841,6 +859,7 @@ class TestCorrelationReport:
                     reviewer=_reviewer(slot, family),
                     sampling_manifest_digest=manifest_digest,
                     source_packet_digest="f" * 64,
+                    neutral_packet_sha256="8" * 64,
                     sample_ids=ids,
                     record_digests=tuple(records_by_lane[slot][sid].record_digest() for sid in ids),
                 )
