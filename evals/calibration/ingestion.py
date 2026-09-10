@@ -154,6 +154,24 @@ CANONICAL_REQUEST_KEYS: frozenset[str] = frozenset(
 )
 
 
+# FIX-R6-1 performance guard: memoize the verified request registry keyed on
+# the exact file identity (path, mtime_ns, size) of every authority input —
+# the lane authority, the retained neutral packet, and every batch/manifest
+# pair. Protected artifacts are immutable (exclusive-create, never modified
+# in place), so any change appears as a NEW file identity and invalidates the
+# cached entry; a tampered rewrite (unlink + recreate) changes mtime/size and
+# is re-verified. Security is unchanged: a cache hit means the exact same
+# bytes were canonically verified in this process.
+_REGISTRY_CACHE: dict[
+    tuple[tuple[str, int, int], ...], dict[str, dict[int, tuple[str, str, str, dict[str, Any]]]]
+] = {}
+
+
+def _file_identity(path: Path) -> tuple[str, int, int]:
+    stat = path.stat()
+    return (str(path), stat.st_mtime_ns, stat.st_size)
+
+
 def _load_request_registry(
     lane_root: Path,
 ) -> dict[str, dict[int, tuple[str, str, str, dict[str, Any]]]]:
@@ -179,13 +197,20 @@ def _load_request_registry(
     sample pending in several generations (resume re-emission) has one
     entry per generation; responses bind to one exact generation.
     """
-    registry: dict[str, dict[int, tuple[str, str, str, dict[str, Any]]]] = {}
     authority: LaneAuthority | None = None
     packet: NeutralModelPacket | None = None
+    cache_key: tuple[tuple[str, int, int], ...] | None = None
     authority_path = lane_root / "lane.json"
     if authority_path.is_file():
-        authority = LaneAuthority.model_validate(json.loads(authority_path.read_text()))
         retained = lane_root / "neutral-packet.json"
+        batches = sorted(lane_root.glob("lane-requests-*.jsonl"))
+        input_paths = [authority_path, retained, *batches]
+        input_paths.extend(_request_batch_manifest_path(p) for p in batches)
+        cache_key = tuple(_file_identity(p) for p in input_paths if p.exists())
+        cached = _REGISTRY_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        authority = LaneAuthority.model_validate(json.loads(authority_path.read_text()))
         if not retained.is_file():
             raise ValueError("lane_retained_neutral_packet_missing")
         payload = retained.read_bytes()
@@ -194,6 +219,7 @@ def _load_request_registry(
         ):
             raise ValueError("neutral_packet_sha_mismatch")
         packet = NeutralModelPacket.model_validate(json.loads(payload))
+    registry: dict[str, dict[int, tuple[str, str, str, dict[str, Any]]]] = {}
     for batch_path in sorted(lane_root.glob("lane-requests-*.jsonl")):
         manifest_path = _request_batch_manifest_path(batch_path)
         verify_request_batch(
@@ -217,6 +243,8 @@ def _load_request_registry(
             if existing is not None and existing != entry:
                 raise ValueError("request_batch_manifest_generation_conflict")
             registry[sample_id][generation] = entry
+    if cache_key is not None:
+        _REGISTRY_CACHE[cache_key] = registry
     return registry
 
 
