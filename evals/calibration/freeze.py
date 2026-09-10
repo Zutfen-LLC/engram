@@ -15,6 +15,7 @@ from typing import Annotated, Any, Literal, Self
 
 from pydantic import AwareDatetime, Field, model_validator
 
+from engram.canonicalize import canonicalize, content_hash
 from evals.admission.schema import Digest, Record, Token, digest
 
 CAMPAIGN_SCHEMA = "engram-calibration-campaign-v1"
@@ -248,7 +249,7 @@ def build_frame(
         frame.append(
             FrameRow(
                 item_uuid=row["item_uuid"],
-                content_hash=row["content_hash"],
+                content_hash=content_hash(canonicalize(content)),
                 content_norm_hash=normalized_text_hash(content),
                 kind=row["kind"],
                 source_type=row["source_type"],

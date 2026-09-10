@@ -117,6 +117,27 @@ def _sampling(
     )
 
 
+def test_frame_freezes_canonical_content_hash_from_protected_content() -> None:
+    item_uuid = "00000000-0000-0000-0000-000000000001"
+    text = "  Mixed   CASE content  "
+    frame, _ = build_frame(
+        [
+            {
+                "item_uuid": item_uuid,
+                "content_hash": "legacy-or-malformed-source-hash",
+                "kind": "fact",
+                "source_type": "manual",
+                "review_status": "active",
+                "created_at": NOW,
+                "valid_to": None,
+            }
+        ],
+        content_by_uuid={item_uuid: text},
+        snapshot_as_of=NOW,
+    )
+    assert frame[0].content_hash == content_hash(canonicalize(text))
+
+
 def test_strict_subset_split_exactly_partitions_sample_membership() -> None:
     frame = _frame()
     sample_ids, strata, coverage = stratified_sample(
