@@ -621,13 +621,32 @@ def test_committed_public_campaign_artifact_reconciles_and_is_content_free() -> 
         "mcp_recall_authority": "legacy",
         "ordinary_recall_authority": "legacy",
     }
-    # Round-2: the superseded freeze must not read as current campaign identity.
-    assert manifest["identity_digest"] is None
-    assert manifest["identity"]["pending_refreeze"] is True
-    assert sampling["pending_refreeze"] is True
-    assert sampling["sampling_manifest_digest"] is None
-    assert sampling["split_manifest_digest"] is None
-    assert manifest["packet_digests"] == {"pending_refreeze": True}
+    # Round-2 re-freeze complete: the manifest now records the real frozen
+    # identity, and no pending_refreeze markers remain anywhere.
+    assert manifest["identity_digest"] == (
+        "57fc03918d5335c2925e2e6402fcadc4a29f5ef138fba6e6d839e9d8ec292ef9"
+    )
+    assert "pending_refreeze" not in manifest["identity"]
+    assert "pending_refreeze" not in manifest["sampling"]
+    assert manifest["identity"]["campaign_tooling_repo_sha"] == (
+        "25256f7615c27be683e09e604df1a3bb553ff061"
+    )
+    assert manifest["sampling"]["sampling_manifest_digest"] == (
+        "ed2e0c80bfe0c30c39d5ad5bc5656b007617320484efae14c87fa51027d66b3d"
+    )
+    assert manifest["sampling"]["split_manifest_digest"] == (
+        "a2a27ed4c0152bf2d9b6c318bbfcfd6e5e20944184a0cc9df18cb2b4e3fbb72b"
+    )
+    assert manifest["packet_digests"] == {
+        "eng-calibration-001f-blind-v2.reviewer_a.json": (
+            "07f9fdbfdaae080fd860dc08f22cd56432826e115a017085004e92a0c9a7d5d4"
+        ),
+        "eng-calibration-001f-blind-v2.reviewer_b.json": (
+            "dbd952815222c232dd8a011c6972cb712963da77c1fedba04e712e57a2f82618"
+        ),
+    }
+    assert manifest["status"] == "STOPPED_FOR_HUMAN_ADJUDICATION"
+    assert "pending_refreeze" not in blob
     # The invalidation trail is preserved, and no human labels preceded it.
     assert manifest["correction"]["status"] == "INVALIDATED_AND_SUPERSEDED_PRE_REVIEW"
     assert manifest["correction"]["human_labels_accepted_before_invalidation"] is False

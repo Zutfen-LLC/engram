@@ -1,11 +1,53 @@
 # ENG-CALIBRATION-001F (#202) operator runbook — corrected pre-review stage
 
-Status: **PENDING ROUND-2 RE-FREEZE, THEN STOPPED FOR HUMAN ADJUDICATION**.
-The corrected v2 freeze has itself been invalidated pre-review (see below) and
-must be re-frozen against the deployed runtime before review begins. No human
-calibration labels have been accepted at any point. Do not fit, gate, enable
-selection, or claim the #202 terminal result before the full human review and
-adjudication contract is complete.
+Status: **STOPPED FOR HUMAN ADJUDICATION** (reviewed Round-2 re-freeze
+complete; see below). No human calibration labels have been accepted at any
+point. Do not fit, gate, enable selection, or claim the #202 terminal result
+before the full human review and adjudication contract is complete.
+
+## Round-2 re-freeze against the deployed runtime (2026-09-10)
+
+The corrected v2 freeze was re-frozen after deploying merged `main`
+(`25256f7615c27be683e09e604df1a3bb553ff061`, PR #203) to `engram01` through
+the documented Compose path (backup → rebuild → `up -d` → `engram init-db`;
+database was already at 44/44 migrations, no new migrations existed in the
+delta). The freeze ran **inside the deployed service container** via
+`python -m evals.calibration freeze-target --derive-provider-config-digest`,
+so the config identity was derived by `engram.assessments.assessment_config_version()`
+from the exact runtime provider settings — the same helper production
+`current_contract()` uses.
+
+| Round-2 re-frozen identity | Digest/count |
+| --- | --- |
+| Campaign tooling SHA | `25256f7615c27be683e09e604df1a3bb553ff061` |
+| Snapshot | `cc172a6f7c2780784ef0ce5686772a72324d1398976fc117da637df2a88fbdb0` (unchanged, verified) |
+| provider_config_digest | `sha256:8488c809d9d1ace29470ad85d57cbebb01b997e1a5730a86263c0e40a0384b45` |
+| Deployed `current_contract().config_version` | `sha256:8488c809d9d1ace29470ad85d57cbebb01b997e1a5730a86263c0e40a0384b45` (exact-equal to frozen) |
+| Target identity | `57fc03918d5335c2925e2e6402fcadc4a29f5ef138fba6e6d839e9d8ec292ef9` |
+| Protected frame | `e5c0c60b5d80a3a715a73cd4596e4cc07db604008dc8452cfde671e97045eb08` (unchanged) |
+| Sampling manifest | `ed2e0c80bfe0c30c39d5ad5bc5656b007617320484efae14c87fa51027d66b3d` |
+| Split manifest | `a2a27ed4c0152bf2d9b6c318bbfcfd6e5e20944184a0cc9df18cb2b4e3fbb72b` |
+| Reviewer A packet | `07f9fdbfdaae080fd860dc08f22cd56432826e115a017085004e92a0c9a7d5d4` |
+| Reviewer B packet | `dbd952815222c232dd8a011c6972cb712963da77c1fedba04e712e57a2f82618` |
+
+Counts are unchanged from the corrected v2 freeze, as required by the
+membership invariant (sampling never consumes the target identity digest):
+
+```text
+eligible = 624
+sampled  = 402
+dev + holdout = 402  (241 + 161)
+duplicate groups = 27, zero cross-split leakage
+```
+
+Membership, split assignment, frame digest, coverage, and strata are
+byte-identical to the invalidated corrected v2 freeze; only the manifests'
+recorded identity digests changed. An independent second regeneration from
+the same deployed tooling, frozen target, snapshot, and seeds reproduced
+every digest above exactly. The old bare-hex value (`725ee055…`) was not
+reused or prefixed; the production helper independently derived the
+canonical `sha256:<64hex>` form. No reviewer material, labels, or ledgers
+existed before or after this re-freeze.
 
 ## Round-2 invalidation of the corrected v2 freeze
 
@@ -56,7 +98,7 @@ invariant. A newer runtime SHA is therefore never automatically trusted — any
 contract drift on it still fails closed — while a merge commit that leaves the
 calibrated contract identical no longer forces a re-freeze.
 
-### Required operator re-freeze
+### Required operator re-freeze (completed 2026-09-10 — see above)
 
 Run on the host whose runtime the campaign targets, so the config identity is
 derived from real deployed provider settings rather than transcribed:
