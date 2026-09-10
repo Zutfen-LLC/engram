@@ -35,6 +35,16 @@ sampling (`449197e8e19d25aba2d936e94bdb6f669890735cd74ee8d9d3e481e575c2e5e3`),
 and split (`dfd71510a58f4c35a4feed6a130351362521e43f380981ff0ea45be8fec5414b`)
 digests are audit history only.
 
+A preliminary v3 regeneration at tooling SHA
+`fd3ddf9c7429712af6c47680267742b421e43fbe` (identity
+`d36bc930d09ec906f17ff7a46bda59cb34297244ef7d2f820e0a8ae422aa748d`, sampling
+`533ee1e338c1985c943ef186d2bb2273740fc4dd61a43d20ca11d1031f288dfa`, split
+`ad248d6605c98b8c4a544d43219576af9a3058c813a99a27c5a082aa18ce79f6`, packets
+`9c5ef5e4…6920d` / `bc384a50…9c36c`) was likewise superseded before review when
+the final evidence-binding and grouping corrections were committed. Its
+protected bytes and invalidation record are retained byte-for-byte in
+`202-invalidated-preliminary-v3-fd3ddf9`.
+
 ## Corrected v2 freeze
 
 The unchanged authorized snapshot was copied byte-for-byte into a new protected
@@ -49,13 +59,13 @@ and invalidation trail.
 
 | Corrected identity | Digest/count |
 | --- | --- |
-| Corrected tooling SHA | `fd3ddf9c7429712af6c47680267742b421e43fbe` |
+| Corrected tooling SHA | `143ff3ffa23cf3ab5884ce11d19c12621ade5aca` |
 | Snapshot | `cc172a6f7c2780784ef0ce5686772a72324d1398976fc117da637df2a88fbdb0` |
-| Target identity | `d36bc930d09ec906f17ff7a46bda59cb34297244ef7d2f820e0a8ae422aa748d` |
-| Sampling manifest | `533ee1e338c1985c943ef186d2bb2273740fc4dd61a43d20ca11d1031f288dfa` |
-| Split manifest | `ad248d6605c98b8c4a544d43219576af9a3058c813a99a27c5a082aa18ce79f6` |
-| Reviewer A packet | `9c5ef5e47950bbe035c9769663cefbc9e064f8bbb8fa423dba1bd7e54886920d` |
-| Reviewer B packet | `bc384a50f3dc5bbdb414c0d118a0b2c7d5ea3c6e10a7e6b7410798653a99c36c` |
+| Target identity | `b81348f7b6f14cf4eaf2ca735ae266babc410bb79299c247150bda054ab01614` |
+| Sampling manifest | `c899ab9fe836b3ad122a933e593d137fb79110dab6aed56984a02e36477c9f65` |
+| Split manifest | `0a97df59abe186e2b914a551bba802bf908253d10a53eddb2d82c7ab4e6c4611` |
+| Reviewer A packet | `f37cb72088aaa2509fdf8e974b8722097a46f8886cadd68308e996502914990e` |
+| Reviewer B packet | `58353df8684dfbf3c6659129cf90a3e4f04d590717c3d92b7451eb9b748a4b27` |
 
 Corrected counts:
 
