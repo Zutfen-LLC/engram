@@ -68,15 +68,22 @@ async def _fresh_engine():
     # change, so this must not depend on which modules happen to be co-resident.
     async with _test_engine.begin() as conn:
         non_default = "tenant_id IN (SELECT id FROM tenants WHERE slug != 'default')"
+        # Children first, then parents. Each name is existence-checked so that
+        # migration drift degrades to "nothing to clean" rather than an
+        # UndefinedTableError that fails every test in this module.
         for table in (
             "admission_assessment_current",
             "admission_assessments",
             "memory_assessments",
             "assessment_requests",
-            "extraction_candidates",
+            "extraction_item_links",
             "extraction_runs",
         ):
-            await conn.execute(text(f"DELETE FROM {table} WHERE {non_default}"))
+            exists = await conn.scalar(
+                text("SELECT to_regclass(:name) IS NOT NULL"), {"name": f"public.{table}"}
+            )
+            if exists:
+                await conn.execute(text(f"DELETE FROM {table} WHERE {non_default}"))
         await conn.execute(text("DELETE FROM tenants WHERE slug != 'default'"))
     await _test_engine.dispose()
 
