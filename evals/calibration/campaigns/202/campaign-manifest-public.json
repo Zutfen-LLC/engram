@@ -54,8 +54,8 @@
     "total_reviewed_min": 300
   },
   "identity": {
-    "note": "The round-2 corrected target must be re-frozen against the deployed runtime before any review begins. provider_config_digest must be captured in the exact production representation (sha256:<64hex>) via `python -m evals.calibration freeze-target --derive-provider-config-digest`, which derives it through engram.assessments.assessment_config_version -- the same helper production current_contract() uses. The prior bare-hex value (725ee055...) has no recorded provenance and must not be reused or prefixed.",
-    "pending_refreeze": true,
+    "campaign_tooling_repo_sha": "25256f7615c27be683e09e604df1a3bb553ff061",
+    "note": "Round-2 re-freeze executed 2026-09-10 inside the deployed engram01 service container (image built from this exact main SHA) via `python -m evals.calibration freeze-target --derive-provider-config-digest`, which derives config identity through engram.assessments.assessment_config_version -- the same helper production current_contract() uses. The frozen value equals the deployed current_contract().config_version by exact string equality. The prior bare-hex value (725ee055...) was not reused or prefixed.",
     "schema": {
       "campaign_tooling_repo_sha": "provenance of the tooling revision that freezes the campaign",
       "provider_config_digest": "exact production AssessmentContract.config_version (sha256:<64hex>)"
@@ -85,10 +85,11 @@
       }
     }
   },
-  "identity_digest": null,
+  "identity_digest": "57fc03918d5335c2925e2e6402fcadc4a29f5ef138fba6e6d839e9d8ec292ef9",
   "note": "Public-safe counts, rules, coverage, and digests only; exact membership and content remain protected.",
   "packet_digests": {
-    "pending_refreeze": true
+    "eng-calibration-001f-blind-v2.reviewer_a.json": "07f9fdbfdaae080fd860dc08f22cd56432826e115a017085004e92a0c9a7d5d4",
+    "eng-calibration-001f-blind-v2.reviewer_b.json": "dbd952815222c232dd8a011c6972cb712963da77c1fedba04e712e57a2f82618"
   },
   "review_plan": {
     "human_adjudication_complete": false,
@@ -294,7 +295,7 @@
     ],
     "holdout_count": 161,
     "inclusion_rules": [
-      "live item: valid_to IS NULL and review_status NOT IN (rejected, archived)",
+      "Live item: valid_to IS NULL and review_status NOT IN (rejected, archived)",
       "tenant dogfood corpus only",
       "content present and passes the production secret denylist"
     ],
@@ -303,10 +304,9 @@
       "duplicate_groups": 27,
       "sample_membership_count": 402
     },
-    "membership_invariant": "Sampling and splitting never consume the target identity digest, so the re-freeze changes recorded manifest digests only. Expected counts are unchanged: eligible 624, sampled 402, dev 241, holdout 161.",
-    "pending_refreeze": true,
+    "membership_invariant": "Sampling and splitting never consume the target identity digest, so the round-2 re-freeze changed recorded manifest digests only; frame digest, membership, and all counts are byte-identical to the corrected v2 freeze.",
     "sample_count": 402,
-    "sampling_manifest_digest": null,
+    "sampling_manifest_digest": "ed2e0c80bfe0c30c39d5ad5bc5656b007617320484efae14c87fa51027d66b3d",
     "sampling_seed": "202-sample-v2",
     "snapshot_as_of": "2026-09-09T19:43:04.195204Z",
     "snapshot_sha256": "cc172a6f7c2780784ef0ce5686772a72324d1398976fc117da637df2a88fbdb0",
@@ -314,7 +314,7 @@
       "eligible_frame": 624,
       "excluded_total": 0
     },
-    "split_manifest_digest": null,
+    "split_manifest_digest": "a2a27ed4c0152bf2d9b6c318bbfcfd6e5e20944184a0cc9df18cb2b4e3fbb72b",
     "split_seed": "202-split-v2",
     "stratum_counts": {
       "decision/import/active": 5,
@@ -359,5 +359,5 @@
     "mcp_recall_authority": "legacy",
     "ordinary_recall_authority": "legacy"
   },
-  "status": "PENDING_ROUND2_REFREEZE_THEN_STOPPED_FOR_HUMAN_ADJUDICATION"
+  "status": "STOPPED_FOR_HUMAN_ADJUDICATION"
 }
