@@ -100,23 +100,29 @@ def _reviewer(slot: str) -> ReviewerIdentity:
 
 
 def _record(slot: str, sample_id: str, judgment: ModelJudgment | None) -> ModelReviewRecord:
-    from evals.calibration.consensus import ExecutionReceipt
+    from evals.calibration.consensus import ExecutionEvidence, ExecutionReceipt
     from evals.calibration.reviewer_instructions import RESPONSE_PARSER_VERSION
 
     fam = FAMILY_BY_SLOT[slot]
     fields = dict(judgment.fields) if judgment is not None else dict(GOOD_CRITICAL)
     raw = _raw_response_json(sample_id, fields).encode()
-    execution = ExecutionReceipt(
-        campaign_id="campaign",
-        reviewer_slot=slot,  # type: ignore[arg-type]
-        reviewer_family=fam,
-        provider_model_identifier=f"{fam}-exact-2026-09",
-        reviewer_config_digest="a" * 64,
-        prompt_digest=labeling_instructions_digest(),
-        request_generation=1,
-        request_item_digest="d" * 64,
-        executed_at=NOW,
-        executor_status="completed",
+    execution = ExecutionReceipt.from_evidence(
+        ExecutionEvidence(
+            campaign_id="campaign",
+            actual_reviewer_slot=slot,  # type: ignore[arg-type]
+            actual_reviewer_family=fam,
+            actual_provider_model_identifier=f"{fam}-exact-2026-09",
+            actual_configuration_digest="a" * 64,
+            actual_prompt_digest=labeling_instructions_digest(),
+            request_generation=1,
+            request_item_digest="d" * 64,
+            executed_at=NOW,
+            executor_status="completed",
+            executor_identity="synthetic-executor-206",
+            identity_source="provider_metadata",
+            provider_request_id="req-206-0001",
+            provider_response_id="resp-206-0001",
+        )
     )
     return ModelReviewRecord(
         protocol_version=CONSENSUS_PROTOCOL_VERSION,
@@ -249,7 +255,6 @@ def _materialize_campaign(
             record = session.build_record(
                 {
                     "sample_id": sid,
-                    "outcome": "judged",
                     "raw_response": _raw_response_json(sid, fields),
                     "execution": json.loads(
                         json.dumps(
@@ -308,15 +313,25 @@ def _raw_response_json(sample_id: str, fields: dict[str, Any]) -> str:
 
 
 def _truthful_receipt(lane_root: Path, reviewer, sample_id: str):
-    from evals.calibration.ingestion import build_execution_receipt
+    """FIX-R5-1: receipt from OBSERVED executor metadata (synthetic executor
+    was configured for this lane's model; observation, not identity copy)."""
+    from evals.calibration.ingestion import observe_execution
 
-    return build_execution_receipt(
+    return observe_execution(
         lane_root,
-        reviewer,
-        sample_id,
-        request_generation=1,
         campaign_id="campaign",
+        actual_reviewer_slot=reviewer.reviewer_slot,
+        actual_reviewer_family=reviewer.reviewer_family,
+        actual_provider_model_identifier=reviewer.provider_model_identifier,
+        actual_configuration_digest=reviewer.reviewer_config_digest,
+        actual_prompt_digest=reviewer.prompt_digest,
+        sample_id=sample_id,
+        request_generation=1,
+        executor_identity="synthetic-executor-206",
         executor_status="completed",
+        identity_source="provider_metadata",
+        provider_request_id="req-206-0001",
+        provider_response_id="resp-206-0001",
         executed_at=NOW,
     )
 
@@ -765,7 +780,6 @@ class TestFixR33NeutralPacketBytes:
             record = session.build_record(
                 {
                     "sample_id": sid,
-                    "outcome": "judged",
                     "raw_response": _raw_response_json(sid, dict(GOOD_CRITICAL)),
                     "execution": json.loads(
                         json.dumps(
@@ -1257,7 +1271,6 @@ class TestFixR36RequestResume:
     def _response(self, sid: str, lane_root: Path) -> dict:
         return {
             "sample_id": sid,
-            "outcome": "judged",
             "raw_response": _raw_response_json(sid, dict(GOOD_CRITICAL)),
             "execution": json.loads(
                 json.dumps(

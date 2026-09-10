@@ -49,18 +49,44 @@ def execution_receipt_for(
     request_generation: int,
     campaign_id: str = "campaign",
     executor_status: str = "completed",
+    identity_source: str = "provider_metadata",
+    executor_identity: str = "synthetic-executor-206",
+    provider_request_id: str | None = "req-206-0001",
+    provider_response_id: str | None = "resp-206-0001",
+    **identity_overrides: str,
 ) -> object:
-    """Build a truthful execution receipt against a retained request batch."""
-    from evals.calibration.ingestion import build_execution_receipt
+    """Build a truthful execution receipt from OBSERVED executor metadata.
 
-    return build_execution_receipt(
+    FIX-R5-1 test fixtures: the actual identity is supplied by the (synthetic)
+    executor as OBSERVED values — ``reviewer`` is only consulted for the
+    DEFAULT observed values (the synthetic executor was configured to run
+    exactly this lane's model), and every adversarial test overrides one
+    observed field to a genuinely different value. The receipt can never be
+    built by copying the expected identity silently: overrides are explicit
+    executor observations.
+    """
+    from evals.calibration.ingestion import observe_execution
+
+    observed = {
+        "actual_reviewer_slot": reviewer.reviewer_slot,  # type: ignore[attr-defined]
+        "actual_reviewer_family": reviewer.reviewer_family,  # type: ignore[attr-defined]
+        "actual_provider_model_identifier": reviewer.provider_model_identifier,  # type: ignore[attr-defined]
+        "actual_configuration_digest": reviewer.reviewer_config_digest,  # type: ignore[attr-defined]
+        "actual_prompt_digest": reviewer.prompt_digest,  # type: ignore[attr-defined]
+    }
+    observed.update(identity_overrides)
+    return observe_execution(
         lane_root,
-        reviewer,  # type: ignore[arg-type]
-        sample_id,
-        request_generation=request_generation,
         campaign_id=campaign_id,
+        sample_id=sample_id,
+        request_generation=request_generation,
         executor_status=executor_status,  # type: ignore[arg-type]
+        identity_source=identity_source,  # type: ignore[arg-type]
+        executor_identity=executor_identity,
+        provider_request_id=provider_request_id,
+        provider_response_id=provider_response_id,
         executed_at=NOW,
+        **observed,  # type: ignore[arg-type]
     )
 
 
@@ -216,12 +242,14 @@ def build_verified_ledger(
     """
     import tempfile
     from pathlib import Path
+    from typing import cast
 
     from evals.admission.schema import digest as _digest
     from evals.calibration.consensus import (
         CONSENSUS_PROTOCOL_VERSION,
         REVIEWER_FAMILIES,
         REVIEWER_SLOTS,
+        ExecutionReceipt,
         ModelJudgment,
         ModelReviewRecord,
         ReviewerIdentity,
@@ -360,16 +388,18 @@ def build_verified_ledger(
                         "judgment": {"fields": dict(fields), "reviewer_confidence": "medium"},
                     }
                 ).encode()
-                from evals.calibration.ingestion import build_execution_receipt
+                from tests.test_calibration_206_helpers import execution_receipt_for
 
-                execution = build_execution_receipt(
-                    tmp_path / "lanes" / slot,
-                    reviewers[slot],
-                    sample_id,
-                    request_generation=1,
-                    campaign_id="campaign",
-                    executor_status="completed",
-                    executed_at=now,
+                execution = cast(
+                    "ExecutionReceipt",
+                    execution_receipt_for(
+                        tmp_path / "lanes" / slot,
+                        reviewers[slot],
+                        sample_id,
+                        request_generation=1,
+                        campaign_id="campaign",
+                        executor_status="completed",
+                    ),
                 )
                 record = ModelReviewRecord(
                     protocol_version=CONSENSUS_PROTOCOL_VERSION,

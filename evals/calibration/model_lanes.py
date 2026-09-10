@@ -222,8 +222,9 @@ def freeze_lane(
         sampling=sampling,
         source_packet_digest=source_packet_digest,
     )
-    # FIX-R4-1: every accepted record must answer an ACTUAL emitted request —
-    # verified against the retained immutable request-batch manifests.
+    # FIX-R4-1 / FIX-R5-3: every accepted record must answer an ACTUAL
+    # emitted request — verified against the retained VERIFIED request
+    # batches (byte-level re-derivation, FIX-R5-2).
     from evals.calibration.ingestion import verify_lane_request_bindings
 
     verify_lane_request_bindings(
@@ -233,6 +234,11 @@ def freeze_lane(
         campaign_id=campaign_id,
         neutral_packet_sha256=neutral_packet_sha256,
     )
+    # FIX-R5-1: unverified (attested-only) actual executor identity can
+    # never freeze as a valid consensus reviewer lane.
+    from evals.calibration.ingestion import require_machine_verified_execution_identity
+
+    require_machine_verified_execution_identity(records)
     # FIX-R2-4: raw model evidence is freeze-bound — every accepted record
     # must have its protected raw bytes present and hashing to the claimed
     # digest (provider_error records must claim none).
@@ -296,6 +302,23 @@ def _load_one_frozen_lane(
         protected_root=protected_root,
         reviewer_slot=reviewer.reviewer_slot,
     )
+    # FIX-R5-3: request provenance is REVERIFIED at frozen-lane load — the
+    # batch bytes (not manifest assertions) must still back every accepted
+    # record's request binding.
+    from evals.calibration.ingestion import verify_lane_request_bindings
+
+    verify_lane_request_bindings(
+        lane_directory(protected_root, reviewer.reviewer_slot),
+        reviewer,
+        records,
+        campaign_id=campaign_id,
+        neutral_packet_sha256=lane.neutral_packet_sha256,
+    )
+    # FIX-R5-1: a frozen lane whose records lack machine-verified actual
+    # executor identity cannot load as a valid consensus reviewer lane.
+    from evals.calibration.ingestion import require_machine_verified_execution_identity
+
+    require_machine_verified_execution_identity(records)
     return lane
 
 

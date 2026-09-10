@@ -6,17 +6,35 @@ session has no guaranteed knowledge of what that repository-local version
 name means, so the five critical fields had names but no decision semantics
 in the actual prompt.
 
-This module freezes the ACTUAL semantics — sourced verbatim in substance
-from the frozen calibration guide (``evals/labeling/calibration-157-v1.md``)
-and the admission labeling handbook (``evals/labeling/admission-v1.md``) —
-into a canonical instruction bundle that:
+FIX-R5-5 (provenance correction — truthful sourcing): this module freezes
+the ACTUAL semantics into a canonical instruction bundle. The material
+splits into two honestly-labeled layers:
 
-- is embedded in FULL in every emitted model request;
-- is bound by ``ReviewerIdentity.prompt_digest`` (via
+- INHERITED from the frozen sources (``evals/labeling/calibration-157-v1.md``
+  + ``evals/labeling/admission-v1.md``): the expected-kind closed
+  vocabulary, the judge-independently-of-governed-kind principle, the
+  ``unknown``-for-custom/unresolved-kinds rule, retention semantics
+  (durable usefulness, never truth), epistemic definitions (decision-time
+  evidence only), consequence definitions (of erroneous silent admission),
+  abstention principles, and the honor rules;
+- NEW #206 REVIEWER OPERATIONALIZATION (frozen here BEFORE execution under
+  ``REVIEWER_INSTRUCTIONS_VERSION`` =
+  ``engram-calibration-reviewer-instructions-206-v1``): the detailed
+  per-kind definitions (fact / observation / decision / procedure /
+  summary / doctrine / invariant / preference / diary_entry) and the exact
+  decision-rule wording. These are pre-execution clarifications introduced
+  by #206 — NOT text inherited from the old guide, which never contained a
+  per-kind prose taxonomy. The old guide remains the underlying
+  calibration guide (``label_guide_version`` is unchanged).
+
+The complete bundle is:
+
+- embedded in FULL in every emitted model request;
+- bound by ``ReviewerIdentity.prompt_digest`` (via
   ``labeling_instructions_digest`` in ``evals.calibration.ingestion``), so a
   reviewer identity whose prompt digest does not match the exact bytes the
   lane emits cannot initialize or load;
-- changes digest whenever any semantic rule changes.
+- changing digest whenever any semantic rule changes.
 
 FIX-R4-2: this module also owns the ONE deterministic parser from preserved
 model-response bytes to a ``ModelJudgment``. The parsed judgment stored on a
@@ -42,10 +60,23 @@ RESPONSE_SCHEMA_NAME: Literal["engram-calibration-model-response-206-v1"] = (
     "engram-calibration-model-response-206-v1"
 )
 
-# --- Frozen semantic bundle (FIX-R4-6) -------------------------------------
-# Substance sourced from the frozen guide + admission handbook. Do not edit
-# after merge without a new protocol version: every emitted request embeds
-# this bundle and every reviewer identity binds its digest.
+# FIX-R5-5: explicit identity for the #206 reviewer operationalization —
+# the pre-execution clarification layer containing the detailed per-kind
+# definitions and exact decision-rule wording. Frozen BEFORE any reviewer
+# receives a packet (no real model review has executed, so no resampling or
+# Round-2 invalidation is required). Distinct from the underlying guide
+# version ``engram-calibration-guide-157-v1``, which is preserved unchanged.
+REVIEWER_INSTRUCTIONS_VERSION: Literal["engram-calibration-reviewer-instructions-206-v1"] = (
+    "engram-calibration-reviewer-instructions-206-v1"
+)
+
+# --- Frozen semantic bundle (FIX-R4-6 / FIX-R5-5) --------------------------
+# Layered provenance: vocabulary + principles inherited from the frozen 157
+# guide + admission handbook; detailed per-kind definitions and exact rule
+# wording are the NEW #206 reviewer operationalization (see
+# REVIEWER_INSTRUCTIONS_VERSION). Do not edit after merge without a new
+# protocol version: every emitted request embeds this bundle and every
+# reviewer identity binds its digest.
 CANONICAL_SEMANTIC_BUNDLE: dict[str, Any] = {
     "expected_kind": {
         "allowed_vocabulary": [
@@ -190,8 +221,9 @@ def canonical_instruction_bundle(label_guide_version: str) -> dict[str, Any]:
     """The complete frozen instruction material supplied to reviewers.
 
     Everything the model receives semantically: task, guide identity, the
-    full semantic bundle, and the strict response contract. ``prompt_digest``
-    binds exactly this object (via ``labeling_instructions_digest``).
+    #206 operationalization identity (FIX-R5-5), the full semantic bundle,
+    and the strict response contract. ``prompt_digest`` binds exactly this
+    object (via ``labeling_instructions_digest``).
     """
     return {
         "task": (
@@ -200,6 +232,7 @@ def canonical_instruction_bundle(label_guide_version: str) -> dict[str, Any]:
             "acceptable_abstention) using ONLY the semantics below."
         ),
         "label_guide_version": label_guide_version,
+        "reviewer_instructions_version": REVIEWER_INSTRUCTIONS_VERSION,
         "semantics": CANONICAL_SEMANTIC_BUNDLE,
         "response_contract": RESPONSE_CONTRACT,
     }

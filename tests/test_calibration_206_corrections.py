@@ -133,8 +133,9 @@ def _record(
     outcome_status: str = "judged",
     error_code: str | None = None,
     raw_digest: str | None = None,
+    item_digest: str | None = None,
 ) -> ModelReviewRecord:
-    from evals.calibration.consensus import ExecutionReceipt
+    from evals.calibration.consensus import ExecutionEvidence, ExecutionReceipt
     from evals.calibration.reviewer_instructions import RESPONSE_PARSER_VERSION
 
     fam = family or FAMILY_BY_SLOT[slot]
@@ -162,17 +163,24 @@ def _record(
     config_digest = config or "a" * 64
     prompt_value = prompt or labeling_instructions_digest()
     campaign_value = campaign or "campaign"
-    execution = ExecutionReceipt(
-        campaign_id=campaign_value,
-        reviewer_slot=slot,  # type: ignore[arg-type]
-        reviewer_family=fam,
-        provider_model_identifier=model_id,
-        reviewer_config_digest=config_digest,
-        prompt_digest=prompt_value,
-        request_generation=1,
-        request_item_digest="d" * 64,
-        executed_at=NOW,
-        executor_status="provider_error" if outcome_status == "provider_error" else "completed",
+    item_digest_value = item_digest or _EMITTED_ITEM_DIGESTS.get((slot, sample_id), "d" * 64)
+    execution = ExecutionReceipt.from_evidence(
+        ExecutionEvidence(
+            campaign_id=campaign_value,
+            actual_reviewer_slot=slot,  # type: ignore[arg-type]
+            actual_reviewer_family=fam,
+            actual_provider_model_identifier=model_id,
+            actual_configuration_digest=config_digest,
+            actual_prompt_digest=prompt_value,
+            request_generation=1,
+            request_item_digest=item_digest_value,
+            executed_at=NOW,
+            executor_status="provider_error" if outcome_status == "provider_error" else "completed",
+            executor_identity="synthetic-executor-206",
+            identity_source="provider_metadata",
+            provider_request_id="req-206-0001",
+            provider_response_id="resp-206-0001",
+        )
     )
     return ModelReviewRecord(
         protocol_version=protocol or CONSENSUS_PROTOCOL_VERSION,  # type: ignore[arg-type]
@@ -191,7 +199,7 @@ def _record(
         outcome_status=outcome_status,  # type: ignore[arg-type]
         execution=execution,
         request_generation=1,
-        request_item_digest="d" * 64,
+        request_item_digest=item_digest_value,
         parser_version=RESPONSE_PARSER_VERSION if parse_status == "parsed" else None,
         reviewer_confidence=judgment.reviewer_confidence if judgment else "unknown",
         judgment=judgment,
@@ -255,42 +263,88 @@ def _frame_rows(ids: tuple[str, ...], *, variety: bool = True) -> dict[str, Fram
     return rows
 
 
+# FIX-R5-2: request-item digests of the most recent genuine batch emitted for
+# (slot, sample_id). The synthetic request content is deterministic per
+# (slot, sample_id), so records built after _emit_request_batch bind the EXACT
+# digest of their own request line automatically.
+_EMITTED_ITEM_DIGESTS: dict[tuple[str, str], str] = {}
+
+
 def _emit_request_batch(
     protected_root: Path, slot: str, reviewer, ids: tuple[str, ...], *, generation: int = 1
-) -> None:
-    """FIX-R4-1 test scaffold: retain one immutable request-batch manifest.
+) -> dict[str, str]:
+    """FIX-R4-1 / FIX-R5-2 test scaffold: emit one GENUINE request batch.
 
-    Writes the same manifest structure ``LaneSession.emit_requests`` produces,
-    with request-item digests computed over canonical synthetic request lines,
-    so records built by ``_record`` (which bind generation 1) verify at freeze.
+    Writes the same immutable batch + manifest structure
+    ``LaneSession.emit_requests`` produces — with real request lines whose
+    canonical digests populate ``request_items`` and a recomputed
+    ``request_sha256`` over the actual batch bytes — so the canonical byte
+    verifier accepts it. Returns ``sample_id -> request_item_digest`` so
+    synthetic records can bind the EXACT digest of their own request line.
     """
     import hashlib as _hl
 
+    from evals.calibration.consensus import CONSENSUS_PROTOCOL_VERSION
+    from evals.calibration.ingestion import (
+        LABELING_INSTRUCTIONS,
+        LANE_REQUEST_BATCH_SCHEMA,
+        LANE_REQUEST_SCHEMA,
+        request_item_digest,
+    )
+    from evals.calibration.model_lanes import write_neutral_packet  # noqa: F401 (layout parity)
     from evals.calibration.review import write_protected_file as _wpf
 
-    request_items = {}
+    lines: list[str] = []
+    item_digests: dict[str, str] = {}
+    case_indexes: dict[str, int] = {}
     for index, sid in enumerate(ids):
-        request_items[sid] = {
-            # The synthetic records built by ``_record`` bind ``"d" * 64`` as
-            # their request-item digest; the retained manifest agrees with the
-            # exact digest those records attest.
-            "request_item_digest": "d" * 64,
+        request = {
+            "lane_request_schema": LANE_REQUEST_SCHEMA,
+            "protocol_version": CONSENSUS_PROTOCOL_VERSION,
+            "campaign_id": "campaign",
+            "sampling_manifest_digest": "e" * 64,
+            "source_packet_digest": "f" * 64,
+            "neutral_packet_sha256": "8" * 64,
+            "reviewer_slot": reviewer.reviewer_slot,
+            "reviewer_family": reviewer.reviewer_family,
+            "provider_model_identifier": reviewer.provider_model_identifier,
+            "reviewer_config_digest": reviewer.reviewer_config_digest,
+            "prompt_digest": reviewer.prompt_digest,
+            "label_guide_version": reviewer.label_guide_version,
             "case_index": index,
+            "sample_id": sid,
+            "case": {"sample_id": sid, "content": f"content-{sid}"},
+            "labeling_instructions": LABELING_INSTRUCTIONS,
         }
+        item_digests[sid] = request_item_digest(request)
+        case_indexes[sid] = index
+        lines.append(json.dumps(request, sort_keys=True))
+    payload = ("\n".join(lines) + "\n").encode() if lines else b""
+    _wpf(
+        protected_root / "lanes" / slot / f"lane-requests-{generation:06d}.jsonl",
+        payload,
+    )
     manifest = {
-        "lane_request_batch_schema": "engram-calibration-model-lane-request-batch-206-v2",
+        "lane_request_batch_schema": LANE_REQUEST_BATCH_SCHEMA,
         "generation": generation,
         "reviewer_identity_digest": reviewer.lane_identity_digest(),
+        "reviewer_prompt_digest": reviewer.prompt_digest,
         "neutral_packet_sha256": "8" * 64,
         "accepted_record_digests": {},
         "pending_sample_ids": list(ids),
-        "request_items": request_items,
-        "request_sha256": _hl.sha256(b"synthetic").hexdigest(),
+        "request_items": {
+            sid: {"request_item_digest": item_digests[sid], "case_index": case_indexes[sid]}
+            for sid in ids
+        },
+        "request_sha256": _hl.sha256(payload).hexdigest(),
     }
     _wpf(
         protected_root / "lanes" / slot / f"lane-requests-{generation:06d}.manifest.json",
         (json.dumps(manifest, sort_keys=True) + "\n").encode(),
     )
+    for sid, value in item_digests.items():
+        _EMITTED_ITEM_DIGESTS[(slot, sid)] = value
+    return item_digests
 
 
 # ---------------------------------------------------------------------------
@@ -785,6 +839,10 @@ def _build_campaign(
     records_by_lane = {slot: {} for slot in REVIEWER_SLOTS}
     reviewers = {slot: _reviewer(slot) for slot in REVIEWER_SLOTS}
     lanes = []
+    # FIX-R5-2: emit GENUINE request batches first, so every synthetic record
+    # binds the exact digest of an actually-emitted request line.
+    for slot in REVIEWER_SLOTS:
+        _emit_request_batch(tmp_path, slot, reviewers[slot], ids, generation=1)
     disagreement_sample = ids[0]  # always: one human-queue case per campaign
     for slot in REVIEWER_SLOTS:
         for sample_id in ids:
@@ -842,9 +900,8 @@ def _build_campaign(
     )
     # publish lanes to the protected root with bound raw evidence, then freeze
     for slot in REVIEWER_SLOTS:
-        # FIX-R4-1: retain one immutable request-batch manifest per lane so
-        # freeze's request-binding verification has real evidence.
-        _emit_request_batch(tmp_path, slot, reviewers[slot], ids, generation=1)
+        # (batches were emitted at construction time so records bind the
+        # exact emitted request-item digests — FIX-R5-2)
         for sid in ids:
             record = records_by_lane[slot][sid]
             _publish_raw(tmp_path, slot, record)
@@ -1613,7 +1670,7 @@ class TestFix6LaneWorkflow:
         return path, manifest_path
 
     def _judged_response(self, sample_id: str, lane_root: Path | None = None) -> dict:
-        from evals.calibration.ingestion import build_execution_receipt
+        from evals.calibration.ingestion import observe_execution
 
         raw = json.dumps(
             {
@@ -1624,17 +1681,26 @@ class TestFix6LaneWorkflow:
         )
         payload: dict[str, Any] = {
             "sample_id": sample_id,
-            "outcome": "judged",
             "raw_response": raw,
         }
         if lane_root is not None:
-            receipt = build_execution_receipt(
+            reviewer = self._session_reviewer()
+            receipt = observe_execution(
                 lane_root,
-                self._session_reviewer(),
-                sample_id,
-                request_generation=1,
                 campaign_id="campaign",
+                actual_reviewer_slot=reviewer.reviewer_slot,
+                actual_reviewer_family=reviewer.reviewer_family,
+                actual_provider_model_identifier=reviewer.provider_model_identifier,
+                actual_configuration_digest=reviewer.reviewer_config_digest,
+                actual_prompt_digest=reviewer.prompt_digest,
+                sample_id=sample_id,
+                request_generation=1,
+                executor_identity="synthetic-executor-206",
                 executor_status="completed",
+                identity_source="provider_metadata",
+                provider_request_id="req-206-0001",
+                provider_response_id="resp-206-0001",
+                executed_at=NOW,
             )
             payload["execution"] = json.loads(json.dumps(receipt.model_dump(mode="json")))
         return payload
@@ -1715,23 +1781,31 @@ class TestFix6LaneWorkflow:
         session, sampling, packet_path, manifest_path = self._init_lane(tmp_path)
         session.emit_requests(packet_path, sampling=sampling, manifest_path=manifest_path)
         lane_root = tmp_path / "lanes" / "model_a"
-        from evals.calibration.ingestion import build_execution_receipt
+        from evals.calibration.ingestion import observe_execution
 
         def receipt(sid: str, status: str = "completed") -> dict:
-            value = build_execution_receipt(
+            value = observe_execution(
                 lane_root,
-                session.reviewer,
-                sid,
-                request_generation=1,
                 campaign_id="campaign",
+                actual_reviewer_slot=session.reviewer.reviewer_slot,
+                actual_reviewer_family=session.reviewer.reviewer_family,
+                actual_provider_model_identifier=session.reviewer.provider_model_identifier,
+                actual_configuration_digest=session.reviewer.reviewer_config_digest,
+                actual_prompt_digest=session.reviewer.prompt_digest,
+                sample_id=sid,
+                request_generation=1,
+                executor_identity="synthetic-executor-206",
                 executor_status=status,  # type: ignore[arg-type]
+                identity_source="provider_metadata",
+                provider_request_id="req-206-0001",
+                provider_response_id="resp-206-0001",
+                executed_at=NOW,
             )
             return json.loads(json.dumps(value.model_dump(mode="json")))
 
         # FIX-R4-2: a refusal must be carried by the response BYTES
         refused = {
             "sample_id": "s1",
-            "outcome": "refused",
             "raw_response": json.dumps(
                 {"sample_id": "s1", "outcome": "refused", "error_code": "refusal"}
             ),
@@ -1742,7 +1816,6 @@ class TestFix6LaneWorkflow:
         assert record.parse_status == "malformed"
         malformed = {
             "sample_id": "s2",
-            "outcome": "malformed",
             "raw_response": "garbage not json",
             "error_code": "schema-parse-failed",
             "execution": receipt("s2"),
@@ -1752,7 +1825,6 @@ class TestFix6LaneWorkflow:
         assert record.parse_status == "malformed"
         provider_error = {
             "sample_id": "s3",
-            "outcome": "provider_error",
             "error_code": "http-503",
             "execution": receipt("s3", "provider_error"),
         }
@@ -2126,7 +2198,7 @@ class TestFixR2RawEvidence:
         # resume safely: ingesting the identical response reuses the orphan.
         # FIX-R4-1/2: the orphan must BE the parseable response bytes, and the
         # response must carry a truthful execution receipt for an emitted request.
-        from evals.calibration.ingestion import build_execution_receipt
+        from evals.calibration.ingestion import observe_execution
 
         session.emit_requests(packet_path, sampling=sampling, manifest_path=manifest_path)
         orphan_payload = json.dumps(
@@ -2137,18 +2209,26 @@ class TestFixR2RawEvidence:
             }
         ).encode()
         write_protected_file(tmp_path / "lanes" / "model_a" / "raw" / "s1.resp", orphan_payload)
-        receipt = build_execution_receipt(
+        receipt = observe_execution(
             tmp_path / "lanes" / "model_a",
-            session.reviewer,
-            "s1",
-            request_generation=1,
             campaign_id="campaign",
+            actual_reviewer_slot=session.reviewer.reviewer_slot,
+            actual_reviewer_family=session.reviewer.reviewer_family,
+            actual_provider_model_identifier=session.reviewer.provider_model_identifier,
+            actual_configuration_digest=session.reviewer.reviewer_config_digest,
+            actual_prompt_digest=session.reviewer.prompt_digest,
+            sample_id="s1",
+            request_generation=1,
+            executor_identity="synthetic-executor-206",
             executor_status="completed",
+            identity_source="provider_metadata",
+            provider_request_id="req-206-0001",
+            provider_response_id="resp-206-0001",
+            executed_at=NOW,
         )
         record = session.ingest_response(
             {
                 "sample_id": "s1",
-                "outcome": "judged",
                 "raw_response": orphan_payload.decode(),
                 "execution": json.loads(json.dumps(receipt.model_dump(mode="json"))),
             },
@@ -2157,19 +2237,27 @@ class TestFixR2RawEvidence:
         assert record.raw_response_digest is not None
         # a DIFFERENT response for the same orphaned sample is refused (never
         # silently overwrite raw model evidence)
-        conflict_receipt = build_execution_receipt(
+        conflict_receipt = observe_execution(
             tmp_path / "lanes" / "model_a",
-            session.reviewer,
-            "s1",
-            request_generation=1,
             campaign_id="campaign",
+            actual_reviewer_slot=session.reviewer.reviewer_slot,
+            actual_reviewer_family=session.reviewer.reviewer_family,
+            actual_provider_model_identifier=session.reviewer.provider_model_identifier,
+            actual_configuration_digest=session.reviewer.reviewer_config_digest,
+            actual_prompt_digest=session.reviewer.prompt_digest,
+            sample_id="s1",
+            request_generation=1,
+            executor_identity="synthetic-executor-206",
             executor_status="completed",
+            identity_source="provider_metadata",
+            provider_request_id="req-206-0001",
+            provider_response_id="resp-206-0001",
+            executed_at=NOW,
         )
         with pytest.raises(ValueError, match="raw_response_orphan_digest_conflict"):
             session.ingest_response(
                 {
                     "sample_id": "s1",
-                    "outcome": "judged",
                     "raw_response": json.dumps(
                         {
                             "sample_id": "s1",

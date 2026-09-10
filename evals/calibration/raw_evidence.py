@@ -158,6 +158,14 @@ def validate_lane_provenance_with_raw(
     bytes exist and hash to the claimed digest (or are correctly absent for
     provider_error). This is the authority path at freeze, load, and final
     ledger verification.
+
+    FIX-R5-3: request provenance is folded into this one composed validator:
+    the retained request-batch BYTES are re-verified (canonical
+    ``verify_request_batch``) and every accepted record's request binding is
+    re-derived from them, so deleting/mutating the request evidence after
+    lane freeze fails every downstream boundary that uses this path (final
+    ``verify_consensus_ledger`` included). FIX-R5-1: only machine-verified
+    actual executor identity may back a consensus lane at this boundary.
     """
     from evals.calibration.lane_binding import validate_lane_provenance
 
@@ -173,3 +181,16 @@ def validate_lane_provenance_with_raw(
         protected_root=protected_root,
         reviewer_slot=lane.reviewer.reviewer_slot,
     )
+    from evals.calibration.ingestion import (
+        require_machine_verified_execution_identity,
+        verify_lane_request_bindings,
+    )
+
+    verify_lane_request_bindings(
+        lane_root_for(protected_root, lane.reviewer.reviewer_slot),
+        lane.reviewer,
+        records,
+        campaign_id=campaign_id,
+        neutral_packet_sha256=lane.neutral_packet_sha256,
+    )
+    require_machine_verified_execution_identity(records)

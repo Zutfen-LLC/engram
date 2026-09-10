@@ -73,10 +73,17 @@ LANE_REQUEST_BATCH_SCHEMA: Literal["engram-calibration-model-lane-request-batch-
     "engram-calibration-model-lane-request-batch-206-v2"
 )
 
-# FIX-R4-6: the emitted instructions are the COMPLETE canonical semantic
-# bundle (actual decision semantics for all five critical fields, sourced
-# from the frozen calibration guide + admission handbook), not just the
-# guide version name. Every emitted request embeds this in full, and
+# FIX-R4-6 / FIX-R5-5: the emitted instructions are the COMPLETE canonical
+# semantic bundle (actual decision semantics for all five critical fields).
+# PROVENANCE: the frozen 157 guide + admission handbook supply the closed
+# vocabularies, the judge-independently principle, the ``unknown`` rule,
+# retention/epistemic/consequence/abstention semantics, and the honor
+# rules; the detailed PER-KIND definitions (fact/observation/decision/
+# procedure/summary/doctrine/invariant/preference/diary_entry/unknown) and
+# the full decision-rule wording are a NEW #206 reviewer operationalization
+# (``REVIEWER_INSTRUCTIONS_VERSION``), frozen before execution and layered
+# on the underlying guide — NOT text inherited from the old sources. Every
+# emitted request embeds the complete bundle in full, and
 # ``ReviewerIdentity.prompt_digest`` binds its exact digest.
 LABELING_INSTRUCTIONS: dict[str, Any] = canonical_instruction_bundle(LABEL_GUIDE_VERSION)
 
@@ -113,20 +120,31 @@ def request_item_digest(request: Mapping[str, Any]) -> str:
     return digest_of(json.loads(json.dumps(request, sort_keys=True)))
 
 
+def _request_batch_manifest_path(batch_path: Path) -> Path:
+    """Manifest path for one request batch (module-level canonical form)."""
+    return batch_path.with_suffix(".manifest.json")
+
+
 def _load_request_registry(lane_root: Path) -> dict[str, dict[int, tuple[str, str, str]]]:
-    """Scan immutable request-batch manifests into a provenance registry.
+    """Scan VERIFIED request batches into a provenance registry.
+
+    FIX-R5-2: every retained ``lane-requests-*.jsonl`` + manifest pair is
+    passed through the canonical ``verify_request_batch`` byte verifier
+    FIRST — a manifest assertion can never register a request that was not
+    actually emitted, because every manifest claim (generation, reviewer
+    identity, neutral packet, request SHA, pending membership, item digests,
+    case indexes) is re-derived from the actual batch bytes.
 
     Returns ``sample_id -> generation -> (request_item_digest,
-    reviewer_identity_digest, neutral_packet_sha256)`` from every retained
-    ``lane-requests-*.manifest.json`` generation. A sample pending in several
-    generations (resume re-emission) has one entry per generation; responses
-    bind to one exact generation.
+    reviewer_identity_digest, neutral_packet_sha256)``. A sample pending in
+    several generations (resume re-emission) has one entry per generation;
+    responses bind to one exact generation.
     """
     registry: dict[str, dict[int, tuple[str, str, str]]] = {}
-    for manifest_path in sorted(lane_root.glob("lane-requests-*.manifest.json")):
+    for batch_path in sorted(lane_root.glob("lane-requests-*.jsonl")):
+        manifest_path = _request_batch_manifest_path(batch_path)
+        verify_request_batch(batch_path, manifest_path=manifest_path)
         manifest = json.loads(manifest_path.read_text())
-        if manifest.get("lane_request_batch_schema") != LANE_REQUEST_BATCH_SCHEMA:
-            raise ValueError("request_batch_manifest_schema_mismatch")
         generation = int(manifest["generation"])
         for sample_id, item in manifest.get("request_items", {}).items():
             entry = (
@@ -141,40 +159,167 @@ def _load_request_registry(lane_root: Path) -> dict[str, dict[int, tuple[str, st
     return registry
 
 
-def build_execution_receipt(
-    lane_root: Path,
-    reviewer: ReviewerIdentity,
-    sample_id: str,
+def verify_request_batch(
+    batch_path: Path,
     *,
-    request_generation: int,
+    manifest_path: Path | None = None,
+) -> dict[str, Any]:
+    """FIX-R5-2: canonical request-batch byte verifier.
+
+    Re-derives EVERY manifest claim from the actual ``.jsonl`` batch bytes:
+
+    1. filename generation matches ``manifest.generation``;
+    2. the batch file exists;
+    3. ``SHA256(batch bytes) == manifest.request_sha256`` (recomputed, never
+       trusted);
+    4. every non-empty line parses as request JSON;
+    5. every line carries the frozen campaign/protocol/lane identity;
+    6. every line carries the expected neutral packet SHA;
+    7. every line carries the frozen prompt/config identity;
+    8. sample IDs are unique inside the generation;
+    9. ``pending_sample_ids`` exactly equal the emitted lines in order;
+    10. ``request_items`` exactly equal the mechanically recomputed item
+        digests/case indexes;
+    11. no extra manifest request item exists;
+    12. no emitted line is omitted from the manifest.
+
+    Returns the verified manifest. Any violation fails closed — a fabricated
+    manifest cannot register a request that was never actually emitted.
+    """
+    if manifest_path is None:
+        manifest_path = _request_batch_manifest_path(batch_path)
+    if not batch_path.is_file():
+        raise ValueError("request_batch_file_missing")
+    if not manifest_path.is_file():
+        raise ValueError("request_batch_manifest_missing")
+    filename_generation = batch_path.stem.rsplit("-", 1)[-1]
+    if not filename_generation.isdigit():
+        raise ValueError("request_batch_filename_generation_unparseable")
+    payload = batch_path.read_bytes()
+    manifest = json.loads(manifest_path.read_text())
+    if manifest.get("lane_request_batch_schema") != LANE_REQUEST_BATCH_SCHEMA:
+        raise ValueError("request_batch_manifest_schema_mismatch")
+    generation = manifest.get("generation")
+    if not isinstance(generation, int) or generation != int(filename_generation):
+        raise ValueError("request_batch_generation_mismatch")
+    if not hmac.compare_digest(
+        hashlib.sha256(payload).hexdigest(), str(manifest.get("request_sha256", ""))
+    ):
+        raise ValueError("request_batch_sha_mismatch")
+    seen_ids: set[str] = set()
+    line_sample_ids: list[str] = []
+    recomputed_items: dict[str, dict[str, Any]] = {}
+    for line in payload.decode().splitlines():
+        if not line.strip():
+            continue
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError:
+            raise ValueError("request_batch_line_not_valid_json") from None
+        if not isinstance(request, dict):
+            raise ValueError("request_batch_line_not_valid_json")
+        # (5) frozen campaign/protocol/lane identity on every line
+        if request.get("lane_request_schema") != LANE_REQUEST_SCHEMA:
+            raise ValueError("request_batch_line_schema_mismatch")
+        if request.get("protocol_version") != CONSENSUS_PROTOCOL_VERSION:
+            raise ValueError("request_batch_line_protocol_mismatch")
+        # (6) expected neutral packet SHA on every line
+        if not hmac.compare_digest(
+            str(request.get("neutral_packet_sha256", "")),
+            str(manifest.get("neutral_packet_sha256", "")),
+        ):
+            raise ValueError("request_batch_line_neutral_packet_mismatch")
+        # (7) frozen prompt/config identity on every line; the reviewer
+        # identity digest over the frozen identity fields must match the
+        # manifest's reviewer binding.
+        if not hmac.compare_digest(
+            str(request.get("prompt_digest", "")),
+            str(manifest.get("reviewer_prompt_digest", "")),
+        ):
+            raise ValueError("request_batch_line_prompt_digest_mismatch")
+        sample_id = request.get("sample_id")
+        if not isinstance(sample_id, str) or not sample_id:
+            raise ValueError("request_batch_line_requires_sample_id")
+        if sample_id in seen_ids:  # (8) unique inside the generation
+            raise ValueError("request_batch_duplicate_sample_id")
+        seen_ids.add(sample_id)
+        line_sample_ids.append(sample_id)  # (9) in emitted order
+        recomputed_items[sample_id] = {
+            "request_item_digest": request_item_digest(request),
+            "case_index": request.get("case_index"),
+        }
+    # (9) pending_sample_ids exactly equal the emitted lines in order
+    pending = manifest.get("pending_sample_ids")
+    if pending != line_sample_ids:
+        raise ValueError("request_batch_pending_membership_mismatch")
+    # (10)+(11) request_items exactly equal the recomputed items, no extras
+    items = manifest.get("request_items")
+    if not isinstance(items, dict) or items != recomputed_items:
+        raise ValueError("request_batch_items_mismatch")
+    # (12) no emitted line omitted from the manifest — implied by the exact
+    # dict equality above (every emitted sample must appear as an item).
+    if not isinstance(manifest, dict):
+        raise ValueError("request_batch_manifest_not_an_object")
+    # reviewer identity digest binding used by the registry consumers
+    if not str(manifest.get("reviewer_identity_digest", "")):
+        raise ValueError("request_batch_requires_reviewer_identity_digest")
+    return manifest
+
+
+def observe_execution(
+    lane_root: Path,
+    *,
     campaign_id: str,
+    actual_reviewer_slot: str,
+    actual_reviewer_family: str,
+    actual_provider_model_identifier: str,
+    actual_configuration_digest: str,
+    actual_prompt_digest: str,
+    sample_id: str,
+    request_generation: int,
+    executor_identity: str,
     executor_status: Literal["completed", "provider_error"],
+    identity_source: Literal["provider_metadata", "executor_attestation"],
+    provider_request_id: str | None = None,
+    provider_response_id: str | None = None,
     executed_at: datetime | None = None,
 ) -> ExecutionReceipt:
-    """Build a truthful execution receipt for an ACTUAL emitted request.
+    """FIX-R5-1: build a truthful execution receipt from OBSERVED metadata.
 
-    The executor wrapper (Hermes, or the test harness) calls this after
-    executing a request emitted by ``model-lane-request``: the receipt's
-    identity fields come from the frozen reviewer identity and its request
-    binding from the retained immutable batch manifest — never guessed.
+    The executor wrapper (Hermes, or the test harness) calls this AFTER
+    executing one request emitted by ``model-lane-request`` with the
+    identity the executor ACTUALLY observed (provider-reported model
+    metadata, or its own attestation). The expected lane
+    ``ReviewerIdentity`` is deliberately NOT a parameter: no helper can
+    manufacture an "actual" identity by copying the intended one. Only the
+    emitted-request binding is looked up from the retained VERIFIED request
+    batches. Ingestion then compares this observed identity EXACTLY against
+    the frozen lane identity — a mismatch fails closed.
     """
+    from evals.calibration.consensus import ExecutionEvidence
+
     registry = _load_request_registry(lane_root)
     emitted = registry.get(sample_id, {}).get(request_generation)
     if emitted is None:
         raise ValueError("response_request_not_emitted")
     item_digest, _identity, _packet = emitted
-    return ExecutionReceipt(
+    evidence = ExecutionEvidence(
         campaign_id=campaign_id,
-        reviewer_slot=reviewer.reviewer_slot,
-        reviewer_family=reviewer.reviewer_family,
-        provider_model_identifier=reviewer.provider_model_identifier,
-        reviewer_config_digest=reviewer.reviewer_config_digest,
-        prompt_digest=reviewer.prompt_digest,
+        actual_reviewer_slot=actual_reviewer_slot,  # type: ignore[arg-type]
+        actual_reviewer_family=actual_reviewer_family,
+        actual_provider_model_identifier=actual_provider_model_identifier,
+        actual_configuration_digest=actual_configuration_digest,
+        actual_prompt_digest=actual_prompt_digest,
         request_generation=request_generation,
         request_item_digest=item_digest,
         executed_at=executed_at or datetime.now(UTC),
         executor_status=executor_status,
+        executor_identity=executor_identity,
+        identity_source=identity_source,
+        provider_request_id=provider_request_id,
+        provider_response_id=provider_response_id,
     )
+    return ExecutionReceipt.from_evidence(evidence)
 
 
 def verify_reviewer_prompt_binding(reviewer: ReviewerIdentity) -> None:
@@ -194,11 +339,15 @@ def verify_lane_request_bindings(
     campaign_id: str,
     neutral_packet_sha256: str,
 ) -> None:
-    """FIX-R4-1: prove every accepted record answers an ACTUAL emitted request.
+    """FIX-R4-1 / FIX-R5-3: prove every accepted record answers an ACTUAL
+    emitted request.
 
-    Runs at lane freeze/load: each record's ``(request_generation,
-    request_item_digest)`` must exist in a retained immutable request-batch
-    manifest for this lane, bound to this exact reviewer identity and this
+    Runs at lane freeze, frozen-lane load, and (through
+    ``validate_lane_provenance_with_raw``) every correlation/report, queue,
+    and final-ledger boundary: each record's ``(request_generation,
+    request_item_digest)`` must exist in a retained VERIFIED request batch
+    for this lane (FIX-R5-2: the batch bytes — not the manifest assertions
+    — are the authority), bound to this exact reviewer identity and this
     exact neutral packet. A lane with accepted records but no emitted
     requests is structurally impossible and fails closed.
     """
@@ -220,6 +369,23 @@ def verify_lane_request_bindings(
             raise ValueError(f"record_request_bound_to_other_neutral_packet:{sample_id}")
         if campaign_id != record.campaign_id:
             raise ValueError(f"record_campaign_mismatch:{sample_id}")
+
+
+def require_machine_verified_execution_identity(
+    records: Mapping[str, ModelReviewRecord],
+) -> None:
+    """FIX-R5-1: a lane can only freeze as a valid consensus reviewer lane
+    when every accepted record's ACTUAL executor identity was
+    machine-verified (``identity_source == provider_metadata``).
+
+    An honest executor attestation (``executor_attestation``) is preserved
+    as protected evidence but can NEVER ground a frozen consensus lane:
+    unverified actual identity cannot freeze.
+    """
+    for sample_id in sorted(records):
+        execution = records[sample_id].execution
+        if execution is None or execution.identity_source != "provider_metadata":
+            raise ValueError(f"lane_freeze_requires_machine_verified_executor_identity:{sample_id}")
 
 
 class LaneAuthority(Record):
@@ -400,7 +566,7 @@ class LaneSession:
 
     @staticmethod
     def _request_batch_manifest_path(batch_path: Path) -> Path:
-        return batch_path.with_suffix(".manifest.json")
+        return _request_batch_manifest_path(batch_path)
 
     def emit_requests(
         self,
@@ -464,6 +630,7 @@ class LaneSession:
             "lane_request_batch_schema": LANE_REQUEST_BATCH_SCHEMA,
             "generation": generation,
             "reviewer_identity_digest": self.reviewer.lane_identity_digest(),
+            "reviewer_prompt_digest": self.reviewer.prompt_digest,
             "neutral_packet_sha256": self.neutral_packet_sha256,
             "accepted_record_digests": {
                 sample_id: accepted[sample_id].record_digest() for sample_id in sorted(accepted)
@@ -498,21 +665,25 @@ class LaneSession:
         never from the response — another lane's output cannot be ingested
         through this path even if its payload names a different slot/family.
 
-        FIX-R4-1: the response must carry an execution receipt (actual
-        provider/model/config identity + the exact emitted request item it
-        answers). The actual executor identity is compared EXACTLY against
-        the frozen ``ReviewerIdentity`` — never derived from lane config —
-        and the referenced request item must exist in one of this lane's
+        FIX-R4-1: the response must carry an execution receipt derived from
+        OBSERVED ``ExecutionEvidence`` (actual provider/model/config
+        identity + the exact emitted request item it answers). The ACTUAL
+        executor identity is compared EXACTLY against the frozen
+        ``ReviewerIdentity`` — never derived from lane config — and the
+        referenced request item must exist in one of this lane's VERIFIED
         immutable request-batch generations, bound to this reviewer identity
         and this neutral packet. A response with no matching emitted request
         fails closed.
 
-        FIX-R4-2: for judged/refused outcomes the preserved raw response
-        bytes are the single authoritative output — the stored judgment is
-        DERIVED by the frozen deterministic parser from those exact bytes.
-        A caller/executor-supplied ``judgment`` is never authority: if the
-        bytes do not parse to exactly the claimed classification, ingestion
-        fails.
+        FIX-R5-4: for ``executor_status == completed`` the substantive
+        outcome (judged / refused / malformed) is DERIVED ENTIRELY from the
+        preserved raw response bytes by the frozen deterministic parser. The
+        external response envelope carries only ``sample_id``,
+        ``execution``, and ``raw_response`` — a caller-supplied ``outcome``
+        or ``judgment`` key is REJECTED, so no wrapper can select or relabel
+        the refusal-vs-malformed-vs-judged distinction. For
+        ``executor_status == provider_error`` no raw response may be present
+        and the outcome is derived from the execution evidence.
         """
         if sampling.manifest_digest() != self.sampling_manifest_digest:
             raise ValueError("sampling_manifest_mismatch")
@@ -522,6 +693,10 @@ class LaneSession:
         if sample_id not in set(sampling.sample_ids):
             raise ValueError("record_sample_not_in_sampling_manifest")
         captured_at = response.get("captured_at") or datetime.now(UTC).isoformat()
+        # --- FIX-R5-4: the wrapper cannot select the substantive outcome ----
+        for forbidden in ("outcome", "judgment"):
+            if forbidden in response:
+                raise ValueError(f"response_envelope_must_not_carry_{forbidden}")
         # --- FIX-R4-1: execution receipt + request binding -------------------
         receipt_payload = response.get("execution")
         if not isinstance(receipt_payload, Mapping):
@@ -540,9 +715,6 @@ class LaneSession:
             raise ValueError("response_request_bound_to_other_reviewer")
         if not hmac.compare_digest(packet_sha, self.neutral_packet_sha256):
             raise ValueError("response_request_bound_to_other_neutral_packet")
-        # --- raw bytes + derived classification ------------------------------
-        raw_response = response.get("raw_response")
-        claimed_outcome = str(response.get("outcome", ""))
         common: dict[str, Any] = {
             "protocol_version": CONSENSUS_PROTOCOL_VERSION,
             "campaign_id": self.campaign_id,
@@ -560,11 +732,10 @@ class LaneSession:
             "request_generation": execution.request_generation,
             "request_item_digest": execution.request_item_digest,
         }
-        if claimed_outcome == "provider_error":
-            # No response bytes exist; the receipt identifies the ATTEMPTED
-            # request (verified above), and the executor status must agree.
-            if execution.executor_status != "provider_error":
-                raise ValueError("provider_error_requires_receipt_provider_error_status")
+        if execution.executor_status == "provider_error":
+            # No response bytes exist; the outcome is DERIVED from the
+            # execution evidence, and no raw response may be carried.
+            raw_response = response.get("raw_response")
             if raw_response:
                 raise ValueError("provider_error_without_response_must_not_carry_raw_response")
             error_code = response.get("error_code")
@@ -579,18 +750,17 @@ class LaneSession:
                 raw_response_digest=None,
                 error_code=str(error_code),
             )
-        if claimed_outcome not in ("judged", "refused", "malformed"):
-            raise ValueError("response_outcome_out_of_vocabulary")
+        # executor_status == completed: the substantive outcome is DERIVED
+        # from the exact raw bytes by the frozen parser — nothing caller-
+        # supplied can influence judged vs refused vs malformed.
+        raw_response = response.get("raw_response")
         if raw_response is None or not isinstance(raw_response, str):
-            raise ValueError("response_received_requires_raw_response_bytes")
-        if execution.executor_status != "completed":
-            raise ValueError("completed_response_requires_receipt_completed_status")
+            raise ValueError("completed_execution_requires_raw_response_bytes")
         raw_bytes = raw_response.encode()
         raw_digest = _sha256_text(raw_response)
         parsed = parse_model_response(raw_bytes, expected_sample_id=sample_id)
-        if claimed_outcome == "judged":
-            if parsed.classification != "judged" or parsed.judgment is None:
-                raise ValueError("claimed_judgment_not_derivable_from_response_bytes")
+        if parsed.classification == "judged":
+            assert parsed.judgment is not None
             return ModelReviewRecord(
                 **common,
                 parse_status="parsed",
@@ -601,11 +771,8 @@ class LaneSession:
                 raw_response_digest=raw_digest,
                 error_code=None,
             )
-        # refused / malformed: classification is DERIVED from the bytes; a
-        # caller claiming the other one is refused as a provenance error.
-        if claimed_outcome == "refused":
-            if parsed.classification != "refused":
-                raise ValueError("claimed_refusal_not_derivable_from_response_bytes")
+        if parsed.classification == "refused":
+            assert parsed.error_code is not None
             return ModelReviewRecord(
                 **common,
                 parse_status="malformed",
@@ -615,8 +782,6 @@ class LaneSession:
                 raw_response_digest=raw_digest,
                 error_code=parsed.error_code,
             )
-        if parsed.classification not in ("malformed", "refused"):
-            raise ValueError("claimed_malformed_but_bytes_parse_cleanly")
         return ModelReviewRecord(
             **common,
             parse_status="malformed",

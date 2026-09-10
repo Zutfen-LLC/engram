@@ -170,19 +170,48 @@ def _setup_lane(tmp_path: Path):
 
 
 def _receipt(session: LaneSession, sample_id: str, **overrides) -> dict:
-    from evals.calibration.ingestion import build_execution_receipt
+    """FIX-R5-1: receipts are built from OBSERVED executor metadata.
 
-    base = build_execution_receipt(
+    Defaults observe the lane's own identity (the synthetic executor was
+    configured for this lane); adversarial overrides replace one OBSERVED
+    value with a genuinely different executor observation. The item digest
+    is always derived from the VERIFIED request-batch registry — never
+    caller-asserted.
+    """
+    from evals.calibration.ingestion import observe_execution
+
+    observed_keys = {
+        "reviewer_family": "actual_reviewer_family",
+        "reviewer_slot": "actual_reviewer_slot",
+        "provider_model_identifier": "actual_provider_model_identifier",
+        "reviewer_config_digest": "actual_configuration_digest",
+        "prompt_digest": "actual_prompt_digest",
+    }
+    observed = {
+        "actual_reviewer_slot": session.reviewer.reviewer_slot,
+        "actual_reviewer_family": session.reviewer.reviewer_family,
+        "actual_provider_model_identifier": session.reviewer.provider_model_identifier,
+        "actual_configuration_digest": session.reviewer.reviewer_config_digest,
+        "actual_prompt_digest": session.reviewer.prompt_digest,
+    }
+    for key, observed_key in observed_keys.items():
+        if key in overrides:
+            observed[observed_key] = overrides.pop(key)
+    receipt = observe_execution(
         session.lane_root,
-        session.reviewer,
-        sample_id,
-        request_generation=1,
         campaign_id="campaign",
-        executor_status="completed",
+        sample_id=sample_id,
+        request_generation=overrides.pop("request_generation", 1),
+        executor_status=overrides.pop("executor_status", "completed"),
+        identity_source=overrides.pop("identity_source", "provider_metadata"),
+        executor_identity=overrides.pop("executor_identity", "synthetic-executor-206"),
+        provider_request_id=overrides.pop("provider_request_id", "req-206-0001"),
+        provider_response_id=overrides.pop("provider_response_id", "resp-206-0001"),
         executed_at=NOW,
+        **observed,
     )
-    payload = json.loads(json.dumps(base.model_dump(mode="json")))
-    payload.update(overrides)
+    payload = json.loads(json.dumps(receipt.model_dump(mode="json")))
+    assert not overrides, f"unmapped receipt overrides: {sorted(overrides)}"
     return payload
 
 
@@ -277,7 +306,6 @@ class TestFixR41ExecutionReceipts:
         record = session.ingest_response(
             {
                 "sample_id": "s1",
-                "outcome": "judged",
                 "raw_response": _raw_judgment("s1"),
                 "execution": _receipt(session, "s1"),
             },
@@ -290,19 +318,20 @@ class TestFixR41ExecutionReceipts:
 
     def test_gpt_receipt_submitted_to_claude_lane_fails(self, tmp_path: Path):
         session, sampling, _, _ = _setup_lane(tmp_path)
-        wrong = _receipt(session, "s1")
-        wrong.update(
-            {
-                "reviewer_family": "gpt-astra",
-                "reviewer_slot": "model_b",
-                "provider_model_identifier": "gpt-astra-impostor",
-            }
+        # FIX-R5-1: the OBSERVED execution metadata names GPT for the Claude
+        # lane — the receipt is built from the observation and then compared
+        # EXACTLY against the frozen expected identity, so ingestion fails.
+        wrong = _receipt(
+            session,
+            "s1",
+            reviewer_family="gpt-astra",
+            reviewer_slot="model_b",
+            provider_model_identifier="gpt-astra-impostor",
         )
         with pytest.raises(ValueError, match="execution_receipt_identity_mismatch"):
             session.ingest_response(
                 {
                     "sample_id": "s1",
-                    "outcome": "judged",
                     "raw_response": _raw_judgment("s1"),
                     "execution": wrong,
                 },
@@ -316,7 +345,6 @@ class TestFixR41ExecutionReceipts:
             session.ingest_response(
                 {
                     "sample_id": "s1",
-                    "outcome": "judged",
                     "raw_response": _raw_judgment("s1"),
                     "execution": wrong,
                 },
@@ -330,7 +358,6 @@ class TestFixR41ExecutionReceipts:
             session.ingest_response(
                 {
                     "sample_id": "s1",
-                    "outcome": "judged",
                     "raw_response": _raw_judgment("s1"),
                     "execution": wrong,
                 },
@@ -343,7 +370,6 @@ class TestFixR41ExecutionReceipts:
             session.ingest_response(
                 {
                     "sample_id": "s1",
-                    "outcome": "judged",
                     "raw_response": _raw_judgment("s1"),
                 },
                 sampling=sampling,
@@ -352,20 +378,25 @@ class TestFixR41ExecutionReceipts:
     def test_never_requested_sample_fails(self, tmp_path: Path):
         """A frozen-manifest sample with NO emitted request cannot be ingested."""
         session, sampling, _, _ = _setup_lane(tmp_path)
-        # request a DIFFERENT pending sample's digest but present it for s2
-        # by forging the binding: s2 has an emitted request (all did), so
-        # instead target the never-emitted case: delete s3's manifest entry.
-        # Simplest honest proof: use a generation that was never emitted.
-        never = _receipt(session, "s1", request_generation=99)
+        # FIX-R5-1: a generation that was never emitted cannot even produce a
+        # receipt (the observation helper refuses to bind one), and a forged
+        # payload naming it is rejected at ingest.
+        from evals.calibration.ingestion import observe_execution
+
         with pytest.raises(ValueError, match="response_request_not_emitted"):
-            session.ingest_response(
-                {
-                    "sample_id": "s1",
-                    "outcome": "judged",
-                    "raw_response": _raw_judgment("s1"),
-                    "execution": never,
-                },
-                sampling=sampling,
+            observe_execution(
+                session.lane_root,
+                campaign_id="campaign",
+                actual_reviewer_slot="model_a",
+                actual_reviewer_family="claude-opus",
+                actual_provider_model_identifier=session.reviewer.provider_model_identifier,
+                actual_configuration_digest=session.reviewer.reviewer_config_digest,
+                actual_prompt_digest=session.reviewer.prompt_digest,
+                sample_id="s1",
+                request_generation=99,
+                executor_identity="synthetic-executor-206",
+                executor_status="completed",
+                identity_source="provider_metadata",
             )
 
     def test_other_generation_binding_fails_after_partial_ingest(self, tmp_path: Path):
@@ -374,7 +405,6 @@ class TestFixR41ExecutionReceipts:
         session.ingest_response(
             {
                 "sample_id": "s1",
-                "outcome": "judged",
                 "raw_response": _raw_judgment("s1"),
                 "execution": _receipt(session, "s1"),
             },
@@ -388,12 +418,14 @@ class TestFixR41ExecutionReceipts:
         forged["request_generation"] = 2  # s1 was never emitted in generation 2
         with pytest.raises(
             ValueError,
-            match="response_request_not_emitted|response_request_item_digest_mismatch",
+            match=(
+                "response_request_not_emitted|response_request_item_digest_mismatch"
+                "|execution_receipt_not_derived_from_its_evidence"
+            ),
         ):
             session.ingest_response(
                 {
                     "sample_id": "s1",
-                    "outcome": "judged",
                     "raw_response": _raw_judgment("s1"),
                     "execution": forged,
                 },
@@ -402,13 +434,15 @@ class TestFixR41ExecutionReceipts:
 
     def test_request_item_from_other_lane_fails(self, tmp_path: Path):
         session, sampling, _, _ = _setup_lane(tmp_path)
-        # a receipt whose identity digest binds another reviewer's manifest
+        # FIX-R5-2: a fabricated manifest alone can no longer register a
+        # request — there is no batch FILE behind it, so the canonical byte
+        # verifier rejects the whole manifest before any response can bind.
         other = _reviewer("model_b")
-        # fabricate a manifest entry bound to model_b under a second manifest
         other_manifest = {
             "lane_request_batch_schema": "engram-calibration-model-lane-request-batch-206-v2",
             "generation": 2,
             "reviewer_identity_digest": other.lane_identity_digest(),
+            "reviewer_prompt_digest": session.reviewer.prompt_digest,
             "neutral_packet_sha256": session.neutral_packet_sha256,
             "accepted_record_digests": {},
             "pending_sample_ids": ["s2"],
@@ -421,25 +455,29 @@ class TestFixR41ExecutionReceipts:
             session.lane_root / "lane-requests-000002.manifest.json",
             (json.dumps(other_manifest, sort_keys=True) + "\n").encode(),
         )
-        with pytest.raises(ValueError, match="response_request_bound_to_other_reviewer"):
+        # FIX-R5-2: a fabricated manifest alone can no longer register a
+        # request — the registry is built from VERIFIED batch FILES, so a
+        # manifest with no batch behind it is invisible and the response has
+        # no emitted request to bind to.
+        with pytest.raises(ValueError, match="response_request_not_emitted"):
             session.ingest_response(
                 {
                     "sample_id": "s2",
-                    "outcome": "judged",
                     "raw_response": _raw_judgment("s2"),
-                    "execution": _receipt(
-                        session, "s2", request_generation=2, request_item_digest="e" * 64
-                    ),
+                    "execution": _receipt(session, "s2", request_generation=2),
                 },
                 sampling=sampling,
             )
 
     def test_request_item_from_other_neutral_packet_fails(self, tmp_path: Path):
         session, sampling, _, _ = _setup_lane(tmp_path)
+        # FIX-R5-2: same shape — a manifest claiming a different neutral
+        # packet has no batch bytes and fails the canonical verifier.
         other_packet_manifest = {
             "lane_request_batch_schema": "engram-calibration-model-lane-request-batch-206-v2",
             "generation": 2,
             "reviewer_identity_digest": session.reviewer.lane_identity_digest(),
+            "reviewer_prompt_digest": session.reviewer.prompt_digest,
             "neutral_packet_sha256": "f" * 64,  # DIFFERENT packet
             "accepted_record_digests": {},
             "pending_sample_ids": ["s2"],
@@ -452,15 +490,15 @@ class TestFixR41ExecutionReceipts:
             session.lane_root / "lane-requests-000002.manifest.json",
             (json.dumps(other_packet_manifest, sort_keys=True) + "\n").encode(),
         )
-        with pytest.raises(ValueError, match="response_request_bound_to_other_neutral_packet"):
+        # FIX-R5-2: same shape — a manifest claiming a different neutral
+        # packet has no batch bytes, is invisible to the registry, and the
+        # response has no emitted request to bind to.
+        with pytest.raises(ValueError, match="response_request_not_emitted"):
             session.ingest_response(
                 {
                     "sample_id": "s2",
-                    "outcome": "judged",
                     "raw_response": _raw_judgment("s2"),
-                    "execution": _receipt(
-                        session, "s2", request_generation=2, request_item_digest="e" * 64
-                    ),
+                    "execution": _receipt(session, "s2", request_generation=2),
                 },
                 sampling=sampling,
             )
@@ -470,7 +508,6 @@ class TestFixR41ExecutionReceipts:
         record = session.ingest_response(
             {
                 "sample_id": "s1",
-                "outcome": "provider_error",
                 "error_code": "http-503",
                 "execution": _receipt(session, "s1", executor_status="provider_error"),
             },
@@ -478,14 +515,13 @@ class TestFixR41ExecutionReceipts:
         )
         assert record.parse_status == "absent"
         assert record.request_item_digest is not None  # attempted request identified
-        # a provider_error receipt claiming completed status fails
-        with pytest.raises(
-            ValueError, match="provider_error_requires_receipt_provider_error_status"
-        ):
+        # FIX-R5-4: a completed execution REQUIRES raw response bytes — an
+        # envelope with none fails deterministically (no caller-selected
+        # outcome can rescue it).
+        with pytest.raises(ValueError, match="completed_execution_requires_raw_response_bytes"):
             session.ingest_response(
                 {
                     "sample_id": "s2",
-                    "outcome": "provider_error",
                     "error_code": "http-503",
                     "execution": _receipt(session, "s2", executor_status="completed"),
                 },
@@ -521,7 +557,6 @@ class TestFixR42DerivedJudgment:
         record = session.ingest_response(
             {
                 "sample_id": "s1",
-                "outcome": "judged",
                 "raw_response": _raw_judgment("s1", {**GOOD_CRITICAL, "expected_kind": "decision"}),
                 "execution": _receipt(session, "s1"),
             },
@@ -529,17 +564,19 @@ class TestFixR42DerivedJudgment:
         )
         assert record.judgment is not None
         assert record.judgment.fields["expected_kind"] == "decision"  # derived from bytes
-        # mutating the BYTES (keeping the claim) makes ingestion fail:
-        with pytest.raises(ValueError, match="claimed_judgment_not_derivable_from_response_bytes"):
-            session.ingest_response(
-                {
-                    "sample_id": "s2",
-                    "outcome": "judged",
-                    "raw_response": "not json at all",
-                    "execution": _receipt(session, "s2"),
-                },
-                sampling=sampling,
-            )
+        # FIX-R5-4: unparseable bytes on a COMPLETED execution become the
+        # frozen failure state `malformed` — deterministically derived, not
+        # caller-selected.
+        malformed = session.ingest_response(
+            {
+                "sample_id": "s2",
+                "raw_response": "not json at all",
+                "execution": _receipt(session, "s2"),
+            },
+            sampling=sampling,
+        )
+        assert malformed.outcome_status == "malformed"
+        assert malformed.parse_status == "malformed"
 
     def test_mutated_judgment_without_changing_bytes_fails_at_freeze(self, tmp_path: Path):
         """A record whose stored judgment disagrees with its own preserved
@@ -548,7 +585,6 @@ class TestFixR42DerivedJudgment:
         record = session.ingest_response(
             {
                 "sample_id": "s1",
-                "outcome": "judged",
                 "raw_response": _raw_judgment("s1"),
                 "execution": _receipt(session, "s1"),
             },
@@ -574,7 +610,6 @@ class TestFixR42DerivedJudgment:
         record = session.ingest_response(
             {
                 "sample_id": "s1",
-                "outcome": "judged",
                 "raw_response": _raw_judgment("s1"),
                 "execution": _receipt(session, "s1"),
             },

@@ -240,26 +240,98 @@ class ModelJudgment(Record):
         return {name: self.fields[name] for name in CRITICAL_FIELDS}
 
 
-class ExecutionReceipt(Record):
-    """FIX-R4-1: immutable proof of which executor actually produced a response.
+class ExecutionEvidence(Record):
+    """FIX-R5-1: OBSERVED execution identity, supplied by the executor.
 
-    Reported by the execution wrapper per response — NOT derived from the
-    lane configuration. Every field is compared for exact equality against
-    the frozen ``ReviewerIdentity`` at ingestion, freeze, load, and final
-    ledger verification, so a response produced by any other provider, model
-    version, configuration, or prompt can never be accepted into this lane.
+    Every ``actual_*`` field describes the executor that REALLY produced the
+    response — provider-reported metadata when the runtime exposes it, or an
+    explicitly-marked ``executor_attestation`` when it cannot. These values
+    are NEVER derived from (or copied out of) the expected lane
+    ``ReviewerIdentity``: the executor wrapper observes them independently at
+    execution time.
 
-    ``request_binding`` additionally ties the response to one exact emitted
-    request item: the immutable batch generation and the canonical digest of
-    the emitted request item (see ``request_item_digest`` in
-    ``evals.calibration.ingestion``). Provider-error responses reference the
+    ``request_generation`` / ``request_item_digest`` tie the execution to one
+    exact emitted request item (immutable batch generation + canonical digest
+    of the emitted request line; see ``verify_request_batch`` in
+    ``evals.calibration.ingestion``). Provider-error executions reference the
     attempted request the same way.
+
+    ``identity_source`` records HOW the actual identity was observed:
+
+    - ``provider_metadata``: machine-verifiable provider request/response IDs
+      bind the reported model identity. REQUIRED for a lane to freeze —
+      only machine-verified execution identity can ground a consensus
+      reviewer lane;
+    - ``executor_attestation``: the executor attests the identity but the
+      environment cannot machine-verify it. An honest, protected
+      representation — ingestible and preserved, but a lane carrying one can
+      NEVER freeze as a valid consensus reviewer lane.
     """
 
-    receipt_schema: Literal["engram-calibration-execution-receipt-206-v1"] = (
-        "engram-calibration-execution-receipt-206-v1"
+    evidence_schema: Literal["engram-calibration-execution-evidence-206-v1"] = (
+        "engram-calibration-execution-evidence-206-v1"
     )
     campaign_id: str
+    actual_reviewer_slot: SlotName
+    actual_reviewer_family: str
+    actual_provider_model_identifier: ModelIdentifier
+    actual_configuration_digest: Digest
+    actual_prompt_digest: Digest
+    request_generation: int = Field(ge=1)
+    request_item_digest: Digest
+    executed_at: AwareDatetime
+    executor_status: Literal["completed", "provider_error"]
+    # Executor/session/run identity — who actually executed the request.
+    executor_identity: str
+    identity_source: Literal["provider_metadata", "executor_attestation"]
+    # Optional provider-reported request/response IDs, preserved and bound.
+    provider_request_id: str | None = None
+    provider_response_id: str | None = None
+
+    @model_validator(mode="after")
+    def evidence_contract(self) -> Self:
+        if FAMILY_BY_SLOT[self.actual_reviewer_slot] != self.actual_reviewer_family:
+            raise ValueError("actual_family_does_not_match_attested_slot")
+        if self.identity_source == "provider_metadata" and not (
+            self.provider_request_id or self.provider_response_id
+        ):
+            raise ValueError("provider_metadata_identity_requires_provider_ids")
+        if not self.executor_identity:
+            raise ValueError("execution_evidence_requires_executor_identity")
+        return self
+
+    def evidence_digest(self) -> Digest:
+        return digest_of(self.model_dump(mode="json"))
+
+
+class ExecutionReceipt(Record):
+    """FIX-R4-1 / FIX-R5-1: immutable proof of which executor actually
+    produced a response.
+
+    DERIVED from ``ExecutionEvidence`` (``from_evidence`` is the only
+    production derivation path) — never constructed from the expected lane
+    ``ReviewerIdentity``. The identity fields below are the ATTESTED ACTUAL
+    executor identity; every one is compared for exact equality against the
+    frozen ``ReviewerIdentity`` at ingestion, freeze, load, and final ledger
+    verification, so a response produced by any other provider, model
+    version, configuration, or prompt can never be accepted into this lane.
+
+    ``request_generation`` / ``request_item_digest`` tie the response to one
+    exact emitted request item: the immutable batch generation and the
+    canonical digest of the emitted request item (see
+    ``verify_request_batch`` in ``evals.calibration.ingestion``).
+    Provider-error responses reference the attempted request the same way.
+
+    ``evidence`` / ``evidence_digest`` bind the exact observed evidence the
+    receipt was derived from: a receipt whose fields disagree with its own
+    embedded evidence cannot validate.
+    """
+
+    receipt_schema: Literal["engram-calibration-execution-receipt-206-v2"] = (
+        "engram-calibration-execution-receipt-206-v2"
+    )
+    campaign_id: str
+    # ATTESTED ACTUAL executor identity (derived from ExecutionEvidence).
     reviewer_slot: SlotName
     reviewer_family: str
     provider_model_identifier: ModelIdentifier
@@ -269,8 +341,63 @@ class ExecutionReceipt(Record):
     request_item_digest: Digest
     executed_at: AwareDatetime
     executor_status: Literal["completed", "provider_error"]
+    executor_identity: str
+    identity_source: Literal["provider_metadata", "executor_attestation"]
+    provider_request_id: str | None = None
+    provider_response_id: str | None = None
+    evidence: ExecutionEvidence
+    evidence_digest: Digest
+
+    @model_validator(mode="after")
+    def derived_from_evidence(self) -> Self:
+        evidence = self.evidence
+        derived_fields = (
+            self.campaign_id == evidence.campaign_id
+            and self.reviewer_slot == evidence.actual_reviewer_slot
+            and self.reviewer_family == evidence.actual_reviewer_family
+            and self.provider_model_identifier == evidence.actual_provider_model_identifier
+            and self.reviewer_config_digest == evidence.actual_configuration_digest
+            and self.prompt_digest == evidence.actual_prompt_digest
+            and self.request_generation == evidence.request_generation
+            and self.request_item_digest == evidence.request_item_digest
+            and self.executed_at == evidence.executed_at
+            and self.executor_status == evidence.executor_status
+            and self.executor_identity == evidence.executor_identity
+            and self.identity_source == evidence.identity_source
+            and self.provider_request_id == evidence.provider_request_id
+            and self.provider_response_id == evidence.provider_response_id
+        )
+        if not derived_fields:
+            raise ValueError("execution_receipt_not_derived_from_its_evidence")
+        if self.evidence_digest != evidence.evidence_digest():
+            raise ValueError("execution_receipt_evidence_digest_mismatch")
+        return self
+
+    @classmethod
+    def from_evidence(cls, evidence: ExecutionEvidence) -> ExecutionReceipt:
+        """The ONE production derivation path (FIX-R5-1)."""
+        return cls(
+            campaign_id=evidence.campaign_id,
+            reviewer_slot=evidence.actual_reviewer_slot,
+            reviewer_family=evidence.actual_reviewer_family,
+            provider_model_identifier=evidence.actual_provider_model_identifier,
+            reviewer_config_digest=evidence.actual_configuration_digest,
+            prompt_digest=evidence.actual_prompt_digest,
+            request_generation=evidence.request_generation,
+            request_item_digest=evidence.request_item_digest,
+            executed_at=evidence.executed_at,
+            executor_status=evidence.executor_status,
+            executor_identity=evidence.executor_identity,
+            identity_source=evidence.identity_source,
+            provider_request_id=evidence.provider_request_id,
+            provider_response_id=evidence.provider_response_id,
+            evidence=evidence,
+            evidence_digest=evidence.evidence_digest(),
+        )
 
     def matches_reviewer_identity(self, reviewer: ReviewerIdentity, campaign_id: str) -> bool:
+        """Compare the ATTESTED ACTUAL identity EXACTLY against the frozen
+        expected lane identity (FIX-R5-1)."""
         return (
             self.campaign_id == campaign_id
             and self.reviewer_slot == reviewer.reviewer_slot

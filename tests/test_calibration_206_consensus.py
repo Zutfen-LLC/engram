@@ -95,21 +95,27 @@ def _record(
     error_code: str | None = None,
     raw_digest: str | None = "c" * 64,
 ) -> ModelReviewRecord:
-    from evals.calibration.consensus import ExecutionReceipt
+    from evals.calibration.consensus import ExecutionEvidence, ExecutionReceipt
     from evals.calibration.reviewer_instructions import RESPONSE_PARSER_VERSION
 
     fam = family or dict(zip(REVIEWER_SLOTS, REVIEWER_FAMILIES, strict=True))[slot]
-    execution = ExecutionReceipt(
-        campaign_id="campaign",
-        reviewer_slot=slot,  # type: ignore[arg-type]
-        reviewer_family=fam,
-        provider_model_identifier=f"{fam}-exact-2026-09",
-        reviewer_config_digest="a" * 64,
-        prompt_digest=labeling_instructions_digest(),
-        request_generation=1,
-        request_item_digest="d" * 64,
-        executed_at=NOW,
-        executor_status="provider_error" if outcome_status == "provider_error" else "completed",
+    execution = ExecutionReceipt.from_evidence(
+        ExecutionEvidence(
+            campaign_id="campaign",
+            actual_reviewer_slot=slot,  # type: ignore[arg-type]
+            actual_reviewer_family=fam,
+            actual_provider_model_identifier=f"{fam}-exact-2026-09",
+            actual_configuration_digest="a" * 64,
+            actual_prompt_digest=labeling_instructions_digest(),
+            request_generation=1,
+            request_item_digest="d" * 64,
+            executed_at=NOW,
+            executor_status="provider_error" if outcome_status == "provider_error" else "completed",
+            executor_identity="synthetic-executor-206",
+            identity_source="provider_metadata",
+            provider_request_id="req-206-0001",
+            provider_response_id="resp-206-0001",
+        )
     )
     return ModelReviewRecord(
         protocol_version=CONSENSUS_PROTOCOL_VERSION,
