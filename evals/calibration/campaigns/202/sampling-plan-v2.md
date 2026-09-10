@@ -52,8 +52,10 @@ implement #161.
 ## Split contract
 
 The split is constructed from the exact frozen sampled frame, never the full eligible population.
-Exact and normalized-text duplicate groups are unioned before assignment. Group assignment targets
-the development fraction by item count while keeping every group in one split.
+Exact-content and normalized-text groups plus known recorded source, root, and session references are
+unioned before assignment. Missing, `unknown`, and `unavailable` references never collapse unrelated
+rows into one group. Group assignment targets the development fraction by item count while keeping
+every known group in one split.
 
 The protected validator fails closed unless:
 

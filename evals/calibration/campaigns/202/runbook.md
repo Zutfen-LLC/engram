@@ -38,9 +38,14 @@ digests are audit history only.
 ## Corrected v2 freeze
 
 The unchanged authorized snapshot was copied byte-for-byte into a new protected
-root. Protected directories are mode `0700`; files are exclusively created at
-mode `0600`. Exact membership, content, duplicate groups, packets, and reviewer
-material remain outside Git.
+root at `$XDG_DATA_HOME/engram/evals/202` (resolved from the operator account's
+XDG data directory). Protected directories are mode `0700`; files are exclusively
+created at mode `0600`. Exact membership, content, duplicate groups, packets,
+reviewer material, ledgers, and assessment evidence remain outside Git. Keep both
+the invalidated and replacement trees through review, adjudication, and audit
+sign-off. Nothing expires automatically; later archival or destruction requires
+explicit data-owner authorization while retaining this content-free public digest
+and invalidation trail.
 
 | Corrected identity | Digest/count |
 | --- | --- |
@@ -136,10 +141,20 @@ unsupported; one dimension’s support cannot hide another dimension’s failure
 
 After real labels are frozen, and not before:
 
-1. Capture provider scores under the frozen target contract on the frozen clone.
+1. Capture exactly one provider execution receipt for every frozen sample under the
+   frozen target contract. Each content-free receipt binds a unique execution ID,
+   frozen input-content hash, mechanically derived request digest, provider-response
+   digest, all three raw `AssessmentDimensions`, and its own payload digest. Store the
+   complete receipt population in a protected assessment-evidence envelope bound to
+   target identity, the exact target-compatible contract, protected-frame digest,
+   sampling-manifest digest, and an independently retained file SHA-256.
 2. Verify the protected ledger bytes against an independently retained SHA-256,
    both packet-file SHA-256 values, exact sampling membership/content hashes, and
-   dataset identity; then build labeled observations and run `check_floors`.
+   dataset identity. `check_floors` rejects incomplete receipt populations, reused
+   execution IDs, target/contract drift, frame substitution, and malformed receipts;
+   it derives all three observations per sample from the verified execution output,
+   protected frame, frozen split, and adjudicated ledger. Caller-supplied outcomes,
+   consequence, and strata are not authority and cannot manufacture support.
    Insufficient or partial evidence stops without lowering any threshold.
 3. Reject duplicate profile keys. Fit development observations only, then evaluate
    the untouched holdout; unsupported bins reduce calibrated support/coverage and

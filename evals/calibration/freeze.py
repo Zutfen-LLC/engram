@@ -86,6 +86,7 @@ class FrameRow(Record):
     """One protected dogfood row containing recorded or derived pre-provider state."""
 
     item_uuid: str
+    sample_id: Token | None = None
     content_hash: str
     content_norm_hash: Digest
     kind: str
@@ -97,14 +98,28 @@ class FrameRow(Record):
     age_days: int | None = Field(default=None, ge=0)
     age_bucket: str
     evidence_state: str
+    source_ref: str | None = None
+    root_ref: str | None = None
+    session_ref: str | None = None
     content_bytes: int = Field(ge=0)
     input_size_bucket: str
+
+
+def protected_frame_digest(frame: list[FrameRow]) -> Digest:
+    """Bind the exact protected frame, including strata and grouping references."""
+    return digest(
+        sorted(
+            (row.model_dump(mode="json") for row in frame),
+            key=lambda row: str(row["sample_id"] or sample_id_for(str(row["item_uuid"]))),
+        )
+    )
 
 
 class SamplingManifest(Record):
     manifest_schema: Literal["engram-calibration-sampling-v2"] = "engram-calibration-sampling-v2"
     campaign_id: Token
     target_identity_digest: Digest
+    frame_digest: Digest
     snapshot_sha256: Digest
     snapshot_as_of: AwareDatetime
     sampling_seed: Token
@@ -138,7 +153,9 @@ class SplitManifest(Record):
     sampling_membership_digest: Digest
     split_seed: Token
     dev_fraction: float = Field(gt=0.0, lt=1.0)
-    grouping: tuple[Literal["content_hash", "normalized_text"], ...]
+    grouping: tuple[
+        Literal["content_hash", "normalized_text", "source_ref", "root_ref", "session_ref"], ...
+    ]
     dev_ids: tuple[Token, ...]
     holdout_ids: tuple[Token, ...]
     leakage_checks: dict[str, int]
@@ -213,6 +230,13 @@ def _recorded(row: dict[str, Any], key: str) -> str:
     return str(row[key])
 
 
+def _group_ref(row: dict[str, Any], key: str) -> str | None:
+    value = row.get(key)
+    if value is None or str(value).strip().lower() in {"", "missing", "unknown", "unavailable"}:
+        return None
+    return str(value)
+
+
 def build_frame(
     rows: list[dict[str, Any]],
     *,
@@ -249,6 +273,7 @@ def build_frame(
         frame.append(
             FrameRow(
                 item_uuid=row["item_uuid"],
+                sample_id=sample_id_for(row["item_uuid"]),
                 content_hash=content_hash(canonicalize(content)),
                 content_norm_hash=normalized_text_hash(content),
                 kind=row["kind"],
@@ -260,6 +285,9 @@ def build_frame(
                 age_days=days,
                 age_bucket=age_bucket(days),
                 evidence_state=_recorded(row, "evidence_state"),
+                source_ref=_group_ref(row, "source_ref"),
+                root_ref=_group_ref(row, "root_ref"),
+                session_ref=_group_ref(row, "session_ref"),
                 content_bytes=size,
                 input_size_bucket=input_size_bucket(size),
             )
@@ -408,10 +436,25 @@ def assign_splits(
         if a != b:
             parent[max(a, b)] = min(a, b)
 
-    by_exact: dict[str, Token] = {}
-    by_norm: dict[str, Token] = {}
+    seen_by_field: dict[str, dict[str, Token]] = {
+        "content_hash": {},
+        "normalized_text": {},
+        "source_ref": {},
+        "root_ref": {},
+        "session_ref": {},
+    }
     for sid, row in sorted(by_id.items()):
-        for value, seen in ((row.content_hash, by_exact), (row.content_norm_hash, by_norm)):
+        values = {
+            "content_hash": row.content_hash,
+            "normalized_text": row.content_norm_hash,
+            "source_ref": row.source_ref,
+            "root_ref": row.root_ref,
+            "session_ref": row.session_ref,
+        }
+        for field, value in values.items():
+            if value is None:
+                continue
+            seen = seen_by_field[field]
             if value in seen:
                 union(sid, seen[value])
             else:
@@ -475,6 +518,7 @@ def public_sampling_summary(sampling: SamplingManifest, split: SplitManifest) ->
         "grouping": split.grouping,
         "leakage_checks": split.leakage_checks,
         "sampling_manifest_digest": sampling.manifest_digest(),
+        "frame_digest": sampling.frame_digest,
         "split_manifest_digest": split.split_digest(),
         "snapshot_sha256": sampling.snapshot_sha256,
         "snapshot_as_of": sampling.snapshot_as_of.isoformat().replace("+00:00", "Z"),

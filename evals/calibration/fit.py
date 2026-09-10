@@ -7,9 +7,14 @@ fitted. Every stratum below the frozen support floor stays explicitly
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Literal
+
+from pydantic import AwareDatetime
 
 from engram.assessment_calibration import (
     MIN_CALIBRATION_SAMPLES,
@@ -17,14 +22,17 @@ from engram.assessment_calibration import (
     CalibrationProfile,
     calibrate,
 )
-from engram.assessment_schema import AssessmentContract
-from evals.admission.schema import Digest, Record, digest
+from engram.assessment_schema import AssessmentContract, AssessmentDimensions
+from evals.admission.schema import Digest, LabelRecord, Record, digest
 from evals.calibration.freeze import (
     LABEL_GUIDE_VERSION,
     EvidenceFloors,
+    FrameRow,
     SamplingManifest,
     SplitManifest,
     TargetIdentity,
+    protected_frame_digest,
+    sample_id_for,
     validate_split_membership,
 )
 from evals.calibration.review import verify_ledger
@@ -43,6 +51,7 @@ class LabeledObservation(Record):
     # honest signal of the reviewed outcome for this dimension?
     outcome: Literal["positive", "negative", "unknown"]
     raw_value: float | None = None
+    suggested_kind: str | None = None
     source_type: str
     assertion_mode: str
     kind: str
@@ -57,6 +66,7 @@ class LabeledObservation(Record):
         split: str,
         dimensions: Any,
         raw_scores: dict[str, float | None],
+        suggested_kind: str | None,
         stratum: dict[str, str],
     ) -> list[LabeledObservation]:
         """Derive per-dimension outcomes from a final adjudicated label.
@@ -70,7 +80,7 @@ class LabeledObservation(Record):
         states) — it never counts toward bin support.
         """
         out: list[LabeledObservation] = []
-        suggested = str(raw_scores.get("suggested_kind") or "")
+        suggested = str(suggested_kind or "")
         if dimensions.expected_kind == "unknown" or not suggested:
             outcome: Literal["positive", "negative", "unknown"] = "unknown"
         else:
@@ -82,6 +92,7 @@ class LabeledObservation(Record):
                 dimension="taxonomy",
                 outcome=outcome,
                 raw_value=raw_scores.get("taxonomy_value"),
+                suggested_kind=suggested or None,
                 consequence=dimensions.consequence,
                 **stratum,
             )
@@ -123,6 +134,22 @@ class LabeledObservation(Record):
         return out
 
 
+class AssessmentExecutionReceipt(Record):
+    """One content-free, target-bound assessment execution receipt."""
+
+    sample_id: str
+    input_content_hash: str
+    execution_id: str
+    captured_at: AwareDatetime
+    provider_request_digest: Digest
+    provider_response_digest: Digest
+    assessment: AssessmentDimensions
+    receipt_digest: Digest
+
+    def verified_payload_digest(self) -> Digest:
+        return digest(self.model_dump(mode="json", exclude={"receipt_digest"}))
+
+
 def _bin_index(value: float) -> int:
     if value < 0.0 or value > 1.0:
         raise ValueError("raw value out of range")
@@ -149,6 +176,115 @@ def _validate_observation_membership(
             raise ValueError("observation_not_in_frozen_split")
         if observation.split != expected_split:
             raise ValueError("observation_split_mismatch")
+
+
+def _verify_observation_evidence(
+    path: Path,
+    expected_sha256: str,
+    *,
+    sampling: SamplingManifest,
+    target_identity: TargetIdentity,
+    assessment_contract: AssessmentContract,
+    split: SplitManifest,
+    frame: list[FrameRow],
+    reviewed_records: list[LabelRecord],
+) -> list[LabeledObservation]:
+    payload = path.read_bytes()
+    if not hmac.compare_digest(hashlib.sha256(payload).hexdigest(), expected_sha256):
+        raise ValueError("assessment_evidence_digest_mismatch")
+    contract_digest = digest(assessment_contract.model_dump(mode="json"))
+    if target_identity.identity_digest() != sampling.target_identity_digest:
+        raise ValueError("assessment_target_identity_mismatch")
+    if (
+        assessment_contract.schema_version != target_identity.assessment_schema_version
+        or assessment_contract.prompt_version != target_identity.prompt_version
+        or assessment_contract.code_version != target_identity.assessment_code_version
+        or assessment_contract.provider != target_identity.provider_adapter
+        or assessment_contract.model != target_identity.provider_model
+        or assessment_contract.config_version != target_identity.provider_config_digest
+        or assessment_contract.calibration_version != target_identity.calibration_dataset_version
+    ):
+        raise ValueError("assessment_contract_target_mismatch")
+    envelope = json.loads(payload)
+    if envelope.get("evidence_schema") != "engram-calibration-assessment-evidence-v1":
+        raise ValueError("assessment_evidence_schema_mismatch")
+    if (
+        envelope.get("target_identity_digest") != target_identity.identity_digest()
+        or envelope.get("sampling_manifest_digest") != sampling.manifest_digest()
+        or envelope.get("assessment_contract_digest") != contract_digest
+        or envelope.get("frame_digest") != sampling.frame_digest
+    ):
+        raise ValueError("assessment_evidence_identity_mismatch")
+    if protected_frame_digest(frame) != sampling.frame_digest:
+        raise ValueError("assessment_frame_digest_mismatch")
+    frame_by_id = {(row.sample_id or sample_id_for(row.item_uuid)): row for row in frame}
+    if set(frame_by_id) != set(sampling.sample_ids):
+        raise ValueError("assessment_frame_membership_mismatch")
+    expected_hashes = dict(zip(sampling.sample_ids, sampling.sample_hashes, strict=True))
+    if any(
+        frame_by_id[sample_id].content_hash != expected_hashes[sample_id]
+        for sample_id in expected_hashes
+    ):
+        raise ValueError("assessment_frame_content_hash_mismatch")
+    receipts = [
+        AssessmentExecutionReceipt.model_validate(row) for row in envelope.get("executions", [])
+    ]
+    if (
+        len(receipts) != len(sampling.sample_ids)
+        or {receipt.sample_id for receipt in receipts} != set(sampling.sample_ids)
+        or len({receipt.execution_id for receipt in receipts}) != len(receipts)
+    ):
+        raise ValueError("assessment_evidence_membership_mismatch")
+    records_by_id = {record.sample_id: record for record in reviewed_records}
+    split_by_id = {sample_id: "dev" for sample_id in split.dev_ids}
+    split_by_id.update({sample_id: "holdout" for sample_id in split.holdout_ids})
+    observations: list[LabeledObservation] = []
+    for receipt in receipts:
+        if not hmac.compare_digest(receipt.verified_payload_digest(), receipt.receipt_digest):
+            raise ValueError("assessment_execution_receipt_digest_mismatch")
+        expected_request_digest = digest(
+            {
+                "sample_id": receipt.sample_id,
+                "input_content_hash": receipt.input_content_hash,
+                "target_identity_digest": target_identity.identity_digest(),
+                "assessment_contract_digest": contract_digest,
+            }
+        )
+        if receipt.provider_request_digest != expected_request_digest:
+            raise ValueError("assessment_execution_request_mismatch")
+        if receipt.input_content_hash != expected_hashes[receipt.sample_id]:
+            raise ValueError("assessment_execution_input_mismatch")
+        scores = (
+            receipt.assessment.taxonomy,
+            receipt.assessment.retention,
+            receipt.assessment.epistemic,
+        )
+        if any(score.status != "uncalibrated" for score in scores):
+            raise ValueError("assessment_execution_must_capture_raw_scores")
+        frozen = frame_by_id[receipt.sample_id]
+        dimensions = records_by_id[receipt.sample_id].final_dimensions()
+        if dimensions is None:
+            raise ValueError("assessment_evidence_requires_completed_review")
+        observations.extend(
+            LabeledObservation.from_review(
+                sample_id=receipt.sample_id,
+                dimensions=dimensions,
+                raw_scores={
+                    "taxonomy_value": receipt.assessment.taxonomy.raw_value,
+                    "retention_value": receipt.assessment.retention.raw_value,
+                    "epistemic_value": receipt.assessment.epistemic.raw_value,
+                },
+                suggested_kind=receipt.assessment.suggested_kind,
+                stratum={
+                    "source_type": frozen.source_type,
+                    "assertion_mode": frozen.assertion_mode,
+                    "kind": frozen.kind,
+                    "risk": frozen.risk,
+                },
+                split=split_by_id[receipt.sample_id],
+            )
+        )
+    return observations
 
 
 def fit_profiles(
@@ -394,6 +530,8 @@ class EvidenceFloorResult(Record):
     ledger_sha256: str
     reviewer_a_packet_sha256: str
     reviewer_b_packet_sha256: str
+    assessment_evidence_sha256: str
+    assessment_contract_digest: str
     full_population_dual_review: Literal[True]
     checks: dict[str, bool]
     dimension_support: dict[str, dict[str, Any]]
@@ -495,14 +633,17 @@ def check_floors(
     reviewer_b_packet_sha256: str,
     expected_dataset_id: str,
     expected_dataset_version: str,
-    observations: list[LabeledObservation],
+    assessment_evidence_path: Path,
+    expected_assessment_evidence_sha256: str,
+    target_identity: TargetIdentity,
+    assessment_contract: AssessmentContract,
+    frame: list[FrameRow],
     profiles: list[CalibrationProfile],
     sampling: SamplingManifest,
     split: SplitManifest,
 ) -> EvidenceFloorResult:
     """Evaluate every frozen floor from reviewer, split, and fitted-profile evidence."""
     validate_split_membership(sampling, split)
-    _validate_observation_membership(observations, split)
     verified_ledger = verify_ledger(
         ledger_path,
         expected_ledger_sha256,
@@ -518,6 +659,17 @@ def check_floors(
         raise ValueError("duplicate_review_record")
     if set(record_ids) != set(sampling.sample_ids):
         raise ValueError("review_records_do_not_match_frozen_sample")
+    observations = _verify_observation_evidence(
+        assessment_evidence_path,
+        expected_assessment_evidence_sha256,
+        sampling=sampling,
+        target_identity=target_identity,
+        assessment_contract=assessment_contract,
+        split=split,
+        frame=frame,
+        reviewed_records=reviewed_records,
+    )
+    _validate_observation_membership(observations, split)
     completed = [
         record
         for record in reviewed_records
@@ -688,6 +840,8 @@ def check_floors(
         ledger_sha256=verified_ledger.ledger_sha256,
         reviewer_a_packet_sha256=verified_ledger.reviewer_a_packet_sha256,
         reviewer_b_packet_sha256=verified_ledger.reviewer_b_packet_sha256,
+        assessment_evidence_sha256=expected_assessment_evidence_sha256,
+        assessment_contract_digest=digest(assessment_contract.model_dump(mode="json")),
         full_population_dual_review=True,
         checks=checks,
         dimension_support=dimension_support,

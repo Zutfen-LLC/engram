@@ -86,6 +86,8 @@ def _floor_result(sampling_digest: str, split_digest: str) -> EvidenceFloorResul
         ledger_sha256="a" * 64,
         reviewer_a_packet_sha256="b" * 64,
         reviewer_b_packet_sha256="c" * 64,
+        assessment_evidence_sha256="d" * 64,
+        assessment_contract_digest="e" * 64,
         full_population_dual_review=True,
         checks={"holdout_size": True},
         dimension_support={},
@@ -175,6 +177,7 @@ class TestDeterministicManifests:
         m1 = SamplingManifest(
             campaign_id="c",
             target_identity_digest="d" * 64,
+            frame_digest="f" * 64,
             snapshot_sha256="e" * 64,
             snapshot_as_of=NOW,
             sampling_seed="s",
@@ -255,6 +258,7 @@ class TestBlindPackets:
         sampling = SamplingManifest(
             campaign_id="c",
             target_identity_digest="d" * 64,
+            frame_digest="f" * 64,
             snapshot_sha256="e" * 64,
             snapshot_as_of=NOW,
             sampling_seed="s",
@@ -299,6 +303,7 @@ class TestBlindPackets:
         sampling = SamplingManifest(
             campaign_id="c",
             target_identity_digest="d" * 64,
+            frame_digest="f" * 64,
             snapshot_sha256="e" * 64,
             snapshot_as_of=NOW,
             sampling_seed="s",

@@ -26,6 +26,44 @@ from evals.admission.schema import Digest, Record, digest
 from evals.calibration.fit import CalibrationArtifactBundle, EvidenceFloorResult
 
 CERTIFIED_SERVING_PROFILES_REQUIRED = frozenset({"legacy"})
+REQUIRED_FLOOR_CHECKS = frozenset(
+    {
+        "total_reviewed",
+        "per_dimension_labeled",
+        "per_dimension_non_unknown_fraction",
+        "holdout_size",
+        "holdout_labeled_support",
+        "high_consequence",
+        "high_consequence_labeled_support",
+        "dual_review_high_consequence",
+        "bin_support",
+        "per_stratum_support",
+        "high_consequence_strata_support",
+        "all_dimensions_explicitly_supported",
+    }
+)
+REQUIRED_MISMATCH_CHECKS = frozenset(
+    {
+        *(
+            f"mismatch_{field}_stays_uncalibrated"
+            for field in (
+                "provider",
+                "model",
+                "prompt_version",
+                "schema_version",
+                "code_version",
+                "config_version",
+                "calibration_version",
+                "calibration_digest",
+                "dimension",
+                "source_type",
+                "assertion_mode",
+                "kind",
+                "risk",
+            )
+        ),
+    }
+)
 
 
 class AuthoritativeRecallProof(Record):
@@ -249,6 +287,7 @@ def gate_checks(
     )
     checks["floors_satisfied"] = (
         floor_result.passed
+        and set(floor_result.checks) == REQUIRED_FLOOR_CHECKS
         and all(floor_result.checks.values())
         and bundle.floors_satisfied == floor_result.passed
         and bundle.floor_results == floor_result.model_dump(mode="json")
@@ -297,7 +336,7 @@ def gate_checks(
         checks["mismatch_proof_bound"]
         and mismatch_proof is not None
         and mismatch_proof.baseline_calibrates
-        and mismatch_proof.checks
+        and set(mismatch_proof.checks) == REQUIRED_MISMATCH_CHECKS
         and all(mismatch_proof.checks.values())
     )
     authoritative_recall_proof = _load_authoritative_recall_proof(

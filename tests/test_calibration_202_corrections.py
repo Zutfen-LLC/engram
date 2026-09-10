@@ -24,6 +24,7 @@ from engram.assessment_schema import AssessmentContract
 from engram.canonicalize import canonicalize, content_hash
 from evals.admission.schema import HumanJudgment, LabelRecord, digest
 from evals.calibration.fit import (
+    AssessmentExecutionReceipt,
     EvidenceFloorResult,
     LabeledObservation,
     evaluate_holdout,
@@ -34,17 +35,19 @@ from evals.calibration.fit import (
 )
 from evals.calibration.freeze import (
     EvidenceFloors,
+    FrameRow,
     SamplingManifest,
     SplitManifest,
     TargetIdentity,
     assign_splits,
     build_frame,
+    protected_frame_digest,
     public_sampling_summary,
     sample_id_for,
     stratified_sample,
     validate_split_membership,
 )
-from evals.calibration.gate import gate_checks, prove_mismatch_uncalibrated
+from evals.calibration.gate import REQUIRED_FLOOR_CHECKS, gate_checks, prove_mismatch_uncalibrated
 from evals.calibration.review import (
     build_packets,
     freeze_ledger,
@@ -104,6 +107,7 @@ def _sampling(
     return SamplingManifest(
         campaign_id="campaign",
         target_identity_digest="c" * 64,
+        frame_digest=protected_frame_digest(frame),
         snapshot_sha256="d" * 64,
         snapshot_as_of=NOW,
         sampling_seed="seed",
@@ -178,6 +182,28 @@ def test_strict_subset_split_exactly_partitions_sample_membership() -> None:
         len({"dev" if sid in dev else "holdout" for sid in members}) == 1
         for members in groups.values()
     )
+
+
+def test_known_source_root_and_session_groups_never_cross_split() -> None:
+    frame = _frame(12)
+    frame[0] = frame[0].model_copy(update={"source_ref": "shared-source"})
+    frame[1] = frame[1].model_copy(update={"source_ref": "shared-source"})
+    frame[2] = frame[2].model_copy(update={"root_ref": "shared-root"})
+    frame[3] = frame[3].model_copy(update={"root_ref": "shared-root"})
+    frame[4] = frame[4].model_copy(update={"session_ref": "shared-session"})
+    frame[5] = frame[5].model_copy(update={"session_ref": "shared-session"})
+    sample_ids = [sample_id_for(row.item_uuid) for row in frame]
+    dev, holdout, _, _ = assign_splits(
+        frame,
+        sample_ids=sample_ids,
+        campaign_id="campaign",
+        split_seed="split",
+        dev_fraction=0.6,
+    )
+    side = {sample_id: "dev" if sample_id in dev else "holdout" for sample_id in sample_ids}
+    for left, right in ((0, 1), (2, 3), (4, 5)):
+        assert side[sample_ids[left]] == side[sample_ids[right]]
+    assert dev and holdout
 
 
 def test_split_manifest_rejects_missing_or_unsampled_members() -> None:
@@ -643,7 +669,7 @@ def _judgment(ref: str, consequence: str = "low") -> HumanJudgment:
                 "expected_subject_or_domain": "unknown",
                 "expected_scope": "unknown",
                 "retention_value": "retain",
-                "epistemic_state": "unknown",
+                "epistemic_state": "adequately_supported",
                 "factual_outcome": None,
                 "consequence": consequence,
                 "expected_storage_disposition": "retain",
@@ -730,6 +756,8 @@ def _floor_evidence(
 def _bound_manifests(
     observations: list[LabeledObservation],
     records: list[LabelRecord] | None = None,
+    *,
+    target_identity_digest: str = "c" * 64,
 ) -> tuple[SamplingManifest, SplitManifest]:
     by_id = {obs.sample_id: obs.split for obs in observations}
     sample_ids = sorted(by_id)
@@ -738,9 +766,35 @@ def _bound_manifests(
         for record in records or []
         if record.content_hash
     }
+    sample_hashes = {
+        sample_id: record_hashes.get(sample_id, "sha256:" + digest(sample_id))
+        for sample_id in sample_ids
+    }
+    frame = [
+        FrameRow(
+            item_uuid=f"protected-{sample_id}",
+            sample_id=sample_id,
+            content_hash=sample_hashes[sample_id],
+            content_norm_hash=digest(["norm", sample_id]),
+            kind=next(obs.kind for obs in observations if obs.sample_id == sample_id),
+            source_type=next(obs.source_type for obs in observations if obs.sample_id == sample_id),
+            review_status="active",
+            assertion_mode=next(
+                obs.assertion_mode for obs in observations if obs.sample_id == sample_id
+            ),
+            origin="unknown",
+            risk=next(obs.risk for obs in observations if obs.sample_id == sample_id),
+            age_bucket="unknown",
+            evidence_state="unknown",
+            content_bytes=1,
+            input_size_bucket="small",
+        )
+        for sample_id in sample_ids
+    ]
     sampling = SamplingManifest(
         campaign_id="campaign",
-        target_identity_digest="c" * 64,
+        target_identity_digest=target_identity_digest,
+        frame_digest=protected_frame_digest(frame),
         snapshot_sha256="d" * 64,
         snapshot_as_of=NOW,
         sampling_seed="seed",
@@ -750,9 +804,7 @@ def _bound_manifests(
         stratum_counts={"all": len(sample_ids)},
         coverage_dimensions={},
         sample_ids=tuple(sample_ids),
-        sample_hashes=tuple(
-            record_hashes.get(sample_id, "sha256:" + digest(sample_id)) for sample_id in sample_ids
-        ),
+        sample_hashes=tuple(sample_hashes[sample_id] for sample_id in sample_ids),
     )
     split = SplitManifest(
         campaign_id="campaign",
@@ -776,8 +828,16 @@ def check_floors(
     observations: list[LabeledObservation],
     profiles: list[CalibrationProfile],
     synthesize_full_dual_review: bool = True,
+    target_identity_override: TargetIdentity | None = None,
+    mutate_frame_after_freeze: bool = False,
+    drop_last_execution: bool = False,
 ) -> EvidenceFloorResult:
-    sampling, split = _bound_manifests(observations, reviewed_records)
+    target_identity = target_identity_override or _identity()
+    sampling, split = _bound_manifests(
+        observations,
+        reviewed_records,
+        target_identity_digest=target_identity.identity_digest(),
+    )
     expected_hashes = dict(zip(sampling.sample_ids, sampling.sample_hashes, strict=True))
     reviewed_records = [
         record.model_copy(
@@ -799,6 +859,107 @@ def check_floors(
     ]
     packet_a_sha = "b" * 64
     packet_b_sha = "c" * 64
+    records_by_id = {record.sample_id: record for record in reviewed_records}
+    bound_observations = [
+        observation.model_copy(
+            update={
+                "suggested_kind": (
+                    observation.suggested_kind
+                    or (
+                        records_by_id[observation.sample_id].final_dimensions()
+                        or records_by_id[observation.sample_id].reviewer_a.dimensions
+                    ).expected_kind
+                    if observation.dimension == "taxonomy"
+                    else None
+                )
+            }
+        )
+        for observation in observations
+    ]
+    frame = [
+        FrameRow(
+            item_uuid=f"protected-{sample_id}",
+            sample_id=sample_id,
+            content_hash=expected_hashes[sample_id],
+            content_norm_hash=digest(["norm", sample_id]),
+            kind=next(obs.kind for obs in bound_observations if obs.sample_id == sample_id),
+            source_type=next(
+                obs.source_type for obs in bound_observations if obs.sample_id == sample_id
+            ),
+            review_status="active",
+            assertion_mode=next(
+                obs.assertion_mode for obs in bound_observations if obs.sample_id == sample_id
+            ),
+            origin="unknown",
+            risk=next(obs.risk for obs in bound_observations if obs.sample_id == sample_id),
+            age_bucket="unknown",
+            evidence_state="unknown",
+            content_bytes=1,
+            input_size_bucket="small",
+        )
+        for sample_id in sampling.sample_ids
+    ]
+    if mutate_frame_after_freeze:
+        frame[0] = frame[0].model_copy(update={"source_type": "substituted-source"})
+    contract = _contract()
+    executions = []
+    for sample_id in sampling.sample_ids:
+        by_dimension = {
+            obs.dimension: obs for obs in bound_observations if obs.sample_id == sample_id
+        }
+        receipt = {
+            "sample_id": sample_id,
+            "input_content_hash": expected_hashes[sample_id],
+            "execution_id": f"execution-{sample_id}",
+            "captured_at": NOW.isoformat(),
+            "provider_request_digest": digest(
+                {
+                    "sample_id": sample_id,
+                    "input_content_hash": expected_hashes[sample_id],
+                    "target_identity_digest": target_identity.identity_digest(),
+                    "assessment_contract_digest": digest(contract.model_dump(mode="json")),
+                }
+            ),
+            "provider_response_digest": digest(["response", sample_id]),
+            "assessment": {
+                "taxonomy": {
+                    "raw_value": (
+                        by_dimension["taxonomy"].raw_value if "taxonomy" in by_dimension else None
+                    )
+                },
+                "suggested_kind": (
+                    by_dimension["taxonomy"].suggested_kind if "taxonomy" in by_dimension else None
+                ),
+                "retention": {
+                    "raw_value": (
+                        by_dimension["retention"].raw_value if "retention" in by_dimension else None
+                    )
+                },
+                "epistemic": {
+                    "raw_value": (
+                        by_dimension["epistemic"].raw_value if "epistemic" in by_dimension else None
+                    )
+                },
+            },
+        }
+        receipt["receipt_digest"] = "0" * 64
+        validated_receipt = AssessmentExecutionReceipt.model_validate(receipt)
+        receipt = validated_receipt.model_dump(mode="json")
+        receipt["receipt_digest"] = validated_receipt.verified_payload_digest()
+        executions.append(receipt)
+    if drop_last_execution:
+        executions.pop()
+    assessment_envelope = {
+        "evidence_schema": "engram-calibration-assessment-evidence-v1",
+        "target_identity_digest": target_identity.identity_digest(),
+        "sampling_manifest_digest": sampling.manifest_digest(),
+        "assessment_contract_digest": digest(contract.model_dump(mode="json")),
+        "frame_digest": sampling.frame_digest,
+        "executions": executions,
+    }
+    assessment_payload = json.dumps(
+        assessment_envelope, sort_keys=True, separators=(",", ":")
+    ).encode()
     envelope = {
         "ledger_schema": "engram-calibration-label-ledger-v2",
         "campaign_id": sampling.campaign_id,
@@ -813,6 +974,10 @@ def check_floors(
     ledger_path = Path(raw_path)
     with os.fdopen(fd, "wb") as stream:
         stream.write(payload)
+    evidence_fd, evidence_raw_path = tempfile.mkstemp()
+    evidence_path = Path(evidence_raw_path)
+    with os.fdopen(evidence_fd, "wb") as stream:
+        stream.write(assessment_payload)
     try:
         return _production_check_floors(
             floors=floors,
@@ -822,13 +987,18 @@ def check_floors(
             reviewer_b_packet_sha256=packet_b_sha,
             expected_dataset_id=reviewed_records[0].dataset_id,
             expected_dataset_version=reviewed_records[0].dataset_version,
-            observations=observations,
+            assessment_evidence_path=evidence_path,
+            expected_assessment_evidence_sha256=hashlib.sha256(assessment_payload).hexdigest(),
+            target_identity=target_identity,
+            assessment_contract=contract,
+            frame=frame,
             profiles=profiles,
             sampling=sampling,
             split=split,
         )
     finally:
         ledger_path.unlink(missing_ok=True)
+        evidence_path.unlink(missing_ok=True)
 
 
 def _floors(**updates: int | float) -> EvidenceFloors:
@@ -864,11 +1034,11 @@ def test_fit_and_floors_reject_duplicate_or_wrong_split_observations() -> None:
         observations[-1].model_copy(update={"split": "dev"}),
     ]
     with pytest.raises(ValueError, match="observation_split_mismatch"):
-        check_floors(
-            floors=_floors(),
-            reviewed_records=records,
+        fit_profiles(
             observations=wrong_split,
-            profiles=_profiles(),
+            identity=_identity(),
+            contract=_contract(),
+            split=split,
         )
 
 
@@ -899,6 +1069,57 @@ def test_holdout_metrics_use_calibrated_profile_outputs() -> None:
     assert unsupported_taxonomy.population_n == 10
     assert unsupported_taxonomy.n == 0
     assert unsupported_taxonomy.coverage == 0.0
+
+
+def test_assessment_evidence_binds_target_contract_frame_and_full_population() -> None:
+    records, observations, profiles = _floor_evidence()
+    mismatched_target = _identity().model_copy(update={"provider_model": "different-model"})
+    with pytest.raises(ValueError, match="assessment_contract_target_mismatch"):
+        check_floors(
+            floors=_floors(),
+            reviewed_records=records,
+            observations=observations,
+            profiles=profiles,
+            target_identity_override=mismatched_target,
+        )
+    with pytest.raises(ValueError, match="assessment_frame_digest_mismatch"):
+        check_floors(
+            floors=_floors(),
+            reviewed_records=records,
+            observations=observations,
+            profiles=profiles,
+            mutate_frame_after_freeze=True,
+        )
+    with pytest.raises(ValueError, match="assessment_evidence_membership_mismatch"):
+        check_floors(
+            floors=_floors(),
+            reviewed_records=records,
+            observations=observations,
+            profiles=profiles,
+            drop_last_execution=True,
+        )
+
+
+def test_floor_evidence_derives_outcomes_and_consequence_from_frozen_review() -> None:
+    records, observations, profiles = _floor_evidence()
+    baseline = check_floors(
+        floors=_floors(),
+        reviewed_records=records,
+        observations=observations,
+        profiles=profiles,
+    )
+    forged = [
+        obs.model_copy(update={"outcome": "negative", "consequence": "high"})
+        for obs in observations
+    ]
+    result = check_floors(
+        floors=_floors(),
+        reviewed_records=records,
+        observations=forged,
+        profiles=profiles,
+    )
+    assert result.checks == baseline.checks
+    assert result.dimension_support == baseline.dimension_support
 
 
 def test_every_frozen_floor_is_evidence_backed() -> None:
@@ -959,6 +1180,33 @@ def test_high_consequence_and_dual_review_floors_fail_independently() -> None:
         )
 
 
+def _records_with_unknown_dimensions(
+    records: list[LabelRecord], sample_ids: set[str]
+) -> list[LabelRecord]:
+    result = []
+    for record in records:
+        if record.sample_id not in sample_ids:
+            result.append(record)
+            continue
+        dimensions = record.reviewer_a.dimensions.model_copy(
+            update={
+                "expected_kind": "unknown",
+                "retention_value": "uncertain",
+                "epistemic_state": "unknown",
+            }
+        )
+        reviewer_a = record.reviewer_a.model_copy(update={"dimensions": dimensions})
+        reviewer_b = (
+            None
+            if record.reviewer_b is None
+            else record.reviewer_b.model_copy(update={"dimensions": dimensions})
+        )
+        result.append(
+            record.model_copy(update={"reviewer_a": reviewer_a, "reviewer_b": reviewer_b})
+        )
+    return result
+
+
 def test_unknown_holdout_and_high_consequence_evidence_fail_closed() -> None:
     records, observations, profiles = _floor_evidence(high_count=2)
     unknown_holdout = [
@@ -967,9 +1215,10 @@ def test_unknown_holdout_and_high_consequence_evidence_fail_closed() -> None:
         else obs
         for obs in observations
     ]
+    holdout_ids = {obs.sample_id for obs in unknown_holdout if obs.split == "holdout"}
     holdout_result = check_floors(
         floors=_floors(),
-        reviewed_records=records,
+        reviewed_records=_records_with_unknown_dimensions(records, holdout_ids),
         observations=unknown_holdout,
         profiles=profiles,
     )
@@ -985,7 +1234,7 @@ def test_unknown_holdout_and_high_consequence_evidence_fail_closed() -> None:
     ]
     high_result = check_floors(
         floors=_floors(high_consequence_reviewed_min=2),
-        reviewed_records=records,
+        reviewed_records=_records_with_unknown_dimensions(records, high_ids),
         observations=unknown_high,
         profiles=profiles,
     )
@@ -1007,17 +1256,22 @@ def test_non_unknown_fraction_and_omitted_strata_are_explicit() -> None:
             per_dimension_labeled_min=40,
             per_dimension_non_unknown_fraction_min=0.80,
         ),
-        reviewed_records=records,
+        reviewed_records=_records_with_unknown_dimensions(records, unknown_ids),
         observations=partly_unknown,
         profiles=profiles,
     )
     assert fraction_result.checks["per_dimension_non_unknown_fraction"] is False
 
-    extra = observations[0].model_copy(update={"source_type": "thin-unprofiled-source"})
+    thin_observations = [
+        obs.model_copy(update={"source_type": "thin-unprofiled-source"})
+        if obs.sample_id == observations[0].sample_id
+        else obs
+        for obs in observations
+    ]
     explicit_result = check_floors(
         floors=_floors(),
         reviewed_records=records,
-        observations=[extra, *observations[1:]],
+        observations=thin_observations,
         profiles=profiles,
     )
     thin = explicit_result.stratum_support["taxonomy/thin-unprofiled-source/unknown/fact/unknown"]
@@ -1083,8 +1337,10 @@ def test_gate_requires_bound_authoritative_recall_and_mismatch_proofs(tmp_path: 
         ledger_sha256="a" * 64,
         reviewer_a_packet_sha256="b" * 64,
         reviewer_b_packet_sha256="c" * 64,
+        assessment_evidence_sha256="d" * 64,
+        assessment_contract_digest="e" * 64,
         full_population_dual_review=True,
-        checks={"holdout_size": True, "holdout_labeled_support": True},
+        checks={key: True for key in REQUIRED_FLOOR_CHECKS},
         dimension_support={},
         stratum_support={},
         bin_support={},
@@ -1163,6 +1419,18 @@ def test_gate_requires_bound_authoritative_recall_and_mismatch_proofs(tmp_path: 
         key for key, value in passed["checks"].items() if value is not True
     ]
     assert passed["checks"]["holdout_calibrated_performance"] is True
+    partial_floor = floor_result.model_copy(update={"checks": {"holdout_size": True}})
+    partial_floor_gate = gate_checks(
+        **{**kwargs, "floor_result": partial_floor},
+        authoritative_recall_evidence_path=proof_path,
+    )
+    assert partial_floor_gate["recommendation"] == "KEEP_DISABLED"
+    partial_mismatch = mismatch.model_copy(update={"checks": {next(iter(mismatch.checks)): True}})
+    partial_mismatch_gate = gate_checks(
+        **{**kwargs, "mismatch_proof": partial_mismatch},
+        authoritative_recall_evidence_path=proof_path,
+    )
+    assert partial_mismatch_gate["recommendation"] == "KEEP_DISABLED"
     invalid_metric_sets = [
         [{**metric, "brier": 1.0} for metric in bundle.holdout_metrics],
         [{**metric, "brier": float("nan")} for metric in bundle.holdout_metrics],
