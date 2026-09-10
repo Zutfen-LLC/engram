@@ -24,6 +24,10 @@ LABEL_GUIDE_VERSION = "engram-calibration-guide-157-v1"
 CANONICALIZATION_VERSION = "assessment-evidence-manifest-v1"
 
 Sha1 = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
+# The exact representation emitted by engram.assessments.assessment_config_version
+# (and therefore by production AssessmentContract.config_version). Campaign
+# identity stores it verbatim so comparisons stay exact string equality.
+ContractDigest = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
 SplitName = Literal["dev", "holdout"]
 PRODUCTION_MIN_BIN_SAMPLES = 50
 UNAVAILABLE = "unavailable"
@@ -32,13 +36,16 @@ UNAVAILABLE = "unavailable"
 class TargetIdentity(Record):
     campaign_schema: Literal["engram-calibration-campaign-v1"] = "engram-calibration-campaign-v1"
     campaign_id: Token
-    repo_sha: Sha1
+    # Provenance of the tooling revision that generated and froze this campaign.
+    # This is NOT a constraint on the revision later deployed at serving time;
+    # runtime compatibility is gated on the deployed assessment contract.
+    campaign_tooling_repo_sha: Sha1
     assessment_schema_version: str
     assessment_code_version: str
     prompt_version: str
     provider_adapter: str
     provider_model: str
-    provider_config_digest: Digest
+    provider_config_digest: ContractDigest
     provider_params: dict[str, Any]
     assessment_policy_version: str
     calibration_artifact_schema_version: str

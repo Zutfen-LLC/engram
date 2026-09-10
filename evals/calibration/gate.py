@@ -24,6 +24,7 @@ from engram.assessment_calibration import (
 from engram.assessment_schema import AssessmentContract
 from evals.admission.schema import Digest, Record, digest
 from evals.calibration.fit import CalibrationArtifactBundle, EvidenceFloorResult
+from evals.calibration.freeze import Sha1
 
 CERTIFIED_SERVING_PROFILES_REQUIRED = frozenset({"legacy"})
 REQUIRED_FLOOR_CHECKS = frozenset(
@@ -67,13 +68,20 @@ REQUIRED_MISMATCH_CHECKS = frozenset(
 
 
 class AuthoritativeRecallProof(Record):
-    """Mechanically verified, identity-bound HTTP/MCP evidence."""
+    """Mechanically verified, identity-bound HTTP/MCP evidence.
+
+    ``deployed_repo_sha`` records the repository revision actually running on
+    the probed host. It is an audit binding for the probe, and is distinct from
+    ``TargetIdentity.campaign_tooling_repo_sha``, which records the revision
+    that froze the campaign. The two legitimately differ once the campaign
+    branch merges; compatibility is gated on the deployed assessment contract.
+    """
 
     proof_schema: str
     campaign_id: str
     target_identity_digest: Digest
     profile_set_digest: str
-    deployed_repo_sha: str
+    deployed_repo_sha: Sha1
     deployed_contract_digest: Digest
     assessment_policy_version: str
     captured_at: datetime
@@ -95,10 +103,6 @@ class MismatchProof(Record):
     profile_set_digest: str
     baseline_calibrates: bool
     checks: dict[str, bool]
-
-
-def _digest_hex(value: str) -> str:
-    return value.removeprefix("sha256:")
 
 
 def _load_authoritative_recall_proof(
@@ -167,7 +171,10 @@ def _recall_proof_matches(
             )
             or ""
         )
-        and proof.deployed_repo_sha == deployed_repo_sha == target.get("repo_sha")
+        # Binds the proof to the runtime revision actually probed. It is
+        # deliberately NOT compared against the campaign tooling SHA: runtime
+        # compatibility is gated on the deployed assessment contract below.
+        and proof.deployed_repo_sha == deployed_repo_sha
         and proof.deployed_contract_digest == digest(deployed_contract.model_dump(mode="json"))
         and proof.assessment_policy_version
         == deployed_assessment_policy_version
@@ -272,9 +279,7 @@ def gate_checks(
         and target.get("prompt_version") == deployed_contract.prompt_version
         and target.get("assessment_schema_version") == deployed_contract.schema_version
         and target.get("assessment_code_version") == deployed_contract.code_version
-        and _digest_hex(str(target.get("provider_config_digest", "")))
-        == _digest_hex(deployed_contract.config_version)
-        and target.get("repo_sha") == deployed_repo_sha
+        and target.get("provider_config_digest") == deployed_contract.config_version
         and target.get("assessment_policy_version") == deployed_assessment_policy_version
         and target.get("calibration_artifact_schema_version") == bundle.artifact_schema_version
         and target.get("calibration_dataset_version") == bundle.calibration_version

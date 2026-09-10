@@ -47,7 +47,12 @@ from evals.calibration.freeze import (
     stratified_sample,
     validate_split_membership,
 )
-from evals.calibration.gate import REQUIRED_FLOOR_CHECKS, gate_checks, prove_mismatch_uncalibrated
+from evals.calibration.gate import (
+    REQUIRED_FLOOR_CHECKS,
+    _load_authoritative_recall_proof,
+    gate_checks,
+    prove_mismatch_uncalibrated,
+)
 from evals.calibration.review import (
     build_packets,
     freeze_ledger,
@@ -59,16 +64,32 @@ from evals.calibration.review import (
 NOW = datetime(2026, 9, 9, tzinfo=UTC)
 
 
+def _production_config_version(model: str = "model") -> str:
+    """Config identity produced by the exact helper production current_contract() uses."""
+    from engram.assessments import assessment_config_version
+    from engram.provider_clients import ClassificationProviderConfig
+
+    return assessment_config_version(
+        ClassificationProviderConfig(
+            provider_adapter="openai",
+            api_key=None,
+            base_url="https://calibration.provider.test/v1",
+            model=model,
+            sanitized_provider_host="calibration.provider.test",
+        )
+    )
+
+
 def _identity() -> TargetIdentity:
     return TargetIdentity(
         campaign_id="campaign",
-        repo_sha="a" * 40,
+        campaign_tooling_repo_sha="a" * 40,
         assessment_schema_version="engram.assessment.v1",
         assessment_code_version="assessment-engine-v1",
         prompt_version="engram.assess.1",
         provider_adapter="openai",
         provider_model="model",
-        provider_config_digest="b" * 64,
+        provider_config_digest=_production_config_version(),
         provider_params={"temperature": 0},
         assessment_policy_version="assessment-selection-v1",
         calibration_artifact_schema_version="engram.calibration-profiles-v1",
@@ -500,8 +521,9 @@ def test_freeze_target_is_protected_and_immutable(tmp_path: Path) -> None:
 
     output = tmp_path / "protected" / "identity-frozen.json"
     args = Namespace(
-        repo_sha="1" * 40,
-        provider_config_digest="2" * 64,
+        campaign_tooling_repo_sha="1" * 40,
+        derive_provider_config_digest=False,
+        provider_config_digest=_production_config_version(),
         output=output,
     )
     old_umask = os.umask(0)
@@ -599,6 +621,31 @@ def test_committed_public_campaign_artifact_reconciles_and_is_content_free() -> 
         "mcp_recall_authority": "legacy",
         "ordinary_recall_authority": "legacy",
     }
+    # Round-2: the superseded freeze must not read as current campaign identity.
+    assert manifest["identity_digest"] is None
+    assert manifest["identity"]["pending_refreeze"] is True
+    assert sampling["pending_refreeze"] is True
+    assert sampling["sampling_manifest_digest"] is None
+    assert sampling["split_manifest_digest"] is None
+    assert manifest["packet_digests"] == {"pending_refreeze": True}
+    # The invalidation trail is preserved, and no human labels preceded it.
+    assert manifest["correction"]["status"] == "INVALIDATED_AND_SUPERSEDED_PRE_REVIEW"
+    assert manifest["correction"]["human_labels_accepted_before_invalidation"] is False
+    assert manifest["review_plan"]["human_adjudication_complete"] is False
+    superseded = manifest["correction"]["superseded_freezes"]
+    round2 = next(
+        entry
+        for entry in superseded
+        if entry.get("campaign_tooling_repo_sha") == "143ff3ffa23cf3ab5884ce11d19c12621ade5aca"
+    )
+    assert round2["identity_digest"] == (
+        "b81348f7b6f14cf4eaf2ca735ae266babc410bb79299c247150bda054ab01614"
+    )
+    assert round2["sampling_manifest_digest"] and round2["split_manifest_digest"]
+    # The corrected campaign stores config identity in production representation only.
+    schema = manifest["identity"]["schema"]
+    assert "sha256:<64hex>" in schema["provider_config_digest"]
+    assert "tooling revision" in schema["campaign_tooling_repo_sha"]
 
 
 def test_cli_help_advertises_only_implemented_pre_review_commands() -> None:
@@ -625,7 +672,10 @@ def test_serving_and_selection_invariants_remain_exact() -> None:
 
 def _contract() -> AssessmentContract:
     return AssessmentContract(
-        provider="openai", model="model", config_version="b" * 64, calibration_version="dataset-v2"
+        provider="openai",
+        model="model",
+        config_version=_production_config_version(),
+        calibration_version="dataset-v2",
     )
 
 
@@ -1347,13 +1397,18 @@ def test_gate_requires_bound_authoritative_recall_and_mismatch_proofs(tmp_path: 
         failures=(),
         passed=True,
     )
+    # The campaign was frozen at tooling SHA `identity.campaign_tooling_repo_sha`;
+    # the runtime under test runs a later, different revision. The gate must not
+    # equate the two (FIX-R2-2).
+    deployed_repo_sha = "b" * 40
+    assert deployed_repo_sha != identity.campaign_tooling_repo_sha
     proof_path = tmp_path / "authoritative-recall-proof.json"
-    proof_payload = {
+    proof_payload: dict[str, Any] = {
         "proof_schema": "engram-authoritative-recall-proof-v1",
         "campaign_id": identity.campaign_id,
         "target_identity_digest": identity.identity_digest(),
         "profile_set_digest": profile_digest,
-        "deployed_repo_sha": identity.repo_sha,
+        "deployed_repo_sha": deployed_repo_sha,
         "deployed_contract_digest": digest(deployed.model_dump(mode="json")),
         "assessment_policy_version": identity.assessment_policy_version,
         "captured_at": datetime.now(UTC).isoformat(),
@@ -1405,7 +1460,7 @@ def test_gate_requires_bound_authoritative_recall_and_mismatch_proofs(tmp_path: 
         artifact_path=artifact_path,
         bundle=bundle,
         deployed_contract=deployed,
-        deployed_repo_sha=identity.repo_sha,
+        deployed_repo_sha=deployed_repo_sha,
         deployed_assessment_policy_version=identity.assessment_policy_version,
         certified_serving_profiles={"legacy"},
         selection_currently_enabled=False,
@@ -1462,32 +1517,566 @@ def test_gate_requires_bound_authoritative_recall_and_mismatch_proofs(tmp_path: 
         )["recommendation"]
         == "KEEP_DISABLED"
     )
-    proof_payload["artifact_digest"] = "0" * 64
-    proof_path.write_text(json.dumps(proof_payload), encoding="utf-8")
-    assert (
-        gate_checks(**kwargs, authoritative_recall_evidence_path=proof_path)["recommendation"]
-        == "KEEP_DISABLED"
+    # --- Non-vacuous semantic negatives (FIX-R2-3) --------------------------
+    # Mutating proof bytes invalidates the frozen proof-file SHA. Unless that
+    # digest is rebound (and with it the artifact digest and mismatch proof),
+    # the gate rejects at the digest check and the intended semantic guard is
+    # never reached. Every semantic case below therefore rebinds first.
+
+    def _rebind(payload: dict[str, Any]) -> dict[str, Any]:
+        proof_path.write_text(json.dumps(payload), encoding="utf-8")
+        rebound_digest = hashlib.sha256(proof_path.read_bytes()).hexdigest()
+        rebound_bundle = bundle.model_copy(
+            update={"authoritative_recall_evidence_digest": rebound_digest}
+        )
+        # A digest mismatch and a semantic mismatch both surface as the single
+        # `authoritative_recall_unchanged` check being false. Proving the proof
+        # parses under its rebound digest is what makes the negatives below
+        # attributable to the mutated field rather than to stale bytes.
+        assert _load_authoritative_recall_proof(proof_path, rebound_digest) is not None
+        rebound_mismatch = prove_mismatch_uncalibrated(
+            profiles,
+            deployed,
+            target_identity_digest=identity.identity_digest(),
+            artifact_digest=rebound_bundle.artifact_digest(),
+        )
+        return {**kwargs, "bundle": rebound_bundle, "mismatch_proof": rebound_mismatch}
+
+    def _only_failure(result: dict[str, Any]) -> list[str]:
+        return sorted(key for key, value in result["checks"].items() if value is False)
+
+    def _rebound_gate(payload: dict[str, Any]) -> dict[str, Any]:
+        return gate_checks(**_rebind(payload), authoritative_recall_evidence_path=proof_path)
+
+    # Control: rebinding alone must leave the gate passing, so any failure below
+    # is attributable to the mutated field and not to the rebinding itself.
+    control = _rebound_gate(dict(proof_payload))
+    assert control["recommendation"] == "ENABLE_DOGFOOD_SHADOW_SELECTION", _only_failure(control)
+
+    # Retained digest-integrity case: proof bytes changed WITHOUT rebinding.
+    tampered_payload = {**proof_payload, "campaign_id": "tampered-campaign"}
+    proof_path.write_text(json.dumps(tampered_payload), encoding="utf-8")
+    # Here the proof genuinely fails to load: the frozen digest no longer matches.
+    assert _load_authoritative_recall_proof(proof_path, proof_digest) is None
+    unbound = gate_checks(**kwargs, authoritative_recall_evidence_path=proof_path)
+    assert _only_failure(unbound) == ["authoritative_recall_unchanged"]
+    assert unbound["recommendation"] == "KEEP_DISABLED"
+
+    # Ordinary /v1/recall did not answer 200.
+    http_failed = _rebound_gate(
+        {
+            **proof_payload,
+            "observations": {
+                **proof_payload["observations"],
+                "ordinary_http": {"status_code": 503, "effective_profile": "legacy"},
+            },
+        }
     )
-    proof_payload["artifact_digest"] = bundle.artifact_digest()
-    proof_payload["observations"]["ordinary_http"]["status_code"] = 503
-    proof_path.write_text(json.dumps(proof_payload), encoding="utf-8")
-    assert (
-        gate_checks(**kwargs, authoritative_recall_evidence_path=proof_path)["recommendation"]
-        == "KEEP_DISABLED"
+    assert _only_failure(http_failed) == ["authoritative_recall_unchanged"]
+    assert http_failed["recommendation"] == "KEEP_DISABLED"
+
+    # Ordinary recall answered from a non-legacy profile.
+    drifted_recall = _rebound_gate(
+        {
+            **proof_payload,
+            "observations": {
+                **proof_payload["observations"],
+                "ordinary_http": {"status_code": 200, "effective_profile": "governed"},
+            },
+        }
     )
-    proof_payload["observations"]["ordinary_http"]["status_code"] = 200
-    proof_payload["captured_at"] = (datetime.now(UTC) - timedelta(days=2)).isoformat()
-    proof_path.write_text(json.dumps(proof_payload), encoding="utf-8")
-    assert (
-        gate_checks(**kwargs, authoritative_recall_evidence_path=proof_path)["recommendation"]
-        == "KEEP_DISABLED"
+    assert _only_failure(drifted_recall) == ["authoritative_recall_unchanged"]
+
+    # MCP recall lost legacy authority.
+    drifted_mcp = _rebound_gate(
+        {
+            **proof_payload,
+            "observations": {
+                **proof_payload["observations"],
+                "mcp": {"ok": True, "effective_profile": "governed"},
+            },
+        }
     )
-    proof_payload["captured_at"] = datetime.now(UTC).isoformat()
-    proof_path.write_text(json.dumps(proof_payload), encoding="utf-8")
+    assert _only_failure(drifted_mcp) == ["authoritative_recall_unchanged"]
+
+    # Proof is older than the 24h freshness bound; everything else is valid.
+    stale = _rebound_gate(
+        {**proof_payload, "captured_at": (datetime.now(UTC) - timedelta(days=2)).isoformat()}
+    )
+    assert _only_failure(stale) == ["authoritative_recall_unchanged"]
+    assert stale["recommendation"] == "KEEP_DISABLED"
+
+    # Certified serving profiles drifted on the probed runtime.
+    proof_serving_drift = _rebound_gate(
+        {
+            **proof_payload,
+            "observations": {
+                **proof_payload["observations"],
+                "certified_serving_profiles": ["legacy", "governed"],
+            },
+        }
+    )
+    assert _only_failure(proof_serving_drift) == ["authoritative_recall_unchanged"]
+
+    # Selection was observed enabled on the probed runtime.
+    proof_selection_enabled = _rebound_gate(
+        {
+            **proof_payload,
+            "observations": {**proof_payload["observations"], "assessment_selection_enabled": True},
+        }
+    )
+    assert _only_failure(proof_selection_enabled) == ["authoritative_recall_unchanged"]
+
+    # Governed serving authorized on the probed runtime.
+    proof_governed = _rebound_gate(
+        {
+            **proof_payload,
+            "observations": {**proof_payload["observations"], "governed_serving_authorized": True},
+        }
+    )
+    assert _only_failure(proof_governed) == ["authoritative_recall_unchanged"]
+
+    # The proof is bound to a runtime other than the one being gated.
+    wrong_sha_binding = _rebound_gate({**proof_payload, "deployed_repo_sha": "9" * 40})
+    assert _only_failure(wrong_sha_binding) == ["authoritative_recall_unchanged"]
+
+    # The proof observed a different deployed contract than the gated one.
+    wrong_contract_binding = _rebound_gate({**proof_payload, "deployed_contract_digest": "0" * 64})
+    assert _only_failure(wrong_contract_binding) == ["authoritative_recall_unchanged"]
+
+    # The proof is bound to a different campaign identity.
+    wrong_identity_binding = _rebound_gate({**proof_payload, "target_identity_digest": "0" * 64})
+    assert _only_failure(wrong_identity_binding) == ["authoritative_recall_unchanged"]
+
+    # --- Deployment-side negatives ------------------------------------------
+    # Restore a valid, rebound proof and vary the deployment arguments instead.
+    valid_kwargs = _rebind(dict(proof_payload))
+
+    serving_drift = gate_checks(
+        **{**valid_kwargs, "certified_serving_profiles": {"legacy", "governed"}},
+        authoritative_recall_evidence_path=proof_path,
+    )
+    assert _only_failure(serving_drift) == ["certified_serving_profiles_exact"]
+    assert serving_drift["recommendation"] == "KEEP_DISABLED"
+
+    already_enabled = gate_checks(
+        **{**valid_kwargs, "selection_currently_enabled": True},
+        authoritative_recall_evidence_path=proof_path,
+    )
+    assert _only_failure(already_enabled) == ["selection_currently_disabled"]
+    assert already_enabled["recommendation"] == "KEEP_DISABLED"
+
+    # A deployed contract that differs from the calibrated one fails on identity,
+    # calibration binding, mismatch binding, and the proof's contract binding.
+    wrong_contract = deployed.model_copy(update={"model": "other-model"})
+    wrong_deployment = gate_checks(
+        **{**valid_kwargs, "deployed_contract": wrong_contract},
+        authoritative_recall_evidence_path=proof_path,
+    )
+    assert wrong_deployment["checks"]["identity_matches_deployment"] is False
+    assert wrong_deployment["checks"]["authoritative_recall_unchanged"] is False
+    assert wrong_deployment["recommendation"] == "KEEP_DISABLED"
+
+    # A deployed config identity in bare-hex form is a different identity and
+    # must never be accepted as equivalent to the production representation.
+    bare_hex_contract = deployed.model_copy(
+        update={"config_version": deployed.config_version.removeprefix("sha256:")}
+    )
+    bare_hex_deployment = gate_checks(
+        **{**valid_kwargs, "deployed_contract": bare_hex_contract},
+        authoritative_recall_evidence_path=proof_path,
+    )
+    assert bare_hex_deployment["checks"]["identity_matches_deployment"] is False
+    assert bare_hex_deployment["recommendation"] == "KEEP_DISABLED"
+
+    # The gated runtime is not the one the proof probed.
+    wrong_runtime = gate_checks(
+        **{**valid_kwargs, "deployed_repo_sha": "7" * 40},
+        authoritative_recall_evidence_path=proof_path,
+    )
+    assert _only_failure(wrong_runtime) == ["authoritative_recall_unchanged"]
+
+
+# --- FIX-R2-1: one canonical config identity, end to end ---------------------
+
+
+def test_production_current_contract_emits_prefixed_config_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production contract's config identity is `sha256:<64hex>`, not bare hex."""
+    from engram.assessments import assessment_config_version, current_contract
+    from engram.provider_clients import ClassificationProviderConfig
+
+    provider = ClassificationProviderConfig(
+        provider_adapter="openai",
+        api_key=None,
+        base_url="https://calibration.provider.test/v1",
+        model="model",
+        sanitized_provider_host="calibration.provider.test",
+    )
+    monkeypatch.setattr(
+        "engram.provider_clients.resolve_classification_provider", lambda *a, **k: provider
+    )
+    monkeypatch.setattr("engram.assessments.resolve_classification_provider", lambda *a: provider)
+    contract = current_contract()
+    assert contract.config_version == assessment_config_version(provider)
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", contract.config_version)
+    # The bare-hex form is a different identity and must never stand in for it.
+    assert contract.config_version != contract.config_version.removeprefix("sha256:")
+
+
+def test_frozen_target_requires_exact_production_config_representation() -> None:
+    """TargetIdentity stores the production representation verbatim."""
+    identity = _identity()
+    assert identity.provider_config_digest == _production_config_version()
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", identity.provider_config_digest)
+    # A bare 64-hex digest cannot be frozen as campaign config identity at all.
+    with pytest.raises(ValueError):
+        _identity().model_copy(
+            update={"provider_config_digest": _production_config_version().removeprefix("sha256:")}
+        ).model_validate(
+            {
+                **_identity().model_dump(mode="json"),
+                "provider_config_digest": _production_config_version().removeprefix("sha256:"),
+            }
+        )
+
+
+def test_freeze_target_cli_rejects_bare_hex_and_derives_from_production(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`freeze-target` refuses non-production form and can derive the real value."""
+    from argparse import Namespace
+
+    from engram.provider_clients import ClassificationProviderConfig
+    from evals.calibration.__main__ import cmd_freeze_target
+
+    bare = Namespace(
+        campaign_tooling_repo_sha="1" * 40,
+        derive_provider_config_digest=False,
+        provider_config_digest=_production_config_version().removeprefix("sha256:"),
+        output=tmp_path / "bare" / "identity.json",
+    )
+    with pytest.raises(SystemExit):
+        cmd_freeze_target(bare)
+    assert not (tmp_path / "bare" / "identity.json").exists()
+
+    provider = ClassificationProviderConfig(
+        provider_adapter="openai",
+        api_key=None,
+        base_url="https://calibration.provider.test/v1",
+        model="model",
+        sanitized_provider_host="calibration.provider.test",
+    )
+    monkeypatch.setattr(
+        "engram.provider_clients.resolve_classification_provider", lambda *a, **k: provider
+    )
+    derived_output = tmp_path / "derived" / "identity.json"
+    derived = Namespace(
+        campaign_tooling_repo_sha="1" * 40,
+        derive_provider_config_digest=True,
+        provider_config_digest=None,
+        output=derived_output,
+    )
+    assert cmd_freeze_target(derived) == 0
+    frozen = json.loads(derived_output.read_text())
+    # Derived through the exact helper production current_contract() uses.
+    assert frozen["target_identity"]["provider_config_digest"] == _production_config_version()
+
+
+def test_production_calibrate_accepts_frozen_identity_and_rejects_config_drift() -> None:
+    """The frozen identity survives all the way into production calibration."""
+    from engram.assessment_calibration import calibrate
+
+    identity = _identity()
+    contract = _contract()
+    # Campaign identity and the deployed contract are the same exact string.
+    assert contract.config_version == identity.provider_config_digest
+
+    profile = _profiles()[0]
+    assert profile.contract.config_version == identity.provider_config_digest
+    supported = next(b for b in profile.bins if b.count >= 50)
+    raw = (supported.lower + supported.upper) / 2
+
+    calibrated = calibrate(
+        raw,
+        profile=profile,
+        contract=contract,
+        dimension=profile.dimension,
+        source_type=profile.source_type,
+        assertion_mode=profile.assertion_mode,
+        kind=profile.kind,
+        risk=profile.risk,
+    )
+    assert calibrated.status == "calibrated"
+
+    # Bare-hex config identity is a genuinely different contract: fail closed.
+    bare_hex = contract.model_copy(
+        update={"config_version": contract.config_version.removeprefix("sha256:")}
+    )
+    assert (
+        calibrate(
+            raw,
+            profile=profile,
+            contract=bare_hex,
+            dimension=profile.dimension,
+            source_type=profile.source_type,
+            assertion_mode=profile.assertion_mode,
+            kind=profile.kind,
+            risk=profile.risk,
+        ).status
+        == "uncalibrated"
+    )
+    # Any other config identity change is equally fail-closed.
+    assert (
+        calibrate(
+            raw,
+            profile=profile,
+            contract=contract.model_copy(update={"config_version": "sha256:" + "0" * 64}),
+            dimension=profile.dimension,
+            source_type=profile.source_type,
+            assertion_mode=profile.assertion_mode,
+            kind=profile.kind,
+            risk=profile.risk,
+        ).status
+        == "uncalibrated"
+    )
+
+
+def test_no_calibration_fixture_uses_bare_hex_config_identity() -> None:
+    """Guard against a fixture silently reintroducing the non-production form."""
+    # Structural: every fixture identity/contract carries the production form.
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", _identity().provider_config_digest)
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", _contract().config_version)
+    for profile in _profiles():
+        assert re.fullmatch(r"sha256:[0-9a-f]{64}", profile.contract.config_version)
+
+    # Textual: no hand-authored bare-hex config identity anywhere in the suites.
+    # The pattern is written so it cannot match its own source line.
+    bare_hex_literal = re.compile(
+        r"(?:provider_)?config_" + r"(?:version|digest)" + r'\s*=\s*"[0-9a-f]"\s*\*\s*64'
+    )
+    for path in (
+        Path("tests/test_calibration_202.py"),
+        Path("tests/test_calibration_202_corrections.py"),
+    ):
+        offenders = bare_hex_literal.findall(path.read_text())
+        assert not offenders, (path, offenders)
+
+
+# --- FIX-R2-2: campaign tooling provenance vs deployed runtime identity ------
+
+
+def _gate_fixture(tmp_path: Path, *, deployed_repo_sha: str) -> dict[str, Any]:
+    """A fully valid gate invocation, parameterized by the deployed runtime SHA."""
+    from evals.calibration.fit import CalibrationArtifactBundle
+
+    identity = _identity()
+    profiles = _profiles()
+    profile_digest = calibration_profiles_digest(profiles)
+    assert profile_digest is not None
+    deployed = _contract().model_copy(update={"calibration_digest": profile_digest})
+    floor_result = EvidenceFloorResult(
+        sampling_manifest_digest="e" * 64,
+        split_manifest_digest="f" * 64,
+        ledger_sha256="a" * 64,
+        reviewer_a_packet_sha256="b" * 64,
+        reviewer_b_packet_sha256="c" * 64,
+        assessment_evidence_sha256="d" * 64,
+        assessment_contract_digest="e" * 64,
+        full_population_dual_review=True,
+        checks={key: True for key in REQUIRED_FLOOR_CHECKS},
+        dimension_support={},
+        stratum_support={},
+        bin_support={},
+        failures=(),
+        passed=True,
+    )
+    proof_path = tmp_path / "proof.json"
+    proof_path.write_text(
+        json.dumps(
+            {
+                "proof_schema": "engram-authoritative-recall-proof-v1",
+                "campaign_id": identity.campaign_id,
+                "target_identity_digest": identity.identity_digest(),
+                "profile_set_digest": profile_digest,
+                "deployed_repo_sha": deployed_repo_sha,
+                "deployed_contract_digest": digest(deployed.model_dump(mode="json")),
+                "assessment_policy_version": identity.assessment_policy_version,
+                "captured_at": datetime.now(UTC).isoformat(),
+                "observations": {
+                    "ordinary_http": {"status_code": 200, "effective_profile": "legacy"},
+                    "mcp": {"ok": True, "effective_profile": "legacy"},
+                    "assessment_selection_enabled": False,
+                    "certified_serving_profiles": ["legacy"],
+                    "governed_serving_authorized": False,
+                    "exploratory_serving_authorized": False,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    bundle = CalibrationArtifactBundle(
+        calibration_version="dataset-v2",
+        target=identity.model_dump(mode="json"),
+        target_identity_digest=identity.identity_digest(),
+        sampling_manifest_digest="e" * 64,
+        split_manifest_digest="f" * 64,
+        floors=_floors().model_dump(mode="json"),
+        fitting_method="exact-stratum-reliability-bins-v1",
+        profiles=[p.model_dump(mode="json") for p in profiles],
+        holdout_metrics=[
+            {
+                "dimension": dimension,
+                "stratum": "manual/unknown/fact/unknown",
+                "n": 10,
+                "brier": 0.1,
+                "ece": 0.05,
+                "covered_stratum": True,
+            }
+            for dimension in ("taxonomy", "retention", "epistemic")
+        ],
+        unsupported_strata=[],
+        floor_results=floor_result.model_dump(mode="json"),
+        floors_satisfied=True,
+        authoritative_recall_evidence_digest=hashlib.sha256(proof_path.read_bytes()).hexdigest(),
+    )
+    artifact_path = tmp_path / "profiles.json"
+    artifact_path.write_bytes(bundle.to_loader_payload())
+    return {
+        "identity": identity,
+        "proof_path": proof_path,
+        "kwargs": dict(
+            artifact_path=artifact_path,
+            bundle=bundle,
+            deployed_contract=deployed,
+            deployed_repo_sha=deployed_repo_sha,
+            deployed_assessment_policy_version=identity.assessment_policy_version,
+            certified_serving_profiles={"legacy"},
+            selection_currently_enabled=False,
+            floor_result=floor_result,
+            mismatch_proof=prove_mismatch_uncalibrated(
+                profiles,
+                deployed,
+                target_identity_digest=identity.identity_digest(),
+                artifact_digest=bundle.artifact_digest(),
+            ),
+        ),
+    }
+
+
+def test_gate_passes_when_deployed_runtime_sha_differs_from_campaign_tooling_sha(
+    tmp_path: Path,
+) -> None:
+    """A merge commit changes the runtime SHA; it must not invalidate the campaign.
+
+    The campaign is frozen at tooling SHA `A`. The runtime later runs SHA `B`.
+    With the assessment contract and every serving invariant unchanged, the gate
+    must still pass: `A != B` is expected once the campaign branch merges, and
+    re-freezing on every merge is not the #202 contract.
+    """
+    deployed_repo_sha = "b" * 40
+    fixture = _gate_fixture(tmp_path, deployed_repo_sha=deployed_repo_sha)
+    identity = fixture["identity"]
+    campaign_tooling_repo_sha = identity.campaign_tooling_repo_sha
+
+    assert campaign_tooling_repo_sha != deployed_repo_sha
+    # The campaign keeps its tooling provenance in the frozen target.
+    assert re.fullmatch(r"[0-9a-f]{40}", campaign_tooling_repo_sha)
+
+    result = gate_checks(
+        **fixture["kwargs"], authoritative_recall_evidence_path=fixture["proof_path"]
+    )
+    assert result["recommendation"] == "ENABLE_DOGFOOD_SHADOW_SELECTION", [
+        key for key, value in result["checks"].items() if value is False
+    ]
+    assert result["checks"]["identity_matches_deployment"] is True
+    assert result["checks"]["authoritative_recall_unchanged"] is True
+    # The scope never widens beyond dogfood shadow selection.
+    assert result["scope"] == "dogfood_shadow_selection_only"
+
+
+def test_gate_still_passes_when_tooling_and_runtime_sha_coincide(tmp_path: Path) -> None:
+    """Divergence is tolerated, not required."""
+    identity_sha = _identity().campaign_tooling_repo_sha
+    fixture = _gate_fixture(tmp_path, deployed_repo_sha=identity_sha)
+    result = gate_checks(
+        **fixture["kwargs"], authoritative_recall_evidence_path=fixture["proof_path"]
+    )
+    assert result["recommendation"] == "ENABLE_DOGFOOD_SHADOW_SELECTION"
+
+
+def test_campaign_tooling_sha_is_not_a_runtime_trust_signal(tmp_path: Path) -> None:
+    """A newer runtime SHA is never automatically trusted when the assessment contract differs."""
+    fixture = _gate_fixture(tmp_path, deployed_repo_sha="b" * 40)
+    kwargs = fixture["kwargs"]
+    drifted = kwargs["deployed_contract"].model_copy(update={"prompt_version": "engram.assess.1"})
+    # Same prompt version: still identical, so still passes.
     assert (
         gate_checks(
-            **{**kwargs, "certified_serving_profiles": {"legacy", "governed"}},
-            authoritative_recall_evidence_path=proof_path,
+            **{**kwargs, "deployed_contract": drifted},
+            authoritative_recall_evidence_path=fixture["proof_path"],
         )["recommendation"]
-        == "KEEP_DISABLED"
+        == "ENABLE_DOGFOOD_SHADOW_SELECTION"
     )
+    # Any real contract drift on that newer SHA fails closed.
+    for update in (
+        {"provider": "other"},
+        {"model": "other"},
+        {"config_version": "sha256:" + "0" * 64},
+        {"calibration_version": "other"},
+        {"calibration_digest": "sha256:" + "0" * 64},
+    ):
+        contract_drift = kwargs["deployed_contract"].model_copy(update=update)
+        drifted_gate = gate_checks(
+            **{**kwargs, "deployed_contract": contract_drift},
+            authoritative_recall_evidence_path=fixture["proof_path"],
+        )
+        assert drifted_gate["recommendation"] == "KEEP_DISABLED", update
+
+
+def test_campaign_identity_change_does_not_move_sample_or_split_membership() -> None:
+    """Re-freezing for an identity correction must not disturb the corpus.
+
+    Sampling and splitting consume the snapshot, campaign id, and seeds -- never
+    the target identity digest. So correcting the config representation or the
+    tooling-SHA field name changes the recorded manifest digests but leaves
+    eligible/sampled/dev/holdout membership byte-identical.
+    """
+    frame = _frame(40)
+    sample_ids, stratum_counts, _ = stratified_sample(
+        frame, campaign_id="campaign", sampling_seed="seed", coverage_min=2
+    )
+    dev_ids, holdout_ids, _, _ = assign_splits(
+        frame,
+        sample_ids=sample_ids,
+        campaign_id="campaign",
+        split_seed="split",
+        dev_fraction=0.6,
+    )
+
+    old_identity = _identity()
+    # The corrected identity: different config representation and tooling SHA.
+    new_identity = _identity().model_copy(
+        update={
+            "campaign_tooling_repo_sha": "c" * 40,
+            "provider_config_digest": "sha256:" + "1" * 64,
+        }
+    )
+    assert old_identity.identity_digest() != new_identity.identity_digest()
+
+    resampled_ids, resampled_counts, _ = stratified_sample(
+        frame, campaign_id="campaign", sampling_seed="seed", coverage_min=2
+    )
+    redev_ids, reholdout_ids, _, _ = assign_splits(
+        frame,
+        sample_ids=resampled_ids,
+        campaign_id="campaign",
+        split_seed="split",
+        dev_fraction=0.6,
+    )
+    assert resampled_ids == sample_ids
+    assert resampled_counts == stratum_counts
+    assert (redev_ids, reholdout_ids) == (dev_ids, holdout_ids)
+    assert set(dev_ids) | set(holdout_ids) == set(sample_ids)
+    assert not set(dev_ids) & set(holdout_ids)

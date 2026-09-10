@@ -1,9 +1,92 @@
 # ENG-CALIBRATION-001F (#202) operator runbook — corrected pre-review stage
 
-Status: **STOPPED FOR HUMAN ADJUDICATION**. The corrected v2 preparation
-artifacts are frozen. No human calibration labels have been accepted. Do not
-fit, gate, enable selection, or claim the #202 terminal result before the full
-human review and adjudication contract is complete.
+Status: **PENDING ROUND-2 RE-FREEZE, THEN STOPPED FOR HUMAN ADJUDICATION**.
+The corrected v2 freeze has itself been invalidated pre-review (see below) and
+must be re-frozen against the deployed runtime before review begins. No human
+calibration labels have been accepted at any point. Do not fit, gate, enable
+selection, or claim the #202 terminal result before the full human review and
+adjudication contract is complete.
+
+## Round-2 invalidation of the corrected v2 freeze
+
+Two defects in the corrected v2 freeze made it unusable as frozen:
+
+1. **Config identity representation.** `provider_config_digest` was frozen as a
+   bare 64-hex digest. Production `current_contract()` emits
+   `AssessmentContract.config_version` as `sha256:<64hex>`, and both the
+   evidence verifier and production `calibrate()` compare it by exact equality.
+   No real deployed contract could satisfy the frozen target, and normalizing
+   only inside the verifier would let fitting proceed on an identity production
+   would later reject as uncalibrated. Campaign identity now stores the exact
+   production representation, and the previous bare-hex value
+   (`725ee055…`) has no recorded capture provenance, so it must **not** be
+   reused or simply prefixed.
+2. **Tooling provenance conflated with deployed runtime identity.** The gate
+   required `proof.deployed_repo_sha == deployed_repo_sha == target.repo_sha`.
+   Once this branch merges, `main` necessarily carries a different SHA, so the
+   gate could only pass by deploying the historical commit or re-freezing after
+   every merge — even with the assessment contract completely unchanged.
+
+Both corrections change `TargetIdentity`, and therefore the target identity
+digest and every artifact transitively bound to it. The corrected v2 protected
+bytes and their invalidation record are retained byte-for-byte in
+`202-invalidated-corrected-v2-143ff3f`; its identity
+(`b81348f7b6f14cf4eaf2ca735ae266babc410bb79299c247150bda054ab01614`), sampling
+(`c899ab9fe836b3ad122a933e593d137fb79110dab6aed56984a02e36477c9f65`), split
+(`0a97df59abe186e2b914a551bba802bf908253d10a53eddb2d82c7ab4e6c4611`), and packet
+(`f37cb720…4990e` / `58353df8…8a4b27`) digests are audit history only.
+
+No accepted reviewer result, frozen label ledger, or adjudication artifact
+existed before this invalidation either.
+
+### Campaign tooling SHA versus deployed runtime SHA
+
+These are now two distinct identities and are never compared to each other:
+
+```text
+TargetIdentity.campaign_tooling_repo_sha  # revision that generated/froze the campaign
+AuthoritativeRecallProof.deployed_repo_sha  # revision actually running on the probed host
+```
+
+The proof still binds to the runtime it probed (`proof.deployed_repo_sha ==
+deployed_repo_sha`) for auditability. Runtime compatibility is gated where it
+belongs: on the exact deployed `AssessmentContract` (provider, model, prompt,
+schema, code, config, calibration version and digest) plus every serving
+invariant. A newer runtime SHA is therefore never automatically trusted — any
+contract drift on it still fails closed — while a merge commit that leaves the
+calibrated contract identical no longer forces a re-freeze.
+
+### Required operator re-freeze
+
+Run on the host whose runtime the campaign targets, so the config identity is
+derived from real deployed provider settings rather than transcribed:
+
+```bash
+python -m evals.calibration freeze-target \
+  --campaign-tooling-repo-sha "$(git rev-parse HEAD)" \
+  --derive-provider-config-digest \
+  --output "$XDG_DATA_HOME/engram/evals/202/identity-frozen.json"
+```
+
+`--derive-provider-config-digest` calls
+`engram.assessments.assessment_config_version()` — the exact helper production
+`current_contract()` uses. Passing `--provider-config-digest` with a bare 64-hex
+value is refused outright. Then regenerate the transitively affected protected
+artifacts (`sample`, then `packets`), recompute the target identity, sampling,
+split, and packet digests, update this runbook and the public manifest, and
+regenerate once more to prove deterministic equality.
+
+Sampling and splitting never consume the target identity digest, so the
+re-freeze changes recorded manifest digests only. Absent a snapshot change the
+counts must be unchanged:
+
+```text
+eligible = 624
+sampled  = 402
+dev + holdout = 402  (241 + 161)
+```
+
+If any count moves, stop and explain why before proceeding.
 
 ## Invalidated v1 pre-review freeze
 
@@ -57,9 +140,9 @@ sign-off. Nothing expires automatically; later archival or destruction requires
 explicit data-owner authorization while retaining this content-free public digest
 and invalidation trail.
 
-| Corrected identity | Digest/count |
+| Corrected v2 identity (INVALIDATED round-2, audit history only) | Digest/count |
 | --- | --- |
-| Corrected tooling SHA | `143ff3ffa23cf3ab5884ce11d19c12621ade5aca` |
+| Campaign tooling SHA | `143ff3ffa23cf3ab5884ce11d19c12621ade5aca` |
 | Snapshot | `cc172a6f7c2780784ef0ce5686772a72324d1398976fc117da637df2a88fbdb0` |
 | Target identity | `b81348f7b6f14cf4eaf2ca735ae266babc410bb79299c247150bda054ab01614` |
 | Sampling manifest | `c899ab9fe836b3ad122a933e593d137fb79110dab6aed56984a02e36477c9f65` |

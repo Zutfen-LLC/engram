@@ -50,16 +50,32 @@ from evals.calibration.review import (
 NOW = datetime(2026, 9, 9, tzinfo=UTC)
 
 
+def _production_config_version(model: str = "model") -> str:
+    """Config identity produced by the exact helper production current_contract() uses."""
+    from engram.assessments import assessment_config_version
+    from engram.provider_clients import ClassificationProviderConfig
+
+    return assessment_config_version(
+        ClassificationProviderConfig(
+            provider_adapter="openai",
+            api_key=None,
+            base_url="https://calibration.provider.test/v1",
+            model=model,
+            sanitized_provider_host="calibration.provider.test",
+        )
+    )
+
+
 def _identity() -> TargetIdentity:
     return TargetIdentity(
         campaign_id="test-campaign",
-        repo_sha="a" * 40,
+        campaign_tooling_repo_sha="a" * 40,
         assessment_schema_version="engram.assessment.v1",
         assessment_code_version="assessment-engine-v1",
         prompt_version="engram.assess.1",
         provider_adapter="openai",
         provider_model="test-model",
-        provider_config_digest="b" * 64,
+        provider_config_digest=_production_config_version(),
         provider_params={"temperature": 0},
         assessment_policy_version="assessment-selection-v1",
         calibration_artifact_schema_version="engram.calibration-profiles-v1",

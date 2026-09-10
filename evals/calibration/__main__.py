@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -48,16 +49,39 @@ def _write_public(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n")
 
 
+def _resolve_provider_config_digest(args: argparse.Namespace) -> str:
+    """Return the campaign config identity in the exact production representation.
+
+    Either derive it from the deployed runtime through the very same helper
+    ``current_contract()`` uses, or accept an explicitly captured value -- but
+    only in production form. A bare 64-hex digest is rejected outright: it is a
+    different identity that production calibration would later refuse.
+    """
+    if getattr(args, "derive_provider_config_digest", False):
+        from engram.assessments import assessment_config_version
+        from engram.provider_clients import resolve_classification_provider
+
+        return assessment_config_version(resolve_classification_provider())
+    supplied = str(args.provider_config_digest)
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", supplied):
+        raise SystemExit(
+            "provider config digest must be the exact production "
+            "AssessmentContract.config_version representation (sha256:<64hex>); "
+            f"refusing {supplied!r}"
+        )
+    return supplied
+
+
 def cmd_freeze_target(args: argparse.Namespace) -> int:
     identity = TargetIdentity(
         campaign_id=CAMPAIGN_ID,
-        repo_sha=args.repo_sha,
+        campaign_tooling_repo_sha=args.campaign_tooling_repo_sha,
         assessment_schema_version="engram.assessment.v1",
         assessment_code_version="assessment-engine-v1",
         prompt_version="engram.assess.1",
         provider_adapter="openai",
         provider_model="deepseek-ai/DeepSeek-V4-Flash",
-        provider_config_digest=args.provider_config_digest,
+        provider_config_digest=_resolve_provider_config_digest(args),
         provider_params={"temperature": 0, "max_tokens": 1024, "input_limit": 16000},
         assessment_policy_version="assessment-selection-v1",
         calibration_artifact_schema_version="engram.calibration-profiles-v1",
@@ -192,8 +216,22 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     command = sub.add_parser("freeze-target")
-    command.add_argument("--repo-sha", required=True)
-    command.add_argument("--provider-config-digest", required=True)
+    command.add_argument(
+        "--campaign-tooling-repo-sha",
+        required=True,
+        help="tooling revision that generates this freeze (campaign provenance only; "
+        "NOT a constraint on the revision later deployed at serving time)",
+    )
+    config_source = command.add_mutually_exclusive_group(required=True)
+    config_source.add_argument(
+        "--provider-config-digest",
+        help="exact production AssessmentContract.config_version (sha256:<64hex>)",
+    )
+    config_source.add_argument(
+        "--derive-provider-config-digest",
+        action="store_true",
+        help="derive config identity from the deployed runtime via the production helper",
+    )
     command.add_argument("--output", type=Path, required=True)
     command.set_defaults(func=cmd_freeze_target)
 
