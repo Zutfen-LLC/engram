@@ -197,16 +197,33 @@ def _receipt(session: LaneSession, sample_id: str, **overrides) -> dict:
     for key, observed_key in observed_keys.items():
         if key in overrides:
             observed[observed_key] = overrides.pop(key)
+    identity_source = overrides.pop("identity_source", "provider_metadata")
+    provider_request_id = overrides.pop("provider_request_id", "req-206-0001")
+    provider_response_id = overrides.pop("provider_response_id", "resp-206-0001")
+    # FIX-R6-2: the synthetic executor captures a digest-bound provider
+    # metadata artifact that honestly reports the (possibly overridden)
+    # observed identity — the artifact derives the model/request/response IDs.
+    artifact = None
+    if identity_source == "provider_metadata":
+        from evals.calibration.provider_metadata import ProviderMetadataArtifact
+
+        artifact = ProviderMetadataArtifact.capture(
+            provider="synthetic-provider-206",
+            raw_metadata={
+                "model": observed["actual_provider_model_identifier"],
+                "request_id": provider_request_id,
+                "response_id": provider_response_id,
+            },
+        )
     receipt = observe_execution(
         session.lane_root,
         campaign_id="campaign",
         sample_id=sample_id,
         request_generation=overrides.pop("request_generation", 1),
         executor_status=overrides.pop("executor_status", "completed"),
-        identity_source=overrides.pop("identity_source", "provider_metadata"),
+        identity_source=identity_source,
         executor_identity=overrides.pop("executor_identity", "synthetic-executor-206"),
-        provider_request_id=overrides.pop("provider_request_id", "req-206-0001"),
-        provider_response_id=overrides.pop("provider_response_id", "resp-206-0001"),
+        provider_metadata_artifact=artifact,
         executed_at=NOW,
         **observed,
     )

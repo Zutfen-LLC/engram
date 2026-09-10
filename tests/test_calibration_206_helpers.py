@@ -15,6 +15,27 @@ from evals.calibration.freeze import FrameRow, SamplingManifest, SplitManifest, 
 NOW = datetime(2026, 9, 10, tzinfo=UTC)
 
 
+def provider_metadata_for(
+    model: str,
+    *,
+    request_id: str = "req-206-0001",
+    response_id: str = "resp-206-0001",
+):
+    """FIX-R6-2 test fixtures: a digest-bound provider metadata artifact
+    that mechanically derives the given observed identity (the synthetic
+    provider honestly reports whatever model/IDs the fixture observed)."""
+    from evals.calibration.provider_metadata import ProviderMetadataArtifact
+
+    return ProviderMetadataArtifact.capture(
+        provider="synthetic-provider-206",
+        raw_metadata={
+            "model": model,
+            "request_id": request_id,
+            "response_id": response_id,
+        },
+    )
+
+
 def build_raw_response(
     sample_id: str,
     fields: dict,
@@ -53,19 +74,27 @@ def execution_receipt_for(
     executor_identity: str = "synthetic-executor-206",
     provider_request_id: str | None = "req-206-0001",
     provider_response_id: str | None = "resp-206-0001",
+    provider_metadata_raw: dict | None = None,
     **identity_overrides: str,
 ) -> object:
     """Build a truthful execution receipt from OBSERVED executor metadata.
 
-    FIX-R5-1 test fixtures: the actual identity is supplied by the (synthetic)
-    executor as OBSERVED values — ``reviewer`` is only consulted for the
-    DEFAULT observed values (the synthetic executor was configured to run
-    exactly this lane's model), and every adversarial test overrides one
-    observed field to a genuinely different value. The receipt can never be
-    built by copying the expected identity silently: overrides are explicit
-    executor observations.
+    FIX-R5-1 / FIX-R6-2 test fixtures: the actual identity is supplied by
+    the (synthetic) executor as OBSERVED values — ``reviewer`` is only
+    consulted for the DEFAULT observed values (the synthetic executor was
+    configured to run exactly this lane's model), and every adversarial
+    test overrides one observed field to a genuinely different value. The
+    receipt can never be built by copying the expected identity silently:
+    overrides are explicit executor observations.
+
+    FIX-R6-2: for ``identity_source == "provider_metadata"`` the receipt is
+    backed by a digest-bound provider metadata artifact whose bytes derive
+    the observed model/request/response IDs. The default artifact carries
+    the OBSERVED identity (post-override); supply ``provider_metadata_raw``
+    to forge a metadata/observed disagreement.
     """
     from evals.calibration.ingestion import observe_execution
+    from evals.calibration.provider_metadata import ProviderMetadataArtifact
 
     observed = {
         "actual_reviewer_slot": reviewer.reviewer_slot,  # type: ignore[attr-defined]
@@ -75,6 +104,15 @@ def execution_receipt_for(
         "actual_prompt_digest": reviewer.prompt_digest,  # type: ignore[attr-defined]
     }
     observed.update(identity_overrides)
+    artifact: object = None
+    if identity_source == "provider_metadata":
+        raw = dict(provider_metadata_raw or {})
+        raw.setdefault("model", observed["actual_provider_model_identifier"])
+        raw.setdefault("request_id", provider_request_id or "req-206-0001")
+        raw.setdefault("response_id", provider_response_id or "resp-206-0001")
+        artifact = ProviderMetadataArtifact.capture(
+            provider="synthetic-provider-206", raw_metadata=raw
+        )
     return observe_execution(
         lane_root,
         campaign_id=campaign_id,
@@ -83,8 +121,7 @@ def execution_receipt_for(
         executor_status=executor_status,  # type: ignore[arg-type]
         identity_source=identity_source,  # type: ignore[arg-type]
         executor_identity=executor_identity,
-        provider_request_id=provider_request_id,
-        provider_response_id=provider_response_id,
+        provider_metadata_artifact=artifact,  # type: ignore[arg-type]
         executed_at=NOW,
         **observed,  # type: ignore[arg-type]
     )

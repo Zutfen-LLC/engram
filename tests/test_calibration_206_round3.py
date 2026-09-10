@@ -52,6 +52,7 @@ from tests.test_calibration_206_helpers import (
     build_identity,
     build_split,
     build_verified_ledger,
+    provider_metadata_for,
 )
 
 NOW = datetime(2026, 9, 10, tzinfo=UTC)
@@ -122,6 +123,9 @@ def _record(slot: str, sample_id: str, judgment: ModelJudgment | None) -> ModelR
             identity_source="provider_metadata",
             provider_request_id="req-206-0001",
             provider_response_id="resp-206-0001",
+            provider_metadata=(
+                provider_metadata_for(f"{fam}-exact-2026-09").model_dump(mode="json")
+            ),
         )
     )
     return ModelReviewRecord(
@@ -330,8 +334,7 @@ def _truthful_receipt(lane_root: Path, reviewer, sample_id: str):
         executor_identity="synthetic-executor-206",
         executor_status="completed",
         identity_source="provider_metadata",
-        provider_request_id="req-206-0001",
-        provider_response_id="resp-206-0001",
+        provider_metadata_artifact=provider_metadata_for(reviewer.provider_model_identifier),
         executed_at=NOW,
     )
 

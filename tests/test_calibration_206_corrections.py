@@ -56,6 +56,7 @@ from evals.calibration.model_lanes import (
     freeze_lane,
     load_frozen_lanes,
 )
+from tests.test_calibration_206_helpers import provider_metadata_for
 
 NOW = datetime(2026, 9, 10, tzinfo=UTC)
 FAMILY_BY_SLOT = dict(zip(REVIEWER_SLOTS, REVIEWER_FAMILIES, strict=True))
@@ -180,6 +181,7 @@ def _record(
             identity_source="provider_metadata",
             provider_request_id="req-206-0001",
             provider_response_id="resp-206-0001",
+            provider_metadata=(provider_metadata_for(model_id).model_dump(mode="json")),
         )
     )
     return ModelReviewRecord(
@@ -999,6 +1001,43 @@ def _publish_raw(protected_root: Path, slot: str, record: ModelReviewRecord) -> 
         protected_root / "lanes" / slot / "raw" / f"{record.sample_id}.resp",
         payload,
     )
+    # FIX-R6-2: publish the preserved provider metadata artifact matching the
+    # record's embedded execution evidence (the synthetic executor captured
+    # it at observation time, exactly as observe_execution would).
+    execution = record.execution
+    if (
+        execution is not None
+        and execution.identity_source == "provider_metadata"
+        and isinstance(execution.provider_metadata, dict)
+    ):
+        from evals.calibration.provider_metadata import (
+            ProviderMetadataArtifact,
+            publish_provider_metadata,
+        )
+
+        publish_provider_metadata(
+            protected_root / "lanes" / slot,
+            record.sample_id,
+            ProviderMetadataArtifact.model_validate(execution.provider_metadata),
+        )
+
+
+def _publish_provider_meta(protected_root: Path, slot: str, record: ModelReviewRecord) -> None:
+    """FIX-R6-2 fixtures: preserve the provider metadata artifact for a
+    record whose execution evidence is provider_metadata-backed."""
+    execution = record.execution
+    if execution is None or not isinstance(execution.provider_metadata, dict):
+        return
+    from evals.calibration.provider_metadata import (
+        ProviderMetadataArtifact,
+        publish_provider_metadata,
+    )
+
+    publish_provider_metadata(
+        protected_root / "lanes" / slot,
+        record.sample_id,
+        ProviderMetadataArtifact.model_validate(execution.provider_metadata),
+    )
 
 
 def _audit_outcome_record(
@@ -1698,8 +1737,9 @@ class TestFix6LaneWorkflow:
                 executor_identity="synthetic-executor-206",
                 executor_status="completed",
                 identity_source="provider_metadata",
-                provider_request_id="req-206-0001",
-                provider_response_id="resp-206-0001",
+                provider_metadata_artifact=provider_metadata_for(
+                    reviewer.provider_model_identifier
+                ),
                 executed_at=NOW,
             )
             payload["execution"] = json.loads(json.dumps(receipt.model_dump(mode="json")))
@@ -1797,8 +1837,9 @@ class TestFix6LaneWorkflow:
                 executor_identity="synthetic-executor-206",
                 executor_status=status,  # type: ignore[arg-type]
                 identity_source="provider_metadata",
-                provider_request_id="req-206-0001",
-                provider_response_id="resp-206-0001",
+                provider_metadata_artifact=provider_metadata_for(
+                    session.reviewer.provider_model_identifier
+                ),
                 executed_at=NOW,
             )
             return json.loads(json.dumps(value.model_dump(mode="json")))
@@ -2135,6 +2176,7 @@ class TestFixR2RawEvidence:
                     "model_a", sid, _judgment(), sampling_digest=sampling.manifest_digest()
                 )
                 _publish_raw(tmp_path, "model_a", record)
+            _publish_provider_meta(tmp_path, "model_a", record)
             append_review_record(record, tmp_path)
         lane = freeze_lane(
             protected_root=tmp_path,
@@ -2176,6 +2218,7 @@ class TestFixR2RawEvidence:
                     "model_a", sid, _judgment(), sampling_digest=sampling.manifest_digest()
                 )
                 _publish_raw(tmp_path, "model_a", record)
+            _publish_provider_meta(tmp_path, "model_a", record)
             append_review_record(record, tmp_path)
         with pytest.raises(ValueError, match="provider_error_must_not_have_raw_response_artifact"):
             freeze_lane(
@@ -2222,8 +2265,9 @@ class TestFixR2RawEvidence:
             executor_identity="synthetic-executor-206",
             executor_status="completed",
             identity_source="provider_metadata",
-            provider_request_id="req-206-0001",
-            provider_response_id="resp-206-0001",
+            provider_metadata_artifact=provider_metadata_for(
+                session.reviewer.provider_model_identifier
+            ),
             executed_at=NOW,
         )
         record = session.ingest_response(
@@ -2250,8 +2294,9 @@ class TestFixR2RawEvidence:
             executor_identity="synthetic-executor-206",
             executor_status="completed",
             identity_source="provider_metadata",
-            provider_request_id="req-206-0001",
-            provider_response_id="resp-206-0001",
+            provider_metadata_artifact=provider_metadata_for(
+                session.reviewer.provider_model_identifier
+            ),
             executed_at=NOW,
         )
         with pytest.raises(ValueError, match="raw_response_orphan_digest_conflict"):

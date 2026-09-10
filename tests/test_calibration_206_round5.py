@@ -44,6 +44,7 @@ from evals.calibration.ingestion import (
     observe_execution,
     verify_request_batch,
 )
+from evals.calibration.provider_metadata import ProviderMetadataArtifact
 from evals.calibration.review import write_protected_file
 from evals.calibration.reviewer_instructions import (
     CANONICAL_SEMANTIC_BUNDLE,
@@ -167,7 +168,16 @@ def _setup_lane(tmp_path: Path, *, slot: str = "model_a"):
 
 
 def _observed(session: LaneSession, sample_id: str, **identity_overrides) -> dict:
-    """OBSERVED execution metadata as an independent dict (executor view)."""
+    """OBSERVED execution metadata as an independent dict (executor view).
+
+    FIX-R6-2: the synthetic executor captures a digest-bound provider
+    metadata artifact whose bytes derive the observed model/request/response
+    IDs (defaults carry the lane's expected model — the synthetic executor
+    was configured for it; adversarial overrides change BOTH the observed
+    identity and the artifact that reports it).
+    """
+    from evals.calibration.provider_metadata import ProviderMetadataArtifact
+
     observed = {
         "campaign_id": "campaign",
         "actual_reviewer_slot": session.reviewer.reviewer_slot,
@@ -185,6 +195,17 @@ def _observed(session: LaneSession, sample_id: str, **identity_overrides) -> dic
         "sample_id": sample_id,
     }
     observed.update(identity_overrides)
+    if observed["identity_source"] == "provider_metadata":
+        observed["provider_metadata_artifact"] = ProviderMetadataArtifact.capture(
+            provider="synthetic-provider-206",
+            raw_metadata={
+                "model": observed["actual_provider_model_identifier"],
+                "request_id": observed["provider_request_id"],
+                "response_id": observed["provider_response_id"],
+            },
+        )
+    observed.pop("provider_request_id", None)
+    observed.pop("provider_response_id", None)
     return observed
 
 
@@ -237,8 +258,15 @@ class TestFixR51ObservedExecutionIdentity:
             executor_identity="synthetic-executor-206",
             executor_status="completed",
             identity_source="provider_metadata",
-            provider_request_id="req-206-0001",
-            provider_response_id="resp-206-0001",
+            provider_metadata_artifact=ProviderMetadataArtifact.capture(
+                provider="synthetic-provider-206",
+                raw_metadata={
+                    # the provider metadata HONESTLY reports the GPT model
+                    "model": "gpt-astra-exact-2026-09",
+                    "request_id": "req-206-0001",
+                    "response_id": "resp-206-0001",
+                },
+            ),
         )
         with pytest.raises(ValueError, match="execution_receipt_identity_mismatch"):
             session.ingest_response(
@@ -265,8 +293,15 @@ class TestFixR51ObservedExecutionIdentity:
             executor_identity="synthetic-executor-206",
             executor_status="completed",
             identity_source="provider_metadata",
-            provider_request_id="req-206-0001",
-            provider_response_id="resp-206-0001",
+            provider_metadata_artifact=ProviderMetadataArtifact.capture(
+                provider="synthetic-provider-206",
+                raw_metadata={
+                    # the provider metadata HONESTLY reports the other version
+                    "model": "claude-opus-OTHER-VERSION",
+                    "request_id": "req-206-0001",
+                    "response_id": "resp-206-0001",
+                },
+            ),
         )
         with pytest.raises(ValueError, match="execution_receipt_identity_mismatch"):
             session.ingest_response(
@@ -293,8 +328,14 @@ class TestFixR51ObservedExecutionIdentity:
             executor_identity="synthetic-executor-206",
             executor_status="completed",
             identity_source="provider_metadata",
-            provider_request_id="req-206-0001",
-            provider_response_id="resp-206-0001",
+            provider_metadata_artifact=ProviderMetadataArtifact.capture(
+                provider="synthetic-provider-206",
+                raw_metadata={
+                    "model": session.reviewer.provider_model_identifier,
+                    "request_id": "req-206-0001",
+                    "response_id": "resp-206-0001",
+                },
+            ),
         )
         with pytest.raises(ValueError, match="execution_receipt_identity_mismatch"):
             session.ingest_response(
@@ -321,8 +362,14 @@ class TestFixR51ObservedExecutionIdentity:
             executor_identity="synthetic-executor-206",
             executor_status="completed",
             identity_source="provider_metadata",
-            provider_request_id="req-206-0001",
-            provider_response_id="resp-206-0001",
+            provider_metadata_artifact=ProviderMetadataArtifact.capture(
+                provider="synthetic-provider-206",
+                raw_metadata={
+                    "model": session.reviewer.provider_model_identifier,
+                    "request_id": "req-206-0001",
+                    "response_id": "resp-206-0001",
+                },
+            ),
         )
         with pytest.raises(ValueError, match="execution_receipt_identity_mismatch"):
             session.ingest_response(
@@ -352,8 +399,7 @@ class TestFixR51ObservedExecutionIdentity:
                 executor_identity="synthetic-executor-206",
                 executor_status="completed",
                 identity_source="executor_attestation",  # honest attestation
-                provider_request_id=None,
-                provider_response_id=None,
+                provider_metadata_artifact=None,  # attestations carry no artifact
             )
             session.ingest_response(
                 {
@@ -409,8 +455,16 @@ class TestFixR51ObservedExecutionIdentity:
             executor_identity="rogue-executor",
             executor_status="completed",
             identity_source="provider_metadata",
-            provider_request_id="req-rogue",
-            provider_response_id="resp-rogue",
+            provider_metadata_artifact=ProviderMetadataArtifact.capture(
+                provider="synthetic-provider-206",
+                raw_metadata={
+                    # the rogue executor's provider metadata HONESTLY reports
+                    # the GLM model it actually ran
+                    "model": "glm-5-3-max-exact-2026-09",
+                    "request_id": "req-rogue",
+                    "response_id": "resp-rogue",
+                },
+            ),
         )
         with pytest.raises(ValueError, match="execution_receipt_identity_mismatch"):
             session.ingest_response(
@@ -687,8 +741,14 @@ def _frozen_campaign(tmp_path: Path):
                 executor_identity=f"synthetic-executor-{slot}",
                 executor_status="completed",
                 identity_source="provider_metadata",
-                provider_request_id=f"req-206-{slot}",
-                provider_response_id=f"resp-206-{slot}",
+                provider_metadata_artifact=ProviderMetadataArtifact.capture(
+                    provider="synthetic-provider-206",
+                    raw_metadata={
+                        "model": session.reviewer.provider_model_identifier,
+                        "request_id": f"req-206-{slot}",
+                        "response_id": f"resp-206-{slot}",
+                    },
+                ),
                 executed_at=NOW,
             )
             record = session.build_record(

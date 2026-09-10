@@ -54,6 +54,7 @@ from evals.calibration.model_lanes import (
     load_lane_records,
 )
 from evals.calibration.review import BlindPacket
+from tests.test_calibration_206_helpers import provider_metadata_for
 
 NOW = datetime(2026, 9, 10, tzinfo=UTC)
 
@@ -115,6 +116,9 @@ def _record(
             identity_source="provider_metadata",
             provider_request_id="req-206-0001",
             provider_response_id="resp-206-0001",
+            provider_metadata=(
+                provider_metadata_for(f"{fam}-exact-2026-09").model_dump(mode="json")
+            ),
         )
     )
     return ModelReviewRecord(

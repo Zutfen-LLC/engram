@@ -56,6 +56,10 @@ from evals.calibration.model_lanes import (
     freeze_lane,
     load_lane_records,
 )
+from evals.calibration.provider_metadata import (
+    CANONICAL_MALFORMED_ERROR_CODE,
+    ProviderMetadataArtifact,
+)
 from evals.calibration.review import write_protected_file
 from evals.calibration.reviewer_instructions import (
     RESPONSE_PARSER_VERSION,
@@ -125,7 +129,34 @@ def _request_batch_manifest_path(batch_path: Path) -> Path:
     return batch_path.with_suffix(".manifest.json")
 
 
-def _load_request_registry(lane_root: Path) -> dict[str, dict[int, tuple[str, str, str]]]:
+# FIX-R6-1: the exact canonical key set of an emitted request line. A
+# request line carrying ANY additional (or missing) key is non-canonical —
+# no extra evidence may appear and no frozen case evidence may be modified.
+CANONICAL_REQUEST_KEYS: frozenset[str] = frozenset(
+    {
+        "lane_request_schema",
+        "protocol_version",
+        "campaign_id",
+        "sampling_manifest_digest",
+        "source_packet_digest",
+        "neutral_packet_sha256",
+        "reviewer_slot",
+        "reviewer_family",
+        "provider_model_identifier",
+        "reviewer_config_digest",
+        "prompt_digest",
+        "label_guide_version",
+        "case_index",
+        "sample_id",
+        "case",
+        "labeling_instructions",
+    }
+)
+
+
+def _load_request_registry(
+    lane_root: Path,
+) -> dict[str, dict[int, tuple[str, str, str, dict[str, Any]]]]:
     """Scan VERIFIED request batches into a provenance registry.
 
     FIX-R5-2: every retained ``lane-requests-*.jsonl`` + manifest pair is
@@ -135,22 +166,52 @@ def _load_request_registry(lane_root: Path) -> dict[str, dict[int, tuple[str, st
     identity, neutral packet, request SHA, pending membership, item digests,
     case indexes) is re-derived from the actual batch bytes.
 
+    FIX-R6-1: when the lane carries its immutable authority file (the real
+    ``LaneSession`` path), every batch is additionally verified against the
+    AUTHORITY — each request line must be the canonical projection of the
+    frozen reviewer/lane identity, the frozen campaign/sampling/source
+    packet bindings, the byte-verified neutral packet cases, and the
+    canonical labeling instructions. A lane with an authority but no
+    retained neutral-packet bytes fails closed.
+
     Returns ``sample_id -> generation -> (request_item_digest,
-    reviewer_identity_digest, neutral_packet_sha256)``. A sample pending in
-    several generations (resume re-emission) has one entry per generation;
-    responses bind to one exact generation.
+    reviewer_identity_digest, neutral_packet_sha256, request_line)``. A
+    sample pending in several generations (resume re-emission) has one
+    entry per generation; responses bind to one exact generation.
     """
-    registry: dict[str, dict[int, tuple[str, str, str]]] = {}
+    registry: dict[str, dict[int, tuple[str, str, str, dict[str, Any]]]] = {}
+    authority: LaneAuthority | None = None
+    packet: NeutralModelPacket | None = None
+    authority_path = lane_root / "lane.json"
+    if authority_path.is_file():
+        authority = LaneAuthority.model_validate(json.loads(authority_path.read_text()))
+        retained = lane_root / "neutral-packet.json"
+        if not retained.is_file():
+            raise ValueError("lane_retained_neutral_packet_missing")
+        payload = retained.read_bytes()
+        if not hmac.compare_digest(
+            hashlib.sha256(payload).hexdigest(), authority.neutral_packet_sha256
+        ):
+            raise ValueError("neutral_packet_sha_mismatch")
+        packet = NeutralModelPacket.model_validate(json.loads(payload))
     for batch_path in sorted(lane_root.glob("lane-requests-*.jsonl")):
         manifest_path = _request_batch_manifest_path(batch_path)
-        verify_request_batch(batch_path, manifest_path=manifest_path)
+        verify_request_batch(
+            batch_path, manifest_path=manifest_path, lane_authority=authority, neutral_packet=packet
+        )
         manifest = json.loads(manifest_path.read_text())
         generation = int(manifest["generation"])
+        batch_lines = {
+            str(json.loads(line)["sample_id"]): json.loads(line)
+            for line in batch_path.read_text().splitlines()
+            if line.strip()
+        }
         for sample_id, item in manifest.get("request_items", {}).items():
             entry = (
                 str(item["request_item_digest"]),
                 str(manifest["reviewer_identity_digest"]),
                 str(manifest["neutral_packet_sha256"]),
+                batch_lines[sample_id],
             )
             existing = registry.setdefault(sample_id, {}).get(generation)
             if existing is not None and existing != entry:
@@ -159,12 +220,73 @@ def _load_request_registry(lane_root: Path) -> dict[str, dict[int, tuple[str, st
     return registry
 
 
+def _verify_request_line_canonical(
+    request: Mapping[str, Any],
+    *,
+    lane_authority: LaneAuthority,
+    neutral_packet: NeutralModelPacket,
+) -> None:
+    """FIX-R6-1: prove one request line IS the canonical projection of the
+    frozen lane authority, frozen reviewer identity, byte-verified neutral
+    packet, and canonical labeling instructions.
+
+    Internal self-consistency (a recomputed manifest after a paired rewrite)
+    is NOT authority: every semantic field is compared against its frozen
+    external authority, the instruction bundle must BE the canonical frozen
+    bundle (with its digest equal to the reviewer's frozen ``prompt_digest``),
+    and the case object must equal ``neutral_packet.cases[case_index]``
+    field-exactly at the frozen packet index.
+    """
+    sample_id = str(request.get("sample_id", ""))
+    reviewer = lane_authority.reviewer
+    if request.get("campaign_id") != lane_authority.campaign_id:
+        raise ValueError(f"request_line_campaign_not_frozen_authority:{sample_id}")
+    if request.get("sampling_manifest_digest") != lane_authority.sampling_manifest_digest:
+        raise ValueError(f"request_line_sampling_manifest_not_frozen_authority:{sample_id}")
+    if request.get("source_packet_digest") != lane_authority.source_packet_digest:
+        raise ValueError(f"request_line_source_packet_not_frozen_authority:{sample_id}")
+    if request.get("neutral_packet_sha256") != lane_authority.neutral_packet_sha256:
+        raise ValueError(f"request_line_neutral_packet_not_frozen_authority:{sample_id}")
+    if request.get("reviewer_slot") != reviewer.reviewer_slot:
+        raise ValueError(f"request_line_slot_not_frozen_reviewer:{sample_id}")
+    if request.get("reviewer_family") != reviewer.reviewer_family:
+        raise ValueError(f"request_line_family_not_frozen_reviewer:{sample_id}")
+    if request.get("provider_model_identifier") != reviewer.provider_model_identifier:
+        raise ValueError(f"request_line_model_not_frozen_reviewer:{sample_id}")
+    if request.get("reviewer_config_digest") != reviewer.reviewer_config_digest:
+        raise ValueError(f"request_line_config_not_frozen_reviewer:{sample_id}")
+    if request.get("prompt_digest") != reviewer.prompt_digest:
+        raise ValueError(f"request_line_prompt_not_frozen_reviewer:{sample_id}")
+    if request.get("label_guide_version") != LABEL_GUIDE_VERSION:
+        raise ValueError(f"request_line_label_guide_not_frozen:{sample_id}")
+    # Frozen instructions: the actual bundle must BE the canonical bundle,
+    # and its digest must equal the reviewer's frozen prompt digest — not a
+    # digest-to-digest comparison within the mutable request/manifest pair.
+    if request.get("labeling_instructions") != LABELING_INSTRUCTIONS:
+        raise ValueError(f"request_line_instructions_not_canonical_bundle:{sample_id}")
+    if request.get("prompt_digest") != labeling_instructions_digest():
+        raise ValueError(f"request_line_prompt_not_canonical_instructions:{sample_id}")
+    # Frozen case projection: field-exact equality with the byte-verified
+    # neutral packet case at the frozen packet index.
+    case_index = request.get("case_index")
+    frozen_case_index = {
+        str(case["sample_id"]): index for index, case in enumerate(neutral_packet.cases)
+    }
+    if not isinstance(case_index, int) or frozen_case_index.get(sample_id) != case_index:
+        raise ValueError(f"request_line_case_index_not_frozen_packet_index:{sample_id}")
+    frozen_case = neutral_packet.cases[case_index]
+    if not isinstance(frozen_case, dict) or request.get("case") != dict(frozen_case):
+        raise ValueError(f"request_line_case_not_frozen_neutral_case:{sample_id}")
+
+
 def verify_request_batch(
     batch_path: Path,
     *,
     manifest_path: Path | None = None,
+    lane_authority: LaneAuthority | None = None,
+    neutral_packet: NeutralModelPacket | None = None,
 ) -> dict[str, Any]:
-    """FIX-R5-2: canonical request-batch byte verifier.
+    """FIX-R5-2 / FIX-R6-1: canonical request-batch byte verifier.
 
     Re-derives EVERY manifest claim from the actual ``.jsonl`` batch bytes:
 
@@ -183,8 +305,31 @@ def verify_request_batch(
     11. no extra manifest request item exists;
     12. no emitted line is omitted from the manifest.
 
-    Returns the verified manifest. Any violation fails closed — a fabricated
-    manifest cannot register a request that was never actually emitted.
+    FIX-R6-1 (canonical authority mode): when ``lane_authority`` and
+    ``neutral_packet`` are supplied — the real lane path, used by the
+    registry, freeze, load, and final-ledger verification — the verifier
+    additionally proves every request line IS the canonical projection of
+    the frozen authorities, not merely self-consistent with its manifest:
+
+    - exact canonical key set (no extra evidence, nothing dropped);
+    - ``campaign_id`` / ``sampling_manifest_digest`` / ``source_packet_digest``
+      / ``neutral_packet_sha256`` equal the frozen ``LaneAuthority``;
+    - ``reviewer_slot`` / ``reviewer_family`` / ``provider_model_identifier``
+      / ``reviewer_config_digest`` / ``prompt_digest`` equal the frozen
+      ``ReviewerIdentity``;
+    - ``label_guide_version`` equals the frozen guide version;
+    - ``labeling_instructions`` IS the canonical frozen instruction bundle
+      (exact object equality) and its digest equals the reviewer's frozen
+      ``prompt_digest`` — never merely a digest-to-digest comparison inside
+      the mutable request/manifest pair;
+    - ``case_index`` is the frozen neutral-packet index of ``sample_id`` and
+      ``case`` equals ``neutral_packet.cases[case_index]`` field-exactly.
+
+    A paired pre-execution rewrite (alter ``case`` or instructions, then
+    recompute every internal digest) therefore fails here: internal
+    self-consistency is not authority.
+
+    Returns the verified manifest. Any violation fails closed.
     """
     if manifest_path is None:
         manifest_path = _request_batch_manifest_path(batch_path)
@@ -206,6 +351,7 @@ def verify_request_batch(
         hashlib.sha256(payload).hexdigest(), str(manifest.get("request_sha256", ""))
     ):
         raise ValueError("request_batch_sha_mismatch")
+    canonical = lane_authority is not None and neutral_packet is not None
     seen_ids: set[str] = set()
     line_sample_ids: list[str] = []
     recomputed_items: dict[str, dict[str, Any]] = {}
@@ -218,6 +364,10 @@ def verify_request_batch(
             raise ValueError("request_batch_line_not_valid_json") from None
         if not isinstance(request, dict):
             raise ValueError("request_batch_line_not_valid_json")
+        # FIX-R6-1: exact canonical key set — no extra evidence may appear
+        # and no frozen case evidence may be modified or dropped.
+        if set(request) != CANONICAL_REQUEST_KEYS:
+            raise ValueError("request_batch_line_noncanonical_keys")
         # (5) frozen campaign/protocol/lane identity on every line
         if request.get("lane_request_schema") != LANE_REQUEST_SCHEMA:
             raise ValueError("request_batch_line_schema_mismatch")
@@ -244,6 +394,14 @@ def verify_request_batch(
             raise ValueError("request_batch_duplicate_sample_id")
         seen_ids.add(sample_id)
         line_sample_ids.append(sample_id)  # (9) in emitted order
+        if canonical:
+            # FIX-R6-1: prove the line against the FROZEN AUTHORITIES.
+            assert lane_authority is not None and neutral_packet is not None
+            _verify_request_line_canonical(
+                request,
+                lane_authority=lane_authority,
+                neutral_packet=neutral_packet,
+            )
         recomputed_items[sample_id] = {
             "request_item_digest": request_item_digest(request),
             "case_index": request.get("case_index"),
@@ -280,21 +438,31 @@ def observe_execution(
     executor_identity: str,
     executor_status: Literal["completed", "provider_error"],
     identity_source: Literal["provider_metadata", "executor_attestation"],
-    provider_request_id: str | None = None,
-    provider_response_id: str | None = None,
+    provider_metadata_artifact: ProviderMetadataArtifact | None = None,
     executed_at: datetime | None = None,
 ) -> ExecutionReceipt:
-    """FIX-R5-1: build a truthful execution receipt from OBSERVED metadata.
+    """FIX-R5-1 / FIX-R6-2: build a truthful execution receipt from OBSERVED
+    evidence.
 
     The executor wrapper (Hermes, or the test harness) calls this AFTER
-    executing one request emitted by ``model-lane-request`` with the
-    identity the executor ACTUALLY observed (provider-reported model
-    metadata, or its own attestation). The expected lane
-    ``ReviewerIdentity`` is deliberately NOT a parameter: no helper can
+    executing one request emitted by ``model-lane-request``. The expected
+    lane ``ReviewerIdentity`` is deliberately NOT a parameter: no helper can
     manufacture an "actual" identity by copying the intended one. Only the
     emitted-request binding is looked up from the retained VERIFIED request
     batches. Ingestion then compares this observed identity EXACTLY against
     the frozen lane identity — a mismatch fails closed.
+
+    FIX-R6-2: for ``identity_source == "provider_metadata"`` the
+    ``provider_metadata_artifact`` (the digest-bound raw provider metadata
+    captured at execution time) is REQUIRED — arbitrary invented
+    request/response ID strings can no longer claim machine verification;
+    the identity fields on the evidence are the mechanical derivation of
+    the artifact bytes (and the artifact is preserved per-sample under
+    ``provider-meta/``). The provider does not report our internal
+    prompt/config digests, so those come from the verified request item the
+    execution answers. An environment that cannot expose model identity in
+    provider metadata must use ``identity_source == "executor_attestation"``
+    — which can never freeze a consensus lane.
     """
     from evals.calibration.consensus import ExecutionEvidence
 
@@ -302,7 +470,26 @@ def observe_execution(
     emitted = registry.get(sample_id, {}).get(request_generation)
     if emitted is None:
         raise ValueError("response_request_not_emitted")
-    item_digest, _identity, _packet = emitted
+    _item_digest, _identity, _packet, request_line = emitted
+    if identity_source == "provider_metadata":
+        if provider_metadata_artifact is None:
+            raise ValueError("provider_metadata_identity_requires_metadata_artifact")
+        from evals.calibration.provider_metadata import (
+            derive_provider_identity,
+            publish_provider_metadata,
+        )
+
+        derived = derive_provider_identity(provider_metadata_artifact)
+        if actual_provider_model_identifier != derived["reported_model_identifier"]:
+            raise ValueError("provider_metadata_model_derivation_mismatch")
+        publish_provider_metadata(lane_root, sample_id, provider_metadata_artifact)
+        provider_request_id = derived["provider_request_id"]
+        provider_response_id = derived["provider_response_id"]
+    else:
+        if provider_metadata_artifact is not None:
+            raise ValueError("executor_attestation_must_not_claim_provider_metadata")
+        provider_request_id = None
+        provider_response_id = None
     evidence = ExecutionEvidence(
         campaign_id=campaign_id,
         actual_reviewer_slot=actual_reviewer_slot,  # type: ignore[arg-type]
@@ -311,13 +498,18 @@ def observe_execution(
         actual_configuration_digest=actual_configuration_digest,
         actual_prompt_digest=actual_prompt_digest,
         request_generation=request_generation,
-        request_item_digest=item_digest,
+        request_item_digest=_item_digest,
         executed_at=executed_at or datetime.now(UTC),
         executor_status=executor_status,
         executor_identity=executor_identity,
         identity_source=identity_source,
         provider_request_id=provider_request_id,
         provider_response_id=provider_response_id,
+        provider_metadata=(
+            provider_metadata_artifact.model_dump(mode="json")
+            if provider_metadata_artifact is not None
+            else None
+        ),
     )
     return ExecutionReceipt.from_evidence(evidence)
 
@@ -360,7 +552,7 @@ def verify_lane_request_bindings(
         emitted = registry.get(sample_id, {}).get(record.request_generation or -1)
         if emitted is None:
             raise ValueError(f"record_request_not_emitted:{sample_id}")
-        item_digest, manifest_identity, packet_sha = emitted
+        item_digest, manifest_identity, packet_sha, _request_line = emitted
         if not hmac.compare_digest(record.request_item_digest or "", item_digest):
             raise ValueError(f"record_request_item_digest_mismatch:{sample_id}")
         if manifest_identity != identity_digest:
@@ -373,19 +565,50 @@ def verify_lane_request_bindings(
 
 def require_machine_verified_execution_identity(
     records: Mapping[str, ModelReviewRecord],
+    *,
+    lane_root: Path | None = None,
 ) -> None:
-    """FIX-R5-1: a lane can only freeze as a valid consensus reviewer lane
-    when every accepted record's ACTUAL executor identity was
+    """FIX-R5-1 / FIX-R6-2: a lane can only freeze as a valid consensus
+    reviewer lane when every accepted record's ACTUAL executor identity was
     machine-verified (``identity_source == provider_metadata``).
 
     An honest executor attestation (``executor_attestation``) is preserved
     as protected evidence but can NEVER ground a frozen consensus lane:
     unverified actual identity cannot freeze.
+
+    FIX-R6-2: machine verification is not a label. When ``lane_root`` is
+    supplied (the freeze/load/ledger paths), each record's embedded
+    provider metadata artifact is re-checked against the PRESERVED
+    per-sample artifact bytes (``provider-meta/<sample>.json``): the
+    artifact must still exist, still digest-bind its raw metadata, and
+    still mechanically derive the identity the evidence claims. Mutating
+    the preserved artifact (or the embedded copy) after ingestion fails
+    every downstream boundary.
     """
+    from evals.calibration.provider_metadata import (
+        ProviderMetadataArtifact,
+        load_provider_metadata,
+        verify_execution_provider_metadata,
+    )
+
     for sample_id in sorted(records):
-        execution = records[sample_id].execution
+        record = records[sample_id]
+        execution = record.execution
         if execution is None or execution.identity_source != "provider_metadata":
             raise ValueError(f"lane_freeze_requires_machine_verified_executor_identity:{sample_id}")
+        if lane_root is None:
+            continue
+        preserved = load_provider_metadata(lane_root, sample_id)
+        if preserved is None:
+            raise ValueError(f"machine_verified_identity_missing_preserved_artifact:{sample_id}")
+        embedded = execution.provider_metadata
+        if not isinstance(embedded, dict):
+            raise ValueError(f"machine_verified_identity_missing_embedded_artifact:{sample_id}")
+        if preserved.model_dump(mode="json") != embedded:
+            raise ValueError(f"provider_metadata_artifact_disagrees_with_preserved:{sample_id}")
+        artifact = ProviderMetadataArtifact.model_validate(embedded)
+        if execution.evidence is not None:
+            verify_execution_provider_metadata(execution.evidence, artifact=artifact)
 
 
 class LaneAuthority(Record):
@@ -516,6 +739,16 @@ class LaneSession:
         _, packet_sha = load_neutral_packet_verified(
             neutral_packet_path, manifest_path=neutral_packet_manifest
         )
+        # FIX-R6-1: retain the exact verified packet bytes inside the lane
+        # root so every later canonical request-line verification (registry
+        # load, freeze, frozen-lane load, final ledger) re-derives request
+        # case projections from byte-verified frozen packet bytes rather
+        # than re-trusting the external packet file.
+        retained = protected_root / "lanes" / reviewer.reviewer_slot / "neutral-packet.json"
+        if not retained.exists():
+            write_protected_file(retained, neutral_packet_path.read_bytes())
+        elif hashlib.sha256(retained.read_bytes()).hexdigest() != packet_sha:
+            raise ValueError("lane_retained_neutral_packet_sha_mismatch")
         authority = LaneAuthority(
             protocol_version=CONSENSUS_PROTOCOL_VERSION,
             campaign_id=campaign_id,
@@ -708,7 +941,7 @@ class LaneSession:
         emitted = registry.get(sample_id, {}).get(execution.request_generation)
         if emitted is None:
             raise ValueError("response_request_not_emitted")
-        item_digest, identity_digest, packet_sha = emitted
+        item_digest, identity_digest, packet_sha, _request_line = emitted
         if not hmac.compare_digest(execution.request_item_digest, item_digest):
             raise ValueError("response_request_item_digest_mismatch")
         if identity_digest != self.reviewer.lane_identity_digest():
@@ -789,7 +1022,10 @@ class LaneSession:
             reviewer_confidence="unknown",
             judgment=None,
             raw_response_digest=raw_digest,
-            error_code=str(response.get("error_code") or "unparseable_response"),
+            # FIX-R6-3: the canonical malformed error code — never a
+            # wrapper-supplied token; re-derived from the bytes at every
+            # verification boundary.
+            error_code=CANONICAL_MALFORMED_ERROR_CODE,
         )
 
     # -- ingestion ------------------------------------------------------------

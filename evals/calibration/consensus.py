@@ -54,6 +54,7 @@ from evals.calibration.freeze import (
     FrameRow,
     SamplingManifest,
 )
+from evals.calibration.provider_metadata import verify_evidence_against_artifact
 
 CONSENSUS_PROTOCOL_VERSION: Literal["eng-calibration-consensus-206-v1"] = (
     "eng-calibration-consensus-206-v1"
@@ -258,14 +259,17 @@ class ExecutionEvidence(Record):
 
     ``identity_source`` records HOW the actual identity was observed:
 
-    - ``provider_metadata``: machine-verifiable provider request/response IDs
-      bind the reported model identity. REQUIRED for a lane to freeze —
-      only machine-verified execution identity can ground a consensus
-      reviewer lane;
+    - ``provider_metadata``: machine-verifiable provider metadata — the
+      evidence embeds a digest-bound provider metadata artifact
+      (``provider_metadata``, FIX-R6-2) whose bytes MECHANICALLY DERIVE the
+      reported model identifier and provider request/response IDs. REQUIRED
+      for a lane to freeze — only machine-verified execution identity can
+      ground a consensus reviewer lane;
     - ``executor_attestation``: the executor attests the identity but the
-      environment cannot machine-verify it. An honest, protected
-      representation — ingestible and preserved, but a lane carrying one can
-      NEVER freeze as a valid consensus reviewer lane.
+      environment cannot machine-verify it (no provider metadata artifact
+      can be captured). An honest, protected representation — ingestible
+      and preserved, but a lane carrying one can NEVER freeze as a valid
+      consensus reviewer lane, and no invented request ID can upgrade it.
     """
 
     evidence_schema: Literal["engram-calibration-execution-evidence-206-v1"] = (
@@ -287,15 +291,27 @@ class ExecutionEvidence(Record):
     # Optional provider-reported request/response IDs, preserved and bound.
     provider_request_id: str | None = None
     provider_response_id: str | None = None
+    # FIX-R6-2: the digest-bound provider metadata artifact. REQUIRED for
+    # ``identity_source == "provider_metadata"`` — the model identifier and
+    # provider IDs above must be the MECHANICAL DERIVATION of these bytes
+    # (verified at schema validation and re-derived at every boundary).
+    # Structurally impossible for ``executor_attestation`` (None).
+    provider_metadata: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def evidence_contract(self) -> Self:
         if FAMILY_BY_SLOT[self.actual_reviewer_slot] != self.actual_reviewer_family:
             raise ValueError("actual_family_does_not_match_attested_slot")
-        if self.identity_source == "provider_metadata" and not (
-            self.provider_request_id or self.provider_response_id
-        ):
-            raise ValueError("provider_metadata_identity_requires_provider_ids")
+        if self.identity_source == "provider_metadata":
+            if not (self.provider_request_id and self.provider_response_id):
+                raise ValueError("provider_metadata_identity_requires_provider_ids")
+            # FIX-R6-2: a provider-metadata LABEL is not provider-metadata
+            # VERIFICATION — the embedded artifact must digest-bind its raw
+            # metadata and mechanically derive the claimed identity.
+            verify_evidence_against_artifact(self)
+        else:
+            if self.provider_metadata is not None:
+                raise ValueError("executor_attestation_must_not_claim_provider_metadata")
         if not self.executor_identity:
             raise ValueError("execution_evidence_requires_executor_identity")
         return self
@@ -345,6 +361,7 @@ class ExecutionReceipt(Record):
     identity_source: Literal["provider_metadata", "executor_attestation"]
     provider_request_id: str | None = None
     provider_response_id: str | None = None
+    provider_metadata: dict[str, Any] | None = None
     evidence: ExecutionEvidence
     evidence_digest: Digest
 
@@ -366,6 +383,7 @@ class ExecutionReceipt(Record):
             and self.identity_source == evidence.identity_source
             and self.provider_request_id == evidence.provider_request_id
             and self.provider_response_id == evidence.provider_response_id
+            and self.provider_metadata == evidence.provider_metadata
         )
         if not derived_fields:
             raise ValueError("execution_receipt_not_derived_from_its_evidence")
@@ -391,6 +409,7 @@ class ExecutionReceipt(Record):
             identity_source=evidence.identity_source,
             provider_request_id=evidence.provider_request_id,
             provider_response_id=evidence.provider_response_id,
+            provider_metadata=evidence.provider_metadata,
             evidence=evidence,
             evidence_digest=evidence.evidence_digest(),
         )

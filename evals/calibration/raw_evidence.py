@@ -53,8 +53,17 @@ def validate_record_raw_evidence(
 
     FIX-R4-2: for judged records the preserved bytes are re-parsed with the
     frozen deterministic parser and the derived judgment must equal the
-    stored one — the record's classification can never disagree with its own
-    preserved output bytes.
+    stored one.
+
+    FIX-R6-3: ALL completed outcome states are re-derived from the exact
+    raw bytes — judged, refused, AND malformed. The parser classification
+    must map exactly onto the stored parse/outcome statuses, the stored
+    judgment/confidence (judged), the stored refusal error code, and the
+    canonical malformed error code. A stored ``malformed`` record whose
+    bytes actually parse as a judgment or refusal fails closed; ``malformed``
+    is never an unchecked catch-all. The record's execution status must
+    also agree with the raw-response state (executor_status == completed
+    requires response bytes; provider_error requires none).
     """
     path = raw_response_path(lane_root, record.sample_id)
     if record.outcome_status == "provider_error":
@@ -62,7 +71,12 @@ def validate_record_raw_evidence(
             raise ValueError("provider_error_must_not_claim_raw_response_digest")
         if path.exists():
             raise ValueError("provider_error_must_not_have_raw_response_artifact")
+        if record.execution is not None and record.execution.executor_status != "provider_error":
+            raise ValueError(f"record_executor_status_disagrees_with_raw_state:{record.sample_id}")
         return
+    # A response-carrying outcome requires completed execution evidence.
+    if record.execution is not None and record.execution.executor_status != "completed":
+        raise ValueError(f"record_executor_status_disagrees_with_raw_state:{record.sample_id}")
     if record.raw_response_digest is None:
         raise ValueError(f"record_raw_evidence_missing_digest:{record.sample_id}")
     if not path.is_file():
@@ -71,26 +85,36 @@ def validate_record_raw_evidence(
     actual = hashlib.sha256(payload).hexdigest()
     if actual != record.raw_response_digest:
         raise ValueError(f"record_raw_evidence_digest_mismatch:{record.sample_id}")
-    if record.parse_status == "parsed":
-        from evals.calibration.reviewer_instructions import parse_model_response
+    from evals.calibration.provider_metadata import CANONICAL_MALFORMED_ERROR_CODE
+    from evals.calibration.reviewer_instructions import parse_model_response
 
-        try:
-            parsed = parse_model_response(payload, expected_sample_id=record.sample_id)
-        except ValueError:
-            raise ValueError(f"record_raw_evidence_sample_mismatch:{record.sample_id}") from None
-        if parsed.classification != "judged" or parsed.judgment is None:
-            raise ValueError(f"record_judgment_not_derivable_from_bytes:{record.sample_id}")
-        if parsed.judgment != record.judgment:
+    try:
+        parsed = parse_model_response(payload, expected_sample_id=record.sample_id)
+    except ValueError:
+        raise ValueError(f"record_raw_evidence_sample_mismatch:{record.sample_id}") from None
+    if parsed.classification == "judged":
+        if record.parse_status != "parsed" or record.outcome_status != "judged":
+            raise ValueError(f"record_outcome_not_derived_from_bytes:{record.sample_id}")
+        if parsed.judgment is None or parsed.judgment != record.judgment:
             raise ValueError(f"record_judgment_disagrees_with_bytes:{record.sample_id}")
-    elif record.outcome_status == "refused":
-        from evals.calibration.reviewer_instructions import parse_model_response
-
-        try:
-            parsed = parse_model_response(payload, expected_sample_id=record.sample_id)
-        except ValueError:
-            raise ValueError(f"record_raw_evidence_sample_mismatch:{record.sample_id}") from None
-        if parsed.classification != "refused":
-            raise ValueError(f"record_refusal_not_derivable_from_bytes:{record.sample_id}")
+        if record.reviewer_confidence != parsed.judgment.reviewer_confidence:
+            raise ValueError(f"record_confidence_disagrees_with_bytes:{record.sample_id}")
+        if record.error_code is not None:
+            raise ValueError(f"record_judged_must_not_carry_error_code:{record.sample_id}")
+    elif parsed.classification == "refused":
+        if record.parse_status != "malformed" or record.outcome_status != "refused":
+            raise ValueError(f"record_outcome_not_derived_from_bytes:{record.sample_id}")
+        if record.judgment is not None:
+            raise ValueError(f"record_refusal_must_not_carry_judgment:{record.sample_id}")
+        if record.error_code != parsed.error_code:
+            raise ValueError(f"record_refusal_error_code_disagrees_with_bytes:{record.sample_id}")
+    else:  # malformed
+        if record.parse_status != "malformed" or record.outcome_status != "malformed":
+            raise ValueError(f"record_outcome_not_derived_from_bytes:{record.sample_id}")
+        if record.judgment is not None:
+            raise ValueError(f"record_malformed_must_not_carry_judgment:{record.sample_id}")
+        if record.error_code != CANONICAL_MALFORMED_ERROR_CODE:
+            raise ValueError(f"record_malformed_error_code_not_canonical:{record.sample_id}")
 
 
 def validate_lane_raw_evidence(
@@ -193,4 +217,6 @@ def validate_lane_provenance_with_raw(
         campaign_id=campaign_id,
         neutral_packet_sha256=lane.neutral_packet_sha256,
     )
-    require_machine_verified_execution_identity(records)
+    require_machine_verified_execution_identity(
+        records, lane_root=lane_root_for(protected_root, lane.reviewer.reviewer_slot)
+    )

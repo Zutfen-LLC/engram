@@ -171,7 +171,11 @@ def load_lane_records(protected_root: Path, reviewer_slot: str) -> dict[str, Mod
     if not lane_dir.exists():
         return records
     for path in sorted(lane_dir.glob("*.json")):
-        if path.name in {"lane-freeze.json", "lane.json"} or path.name.endswith(".manifest.json"):
+        if path.name in {
+            "lane-freeze.json",
+            "lane.json",
+            "neutral-packet.json",
+        } or path.name.endswith(".manifest.json"):
             continue
         record = ModelReviewRecord.model_validate(json.loads(path.read_text()))
         if record.sample_id in records:
@@ -238,7 +242,9 @@ def freeze_lane(
     # never freeze as a valid consensus reviewer lane.
     from evals.calibration.ingestion import require_machine_verified_execution_identity
 
-    require_machine_verified_execution_identity(records)
+    require_machine_verified_execution_identity(
+        records, lane_root=lane_directory(protected_root, reviewer.reviewer_slot)
+    )
     # FIX-R2-4: raw model evidence is freeze-bound — every accepted record
     # must have its protected raw bytes present and hashing to the claimed
     # digest (provider_error records must claim none).
@@ -318,7 +324,9 @@ def _load_one_frozen_lane(
     # executor identity cannot load as a valid consensus reviewer lane.
     from evals.calibration.ingestion import require_machine_verified_execution_identity
 
-    require_machine_verified_execution_identity(records)
+    require_machine_verified_execution_identity(
+        records, lane_root=lane_directory(protected_root, reviewer.reviewer_slot)
+    )
     return lane
 
 
