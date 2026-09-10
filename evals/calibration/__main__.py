@@ -4,6 +4,10 @@ Available subcommands:
   freeze-target   write the target identity and frozen evidence floors
   sample          write protected exact sampling/split artifacts and a public summary
   packets         emit blind reviewer packets from protected sample membership
+  model-packet    project the frozen blind packet into a neutral model packet (#206)
+  freeze-model-lane  freeze one completed frontier-model reviewer lane (#206)
+  model-report    public-safe correlation report after all three lanes freeze (#206)
+  human-queue     build the mandatory human queue from frozen lanes (#206)
 
 Reviewer ingestion, ledger freezing, fitting, gating, and reporting remain
 library-only stop-point operations until real human labels exist.
@@ -18,6 +22,12 @@ from datetime import datetime
 from pathlib import Path
 
 from evals.admission.schema import digest
+from evals.calibration.consensus import (
+    CONSENSUS_PROTOCOL_VERSION,
+    REVIEWER_SLOTS,
+    ReviewerIdentity,
+    build_correlation_report,
+)
 from evals.calibration.freeze import (
     EXCLUSION_RULES,
     INCLUSION_RULES,
@@ -33,7 +43,20 @@ from evals.calibration.freeze import (
     stratified_sample,
     validate_split_membership,
 )
-from evals.calibration.review import build_packets, write_packets, write_protected_file
+from evals.calibration.human_queue import build_queue, write_queue
+from evals.calibration.model_lanes import (
+    NeutralModelPacket,
+    freeze_lane,
+    load_frozen_lanes,
+    records_by_lane_from_files,
+    write_neutral_packet,
+)
+from evals.calibration.review import (
+    BlindPacket,
+    build_packets,
+    write_packets,
+    write_protected_file,
+)
 
 CAMPAIGN_ID = "eng-calibration-001f"
 DATASET_VERSION = "calibration-157-dogfood-v2"
@@ -211,6 +234,94 @@ def cmd_packets(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_model_packet(args: argparse.Namespace) -> int:
+    """Project the frozen blind packet into the neutral model-review packet."""
+    blind = BlindPacket.model_validate(json.loads(Path(args.blind_packet).read_text()))
+    neutral = NeutralModelPacket.from_blind(blind, protocol_version=CONSENSUS_PROTOCOL_VERSION)
+    if neutral.sampling_manifest_digest != blind.sampling_manifest_digest:
+        raise SystemExit("neutral_packet_sampling_manifest_mismatch")
+    manifest = write_neutral_packet(neutral, Path(args.protected_dir))
+    print(json.dumps({"neutral_packet": manifest}, sort_keys=True))
+    return 0
+
+
+def cmd_freeze_model_lane(args: argparse.Namespace) -> int:
+    """Freeze one completed reviewer lane after exact membership is proven."""
+    sampling = SamplingManifest.model_validate(json.loads(Path(args.sampling_manifest).read_text()))
+    reviewer = ReviewerIdentity.model_validate(json.loads(Path(args.reviewer_identity).read_text()))
+    lane = freeze_lane(
+        protected_root=Path(args.protected_dir),
+        reviewer=reviewer,
+        campaign_id=CAMPAIGN_ID,
+        sampling=sampling,
+        source_packet_digest=args.source_packet_digest,
+    )
+    print(json.dumps({"lane_digest": lane.lane_digest(), "cases": len(lane.sample_ids)}))
+    return 0
+
+
+def cmd_model_report(args: argparse.Namespace) -> int:
+    """Build the public-safe correlation report after all three lanes freeze."""
+    sampling = SamplingManifest.model_validate(json.loads(Path(args.sampling_manifest).read_text()))
+    reviewers = {
+        slot: ReviewerIdentity.model_validate(json.loads(path.read_text()))
+        for slot, path in zip(REVIEWER_SLOTS, args.reviewer_identities, strict=True)
+    }
+    lanes = load_frozen_lanes(
+        Path(args.protected_dir),
+        campaign_id=CAMPAIGN_ID,
+        sampling=sampling,
+        source_packet_digest=args.source_packet_digest,
+        reviewers=reviewers,
+    )
+    records_by_lane = records_by_lane_from_files(Path(args.protected_dir))
+    report = build_correlation_report(
+        campaign_id=CAMPAIGN_ID,
+        lanes=lanes,
+        records_by_lane=records_by_lane,
+        sampling=sampling,
+        source_packet_digest=args.source_packet_digest,
+    )
+    _write_public(Path(args.report), report.model_dump(mode="json"))
+    print(
+        json.dumps(
+            {
+                "consensus_count": report.consensus_count,
+                "human_queue_count_before_audit": report.human_queue_count_before_audit,
+                "audit_count": report.audit_count,
+                "total_human_workload": report.total_human_workload,
+            }
+        )
+    )
+    return 0
+
+
+def cmd_human_queue(args: argparse.Namespace) -> int:
+    """Build the mandatory human queue from three frozen lanes (pre-audit)."""
+    sampling = SamplingManifest.model_validate(json.loads(Path(args.sampling_manifest).read_text()))
+    reviewers = {
+        slot: ReviewerIdentity.model_validate(json.loads(path.read_text()))
+        for slot, path in zip(REVIEWER_SLOTS, args.reviewer_identities, strict=True)
+    }
+    load_frozen_lanes(
+        Path(args.protected_dir),
+        campaign_id=CAMPAIGN_ID,
+        sampling=sampling,
+        source_packet_digest=args.source_packet_digest,
+        reviewers=reviewers,
+    )
+    records_by_lane = records_by_lane_from_files(Path(args.protected_dir))
+    queue = build_queue(
+        campaign_id=CAMPAIGN_ID,
+        sampling=sampling,
+        source_packet_digest=args.source_packet_digest,
+        records_by_lane=records_by_lane,
+    )
+    path = write_queue(queue, Path(args.queue_dir))
+    print(json.dumps({"queue_path": str(path), "queue_size": len(queue.entries)}))
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -246,6 +357,44 @@ def main() -> int:
     command.add_argument("--samples", required=True)
     command.add_argument("--protected-dir", required=True)
     command.set_defaults(func=cmd_packets)
+
+    command = sub.add_parser(
+        "model-packet", help="project the frozen blind packet for model review (#206)"
+    )
+    command.add_argument("--blind-packet", required=True)
+    command.add_argument("--protected-dir", required=True)
+    command.set_defaults(func=cmd_model_packet)
+
+    command = sub.add_parser("freeze-model-lane", help="freeze one completed reviewer lane (#206)")
+    command.add_argument("--sampling-manifest", required=True)
+    command.add_argument("--reviewer-identity", required=True)
+    command.add_argument("--source-packet-digest", required=True)
+    command.add_argument("--protected-dir", required=True)
+    command.set_defaults(func=cmd_freeze_model_lane)
+
+    command = sub.add_parser(
+        "model-report", help="public-safe correlation report after three frozen lanes (#206)"
+    )
+    command.add_argument("--sampling-manifest", required=True)
+    command.add_argument(
+        "--reviewer-identities", nargs=3, required=True, metavar=("MODEL_A", "MODEL_B", "MODEL_C")
+    )
+    command.add_argument("--source-packet-digest", required=True)
+    command.add_argument("--protected-dir", required=True)
+    command.add_argument("--report", type=Path, required=True, help="public aggregate report")
+    command.set_defaults(func=cmd_model_report)
+
+    command = sub.add_parser(
+        "human-queue", help="build the mandatory human queue from frozen lanes (#206)"
+    )
+    command.add_argument("--sampling-manifest", required=True)
+    command.add_argument(
+        "--reviewer-identities", nargs=3, required=True, metavar=("MODEL_A", "MODEL_B", "MODEL_C")
+    )
+    command.add_argument("--source-packet-digest", required=True)
+    command.add_argument("--protected-dir", required=True)
+    command.add_argument("--queue-dir", required=True)
+    command.set_defaults(func=cmd_human_queue)
 
     args = parser.parse_args()
     return int(args.func(args) or 0)

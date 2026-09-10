@@ -24,6 +24,7 @@ from engram.assessment_calibration import (
 )
 from engram.assessment_schema import AssessmentContract, AssessmentDimensions
 from evals.admission.schema import Digest, LabelRecord, Record, digest
+from evals.calibration.consensus import ReferenceLabel
 from evals.calibration.freeze import (
     LABEL_GUIDE_VERSION,
     EvidenceFloors,
@@ -36,6 +37,123 @@ from evals.calibration.freeze import (
     validate_split_membership,
 )
 from evals.calibration.review import verify_ledger
+
+
+class ConsensusDimensionsView:
+    """Adapter: expose five #206 critical fields through the Dimensions API.
+
+    ``LabeledObservation.from_review`` and the consequence floors read only
+    ``expected_kind``, ``retention_value``, ``epistemic_state``, and
+    ``consequence`` from this view. It contains no human-review provenance and
+    cannot be embedded in a ``LabelRecord``.
+    """
+
+    __slots__ = ("expected_kind", "retention_value", "epistemic_state", "consequence")
+
+    def __init__(self, critical: dict[str, Any]):
+        self.expected_kind = critical["expected_kind"]
+        self.retention_value = critical["retention_value"]
+        self.epistemic_state = critical["epistemic_state"]
+        self.consequence = critical["consequence"]
+
+
+def consensus_reference_observations(
+    *,
+    receipts: list[AssessmentExecutionReceipt],
+    reference_labels: list[ReferenceLabel],
+    target_identity: TargetIdentity,
+    contract: AssessmentContract,
+    split: SplitManifest,
+    frame: list[FrameRow],
+) -> list[LabeledObservation]:
+    """Derive observations from #206 final reference labels (not raw votes).
+
+    Mirrors ``_verify_observation_evidence`` binding discipline minus the
+    human-ledger verification path: every receipt digest, request digest, and
+    input hash is verified against the frozen target identity and frame; the
+    reviewed label is ALWAYS the final reference label, never a majority vote
+    or an individual model judgment.
+    """
+    contract_digest = digest(contract.model_dump(mode="json"))
+    by_sample = {label.sample_id: label for label in reference_labels}
+    if len(by_sample) != len(reference_labels):
+        raise ValueError("duplicate_reference_label")
+    expected_hashes = {row.sample_id: row.content_hash for row in frame}
+    split_by_id = {sample_id: "dev" for sample_id in split.dev_ids}
+    split_by_id.update({sample_id: "holdout" for sample_id in split.holdout_ids})
+    observations: list[LabeledObservation] = []
+    for receipt in receipts:
+        if not hmac.compare_digest(receipt.verified_payload_digest(), receipt.receipt_digest):
+            raise ValueError("assessment_execution_receipt_digest_mismatch")
+        expected_request_digest = digest(
+            {
+                "sample_id": receipt.sample_id,
+                "input_content_hash": receipt.input_content_hash,
+                "target_identity_digest": target_identity.identity_digest(),
+                "assessment_contract_digest": contract_digest,
+            }
+        )
+        if receipt.provider_request_digest != expected_request_digest:
+            raise ValueError("assessment_execution_request_mismatch")
+        if receipt.input_content_hash != expected_hashes.get(receipt.sample_id):
+            raise ValueError("assessment_execution_input_mismatch")
+        scores = (
+            receipt.assessment.taxonomy,
+            receipt.assessment.retention,
+            receipt.assessment.epistemic,
+        )
+        if any(score.status != "uncalibrated" for score in scores):
+            raise ValueError("assessment_execution_must_capture_raw_scores")
+        label = by_sample.get(receipt.sample_id)
+        if label is None:
+            raise ValueError("reference_label_membership_mismatch")
+        frozen = None
+        for row in frame:
+            if row.sample_id == receipt.sample_id:
+                frozen = row
+                break
+        if frozen is None:
+            raise ValueError("assessment_evidence_sample_not_in_frame")
+        observations.extend(
+            LabeledObservation.from_review(
+                sample_id=receipt.sample_id,
+                dimensions=ConsensusDimensionsView(label.critical),
+                raw_scores={
+                    "taxonomy_value": receipt.assessment.taxonomy.raw_value,
+                    "retention_value": receipt.assessment.retention.raw_value,
+                    "epistemic_value": receipt.assessment.epistemic.raw_value,
+                },
+                suggested_kind=receipt.assessment.suggested_kind,
+                stratum={
+                    "source_type": frozen.source_type,
+                    "assertion_mode": frozen.assertion_mode,
+                    "kind": frozen.kind,
+                    "risk": frozen.risk,
+                },
+                split=split_by_id[receipt.sample_id],
+            )
+        )
+    return observations
+
+
+def consensus_reference_completion(
+    reference_labels: list[ReferenceLabel],
+) -> list[ReferenceLabel]:
+    """Completed reference labels accepted for floor counting (#206 lanes).
+
+    Every schema-validated reference label is complete by construction (the
+    wrapper requires a final origin and full critical fields); the returned
+    list is the exact input membership. Human-origin rows are directly
+    human-labeled; consensus rows carry provenance that no human directly
+    labeled them.
+    """
+    by_id: dict[str, ReferenceLabel] = {}
+    for label in reference_labels:
+        if label.sample_id in by_id:
+            raise ValueError("duplicate_reference_label")
+        by_id[label.sample_id] = label
+    return list(reference_labels)
+
 
 DimensionName = Literal["taxonomy", "retention", "epistemic"]
 BinEdges: tuple[float, ...] = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)

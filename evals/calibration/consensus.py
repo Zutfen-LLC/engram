@@ -1,0 +1,717 @@
+"""Frozen three-frontier-model consensus review protocol (#206, ENG-CALIBRATION-001G).
+
+This module freezes the review-methodology correction for #202 BEFORE any
+model review executes. It must not be edited after the methodology PR merges
+without a new protocol version and explicit re-freeze.
+
+Frozen values (protocol version ``eng-calibration-consensus-206-v1``):
+
+- reviewer families (exactly three): claude-opus, gpt-astra, glm-5-3-max;
+- consensus-critical fields (exact agreement required on ALL five):
+  expected_kind, retention_value, epistemic_state, consequence,
+  acceptable_abstention;
+- diagnostic-only fields (never create human cases by disagreement):
+  every other ``Dimensions`` field;
+- escalation triggers: any critical-field disagreement, any
+  unknown/uncertain/ambiguous critical value, malformed/unparseable output,
+  refusal, provider failure, any reviewer confidence below ``medium`` on its
+  own judgment, and any reviewer assigning ``consequence=high``;
+- audit: 15% of otherwise consensus-accepted cases, selected deterministically
+  by frozen sample ID and seed ``202-model-consensus-audit-v1``;
+- audit escalation threshold: material audit disagreement on any critical
+  field for more than 5% of audited cases, or any single audited
+  consensus error with adjudicated ``consequence=high`` or material
+  calibration reversal, escalates ALL remaining consensus cases to human
+  review;
+- no majority voting: 2-of-3 agreement never qualifies as consensus;
+- model judgments are never stored or reported as ``human_adjudicated``.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+from collections.abc import Mapping, Sequence
+from typing import Annotated, Any, Literal, Self
+
+import rfc8785
+from pydantic import AwareDatetime, Field, model_validator
+
+from evals.admission.schema import Digest, Record, Token
+from evals.calibration.freeze import LABEL_GUIDE_VERSION, SamplingManifest
+
+CONSENSUS_PROTOCOL_VERSION: Literal["eng-calibration-consensus-206-v1"] = (
+    "eng-calibration-consensus-206-v1"
+)
+MODEL_REVIEW_SCHEMA: Literal["engram-calibration-model-review-206-v1"] = (
+    "engram-calibration-model-review-206-v1"
+)
+CORRELATION_REPORT_SCHEMA: Literal["engram-calibration-correlation-206-v1"] = (
+    "engram-calibration-correlation-206-v1"
+)
+PROVENANCE_WRAPPER_SCHEMA: Literal["engram-calibration-consensus-provenance-206-v1"] = (
+    "engram-calibration-consensus-provenance-206-v1"
+)
+CONSENSUS_LEDGER_SCHEMA: Literal["engram-calibration-consensus-ledger-206-v1"] = (
+    "engram-calibration-consensus-ledger-206-v1"
+)
+AUDIT_SAMPLE_RATE = 0.15
+AUDIT_SELECTION_SEED = "202-model-consensus-audit-v1"
+AUDIT_DISAGREEMENT_RATE_THRESHOLD = 0.05
+MIN_REVIEWER_CONFIDENCE = "medium"
+CONFIDENCE_ORDER: dict[str, int] = {
+    "low": 0,
+    "medium": 1,
+    "high": 2,
+    "unknown": 0,
+}
+CRITICAL_FIELDS: tuple[str, ...] = (
+    "expected_kind",
+    "retention_value",
+    "epistemic_state",
+    "consequence",
+    "acceptable_abstention",
+)
+# Values that make a judgment non-consensus-eligible even when all three
+# reviewers agree exactly (unknown / uncertain / ambiguous epistemics).
+NON_CONSENSUS_VALUES: dict[str, frozenset[str]] = {
+    "expected_kind": frozenset({"unknown"}),
+    "retention_value": frozenset({"uncertain"}),
+    "epistemic_state": frozenset({"unknown", "ambiguous"}),
+    "consequence": frozenset({"unknown"}),
+    "acceptable_abstention": frozenset({"unknown"}),
+}
+REVIEWER_FAMILIES: tuple[str, ...] = ("claude-opus", "gpt-astra", "glm-5-3-max")
+REVIEWER_SLOTS: tuple[str, ...] = ("model_a", "model_b", "model_c")
+FAMILY_BY_SLOT: dict[str, str] = dict(zip(REVIEWER_SLOTS, REVIEWER_FAMILIES, strict=True))
+SlotName = Literal["model_a", "model_b", "model_c"]
+ModelIdentifier = Annotated[str, Field(min_length=1, max_length=256)]
+ParseStatus = Literal["parsed", "malformed"]
+OutcomeStatus = Literal["judged", "refused", "provider_error"]
+CriticalFieldVocabulary: dict[str, set[str]] = {
+    "expected_kind": {
+        "preference",
+        "fact",
+        "observation",
+        "decision",
+        "procedure",
+        "summary",
+        "doctrine",
+        "invariant",
+        "diary_entry",
+        "unknown",
+    },
+    "retention_value": {"retain", "do_not_retain", "uncertain"},
+    "epistemic_state": {
+        "adequately_supported",
+        "weakly_supported",
+        "contradicted",
+        "contested",
+        "ambiguous",
+        "unverifiable",
+        "unknown",
+    },
+    "consequence": {"low", "medium", "high", "unknown"},
+    "acceptable_abstention": {"yes", "no", "unknown"},
+}
+# Every Dimensions field that is not consensus-critical is diagnostic-only:
+# reviewers MAY return these fields, and disagreement on them NEVER creates a
+# human case or blocks consensus acceptance.
+DIAGNOSTIC_FIELDS: tuple[str, ...] = (
+    "atomic",
+    "proposition_count",
+    "attribution",
+    "source_span",
+    "evidence_span",
+    "assertion_origin",
+    "expected_subject_or_domain",
+    "expected_scope",
+    "factual_outcome",
+    "expected_storage_disposition",
+    "expected_startup_eligibility",
+    "expected_governed_semantic_eligibility",
+    "human_review_required",
+    "conflict_expected",
+    "dispute_expected",
+    "supersession_expected",
+    "temporal_validity_issue",
+    "scope_visibility_concern",
+    "evidence_independence",
+    "expected_blockers",
+    "expected_next_action",
+)
+
+
+def digest_of(value: Any) -> str:
+    return hashlib.sha256(rfc8785.dumps(value)).hexdigest()
+
+
+class ReviewerIdentity(Record):
+    """Provenance for one first-pass model reviewer lane."""
+
+    reviewer_slot: SlotName
+    reviewer_family: str
+    provider_model_identifier: ModelIdentifier
+    reviewer_config_digest: Digest
+    prompt_digest: Digest
+    label_guide_version: str = LABEL_GUIDE_VERSION
+
+    @model_validator(mode="after")
+    def family_matches_slot(self) -> Self:
+        if FAMILY_BY_SLOT[self.reviewer_slot] != self.reviewer_family:
+            raise ValueError("reviewer_family_does_not_match_frozen_slot")
+        return self
+
+    def lane_identity_digest(self) -> Digest:
+        return digest_of(self.model_dump(mode="json"))
+
+
+class ModelJudgment(Record):
+    """Parsed critical fields (plus optional diagnostics) from one reviewer."""
+
+    fields: dict[str, Any]
+    reviewer_confidence: Literal["low", "medium", "high", "unknown"] = "unknown"
+
+    @model_validator(mode="after")
+    def closed_critical_vocabulary(self) -> Self:
+        missing = set(CRITICAL_FIELDS) - set(self.fields)
+        if missing:
+            raise ValueError(f"missing_critical_fields:{','.join(sorted(missing))}")
+        extra = set(self.fields) - set(CRITICAL_FIELDS) - set(DIAGNOSTIC_FIELDS)
+        if extra:
+            raise ValueError(f"unknown_review_fields:{','.join(sorted(extra))}")
+        for name, vocabulary in CriticalFieldVocabulary.items():
+            if self.fields[name] not in vocabulary:
+                raise ValueError(f"critical_field_out_of_vocabulary:{name}")
+        return self
+
+    def critical(self) -> dict[str, Any]:
+        return {name: self.fields[name] for name in CRITICAL_FIELDS}
+
+
+class ModelReviewRecord(Record):
+    """One reviewer's first-pass artifact for one sample.
+
+    Never interchangeable with a human judgment: distinct schema name, slot
+    and family provenance required, and the frozen #202 ledger validators
+    reject any attempt to feed these rows in as reviewer labels.
+    """
+
+    review_schema: Literal["engram-calibration-model-review-206-v1"] = MODEL_REVIEW_SCHEMA
+    protocol_version: str
+    campaign_id: str
+    sampling_manifest_digest: str
+    source_packet_digest: str
+    sample_id: Token
+    reviewer_slot: SlotName
+    reviewer_family: str
+    provider_model_identifier: ModelIdentifier
+    reviewer_config_digest: str
+    prompt_digest: str
+    label_guide_version: str
+    captured_at: AwareDatetime
+    parse_status: ParseStatus
+    outcome_status: OutcomeStatus
+    reviewer_confidence: Literal["low", "medium", "high", "unknown"] = "unknown"
+    judgment: ModelJudgment | None = None
+    raw_response_digest: Digest
+    error_code: Token | None = None
+
+    @model_validator(mode="after")
+    def status_contract(self) -> Self:
+        if self.protocol_version != CONSENSUS_PROTOCOL_VERSION:
+            raise ValueError("protocol_version_mismatch")
+        if FAMILY_BY_SLOT[self.reviewer_slot] != self.reviewer_family:
+            raise ValueError("reviewer_family_does_not_match_frozen_slot")
+        if self.label_guide_version != LABEL_GUIDE_VERSION:
+            raise ValueError("label_guide_version_mismatch")
+        if self.parse_status == "parsed":
+            if self.judgment is None:
+                raise ValueError("parsed_review_requires_judgment")
+            if self.outcome_status != "judged":
+                raise ValueError("parsed_review_requires_judged_outcome")
+            if self.error_code is not None:
+                raise ValueError("judged_review_must_not_carry_error_code")
+            if self.judgment.reviewer_confidence != self.reviewer_confidence:
+                raise ValueError("reviewer_confidence_must_match_judgment")
+        else:
+            if self.judgment is not None:
+                raise ValueError("unparseable_review_must_not_carry_judgment")
+            if self.outcome_status == "judged":
+                raise ValueError("non_parsed_review_cannot_be_judged")
+            if self.error_code is None:
+                raise ValueError("failed_review_requires_error_code")
+        return self
+
+    def record_digest(self) -> Digest:
+        return digest_of(self.model_dump(mode="json"))
+
+
+class LaneFreeze(Record):
+    """Completion attestation for one reviewer lane (all frozen cases)."""
+
+    lane_schema: Literal["engram-calibration-model-lane-206-v1"] = (
+        "engram-calibration-model-lane-206-v1"
+    )
+    protocol_version: str
+    campaign_id: str
+    reviewer: ReviewerIdentity
+    sampling_manifest_digest: str
+    source_packet_digest: str
+    sample_ids: tuple[Token, ...]
+    record_digests: tuple[Digest, ...]
+
+    @model_validator(mode="after")
+    def lane_membership(self) -> Self:
+        if self.protocol_version != CONSENSUS_PROTOCOL_VERSION:
+            raise ValueError("protocol_version_mismatch")
+        if len(self.sample_ids) != len(self.record_digests):
+            raise ValueError("lane_membership_length_mismatch")
+        if len(set(self.sample_ids)) != len(self.sample_ids):
+            raise ValueError("lane_duplicate_sample_id")
+        return self
+
+    def lane_digest(self) -> Digest:
+        return digest_of(self.model_dump(mode="json"))
+
+
+def validate_lane_membership(
+    lane: LaneFreeze, sampling: SamplingManifest, *, source_packet_digest: str
+) -> None:
+    """Fail closed unless the lane covers exactly the frozen sample membership."""
+    if lane.sampling_manifest_digest != sampling.manifest_digest():
+        raise ValueError("lane_sampling_manifest_mismatch")
+    if not hmac.compare_digest(lane.source_packet_digest, source_packet_digest):
+        raise ValueError("lane_source_packet_mismatch")
+    if tuple(lane.sample_ids) != tuple(sampling.sample_ids):
+        raise ValueError("lane_sample_membership_mismatch")
+
+
+def validate_lane_isolation(lanes: Sequence[LaneFreeze]) -> None:
+    """Prove lanes are provenance-independent: distinct slots and identities.
+
+    Lane isolation at execution time is enforced by the harness design (each
+    lane runs in a separate context with only its own packet); this check
+    proves the provenance side: no two lanes may share a slot or a reviewer
+    identity digest, and all three frozen slots must be present.
+    """
+    slots = [lane.reviewer.reviewer_slot for lane in lanes]
+    if len(set(slots)) != len(slots):
+        raise ValueError("duplicate_reviewer_slot")
+    identities = [lane.reviewer.lane_identity_digest() for lane in lanes]
+    if len(set(identities)) != len(identities):
+        raise ValueError("duplicate_reviewer_identity")
+    if set(slots) != set(REVIEWER_SLOTS):
+        raise ValueError("missing_reviewer_lane")
+
+
+def judgment_is_consensus_eligible(judgment: ModelJudgment) -> bool:
+    """A single judgment is eligible only if confident and non-degenerate."""
+    if CONFIDENCE_ORDER[judgment.reviewer_confidence] < CONFIDENCE_ORDER[MIN_REVIEWER_CONFIDENCE]:
+        return False
+    for name, forbidden in NON_CONSENSUS_VALUES.items():
+        if judgment.fields[name] in forbidden:
+            return False
+    return True
+
+
+def classify_case(records_by_slot: Mapping[str, ModelReviewRecord]) -> dict[str, Any]:
+    """Classify one case from its three first-pass model records.
+
+    Returns ``consensus`` (unanimous exact agreement on all five critical
+    fields with every judgment eligible) or the deduplicated escalation
+    reasons that put the case in the mandatory human queue.
+    """
+    if set(records_by_slot) != set(REVIEWER_SLOTS):
+        raise ValueError("case_requires_all_three_lanes")
+    reasons: list[str] = []
+    judgments: list[ModelJudgment] = []
+    for slot in REVIEWER_SLOTS:
+        record = records_by_slot[slot]
+        if record.parse_status != "parsed" or record.outcome_status != "judged":
+            if record.parse_status != "parsed":
+                reasons.append("malformed_review")
+            if record.outcome_status == "refused":
+                reasons.append("refused")
+            elif record.outcome_status == "provider_error":
+                reasons.append("provider_error")
+        elif record.judgment is not None:
+            judgments.append(record.judgment)
+    if len(judgments) == len(REVIEWER_SLOTS):
+        criticals = [j.critical() for j in judgments]
+        unanimous = all(critical == criticals[0] for critical in criticals[1:])
+        degenerate = any(
+            judgment.fields[name] in forbidden
+            for judgment in judgments
+            for name, forbidden in NON_CONSENSUS_VALUES.items()
+        )
+        below_floor = any(not judgment_is_consensus_eligible(j) for j in judgments)
+        if not unanimous:
+            reasons.append("critical_field_disagreement")
+        if degenerate:
+            reasons.append("uncertain_unknown_or_ambiguous_critical_value")
+        if below_floor:
+            reasons.append("reviewer_below_confidence_floor")
+    else:
+        reasons.append("missing_parsed_judgment")
+    high_signal = any(
+        record.judgment is not None and record.judgment.fields.get("consequence") == "high"
+        for record in records_by_slot.values()
+    )
+    if high_signal:
+        reasons.append("high_consequence_signal")
+    unique_reasons: list[str] = []
+    for reason in reasons:
+        if reason not in unique_reasons:
+            unique_reasons.append(reason)
+    consensus = not unique_reasons
+    return {
+        "consensus": consensus,
+        "escalation_reasons": unique_reasons,
+        "high_consequence_signal": high_signal,
+    }
+
+
+def select_audit_sample(
+    consensus_sample_ids: Sequence[str],
+    *,
+    rate: float = AUDIT_SAMPLE_RATE,
+    seed: str = AUDIT_SELECTION_SEED,
+) -> tuple[str, ...]:
+    """Deterministically select ``ceil(rate * N)`` consensus cases for audit.
+
+    Selection ranks frozen sample IDs by HMAC-SHA256 under the frozen seed and
+    is label-blind: it never reads any judgment value, only membership
+    eligibility as a consensus case. Reproducible for fixed consensus
+    membership; changing membership changes the eligible pool only.
+    """
+    if not 0.0 < rate <= 1.0:
+        raise ValueError("audit_rate_out_of_range")
+    unique = sorted(set(consensus_sample_ids))
+    if len(unique) != len(consensus_sample_ids):
+        raise ValueError("audit_pool_membership_duplicate")
+    target = len(unique) - int(len(unique) * (1.0 - rate))
+    target = min(max(target, 1) if unique else 0, len(unique))
+    ranked = sorted(
+        unique,
+        key=lambda sample_id: (
+            hmac.new(seed.encode(), sample_id.encode(), hashlib.sha256).hexdigest(),
+            sample_id,
+        ),
+    )
+    return tuple(ranked[:target])
+
+
+def audit_outcome(
+    *,
+    audited_count: int,
+    material_disagreements: int,
+    high_consequence_misses: int,
+) -> dict[str, Any]:
+    """Apply the frozen audit escalation threshold. Fails toward escalation."""
+    escalate = (high_consequence_misses > 0) or (
+        audited_count > 0
+        and (material_disagreements / audited_count) > AUDIT_DISAGREEMENT_RATE_THRESHOLD
+    )
+    return {
+        "audited_count": audited_count,
+        "material_disagreements": material_disagreements,
+        "high_consequence_misses": high_consequence_misses,
+        "material_disagreement_rate": (
+            round(material_disagreements / audited_count, 4) if audited_count else None
+        ),
+        "escalate_full_human_review": escalate,
+    }
+
+
+class ConsensusProvenanceWrapper(Record):
+    """Per-case provenance wrapper: how the final reference label was reached.
+
+    ``final_label_origin`` is campaign-specific vocabulary that never collides
+    with the frozen #202 ``label_origin`` values. ``cross_model_consensus``
+    rows carry explicit provenance that NO human directly labeled them;
+    ``human_audited_consensus`` rows were audit-selected and human-confirmed.
+    """
+
+    wrapper_schema: Literal["engram-calibration-consensus-provenance-206-v1"] = (
+        "engram-calibration-consensus-provenance-206-v1"
+    )
+    protocol_version: str
+    campaign_id: str
+    sampling_manifest_digest: str
+    source_packet_digest: str
+    sample_id: Token
+    first_pass_record_digests: tuple[Digest, ...]  # exactly three, slot order
+    consensus_reached: bool
+    entered_human_queue: bool
+    queue_reasons: tuple[str, ...] = ()
+    human_initial_judgment_digest: Digest | None = None
+    final_label_origin: Literal[
+        "cross_model_consensus", "human_adjudicated", "human_audited_consensus"
+    ]
+    final_dimensions: dict[str, Any]
+    audit_selected: bool = False
+
+    @model_validator(mode="after")
+    def provenance_contract(self) -> Self:
+        if self.protocol_version != CONSENSUS_PROTOCOL_VERSION:
+            raise ValueError("protocol_version_mismatch")
+        if len(self.first_pass_record_digests) != len(REVIEWER_SLOTS):
+            raise ValueError("first_pass_record_count_mismatch")
+        if self.final_label_origin == "cross_model_consensus":
+            if not self.consensus_reached:
+                raise ValueError("consensus_origin_requires_consensus")
+            if self.entered_human_queue:
+                raise ValueError("consensus_origin_requires_no_human_queue")
+        else:
+            if not self.entered_human_queue:
+                raise ValueError("human_origin_requires_human_queue")
+            if self.final_label_origin == "human_audited_consensus" and not self.consensus_reached:
+                raise ValueError("audited_consensus_requires_consensus")
+        if self.entered_human_queue and not self.queue_reasons:
+            raise ValueError("human_queue_requires_reasons")
+        if self.final_label_origin == "human_audited_consensus":
+            if not self.audit_selected:
+                raise ValueError("audited_origin_requires_audit_selection")
+        elif self.audit_selected:
+            raise ValueError("audited_case_must_use_audited_origin")
+        return self
+
+
+class ReferenceLabel(Record):
+    """One final reference label under the consensus protocol (#206).
+
+    Carries exactly the five calibration-critical fields plus the campaign
+    provenance vocabulary. This is what ``check_floors`` and downstream
+    fitting consume — never majority votes or raw model judgments. The
+    ``final_label_origin`` vocabulary is deliberately disjoint from the
+    frozen #202 ``LabelRecord.label_origin`` values so a model-consensus row
+    can never masquerade as ``human_adjudicated``.
+    """
+
+    label_schema: Literal["engram-calibration-reference-206-v1"] = (
+        "engram-calibration-reference-206-v1"
+    )
+    sample_id: Token
+    final_label_origin: Literal[
+        "cross_model_consensus", "human_adjudicated", "human_audited_consensus"
+    ]
+    critical: dict[str, Any]
+
+    @model_validator(mode="after")
+    def closed_vocabulary(self) -> Self:
+        if set(self.critical) != set(CRITICAL_FIELDS):
+            raise ValueError("reference_label_requires_exactly_critical_fields")
+        for name, vocabulary in CriticalFieldVocabulary.items():
+            if self.critical[name] not in vocabulary:
+                raise ValueError(f"critical_field_out_of_vocabulary:{name}")
+        return self
+
+
+class ConsensusLedger(Record):
+    """Final reference-label ledger under the consensus protocol.
+
+    Replaces full-population dual review for #202's corrected methodology.
+    ``check_floors`` consumes ONLY the final reference dimensions from these
+    wrappers — never majority votes or raw model judgments.
+    """
+
+    ledger_schema: Literal["engram-calibration-consensus-ledger-206-v1"] = CONSENSUS_LEDGER_SCHEMA
+    protocol_version: str
+    campaign_id: str
+    sampling_manifest_digest: str
+    source_packet_digest: str
+    lane_digests: tuple[Digest, ...]  # exactly three, slot order
+    audit_seed: str = AUDIT_SELECTION_SEED
+    audit_rate: float = AUDIT_SAMPLE_RATE
+    wrappers: tuple[ConsensusProvenanceWrapper, ...]
+
+    @model_validator(mode="after")
+    def ledger_contract(self) -> Self:
+        if self.protocol_version != CONSENSUS_PROTOCOL_VERSION:
+            raise ValueError("protocol_version_mismatch")
+        if len(self.lane_digests) != len(REVIEWER_SLOTS):
+            raise ValueError("lane_count_mismatch")
+        if self.audit_seed != AUDIT_SELECTION_SEED:
+            raise ValueError("audit_seed_frozen")
+        if self.audit_rate != AUDIT_SAMPLE_RATE:
+            raise ValueError("audit_rate_frozen")
+        ids = [wrapper.sample_id for wrapper in self.wrappers]
+        if len(set(ids)) != len(ids):
+            raise ValueError("duplicate_ledger_sample_id")
+        return self
+
+    def final_dimensions_by_sample(self) -> dict[str, dict[str, Any]]:
+        return {wrapper.sample_id: wrapper.final_dimensions for wrapper in self.wrappers}
+
+
+class CorrelationReport(Record):
+    """Public-safe aggregate correlation report (no tenant content)."""
+
+    report_schema: Literal["engram-calibration-correlation-206-v1"] = CORRELATION_REPORT_SCHEMA
+    protocol_version: str
+    campaign_id: str
+    sampling_manifest_digest: str
+    source_packet_digest: str
+    reviewer_identities: tuple[ReviewerIdentity, ...]
+    lane_digests: tuple[Digest, ...]
+    expected_cases: int
+    completion_counts: dict[str, int]
+    consensus_count: int
+    disagreement_count: int
+    uncertain_count: int
+    malformed_error_refusal_count: int
+    mandatory_high_consequence_count: int
+    queue_reason_overlap: dict[str, int]
+    human_queue_count_before_audit: int
+    audit_count: int
+    total_human_workload: int
+    per_dimension_agreement: dict[str, dict[str, Any]]
+    pairwise_agreement: dict[str, dict[str, dict[str, int]]]
+    threeway_agreement: dict[str, int]
+    aggregate_by_axis: dict[str, dict[str, dict[str, int]]]
+    audit: dict[str, Any]
+
+    @model_validator(mode="after")
+    def report_contract(self) -> Self:
+        if self.protocol_version != CONSENSUS_PROTOCOL_VERSION:
+            raise ValueError("protocol_version_mismatch")
+        if len(self.reviewer_identities) != len(REVIEWER_SLOTS):
+            raise ValueError("reviewer_identity_count_mismatch")
+        if len(self.lane_digests) != len(REVIEWER_SLOTS):
+            raise ValueError("lane_digest_count_mismatch")
+        return self
+
+
+def build_correlation_report(
+    *,
+    campaign_id: str,
+    lanes: Sequence[LaneFreeze],
+    records_by_lane: Mapping[str, Mapping[str, ModelReviewRecord]],
+    sampling: SamplingManifest,
+    source_packet_digest: str,
+    audit: Mapping[str, Any] | None = None,
+) -> CorrelationReport:
+    """Aggregate three frozen lanes into the public-safe correlation report.
+
+    Must be called only after all three lanes are frozen. Produces counts and
+    digests only — no tenant content, private IDs, reviewer rationales, or
+    protected labels.
+    """
+    audit = audit or {}
+    validate_lane_isolation(lanes)
+    for lane in lanes:
+        validate_lane_membership(lane, sampling, source_packet_digest=source_packet_digest)
+    expected = len(sampling.sample_ids)
+    completions: dict[str, int] = {}
+    judgments_by_sample: dict[str, dict[str, ModelJudgment]] = {}
+    for lane in lanes:
+        slot = lane.reviewer.reviewer_slot
+        lane_records = records_by_lane[slot]
+        if set(lane_records) != set(lane.sample_ids):
+            raise ValueError("lane_records_membership_mismatch")
+        completions[slot] = sum(
+            1
+            for record in lane_records.values()
+            if record.parse_status == "parsed" and record.outcome_status == "judged"
+        )
+        for sample_id, record in lane_records.items():
+            if record.judgment is not None:
+                judgments_by_sample.setdefault(sample_id, {})[slot] = record.judgment
+    classifications = {
+        sample_id: classify_case(
+            {slot: records_by_lane[slot][sample_id] for slot in REVIEWER_SLOTS}
+        )
+        for sample_id in sampling.sample_ids
+    }
+    consensus_ids = [sid for sid, c in classifications.items() if c["consensus"]]
+    queue_ids = [sid for sid, c in classifications.items() if c["escalation_reasons"]]
+    reason_counts: dict[str, int] = {}
+    overlap_pairs: dict[str, int] = {}
+    for classification in classifications.values():
+        reasons = classification["escalation_reasons"]
+        for reason in reasons:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        ordered = sorted(reasons)
+        for i, first in enumerate(ordered):
+            for second in ordered[i + 1 :]:
+                key = f"{first}+{second}"
+                overlap_pairs[key] = overlap_pairs.get(key, 0) + 1
+    pairwise: dict[str, dict[str, dict[str, int]]] = {}
+    threeway: dict[str, int] = {}
+    for field_name in CRITICAL_FIELDS:
+        field_pairwise: dict[str, dict[str, int]] = {}
+        for i, left in enumerate(REVIEWER_SLOTS):
+            for right in REVIEWER_SLOTS[i + 1 :]:
+                agree = disagree = absent = 0
+                for sample_id in sampling.sample_ids:
+                    left_j = judgments_by_sample.get(sample_id, {}).get(left)
+                    right_j = judgments_by_sample.get(sample_id, {}).get(right)
+                    if left_j is None or right_j is None:
+                        absent += 1
+                        continue
+                    if left_j.fields.get(field_name) == right_j.fields.get(field_name):
+                        agree += 1
+                    else:
+                        disagree += 1
+                field_pairwise[f"{left}:{right}"] = {
+                    "agree": agree,
+                    "disagree": disagree,
+                    "absent": absent,
+                }
+        pairwise[field_name] = field_pairwise
+        three_agree = 0
+        for sample_id in sampling.sample_ids:
+            per_slot = [judgments_by_sample.get(sample_id, {}).get(slot) for slot in REVIEWER_SLOTS]
+            if any(j is None for j in per_slot):
+                continue
+            values = {j.fields[field_name] for j in per_slot}  # type: ignore[union-attr]
+            if len(values) == 1:
+                three_agree += 1
+        threeway[field_name] = three_agree
+    audit_selected = select_audit_sample(consensus_ids)
+    audit_payload = {
+        "audit_selection_seed": AUDIT_SELECTION_SEED,
+        "audit_rate": AUDIT_SAMPLE_RATE,
+        "audit_count": len(audit_selected),
+        **{str(key): value for key, value in audit.items()},
+    }
+    audit_payload["audit_count"] = len(audit_selected)
+    workload = len(set(queue_ids) | set(audit_selected))
+    return CorrelationReport(
+        protocol_version=CONSENSUS_PROTOCOL_VERSION,
+        campaign_id=campaign_id,
+        sampling_manifest_digest=sampling.manifest_digest(),
+        source_packet_digest=source_packet_digest,
+        reviewer_identities=tuple(lane.reviewer for lane in lanes),
+        lane_digests=tuple(lane.lane_digest() for lane in lanes),
+        expected_cases=expected,
+        completion_counts=completions,
+        consensus_count=len(consensus_ids),
+        disagreement_count=reason_counts.get("critical_field_disagreement", 0),
+        uncertain_count=reason_counts.get("uncertain_unknown_or_ambiguous_critical_value", 0),
+        malformed_error_refusal_count=(
+            reason_counts.get("malformed_review", 0)
+            + reason_counts.get("refused", 0)
+            + reason_counts.get("provider_error", 0)
+        ),
+        mandatory_high_consequence_count=reason_counts.get("high_consequence_signal", 0),
+        queue_reason_overlap=dict(sorted(overlap_pairs.items())),
+        human_queue_count_before_audit=len(set(queue_ids)),
+        audit_count=len(audit_selected),
+        total_human_workload=workload,
+        per_dimension_agreement={
+            field_name: {
+                "pairwise_agree": {
+                    pair: counts["agree"] for pair, counts in pairwise[field_name].items()
+                },
+                "threeway_agree": threeway[field_name],
+                "expected": expected,
+            }
+            for field_name in CRITICAL_FIELDS
+        },
+        pairwise_agreement=pairwise,
+        threeway_agreement=threeway,
+        aggregate_by_axis={},  # axes live in the protected frame; see runbook
+        audit=audit_payload,
+    )
