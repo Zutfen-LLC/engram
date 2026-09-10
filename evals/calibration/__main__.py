@@ -44,6 +44,7 @@ from evals.calibration.freeze import (
     TargetIdentity,
     assign_splits,
     build_frame,
+    load_frozen_frame_rows,
     protected_frame_digest,
     public_sampling_summary,
     sample_id_for,
@@ -568,29 +569,18 @@ def _load_frame_rows(frame_path: str | None, sampling: SamplingManifest) -> dict
     FIX-R3-4: fails closed. The frame is mandatory on campaign paths and must
     contain EVERY frozen sampled ID — a partial mapping is rejected instead
     of silently degrading the audit selection.
+
+    FIX-R4-3: delegates to the ONE canonical frozen-frame validator
+    (``load_frozen_frame_rows`` -> ``verify_frozen_frame``) shared with the
+    ledger authority boundary, so the CLI and the verifier can never diverge
+    on what counts as the frozen frame.
     """
     if not frame_path:
         raise SystemExit("--frame is required for the frozen campaign audit path")
-    rows = [FrameRow.model_validate(row) for row in json.loads(Path(frame_path).read_text())]
-    by_id: dict[str, FrameRow] = {}
-    duplicate_ids: set[str] = set()
-    for row in rows:
-        key = row.sample_id or sample_id_for(row.item_uuid)
-        if key in by_id:
-            duplicate_ids.add(key)
-        by_id[key] = row
-    if duplicate_ids:
-        raise SystemExit("frame contains duplicate sampled IDs; refusing ambiguous audit frame")
-    selected_rows = [by_id[sid] for sid in sampling.sample_ids if sid in by_id]
-    missing = [sid for sid in sampling.sample_ids if sid not in by_id]
-    if missing:
-        raise SystemExit(
-            f"frame membership incomplete: {len(missing)} frozen sampled IDs missing; "
-            "refusing partial frame mapping"
-        )
-    if protected_frame_digest(selected_rows) != sampling.frame_digest:
-        raise SystemExit("frame digest does not match frozen sampling manifest")
-    return {sid: by_id[sid] for sid in sampling.sample_ids}
+    try:
+        return load_frozen_frame_rows(Path(frame_path), sampling)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def _load_lane_session(args: argparse.Namespace) -> tuple[LaneSession, SamplingManifest]:

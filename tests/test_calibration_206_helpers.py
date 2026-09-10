@@ -3,14 +3,65 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import UTC, datetime
+from pathlib import Path
 
 from engram.assessment_schema import AssessmentContract
 from evals.admission.schema import digest
 from evals.calibration.fit import AssessmentExecutionReceipt
-from evals.calibration.freeze import FrameRow, SplitManifest, TargetIdentity
+from evals.calibration.freeze import FrameRow, SamplingManifest, SplitManifest, TargetIdentity
 
 NOW = datetime(2026, 9, 10, tzinfo=UTC)
+
+
+def build_raw_response(
+    sample_id: str,
+    fields: dict,
+    *,
+    reviewer_confidence: str = "medium",
+) -> bytes:
+    """FIX-R4-2 test fixtures: a model response whose bytes carry the judgment."""
+    return json.dumps(
+        {
+            "sample_id": sample_id,
+            "outcome": "judged",
+            "judgment": {
+                "fields": dict(fields),
+                "reviewer_confidence": reviewer_confidence,
+            },
+        }
+    ).encode()
+
+
+def build_raw_refusal(sample_id: str, error_code: str = "refused_by_model") -> bytes:
+    """FIX-R4-2 test fixtures: an explicit refusal in response bytes."""
+    return json.dumps(
+        {"sample_id": sample_id, "outcome": "refused", "error_code": error_code}
+    ).encode()
+
+
+def execution_receipt_for(
+    lane_root: Path,
+    reviewer: object,
+    sample_id: str,
+    *,
+    request_generation: int,
+    campaign_id: str = "campaign",
+    executor_status: str = "completed",
+) -> object:
+    """Build a truthful execution receipt against a retained request batch."""
+    from evals.calibration.ingestion import build_execution_receipt
+
+    return build_execution_receipt(
+        lane_root,
+        reviewer,  # type: ignore[arg-type]
+        sample_id,
+        request_generation=request_generation,
+        campaign_id=campaign_id,
+        executor_status=executor_status,  # type: ignore[arg-type]
+        executed_at=NOW,
+    )
 
 
 def build_identity() -> TargetIdentity:
@@ -110,10 +161,49 @@ def build_receipts(
     return receipts
 
 
+def write_assessment_evidence(
+    tmp_path: Path,
+    ids: tuple[str, ...],
+    frame: list[FrameRow],
+    identity: TargetIdentity,
+    contract: AssessmentContract,
+    sampling: SamplingManifest,
+) -> tuple[Path, str]:
+    """FIX-R4-5 test fixtures: write a protected assessment-evidence artifact.
+
+    Builds the same ``engram-calibration-assessment-evidence-v1`` envelope
+    the legacy #202 path consumes (target/contract/sampling/frame bound,
+    one execution per sampled item, self-consistent receipt digests) and
+    returns ``(path, sha256)`` for the consensus front door.
+    """
+    import hashlib
+    import json as _json
+
+    from evals.calibration.freeze import SamplingManifest  # noqa: F401 (re-assurance)
+
+    receipts = build_receipts(ids, frame, identity, contract)
+    envelope = {
+        "evidence_schema": "engram-calibration-assessment-evidence-v1",
+        "target_identity_digest": identity.identity_digest(),
+        "sampling_manifest_digest": sampling.manifest_digest(),
+        "assessment_contract_digest": digest(contract.model_dump(mode="json")),
+        "frame_digest": sampling.frame_digest,
+        "executions": [r.model_dump(mode="json") for r in receipts],
+    }
+    payload = _json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode()
+    path = tmp_path / "assessment-evidence.json"
+    path.write_bytes(payload)
+    return path, hashlib.sha256(payload).hexdigest()
+
+
 def build_verified_ledger(
     ids: tuple[str, ...],
     critical_by_id: dict[str, dict],
     origin: str = "cross_model_consensus",
+    *,
+    sampling: SamplingManifest | None = None,
+    split: SplitManifest | None = None,
+    expected_split_digest: str | None = None,
 ):
     """Genuine VerifiedConsensusLedger built through the REAL verifier.
 
@@ -154,22 +244,30 @@ def build_verified_ledger(
 
     prompt_digest = labeling_instructions_digest()
     now = NOW
-    sampling = SamplingManifest(
-        campaign_id="campaign",
-        target_identity_digest="1" * 64,
-        frame_digest="2" * 64,
-        snapshot_sha256="3" * 64,
-        snapshot_as_of=now,
-        sampling_seed="seed",
-        inclusion_rules=("rule",),
-        exclusion_rules=(),
-        source_row_counts={"eligible_frame": len(ids)},
-        stratum_counts={"all": len(ids)},
-        coverage_dimensions={},
-        sample_ids=ids,
-        sample_hashes=tuple(_digest(sid) for sid in ids),
-    )
-    frame_rows = {str(row.sample_id): row for row in build_frame_rows(ids)}
+    from evals.calibration.freeze import protected_frame_digest
+
+    frame_rows_list = build_frame_rows(ids)
+    if sampling is None:
+        sampling = SamplingManifest(
+            campaign_id="campaign",
+            target_identity_digest="1" * 64,
+            # FIX-R4-3: derived from the actual frame rows so the canonical
+            # frozen-frame validator can verify them at the ledger boundary.
+            frame_digest=protected_frame_digest(frame_rows_list),
+            snapshot_sha256="3" * 64,
+            snapshot_as_of=now,
+            sampling_seed="seed",
+            inclusion_rules=("rule",),
+            exclusion_rules=(),
+            source_row_counts={"eligible_frame": len(ids)},
+            stratum_counts={"all": len(ids)},
+            coverage_dimensions={},
+            sample_ids=ids,
+            sample_hashes=tuple(_digest(sid) for sid in ids),
+        )
+    retained_split = split
+    retained_expected_split = expected_split_digest
+    frame_rows = {str(row.sample_id): row for row in frame_rows_list}
     adjudicate = origin != "cross_model_consensus"
     family_by_slot = dict(zip(REVIEWER_SLOTS, REVIEWER_FAMILIES, strict=True))
     reviewers = {
@@ -185,6 +283,65 @@ def build_verified_ledger(
     records_by_lane: dict[str, dict[str, ModelReviewRecord]] = {slot: {} for slot in REVIEWER_SLOTS}
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
+        # FIX-R4-1: emit immutable request batches first so every record can
+        # bind to an ACTUAL emitted request item (freeze enforces this).
+        from evals.calibration.ingestion import LaneSession
+        from evals.calibration.model_lanes import NeutralModelPacket
+        from evals.calibration.review import _packet_file_payload
+
+        cases = [
+            {
+                "sample_id": sid,
+                "content": f"content-{sid}",
+                "governed_kind": "fact",
+                "source_type": "manual",
+                "review_status": "active",
+                "assertion_mode": "unknown",
+                "origin": "unknown",
+                "risk": "unknown",
+                "evidence_state": "unknown",
+                "age_days": 5,
+                "age_bucket": "lt_7d",
+                "input_size_bucket": "small",
+            }
+            for sid in ids
+        ]
+        packet = NeutralModelPacket(
+            packet_id="campaign-blind-v2",
+            sampling_manifest_digest=sampling.manifest_digest(),
+            guide_version="engram-calibration-guide-157-v1",
+            reviewer_hint="neutral_model_review",
+            cases=cases,
+            source_packet_digest="f" * 64,
+        )
+        packet_dir = tmp_path / "packet"
+        packet_dir.mkdir(parents=True, exist_ok=True)
+        packet_payload = _packet_file_payload(packet)
+        packet_path = packet_dir / "campaign-blind-v2.neutral.json"
+        write_protected_file(packet_path, packet_payload)
+        packet_manifest = packet_dir / "neutral-packet-manifest.json"
+        write_protected_file(
+            packet_manifest,
+            (
+                json.dumps(
+                    {packet_path.name: hashlib.sha256(packet_payload).hexdigest()},
+                    sort_keys=True,
+                    indent=2,
+                )
+                + "\n"
+            ).encode(),
+        )
+        for slot in REVIEWER_SLOTS:
+            session = LaneSession.init(
+                tmp_path,
+                reviewer=reviewers[slot],
+                campaign_id="campaign",
+                sampling=sampling,
+                source_packet_digest="f" * 64,
+                neutral_packet_path=packet_path,
+                neutral_packet_manifest=packet_manifest,
+            )
+            session.emit_requests(packet_path, sampling=sampling, manifest_path=packet_manifest)
         for slot in REVIEWER_SLOTS:
             for sample_id in ids:
                 fields = dict(critical_by_id[sample_id])
@@ -192,7 +349,28 @@ def build_verified_ledger(
                     fields = dict(fields)
                     fields["expected_kind"] = "decision"  # guaranteed disagreement
                 judgment = ModelJudgment(fields=fields, reviewer_confidence="medium")
-                raw = f"raw-model-output:{slot}:{sample_id}".encode()
+                import json as _json
+
+                from evals.calibration.reviewer_instructions import RESPONSE_PARSER_VERSION
+
+                raw = _json.dumps(
+                    {
+                        "sample_id": sample_id,
+                        "outcome": "judged",
+                        "judgment": {"fields": dict(fields), "reviewer_confidence": "medium"},
+                    }
+                ).encode()
+                from evals.calibration.ingestion import build_execution_receipt
+
+                execution = build_execution_receipt(
+                    tmp_path / "lanes" / slot,
+                    reviewers[slot],
+                    sample_id,
+                    request_generation=1,
+                    campaign_id="campaign",
+                    executor_status="completed",
+                    executed_at=now,
+                )
                 record = ModelReviewRecord(
                     protocol_version=CONSENSUS_PROTOCOL_VERSION,
                     campaign_id="campaign",
@@ -206,6 +384,10 @@ def build_verified_ledger(
                     prompt_digest=prompt_digest,
                     label_guide_version="engram-calibration-guide-157-v1",
                     captured_at=now,
+                    execution=execution,
+                    request_generation=execution.request_generation,
+                    request_item_digest=execution.request_item_digest,
+                    parser_version=RESPONSE_PARSER_VERSION,
                     parse_status="parsed",
                     outcome_status="judged",
                     reviewer_confidence="medium",
@@ -254,7 +436,7 @@ def build_verified_ledger(
                 campaign_id="campaign",
                 sampling=sampling,
                 source_packet_digest="f" * 64,
-                neutral_packet_sha256="8" * 64,
+                neutral_packet_sha256=hashlib.sha256(packet_payload).hexdigest(),
             )
             for slot in REVIEWER_SLOTS
         )
@@ -314,4 +496,6 @@ def build_verified_ledger(
             queue_dir=queue_dir,
             frame_rows=frame_rows,
             protected_root=tmp_path,
+            split=retained_split,
+            expected_split_digest=retained_expected_split,
         )

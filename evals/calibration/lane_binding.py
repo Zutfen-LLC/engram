@@ -85,6 +85,13 @@ def validate_record_lane_binding(
     Raises ``ValueError`` naming the first identity field that disagrees
     (``record_lane_identity_mismatch:<fields>``), or a specific contract error
     for membership/digest violations.
+
+    FIX-R4-1: the record's embedded ACTUAL execution receipt must compare
+    exactly with the frozen lane authority (actual provider/model/config
+    identity == frozen ``ReviewerIdentity``; the record's attested request
+    binding == the receipt's). Actual executor identity is never taken from
+    the lane configuration: a record whose receipt names another executor is
+    rejected here even when its top-level fields were copied from the lane.
     """
     authority = _lane_authority(
         reviewer=reviewer,
@@ -99,6 +106,16 @@ def validate_record_lane_binding(
         raise ValueError("record_sample_not_in_sampling_manifest")
     if record.reviewer_slot != reviewer.reviewer_slot:
         raise ValueError("record_slot_mismatch")  # defensive; covered by identity fields
+    execution = record.execution
+    if execution is None:
+        raise ValueError("record_requires_execution_receipt")  # defensive; schema-enforced
+    if not execution.matches_reviewer_identity(reviewer, campaign_id):
+        raise ValueError("record_execution_receipt_identity_mismatch")
+    if (
+        record.request_generation != execution.request_generation
+        or record.request_item_digest != execution.request_item_digest
+    ):
+        raise ValueError("record_request_binding_disagrees_with_receipt")
 
 
 def validate_records_lane_binding(

@@ -95,7 +95,22 @@ def _record(
     error_code: str | None = None,
     raw_digest: str | None = "c" * 64,
 ) -> ModelReviewRecord:
+    from evals.calibration.consensus import ExecutionReceipt
+    from evals.calibration.reviewer_instructions import RESPONSE_PARSER_VERSION
+
     fam = family or dict(zip(REVIEWER_SLOTS, REVIEWER_FAMILIES, strict=True))[slot]
+    execution = ExecutionReceipt(
+        campaign_id="campaign",
+        reviewer_slot=slot,  # type: ignore[arg-type]
+        reviewer_family=fam,
+        provider_model_identifier=f"{fam}-exact-2026-09",
+        reviewer_config_digest="a" * 64,
+        prompt_digest=labeling_instructions_digest(),
+        request_generation=1,
+        request_item_digest="d" * 64,
+        executed_at=NOW,
+        executor_status="provider_error" if outcome_status == "provider_error" else "completed",
+    )
     return ModelReviewRecord(
         protocol_version=CONSENSUS_PROTOCOL_VERSION,
         campaign_id="campaign",
@@ -111,6 +126,10 @@ def _record(
         captured_at=NOW,
         parse_status=parse_status,  # type: ignore[arg-type]
         outcome_status=outcome_status,  # type: ignore[arg-type]
+        execution=execution,
+        request_generation=1,
+        request_item_digest="d" * 64,
+        parser_version=RESPONSE_PARSER_VERSION if parse_status == "parsed" else None,
         reviewer_confidence=judgment.reviewer_confidence if judgment else "unknown",
         judgment=judgment,
         raw_response_digest=raw_digest,  # type: ignore[arg-type]
@@ -179,7 +198,7 @@ class TestModelReviewSchemaCannotMasqueradeAsHuman:
 
     def test_schema_name_is_campaign_specific(self):
         record = _record("model_a", "s1", _judgment())
-        assert record.review_schema == "engram-calibration-model-review-206-v1"
+        assert record.review_schema == "engram-calibration-model-review-206-v2"
         assert record.review_schema != "engram-admission-label-v1"
 
     def test_model_record_is_not_a_label_record(self):
@@ -747,8 +766,8 @@ class TestFloorsConsumeOnlyFinalLabels:
         )
         from tests.test_calibration_206_helpers import (
             build_frame_rows,
-            build_receipts,
             build_split,
+            write_assessment_evidence,
         )
 
         ids = ("s1", "s2", "s3")
@@ -763,17 +782,56 @@ class TestFloorsConsumeOnlyFinalLabels:
         from tests.test_calibration_206_helpers import build_identity
 
         identity = build_identity()
-        receipts = build_receipts(ids, frame, identity, contract)
+        # FIX-R4-5: build the sampling the ledger was verified against so the
+        # protected evidence binds to the same identity.
+        from evals.admission.schema import digest as _digest
+        from evals.calibration.freeze import SamplingManifest, protected_frame_digest
+
+        sampling = SamplingManifest(
+            campaign_id="campaign",
+            target_identity_digest="1" * 64,
+            frame_digest=protected_frame_digest(frame),
+            snapshot_sha256="3" * 64,
+            snapshot_as_of=__import__("datetime").datetime(
+                2026, 9, 10, tzinfo=__import__("datetime").UTC
+            ),
+            sampling_seed="seed",
+            inclusion_rules=("rule",),
+            exclusion_rules=(),
+            source_row_counts={"eligible_frame": len(ids)},
+            stratum_counts={"all": len(ids)},
+            coverage_dimensions={},
+            sample_ids=ids,
+            sample_hashes=tuple(_digest(sid) for sid in ids),
+        )
+        # FIX-R4-5: Stage A proves sampling.target_identity_digest == evidence
+        # target identity before any receipt check runs.
+        sampling = sampling.model_copy(
+            update={"target_identity_digest": identity.identity_digest()}
+        )
+        split = split.model_copy(update={"sampling_manifest_digest": sampling.manifest_digest()})
+        evidence_path, evidence_sha = write_assessment_evidence(
+            tmp_path, ids, frame, identity, contract, sampling
+        )
         from tests.test_calibration_206_helpers import build_verified_ledger
 
-        verified = build_verified_ledger(ids, {sid: dict(GOOD_CRITICAL) for sid in ids})
+        verified = build_verified_ledger(
+            ids,
+            {sid: dict(GOOD_CRITICAL) for sid in ids},
+            sampling=sampling,
+            split=split,
+            expected_split_digest=split.split_digest(),
+        )
         observations = consensus_reference_observations(
-            receipts=receipts,
+            assessment_evidence_path=evidence_path,
+            expected_assessment_evidence_sha256=evidence_sha,
             verified_ledger=verified,
+            sampling=sampling,
             target_identity=identity,
             contract=contract,
             split=split,
             frame=frame,
+            expected_split_digest=split.split_digest(),
         )
         # 3 samples x 3 dimensions, outcome driven by the FINAL label only
         assert len(observations) == 9
@@ -784,14 +842,20 @@ class TestFloorsConsumeOnlyFinalLabels:
             ids,
             {sid: dict(GOOD_CRITICAL, retention_value="do_not_retain") for sid in ids},
             origin="human_adjudicated",
+            sampling=sampling,
+            split=split,
+            expected_split_digest=split.split_digest(),
         )
         flipped_obs = consensus_reference_observations(
-            receipts=receipts,
+            assessment_evidence_path=evidence_path,
+            expected_assessment_evidence_sha256=evidence_sha,
             verified_ledger=flipped_ledger,
+            sampling=sampling,
             target_identity=identity,
             contract=contract,
             split=split,
             frame=frame,
+            expected_split_digest=split.split_digest(),
         )
         assert all(o.outcome == "negative" for o in flipped_obs if o.dimension == "retention")
 
@@ -801,8 +865,8 @@ class TestFloorsConsumeOnlyFinalLabels:
         from tests.test_calibration_206_helpers import (
             build_frame_rows,
             build_identity,
-            build_receipts,
             build_split,
+            write_assessment_evidence,
         )
 
         ids = ("s1",)
@@ -815,20 +879,67 @@ class TestFloorsConsumeOnlyFinalLabels:
             calibration_version="dataset-v2",
         )
         identity = build_identity()
-        receipts = build_receipts(ids, frame, identity, contract)
-        # tamper with the receipt digest
-        tampered = receipts[0].model_copy(update={"receipt_digest": "0" * 64})
+        import datetime as _dt
+
+        from evals.admission.schema import digest as _digest
+        from evals.calibration.freeze import SamplingManifest, protected_frame_digest
+
+        sampling = SamplingManifest(
+            campaign_id="campaign",
+            target_identity_digest="1" * 64,
+            frame_digest=protected_frame_digest(frame),
+            snapshot_sha256="3" * 64,
+            snapshot_as_of=_dt.datetime(2026, 9, 10, tzinfo=_dt.UTC),
+            sampling_seed="seed",
+            inclusion_rules=("rule",),
+            exclusion_rules=(),
+            source_row_counts={"eligible_frame": len(ids)},
+            stratum_counts={"all": len(ids)},
+            coverage_dimensions={},
+            sample_ids=ids,
+            sample_hashes=tuple(_digest(sid) for sid in ids),
+        )
+        # FIX-R4-5: Stage A proves sampling.target_identity_digest == evidence
+        # target identity before any receipt check runs.
+        sampling = sampling.model_copy(
+            update={"target_identity_digest": identity.identity_digest()}
+        )
+        split = split.model_copy(update={"sampling_manifest_digest": sampling.manifest_digest()})
+        evidence_path, _sha = write_assessment_evidence(
+            tmp_path, ids, frame, identity, contract, sampling
+        )
+        # FIX-R4-5: tamper a receipt digest INSIDE the protected artifact —
+        # the retained SHA catches any byte change first; to target the
+        # receipt check itself, rewrite the file AND use its new SHA.
+        import json as _json
+
+        envelope = _json.loads(evidence_path.read_text())
+        envelope["executions"][0]["receipt_digest"] = "0" * 64
+        tampered_payload = _json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode()
+        evidence_path.write_bytes(tampered_payload)
+        import hashlib as _hl
+
+        tampered_sha = _hl.sha256(tampered_payload).hexdigest()
         from tests.test_calibration_206_helpers import build_verified_ledger
 
-        verified = build_verified_ledger(("s1",), {"s1": dict(GOOD_CRITICAL)})
+        verified = build_verified_ledger(
+            ("s1",),
+            {"s1": dict(GOOD_CRITICAL)},
+            sampling=sampling,
+            split=split,
+            expected_split_digest=split.split_digest(),
+        )
         with pytest.raises(Exception, match="assessment_execution_receipt_digest_mismatch"):
             consensus_reference_observations(
-                receipts=[tampered],
+                assessment_evidence_path=evidence_path,
+                expected_assessment_evidence_sha256=tampered_sha,
                 verified_ledger=verified,
+                sampling=sampling,
                 target_identity=identity,
                 contract=contract,
                 split=split,
                 frame=frame,
+                expected_split_digest=split.split_digest(),
             )
 
 
@@ -1152,6 +1263,10 @@ class TestServingInvariantsUnchanged:
             "captured_at",
             "parse_status",
             "outcome_status",
+            "execution",
+            "request_generation",
+            "request_item_digest",
+            "parser_version",
             "reviewer_confidence",
             "judgment",
             "raw_response_digest",

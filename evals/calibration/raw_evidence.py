@@ -50,6 +50,11 @@ def validate_record_raw_evidence(
     - provider_error: digest is None and no raw artifact exists for the sample
       (an existing ``.resp`` file for a provider_error record means evidence
       is claimed that the record says does not exist — rejected).
+
+    FIX-R4-2: for judged records the preserved bytes are re-parsed with the
+    frozen deterministic parser and the derived judgment must equal the
+    stored one — the record's classification can never disagree with its own
+    preserved output bytes.
     """
     path = raw_response_path(lane_root, record.sample_id)
     if record.outcome_status == "provider_error":
@@ -66,6 +71,26 @@ def validate_record_raw_evidence(
     actual = hashlib.sha256(payload).hexdigest()
     if actual != record.raw_response_digest:
         raise ValueError(f"record_raw_evidence_digest_mismatch:{record.sample_id}")
+    if record.parse_status == "parsed":
+        from evals.calibration.reviewer_instructions import parse_model_response
+
+        try:
+            parsed = parse_model_response(payload, expected_sample_id=record.sample_id)
+        except ValueError:
+            raise ValueError(f"record_raw_evidence_sample_mismatch:{record.sample_id}") from None
+        if parsed.classification != "judged" or parsed.judgment is None:
+            raise ValueError(f"record_judgment_not_derivable_from_bytes:{record.sample_id}")
+        if parsed.judgment != record.judgment:
+            raise ValueError(f"record_judgment_disagrees_with_bytes:{record.sample_id}")
+    elif record.outcome_status == "refused":
+        from evals.calibration.reviewer_instructions import parse_model_response
+
+        try:
+            parsed = parse_model_response(payload, expected_sample_id=record.sample_id)
+        except ValueError:
+            raise ValueError(f"record_raw_evidence_sample_mismatch:{record.sample_id}") from None
+        if parsed.classification != "refused":
+            raise ValueError(f"record_refusal_not_derivable_from_bytes:{record.sample_id}")
 
 
 def validate_lane_raw_evidence(

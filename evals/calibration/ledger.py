@@ -67,6 +67,7 @@ from pathlib import Path
 from typing import Any
 
 from evals.admission.schema import Record
+from evals.calibration.campaigns import EXPECTED_SPLIT_MANIFEST_DIGEST
 from evals.calibration.consensus import (
     AUDIT_SAMPLE_RATE,
     AUDIT_SELECTION_SEED,
@@ -82,7 +83,12 @@ from evals.calibration.consensus import (
     select_audit_sample_with_coverage,
     unanimous_consensus_critical,
 )
-from evals.calibration.freeze import FrameRow, SamplingManifest
+from evals.calibration.freeze import (
+    FrameRow,
+    SamplingManifest,
+    SplitManifest,
+    verify_frozen_frame,
+)
 from evals.calibration.human_queue import (
     export_queue_evidence,
     load_final_resolution,
@@ -210,6 +216,8 @@ def verify_consensus_ledger(
     queue_dir: Path,
     frame_rows: dict[str, FrameRow],
     protected_root: Path,
+    split: SplitManifest | None = None,
+    expected_split_digest: str | None = None,
     suggested_kind_by_sample: dict[str, str] | None = None,
     audit_outcome_record: AuditOutcomeRecord | None = None,
 ) -> VerifiedConsensusLedger:
@@ -239,11 +247,34 @@ def verify_consensus_ledger(
     response bytes are verified to exist and hash to the claimed digest
     (provider_error records must claim none) through the full canonical
     ``validate_lane_provenance_with_raw`` verifier. There is no bypass.
+
+    FIX-R4-3: ``frame_rows`` is verified against the frozen frame itself
+    (canonical ``verify_frozen_frame``: exact membership, reconstructed
+    frozen order, ``protected_frame_digest == sampling.frame_digest``,
+    per-sample content hashes) BEFORE it influences audit selection. The
+    CLI having validated the frame beforehand is never assumed.
+
+    FIX-R4-4: when the frozen split is supplied (the fitting/floor path
+    requires it), it is verified against the INDEPENDENTLY retained campaign
+    authority digest — never computed from the split object being verified —
+    and bound into the ledger.
     """
     if not isinstance(protected_root, Path):
         raise ValueError("ledger_requires_protected_root")
     if campaign_id != sampling.campaign_id:
         raise ValueError("ledger_campaign_mismatch")
+    # --- FIX-R4-3: prove the frame IS the frozen frame before use ---
+    verified_frame_rows = verify_frozen_frame(frame_rows, sampling)
+    # --- FIX-R4-4: verify + bind the frozen split against the campaign authority ---
+    verified_split_digest: str | None = None
+    if split is not None:
+        if expected_split_digest is None:
+            verified_split_digest = verify_frozen_split(split, sampling)
+        else:
+            # Synthetic campaigns retain their own independent expected digest.
+            verified_split_digest = verify_frozen_split_with_expected(
+                split, sampling, expected_split_digest=expected_split_digest
+            )
     # --- lanes: FULL canonical provenance path (FIX-R2-1 + FIX-R3-2) ---
     if len(lanes) != len(REVIEWER_SLOTS):
         raise ValueError("lane_count_mismatch")
@@ -284,7 +315,7 @@ def verify_consensus_ledger(
         for sample_id in sampling.sample_ids
     }
     consensus_ids = [sid for sid, c in classifications.items() if c["consensus"]]
-    selection = select_audit_sample_with_coverage(consensus_ids, frame_rows)
+    selection = select_audit_sample_with_coverage(consensus_ids, verified_frame_rows)
     audit_ids = set(selection.selected)
     # --- queue evidence ---
     queue_export = export_queue_evidence(queue_dir)
@@ -441,6 +472,7 @@ def verify_consensus_ledger(
         campaign_id=campaign_id,
         sampling_manifest_digest=sampling.manifest_digest(),
         source_packet_digest=source_packet_digest,
+        split_manifest_digest=verified_split_digest,
         # FIX-R3 (lane order): canonical REVIEWER_SLOTS order, never the
         # caller's input tuple order.
         lane_digests=canonical_lane_digests,
@@ -513,6 +545,44 @@ def escalated_and_consensus(escalated: bool, consensus_reached: bool) -> bool:
     return escalated and consensus_reached
 
 
+def verify_frozen_split(split: SplitManifest, sampling: SamplingManifest) -> str:
+    """FIX-R4-4: verify a split against the INDEPENDENT frozen authority.
+
+    The expected digest is sourced from the already-frozen campaign authority
+    (``evals.calibration.campaigns`` — the committed Round-2 re-freeze
+    record), NEVER computed from the split object being verified. Also
+    proves the split's campaign binding and exact membership against the
+    frozen sampling manifest. Returns the verified split digest.
+
+    Synthetic campaigns (tests) use ``verify_frozen_split_with_expected``
+    with their own independently retained expected digest.
+    """
+    return verify_frozen_split_with_expected(
+        split, sampling, expected_split_digest=EXPECTED_SPLIT_MANIFEST_DIGEST
+    )
+
+
+def verify_frozen_split_with_expected(
+    split: SplitManifest,
+    sampling: SamplingManifest,
+    *,
+    expected_split_digest: str,
+) -> str:
+    """Verify a split against a caller-INDEPENDENTLY-retained expected digest.
+
+    ``expected_split_digest`` must come from an authority outside the split
+    object being verified (campaign manifest, test fixture). For the real
+    #206/#202 campaign use ``verify_frozen_split`` instead.
+    """
+    from evals.calibration.freeze import validate_split_membership
+
+    validate_split_membership(sampling, split)
+    actual = split.split_digest()
+    if not hmac.compare_digest(actual, expected_split_digest):
+        raise ValueError("split_digest_does_not_match_frozen_authority")
+    return actual
+
+
 def _queue_reasons(
     escalation_reasons: tuple[str, ...], audit_selected: bool, escalated: bool
 ) -> tuple[str, ...]:
@@ -560,6 +630,8 @@ def load_verified_ledger(
     queue_dir: Path,
     frame_rows: dict[str, FrameRow],
     protected_root: Path,
+    split: SplitManifest | None = None,
+    expected_split_digest: str | None = None,
     suggested_kind_by_sample: dict[str, str] | None = None,
     reviewers: dict[str, Any] | None = None,
 ) -> VerifiedConsensusLedger:
@@ -574,6 +646,14 @@ def load_verified_ledger(
     audit outcome is passed through as audit PROVENANCE and must match the
     independently derived outcome (FIX-R2-2).
 
+    FIX-R4-3: ``frame_rows`` is proven to BE the frozen frame inside the
+    verifier (canonical ``verify_frozen_frame``), never trusted because the
+    CLI validated it.
+
+    FIX-R4-4: ``split``, when supplied, is verified against the campaign
+    authority digest inside the verifier and compared field-exactly with the
+    stored ledger's ``split_manifest_digest``.
+
     ``reviewers`` is optional only when the caller has already loaded and
     validated the lanes; when omitted, the lanes are loaded from
     ``protected_root`` through ``load_frozen_lanes``-equivalent validation.
@@ -587,6 +667,8 @@ def load_verified_ledger(
     if envelope.get("ledger_file_schema") != LEDGER_FILE_SCHEMA:
         raise ValueError("consensus_ledger_schema_mismatch")
     stored = ConsensusLedger.model_validate(envelope["ledger"])
+    if split is not None and stored.split_manifest_digest is None:
+        raise ValueError("ledger_missing_frozen_split_binding")
     if reviewers is not None:
         lanes = load_frozen_lanes(
             protected_root,
@@ -608,9 +690,11 @@ def load_verified_ledger(
         records_by_lane=records_by_lane,
         queue_dir=queue_dir,
         frame_rows=frame_rows,
+        protected_root=protected_root,
+        split=split,
+        expected_split_digest=expected_split_digest,
         suggested_kind_by_sample=suggested_kind_by_sample,
         audit_outcome_record=stored.audit_outcome,
-        protected_root=protected_root,
     )
     if reverified.ledger.model_dump(mode="json") != stored.model_dump(mode="json"):
         raise ValueError("consensus_ledger_reverification_mismatch")

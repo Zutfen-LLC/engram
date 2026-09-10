@@ -7,6 +7,7 @@ FAIL, where mutually consistent fixtures previously made it look valid.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -70,8 +71,21 @@ GOOD_CRITICAL = {
 
 
 def _raw_bytes(slot: str, sample_id: str) -> bytes:
-    """Deterministic raw model output per (slot, sample)."""
-    return f"raw-model-output:{slot}:{sample_id}".encode()
+    """Deterministic raw model output per (slot, sample).
+
+    FIX-R4-2: the preserved bytes are strict-JSON responses carrying the
+    default judgment, so the frozen deterministic parser can re-derive the
+    stored judgment from them at freeze/load/verify time.
+    """
+    import json as _json
+
+    return _json.dumps(
+        {
+            "sample_id": sample_id,
+            "outcome": "judged",
+            "judgment": {"fields": dict(GOOD_CRITICAL), "reviewer_confidence": "medium"},
+        }
+    ).encode()
 
 
 def _raw_digest(slot: str, sample_id: str) -> str:
@@ -120,24 +134,65 @@ def _record(
     error_code: str | None = None,
     raw_digest: str | None = None,
 ) -> ModelReviewRecord:
+    from evals.calibration.consensus import ExecutionReceipt
+    from evals.calibration.reviewer_instructions import RESPONSE_PARSER_VERSION
+
     fam = family or FAMILY_BY_SLOT[slot]
     if raw_digest is None and parse_status != "absent":
-        raw_digest = _raw_digest(slot, sample_id)
+        # FIX-R4-2: digest over the exact bytes _publish_raw writes — a strict
+        # JSON response carrying THIS record's judgment.
+        import json as _json
+
+        if judgment is not None:
+            raw_digest = hashlib.sha256(
+                _json.dumps(
+                    {
+                        "sample_id": sample_id,
+                        "outcome": "judged",
+                        "judgment": {
+                            "fields": dict(judgment.fields),
+                            "reviewer_confidence": judgment.reviewer_confidence,
+                        },
+                    }
+                ).encode()
+            ).hexdigest()
+        else:
+            raw_digest = _raw_digest(slot, sample_id)
+    model_id = model or f"{FAMILY_BY_SLOT[slot]}-exact-2026-09"
+    config_digest = config or "a" * 64
+    prompt_value = prompt or labeling_instructions_digest()
+    campaign_value = campaign or "campaign"
+    execution = ExecutionReceipt(
+        campaign_id=campaign_value,
+        reviewer_slot=slot,  # type: ignore[arg-type]
+        reviewer_family=fam,
+        provider_model_identifier=model_id,
+        reviewer_config_digest=config_digest,
+        prompt_digest=prompt_value,
+        request_generation=1,
+        request_item_digest="d" * 64,
+        executed_at=NOW,
+        executor_status="provider_error" if outcome_status == "provider_error" else "completed",
+    )
     return ModelReviewRecord(
         protocol_version=protocol or CONSENSUS_PROTOCOL_VERSION,  # type: ignore[arg-type]
-        campaign_id=campaign or "campaign",
+        campaign_id=campaign_value,
         sampling_manifest_digest=sampling_digest or "e" * 64,
         source_packet_digest=packet_digest or "f" * 64,
         sample_id=sample_id,
         reviewer_slot=slot,  # type: ignore[arg-type]
         reviewer_family=fam,
-        provider_model_identifier=model or f"{FAMILY_BY_SLOT[slot]}-exact-2026-09",
-        reviewer_config_digest=config or "a" * 64,
-        prompt_digest=prompt or labeling_instructions_digest(),
+        provider_model_identifier=model_id,
+        reviewer_config_digest=config_digest,
+        prompt_digest=prompt_value,
         label_guide_version=guide or "engram-calibration-guide-157-v1",
         captured_at=NOW,
         parse_status=parse_status,  # type: ignore[arg-type]
         outcome_status=outcome_status,  # type: ignore[arg-type]
+        execution=execution,
+        request_generation=1,
+        request_item_digest="d" * 64,
+        parser_version=RESPONSE_PARSER_VERSION if parse_status == "parsed" else None,
         reviewer_confidence=judgment.reviewer_confidence if judgment else "unknown",
         judgment=judgment,
         raw_response_digest=raw_digest,  # type: ignore[arg-type]
@@ -146,10 +201,14 @@ def _record(
 
 
 def _sampling(ids: tuple[str, ...], *, campaign: str = "campaign") -> SamplingManifest:
+    from evals.calibration.freeze import protected_frame_digest
+
     return SamplingManifest(
         campaign_id=campaign,  # type: ignore[arg-type]
         target_identity_digest="1" * 64,
-        frame_digest="2" * 64,
+        # FIX-R4-3: derived from the actual frame rows so the canonical
+        # frozen-frame validator can verify them at the ledger boundary.
+        frame_digest=protected_frame_digest(list(_frame_rows(ids, variety=False).values())),
         snapshot_sha256="3" * 64,
         snapshot_as_of=NOW,
         sampling_seed="seed",
@@ -194,6 +253,44 @@ def _frame_rows(ids: tuple[str, ...], *, variety: bool = True) -> dict[str, Fram
             input_size_bucket="small",
         )
     return rows
+
+
+def _emit_request_batch(
+    protected_root: Path, slot: str, reviewer, ids: tuple[str, ...], *, generation: int = 1
+) -> None:
+    """FIX-R4-1 test scaffold: retain one immutable request-batch manifest.
+
+    Writes the same manifest structure ``LaneSession.emit_requests`` produces,
+    with request-item digests computed over canonical synthetic request lines,
+    so records built by ``_record`` (which bind generation 1) verify at freeze.
+    """
+    import hashlib as _hl
+
+    from evals.calibration.review import write_protected_file as _wpf
+
+    request_items = {}
+    for index, sid in enumerate(ids):
+        request_items[sid] = {
+            # The synthetic records built by ``_record`` bind ``"d" * 64`` as
+            # their request-item digest; the retained manifest agrees with the
+            # exact digest those records attest.
+            "request_item_digest": "d" * 64,
+            "case_index": index,
+        }
+    manifest = {
+        "lane_request_batch_schema": "engram-calibration-model-lane-request-batch-206-v2",
+        "generation": generation,
+        "reviewer_identity_digest": reviewer.lane_identity_digest(),
+        "neutral_packet_sha256": "8" * 64,
+        "accepted_record_digests": {},
+        "pending_sample_ids": list(ids),
+        "request_items": request_items,
+        "request_sha256": _hl.sha256(b"synthetic").hexdigest(),
+    }
+    _wpf(
+        protected_root / "lanes" / slot / f"lane-requests-{generation:06d}.manifest.json",
+        (json.dumps(manifest, sort_keys=True) + "\n").encode(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +394,7 @@ class TestFix1LaneBinding:
 
     def test_lane_freeze_rejects_mutated_record_after_freeze(self, tmp_path: Path):
         sampling, reviewer, _ = self._setup()
+        _emit_request_batch(tmp_path, "model_a", reviewer, self.IDS, generation=1)
         for sample_id in self.IDS:
             record = _record(
                 "model_a", sample_id, _judgment(), sampling_digest=sampling.manifest_digest()
@@ -667,11 +765,23 @@ def _build_campaign(
     escalate: bool = False,
     high_consequence_sample: str | None = None,
     audit_disagreement_sample: str | None = None,
+    target_identity: Any = None,
 ):
     """Materialize a full synthetic campaign: lanes, queue, resolutions."""
 
-    sampling = _sampling(ids)
     frame_rows = _frame_rows(ids)
+    sampling = _sampling(ids)
+    if target_identity is not None:
+        # FIX-R4-5: Stage-A evidence verification requires the sampling's
+        # target-identity digest to equal the evidence target identity.
+        sampling = sampling.model_copy(
+            update={"target_identity_digest": target_identity.identity_digest()}
+        )
+    # FIX-R4-3: the sampling's frame digest must bind the EXACT campaign frame
+    # (variety rows), so the canonical frozen-frame validator passes.
+    from evals.calibration.freeze import protected_frame_digest as _pfd
+
+    sampling = sampling.model_copy(update={"frame_digest": _pfd(list(frame_rows.values()))})
     records_by_lane = {slot: {} for slot in REVIEWER_SLOTS}
     reviewers = {slot: _reviewer(slot) for slot in REVIEWER_SLOTS}
     lanes = []
@@ -732,6 +842,9 @@ def _build_campaign(
     )
     # publish lanes to the protected root with bound raw evidence, then freeze
     for slot in REVIEWER_SLOTS:
+        # FIX-R4-1: retain one immutable request-batch manifest per lane so
+        # freeze's request-binding verification has real evidence.
+        _emit_request_batch(tmp_path, slot, reviewers[slot], ids, generation=1)
         for sid in ids:
             record = records_by_lane[slot][sid]
             _publish_raw(tmp_path, slot, record)
@@ -802,14 +915,32 @@ def _build_campaign(
 
 
 def _publish_raw(protected_root: Path, slot: str, record: ModelReviewRecord) -> None:
-    """Write the raw evidence bytes a record claims (test-side ingestion)."""
+    """Write the raw evidence bytes a record claims (test-side ingestion).
+
+    FIX-R4-2: the bytes carry the RECORD's own judgment so the frozen parser
+    re-derives exactly what the record stores.
+    """
     if record.raw_response_digest is None:
         return  # provider_error: no bytes
     from evals.calibration.review import write_protected_file
 
+    payload = _raw_bytes(slot, record.sample_id)
+    if record.judgment is not None:
+        import json as _json
+
+        payload = _json.dumps(
+            {
+                "sample_id": record.sample_id,
+                "outcome": "judged",
+                "judgment": {
+                    "fields": dict(record.judgment.fields),
+                    "reviewer_confidence": record.judgment.reviewer_confidence,
+                },
+            }
+        ).encode()
     write_protected_file(
         protected_root / "lanes" / slot / "raw" / f"{record.sample_id}.resp",
-        _raw_bytes(slot, record.sample_id),
+        payload,
     )
 
 
@@ -829,7 +960,7 @@ def _audit_outcome_record(
 class TestFix4VerifiedLedger:
     IDS = tuple(f"s{i}" for i in range(20))
 
-    def _verify(self, tmp_path, campaign, *, escalate=False, supplied_outcome=None):
+    def _verify(self, tmp_path, campaign, *, escalate=False, supplied_outcome=None, split=None):
         from evals.calibration.ledger import verify_consensus_ledger
 
         return verify_consensus_ledger(
@@ -842,6 +973,8 @@ class TestFix4VerifiedLedger:
             frame_rows=campaign["frame_rows"],
             audit_outcome_record=supplied_outcome,
             protected_root=tmp_path,
+            split=split,
+            expected_split_digest=split.split_digest() if split is not None else None,
         )
 
     def test_verified_ledger_derives_expected_origins(self, tmp_path: Path):
@@ -956,31 +1089,54 @@ class TestFix4VerifiedLedger:
         from engram.assessment_schema import AssessmentContract
         from evals.calibration.fit import consensus_reference_observations
         from tests.test_calibration_206_helpers import (
-            build_frame_rows,
             build_identity,
-            build_receipts,
             build_split,
+            write_assessment_evidence,
         )
 
-        campaign = _build_campaign(tmp_path, ids=tuple(f"s{i}" for i in range(3)))
-        verified = self._verify(tmp_path, campaign)
         identity = build_identity()
+        # FIX-R4-5: Stage A requires sampling.target_identity_digest == the
+        # evidence target identity — build the campaign against that identity
+        # from the start (post-freeze mutation would break lane bindings).
+        campaign = _build_campaign(
+            tmp_path, ids=tuple(f"s{i}" for i in range(3)), target_identity=identity
+        )
+        verified = self._verify(tmp_path, campaign)
         contract = AssessmentContract(
             provider="openai",
             model="model",
             config_version="sha256:" + "9" * 64,
             calibration_version="dataset-v2",
         )
-        frame = build_frame_rows(("s0", "s1", "s2"))
-        split = build_split(("s0", "s1", "s2"), dev=("s0", "s1"), holdout=("s2",))
-        receipts = build_receipts(("s0", "s1", "s2"), frame, identity, contract)
+        # FIX-R4-5: the evidence frame must BE the campaign's frozen frame.
+        frame = list(campaign["frame_rows"].values())
+        # FIX-R4-4/R4-5: bind the campaign's split into the verified ledger and
+        # verify the protected assessment evidence through the Stage-A contract.
+        split = build_split(("s0", "s1", "s2"), dev=("s0", "s1"), holdout=("s2",)).model_copy(
+            update={
+                "campaign_id": campaign["sampling"].campaign_id,
+                "sampling_manifest_digest": campaign["sampling"].manifest_digest(),
+            }
+        )
+        evidence_path, evidence_sha = write_assessment_evidence(
+            tmp_path,
+            ("s0", "s1", "s2"),
+            frame,
+            identity,
+            contract,
+            campaign["sampling"],
+        )
+        verified = self._verify(tmp_path, campaign, split=split)
         observations = consensus_reference_observations(
-            receipts=receipts,
+            assessment_evidence_path=evidence_path,
+            expected_assessment_evidence_sha256=evidence_sha,
             verified_ledger=verified,
+            sampling=campaign["sampling"],
             target_identity=identity,
             contract=contract,
             split=split,
             frame=frame,
+            expected_split_digest=split.split_digest(),
         )
         assert len(observations) == 9  # 3 samples x 3 dimensions
 
@@ -1456,13 +1612,35 @@ class TestFix6LaneWorkflow:
         )
         return path, manifest_path
 
-    def _judged_response(self, sample_id: str) -> dict:
-        return {
+    def _judged_response(self, sample_id: str, lane_root: Path | None = None) -> dict:
+        from evals.calibration.ingestion import build_execution_receipt
+
+        raw = json.dumps(
+            {
+                "sample_id": sample_id,
+                "outcome": "judged",
+                "judgment": {"fields": dict(GOOD_CRITICAL), "reviewer_confidence": "medium"},
+            }
+        )
+        payload: dict[str, Any] = {
             "sample_id": sample_id,
             "outcome": "judged",
-            "judgment": {"fields": dict(GOOD_CRITICAL), "reviewer_confidence": "medium"},
-            "raw_response": f"model output for {sample_id}",
+            "raw_response": raw,
         }
+        if lane_root is not None:
+            receipt = build_execution_receipt(
+                lane_root,
+                self._session_reviewer(),
+                sample_id,
+                request_generation=1,
+                campaign_id="campaign",
+                executor_status="completed",
+            )
+            payload["execution"] = json.loads(json.dumps(receipt.model_dump(mode="json")))
+        return payload
+
+    def _session_reviewer(self):
+        return _reviewer("model_a")
 
     def test_init_binds_lane_exclusively(self, tmp_path: Path):
         session, _, packet_path, manifest_path = self._init_lane(tmp_path)
@@ -1482,20 +1660,27 @@ class TestFix6LaneWorkflow:
     def test_requests_resume_from_next_missing(self, tmp_path: Path):
 
         session, sampling, packet_path, manifest_path = self._init_lane(tmp_path)
-        # ingest one record first
-        session.ingest_response(self._judged_response("s1"), sampling=sampling)
+        # FIX-R4-1: emit first so the response can bind to an actual request.
+        session.emit_requests(packet_path, sampling=sampling, manifest_path=manifest_path)
+        lane_root = tmp_path / "lanes" / "model_a"
+        session.ingest_response(self._judged_response("s1", lane_root), sampling=sampling)
         path = session.emit_requests(packet_path, sampling=sampling, manifest_path=manifest_path)
         lines = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
         assert [line["sample_id"] for line in lines] == ["s2", "s3"]  # s1 skipped
-        assert path.name == "lane-requests-000001.jsonl"  # FIX-R3-6 first generation
+        # FIX-R4-1: the post-ingest emission is the SECOND immutable generation
+        assert path.name == "lane-requests-000002.jsonl"
         # requests carry lane identity + labeling instructions only
         assert set(lines[0]) >= {"reviewer_slot", "labeling_instructions", "case"}
         assert lines[0]["reviewer_slot"] == "model_a"
 
     def test_batch_ingestion_and_duplicate_refusal(self, tmp_path: Path):
         session, sampling, packet_path, manifest_path = self._init_lane(tmp_path)
+        session.emit_requests(packet_path, sampling=sampling, manifest_path=manifest_path)
+        lane_root = tmp_path / "lanes" / "model_a"
         responses_file = tmp_path / "responses.jsonl"
-        payload = "\n".join(json.dumps(self._judged_response(sid)) for sid in ("s1", "s2"))
+        payload = "\n".join(
+            json.dumps(self._judged_response(sid, lane_root)) for sid in ("s1", "s2")
+        )
         responses_file.write_text(payload + "\n")
         result = session.ingest_jsonl(responses_file, sampling=sampling)
         assert result["accepted_total"] == 2
@@ -1509,7 +1694,9 @@ class TestFix6LaneWorkflow:
         import hashlib
 
         session, sampling, packet_path, manifest_path = self._init_lane(tmp_path)
-        record = session.ingest_response(self._judged_response("s1"), sampling=sampling)
+        session.emit_requests(packet_path, sampling=sampling, manifest_path=manifest_path)
+        lane_root = tmp_path / "lanes" / "model_a"
+        record = session.ingest_response(self._judged_response("s1", lane_root), sampling=sampling)
         raw = (tmp_path / "lanes" / "model_a" / "raw" / "s1.resp").read_bytes()
         assert record.raw_response_digest == hashlib.sha256(raw).hexdigest()
 
@@ -1526,11 +1713,29 @@ class TestFix6LaneWorkflow:
 
     def test_failure_semantics_distinct(self, tmp_path: Path):
         session, sampling, packet_path, manifest_path = self._init_lane(tmp_path)
+        session.emit_requests(packet_path, sampling=sampling, manifest_path=manifest_path)
+        lane_root = tmp_path / "lanes" / "model_a"
+        from evals.calibration.ingestion import build_execution_receipt
+
+        def receipt(sid: str, status: str = "completed") -> dict:
+            value = build_execution_receipt(
+                lane_root,
+                session.reviewer,
+                sid,
+                request_generation=1,
+                campaign_id="campaign",
+                executor_status=status,  # type: ignore[arg-type]
+            )
+            return json.loads(json.dumps(value.model_dump(mode="json")))
+
+        # FIX-R4-2: a refusal must be carried by the response BYTES
         refused = {
             "sample_id": "s1",
             "outcome": "refused",
-            "raw_response": "I cannot judge this",
-            "error_code": "refusal",
+            "raw_response": json.dumps(
+                {"sample_id": "s1", "outcome": "refused", "error_code": "refusal"}
+            ),
+            "execution": receipt("s1"),
         }
         record = session.ingest_response(refused, sampling=sampling)
         assert record.outcome_status == "refused"
@@ -1540,6 +1745,7 @@ class TestFix6LaneWorkflow:
             "outcome": "malformed",
             "raw_response": "garbage not json",
             "error_code": "schema-parse-failed",
+            "execution": receipt("s2"),
         }
         record = session.ingest_response(malformed, sampling=sampling)
         assert record.outcome_status == "malformed"
@@ -1548,6 +1754,7 @@ class TestFix6LaneWorkflow:
             "sample_id": "s3",
             "outcome": "provider_error",
             "error_code": "http-503",
+            "execution": receipt("s3", "provider_error"),
         }
         record = session.ingest_response(provider_error, sampling=sampling)
         assert record.outcome_status == "provider_error"
@@ -1563,12 +1770,19 @@ class TestFix6LaneWorkflow:
             neutral_packet_path=packet_path,
             neutral_packet_manifest=manifest_path,
         )
-        judged = session2.ingest_response(self._judged_response("s1"), sampling=sampling)
+        session2.emit_requests(packet_path, sampling=sampling, manifest_path=manifest_path)
+        judged = session2.ingest_response(
+            self._judged_response("s1", tmp_path / "lanes2" / "lanes" / "model_a"),
+            sampling=sampling,
+        )
         assert judged.parse_status == "parsed" and judged.outcome_status == "judged"
 
     def test_status_counts(self, tmp_path: Path):
         session, sampling, packet_path, manifest_path = self._init_lane(tmp_path)
-        session.ingest_response(self._judged_response("s1"), sampling=sampling)
+        session.emit_requests(packet_path, sampling=sampling, manifest_path=manifest_path)
+        session.ingest_response(
+            self._judged_response("s1", tmp_path / "lanes" / "model_a"), sampling=sampling
+        )
         status = session.status(sampling)
         assert status["accepted"] == 1
         assert status["missing"] == 2
@@ -1576,11 +1790,13 @@ class TestFix6LaneWorkflow:
 
     def test_exact_membership_required_to_freeze(self, tmp_path: Path):
         session, sampling, packet_path, manifest_path = self._init_lane(tmp_path)
-        session.ingest_response(self._judged_response("s1"), sampling=sampling)
+        session.emit_requests(packet_path, sampling=sampling, manifest_path=manifest_path)
+        lane_root = tmp_path / "lanes" / "model_a"
+        session.ingest_response(self._judged_response("s1", lane_root), sampling=sampling)
         with pytest.raises(ValueError, match="lane_sample_membership_mismatch"):
             session.freeze(sampling)
         for sid in ("s2", "s3"):
-            session.ingest_response(self._judged_response(sid), sampling=sampling)
+            session.ingest_response(self._judged_response(sid, lane_root), sampling=sampling)
         lane = session.freeze(sampling)
         assert tuple(lane.sample_ids) == self.IDS
 
@@ -1760,6 +1976,7 @@ class TestFixR2RawEvidence:
     def _build_lane(self, tmp_path: Path):
         sampling = _sampling(self.IDS)
         reviewer = _reviewer("model_a")
+        _emit_request_batch(tmp_path, "model_a", reviewer, self.IDS, generation=1)
         for sid in self.IDS:
             record = _record(
                 "model_a", sid, _judgment(), sampling_digest=sampling.manifest_digest()
@@ -1828,6 +2045,7 @@ class TestFixR2RawEvidence:
 
         sampling = _sampling(self.IDS)
         reviewer = _reviewer("model_a")
+        _emit_request_batch(tmp_path, "model_a", reviewer, self.IDS, generation=1)
         for sid in self.IDS:
             if sid == "s2":
                 record = _record(
@@ -1861,6 +2079,7 @@ class TestFixR2RawEvidence:
     def test_provider_error_with_raw_artifact_fails(self, tmp_path: Path):
         sampling = _sampling(self.IDS)
         reviewer = _reviewer("model_a")
+        _emit_request_batch(tmp_path, "model_a", reviewer, self.IDS, generation=1)
         for sid in self.IDS:
             if sid == "s2":
                 record = _record(
@@ -1898,36 +2117,70 @@ class TestFixR2RawEvidence:
 
     def test_crash_orphan_raw_file_not_a_completed_review(self, tmp_path: Path):
         # simulate: raw bytes written, then crash before record publication
-        session, sampling = self._init_session(tmp_path)
+        session, sampling, packet_path, manifest_path = self._init_session(tmp_path)
         from evals.calibration.review import write_protected_file
 
-        write_protected_file(
-            tmp_path / "lanes" / "model_a" / "raw" / "s1.resp",
-            b"orphan raw output",
-        )
         status = session.status(sampling)
         assert status["accepted"] == 0  # orphan never counts as completed review
         assert status["missing"] == 3
-        # resume safely: ingesting the identical response reuses the orphan
-        record = session.ingest_response(
+        # resume safely: ingesting the identical response reuses the orphan.
+        # FIX-R4-1/2: the orphan must BE the parseable response bytes, and the
+        # response must carry a truthful execution receipt for an emitted request.
+        from evals.calibration.ingestion import build_execution_receipt
+
+        session.emit_requests(packet_path, sampling=sampling, manifest_path=manifest_path)
+        orphan_payload = json.dumps(
             {
                 "sample_id": "s1",
                 "outcome": "judged",
                 "judgment": {"fields": dict(GOOD_CRITICAL), "reviewer_confidence": "medium"},
-                "raw_response": "orphan raw output",
+            }
+        ).encode()
+        write_protected_file(tmp_path / "lanes" / "model_a" / "raw" / "s1.resp", orphan_payload)
+        receipt = build_execution_receipt(
+            tmp_path / "lanes" / "model_a",
+            session.reviewer,
+            "s1",
+            request_generation=1,
+            campaign_id="campaign",
+            executor_status="completed",
+        )
+        record = session.ingest_response(
+            {
+                "sample_id": "s1",
+                "outcome": "judged",
+                "raw_response": orphan_payload.decode(),
+                "execution": json.loads(json.dumps(receipt.model_dump(mode="json"))),
             },
             sampling=sampling,
         )
         assert record.raw_response_digest is not None
         # a DIFFERENT response for the same orphaned sample is refused (never
         # silently overwrite raw model evidence)
+        conflict_receipt = build_execution_receipt(
+            tmp_path / "lanes" / "model_a",
+            session.reviewer,
+            "s1",
+            request_generation=1,
+            campaign_id="campaign",
+            executor_status="completed",
+        )
         with pytest.raises(ValueError, match="raw_response_orphan_digest_conflict"):
             session.ingest_response(
                 {
                     "sample_id": "s1",
-                    "outcome": "refused",
-                    "raw_response": "different bytes entirely",
-                    "error_code": "refusal",
+                    "outcome": "judged",
+                    "raw_response": json.dumps(
+                        {
+                            "sample_id": "s1",
+                            "outcome": "judged",
+                            "judgment": {
+                                "fields": dict(GOOD_CRITICAL, expected_kind="decision"),
+                                "reviewer_confidence": "medium",
+                            },
+                        }
+                    ),
+                    "execution": json.loads(json.dumps(conflict_receipt.model_dump(mode="json"))),
                 },
                 sampling=sampling,
             )
@@ -1988,7 +2241,7 @@ class TestFixR2RawEvidence:
             neutral_packet_path=packet_path,
             neutral_packet_manifest=manifest_path,
         )
-        return session, sampling
+        return session, sampling, packet_path, manifest_path
 
 
 class TestFixR2GreedyCoverage:

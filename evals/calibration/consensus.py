@@ -58,8 +58,8 @@ from evals.calibration.freeze import (
 CONSENSUS_PROTOCOL_VERSION: Literal["eng-calibration-consensus-206-v1"] = (
     "eng-calibration-consensus-206-v1"
 )
-MODEL_REVIEW_SCHEMA: Literal["engram-calibration-model-review-206-v1"] = (
-    "engram-calibration-model-review-206-v1"
+MODEL_REVIEW_SCHEMA: Literal["engram-calibration-model-review-206-v2"] = (
+    "engram-calibration-model-review-206-v2"
 )
 CORRELATION_REPORT_SCHEMA: Literal["engram-calibration-correlation-206-v1"] = (
     "engram-calibration-correlation-206-v1"
@@ -240,6 +240,47 @@ class ModelJudgment(Record):
         return {name: self.fields[name] for name in CRITICAL_FIELDS}
 
 
+class ExecutionReceipt(Record):
+    """FIX-R4-1: immutable proof of which executor actually produced a response.
+
+    Reported by the execution wrapper per response — NOT derived from the
+    lane configuration. Every field is compared for exact equality against
+    the frozen ``ReviewerIdentity`` at ingestion, freeze, load, and final
+    ledger verification, so a response produced by any other provider, model
+    version, configuration, or prompt can never be accepted into this lane.
+
+    ``request_binding`` additionally ties the response to one exact emitted
+    request item: the immutable batch generation and the canonical digest of
+    the emitted request item (see ``request_item_digest`` in
+    ``evals.calibration.ingestion``). Provider-error responses reference the
+    attempted request the same way.
+    """
+
+    receipt_schema: Literal["engram-calibration-execution-receipt-206-v1"] = (
+        "engram-calibration-execution-receipt-206-v1"
+    )
+    campaign_id: str
+    reviewer_slot: SlotName
+    reviewer_family: str
+    provider_model_identifier: ModelIdentifier
+    reviewer_config_digest: Digest
+    prompt_digest: Digest
+    request_generation: int = Field(ge=1)
+    request_item_digest: Digest
+    executed_at: AwareDatetime
+    executor_status: Literal["completed", "provider_error"]
+
+    def matches_reviewer_identity(self, reviewer: ReviewerIdentity, campaign_id: str) -> bool:
+        return (
+            self.campaign_id == campaign_id
+            and self.reviewer_slot == reviewer.reviewer_slot
+            and self.reviewer_family == reviewer.reviewer_family
+            and self.provider_model_identifier == reviewer.provider_model_identifier
+            and self.reviewer_config_digest == reviewer.reviewer_config_digest
+            and self.prompt_digest == reviewer.prompt_digest
+        )
+
+
 class ModelReviewRecord(Record):
     """One reviewer's first-pass artifact for one sample.
 
@@ -256,9 +297,26 @@ class ModelReviewRecord(Record):
       response digest required; error code required.
     - ``(absent, provider_error)``: NO response bytes; raw response digest
       must be ``None``; error code required.
+
+    FIX-R4-1 (execution provenance): the record carries an immutable
+    execution receipt binding the response to an ACTUAL emitted request item
+    and the ACTUAL executor identity reported by the execution wrapper —
+    never merely the lane configuration:
+
+    - ``execution``: the actual provider/model/config identity that claims to
+      have produced the response (compared exactly against the frozen
+      ``ReviewerIdentity`` at ingestion/freeze/load/verify);
+    - ``request_generation`` / ``request_item_digest``: the immutable request
+      batch generation and the canonical digest of the exact emitted request
+      item this response answers.
+
+    FIX-R4-2 (derivation provenance): for parsed judgments the stored
+    ``judgment`` must be derived by the frozen deterministic parser from the
+    exact preserved response bytes; ``parser_version`` records the frozen
+    parser identity and is required exactly on parsed records.
     """
 
-    review_schema: Literal["engram-calibration-model-review-206-v1"] = MODEL_REVIEW_SCHEMA
+    review_schema: Literal["engram-calibration-model-review-206-v2"] = MODEL_REVIEW_SCHEMA
     protocol_version: str
     campaign_id: str
     sampling_manifest_digest: str
@@ -273,6 +331,10 @@ class ModelReviewRecord(Record):
     captured_at: AwareDatetime
     parse_status: ParseStatus
     outcome_status: OutcomeStatus
+    execution: ExecutionReceipt | None = None
+    request_generation: int | None = None
+    request_item_digest: Digest | None = None
+    parser_version: str | None = None
     reviewer_confidence: Literal["low", "medium", "high", "unknown"] = "unknown"
     judgment: ModelJudgment | None = None
     raw_response_digest: Digest | None = None
@@ -286,6 +348,10 @@ class ModelReviewRecord(Record):
             raise ValueError("reviewer_family_does_not_match_frozen_slot")
         if self.label_guide_version != LABEL_GUIDE_VERSION:
             raise ValueError("label_guide_version_mismatch")
+        if self.execution is None or self.request_generation is None:
+            raise ValueError("model_review_record_requires_execution_receipt")
+        if self.request_item_digest is None:
+            raise ValueError("model_review_record_requires_request_item_digest")
         if self.parse_status == "parsed":
             if self.outcome_status != "judged":
                 raise ValueError("parsed_review_requires_judged_outcome")
@@ -297,25 +363,32 @@ class ModelReviewRecord(Record):
                 raise ValueError("reviewer_confidence_must_match_judgment")
             if self.raw_response_digest is None:
                 raise ValueError("parsed_review_requires_raw_response_digest")
-        elif self.parse_status == "malformed":
-            # Response bytes exist (refusal or unparseable output).
-            if self.outcome_status not in ("refused", "malformed"):
-                raise ValueError("malformed_response_requires_refused_or_malformed_outcome")
-            if self.judgment is not None:
-                raise ValueError("unparseable_review_must_not_carry_judgment")
-            if self.error_code is None:
-                raise ValueError("failed_review_requires_error_code")
-            if self.raw_response_digest is None:
-                raise ValueError("response_received_requires_raw_response_digest")
-        else:  # absent: provider execution failed, no response bytes
-            if self.outcome_status != "provider_error":
-                raise ValueError("absent_response_requires_provider_error_outcome")
-            if self.judgment is not None:
-                raise ValueError("provider_error_must_not_carry_judgment")
-            if self.error_code is None:
-                raise ValueError("failed_review_requires_error_code")
-            if self.raw_response_digest is not None:
-                raise ValueError("provider_error_without_response_must_not_carry_digest")
+            from evals.calibration.reviewer_instructions import RESPONSE_PARSER_VERSION
+
+            if self.parser_version != RESPONSE_PARSER_VERSION:
+                raise ValueError("parsed_review_requires_frozen_parser_version")
+        else:
+            if self.parser_version is not None:
+                raise ValueError("unparsed_review_must_not_carry_parser_version")
+            if self.parse_status == "malformed":
+                # Response bytes exist (refusal or unparseable output).
+                if self.outcome_status not in ("refused", "malformed"):
+                    raise ValueError("malformed_response_requires_refused_or_malformed_outcome")
+                if self.judgment is not None:
+                    raise ValueError("unparseable_review_must_not_carry_judgment")
+                if self.error_code is None:
+                    raise ValueError("failed_review_requires_error_code")
+                if self.raw_response_digest is None:
+                    raise ValueError("response_received_requires_raw_response_digest")
+            else:  # absent: provider execution failed, no response bytes
+                if self.outcome_status != "provider_error":
+                    raise ValueError("absent_response_requires_provider_error_outcome")
+                if self.judgment is not None:
+                    raise ValueError("provider_error_must_not_carry_judgment")
+                if self.error_code is None:
+                    raise ValueError("failed_review_requires_error_code")
+                if self.raw_response_digest is not None:
+                    raise ValueError("provider_error_without_response_must_not_carry_digest")
         return self
 
     def record_digest(self) -> Digest:
@@ -977,6 +1050,12 @@ class ConsensusLedger(Record):
     campaign_id: str
     sampling_manifest_digest: str
     source_packet_digest: str
+    # FIX-R4-4: the exact frozen dev/holdout split the ledger was verified
+    # against (verified against the INDEPENDENTLY retained campaign-authority
+    # digest, never derived from a caller-supplied split). Required by the
+    # fitting/floor front doors; optional only for pre-fitting campaign
+    # inspection paths that never feed calibration.
+    split_manifest_digest: str | None = None
     lane_digests: tuple[Digest, ...]  # exactly three, slot order
     queue_evidence_sha256: str
     audit_outcome: AuditOutcomeRecord

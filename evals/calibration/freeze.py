@@ -7,10 +7,12 @@ Sampling uses recorded decision-time state and never provider output or labels.
 
 from __future__ import annotations
 
+import json
 import re
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime
+from pathlib import Path
 from typing import Annotated, Any, Literal, Self
 
 from pydantic import AwareDatetime, Field, model_validator
@@ -131,6 +133,62 @@ def protected_frame_digest(frame: list[FrameRow]) -> Digest:
             key=lambda row: str(row["sample_id"] or sample_id_for(str(row["item_uuid"]))),
         )
     )
+
+
+def verify_frozen_frame(
+    frame_rows: Mapping[str, FrameRow], sampling: SamplingManifest
+) -> dict[str, FrameRow]:
+    """FIX-R4-3: canonical frozen-frame validator at the authority boundary.
+
+    Proves a caller-supplied ``sample_id -> FrameRow`` mapping IS the frozen
+    frame before any frame metadata may influence audit selection or
+    calibration strata:
+
+    - exact sampled membership (no missing, no extra IDs);
+    - no duplicate IDs (a mapping enforces uniqueness, but the input list
+      form is checked by callers through ``load_frozen_frame_rows``);
+    - frozen order reconstructed correctly (output ordered by the frozen
+      ``sampling.sample_ids`` sequence);
+    - ``protected_frame_digest(ordered rows) == sampling.frame_digest`` —
+      any altered source type / kind / review status / age bucket /
+      content hash changes the digest and fails here;
+    - each ``FrameRow.content_hash == SamplingManifest.sample_hash`` for
+      that sample.
+
+    Only the returned, verified mapping may feed audit selection. Used by
+    ``verify_consensus_ledger`` / ``load_verified_ledger`` (never trusting
+    the CLI to have validated the frame beforehand) and by the campaign CLI
+    loader.
+    """
+    if set(frame_rows) != set(sampling.sample_ids):
+        raise ValueError("frame_membership_mismatch")
+    ordered = [frame_rows[sid] for sid in sampling.sample_ids]
+    if protected_frame_digest(ordered) != sampling.frame_digest:
+        raise ValueError("frame_digest_mismatch")
+    expected_hashes = dict(zip(sampling.sample_ids, sampling.sample_hashes, strict=True))
+    for sid in sampling.sample_ids:
+        if frame_rows[sid].content_hash != expected_hashes[sid]:
+            raise ValueError(f"frame_content_hash_mismatch:{sid}")
+    return {sid: frame_rows[sid] for sid in sampling.sample_ids}
+
+
+def load_frozen_frame_rows(frame_path: Path, sampling: SamplingManifest) -> dict[str, FrameRow]:
+    """Load a protected frame file and verify it IS the frozen frame.
+
+    Rejects duplicate sampled IDs and partial mappings before delegating to
+    the canonical ``verify_frozen_frame`` validator.
+    """
+    rows = [FrameRow.model_validate(row) for row in json.loads(Path(frame_path).read_text())]
+    by_id: dict[str, FrameRow] = {}
+    duplicate_ids: set[str] = set()
+    for row in rows:
+        key = row.sample_id or sample_id_for(row.item_uuid)
+        if key in by_id:
+            duplicate_ids.add(key)
+        by_id[key] = row
+    if duplicate_ids:
+        raise ValueError("frame_contains_duplicate_sampled_ids")
+    return verify_frozen_frame(by_id, sampling)
 
 
 class SamplingManifest(Record):

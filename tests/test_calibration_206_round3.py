@@ -50,7 +50,6 @@ from evals.calibration.review import _packet_file_payload, write_protected_file
 from tests.test_calibration_206_helpers import (
     build_frame_rows,
     build_identity,
-    build_receipts,
     build_split,
     build_verified_ledger,
 )
@@ -68,10 +67,14 @@ NEUTRAL_SHA = "8" * 64
 
 
 def _sampling(ids: tuple[str, ...], *, campaign: str = "campaign") -> SamplingManifest:
+    from evals.calibration.freeze import protected_frame_digest
+
     return SamplingManifest(
         campaign_id=campaign,  # type: ignore[arg-type]
         target_identity_digest=build_identity().identity_digest(),
-        frame_digest="2" * 64,
+        # FIX-R4-3: the frozen frame digest is DERIVED from the actual frame
+        # rows so the canonical frozen-frame validator can verify them.
+        frame_digest=protected_frame_digest(list(_frame_rows(ids).values())),
         snapshot_sha256="3" * 64,
         snapshot_as_of=NOW,
         sampling_seed="seed",
@@ -97,8 +100,24 @@ def _reviewer(slot: str) -> ReviewerIdentity:
 
 
 def _record(slot: str, sample_id: str, judgment: ModelJudgment | None) -> ModelReviewRecord:
+    from evals.calibration.consensus import ExecutionReceipt
+    from evals.calibration.reviewer_instructions import RESPONSE_PARSER_VERSION
+
     fam = FAMILY_BY_SLOT[slot]
-    raw = f"raw-model-output:{slot}:{sample_id}".encode()
+    fields = dict(judgment.fields) if judgment is not None else dict(GOOD_CRITICAL)
+    raw = _raw_response_json(sample_id, fields).encode()
+    execution = ExecutionReceipt(
+        campaign_id="campaign",
+        reviewer_slot=slot,  # type: ignore[arg-type]
+        reviewer_family=fam,
+        provider_model_identifier=f"{fam}-exact-2026-09",
+        reviewer_config_digest="a" * 64,
+        prompt_digest=labeling_instructions_digest(),
+        request_generation=1,
+        request_item_digest="d" * 64,
+        executed_at=NOW,
+        executor_status="completed",
+    )
     return ModelReviewRecord(
         protocol_version=CONSENSUS_PROTOCOL_VERSION,
         campaign_id="campaign",
@@ -114,6 +133,10 @@ def _record(slot: str, sample_id: str, judgment: ModelJudgment | None) -> ModelR
         captured_at=NOW,
         parse_status="parsed",
         outcome_status="judged",
+        execution=execution,
+        request_generation=1,
+        request_item_digest="d" * 64,
+        parser_version=RESPONSE_PARSER_VERSION,
         reviewer_confidence=judgment.reviewer_confidence if judgment else "unknown",
         judgment=judgment,
         raw_response_digest=hashlib.sha256(raw).hexdigest(),
@@ -129,13 +152,6 @@ def _judgment(**overrides: Any) -> ModelJudgment:
 
 def _frame_rows(ids: tuple[str, ...]) -> dict[str, FrameRow]:
     return {str(row.sample_id): row for row in build_frame_rows(ids)}
-
-
-def _publish_raw(protected_root: Path, slot: str, sample_id: str) -> None:
-    write_protected_file(
-        protected_root / "lanes" / slot / "raw" / f"{sample_id}.resp",
-        f"raw-model-output:{slot}:{sample_id}".encode(),
-    )
 
 
 def _neutral_packet_files(
@@ -201,7 +217,13 @@ def _materialize_campaign(
     adjudicate_ids: frozenset[str] = frozenset(),
     audit_override_ids: frozenset[str] = frozenset(),
 ):
-    """Full synthetic campaign through the REAL ingestion/freeze/verify path."""
+    """Full synthetic campaign through the REAL ingestion/freeze/verify path.
+
+    FIX-R4-1/R4-2: requests are EMITTED first (creating immutable batch
+    manifests), then responses are ingested with truthful execution
+    receipts, and the raw bytes are strict-JSON responses carrying the
+    judgment (the stored judgment is derived from them by the parser).
+    """
     sampling = _sampling(ids)
     frame_rows = _frame_rows(ids)
     packet_path, manifest_path = _neutral_packet_files(tmp_path, sampling, ids)
@@ -218,6 +240,8 @@ def _materialize_campaign(
             neutral_packet_manifest=manifest_path,
         )
         sessions[slot] = session
+        session.emit_requests(packet_path, sampling=sampling, manifest_path=manifest_path)
+        lane_root = tmp_path / "lanes" / slot
         for sid in ids:
             fields = dict(GOOD_CRITICAL)
             if sid in adjudicate_ids and slot == "model_b":
@@ -226,13 +250,19 @@ def _materialize_campaign(
                 {
                     "sample_id": sid,
                     "outcome": "judged",
-                    "judgment": {"fields": fields, "reviewer_confidence": "medium"},
-                    "raw_response": f"raw-model-output:{slot}:{sid}",
+                    "raw_response": _raw_response_json(sid, fields),
+                    "execution": json.loads(
+                        json.dumps(
+                            _truthful_receipt(lane_root, _reviewer(slot), sid).model_dump(
+                                mode="json"
+                            )
+                        )
+                    ),
                 },
                 sampling=sampling,
             )
             records_by_lane[slot][sid] = record
-            _publish_raw(tmp_path, slot, sid)
+            _publish_raw(tmp_path, slot, sid, fields)
             append_review_record(record, tmp_path)
     lanes = tuple(
         freeze_lane(
@@ -244,6 +274,16 @@ def _materialize_campaign(
         )
         for slot in REVIEWER_SLOTS
     )
+    # FIX-R4-4 (synthetic campaigns): a canonical split retained INDEPENDENTLY
+    # of any later verification call, with its expected digest precomputed.
+    canonical_split = build_split(
+        ids, dev=ids[: max(1, len(ids) // 2)], holdout=ids[max(1, len(ids) // 2) :]
+    ).model_copy(
+        update={
+            "campaign_id": "campaign",
+            "sampling_manifest_digest": sampling.manifest_digest(),
+        }
+    )
     return {
         "sampling": sampling,
         "frame_rows": frame_rows,
@@ -252,7 +292,40 @@ def _materialize_campaign(
         "packet_path": packet_path,
         "manifest_path": manifest_path,
         "sessions": sessions,
+        "canonical_split": canonical_split,
+        "expected_split_digest": canonical_split.split_digest(),
     }
+
+
+def _raw_response_json(sample_id: str, fields: dict[str, Any]) -> str:
+    return json.dumps(
+        {
+            "sample_id": sample_id,
+            "outcome": "judged",
+            "judgment": {"fields": dict(fields), "reviewer_confidence": "medium"},
+        }
+    )
+
+
+def _truthful_receipt(lane_root: Path, reviewer, sample_id: str):
+    from evals.calibration.ingestion import build_execution_receipt
+
+    return build_execution_receipt(
+        lane_root,
+        reviewer,
+        sample_id,
+        request_generation=1,
+        campaign_id="campaign",
+        executor_status="completed",
+        executed_at=NOW,
+    )
+
+
+def _publish_raw(
+    protected_root: Path, slot: str, sample_id: str, fields: dict[str, Any] | None = None
+) -> None:
+    payload = _raw_response_json(sample_id, fields or dict(GOOD_CRITICAL)).encode()
+    write_protected_file(protected_root / "lanes" / slot / "raw" / f"{sample_id}.resp", payload)
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +476,8 @@ class TestFixR31VerifiedLedgerCapability:
             queue_dir=tmp_path / "queue",
             frame_rows=campaign["frame_rows"],
             protected_root=tmp_path,
+            split=campaign["canonical_split"],
+            expected_split_digest=campaign["expected_split_digest"],
         )
         assert reloaded.ledger.model_dump(mode="json") == verified.ledger.model_dump(mode="json")
 
@@ -518,6 +593,8 @@ def _verify_campaign(tmp_path: Path, campaign: dict, ids: tuple[str, ...]):
         queue_dir=queue_dir,
         frame_rows=campaign["frame_rows"],
         protected_root=tmp_path,
+        split=campaign.get("canonical_split"),
+        expected_split_digest=campaign.get("expected_split_digest"),
     )
 
 
@@ -682,13 +759,21 @@ class TestFixR33NeutralPacketBytes:
     def test_lane_authority_and_freeze_carry_neutral_sha(self, tmp_path: Path):
         session, sampling, packet_path, manifest_path = self._init(tmp_path)
         assert session.neutral_packet_sha256 == hashlib.sha256(packet_path.read_bytes()).hexdigest()
+        session.emit_requests(packet_path, sampling=sampling, manifest_path=manifest_path)
+        lane_root = tmp_path / "lanes" / "model_a"
         for sid in self.IDS:
             record = session.build_record(
                 {
                     "sample_id": sid,
                     "outcome": "judged",
-                    "judgment": {"fields": dict(GOOD_CRITICAL), "reviewer_confidence": "medium"},
-                    "raw_response": f"raw-model-output:model_a:{sid}",
+                    "raw_response": _raw_response_json(sid, dict(GOOD_CRITICAL)),
+                    "execution": json.loads(
+                        json.dumps(
+                            _truthful_receipt(lane_root, _reviewer("model_a"), sid).model_dump(
+                                mode="json"
+                            )
+                        )
+                    ),
                 },
                 sampling=sampling,
             )
@@ -734,7 +819,9 @@ class TestFixR34MandatoryFrame:
         rows = build_frame_rows(self.IDS[:-1])  # one frozen ID missing
         frame_path = tmp_path / "frame.json"
         frame_path.write_text(json.dumps([r.model_dump(mode="json") for r in rows]))
-        with pytest.raises(SystemExit, match="frame membership incomplete"):
+        # FIX-R4-3: the canonical validator names the exact failure mode —
+        # a partial frame is a MEMBERSHIP mismatch against the frozen sample.
+        with pytest.raises(SystemExit, match="frame_membership_mismatch"):
             _load_frame_rows(str(frame_path), sampling)
 
     def test_model_report_and_human_queue_select_identical_audit_ids(self):
@@ -1167,16 +1254,21 @@ class TestFixR36RequestResume:
         )
         return session, sampling, packet_path, manifest_path
 
-    def _response(self, sid: str) -> dict:
+    def _response(self, sid: str, lane_root: Path) -> dict:
         return {
             "sample_id": sid,
             "outcome": "judged",
-            "judgment": {"fields": dict(GOOD_CRITICAL), "reviewer_confidence": "medium"},
-            "raw_response": f"model output for {sid}",
+            "raw_response": _raw_response_json(sid, dict(GOOD_CRITICAL)),
+            "execution": json.loads(
+                json.dumps(
+                    _truthful_receipt(lane_root, _reviewer("model_a"), sid).model_dump(mode="json")
+                )
+            ),
         }
 
     def test_real_resume_sequence(self, tmp_path: Path):
         session, sampling, packet_path, manifest_path = self._init(tmp_path)
+        lane_root = tmp_path / "lanes" / "model_a"
         # 1. initial batch: all three pending
         first = session.emit_requests(packet_path, sampling=sampling, manifest_path=manifest_path)
         assert first.name == "lane-requests-000001.jsonl"
@@ -1184,7 +1276,7 @@ class TestFixR36RequestResume:
         first_ids = [json.loads(line)["sample_id"] for line in first_bytes.decode().splitlines()]
         assert first_ids == list(self.IDS)
         # 2. ingest only SOME responses
-        session.ingest_response(self._response("s1"), sampling=sampling)
+        session.ingest_response(self._response("s1", lane_root), sampling=sampling)
         # 3. emit again: must succeed, as a SECOND immutable batch
         second = session.emit_requests(packet_path, sampling=sampling, manifest_path=manifest_path)
         assert second.name == "lane-requests-000002.jsonl"
@@ -1223,14 +1315,17 @@ class TestFixR37ConsensusFloors:
         # sampling in the campaign uses a synthetic target digest; rebuild
         # receipts against that identity via helpers
         frame = build_frame_rows(self.IDS)
-        split = build_split(self.IDS, dev=self.IDS[:4], holdout=self.IDS[4:]).model_copy(
-            update={
-                "campaign_id": "campaign",
-                "sampling_manifest_digest": campaign["sampling"].manifest_digest(),
-            }
-        )
+        # FIX-R4-4 (synthetic campaigns): use the campaign's canonically
+        # frozen split; the expected digest was retained INDEPENDENTLY at
+        # materialization time.
+        split = campaign["canonical_split"]
+        expected_split = campaign["expected_split_digest"]
         contract = _contract()
-        receipts = build_receipts(self.IDS, frame, identity, contract)
+        from tests.test_calibration_206_helpers import write_assessment_evidence
+
+        evidence_path, evidence_sha = write_assessment_evidence(
+            tmp_path, self.IDS, frame, identity, contract, campaign["sampling"]
+        )
         floors = EvidenceFloors(
             campaign_id="campaign",
             total_reviewed_min=4,
@@ -1247,13 +1342,15 @@ class TestFixR37ConsensusFloors:
         result = check_consensus_floors(
             floors=floors,
             verified_ledger=verified,
-            receipts=receipts,
+            assessment_evidence_path=evidence_path,
+            expected_assessment_evidence_sha256=evidence_sha,
+            sampling=campaign["sampling"],
             target_identity=identity,
             assessment_contract=contract,
             frame=frame,
             profiles=[],
-            sampling=campaign["sampling"],
             split=split,
+            expected_split_digest=expected_split,
         )
         assert result.evidence_methodology == "frontier_consensus_206"
         assert result.full_population_dual_review is False
@@ -1330,23 +1427,50 @@ class TestFixR37ConsensusFloors:
             per_bin_support_min=50,
             per_stratum_min=1,
         )
-        sampling = _sampling(self.IDS)
-        split = build_split(self.IDS, dev=self.IDS[:4], holdout=self.IDS[4:])
         identity = build_identity()
+        # FIX-R4-5: bind sampling to the evidence identity and write the
+        # protected assessment-evidence artifact the consensus front door now
+        # requires; FIX-R4-4: retain the expected split digest independently.
+        sampling = _sampling(self.IDS).model_copy(
+            update={"target_identity_digest": identity.identity_digest()}
+        )
+        split = build_split(self.IDS, dev=self.IDS[:4], holdout=self.IDS[4:]).model_copy(
+            update={"sampling_manifest_digest": sampling.manifest_digest()}
+        )
         contract = _contract()
         frame = build_frame_rows(self.IDS)
-        receipts = build_receipts(self.IDS, frame, identity, contract)
-        verified = build_verified_ledger(self.IDS, {sid: dict(GOOD_CRITICAL) for sid in self.IDS})
         from evals.calibration.fit import consensus_reference_observations
+        from tests.test_calibration_206_helpers import write_assessment_evidence
 
-        observations = consensus_reference_observations(
-            receipts=receipts,
-            verified_ledger=verified,
-            target_identity=identity,
-            contract=contract,
-            split=split,
-            frame=frame,
+        evidence_path, evidence_sha = (
+            write_assessment_evidence(None, self.IDS, frame, identity, contract, sampling)
+            if False
+            else (None, None)
         )
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as _td:
+            evidence_path, evidence_sha = write_assessment_evidence(
+                Path(_td), self.IDS, frame, identity, contract, sampling
+            )
+            verified = build_verified_ledger(
+                self.IDS,
+                {sid: dict(GOOD_CRITICAL) for sid in self.IDS},
+                sampling=sampling,
+                split=split,
+                expected_split_digest=split.split_digest(),
+            )
+            observations = consensus_reference_observations(
+                assessment_evidence_path=evidence_path,
+                expected_assessment_evidence_sha256=evidence_sha,
+                verified_ledger=verified,
+                sampling=sampling,
+                target_identity=identity,
+                contract=contract,
+                split=split,
+                frame=frame,
+                expected_split_digest=split.split_digest(),
+            )
         common = dict(
             floors=floors,
             observations=observations,
@@ -1383,14 +1507,17 @@ class TestFixR37ConsensusFloors:
         verified = _verify_campaign(tmp_path, campaign, self.IDS)
         identity = build_identity()
         frame = build_frame_rows(self.IDS)
-        split = build_split(self.IDS, dev=self.IDS[:4], holdout=self.IDS[4:]).model_copy(
-            update={
-                "campaign_id": "campaign",
-                "sampling_manifest_digest": campaign["sampling"].manifest_digest(),
-            }
-        )
+        # FIX-R4-4 (synthetic campaigns): use the campaign's canonically
+        # frozen split; the expected digest was retained INDEPENDENTLY at
+        # materialization time.
+        split = campaign["canonical_split"]
+        expected_split = campaign["expected_split_digest"]
         contract = _contract()
-        receipts = build_receipts(self.IDS, frame, identity, contract)
+        from tests.test_calibration_206_helpers import write_assessment_evidence
+
+        evidence_path, evidence_sha = write_assessment_evidence(
+            tmp_path, self.IDS, frame, identity, contract, campaign["sampling"]
+        )
         floors = EvidenceFloors(
             campaign_id="campaign",
             total_reviewed_min=4,
@@ -1407,13 +1534,15 @@ class TestFixR37ConsensusFloors:
         base = check_consensus_floors(
             floors=floors,
             verified_ledger=verified,
-            receipts=receipts,
+            assessment_evidence_path=evidence_path,
+            expected_assessment_evidence_sha256=evidence_sha,
+            sampling=campaign["sampling"],
             target_identity=identity,
             assessment_contract=contract,
             frame=frame,
             profiles=[],
-            sampling=campaign["sampling"],
             split=split,
+            expected_split_digest=expected_split,
         )
         # the observations only read the ledger's FINAL reference labels
         # (consensus criticals / human finals) — the raw votes in

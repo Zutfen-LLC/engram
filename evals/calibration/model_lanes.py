@@ -222,6 +222,17 @@ def freeze_lane(
         sampling=sampling,
         source_packet_digest=source_packet_digest,
     )
+    # FIX-R4-1: every accepted record must answer an ACTUAL emitted request —
+    # verified against the retained immutable request-batch manifests.
+    from evals.calibration.ingestion import verify_lane_request_bindings
+
+    verify_lane_request_bindings(
+        lane_directory(protected_root, reviewer.reviewer_slot),
+        reviewer,
+        records,
+        campaign_id=campaign_id,
+        neutral_packet_sha256=neutral_packet_sha256,
+    )
     # FIX-R2-4: raw model evidence is freeze-bound — every accepted record
     # must have its protected raw bytes present and hashing to the claimed
     # digest (provider_error records must claim none).
