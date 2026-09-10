@@ -309,21 +309,77 @@ def load_reveal_event(protected_dir: Path, sample_id: str) -> VoteRevealEvent | 
     return VoteRevealEvent.model_validate(json.loads(path.read_text()))
 
 
+def validate_reveal_binding(
+    event: VoteRevealEvent,
+    *,
+    current_records_by_slot: dict[str, ModelReviewRecord],
+    lane_digests: tuple[str, ...],
+    protocol_version: str,
+    campaign_id: str,
+    sampling_manifest_digest: str,
+    source_packet_digest: str,
+    sample_id: str,
+) -> None:
+    """Canonical reveal-event validator (FIX-R2-3).
+
+    Proves the reveal event is bound to the EXACT current frozen evidence:
+
+    - protocol version, campaign, sampling manifest, source packet, sample;
+    - the exact three CURRENT record digests in frozen slot order;
+    - the exact three frozen lane digests in slot order.
+
+    Used both by ``record_final_resolution`` (mandatory strong verification)
+    and by ``verify_consensus_ledger`` (the final ledger must never trust the
+    writer to have done the right thing).
+    """
+    if event.protocol_version != protocol_version:
+        raise ValueError("reveal_protocol_version_mismatch")
+    if event.campaign_id != campaign_id:
+        raise ValueError("reveal_campaign_mismatch")
+    if event.sampling_manifest_digest != sampling_manifest_digest:
+        raise ValueError("reveal_sampling_manifest_mismatch")
+    if not hmac.compare_digest(event.source_packet_digest, source_packet_digest):
+        raise ValueError("reveal_source_packet_mismatch")
+    if event.sample_id != sample_id:
+        raise ValueError("reveal_sample_mismatch")
+    if set(current_records_by_slot) != set(REVIEWER_SLOTS):
+        raise ValueError("reveal_requires_all_three_lanes")
+    if len(lane_digests) != len(REVIEWER_SLOTS):
+        raise ValueError("reveal_requires_all_three_lane_digests")
+    current_digests = tuple(
+        current_records_by_slot[slot].record_digest() for slot in REVIEWER_SLOTS
+    )
+    if tuple(event.revealed_record_digests) != current_digests:
+        raise ValueError("reveal_record_digests_do_not_match_current_lane_evidence")
+    if not hmac.compare_digest(
+        hashlib.sha256(json.dumps(tuple(event.lane_digests)).encode()).hexdigest(),
+        hashlib.sha256(json.dumps(tuple(lane_digests)).encode()).hexdigest(),
+    ):
+        raise ValueError("reveal_lane_digests_do_not_match_frozen_lanes")
+
+
 def record_final_resolution(
     protected_dir: Path,
     sample_id: str,
     *,
     final_critical: dict[str, Any],
     final_confidence: Literal["low", "medium", "high", "unknown"],
+    current_records_by_slot: dict[str, ModelReviewRecord],
+    lane_digests: tuple[str, ...],
+    campaign_id: str,
+    sampling_manifest_digest: str,
+    source_packet_digest: str,
     note: str | None = None,
-    current_records_by_slot: dict[str, ModelReviewRecord] | None = None,
 ) -> HumanQueueJudgment:
     """Attach the final resolution to an existing initial judgment.
 
-    FIX-5A: when the current lane records are supplied (the normal path), the
-    recorded reveal event is verified against them — the exact three record
-    digests the human saw must equal the CURRENT frozen lane evidence. A
-    model record mutated after the reveal fails resolution here, not later.
+    FIX-5A + FIX-R2-3: the recorded reveal event is verified against the
+    CURRENT lane evidence through the canonical ``validate_reveal_binding``
+    validator — identity (protocol/campaign/sampling/packet/sample), the
+    exact three current record digests, and the exact three frozen lane
+    digests must all match. Strong verification is MANDATORY; there is no
+    bypass path (the former optional ``current_records_by_slot=None`` weak
+    path was removed).
     """
     path = queue_judgment_path(protected_dir, sample_id)
     if not path.exists():
@@ -331,22 +387,27 @@ def record_final_resolution(
     judgment = HumanQueueJudgment.model_validate(json.loads(path.read_text()))
     if judgment.final_critical is not None:
         raise ValueError("final_resolution_already_recorded")
+    if judgment.campaign_id != campaign_id:
+        raise ValueError("resolution_campaign_mismatch")
+    if judgment.sampling_manifest_digest != sampling_manifest_digest:
+        raise ValueError("resolution_sampling_manifest_mismatch")
+    if judgment.source_packet_digest != source_packet_digest:
+        raise ValueError("resolution_source_packet_mismatch")
     event = load_reveal_event(protected_dir, sample_id)
     if event is None:
         raise ValueError("model_votes_must_be_revealed_before_final_resolution")
     if event.sample_id != sample_id:
         raise ValueError("reveal_event_sample_mismatch")
-    if current_records_by_slot is not None:
-        if set(current_records_by_slot) != set(REVIEWER_SLOTS):
-            raise ValueError("resolution_requires_all_three_lanes")
-        current_digests = tuple(
-            current_records_by_slot[slot].record_digest() for slot in REVIEWER_SLOTS
-        )
-        if not hmac.compare_digest(
-            hashlib.sha256(json.dumps(current_digests).encode()).hexdigest(),
-            hashlib.sha256(json.dumps(tuple(event.revealed_record_digests)).encode()).hexdigest(),
-        ):
-            raise ValueError("reveal_does_not_match_current_lane_evidence")
+    validate_reveal_binding(
+        event,
+        current_records_by_slot=current_records_by_slot,
+        lane_digests=lane_digests,
+        protocol_version=CONSENSUS_PROTOCOL_VERSION,
+        campaign_id=campaign_id,
+        sampling_manifest_digest=sampling_manifest_digest,
+        source_packet_digest=source_packet_digest,
+        sample_id=sample_id,
+    )
     updated = judgment.model_copy(
         update={
             "model_votes_revealed_at": event.revealed_at,

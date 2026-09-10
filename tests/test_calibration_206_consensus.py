@@ -709,25 +709,18 @@ class TestFinalLedgerProvenance:
 class TestFloorsConsumeOnlyFinalLabels:
     """Verification 14: downstream consumption uses only final reference labels."""
 
-    def test_consensus_reference_completion_from_final_labels(self):
+    def test_consensus_reference_completion_requires_verified_ledger(self):
+        # FIX-R2-5: the reference_labels parameter no longer exists — a
+        # perfectly valid hand-constructed list cannot be passed at all.
+        import inspect
+
         from evals.calibration.fit import consensus_reference_completion
 
-        labels = [
-            ReferenceLabel(
-                sample_id="s1",
-                final_label_origin="cross_model_consensus",
-                critical=dict(GOOD_CRITICAL),
-            ),
-            ReferenceLabel(
-                sample_id="s2",
-                final_label_origin="human_adjudicated",
-                critical=dict(GOOD_CRITICAL, consequence="high"),
-            ),
-        ]
-        completed = consensus_reference_completion(reference_labels=labels)
-        assert [label.sample_id for label in completed] == ["s1", "s2"]
-        with pytest.raises(Exception, match="duplicate_reference_label"):
-            consensus_reference_completion(reference_labels=[labels[0], labels[0]])
+        signature = inspect.signature(consensus_reference_completion)
+        assert "reference_labels" not in signature.parameters
+        assert "verified_ledger" in signature.parameters
+        with pytest.raises(TypeError):
+            consensus_reference_completion(reference_labels=[])  # type: ignore[call-arg]
 
     def test_observations_derive_from_reference_not_votes(self, tmp_path: Path):
         from engram.assessment_schema import AssessmentContract
@@ -753,17 +746,12 @@ class TestFloorsConsumeOnlyFinalLabels:
 
         identity = build_identity()
         receipts = build_receipts(ids, frame, identity, contract)
-        labels = [
-            ReferenceLabel(
-                sample_id=sid,
-                final_label_origin="cross_model_consensus",
-                critical=dict(GOOD_CRITICAL),
-            )
-            for sid in ids
-        ]
+        from tests.test_calibration_206_helpers import build_verified_ledger
+
+        verified = build_verified_ledger(ids, {sid: dict(GOOD_CRITICAL) for sid in ids})
         observations = consensus_reference_observations(
             receipts=receipts,
-            reference_labels=labels,
+            verified_ledger=verified,
             target_identity=identity,
             contract=contract,
             split=split,
@@ -774,17 +762,14 @@ class TestFloorsConsumeOnlyFinalLabels:
         retention = [o for o in observations if o.dimension == "retention"]
         assert all(o.outcome == "positive" for o in retention)
         # flipping the final reference label flips outcomes: votes don't exist here
-        flipped = [
-            ReferenceLabel(
-                sample_id=sid,
-                final_label_origin="human_adjudicated",
-                critical=dict(GOOD_CRITICAL, retention_value="do_not_retain"),
-            )
-            for sid in ids
-        ]
+        flipped_ledger = build_verified_ledger(
+            ids,
+            {sid: dict(GOOD_CRITICAL, retention_value="do_not_retain") for sid in ids},
+            origin="human_adjudicated",
+        )
         flipped_obs = consensus_reference_observations(
             receipts=receipts,
-            reference_labels=flipped,
+            verified_ledger=flipped_ledger,
             target_identity=identity,
             contract=contract,
             split=split,
@@ -815,17 +800,13 @@ class TestFloorsConsumeOnlyFinalLabels:
         receipts = build_receipts(ids, frame, identity, contract)
         # tamper with the receipt digest
         tampered = receipts[0].model_copy(update={"receipt_digest": "0" * 64})
-        labels = [
-            ReferenceLabel(
-                sample_id="s1",
-                final_label_origin="cross_model_consensus",
-                critical=dict(GOOD_CRITICAL),
-            )
-        ]
+        from tests.test_calibration_206_helpers import build_verified_ledger
+
+        verified = build_verified_ledger(("s1",), {"s1": dict(GOOD_CRITICAL)})
         with pytest.raises(Exception, match="assessment_execution_receipt_digest_mismatch"):
             consensus_reference_observations(
                 receipts=[tampered],
-                reference_labels=labels,
+                verified_ledger=verified,
                 target_identity=identity,
                 contract=contract,
                 split=split,
@@ -1034,6 +1015,11 @@ class TestHumanQueueWorkflow:
                 "s0",
                 final_critical=dict(GOOD_CRITICAL, expected_kind="decision"),
                 final_confidence="high",
+                current_records_by_slot=self._lane_records("s0"),
+                lane_digests=("4" * 64, "5" * 64, "6" * 64),
+                campaign_id="campaign",
+                sampling_manifest_digest="e" * 64,
+                source_packet_digest="f" * 64,
             )
         from evals.calibration.human_queue import reveal_model_votes
 
@@ -1056,6 +1042,10 @@ class TestHumanQueueWorkflow:
             final_critical=dict(GOOD_CRITICAL, expected_kind="decision"),
             final_confidence="high",
             current_records_by_slot=records,
+            lane_digests=("4" * 64, "5" * 64, "6" * 64),
+            campaign_id="campaign",
+            sampling_manifest_digest="e" * 64,
+            source_packet_digest="f" * 64,
         )
         assert resolved.initial_critical["expected_kind"] == "fact"
         assert resolved.final_critical is not None
@@ -1068,6 +1058,11 @@ class TestHumanQueueWorkflow:
                 "s0",
                 final_critical=dict(GOOD_CRITICAL),
                 final_confidence="high",
+                current_records_by_slot=self._lane_records("s0"),
+                lane_digests=("4" * 64, "5" * 64, "6" * 64),
+                campaign_id="campaign",
+                sampling_manifest_digest="e" * 64,
+                source_packet_digest="f" * 64,
             )
 
     def test_export_counts(self, tmp_path: Path):

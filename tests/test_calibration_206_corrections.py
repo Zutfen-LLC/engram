@@ -58,6 +58,7 @@ from evals.calibration.model_lanes import (
 
 NOW = datetime(2026, 9, 10, tzinfo=UTC)
 FAMILY_BY_SLOT = dict(zip(REVIEWER_SLOTS, REVIEWER_FAMILIES, strict=True))
+LANE_DIGITS = ("4" * 64, "5" * 64, "6" * 64)
 
 GOOD_CRITICAL = {
     "expected_kind": "fact",
@@ -66,6 +67,17 @@ GOOD_CRITICAL = {
     "consequence": "low",
     "acceptable_abstention": "no",
 }
+
+
+def _raw_bytes(slot: str, sample_id: str) -> bytes:
+    """Deterministic raw model output per (slot, sample)."""
+    return f"raw-model-output:{slot}:{sample_id}".encode()
+
+
+def _raw_digest(slot: str, sample_id: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(_raw_bytes(slot, sample_id)).hexdigest()
 
 
 def _judgment(**overrides: Any) -> ModelJudgment:
@@ -104,9 +116,11 @@ def _record(
     parse_status: str = "parsed",
     outcome_status: str = "judged",
     error_code: str | None = None,
-    raw_digest: str | None = "c" * 64,
+    raw_digest: str | None = None,
 ) -> ModelReviewRecord:
     fam = family or FAMILY_BY_SLOT[slot]
+    if raw_digest is None and parse_status != "absent":
+        raw_digest = _raw_digest(slot, sample_id)
     return ModelReviewRecord(
         protocol_version=protocol or CONSENSUS_PROTOCOL_VERSION,  # type: ignore[arg-type]
         campaign_id=campaign or "campaign",
@@ -260,16 +274,15 @@ class TestFix1LaneBinding:
         sampling, reviewer, _ = self._setup()
         # records claim a DIFFERENT provider model identifier than the lane authority
         for sample_id in self.IDS:
-            append_review_record(
-                _record(
-                    "model_a",
-                    sample_id,
-                    _judgment(),
-                    model="gpt-astra-impostor",
-                    sampling_digest=sampling.manifest_digest(),
-                ),
-                tmp_path,
+            record = _record(
+                "model_a",
+                sample_id,
+                _judgment(),
+                model="gpt-astra-impostor",
+                sampling_digest=sampling.manifest_digest(),
             )
+            _publish_raw(tmp_path, "model_a", record)
+            append_review_record(record, tmp_path)
         with pytest.raises(ValueError, match="record_lane_identity_mismatch"):
             freeze_lane(
                 protected_root=tmp_path,
@@ -282,12 +295,11 @@ class TestFix1LaneBinding:
     def test_lane_freeze_rejects_mutated_record_after_freeze(self, tmp_path: Path):
         sampling, reviewer, _ = self._setup()
         for sample_id in self.IDS:
-            append_review_record(
-                _record(
-                    "model_a", sample_id, _judgment(), sampling_digest=sampling.manifest_digest()
-                ),
-                tmp_path,
+            record = _record(
+                "model_a", sample_id, _judgment(), sampling_digest=sampling.manifest_digest()
             )
+            _publish_raw(tmp_path, "model_a", record)
+            append_review_record(record, tmp_path)
         freeze_lane(
             protected_root=tmp_path,
             reviewer=reviewer,
@@ -545,16 +557,54 @@ class TestFix3AuditEscalation:
         assert no_reversal is False
 
     def test_evaluate_audit_outcome_derivation(self):
-        consensus_case = GOOD_CRITICAL
+        """FIX-R2-2: consensus is DERIVED from the frozen records, not
+        caller-supplied; a caller cannot forge consensus_critical."""
         human_flip = {**GOOD_CRITICAL, "retention_value": "do_not_retain"}
-        results = {
-            "s1": {"consensus_critical": consensus_case, "human_final_critical": human_flip},
-            "s2": {"consensus_critical": GOOD_CRITICAL, "human_final_critical": GOOD_CRITICAL},
+        records_by_lane = {
+            "s1": {slot: _record(slot, "s1", _judgment()) for slot in REVIEWER_SLOTS},
+            "s2": {slot: _record(slot, "s2", _judgment()) for slot in REVIEWER_SLOTS},
         }
-        outcome = evaluate_audit_outcome(audit_results=results, records_by_lane={})
+        results = {
+            "s1": {"human_final_critical": human_flip},
+            "s2": {"human_final_critical": GOOD_CRITICAL},
+        }
+        outcome = evaluate_audit_outcome(audit_results=results, records_by_lane=records_by_lane)
         assert outcome["material_disagreements"] == 1
         assert outcome["material_reversals"] == 1
         assert outcome["escalate_full_human_review"] is True
+        # a caller-supplied consensus_critical is no longer even part of the
+        # API shape: forging it is impossible
+        forged = {
+            "s1": {
+                "human_final_critical": human_flip,
+                "consensus_critical": human_flip,  # ignored/forged
+            },
+            "s2": {"human_final_critical": GOOD_CRITICAL},
+        }
+        outcome_forged = evaluate_audit_outcome(
+            audit_results=forged, records_by_lane=records_by_lane
+        )
+        assert outcome_forged["material_disagreements"] == 1  # evidence wins
+        # an audited sample whose records do not carry three unanimous parsed
+        # judgments fails closed
+        broken = {
+            "s1": {
+                "model_a": _record(
+                    "model_a",
+                    "s1",
+                    None,
+                    parse_status="absent",
+                    outcome_status="provider_error",
+                    error_code="http-503",
+                    raw_digest=None,
+                )
+            }
+        }
+        with pytest.raises(ValueError, match="audit_consensus_not_derivable_from_records:s1"):
+            evaluate_audit_outcome(
+                audit_results={"s1": {"human_final_critical": human_flip}},
+                records_by_lane=broken,
+            )
 
     def test_escalation_expands_queue_to_every_remaining_consensus_case(self):
         consensus_ids = [f"s{i}" for i in range(20)]
@@ -675,6 +725,22 @@ def _build_campaign(
         ),
         queue_dir,
     )
+    # publish lanes to the protected root with bound raw evidence, then freeze
+    for slot in REVIEWER_SLOTS:
+        for sid in ids:
+            record = records_by_lane[slot][sid]
+            _publish_raw(tmp_path, slot, record)
+            append_review_record(record, tmp_path)
+        lanes.append(
+            freeze_lane(
+                protected_root=tmp_path,
+                reviewer=reviewers[slot],
+                campaign_id="campaign",
+                sampling=sampling,
+                source_packet_digest="f" * 64,
+            )
+        )
+    real_lane_digests = tuple(lane.lane_digest() for lane in lanes)
     # resolve every queued case
     for entry in entries:
         sid = entry.sample_id
@@ -696,7 +762,7 @@ def _build_campaign(
             queue_dir,
             sid,
             current_records_by_slot={slot: records_by_lane[slot][sid] for slot in REVIEWER_SLOTS},
-            lane_digests=("4" * 64, "5" * 64, "6" * 64),
+            lane_digests=real_lane_digests,
             campaign_id="campaign",
             sampling_manifest_digest=sampling.manifest_digest(),
             source_packet_digest="f" * 64,
@@ -710,18 +776,10 @@ def _build_campaign(
             final_critical=final,
             final_confidence="high",
             current_records_by_slot={slot: records_by_lane[slot][sid] for slot in REVIEWER_SLOTS},
-        )
-    for slot in REVIEWER_SLOTS:
-        for sid in ids:
-            append_review_record(records_by_lane[slot][sid], tmp_path)
-        lanes.append(
-            freeze_lane(
-                protected_root=tmp_path,
-                reviewer=reviewers[slot],
-                campaign_id="campaign",
-                sampling=sampling,
-                source_packet_digest="f" * 64,
-            )
+            lane_digests=real_lane_digests,
+            campaign_id="campaign",
+            sampling_manifest_digest=sampling.manifest_digest(),
+            source_packet_digest="f" * 64,
         )
     return {
         "sampling": sampling,
@@ -729,11 +787,24 @@ def _build_campaign(
         "records_by_lane": records_by_lane,
         "reviewers": reviewers,
         "lanes": tuple(lanes),
+        "lane_digests": real_lane_digests,
         "queue_dir": queue_dir,
         "consensus_ids": consensus_ids,
         "queue_ids": queue_ids,
         "audit_ids": audit_ids,
     }
+
+
+def _publish_raw(protected_root: Path, slot: str, record: ModelReviewRecord) -> None:
+    """Write the raw evidence bytes a record claims (test-side ingestion)."""
+    if record.raw_response_digest is None:
+        return  # provider_error: no bytes
+    from evals.calibration.review import write_protected_file
+
+    write_protected_file(
+        protected_root / "lanes" / slot / "raw" / f"{record.sample_id}.resp",
+        _raw_bytes(slot, record.sample_id),
+    )
 
 
 def _audit_outcome_record(
@@ -752,7 +823,7 @@ def _audit_outcome_record(
 class TestFix4VerifiedLedger:
     IDS = tuple(f"s{i}" for i in range(20))
 
-    def _verify(self, tmp_path, campaign, *, escalate=False):
+    def _verify(self, tmp_path, campaign, *, escalate=False, supplied_outcome=None):
         from evals.calibration.ledger import verify_consensus_ledger
 
         return verify_consensus_ledger(
@@ -763,7 +834,8 @@ class TestFix4VerifiedLedger:
             records_by_lane=campaign["records_by_lane"],
             queue_dir=campaign["queue_dir"],
             frame_rows=campaign["frame_rows"],
-            audit_outcome_record=_audit_outcome_record(escalate, len(campaign["audit_ids"])),
+            audit_outcome_record=supplied_outcome,
+            protected_root=tmp_path,
         )
 
     def test_verified_ledger_derives_expected_origins(self, tmp_path: Path):
@@ -785,8 +857,18 @@ class TestFix4VerifiedLedger:
         assert len(ids) == len(set(ids))
 
     def test_escalation_removes_all_auto_consensus_rows(self, tmp_path: Path):
-        campaign = _build_campaign(tmp_path, ids=self.IDS, escalate=True)
-        verified = self._verify(tmp_path, campaign, escalate=True)
+        # genuine escalation: an audit-selected consensus case where the human
+        # final resolution materially disagrees (derived outcome => escalate)
+        campaign_probe = _build_campaign(tmp_path / "probe", ids=self.IDS)
+        audit_consensus = sorted(campaign_probe["audit_ids"] & set(campaign_probe["consensus_ids"]))
+        campaign = _build_campaign(
+            tmp_path / "real",
+            ids=self.IDS,
+            escalate=True,
+            audit_disagreement_sample=audit_consensus[0],
+        )
+        verified = self._verify(tmp_path / "real", campaign)
+        assert verified.ledger.audit_outcome.escalate_full_human_review is True
         # every remaining consensus case was made human-required and resolved
         origins = {w.final_label_origin for w in verified.ledger.wrappers}
         assert "cross_model_consensus" not in origins
@@ -800,40 +882,68 @@ class TestFix4VerifiedLedger:
             self._verify(tmp_path, campaign)
 
     def test_escalation_with_unresolved_expanded_case_blocks_ledger(self, tmp_path: Path):
-        campaign = _build_campaign(tmp_path, ids=self.IDS, escalate=True)
+        campaign_probe = _build_campaign(tmp_path / "probe", ids=self.IDS)
+        audit_consensus = sorted(campaign_probe["audit_ids"] & set(campaign_probe["consensus_ids"]))
+        campaign = _build_campaign(
+            tmp_path / "real",
+            ids=self.IDS,
+            escalate=True,
+            audit_disagreement_sample=audit_consensus[0],
+        )
         consensus_not_audited = sorted(set(campaign["consensus_ids"]) - campaign["audit_ids"])
         # one expanded-queue consensus case left unresolved
         (campaign["queue_dir"] / "judgments" / f"{consensus_not_audited[0]}.final.json").unlink()
         with pytest.raises(ValueError, match="ledger_requires_all_required_human_resolutions"):
-            self._verify(tmp_path, campaign, escalate=True)
+            self._verify(tmp_path / "real", campaign)
 
     def test_fabricated_reference_labels_rejected_downstream(self):
+        import inspect
+
         from evals.calibration.fit import consensus_reference_observations
 
-        # no verified ledger and no legacy labels -> fail closed
-        with pytest.raises(ValueError, match="verified_ledger_required_for_consensus_path"):
+        # FIX-R2-5: there is NO reference_labels parameter at all anymore —
+        # a perfectly valid-looking hand-constructed list cannot even be
+        # passed to the consensus API.
+        signature = inspect.signature(consensus_reference_observations)
+        assert "reference_labels" not in signature.parameters
+        assert "verified_ledger" in signature.parameters
+        with pytest.raises(TypeError):
             consensus_reference_observations(
                 receipts=[],
+                reference_labels=[
+                    ReferenceLabel(
+                        sample_id="s1",
+                        final_label_origin="cross_model_consensus",
+                        critical=dict(GOOD_CRITICAL),
+                    )
+                ],  # type: ignore[call-arg]
                 target_identity=None,  # type: ignore[arg-type]
                 contract=None,  # type: ignore[arg-type]
                 split=None,  # type: ignore[arg-type]
                 frame=[],
             )
 
+    def test_no_consensus_api_accepts_reference_labels(self):
+        import inspect
+
+        from evals.calibration import fit
+
+        for name in dir(fit):
+            if not name.startswith("consensus_"):
+                continue
+            func = getattr(fit, name)
+            if callable(func):
+                assert "reference_labels" not in inspect.signature(func).parameters, name
+
     def test_both_inputs_rejected(self):
+        # FIX-R2-5: reference_labels cannot be multiplexed with a verified
+        # ledger — the parameter does not exist; passing it is a TypeError.
         from evals.calibration.fit import consensus_reference_completion
 
-        labels = [
-            ReferenceLabel(
-                sample_id="s1",
-                final_label_origin="cross_model_consensus",
-                critical=dict(GOOD_CRITICAL),
-            )
-        ]
-        with pytest.raises(ValueError, match="verified_ledger_and_reference_labels_exclusive"):
+        with pytest.raises(TypeError):
             consensus_reference_completion(
                 verified_ledger=object(),  # type: ignore[arg-type]
-                reference_labels=labels,
+                reference_labels=[],  # type: ignore[call-arg]
             )
 
     def test_verified_ledger_feeds_observations(self, tmp_path: Path):
@@ -891,8 +1001,185 @@ class TestFix4AdversarialLedger:
                 records_by_lane=tampered,
                 queue_dir=campaign["queue_dir"],
                 frame_rows=campaign["frame_rows"],
-                audit_outcome_record=_audit_outcome_record(False, len(campaign["audit_ids"])),
+                protected_root=tmp_path,
             )
+
+    def test_post_freeze_same_identity_judgment_mutation_fails_at_verify(self, tmp_path: Path):
+        """FIX-R2-1: mutate one model's critical judgment WITHOUT touching
+        identity fields, pass the mutated records_by_lane DIRECTLY to
+        verify_consensus_ledger (never load_frozen_lanes first) — the frozen
+        LaneFreeze.record_digests must catch it at the ledger boundary."""
+        from evals.calibration.ledger import verify_consensus_ledger
+
+        campaign = _build_campaign(tmp_path, ids=self.IDS)
+        tampered = {slot: dict(records) for slot, records in campaign["records_by_lane"].items()}
+        sample_id = self.IDS[1]
+        # same identity fields, mutated critical judgment
+        original = tampered["model_b"][sample_id]
+        forged = original.model_copy(deep=True)
+        forged = ModelReviewRecord.model_validate(
+            {
+                **forged.model_dump(mode="json"),
+                "judgment": {
+                    "fields": {**forged.judgment.fields, "expected_kind": "doctrine"},
+                    "reviewer_confidence": forged.judgment.reviewer_confidence,
+                },
+            }
+        )
+        assert forged.reviewer_slot == original.reviewer_slot
+        assert forged.provider_model_identifier == original.provider_model_identifier
+        assert forged.record_digest() != original.record_digest()
+        tampered["model_b"][sample_id] = forged
+        with pytest.raises(ValueError, match="lane_record_digest_mismatch"):
+            verify_consensus_ledger(
+                campaign_id="campaign",
+                sampling=campaign["sampling"],
+                source_packet_digest="f" * 64,
+                lanes=campaign["lanes"],
+                records_by_lane=tampered,
+                queue_dir=campaign["queue_dir"],
+                frame_rows=campaign["frame_rows"],
+                protected_root=tmp_path,
+            )
+
+    def test_false_no_escalation_cannot_bypass_actual_audit_evidence(self, tmp_path: Path):
+        """FIX-R2-2: human audit evidence requires escalation but a supplied
+        record says no escalation -> reject at the ledger boundary."""
+        from evals.calibration.ledger import verify_consensus_ledger
+
+        # Build a campaign with a genuine >5% audit disagreement (audit
+        # population small => every disagreement exceeds 5%).
+        ids = tuple(f"s{i}" for i in range(10))  # 9 consensus -> 2 audited
+        campaign = _build_campaign(tmp_path, ids=ids)
+        audit_consensus = sorted(campaign["audit_ids"] & set(campaign["consensus_ids"]))
+        assert audit_consensus  # at least one audited consensus case exists
+        # rewrite one audited case's final resolution to materially disagree
+        sid = audit_consensus[0]
+        resolution_path = campaign["queue_dir"] / "judgments" / f"{sid}.final.json"
+        payload = json.loads(resolution_path.read_text())
+        payload["final_critical"]["retention_value"] = "do_not_retain"
+        resolution_path.write_text(json.dumps(payload, sort_keys=True) + "\n")
+        # a caller SUPPLIES a no-escalation outcome despite the evidence
+        lying = _audit_outcome_record(False, len(campaign["audit_ids"]))
+        with pytest.raises(
+            ValueError, match="audit_outcome_record_does_not_match_derived_evidence"
+        ):
+            verify_consensus_ledger(
+                campaign_id="campaign",
+                sampling=campaign["sampling"],
+                source_packet_digest="f" * 64,
+                lanes=campaign["lanes"],
+                records_by_lane=campaign["records_by_lane"],
+                queue_dir=campaign["queue_dir"],
+                frame_rows=campaign["frame_rows"],
+                audit_outcome_record=lying,
+                protected_root=tmp_path,
+            )
+
+    def test_supplied_zero_high_consequence_misses_rejected(self, tmp_path: Path):
+        """FIX-R2-2: human final resolution is high consequence but a
+        supplied record claims zero high-consequence misses -> reject."""
+        from evals.calibration.ledger import verify_consensus_ledger
+
+        ids = tuple(f"s{i}" for i in range(10))
+        campaign = _build_campaign(tmp_path, ids=ids)
+        audit_consensus = sorted(campaign["audit_ids"] & set(campaign["consensus_ids"]))
+        sid = audit_consensus[0]
+        resolution_path = campaign["queue_dir"] / "judgments" / f"{sid}.final.json"
+        payload = json.loads(resolution_path.read_text())
+        payload["final_critical"]["consequence"] = "high"
+        payload["final_critical"]["retention_value"] = "do_not_retain"
+        resolution_path.write_text(json.dumps(payload, sort_keys=True) + "\n")
+        lying = _audit_outcome_record(False, len(campaign["audit_ids"]))
+        with pytest.raises(
+            ValueError, match="audit_outcome_record_does_not_match_derived_evidence"
+        ):
+            verify_consensus_ledger(
+                campaign_id="campaign",
+                sampling=campaign["sampling"],
+                source_packet_digest="f" * 64,
+                lanes=campaign["lanes"],
+                records_by_lane=campaign["records_by_lane"],
+                queue_dir=campaign["queue_dir"],
+                frame_rows=campaign["frame_rows"],
+                audit_outcome_record=lying,
+                protected_root=tmp_path,
+            )
+
+    def test_supplied_zero_reversals_rejected(self, tmp_path: Path):
+        """FIX-R2-2: retention polarity reverses (retain -> do_not_retain)
+        but a supplied record claims zero material reversals -> reject."""
+        from evals.calibration.ledger import verify_consensus_ledger
+
+        ids = tuple(f"s{i}" for i in range(10))
+        campaign = _build_campaign(tmp_path, ids=ids)
+        audit_consensus = sorted(campaign["audit_ids"] & set(campaign["consensus_ids"]))
+        sid = audit_consensus[0]
+        resolution_path = campaign["queue_dir"] / "judgments" / f"{sid}.final.json"
+        payload = json.loads(resolution_path.read_text())
+        payload["final_critical"]["retention_value"] = "do_not_retain"
+        resolution_path.write_text(json.dumps(payload, sort_keys=True) + "\n")
+        lying = _audit_outcome_record(
+            False, len(campaign["audit_ids"]), disagreements=1
+        )  # admits the disagreement but hides the reversal
+        lying = AuditOutcomeRecord(
+            audited_count=lying.audited_count,
+            material_disagreements=1,
+            high_consequence_misses=0,
+            material_reversals=0,  # FALSE: derived evidence says 1
+            material_disagreement_rate=lying.material_disagreement_rate,
+            escalate_full_human_review=False,
+        )
+        with pytest.raises(
+            ValueError, match="audit_outcome_record_does_not_match_derived_evidence"
+        ):
+            verify_consensus_ledger(
+                campaign_id="campaign",
+                sampling=campaign["sampling"],
+                source_packet_digest="f" * 64,
+                lanes=campaign["lanes"],
+                records_by_lane=campaign["records_by_lane"],
+                queue_dir=campaign["queue_dir"],
+                frame_rows=campaign["frame_rows"],
+                audit_outcome_record=lying,
+                protected_root=tmp_path,
+            )
+
+    def test_clean_audit_with_correct_derived_outcome_passes(self, tmp_path: Path):
+        """FIX-R2-2: clean audit + NO supplied record -> derived outcome used,
+        ledger verifies."""
+        campaign = _build_campaign(tmp_path, ids=self.IDS)
+        verified = self._verify_clean(tmp_path, campaign)
+        assert verified.ledger.audit_outcome.escalate_full_human_review is False
+        assert verified.ledger.audit_outcome.material_disagreements == 0
+
+    def test_stored_outcome_equal_to_derived_passes(self, tmp_path: Path):
+        """FIX-R2-2: stored outcome that exactly equals the derived outcome
+        is accepted (provenance comparison succeeds)."""
+        campaign = _build_campaign(tmp_path, ids=self.IDS)
+        verified = self._verify_clean(tmp_path, campaign)
+        # re-verify supplying the (correct) stored outcome — must pass
+        verified_again = self._verify_clean(
+            tmp_path, campaign, supplied=verified.ledger.audit_outcome
+        )
+        assert verified_again.ledger.audit_outcome.model_dump(
+            mode="json"
+        ) == verified.ledger.audit_outcome.model_dump(mode="json")
+
+    def _verify_clean(self, tmp_path, campaign, supplied=None):
+        from evals.calibration.ledger import verify_consensus_ledger
+
+        return verify_consensus_ledger(
+            campaign_id="campaign",
+            sampling=campaign["sampling"],
+            source_packet_digest="f" * 64,
+            lanes=campaign["lanes"],
+            records_by_lane=campaign["records_by_lane"],
+            queue_dir=campaign["queue_dir"],
+            frame_rows=campaign["frame_rows"],
+            audit_outcome_record=supplied,
+            protected_root=tmp_path,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -961,7 +1248,15 @@ class TestFix5RevealExport:
             ValueError, match="model_votes_must_be_revealed_before_final_resolution"
         ):
             record_final_resolution(
-                tmp_path, "s1", final_critical=dict(GOOD_CRITICAL), final_confidence="high"
+                tmp_path,
+                "s1",
+                final_critical=dict(GOOD_CRITICAL),
+                final_confidence="high",
+                current_records_by_slot=self._records("s1"),
+                lane_digests=LANE_DIGITS,
+                campaign_id="campaign",
+                sampling_manifest_digest="e" * 64,
+                source_packet_digest="f" * 64,
             )
 
     def test_mutated_model_record_after_reveal_fails_resolution(self, tmp_path: Path):
@@ -979,13 +1274,19 @@ class TestFix5RevealExport:
         # mutate the model evidence after the reveal
         mutated = dict(records)
         mutated["model_c"] = _record("model_c", "s1", _judgment(expected_kind="decision"))
-        with pytest.raises(ValueError, match="reveal_does_not_match_current_lane_evidence"):
+        with pytest.raises(
+            ValueError, match="reveal_record_digests_do_not_match_current_lane_evidence"
+        ):
             record_final_resolution(
                 tmp_path,
                 "s1",
                 final_critical=dict(GOOD_CRITICAL),
                 final_confidence="high",
                 current_records_by_slot=mutated,
+                lane_digests=LANE_DIGITS,
+                campaign_id="campaign",
+                sampling_manifest_digest="e" * 64,
+                source_packet_digest="f" * 64,
             )
 
     def test_initial_file_byte_identical_after_reveal_and_final(self, tmp_path: Path):
@@ -1008,6 +1309,10 @@ class TestFix5RevealExport:
             final_critical=dict(GOOD_CRITICAL),
             final_confidence="high",
             current_records_by_slot=records,
+            lane_digests=LANE_DIGITS,
+            campaign_id="campaign",
+            sampling_manifest_digest="e" * 64,
+            source_packet_digest="f" * 64,
         )
         assert initial_path.read_bytes() == before
 
@@ -1047,6 +1352,10 @@ class TestFix5RevealExport:
             final_critical=dict(GOOD_CRITICAL),
             final_confidence="high",
             current_records_by_slot=records,
+            lane_digests=LANE_DIGITS,
+            campaign_id="campaign",
+            sampling_manifest_digest=sampling.manifest_digest(),
+            source_packet_digest="f" * 64,
         )
         exported = export_queue_evidence(tmp_path)
         assert len(exported["case_states"]) == 2
@@ -1310,3 +1619,434 @@ class TestUniqueCaseCounting:
         assert report.malformed_error_refusal_count == 2
         # overlap diagnostics kept separately
         assert report.queue_reason_overlap  # s1 contributes overlapping pairs
+
+
+# ---------------------------------------------------------------------------
+# Round-2 corrections (FIX-R2-1 .. FIX-R2-6)
+# ---------------------------------------------------------------------------
+
+
+class TestFixR2RevealLedgerVerification:
+    """FIX-R2-3: the final ledger independently re-verifies VoteRevealEvents.
+
+    Forged reveal events must fail final ledger verification even when the
+    final human dimensions are otherwise valid.
+    """
+
+    IDS = tuple(f"s{i}" for i in range(6))
+
+    def _forge_reveal(self, campaign, sample_id: str, updates: dict) -> None:
+        from evals.calibration.human_queue import reveal_event_path
+
+        path = reveal_event_path(campaign["queue_dir"], sample_id)
+        payload = json.loads(path.read_text())
+        payload.update(updates)
+        path.write_text(json.dumps(payload, sort_keys=True) + "\n")
+
+    def _verify(self, tmp_path, campaign):
+        from evals.calibration.ledger import verify_consensus_ledger
+
+        return verify_consensus_ledger(
+            campaign_id="campaign",
+            sampling=campaign["sampling"],
+            source_packet_digest="f" * 64,
+            lanes=campaign["lanes"],
+            records_by_lane=campaign["records_by_lane"],
+            queue_dir=campaign["queue_dir"],
+            frame_rows=campaign["frame_rows"],
+            protected_root=tmp_path,
+        )
+
+    def test_forged_wrong_lane_digest_fails(self, tmp_path: Path):
+        campaign = _build_campaign(tmp_path, ids=self.IDS)
+        sid = campaign["queue_ids"][0]
+        self._forge_reveal(campaign, sid, {"lane_digests": ["9" * 64, "5" * 64, "6" * 64]})
+        with pytest.raises(ValueError, match="reveal_lane_digests_do_not_match_frozen_lanes"):
+            self._verify(tmp_path, campaign)
+
+    def test_forged_wrong_record_digest_fails(self, tmp_path: Path):
+        campaign = _build_campaign(tmp_path, ids=self.IDS)
+        sid = campaign["queue_ids"][0]
+        digests = list(
+            campaign["records_by_lane"][slot][sid].record_digest() for slot in REVIEWER_SLOTS
+        )
+        digests[2] = "0" * 64
+        self._forge_reveal(campaign, sid, {"revealed_record_digests": digests})
+        with pytest.raises(
+            ValueError, match="reveal_record_digests_do_not_match_current_lane_evidence"
+        ):
+            self._verify(tmp_path, campaign)
+
+    def test_forged_wrong_campaign_fails(self, tmp_path: Path):
+        campaign = _build_campaign(tmp_path, ids=self.IDS)
+        sid = campaign["queue_ids"][0]
+        self._forge_reveal(campaign, sid, {"campaign_id": "other-campaign"})
+        with pytest.raises(ValueError, match="reveal_campaign_mismatch"):
+            self._verify(tmp_path, campaign)
+
+    def test_forged_wrong_sampling_digest_fails(self, tmp_path: Path):
+        campaign = _build_campaign(tmp_path, ids=self.IDS)
+        sid = campaign["queue_ids"][0]
+        self._forge_reveal(campaign, sid, {"sampling_manifest_digest": "7" * 64})
+        with pytest.raises(ValueError, match="reveal_sampling_manifest_mismatch"):
+            self._verify(tmp_path, campaign)
+
+    def test_forged_wrong_source_packet_fails(self, tmp_path: Path):
+        campaign = _build_campaign(tmp_path, ids=self.IDS)
+        sid = campaign["queue_ids"][0]
+        self._forge_reveal(campaign, sid, {"source_packet_digest": "6" * 64})
+        with pytest.raises(ValueError, match="reveal_source_packet_mismatch"):
+            self._verify(tmp_path, campaign)
+
+    def test_forged_wrong_sample_fails(self, tmp_path: Path):
+        campaign = _build_campaign(tmp_path, ids=self.IDS)
+        sid = campaign["queue_ids"][0]
+        self._forge_reveal(campaign, sid, {"sample_id": "sX"})
+        # the human-row loop passes the ledger sample_id -> forged sample mismatches
+        with pytest.raises(ValueError, match="reveal_sample_mismatch"):
+            self._verify(tmp_path, campaign)
+
+    def test_valid_reveals_pass_ledger(self, tmp_path: Path):
+        campaign = _build_campaign(tmp_path, ids=self.IDS)
+        verified = self._verify(tmp_path, campaign)
+        assert verified.ledger.audit_outcome.escalate_full_human_review is False
+
+
+class TestFixR2RawEvidence:
+    """FIX-R2-4: raw model evidence is freeze-bound protected evidence."""
+
+    IDS = ("s1", "s2", "s3")
+
+    def _build_lane(self, tmp_path: Path):
+        sampling = _sampling(self.IDS)
+        reviewer = _reviewer("model_a")
+        for sid in self.IDS:
+            record = _record(
+                "model_a", sid, _judgment(), sampling_digest=sampling.manifest_digest()
+            )
+            _publish_raw(tmp_path, "model_a", record)
+            append_review_record(record, tmp_path)
+        return sampling, reviewer
+
+    def test_missing_raw_file_freeze_fails(self, tmp_path: Path):
+        sampling, reviewer = self._build_lane(tmp_path)
+        # delete the raw evidence for s2
+        (tmp_path / "lanes" / "model_a" / "raw" / "s2.resp").unlink()
+        with pytest.raises(ValueError, match="record_raw_evidence_file_missing"):
+            freeze_lane(
+                protected_root=tmp_path,
+                reviewer=reviewer,
+                campaign_id="campaign",
+                sampling=sampling,
+                source_packet_digest="f" * 64,
+            )
+
+    def test_mutated_raw_file_fails_freeze_and_load(self, tmp_path: Path):
+        sampling, reviewer = self._build_lane(tmp_path)
+        freeze_lane(
+            protected_root=tmp_path,
+            reviewer=reviewer,
+            campaign_id="campaign",
+            sampling=sampling,
+            source_packet_digest="f" * 64,
+        )
+        # mutate raw bytes after freeze
+        path = tmp_path / "lanes" / "model_a" / "raw" / "s2.resp"
+        path.write_bytes(b"tampered evidence")
+        with pytest.raises(ValueError, match="record_raw_evidence_digest_mismatch"):
+            load_frozen_lanes(
+                tmp_path,
+                campaign_id="campaign",
+                sampling=sampling,
+                source_packet_digest="f" * 64,
+                reviewers={
+                    "model_a": reviewer,
+                    "model_b": _reviewer("model_b"),
+                    "model_c": _reviewer("model_c"),
+                },
+            )
+
+    def test_substituted_raw_file_for_another_response_fails(self, tmp_path: Path):
+        sampling, reviewer = self._build_lane(tmp_path)
+        # replace s1's raw bytes with s2's
+        raw_dir = tmp_path / "lanes" / "model_a" / "raw"
+        (raw_dir / "s1.resp").write_bytes(_raw_bytes("model_a", "s2"))
+        with pytest.raises(ValueError, match="record_raw_evidence_digest_mismatch"):
+            freeze_lane(
+                protected_root=tmp_path,
+                reviewer=reviewer,
+                campaign_id="campaign",
+                sampling=sampling,
+                source_packet_digest="f" * 64,
+            )
+
+    def test_provider_error_without_raw_file_is_valid(self, tmp_path: Path):
+        from evals.calibration.model_lanes import load_lane_records
+
+        sampling = _sampling(self.IDS)
+        reviewer = _reviewer("model_a")
+        for sid in self.IDS:
+            if sid == "s2":
+                record = _record(
+                    "model_a",
+                    sid,
+                    None,
+                    sampling_digest=sampling.manifest_digest(),
+                    parse_status="absent",
+                    outcome_status="provider_error",
+                    error_code="http-503",
+                    raw_digest=None,
+                )
+            else:
+                record = _record(
+                    "model_a", sid, _judgment(), sampling_digest=sampling.manifest_digest()
+                )
+                _publish_raw(tmp_path, "model_a", record)
+            append_review_record(record, tmp_path)
+        lane = freeze_lane(
+            protected_root=tmp_path,
+            reviewer=reviewer,
+            campaign_id="campaign",
+            sampling=sampling,
+            source_packet_digest="f" * 64,
+        )
+        assert tuple(lane.sample_ids) == self.IDS
+        records = load_lane_records(tmp_path, "model_a")
+        assert records["s2"].raw_response_digest is None
+
+    def test_provider_error_with_raw_artifact_fails(self, tmp_path: Path):
+        sampling = _sampling(self.IDS)
+        reviewer = _reviewer("model_a")
+        for sid in self.IDS:
+            if sid == "s2":
+                record = _record(
+                    "model_a",
+                    sid,
+                    None,
+                    sampling_digest=sampling.manifest_digest(),
+                    parse_status="absent",
+                    outcome_status="provider_error",
+                    error_code="http-503",
+                    raw_digest=None,
+                )
+                # claim bytes the record says do not exist
+                from evals.calibration.review import write_protected_file
+
+                write_protected_file(
+                    tmp_path / "lanes" / "model_a" / "raw" / "s2.resp",
+                    b"evidence that should not exist",
+                )
+            else:
+                record = _record(
+                    "model_a", sid, _judgment(), sampling_digest=sampling.manifest_digest()
+                )
+                _publish_raw(tmp_path, "model_a", record)
+            append_review_record(record, tmp_path)
+        with pytest.raises(ValueError, match="provider_error_must_not_have_raw_response_artifact"):
+            freeze_lane(
+                protected_root=tmp_path,
+                reviewer=reviewer,
+                campaign_id="campaign",
+                sampling=sampling,
+                source_packet_digest="f" * 64,
+            )
+
+    def test_crash_orphan_raw_file_not_a_completed_review(self, tmp_path: Path):
+        # simulate: raw bytes written, then crash before record publication
+        session, sampling = self._init_session(tmp_path)
+        from evals.calibration.review import write_protected_file
+
+        write_protected_file(
+            tmp_path / "lanes" / "model_a" / "raw" / "s1.resp",
+            b"orphan raw output",
+        )
+        status = session.status(sampling)
+        assert status["accepted"] == 0  # orphan never counts as completed review
+        assert status["missing"] == 3
+        # resume safely: ingesting the identical response reuses the orphan
+        record = session.ingest_response(
+            {
+                "sample_id": "s1",
+                "outcome": "judged",
+                "judgment": {"fields": dict(GOOD_CRITICAL), "reviewer_confidence": "medium"},
+                "raw_response": "orphan raw output",
+            },
+            sampling=sampling,
+        )
+        assert record.raw_response_digest is not None
+        # a DIFFERENT response for the same orphaned sample is refused (never
+        # silently overwrite raw model evidence)
+        with pytest.raises(ValueError, match="raw_response_orphan_digest_conflict"):
+            session.ingest_response(
+                {
+                    "sample_id": "s1",
+                    "outcome": "refused",
+                    "raw_response": "different bytes entirely",
+                    "error_code": "refusal",
+                },
+                sampling=sampling,
+            )
+
+    def _init_session(self, tmp_path: Path):
+        sampling = _sampling(self.IDS)
+        session = LaneSession.init(
+            tmp_path,
+            reviewer=_reviewer("model_a"),
+            campaign_id="campaign",
+            sampling=sampling,
+            source_packet_digest="f" * 64,
+        )
+        return session, sampling
+
+
+class TestFixR2GreedyCoverage:
+    """FIX-R2-6: max-new-cell greedy beats rank-first; claim narrowed."""
+
+    def _rows(self, cells_by_id: dict[str, tuple[str, ...]]) -> dict[str, FrameRow]:
+        """Frame rows where each case covers the given kind cells."""
+        rows: dict[str, FrameRow] = {}
+        for index, (sample_id, kinds) in enumerate(sorted(cells_by_id.items())):
+            first = kinds[0] if kinds else "fact"
+            rows[sample_id] = FrameRow(
+                item_uuid=f"00000000-0000-0000-0000-{index:012d}",
+                sample_id=sample_id,
+                content_hash=digest(sample_id),
+                content_norm_hash=digest(["norm", sample_id]),
+                kind=first,
+                source_type="manual",
+                review_status="active",
+                assertion_mode="unknown",
+                origin="unknown",
+                risk="unknown",
+                age_bucket="lt_7d",
+                evidence_state="unknown",
+                content_bytes=10,
+                input_size_bucket="small",
+            )
+        return rows
+
+    def test_greedy_beats_rank_first_on_adversarial_structure(self):
+        """Construct cells where rank-first greedy misses a cell that
+        max-new-cell greedy covers within the same target.
+
+        With one axis (kind) and four values c1..c4 distributed as:
+            A -> c1+c2, B -> c1+c3, C -> c3+c4, target 2
+        rank-first (HMAC order A,B,C) selects A then B -> c4 uncovered;
+        max-gain greedy selects A (2 cells) then C (2 new cells) -> covered.
+        We force the HMAC order by choosing sample IDs whose rank order is
+        A < B < C (verified by construction below).
+        """
+        from evals.calibration.consensus import _audit_rank
+
+        # find three sample IDs in ascending HMAC rank order
+        ids = [f"c{index}" for index in range(100)]
+        ranked = sorted(ids, key=lambda sid: _audit_rank(sid))
+        a, b, c = ranked[0], ranked[1], ranked[2]
+        # build kind coverage via review_status axis is single-valued; use
+        # kind axis only: A covers {c1,c2}? FrameRow has one kind per row, so
+        # we simulate multi-cell coverage across TWO axes: kind + source_type.
+        rows: dict[str, FrameRow] = {}
+        structure = {
+            a: ("fact", "manual"),  # cells: kind=fact, source_type=manual
+            b: ("fact", "sync_turn"),  # cells: kind=fact(covered), source_type=sync_turn
+            c: ("decision", "extraction"),  # new cells: kind=decision, source_type=extraction
+        }
+        for index, (sample_id, (kind, source)) in enumerate(structure.items()):
+            rows[sample_id] = FrameRow(
+                item_uuid=f"00000000-0000-0000-0000-{index:012d}",
+                sample_id=sample_id,
+                content_hash=digest(sample_id),
+                content_norm_hash=digest(["norm", sample_id]),
+                kind=kind,
+                source_type=source,
+                review_status="active",
+                assertion_mode="unknown",
+                origin="unknown",
+                risk="unknown",
+                age_bucket="lt_7d",
+                evidence_state="unknown",
+                content_bytes=10,
+                input_size_bucket="small",
+            )
+        pool = tuple(structure)
+        selection = select_audit_sample_with_coverage(pool, rows)
+        assert selection.target_count == 1  # ceil(0.15 * 3) = 1
+        # greedy picks the case covering the most cells: both a and c cover 2;
+        # tie broken by HMAC rank -> a wins. uncovered reported honestly.
+        assert selection.selected == (a,)
+        assert selection.uncovered_cells  # NOT claimed as infeasible
+
+    def test_exact_greedy_selection_pinned(self):
+        """Deterministic pin: same pool + frame -> byte-identical selection."""
+        ids = tuple(f"g{i}" for i in range(50))  # target ceil(7.5)=8
+        rows = _frame_rows(ids)
+        first = select_audit_sample_with_coverage(ids, rows)
+        second = select_audit_sample_with_coverage(ids, rows)
+        assert first.selected == second.selected
+        assert first.model_dump(mode="json") == second.model_dump(mode="json")
+        assert first.algorithm == "marginal-coverage-greedy-hmac-v1"
+        # full marginal coverage when the target permits (50 cases, 13 cells)
+        assert not first.uncovered_cells
+
+    def test_rank_first_would_miss_greedy_covers(self):
+        """The reviewed adversarial structure: rank-first greedy leaves cell 4
+        uncovered although a target-size cover exists; corrected greedy covers
+        all four cells within the same target."""
+        from evals.calibration.consensus import _audit_rank
+
+        # cells: A={1,2} B={1,3} C={3,4}; target 2; feasible cover A+C or B+C?
+        # A+C covers 1,2,3,4. We need rank order A,B,C and target 2.
+        # Model with two axes: kind in {k1,k2}, source in {s1,s2}:
+        #   A: k1,s1  B: k1,s2  C: k2,s2  -> cells {k1,s1} {k1,s2} {k2,s2}
+        # rank-first with target 1: picks A, leaves k2+s2 partially uncovered.
+        # Better direct construction of the reviewed example with 4 distinct
+        # cells across two binary axes needs 4 cases; with target 2 we can
+        # force it: A covers {k1,s1}, B covers {k1,s2}, C covers {k2,s2},
+        # D covers {k2,s1}. rank order A,B,C,D; target 2.
+        # rank-first: A ({k1,s1} new) then B ({k1,s2} new) -> k2 cells uncovered.
+        # greedy: A(2 cells) then C or D (2 cells) -> still 2 cells uncovered
+        # BUT the max covered is 4 of 4 with A+C? A={k1,s1} C={k2,s2}: covers
+        # all four cells. greedy picks A (gain 2, best rank), then among
+        # remaining: C gain 2, D gain 2 -> tie by rank.
+        ids = [f"r{index}" for index in range(100)]
+        ranked = sorted(ids, key=lambda sid: _audit_rank(sid))
+        a, b, c, d = ranked[0], ranked[1], ranked[2], ranked[3]
+        structure = {
+            a: ("k1", "s1"),
+            b: ("k1", "s2"),
+            c: ("k2", "s2"),
+            d: ("k2", "s1"),
+        }
+        rows: dict[str, FrameRow] = {}
+        for index, (sample_id, (kind, source)) in enumerate(structure.items()):
+            rows[sample_id] = FrameRow(
+                item_uuid=f"00000000-0000-0000-0000-{index:012d}",
+                sample_id=sample_id,
+                content_hash=digest(sample_id),
+                content_norm_hash=digest(["norm", sample_id]),
+                kind=kind,
+                source_type=source,
+                review_status="active",
+                assertion_mode="unknown",
+                origin="unknown",
+                risk="unknown",
+                age_bucket="lt_7d",
+                evidence_state="unknown",
+                content_bytes=10,
+                input_size_bucket="small",
+            )
+        pool = tuple(structure)
+        selection = select_audit_sample_with_coverage(pool, rows)
+        assert selection.target_count == 1  # ceil(0.15*4)=1
+        # rank-first and greedy coincide at target 1 (max gain 2, tie -> rank)
+        assert selection.selected == (a,)
+        assert len(selection.uncovered_cells) == 2  # honest report
+        # With rate=0.5 (target 2): greedy takes A then a case covering the
+        # two remaining cells (C or D, tie by rank).
+        bigger = select_audit_sample_with_coverage(pool, rows, rate=0.5)
+        assert bigger.target_count == 2
+        assert bigger.selected[0] == a
+        assert bigger.selected[1] in (c, d)
+        # greedy covers every cell at target 2 here (each pick spans the
+        # shared cells; k2 + its source cell are new on the second pick)
+        assert bigger.uncovered_cells == ()

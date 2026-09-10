@@ -317,8 +317,31 @@ class LaneSession:
         *,
         sampling: SamplingManifest,
     ) -> ModelReviewRecord:
-        """Validate + append ONE structured response (fail closed, FIX-1 bound)."""
+        """Validate + append ONE structured response (fail closed, FIX-1 bound).
+
+        FIX-R2-4 interruption-safe ordering: the raw response bytes are
+        written EXCLUSIVELY FIRST (never overwriting existing evidence), the
+        record is constructed/validated against that exact digest, and only
+        then is the accepted record published. A crash can therefore leave at
+        most an orphan raw file without an accepted record — never an
+        accepted record lacking its bound raw bytes. Re-ingesting the same
+        sample after such a crash reuses the identical raw bytes
+        (byte-identical rewrite is refused, not silently overwritten).
+        """
         record = self.build_record(response, sampling=sampling)
+        raw_response = response.get("raw_response")
+        if raw_response:
+            raw_path = self.lane_root / "raw" / f"{record.sample_id}.resp"
+            payload = raw_response.encode()
+            if raw_path.exists():
+                # Never silently overwrite raw model evidence: the orphan
+                # must hash identically to what this response claims.
+                if hashlib.sha256(raw_path.read_bytes()).hexdigest() != (
+                    record.raw_response_digest
+                ):
+                    raise ValueError("raw_response_orphan_digest_conflict")
+            else:
+                write_protected_file(raw_path, payload)
         append_review_record(
             record,
             self.protected_root,
@@ -327,11 +350,6 @@ class LaneSession:
             sampling=sampling,
             source_packet_digest=self.source_packet_digest,
         )
-        raw_response = response.get("raw_response")
-        if raw_response:
-            write_protected_file(
-                self.lane_root / "raw" / f"{record.sample_id}.resp", raw_response.encode()
-            )
         return record
 
     def ingest_jsonl(

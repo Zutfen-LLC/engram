@@ -107,3 +107,75 @@ def build_receipts(
             placeholder.model_copy(update={"receipt_digest": placeholder.verified_payload_digest()})
         )
     return receipts
+
+
+def build_verified_ledger(
+    ids: tuple[str, ...],
+    critical_by_id: dict[str, dict],
+    origin: str = "cross_model_consensus",
+):
+    """Minimal VerifiedConsensusLedger for consumer-semantics unit tests.
+
+    NOTE: this bypasses verify_consensus_ledger (it is a test convenience for
+    exercising observation/floor semantics only). Provenance-enforcement tests
+    live in test_calibration_206_corrections.py and always go through the real
+    verifier.
+    """
+    from evals.calibration.consensus import (
+        CONSENSUS_PROTOCOL_VERSION,
+        AuditOutcomeRecord,
+        AuditSelection,
+        ConsensusLedger,
+        ConsensusProvenanceWrapper,
+    )
+    from evals.calibration.ledger import VerifiedConsensusLedger
+
+    wrappers = tuple(
+        ConsensusProvenanceWrapper(
+            protocol_version=CONSENSUS_PROTOCOL_VERSION,
+            campaign_id="campaign",
+            sampling_manifest_digest="e" * 64,
+            source_packet_digest="f" * 64,
+            sample_id=sample_id,
+            first_pass_record_digests=("1" * 64, "2" * 64, "3" * 64),
+            consensus_reached=True,
+            entered_human_queue=origin != "cross_model_consensus",
+            queue_reasons=()
+            if origin == "cross_model_consensus"
+            else ("critical_field_disagreement",),
+            final_label_origin=origin,  # type: ignore[arg-type]
+            final_dimensions=dict(critical_by_id[sample_id]),
+            audit_selected=False,
+        )
+        for sample_id in ids
+    )
+    ledger = ConsensusLedger(
+        protocol_version=CONSENSUS_PROTOCOL_VERSION,
+        campaign_id="campaign",
+        sampling_manifest_digest="e" * 64,
+        source_packet_digest="f" * 64,
+        lane_digests=("4" * 64, "5" * 64, "6" * 64),
+        queue_evidence_sha256="7" * 64,
+        audit_outcome=AuditOutcomeRecord(
+            audited_count=0,
+            material_disagreements=0,
+            high_consequence_misses=0,
+            material_reversals=0,
+            material_disagreement_rate=None,
+            escalate_full_human_review=False,
+        ),
+        audit_selection=AuditSelection(
+            selected=(),
+            target_count=0,
+            population_count=len(ids),
+            covered_cells=(),
+            uncovered_cells=(),
+        ),
+        wrappers=wrappers,
+    )
+    return VerifiedConsensusLedger(
+        ledger=ledger,
+        queue_evidence_sha256="7" * 64,
+        records_by_lane={},
+        lanes=(),
+    )

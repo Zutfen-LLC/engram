@@ -160,9 +160,9 @@ confidence weighting, reputation weighting, or a fourth model.
   mandatory human queue (they are not ordinary audit-only cases — audit-only
   cases come from the non-high consensus pool).
 
-### 6a. Marginal-coverage selection algorithm (FIX-2)
+### 6a. Marginal-coverage selection algorithm (FIX-2, corrected FIX-R2-6)
 
-Algorithm `marginal-coverage-hmac-rank-v1`
+Algorithm `marginal-coverage-greedy-hmac-v1`
 (`select_audit_sample_with_coverage`), deterministic and mechanically
 reproducible — no optimization solver:
 
@@ -170,19 +170,22 @@ reproducible — no optimization solver:
    frozen axis — `source_type`, `kind`, `review_status`, `age_bucket` —
    using only pre-existing frozen frame metadata.
 2. The frozen HMAC seed/rank is the ONLY ranking and tie-break primitive.
-3. Phase A walks cases in ascending HMAC rank and selects each case covering
-   at least one not-yet-covered marginal cell, until every cell is covered
-   or the target count is reached.
+3. Phase A deterministically maximizes marginal coverage under the frozen
+   greedy rule: while slots remain and uncovered cells exist, select the
+   remaining case covering the MOST currently-uncovered cells, breaking
+   ties by frozen HMAC rank.
 4. Phase B fills remaining audit slots by global HMAC rank.
 5. The selection never exceeds the frozen target count.
 
-If the target is smaller than the number of coverable cells, Phase A's
-rank-greedy order IS the deterministic prioritization (the covered cells are
-exactly those owned by the globally highest-ranked cases) and the uncovered
-cells are reported in the `AuditSelection.uncovered_cells` evidence —
-coverage is never silently claimed. Reporting populates the privacy-safe
-`aggregate_by_axis` (consensus and audit-selected counts per cell; no sample
-IDs, no tenant content) in the correlation report.
+**Truthful guarantee (FIX-R2-6).** This algorithm deterministically
+maximizes marginal coverage under the frozen greedy rule; it is NOT an
+exact set-cover solver. `uncovered_cells != ()` does NOT prove full coverage
+was mathematically infeasible at the target size — it reports exactly the
+cells the frozen greedy rule left uncovered. The protocol claims only:
+deterministic maximum marginal coverage under the greedy rule, with
+uncovered cells reported honestly. Reporting populates the privacy-safe
+`aggregate_by_axis` (consensus and audit-selected counts per cell; no
+sample IDs, no tenant content) in the correlation report.
 
 ### 6b. Frozen audit escalation threshold (FIX-3)
 
@@ -239,17 +242,28 @@ The final calibration ledger distinguishes:
 **The verified consensus ledger is the sole normal authority into floors and
 fitting.** `verify_consensus_ledger` (`evals/calibration/ledger.py`)
 re-derives every row from protected evidence — the three frozen lanes (each
-record FIX-1-bound to its lane identity), the initial classifications, the
-deterministic audit selection, the completed human queue evidence, and the
-frozen audit outcome — and fails closed on: fabricated unanimous labels that
+validated through the FULL canonical provenance path: FIX-1 identity binding,
+campaign/sampling/packet, exact frozen membership/order, AND current record
+digests equal to the frozen `LaneFreeze.record_digests`, FIX-R2-1; plus
+raw-response evidence verification, FIX-R2-4), the initial classifications,
+the deterministic audit selection, the completed human queue evidence (every
+reveal event independently re-verified, FIX-R2-3), and the audit outcome
+MECHANICALLY DERIVED from that evidence (FIX-R2-2 — a supplied/stored
+`AuditOutcomeRecord` is audit provenance that must match the derived result
+field-exactly; it is never authority) — and fails closed on: fabricated unanimous labels that
 differ from the actual three-model records; consensus provenance on a 2–1
 case; consensus provenance on an audit-selected case; human provenance
 without initial/reveal/final evidence; final dimensions differing from the
 stored final resolution; missing, duplicate, or extra samples; unresolved
 required human cases; and escalation with an automatic-consensus row left
 behind. `consensus_reference_observations` / `consensus_reference_completion`
-consume this verified ledger; there is no normal calibration path accepting
-hand-constructed `ReferenceLabel` lists.
+consume this verified ledger ONLY (FIX-R2-5): the `reference_labels`
+parameter no longer exists on any consensus API — a hand-constructed
+`ReferenceLabel` list cannot be passed at all. The pre-#206 human
+dual-review workflow keeps its own separate `LabelRecord`/verified
+human-ledger path; nothing is multiplexed through #206 `ReferenceLabel`.
+No `VerifiedConsensusLedger` => no #206 calibration observations, no floor
+support, no fitting.
 
 Per row, protected provenance reconstructs: the three first-pass model record
 digests, whether consensus was reached, human-queue entry and reasons, the
@@ -278,9 +292,14 @@ Engram product UI.
 campaign/protocol/sampling/source-packet identity; the EXACT three
 first-pass model record digests in frozen slot order; the three frozen lane
 digests; and the reveal timestamp. Reveal before the initial judgment fails;
-`record_final_resolution` verifies the reveal event matches the CURRENT
-frozen lane evidence (a model record mutated after the reveal fails
-resolution) and never mutates the immutable initial judgment.
+`record_final_resolution` verifies the reveal event through the canonical
+`validate_reveal_binding` validator — identity (protocol/campaign/sampling/
+packet/sample), the exact three CURRENT record digests, and the exact three
+frozen lane digests must all match; strong verification is mandatory with no
+bypass (FIX-R2-3). `verify_consensus_ledger` independently re-verifies every
+human-resolved row's reveal event against the same current frozen evidence
+(the final ledger never trusts the writer), and never mutates the immutable
+initial judgment.
 
 ### 8b. Queue export (FIX-5)
 
@@ -334,8 +353,16 @@ python -m evals.calibration freeze-model-lane …   # exact 402 required
 Guarantees: one lane binds one frozen `ReviewerIdentity` (exclusive-create);
 requests carry only that lane's neutral case input plus the frozen labeling
 instructions/schema; raw response bytes are preserved under
-`lanes/<slot>/raw/` with their digest recorded; ingestion is append-only and
-resume-safe (accepted evidence is never replaced, duplicates refused,
+`lanes/<slot>/raw/` with their digest recorded and are FREEZE-BOUND
+(FIX-R2-4): at lane freeze/load and final ledger verification every accepted
+judged/refused/malformed record must have its raw file present with
+SHA256(bytes) == `record.raw_response_digest`, and every `provider_error`
+record must claim no raw digest and have no raw artifact; ingestion writes
+raw bytes EXCLUSIVELY BEFORE publishing the accepted record (a crash can
+leave at most an orphan raw file, never an accepted record lacking its
+evidence; orphans never count as completed reviews and are never silently
+overwritten — a conflicting re-ingest is refused); ingestion is append-only
+and resume-safe (accepted evidence is never replaced, duplicates refused,
 requests resume from the next missing sample); status reports
 completion/missing/failure counts (never protected sample IDs); freeze
 requires exact full frozen membership. A response envelope never supplies

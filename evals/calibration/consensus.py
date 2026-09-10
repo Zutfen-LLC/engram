@@ -526,7 +526,7 @@ class AuditSelection(Record):
     population_count: int
     covered_cells: tuple[str, ...]
     uncovered_cells: tuple[str, ...]
-    algorithm: Literal["marginal-coverage-hmac-rank-v1"] = "marginal-coverage-hmac-rank-v1"
+    algorithm: Literal["marginal-coverage-greedy-hmac-v1"] = "marginal-coverage-greedy-hmac-v1"
 
 
 def select_audit_sample_with_coverage(
@@ -536,25 +536,26 @@ def select_audit_sample_with_coverage(
     rate: float = AUDIT_SAMPLE_RATE,
     seed: str = AUDIT_SELECTION_SEED,
 ) -> AuditSelection:
-    """Frozen 15% audit selection WITH marginal coverage (FIX-2).
+    """Frozen 15% audit selection WITH marginal coverage (FIX-2, FIX-R2-6).
 
-    Deterministic, label-blind algorithm (``marginal-coverage-hmac-rank-v1``):
+    Deterministic, label-blind algorithm (``marginal-coverage-greedy-hmac-v1``):
 
     1. Required marginal cells are derived from the consensus population per
        frozen axis (``source_type``, ``kind``, ``review_status``,
        ``age_bucket``) using only pre-existing frozen frame metadata.
     2. The frozen HMAC seed/rank is the ONLY ranking and tie-break primitive.
-    3. Phase A walks cases in ascending HMAC rank and selects each case that
-       covers at least one not-yet-covered marginal cell, until every cell is
-       covered or the target count is reached.
+    3. Phase A greedily maximizes marginal coverage: while slots remain and
+       uncovered cells exist, select the remaining case covering the MOST
+       currently-uncovered cells, breaking ties by frozen HMAC rank.
     4. Phase B fills the remaining audit slots by global HMAC rank.
     5. The selection never exceeds ``ceil(rate * N)``.
 
-    If the target is smaller than the number of coverable cells, Phase A's
-    rank-greedy order IS the documented deterministic prioritization: the
-    cells covered are exactly those owned by the globally highest-ranked
-    cases, and the uncovered cells are reported — coverage is never silently
-    claimed.
+    Truthful guarantee (FIX-R2-6, option B): this algorithm deterministically
+    MAXIMIZES marginal coverage under the frozen greedy rule; it is NOT an
+    exact set-cover solver, and ``uncovered_cells != ()`` does NOT prove that
+    full coverage was mathematically infeasible at the target size — only
+    that the frozen greedy rule left these cells uncovered. Uncovered cells
+    are reported honestly, never silently claimed as covered.
     """
     if not 0.0 < rate <= 1.0:
         raise ValueError("audit_rate_out_of_range")
@@ -574,26 +575,32 @@ def select_audit_sample_with_coverage(
             uncovered_cells=(),
         )
     ranked = sorted(unique, key=lambda sample_id: _audit_rank(sample_id, seed))
+
+    def cells_of(sample_id: str) -> frozenset[str]:
+        row = frame_rows[sample_id]
+        return frozenset(f"{axis}={getattr(row, axis)}" for axis in AUDIT_COVERAGE_AXES)
+
     cells: set[str] = set()
     for sid in unique:
-        row = frame_rows[sid]
-        for axis in AUDIT_COVERAGE_AXES:
-            cells.add(f"{axis}={getattr(row, axis)}")
+        cells |= cells_of(sid)
     covered: set[str] = set()
     selected: list[str] = []
-    # Phase A: rank-greedy marginal coverage.
-    for sid in ranked:
-        if len(selected) >= target:
+    chosen: set[str] = set()
+    # Phase A: greedy max-new-cell coverage, ties by frozen HMAC rank (FIX-R2-6).
+    while len(selected) < target and covered < cells:
+        remaining = [sid for sid in ranked if sid not in chosen]
+        best: str | None = None
+        best_gain = 0
+        for sid in remaining:
+            gain = len(cells_of(sid) - covered)
+            if gain > best_gain:
+                best, best_gain = sid, gain
+        if best is None or best_gain <= 0:
             break
-        if cells <= covered:
-            break
-        row = frame_rows[sid]
-        new_cells = {f"{axis}={getattr(row, axis)}" for axis in AUDIT_COVERAGE_AXES} - covered
-        if new_cells:
-            selected.append(sid)
-            covered |= new_cells
+        selected.append(best)
+        chosen.add(best)
+        covered |= cells_of(best)
     # Phase B: global rank fill.
-    chosen = set(selected)
     for sid in ranked:
         if len(selected) >= target:
             break
@@ -715,17 +722,32 @@ def evaluate_audit_outcome(
 ) -> dict[str, Any]:
     """Derive the frozen audit outcome from audited-case human resolutions.
 
-    ``audit_results`` maps audited sample ID -> ``{"human_final_critical": …,
-    "consensus_critical": …}`` (the human FINAL resolution, not the initial
-    judgment). High-consequence misses are audited consensus errors the human
-    final resolution adjudicates as ``consequence=high``.
+    ``audit_results`` maps audited sample ID -> ``{"human_final_critical": …}``
+    — ONLY the human FINAL resolution. The model-consensus side is NEVER
+    caller-supplied (FIX-R2-2): it is derived here from the frozen three
+    records per sample in ``records_by_lane`` via
+    ``unanimous_consensus_critical``. An audited sample lacking three
+    unanimous parsed judgments fails closed (it could not have been an
+    audit-selected consensus case). High-consequence misses are audited
+    consensus errors the human final resolution adjudicates as
+    ``consequence=high``.
     """
     material = 0
     high_misses = 0
     reversals = 0
     for sample_id, result in audit_results.items():
+        lane_records = records_by_lane.get(sample_id, {})
+        judgments: list[ModelJudgment] = []
+        for slot in REVIEWER_SLOTS:
+            record = lane_records.get(slot)
+            if record is not None and record.judgment is not None:
+                judgments.append(record.judgment)
+        if len(judgments) != len(REVIEWER_SLOTS):
+            raise ValueError(f"audit_consensus_not_derivable_from_records:{sample_id}")
+        consensus = unanimous_consensus_critical(judgments)
+        if consensus is None:
+            raise ValueError(f"audit_consensus_not_derivable_from_records:{sample_id}")
         human_final = result["human_final_critical"]
-        consensus = result["consensus_critical"]
         if not material_disagreement(consensus, human_final):
             continue
         material += 1
@@ -739,6 +761,38 @@ def evaluate_audit_outcome(
         material_disagreements=material,
         high_consequence_misses=high_misses,
         material_reversals=reversals,
+    )
+
+
+def audit_outcome_record_from_evidence(
+    *,
+    audit_selected_ids: Sequence[str],
+    records_by_lane: Mapping[str, Mapping[str, ModelReviewRecord]],
+    final_resolutions: Mapping[str, Mapping[str, Any]],
+    suggested_kind_by_sample: Mapping[str, str] | None = None,
+) -> AuditOutcomeRecord:
+    """Derive the authoritative ``AuditOutcomeRecord`` from protected evidence.
+
+    FIX-R2-2: the audit outcome is a DERIVED FACT. Consensus critical fields
+    come from the frozen three model records; human authority comes from the
+    protected human FINAL resolutions. Nothing caller-asserted enters the
+    computation. Used by ``verify_consensus_ledger`` as the sole authority.
+    """
+    derived = evaluate_audit_outcome(
+        audit_results={
+            sample_id: {"human_final_critical": final_resolutions[sample_id]}
+            for sample_id in audit_selected_ids
+        },
+        records_by_lane=records_by_lane,
+        suggested_kind_by_sample=suggested_kind_by_sample,
+    )
+    return AuditOutcomeRecord(
+        audited_count=derived["audited_count"],
+        material_disagreements=derived["material_disagreements"],
+        high_consequence_misses=derived["high_consequence_misses"],
+        material_reversals=derived["material_reversals"],
+        material_disagreement_rate=derived["material_disagreement_rate"],
+        escalate_full_human_review=derived["escalate_full_human_review"],
     )
 
 

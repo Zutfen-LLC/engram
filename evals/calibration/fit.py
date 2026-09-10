@@ -40,32 +40,24 @@ from evals.calibration.ledger import VerifiedConsensusLedger
 from evals.calibration.review import verify_ledger
 
 
-def _verified_ledger_rows(
-    verified_ledger: VerifiedConsensusLedger | None,
-    reference_labels: list[ReferenceLabel] | None,
-) -> list[ReferenceLabel]:
-    """FIX-4 boundary: the NORMAL path requires a verified consensus ledger.
+def _verified_ledger_rows(verified_ledger: VerifiedConsensusLedger) -> list[ReferenceLabel]:
+    """FIX-4/FIX-R2-5 boundary: the ONLY path into #206 consensus
+    observations/completion is a ``VerifiedConsensusLedger`` re-derived from
+    protected evidence by ``evals.calibration.ledger.verify_consensus_ledger``.
 
-    ``reference_labels`` is accepted ONLY for the frozen #202-era human dual
-    review path compatibility in tests that intentionally exercise the
-    pre-#206 methodology; the consensus campaign path must hand in a
-    ``VerifiedConsensusLedger`` whose rows were re-derived from protected
-    evidence by ``evals.calibration.ledger.verify_consensus_ledger``.
+    There is NO consensus fitting/completion API that accepts free-form
+    ``ReferenceLabel`` lists: the type alone proves nothing about provenance,
+    and the pre-#206 human dual-review workflow already has its own
+    ``LabelRecord``/verified human-ledger path.
     """
-    if verified_ledger is not None:
-        if reference_labels is not None:
-            raise ValueError("verified_ledger_and_reference_labels_exclusive")
-        return [
-            ReferenceLabel(
-                sample_id=row["sample_id"],
-                final_label_origin=row["final_label_origin"],
-                critical=row["critical"],
-            )
-            for row in verified_ledger.reference_rows()
-        ]
-    if reference_labels is None:
-        raise ValueError("verified_ledger_required_for_consensus_path")
-    return reference_labels
+    return [
+        ReferenceLabel(
+            sample_id=row["sample_id"],
+            final_label_origin=row["final_label_origin"],
+            critical=row["critical"],
+        )
+        for row in verified_ledger.reference_rows()
+    ]
 
 
 class ConsensusDimensionsView:
@@ -89,8 +81,7 @@ class ConsensusDimensionsView:
 def consensus_reference_observations(
     *,
     receipts: list[AssessmentExecutionReceipt],
-    verified_ledger: VerifiedConsensusLedger | None = None,
-    reference_labels: list[ReferenceLabel] | None = None,
+    verified_ledger: VerifiedConsensusLedger,
     target_identity: TargetIdentity,
     contract: AssessmentContract,
     split: SplitManifest,
@@ -104,12 +95,11 @@ def consensus_reference_observations(
     reviewed label is ALWAYS the final reference label, never a majority vote
     or an individual model judgment.
 
-    FIX-4: the normal calibration path consumes a ``VerifiedConsensusLedger``
-    (re-derived from protected evidence), not a free-form ``ReferenceLabel``
-    list. Passing hand-constructed labels is only possible on the frozen
-    pre-#206 human path, and passing both inputs is rejected.
+    FIX-4 + FIX-R2-5: the ONLY input path is a ``VerifiedConsensusLedger``
+    (re-derived from protected evidence). Free-form ``ReferenceLabel`` lists
+    are structurally rejected — the parameter no longer exists.
     """
-    labels = _verified_ledger_rows(verified_ledger, reference_labels)
+    labels = _verified_ledger_rows(verified_ledger)
     contract_digest = digest(contract.model_dump(mode="json"))
     by_sample = {label.sample_id: label for label in labels}
     if len(by_sample) != len(labels):
@@ -174,17 +164,15 @@ def consensus_reference_observations(
 
 def consensus_reference_completion(
     *,
-    verified_ledger: VerifiedConsensusLedger | None = None,
-    reference_labels: list[ReferenceLabel] | None = None,
+    verified_ledger: VerifiedConsensusLedger,
 ) -> list[ReferenceLabel]:
     """Completed reference labels accepted for floor counting (#206 lanes).
 
-    FIX-4: the normal path consumes a verified consensus ledger whose rows
-    were re-derived from protected evidence. Hand-constructed label lists are
-    only accepted on the frozen pre-#206 human path; supplying neither (or
-    both) fails closed.
+    FIX-4 + FIX-R2-5: the ONLY input path is a verified consensus ledger
+    whose rows were re-derived from protected evidence. There is no
+    ``reference_labels`` parameter and no other consensus completion API.
     """
-    labels = _verified_ledger_rows(verified_ledger, reference_labels)
+    labels = _verified_ledger_rows(verified_ledger)
     by_id: dict[str, ReferenceLabel] = {}
     for label in labels:
         if label.sample_id in by_id:

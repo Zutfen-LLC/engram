@@ -36,6 +36,7 @@ from evals.calibration.lane_binding import (
     validate_record_lane_binding,
     validate_records_lane_binding,
 )
+from evals.calibration.raw_evidence import validate_lane_raw_evidence
 from evals.calibration.review import (
     BlindPacket,
     _packet_file_payload,
@@ -204,6 +205,14 @@ def freeze_lane(
         sampling=sampling,
         source_packet_digest=source_packet_digest,
     )
+    # FIX-R2-4: raw model evidence is freeze-bound — every accepted record
+    # must have its protected raw bytes present and hashing to the claimed
+    # digest (provider_error records must claim none).
+    validate_lane_raw_evidence(
+        records,
+        protected_root=protected_root,
+        reviewer_slot=reviewer.reviewer_slot,
+    )
     ordered_ids = tuple(sampling.sample_ids)
     lane = LaneFreeze(
         protocol_version=CONSENSUS_PROTOCOL_VERSION,
@@ -235,13 +244,19 @@ def _load_one_frozen_lane(
     if lane.reviewer != reviewer:
         raise ValueError("lane_reviewer_identity_mismatch")
     records = load_lane_records(protected_root, reviewer.reviewer_slot)
-    # Full FIX-1 validation: identity binding + membership + live digests.
+    # Full FIX-1 + FIX-R2-4 validation: identity binding, membership, live
+    # digests, and bound raw-response evidence.
     validate_lane_provenance(
         lane,
         records,
         campaign_id=campaign_id,
         sampling=sampling,
         source_packet_digest=source_packet_digest,
+    )
+    validate_lane_raw_evidence(
+        records,
+        protected_root=protected_root,
+        reviewer_slot=reviewer.reviewer_slot,
     )
     return lane
 
