@@ -155,6 +155,7 @@ def _run_preflight() -> None:
     _run("mypy", "engram/")
     _run("mypy", "--explicit-package-bases", "evals/admission/")
     _run("mypy", "--explicit-package-bases", "evals/recall/")
+    _run("mypy", "--explicit-package-bases", "evals/calibration/")
 
     _section("Type Check: SDK")
     _run(

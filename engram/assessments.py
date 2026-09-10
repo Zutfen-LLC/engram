@@ -28,31 +28,43 @@ from engram.models import (
     MemoryAssessment,
     MemoryItem,
 )
-from engram.provider_clients import resolve_classification_provider
+from engram.provider_clients import (
+    ClassificationProviderConfig,
+    resolve_classification_provider,
+)
+
+
+def assessment_config_version(provider: ClassificationProviderConfig) -> str:
+    """The one canonical assessment config identity, as ``sha256:<64hex>``.
+
+    Every producer and consumer of assessment config identity -- the deployed
+    contract, calibration profiles, and frozen calibration campaign targets --
+    must use this exact representation. Comparisons are exact string equality;
+    a bare 64-hex digest is a different, non-production identity.
+    """
+    return digest(
+        {
+            "host": provider.sanitized_provider_host,
+            "endpoint_hash": digest(provider.base_url),
+            "temperature": 0,
+            "max_tokens": 1024,
+            "input_limit": 16000,
+        }
+    )
 
 
 def current_contract() -> AssessmentContract:
     """Identify the deployed inference contract without including credentials."""
     provider = resolve_classification_provider()
-    from engram.assessment_calibration import load_profiles
+    from engram.assessment_calibration import calibration_profiles_digest, load_profiles
 
     profiles = load_profiles(settings.assessment_calibration_profiles_path)
     return AssessmentContract(
         provider=provider.provider_adapter,
         model=provider.model,
-        config_version=digest(
-            {
-                "host": provider.sanitized_provider_host,
-                "endpoint_hash": digest(provider.base_url),
-                "temperature": 0,
-                "max_tokens": 1024,
-                "input_limit": 16000,
-            }
-        ),
+        config_version=assessment_config_version(provider),
         calibration_version=settings.assessment_calibration_version,
-        calibration_digest=digest([p.model_dump(mode="json") for p in profiles])
-        if profiles
-        else None,
+        calibration_digest=calibration_profiles_digest(profiles),
     )
 
 
@@ -128,9 +140,7 @@ async def evidence_snapshot(
     )
     if len(rows) > 64:
         raise ValueError("assessment evidence exceeds 64 extraction links")
-    return _snapshot_payload(
-        item, context, [_snapshot_root(dict(row)) for row in rows]
-    )
+    return _snapshot_payload(item, context, [_snapshot_root(dict(row)) for row in rows])
 
 
 def live_item(item: MemoryItem) -> bool:

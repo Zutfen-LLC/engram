@@ -57,7 +57,33 @@ async def _fresh_engine():
     # rows survive across test MODULES and their ON DELETE RESTRICT to
     # recall_logs breaks other files' unscoped `DELETE FROM recall_logs`
     # cleanup fixtures (e.g. tests/test_graph_recall.py).
+    #
+    # Several assessment/extraction tables reference tenants WITHOUT
+    # ON DELETE CASCADE (memory_assessments, assessment_requests,
+    # admission_assessments, admission_assessment_current, extraction_runs,
+    # extraction_candidates). Rows left by an earlier test MODULE in this
+    # shard would make the unscoped tenant delete below raise
+    # ForeignKeyViolationError during teardown, so clear those dependents for
+    # non-default tenants first. Shard composition is size-balanced and can
+    # change, so this must not depend on which modules happen to be co-resident.
     async with _test_engine.begin() as conn:
+        non_default = "tenant_id IN (SELECT id FROM tenants WHERE slug != 'default')"
+        # Children first, then parents. Each name is existence-checked so that
+        # migration drift degrades to "nothing to clean" rather than an
+        # UndefinedTableError that fails every test in this module.
+        for table in (
+            "admission_assessment_current",
+            "admission_assessments",
+            "memory_assessments",
+            "assessment_requests",
+            "extraction_item_links",
+            "extraction_runs",
+        ):
+            exists = await conn.scalar(
+                text("SELECT to_regclass(:name) IS NOT NULL"), {"name": f"public.{table}"}
+            )
+            if exists:
+                await conn.execute(text(f"DELETE FROM {table} WHERE {non_default}"))
         await conn.execute(text("DELETE FROM tenants WHERE slug != 'default'"))
     await _test_engine.dispose()
 

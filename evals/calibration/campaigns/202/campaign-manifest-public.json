@@ -1,0 +1,363 @@
+{
+  "campaign_id": "eng-calibration-001f",
+  "correction": {
+    "human_labels_accepted_before_invalidation": false,
+    "original_invalid_freeze": {
+      "identity_digest": "78d45df3b89261bc95adcf4fdaf4eeb3b54784c5dc4d5cea1fbd85a57b8f3093",
+      "repo_sha": "3d17923e6553a5a633a819682f9ffad8423cd8ef",
+      "sampling_manifest_digest": "27de308acfac24f4a9292cf93d022f333277f1a080b529cbe74e665f64ec8475",
+      "split_manifest_digest": "2f2b7ec5dccb0ab4882fa66906b5e9e4136c54632b0d44ef06fc3ec49ffeed73"
+    },
+    "reason": "v1 split used all 624 eligible rows rather than the 402 sampled population; corrected tooling (split-of-sample, expanded coverage, executable gate, enforced floors, protected permissions) changed campaign identity; round-2 correction additionally invalidated the corrected v2 freeze because campaign config identity used a non-production digest representation and the gate equated campaign tooling provenance with the deployed runtime SHA",
+    "status": "INVALIDATED_AND_SUPERSEDED_PRE_REVIEW",
+    "superseded_freezes": [
+      {
+        "archive": "202-invalidated-preliminary-v3-fd3ddf9",
+        "identity_digest": "d36bc930d09ec906f17ff7a46bda59cb34297244ef7d2f820e0a8ae422aa748d",
+        "packet_digests": {
+          "eng-calibration-001f-blind-v2.reviewer_a.json": "9c5ef5e47950bbe035c9769663cefbc9e064f8bbb8fa423dba1bd7e54886920d",
+          "eng-calibration-001f-blind-v2.reviewer_b.json": "bc384a50f3dc5bbdb414c0d118a0b2c7d5ea3c6e10a7e6b7410798653a99c36c"
+        },
+        "repo_sha": "fd3ddf9c7429712af6c47680267742b421e43fbe",
+        "sampling_manifest_digest": "550da08effe75a757226436d0a9ae2e87ceabde82b34fa6841d0a5b8ce224cdc",
+        "split_manifest_digest": "09113a0aabbd1993e832a9f3a57daa0a2a6bf5924cb5b25babcf1312c8c02128",
+        "superseded_digest_kind": "file_sha256"
+      },
+      {
+        "archive": "202-invalidated-corrected-v2-143ff3f",
+        "campaign_tooling_repo_sha": "143ff3ffa23cf3ab5884ce11d19c12621ade5aca",
+        "identity_digest": "b81348f7b6f14cf4eaf2ca735ae266babc410bb79299c247150bda054ab01614",
+        "packet_digests": {
+          "eng-calibration-001f-blind-v2.reviewer_a.json": "f37cb72088aaa2509fdf8e974b8722097a46f8886cadd68308e996502914990e",
+          "eng-calibration-001f-blind-v2.reviewer_b.json": "58353df8684dfbf3c6659129cf90a3e4f04d590717c3d92b7451eb9b748a4b27"
+        },
+        "reason": "provider_config_digest was frozen as bare 64-hex; production AssessmentContract.config_version is sha256:<64hex>, so no real deployed contract could ever satisfy this target. The tooling-provenance SHA was also conflated with the deployed runtime SHA in the selection-enable gate.",
+        "sampling_manifest_digest": "c899ab9fe836b3ad122a933e593d137fb79110dab6aed56984a02e36477c9f65",
+        "split_manifest_digest": "0a97df59abe186e2b914a551bba802bf908253d10a53eddb2d82c7ab4e6c4611",
+        "superseded_digest_kind": "file_sha256"
+      }
+    ]
+  },
+  "floors": {
+    "campaign_id": "eng-calibration-001f",
+    "dual_review_high_consequence": true,
+    "floors_schema": "engram-calibration-floors-v2",
+    "high_consequence_reviewed_min": 20,
+    "holdout_calibrated_brier_max": 0.25,
+    "holdout_calibrated_ece_max": 0.15,
+    "holdout_min": 100,
+    "holdout_per_profile_min": 10,
+    "per_bin_support_min": 50,
+    "per_dimension_labeled_min": 150,
+    "per_dimension_non_unknown_fraction_min": 0.5,
+    "per_stratum_min": 10,
+    "total_reviewed_min": 300
+  },
+  "identity": {
+    "note": "The round-2 corrected target must be re-frozen against the deployed runtime before any review begins. provider_config_digest must be captured in the exact production representation (sha256:<64hex>) via `python -m evals.calibration freeze-target --derive-provider-config-digest`, which derives it through engram.assessments.assessment_config_version -- the same helper production current_contract() uses. The prior bare-hex value (725ee055...) has no recorded provenance and must not be reused or prefixed.",
+    "pending_refreeze": true,
+    "schema": {
+      "campaign_tooling_repo_sha": "provenance of the tooling revision that freezes the campaign",
+      "provider_config_digest": "exact production AssessmentContract.config_version (sha256:<64hex>)"
+    },
+    "stable_fields": {
+      "assessment_code_version": "assessment-engine-v1",
+      "assessment_policy_version": "assessment-selection-v1",
+      "assessment_schema_version": "engram.assessment.v1",
+      "calibration_artifact_schema_version": "engram.calibration-profiles-v1",
+      "calibration_dataset_version": "calibration-157-dogfood-v2",
+      "campaign_id": "eng-calibration-001f",
+      "campaign_schema": "engram-calibration-campaign-v1",
+      "canonicalization_version": "assessment-evidence-manifest-v1",
+      "dimensions": [
+        "taxonomy",
+        "retention",
+        "epistemic"
+      ],
+      "label_guide_version": "engram-calibration-guide-157-v1",
+      "prompt_version": "engram.assess.1",
+      "provider_adapter": "openai",
+      "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+      "provider_params": {
+        "input_limit": 16000,
+        "max_tokens": 1024,
+        "temperature": 0
+      }
+    }
+  },
+  "identity_digest": null,
+  "note": "Public-safe counts, rules, coverage, and digests only; exact membership and content remain protected.",
+  "packet_digests": {
+    "pending_refreeze": true
+  },
+  "review_plan": {
+    "human_adjudication_complete": false,
+    "reviewer_a_count": 402,
+    "reviewer_b_count": 402,
+    "strategy": "independent_full_population_dual_review"
+  },
+  "sampling": {
+    "coverage_dimensions": {
+      "age_bucket": {
+        "cells": {
+          "30_89d": {
+            "coverage_min": 8,
+            "population": 407,
+            "selected": 263
+          },
+          "7_29d": {
+            "coverage_min": 8,
+            "population": 185,
+            "selected": 113
+          },
+          "lt_7d": {
+            "coverage_min": 8,
+            "population": 32,
+            "selected": 26
+          }
+        },
+        "status": "sampled"
+      },
+      "ambiguity_contested": {
+        "reason": "no disputed/contested decision-time field in frozen snapshot",
+        "status": "unavailable"
+      },
+      "assertion_mode": {
+        "reason": "field_absent_from_frozen_snapshot",
+        "status": "unavailable"
+      },
+      "consequence": {
+        "status": "post_review_only"
+      },
+      "difficulty": {
+        "reason": "no objective pre-provider difficulty field; input size is reported separately",
+        "status": "unavailable"
+      },
+      "directness": {
+        "reason": "principal/assertion provenance absent; source_type is not a proxy",
+        "status": "unavailable"
+      },
+      "evidence_state": {
+        "reason": "field_absent_from_frozen_snapshot",
+        "status": "unavailable"
+      },
+      "input_size_bucket": {
+        "cells": {
+          "1025_4096b": {
+            "coverage_min": 8,
+            "population": 29,
+            "selected": 22
+          },
+          "257_1024b": {
+            "coverage_min": 8,
+            "population": 193,
+            "selected": 123
+          },
+          "le_256b": {
+            "coverage_min": 8,
+            "population": 402,
+            "selected": 257
+          }
+        },
+        "status": "sampled"
+      },
+      "kind": {
+        "cells": {
+          "decision": {
+            "coverage_min": 8,
+            "population": 12,
+            "selected": 12
+          },
+          "doctrine": {
+            "coverage_min": 8,
+            "population": 29,
+            "selected": 22
+          },
+          "fact": {
+            "coverage_min": 8,
+            "population": 562,
+            "selected": 347
+          },
+          "invariant": {
+            "coverage_min": 3,
+            "population": 3,
+            "selected": 3
+          },
+          "observation": {
+            "coverage_min": 7,
+            "population": 7,
+            "selected": 7
+          },
+          "preference": {
+            "coverage_min": 4,
+            "population": 4,
+            "selected": 4
+          },
+          "procedure": {
+            "coverage_min": 4,
+            "population": 4,
+            "selected": 4
+          },
+          "summary": {
+            "coverage_min": 3,
+            "population": 3,
+            "selected": 3
+          }
+        },
+        "status": "sampled"
+      },
+      "origin": {
+        "reason": "field_absent_from_frozen_snapshot",
+        "status": "unavailable"
+      },
+      "provider_condition": {
+        "reason": "provider success/failure/abstention cannot influence membership",
+        "status": "post_selection_only"
+      },
+      "retention_disposition": {
+        "status": "post_review_only"
+      },
+      "review_status": {
+        "cells": {
+          "active": {
+            "coverage_min": 8,
+            "population": 375,
+            "selected": 242
+          },
+          "proposed": {
+            "coverage_min": 8,
+            "population": 249,
+            "selected": 160
+          }
+        },
+        "status": "sampled"
+      },
+      "risk": {
+        "reason": "field_absent_from_frozen_snapshot",
+        "status": "unavailable"
+      },
+      "source_type": {
+        "cells": {
+          "extraction": {
+            "coverage_min": 8,
+            "population": 116,
+            "selected": 70
+          },
+          "import": {
+            "coverage_min": 8,
+            "population": 44,
+            "selected": 34
+          },
+          "manual": {
+            "coverage_min": 8,
+            "population": 29,
+            "selected": 22
+          },
+          "migration": {
+            "coverage_min": 8,
+            "population": 319,
+            "selected": 194
+          },
+          "pre_compress": {
+            "coverage_min": 1,
+            "population": 1,
+            "selected": 1
+          },
+          "session_end": {
+            "coverage_min": 8,
+            "population": 19,
+            "selected": 18
+          },
+          "sync_turn": {
+            "coverage_min": 8,
+            "population": 96,
+            "selected": 63
+          }
+        },
+        "status": "sampled"
+      }
+    },
+    "dev_count": 241,
+    "dev_fraction": 0.6,
+    "exclusion_rules": [
+      "kind=diary_entry: governed not_applicable epistemic, no calibration signal",
+      "content > 16000 bytes: exceeds the provider input bound",
+      "secret-scanner match on content"
+    ],
+    "frame_digest": "e5c0c60b5d80a3a715a73cd4596e4cc07db604008dc8452cfde671e97045eb08",
+    "grouping": [
+      "content_hash",
+      "normalized_text",
+      "source_ref",
+      "root_ref",
+      "session_ref"
+    ],
+    "holdout_count": 161,
+    "inclusion_rules": [
+      "live item: valid_to IS NULL and review_status NOT IN (rejected, archived)",
+      "tenant dogfood corpus only",
+      "content present and passes the production secret denylist"
+    ],
+    "leakage_checks": {
+      "cross_split_shared_hash_groups": 0,
+      "duplicate_groups": 27,
+      "sample_membership_count": 402
+    },
+    "membership_invariant": "Sampling and splitting never consume the target identity digest, so the re-freeze changes recorded manifest digests only. Expected counts are unchanged: eligible 624, sampled 402, dev 241, holdout 161.",
+    "pending_refreeze": true,
+    "sample_count": 402,
+    "sampling_manifest_digest": null,
+    "sampling_seed": "202-sample-v2",
+    "snapshot_as_of": "2026-09-09T19:43:04.195204Z",
+    "snapshot_sha256": "cc172a6f7c2780784ef0ce5686772a72324d1398976fc117da637df2a88fbdb0",
+    "source_row_counts": {
+      "eligible_frame": 624,
+      "excluded_total": 0
+    },
+    "split_manifest_digest": null,
+    "split_seed": "202-split-v2",
+    "stratum_counts": {
+      "decision/import/active": 5,
+      "decision/manual/active": 1,
+      "decision/migration/active": 2,
+      "decision/session_end/active": 2,
+      "decision/sync_turn/active": 2,
+      "doctrine/import/active": 8,
+      "doctrine/migration/proposed": 10,
+      "doctrine/session_end/active": 1,
+      "doctrine/sync_turn/proposed": 3,
+      "fact/extraction/proposed": 70,
+      "fact/import/active": 16,
+      "fact/manual/active": 4,
+      "fact/manual/proposed": 11,
+      "fact/migration/active": 178,
+      "fact/migration/proposed": 3,
+      "fact/pre_compress/proposed": 1,
+      "fact/session_end/active": 5,
+      "fact/session_end/proposed": 8,
+      "fact/sync_turn/active": 8,
+      "fact/sync_turn/proposed": 43,
+      "invariant/migration/proposed": 1,
+      "invariant/sync_turn/proposed": 2,
+      "observation/manual/active": 3,
+      "observation/manual/proposed": 1,
+      "observation/session_end/proposed": 1,
+      "observation/sync_turn/proposed": 2,
+      "preference/manual/active": 1,
+      "preference/sync_turn/proposed": 3,
+      "procedure/import/active": 3,
+      "procedure/manual/proposed": 1,
+      "summary/import/active": 2,
+      "summary/session_end/active": 1
+    }
+  },
+  "serving_invariants": {
+    "assessment_selection_enabled": false,
+    "certified_serving_profiles": [
+      "legacy"
+    ],
+    "mcp_recall_authority": "legacy",
+    "ordinary_recall_authority": "legacy"
+  },
+  "status": "PENDING_ROUND2_REFREEZE_THEN_STOPPED_FOR_HUMAN_ADJUDICATION"
+}

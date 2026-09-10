@@ -10,6 +10,7 @@ typecheck:
 	$(VENV_BIN)/mypy engram/
 	$(VENV_BIN)/mypy --explicit-package-bases evals/admission/
 	$(VENV_BIN)/mypy --explicit-package-bases evals/recall/
+	$(VENV_BIN)/mypy --explicit-package-bases evals/calibration/
 	$(VENV_BIN)/mypy --config-file sdk/engram-client/pyproject.toml \
 		sdk/engram-client/engram_client
 	MYPYPATH=sdk/engram-client $(VENV_BIN)/mypy \

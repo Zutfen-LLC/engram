@@ -8,7 +8,12 @@ from uuid import UUID, uuid4
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from engram.assessment_calibration import CalibrationProfile, calibrate, load_profiles
+from engram.assessment_calibration import (
+    CalibrationProfile,
+    calibrate,
+    calibration_profiles_digest,
+    load_profiles,
+)
 from engram.assessment_schema import AssessmentContract, AssessmentDimensions
 from engram.assessments import current_contract, evidence_snapshot, live_item
 from engram.auth import Principal
@@ -145,8 +150,7 @@ async def handle_assessment_reassess(session: AsyncSession, job: Job) -> None:
     if target != current_contract():
         raise RuntimeError("assessment target contract unavailable on this worker")
     profiles = load_profiles(settings.assessment_calibration_profiles_path)
-    profile_digest = digest([p.model_dump(mode="json") for p in profiles]) if profiles else None
-    if profile_digest != target.calibration_digest:
+    if calibration_profiles_digest(profiles) != target.calibration_digest:
         raise RuntimeError("assessment calibration artifact changed")
     before = await evidence_snapshot(session, item, context)
     stale = not live_item(item) or digest(before) != request.input_digest

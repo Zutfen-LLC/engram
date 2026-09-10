@@ -50,6 +50,22 @@ class CalibrationProfile(StrictModel):
         return self
 
 
+def calibration_profiles_digest(profiles: list[CalibrationProfile]) -> str | None:
+    """Canonical digest used by the deployed assessment contract."""
+    if not profiles:
+        return None
+    from engram.extraction import digest
+
+    return digest([profile.model_dump(mode="json") for profile in profiles])
+
+
+def verified_profiles_for_contract(
+    profiles: list[CalibrationProfile], contract: AssessmentContract
+) -> list[CalibrationProfile]:
+    """Return profiles only when the complete installed set matches the contract."""
+    return profiles if calibration_profiles_digest(profiles) == contract.calibration_digest else []
+
+
 def calibrate(
     raw_value: float | None,
     *,
