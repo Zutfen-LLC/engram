@@ -70,10 +70,12 @@ Exact membership, hashes, duplicate groups, sample content, and reviewer packets
 They are exclusively created under `0700` directories with `0600` files. Public output contains only
 rules, aggregate population/selection counts, sanitized coverage categories, and digests.
 
-Frozen floors remain unchanged except for making the already-required non-unknown floor explicit:
+Frozen before any labels exist:
 300 total reviewed, 150 labeled per dimension, at least 50% non-unknown coverage per dimension,
-100 holdout, 20 high-consequence reviewed, 50 fitted observations per used bin, and 10
-reviewed/labeled observations per claimed supported stratum. Every floor is evaluated from reviewer,
+100 holdout overall and at least 10 labeled holdout observations per emitted profile,
+with calibrated Brier <= 0.25 and calibrated ECE <= 0.15 for every emitted profile stratum,
+20 high-consequence reviewed, 50 fitted observations per used bin, and 10 reviewed/labeled
+observations per claimed supported stratum. Every floor is evaluated from reviewer,
 observation, and fitted-profile evidence. Holdout and high-consequence support require real non-unknown
 labeled evidence; empty or all-unknown evidence cannot pass. Thin bins or strata and partially
 unsupported dimensions stay explicitly uncalibrated.

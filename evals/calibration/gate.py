@@ -7,7 +7,9 @@ configuration and can recommend only dogfood shadow selection.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import math
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -32,7 +34,7 @@ class AuthoritativeRecallProof(Record):
     proof_schema: str
     campaign_id: str
     target_identity_digest: Digest
-    artifact_digest: Digest
+    profile_set_digest: str
     deployed_repo_sha: str
     deployed_contract_digest: Digest
     assessment_policy_version: str
@@ -61,12 +63,17 @@ def _digest_hex(value: str) -> str:
     return value.removeprefix("sha256:")
 
 
-def _load_authoritative_recall_proof(path: Path | None) -> AuthoritativeRecallProof | None:
-    """Parse and hash bounded probe evidence; malformed evidence fails closed."""
-    if path is None:
+def _load_authoritative_recall_proof(
+    path: Path | None, expected_sha256: str | None
+) -> AuthoritativeRecallProof | None:
+    """Verify a separately frozen probe digest, then parse bounded evidence."""
+    if path is None or expected_sha256 is None or len(expected_sha256) != 64:
         return None
     try:
         payload = path.read_bytes()
+        actual_sha256 = hashlib.sha256(payload).hexdigest()
+        if not hmac.compare_digest(actual_sha256, expected_sha256):
+            return None
         if not payload or len(payload) > 65536:
             return None
         data = json.loads(payload)
@@ -77,7 +84,7 @@ def _load_authoritative_recall_proof(path: Path | None) -> AuthoritativeRecallPr
             proof_schema=data["proof_schema"],
             campaign_id=data["campaign_id"],
             target_identity_digest=data["target_identity_digest"],
-            artifact_digest=data["artifact_digest"],
+            profile_set_digest=data["profile_set_digest"],
             deployed_repo_sha=data["deployed_repo_sha"],
             deployed_contract_digest=data["deployed_contract_digest"],
             assessment_policy_version=data["assessment_policy_version"],
@@ -115,7 +122,13 @@ def _recall_proof_matches(
         and -timedelta(minutes=5) <= proof_age <= timedelta(hours=24)
         and proof.campaign_id == target.get("campaign_id")
         and proof.target_identity_digest == bundle.target_identity_digest
-        and proof.artifact_digest == bundle.artifact_digest()
+        and proof.profile_set_digest
+        == (
+            calibration_profiles_digest(
+                [CalibrationProfile.model_validate(profile) for profile in bundle.profiles]
+            )
+            or ""
+        )
         and proof.deployed_repo_sha == deployed_repo_sha == target.get("repo_sha")
         and proof.deployed_contract_digest == digest(deployed_contract.model_dump(mode="json"))
         and proof.assessment_policy_version
@@ -130,6 +143,62 @@ def _recall_proof_matches(
         and not proof.governed_serving_authorized
         and not proof.exploratory_serving_authorized
     )
+
+
+def _holdout_calibrated_performance(bundle: CalibrationArtifactBundle) -> bool:
+    """Require bounded calibrated holdout metrics for every emitted profile."""
+    try:
+        brier_max = float(bundle.floors["holdout_calibrated_brier_max"])
+        ece_max = float(bundle.floors["holdout_calibrated_ece_max"])
+        support_min = int(bundle.floors["holdout_per_profile_min"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    profile_keys = [
+        (
+            profile.get("dimension"),
+            profile.get("source_type"),
+            profile.get("assertion_mode"),
+            profile.get("kind"),
+            profile.get("risk"),
+        )
+        for profile in bundle.profiles
+    ]
+    if len(set(profile_keys)) != len(profile_keys):
+        return False
+    metrics = {
+        (metric.get("dimension"), metric.get("stratum")): metric
+        for metric in bundle.holdout_metrics
+    }
+    if len(metrics) != len(bundle.holdout_metrics):
+        return False
+    if not bundle.profiles:
+        return False
+    for profile in bundle.profiles:
+        key = (
+            profile.get("dimension"),
+            "/".join(
+                str(profile.get(field))
+                for field in ("source_type", "assertion_mode", "kind", "risk")
+            ),
+        )
+        metric = metrics.get(key)
+        if metric is None or not metric.get("covered_stratum"):
+            return False
+        try:
+            brier = float(metric["brier"])
+            ece = float(metric["ece"])
+            count = int(metric["n"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if (
+            count < support_min
+            or not math.isfinite(brier)
+            or not math.isfinite(ece)
+            or not 0.0 <= brier <= brier_max
+            or not 0.0 <= ece <= ece_max
+        ):
+            return False
+    return True
 
 
 def gate_checks(
@@ -187,6 +256,7 @@ def gate_checks(
     checks["holdout_support_satisfied"] = floor_result.checks.get(
         "holdout_size", False
     ) and floor_result.checks.get("holdout_labeled_support", False)
+    checks["holdout_calibrated_performance"] = _holdout_calibrated_performance(bundle)
 
     profile_strata = {
         "/".join(
@@ -231,7 +301,8 @@ def gate_checks(
         and all(mismatch_proof.checks.values())
     )
     authoritative_recall_proof = _load_authoritative_recall_proof(
-        authoritative_recall_evidence_path
+        authoritative_recall_evidence_path,
+        bundle.authoritative_recall_evidence_digest,
     )
     checks["authoritative_recall_unchanged"] = _recall_proof_matches(
         authoritative_recall_proof,
@@ -252,6 +323,7 @@ def gate_checks(
         "calibration_digest_binds",
         "floors_satisfied",
         "holdout_support_satisfied",
+        "holdout_calibrated_performance",
         "unsupported_strata_fail_closed",
         "mismatch_proof_bound",
         "mismatch_resolves_uncalibrated",

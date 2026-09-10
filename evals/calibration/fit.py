@@ -8,21 +8,26 @@ fitted. Every stratum below the frozen support floor stays explicitly
 from __future__ import annotations
 
 from collections import defaultdict
+from pathlib import Path
 from typing import Any, Literal
 
 from engram.assessment_calibration import (
     MIN_CALIBRATION_SAMPLES,
     CalibrationBin,
     CalibrationProfile,
+    calibrate,
 )
 from engram.assessment_schema import AssessmentContract
-from evals.admission.schema import LabelRecord, Record, digest
+from evals.admission.schema import Digest, Record, digest
 from evals.calibration.freeze import (
     LABEL_GUIDE_VERSION,
     EvidenceFloors,
+    SamplingManifest,
     SplitManifest,
     TargetIdentity,
+    validate_split_membership,
 )
+from evals.calibration.review import verify_ledger
 
 DimensionName = Literal["taxonomy", "retention", "epistemic"]
 BinEdges: tuple[float, ...] = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
@@ -128,11 +133,30 @@ def _bin_index(value: float) -> int:
     raise ValueError("unreachable bin")
 
 
+def _validate_observation_membership(
+    observations: list[LabeledObservation], split: SplitManifest
+) -> None:
+    assignments = {sample_id: "dev" for sample_id in split.dev_ids}
+    assignments.update({sample_id: "holdout" for sample_id in split.holdout_ids})
+    seen: set[tuple[str, str]] = set()
+    for observation in observations:
+        key = (observation.sample_id, observation.dimension)
+        if key in seen:
+            raise ValueError("duplicate_observation")
+        seen.add(key)
+        expected_split = assignments.get(observation.sample_id)
+        if expected_split is None:
+            raise ValueError("observation_not_in_frozen_split")
+        if observation.split != expected_split:
+            raise ValueError("observation_split_mismatch")
+
+
 def fit_profiles(
     observations: list[LabeledObservation],
     *,
     identity: TargetIdentity,
     contract: AssessmentContract,
+    split: SplitManifest,
 ) -> list[CalibrationProfile]:
     """Fit exact-stratum reliability bins from DEV observations only.
 
@@ -140,6 +164,7 @@ def fit_profiles(
     observations is dropped — the production loader would refuse it anyway,
     and an undersupported profile must not claim support it lacks.
     """
+    _validate_observation_membership(observations, split)
     grouped: dict[tuple[str, ...], list[LabeledObservation]] = defaultdict(list)
     for obs in observations:
         if obs.split != "dev":
@@ -195,105 +220,167 @@ class HoldoutMetrics(Record):
     dimension: str
     stratum: str
     n: int
+    population_n: int
     brier: float | None = None
     ece: float | None = None
+    raw_brier: float | None = None
+    raw_ece: float | None = None
     mean_outcome: float | None = None
     mean_raw: float | None = None
+    mean_calibrated: float | None = None
     selective_accuracy: float | None = None
     coverage: float | None = None
     reliability: tuple[dict[str, float | int | None], ...] = ()
     covered_stratum: bool = False
 
 
+def _index_profiles(
+    profiles: list[CalibrationProfile],
+) -> dict[tuple[str, str, str, str, str], CalibrationProfile]:
+    indexed = {_profile_key(profile): profile for profile in profiles}
+    if len(indexed) != len(profiles):
+        raise ValueError("duplicate_calibration_profile_key")
+    return indexed
+
+
 def evaluate_holdout(
     observations: list[LabeledObservation],
     *,
     profiles: list[CalibrationProfile],
+    split: SplitManifest,
 ) -> list[HoldoutMetrics]:
-    """Holdout metrics per dimension and stratum, never fitted on holdout."""
+    """Evaluate fitted calibration values on frozen holdout membership only."""
+    _validate_observation_membership(observations, split)
     per: dict[tuple[str, str], list[LabeledObservation]] = defaultdict(list)
     for obs in observations:
         if obs.split != "holdout":
             continue
         stratum_key = "/".join([obs.source_type, obs.assertion_mode, obs.kind, obs.risk])
         per[(obs.dimension, stratum_key)].append(obs)
-    profile_keys = {
-        (p.dimension, p.source_type, p.assertion_mode, p.kind, p.risk) for p in profiles
-    }
+    profile_by_key = _index_profiles(profiles)
+
+    def ece(pairs: list[tuple[float, str]]) -> float:
+        weighted = 0.0
+        for index in range(len(BinEdges) - 1):
+            lower, upper = BinEdges[index], BinEdges[index + 1]
+            bucket = [
+                (value, outcome)
+                for value, outcome in pairs
+                if lower <= value < upper or value == upper == 1.0
+            ]
+            if bucket:
+                mean_value = sum(value for value, _ in bucket) / len(bucket)
+                frequency = sum(1 for _, outcome in bucket if outcome == "positive") / len(bucket)
+                weighted += len(bucket) * abs(mean_value - frequency)
+        return weighted / len(pairs)
+
     metrics: list[HoldoutMetrics] = []
     for key in sorted(per):
         dimension, stratum = key
         rows = per[key]
         labeled = [
-            (o.raw_value, o.outcome)
-            for o in rows
-            if o.raw_value is not None and o.outcome != "unknown"
+            observation
+            for observation in rows
+            if observation.raw_value is not None and observation.outcome != "unknown"
         ]
-        covered = (
-            dimension,
-            *stratum.split("/"),
-        ) in profile_keys
+        source_type, assertion_mode, kind, risk = stratum.split("/", 3)
+        profile = profile_by_key.get((dimension, source_type, assertion_mode, kind, risk))
         if not labeled:
             metrics.append(
                 HoldoutMetrics(
-                    dimension=dimension, stratum=stratum, n=len(rows), covered_stratum=covered
+                    dimension=dimension,
+                    stratum=stratum,
+                    n=0,
+                    population_n=len(rows),
+                    covered_stratum=profile is not None,
                 )
             )
             continue
-        brier = sum(
-            (raw - (1.0 if outcome == "positive" else 0.0)) ** 2 for raw, outcome in labeled
-        ) / len(labeled)
+        raw_pairs: list[tuple[float, str]] = []
+        for observation in labeled:
+            if observation.raw_value is None:
+                raise ValueError("labeled_observation_missing_raw_value")
+            raw_pairs.append((observation.raw_value, observation.outcome))
+        calibrated_pairs: list[tuple[float, str]] = []
+        if profile is not None:
+            for observation in labeled:
+                result = calibrate(
+                    dimension=observation.dimension,
+                    raw_value=observation.raw_value,
+                    source_type=observation.source_type,
+                    assertion_mode=observation.assertion_mode,
+                    kind=observation.kind,
+                    risk=observation.risk,
+                    contract=profile.contract,
+                    profile=profile,
+                )
+                if result.status == "calibrated" and result.calibrated_value is not None:
+                    calibrated_pairs.append((result.calibrated_value, observation.outcome))
+        raw_brier = sum(
+            (value - (1.0 if outcome == "positive" else 0.0)) ** 2 for value, outcome in raw_pairs
+        ) / len(raw_pairs)
+        calibrated_brier = (
+            sum(
+                (value - (1.0 if outcome == "positive" else 0.0)) ** 2
+                for value, outcome in calibrated_pairs
+            )
+            / len(calibrated_pairs)
+            if calibrated_pairs
+            else None
+        )
         reliability: list[dict[str, float | int | None]] = []
-        weighted = 0.0
         for index in range(len(BinEdges) - 1):
             lower, upper = BinEdges[index], BinEdges[index + 1]
             bucket = [
-                (raw, outcome)
-                for raw, outcome in labeled
-                if lower <= raw < upper or raw == upper == 1.0
+                (value, outcome)
+                for value, outcome in calibrated_pairs
+                if lower <= value < upper or value == upper == 1.0
             ]
-            mean_raw = sum(raw for raw, _ in bucket) / len(bucket) if bucket else None
-            freq = (
-                sum(1 for _, outcome in bucket if outcome == "positive") / len(bucket)
-                if bucket
-                else None
-            )
-            if mean_raw is not None and freq is not None:
-                weighted += len(bucket) * abs(mean_raw - freq)
             reliability.append(
                 {
                     "lower": lower,
                     "upper": upper,
                     "count": len(bucket),
-                    "mean_raw": mean_raw,
-                    "observed_frequency": freq,
+                    "mean_calibrated": (
+                        sum(value for value, _ in bucket) / len(bucket) if bucket else None
+                    ),
+                    "observed_frequency": (
+                        sum(1 for _, outcome in bucket if outcome == "positive") / len(bucket)
+                        if bucket
+                        else None
+                    ),
                 }
             )
-        ece = weighted / len(labeled)
-        # Selective accuracy/coverage at the frozen abstention threshold 0.5:
-        # "covered" means a non-null raw score at or above 0.5.
-        high_conf = [(raw, outcome) for raw, outcome in labeled if raw >= 0.5]
+        high_confidence = [(value, outcome) for value, outcome in calibrated_pairs if value >= 0.5]
         selective = (
-            sum(1 for _, outcome in high_conf if outcome == "positive") / len(high_conf)
-            if high_conf
+            sum(1 for _, outcome in high_confidence if outcome == "positive") / len(high_confidence)
+            if high_confidence
             else None
         )
-        coverage = len(high_conf) / len(labeled)
         metrics.append(
             HoldoutMetrics(
                 dimension=str(dimension),
                 stratum=stratum,
-                n=len(rows),
-                brier=round(brier, 6),
-                ece=round(ece, 6),
+                n=len(calibrated_pairs),
+                population_n=len(rows),
+                brier=None if calibrated_brier is None else round(calibrated_brier, 6),
+                ece=None if not calibrated_pairs else round(ece(calibrated_pairs), 6),
+                raw_brier=round(raw_brier, 6),
+                raw_ece=round(ece(raw_pairs), 6),
                 mean_outcome=round(
-                    sum(1 for _, outcome in labeled if outcome == "positive") / len(labeled), 6
+                    sum(1 for _, outcome in raw_pairs if outcome == "positive") / len(raw_pairs),
+                    6,
                 ),
-                mean_raw=round(sum(raw for raw, _ in labeled) / len(labeled), 6),
+                mean_raw=round(sum(value for value, _ in raw_pairs) / len(raw_pairs), 6),
+                mean_calibrated=(
+                    round(sum(value for value, _ in calibrated_pairs) / len(calibrated_pairs), 6)
+                    if calibrated_pairs
+                    else None
+                ),
                 selective_accuracy=None if selective is None else round(selective, 6),
-                coverage=round(coverage, 6),
+                coverage=round(len(calibrated_pairs) / len(raw_pairs), 6),
                 reliability=tuple(reliability),
-                covered_stratum=covered,
+                covered_stratum=profile is not None,
             )
         )
     return metrics
@@ -302,6 +389,12 @@ def evaluate_holdout(
 class EvidenceFloorResult(Record):
     """Evidence-derived result for every frozen floor, with partial support visible."""
 
+    sampling_manifest_digest: str
+    split_manifest_digest: str
+    ledger_sha256: str
+    reviewer_a_packet_sha256: str
+    reviewer_b_packet_sha256: str
+    full_population_dual_review: Literal[True]
     checks: dict[str, bool]
     dimension_support: dict[str, dict[str, Any]]
     stratum_support: dict[str, dict[str, Any]]
@@ -330,6 +423,7 @@ class CalibrationArtifactBundle(Record):
     unsupported_strata: list[str]
     floor_results: dict[str, Any]
     floors_satisfied: bool
+    authoritative_recall_evidence_digest: Digest
 
     def artifact_digest(self) -> str:
         return digest(self.model_dump(mode="json"))
@@ -351,8 +445,13 @@ def build_artifact(
     profiles: list[CalibrationProfile],
     holdout_metrics: list[HoldoutMetrics],
     floor_result: EvidenceFloorResult,
+    authoritative_recall_evidence_digest: Digest,
 ) -> CalibrationArtifactBundle:
-    {(p.dimension, p.source_type, p.assertion_mode, p.kind, p.risk) for p in profiles}
+    _index_profiles(profiles)
+    if floor_result.sampling_manifest_digest != sampling_digest:
+        raise ValueError("floor_sampling_manifest_mismatch")
+    if floor_result.split_manifest_digest != split.split_digest():
+        raise ValueError("floor_split_manifest_mismatch")
     unsupported = sorted(
         {"/".join([m.dimension, m.stratum]) for m in holdout_metrics if not m.covered_stratum}
     )
@@ -369,6 +468,7 @@ def build_artifact(
         unsupported_strata=unsupported,
         floor_results=floor_result.model_dump(mode="json"),
         floors_satisfied=floor_result.passed,
+        authoritative_recall_evidence_digest=authoritative_recall_evidence_digest,
     )
 
 
@@ -389,11 +489,35 @@ def _observation_key(obs: LabeledObservation) -> tuple[str, str, str, str, str]:
 def check_floors(
     *,
     floors: EvidenceFloors,
-    reviewed_records: list[LabelRecord],
+    ledger_path: Path,
+    expected_ledger_sha256: str,
+    reviewer_a_packet_sha256: str,
+    reviewer_b_packet_sha256: str,
+    expected_dataset_id: str,
+    expected_dataset_version: str,
     observations: list[LabeledObservation],
     profiles: list[CalibrationProfile],
+    sampling: SamplingManifest,
+    split: SplitManifest,
 ) -> EvidenceFloorResult:
     """Evaluate every frozen floor from reviewer, split, and fitted-profile evidence."""
+    validate_split_membership(sampling, split)
+    _validate_observation_membership(observations, split)
+    verified_ledger = verify_ledger(
+        ledger_path,
+        expected_ledger_sha256,
+        sampling=sampling,
+        reviewer_a_packet_sha256=reviewer_a_packet_sha256,
+        reviewer_b_packet_sha256=reviewer_b_packet_sha256,
+        expected_dataset_id=expected_dataset_id,
+        expected_dataset_version=expected_dataset_version,
+    )
+    reviewed_records = list(verified_ledger.records)
+    record_ids = [record.sample_id for record in reviewed_records]
+    if len(record_ids) != len(set(record_ids)):
+        raise ValueError("duplicate_review_record")
+    if set(record_ids) != set(sampling.sample_ids):
+        raise ValueError("review_records_do_not_match_frozen_sample")
     completed = [
         record
         for record in reviewed_records
@@ -559,6 +683,12 @@ def check_floors(
     }
     failures = tuple(sorted(name for name, passed in checks.items() if not passed))
     return EvidenceFloorResult(
+        sampling_manifest_digest=sampling.manifest_digest(),
+        split_manifest_digest=split.split_digest(),
+        ledger_sha256=verified_ledger.ledger_sha256,
+        reviewer_a_packet_sha256=verified_ledger.reviewer_a_packet_sha256,
+        reviewer_b_packet_sha256=verified_ledger.reviewer_b_packet_sha256,
+        full_population_dual_review=True,
         checks=checks,
         dimension_support=dimension_support,
         stratum_support=stratum_support,

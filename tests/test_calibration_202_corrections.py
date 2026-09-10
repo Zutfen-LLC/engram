@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
+import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -18,8 +21,17 @@ from engram.assessment_calibration import (
     calibration_profiles_digest,
 )
 from engram.assessment_schema import AssessmentContract
+from engram.canonicalize import canonicalize, content_hash
 from evals.admission.schema import HumanJudgment, LabelRecord, digest
-from evals.calibration.fit import EvidenceFloorResult, LabeledObservation, check_floors
+from evals.calibration.fit import (
+    EvidenceFloorResult,
+    LabeledObservation,
+    evaluate_holdout,
+    fit_profiles,
+)
+from evals.calibration.fit import (
+    check_floors as _production_check_floors,
+)
 from evals.calibration.freeze import (
     EvidenceFloors,
     SamplingManifest,
@@ -33,7 +45,13 @@ from evals.calibration.freeze import (
     validate_split_membership,
 )
 from evals.calibration.gate import gate_checks, prove_mismatch_uncalibrated
-from evals.calibration.review import write_protected_file
+from evals.calibration.review import (
+    build_packets,
+    freeze_ledger,
+    verify_ledger,
+    write_packets,
+    write_protected_file,
+)
 
 NOW = datetime(2026, 9, 9, tzinfo=UTC)
 
@@ -67,7 +85,7 @@ def _frame(n: int = 40, *, duplicate: bool = False) -> list[Any]:
         rows.append(
             {
                 "item_uuid": item_uuid,
-                "content_hash": "sha256:" + digest(text),
+                "content_hash": content_hash(canonicalize(text)),
                 "kind": "fact",
                 "source_type": "manual",
                 "review_status": "active",
@@ -305,6 +323,129 @@ def test_protected_writer_forces_permissions_and_exclusive_create(tmp_path: Path
         write_protected_file(path, b"replacement")
 
 
+def test_protected_writer_secures_nested_parents_and_rejects_symlinks(tmp_path: Path) -> None:
+    old_umask = os.umask(0)
+    try:
+        nested = tmp_path / "outer" / "inner" / "artifact.json"
+        write_protected_file(nested, b"complete")
+    finally:
+        os.umask(old_umask)
+    assert nested.parent.parent.stat().st_mode & 0o777 == 0o700
+    assert nested.parent.stat().st_mode & 0o777 == 0o700
+    assert nested.read_bytes() == b"complete"
+
+    real = tmp_path / "real"
+    real.mkdir()
+    redirected = tmp_path / "redirected"
+    redirected.symlink_to(real, target_is_directory=True)
+    with pytest.raises(OSError):
+        write_protected_file(redirected / "secret.json", b"secret")
+    assert not (real / "secret.json").exists()
+
+
+def test_packet_content_is_bound_to_frozen_sample_hash() -> None:
+    frame = _frame(1)
+    sample_id = sample_id_for(frame[0].item_uuid)
+    sampling = _sampling(frame, [sample_id], {"fact/manual/active": 1}, {})
+    sample = {
+        "sample_id": sample_id,
+        "content": "memory 0 ",
+        "content_hash": frame[0].content_hash,
+        "kind": "fact",
+        "source_type": "manual",
+        "review_status": "active",
+        "assertion_mode": "unavailable",
+        "origin": "unavailable",
+        "risk": "unavailable",
+        "evidence_state": "unavailable",
+        "age_days": 0,
+    }
+    assert build_packets(sampling=sampling, samples=[sample], packet_id="packet")
+    with pytest.raises(ValueError, match="packet_content_hash_mismatch"):
+        build_packets(
+            sampling=sampling,
+            samples=[{**sample, "content": "substituted tenant content"}],
+            packet_id="packet",
+        )
+
+
+def test_freeze_ledger_enforces_full_independent_dual_review(tmp_path: Path) -> None:
+    frame = _frame(2)
+    sample_ids = [sample_id_for(row.item_uuid) for row in frame]
+    sampling = _sampling(frame, sample_ids, {"fact/manual/active": 2}, {})
+    samples = [
+        {
+            "sample_id": sample_id,
+            "content": "memory 0 " if index == 0 else "memory 1 x",
+            "content_hash": row.content_hash,
+            "kind": "fact",
+            "source_type": "manual",
+            "review_status": "active",
+            "assertion_mode": "unavailable",
+            "origin": "unavailable",
+            "risk": "unavailable",
+            "evidence_state": "unavailable",
+            "age_days": index * 4,
+        }
+        for index, (sample_id, row) in enumerate(zip(sample_ids, frame, strict=True))
+    ]
+    packet_dir = tmp_path / "packets"
+    packet_manifest = write_packets(
+        build_packets(sampling=sampling, samples=samples, packet_id="packet"), packet_dir
+    )
+    reviewer_a_path = packet_dir / "packet.reviewer_a.json"
+    reviewer_b_path = packet_dir / "packet.reviewer_b.json"
+    records = [
+        _record(index).model_copy(
+            update={
+                "sample_id": sample_id,
+                "content_hash": row.content_hash,
+                "reviewer_b": _judgment(f"b{index}"),
+                "review_stage": "complete",
+            }
+        )
+        for index, (sample_id, row) in enumerate(zip(sample_ids, frame, strict=True))
+    ]
+    result = freeze_ledger(
+        campaign_id="campaign",
+        records=records,
+        sampling=sampling,
+        protected_dir=tmp_path / "ledger",
+        reviewer_a_packet_path=reviewer_a_path,
+        reviewer_a_packet_sha256=packet_manifest[reviewer_a_path.name],
+        reviewer_b_packet_path=reviewer_b_path,
+        reviewer_b_packet_sha256=packet_manifest[reviewer_b_path.name],
+        expected_dataset_id="campaign",
+        expected_dataset_version="dataset-v2",
+    )
+    assert result["records"] == 2
+    ledger_path = Path(str(result["path"]))
+    verified = verify_ledger(
+        ledger_path,
+        str(result["sha256"]),
+        sampling=sampling,
+        reviewer_a_packet_sha256=packet_manifest[reviewer_a_path.name],
+        reviewer_b_packet_sha256=packet_manifest[reviewer_b_path.name],
+        expected_dataset_id="campaign",
+        expected_dataset_version="dataset-v2",
+    )
+    assert verified.full_population_dual_review is True
+    assert len(verified.records) == 2
+    with pytest.raises(ValueError, match="full_dual_review_required"):
+        freeze_ledger(
+            campaign_id="campaign",
+            records=[records[0].model_copy(update={"reviewer_b": None}), records[1]],
+            sampling=sampling,
+            protected_dir=tmp_path / "bad-ledger",
+            reviewer_a_packet_path=reviewer_a_path,
+            reviewer_a_packet_sha256=packet_manifest[reviewer_a_path.name],
+            reviewer_b_packet_path=reviewer_b_path,
+            reviewer_b_packet_sha256=packet_manifest[reviewer_b_path.name],
+            expected_dataset_id="campaign",
+            expected_dataset_version="dataset-v2",
+        )
+
+
 def test_freeze_target_is_protected_and_immutable(tmp_path: Path) -> None:
     from argparse import Namespace
 
@@ -378,6 +519,39 @@ def test_cli_sample_writes_exact_protected_artifacts_and_safe_public_summary(
     assert "memory 0" not in public_blob
     assert "00000000-" not in public_blob
     assert str(protected) not in public_blob
+
+
+def test_committed_public_campaign_artifact_reconciles_and_is_content_free() -> None:
+    path = Path("evals/calibration/campaigns/202/campaign-manifest-public.json")
+    manifest = json.loads(path.read_text())
+    sampling = manifest["sampling"]
+    assert sampling["sample_count"] == sampling["dev_count"] + sampling["holdout_count"]
+    blob = path.read_text()
+    assert (
+        re.search(
+            r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
+            blob,
+            re.IGNORECASE,
+        )
+        is None
+    )
+    for forbidden in (
+        '"sample_ids"',
+        '"sample_hashes"',
+        '"content"',
+        '"reviewer_notes"',
+        '"credentials"',
+        "/home/",
+        ".local/share",
+        "raw-items-snapshot.json",
+    ):
+        assert forbidden not in blob
+    assert manifest["serving_invariants"] == {
+        "assessment_selection_enabled": False,
+        "certified_serving_profiles": ["legacy"],
+        "mcp_recall_authority": "legacy",
+        "ordinary_recall_authority": "legacy",
+    }
 
 
 def test_cli_help_advertises_only_implemented_pre_review_commands() -> None:
@@ -532,6 +706,110 @@ def _floor_evidence(
     return records, observations, profiles
 
 
+def _bound_manifests(
+    observations: list[LabeledObservation],
+    records: list[LabelRecord] | None = None,
+) -> tuple[SamplingManifest, SplitManifest]:
+    by_id = {obs.sample_id: obs.split for obs in observations}
+    sample_ids = sorted(by_id)
+    record_hashes = {
+        record.sample_id: str(record.content_hash)
+        for record in records or []
+        if record.content_hash
+    }
+    sampling = SamplingManifest(
+        campaign_id="campaign",
+        target_identity_digest="c" * 64,
+        snapshot_sha256="d" * 64,
+        snapshot_as_of=NOW,
+        sampling_seed="seed",
+        inclusion_rules=("rule",),
+        exclusion_rules=(),
+        source_row_counts={"eligible_frame": len(sample_ids)},
+        stratum_counts={"all": len(sample_ids)},
+        coverage_dimensions={},
+        sample_ids=tuple(sample_ids),
+        sample_hashes=tuple(
+            record_hashes.get(sample_id, "sha256:" + digest(sample_id)) for sample_id in sample_ids
+        ),
+    )
+    split = SplitManifest(
+        campaign_id="campaign",
+        sampling_manifest_digest=sampling.manifest_digest(),
+        sampling_membership_digest=digest(sorted(sample_ids)),
+        split_seed="split",
+        dev_fraction=0.6,
+        grouping=("content_hash",),
+        dev_ids=tuple(sample_id for sample_id in sample_ids if by_id[sample_id] == "dev"),
+        holdout_ids=tuple(sample_id for sample_id in sample_ids if by_id[sample_id] == "holdout"),
+        leakage_checks={},
+    )
+    validate_split_membership(sampling, split)
+    return sampling, split
+
+
+def check_floors(
+    *,
+    floors: EvidenceFloors,
+    reviewed_records: list[LabelRecord],
+    observations: list[LabeledObservation],
+    profiles: list[CalibrationProfile],
+    synthesize_full_dual_review: bool = True,
+) -> EvidenceFloorResult:
+    sampling, split = _bound_manifests(observations, reviewed_records)
+    expected_hashes = dict(zip(sampling.sample_ids, sampling.sample_hashes, strict=True))
+    reviewed_records = [
+        record.model_copy(
+            update={
+                "content_hash": expected_hashes[record.sample_id],
+                "reviewer_b": (
+                    record.reviewer_b
+                    or (
+                        record.reviewer_a.model_copy(
+                            update={"adjudicator_ref": f"reviewer-b-{record.sample_id}"}
+                        )
+                        if synthesize_full_dual_review
+                        else None
+                    )
+                ),
+            }
+        )
+        for record in reviewed_records
+    ]
+    packet_a_sha = "b" * 64
+    packet_b_sha = "c" * 64
+    envelope = {
+        "ledger_schema": "engram-calibration-label-ledger-v2",
+        "campaign_id": sampling.campaign_id,
+        "sampling_manifest_digest": sampling.manifest_digest(),
+        "reviewer_a_packet_sha256": packet_a_sha,
+        "reviewer_b_packet_sha256": packet_b_sha,
+        "full_population_dual_review": True,
+        "records": [record.model_dump(mode="json") for record in reviewed_records],
+    }
+    payload = json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode()
+    fd, raw_path = tempfile.mkstemp()
+    ledger_path = Path(raw_path)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(payload)
+    try:
+        return _production_check_floors(
+            floors=floors,
+            ledger_path=ledger_path,
+            expected_ledger_sha256=hashlib.sha256(payload).hexdigest(),
+            reviewer_a_packet_sha256=packet_a_sha,
+            reviewer_b_packet_sha256=packet_b_sha,
+            expected_dataset_id=reviewed_records[0].dataset_id,
+            expected_dataset_version=reviewed_records[0].dataset_version,
+            observations=observations,
+            profiles=profiles,
+            sampling=sampling,
+            split=split,
+        )
+    finally:
+        ledger_path.unlink(missing_ok=True)
+
+
 def _floors(**updates: int | float) -> EvidenceFloors:
     values = dict(
         campaign_id="campaign",
@@ -539,12 +817,67 @@ def _floors(**updates: int | float) -> EvidenceFloors:
         per_dimension_labeled_min=50,
         per_dimension_non_unknown_fraction_min=0.80,
         holdout_min=10,
+        holdout_per_profile_min=10,
+        holdout_calibrated_brier_max=0.25,
+        holdout_calibrated_ece_max=0.15,
         high_consequence_reviewed_min=0,
         per_bin_support_min=50,
         per_stratum_min=50,
     )
     values.update(updates)
     return EvidenceFloors(**values)
+
+
+def test_fit_and_floors_reject_duplicate_or_wrong_split_observations() -> None:
+    records, observations, _ = _floor_evidence()
+    sampling, split = _bound_manifests(observations)
+    with pytest.raises(ValueError, match="duplicate_observation"):
+        fit_profiles(
+            observations=[observations[0], observations[0]],
+            identity=_identity(),
+            contract=_contract(),
+            split=split,
+        )
+    wrong_split = [
+        *observations[:-1],
+        observations[-1].model_copy(update={"split": "dev"}),
+    ]
+    with pytest.raises(ValueError, match="observation_split_mismatch"):
+        check_floors(
+            floors=_floors(),
+            reviewed_records=records,
+            observations=wrong_split,
+            profiles=_profiles(),
+        )
+
+
+def test_holdout_metrics_use_calibrated_profile_outputs() -> None:
+    _, observations, profiles = _floor_evidence()
+    _, split = _bound_manifests(observations)
+    bad_profile = profiles[0].model_copy(
+        update={"bins": tuple(bin_.model_copy(update={"value": 0.0}) for bin_ in profiles[0].bins)}
+    )
+    metrics = evaluate_holdout(observations, profiles=[bad_profile], split=split)
+    taxonomy = next(metric for metric in metrics if metric.dimension == "taxonomy")
+    assert taxonomy.brier == 1.0
+    assert taxonomy.raw_brier is not None
+    assert taxonomy.brier is not None
+    assert taxonomy.raw_brier < taxonomy.brier
+    with pytest.raises(ValueError, match="duplicate_calibration_profile_key"):
+        evaluate_holdout(observations, profiles=[profiles[0], profiles[0]], split=split)
+    unsupported_profile = profiles[0].model_copy(
+        update={
+            "bins": tuple(
+                bin_.model_copy(update={"count": 0}) if index == 5 else bin_
+                for index, bin_ in enumerate(profiles[0].bins)
+            )
+        }
+    )
+    unsupported = evaluate_holdout(observations, profiles=[unsupported_profile], split=split)
+    unsupported_taxonomy = next(metric for metric in unsupported if metric.dimension == "taxonomy")
+    assert unsupported_taxonomy.population_n == 10
+    assert unsupported_taxonomy.n == 0
+    assert unsupported_taxonomy.coverage == 0.0
 
 
 def test_every_frozen_floor_is_evidence_backed() -> None:
@@ -595,14 +928,14 @@ def test_high_consequence_and_dual_review_floors_fail_independently() -> None:
     assert too_few.checks["high_consequence"] is False
     pending = list(records)
     pending[0] = _record(0, "high", dual=False)
-    result = check_floors(
-        floors=_floors(high_consequence_reviewed_min=2),
-        reviewed_records=pending,
-        observations=observations,
-        profiles=profiles,
-    )
-    assert result.checks["dual_review_high_consequence"] is False
-    assert result.passed is False
+    with pytest.raises(ValueError, match="dual_review_required"):
+        check_floors(
+            floors=_floors(high_consequence_reviewed_min=2),
+            reviewed_records=pending,
+            observations=observations,
+            profiles=profiles,
+            synthesize_full_dual_review=False,
+        )
 
 
 def test_unknown_holdout_and_high_consequence_evidence_fail_closed() -> None:
@@ -663,7 +996,7 @@ def test_non_unknown_fraction_and_omitted_strata_are_explicit() -> None:
     explicit_result = check_floors(
         floors=_floors(),
         reviewed_records=records,
-        observations=[*observations, extra],
+        observations=[extra, *observations[1:]],
         profiles=profiles,
     )
     thin = explicit_result.stratum_support["taxonomy/thin-unprofiled-source/unknown/fact/unknown"]
@@ -724,6 +1057,12 @@ def test_gate_requires_bound_authoritative_recall_and_mismatch_proofs(tmp_path: 
     assert profile_digest is not None
     deployed = _contract().model_copy(update={"calibration_digest": profile_digest})
     floor_result = EvidenceFloorResult(
+        sampling_manifest_digest="e" * 64,
+        split_manifest_digest="f" * 64,
+        ledger_sha256="a" * 64,
+        reviewer_a_packet_sha256="b" * 64,
+        reviewer_b_packet_sha256="c" * 64,
+        full_population_dual_review=True,
         checks={"holdout_size": True, "holdout_labeled_support": True},
         dimension_support={},
         stratum_support={},
@@ -731,34 +1070,12 @@ def test_gate_requires_bound_authoritative_recall_and_mismatch_proofs(tmp_path: 
         failures=(),
         passed=True,
     )
-    bundle = CalibrationArtifactBundle(
-        calibration_version="dataset-v2",
-        target=identity.model_dump(mode="json"),
-        target_identity_digest=identity.identity_digest(),
-        sampling_manifest_digest="e" * 64,
-        split_manifest_digest="f" * 64,
-        floors=_floors().model_dump(mode="json"),
-        fitting_method="exact-stratum-reliability-bins-v1",
-        profiles=profile_payload,
-        holdout_metrics=[],
-        unsupported_strata=[],
-        floor_results=floor_result.model_dump(mode="json"),
-        floors_satisfied=True,
-    )
-    artifact_path = tmp_path / "profiles.json"
-    artifact_path.write_bytes(bundle.to_loader_payload())
-    mismatch = prove_mismatch_uncalibrated(
-        profiles,
-        deployed,
-        target_identity_digest=identity.identity_digest(),
-        artifact_digest=bundle.artifact_digest(),
-    )
     proof_path = tmp_path / "authoritative-recall-proof.json"
     proof_payload = {
         "proof_schema": "engram-authoritative-recall-proof-v1",
         "campaign_id": identity.campaign_id,
         "target_identity_digest": identity.identity_digest(),
-        "artifact_digest": bundle.artifact_digest(),
+        "profile_set_digest": profile_digest,
         "deployed_repo_sha": identity.repo_sha,
         "deployed_contract_digest": digest(deployed.model_dump(mode="json")),
         "assessment_policy_version": identity.assessment_policy_version,
@@ -773,6 +1090,40 @@ def test_gate_requires_bound_authoritative_recall_and_mismatch_proofs(tmp_path: 
         },
     }
     proof_path.write_text(json.dumps(proof_payload), encoding="utf-8")
+    proof_digest = hashlib.sha256(proof_path.read_bytes()).hexdigest()
+    bundle = CalibrationArtifactBundle(
+        calibration_version="dataset-v2",
+        target=identity.model_dump(mode="json"),
+        target_identity_digest=identity.identity_digest(),
+        sampling_manifest_digest="e" * 64,
+        split_manifest_digest="f" * 64,
+        floors=_floors().model_dump(mode="json"),
+        fitting_method="exact-stratum-reliability-bins-v1",
+        profiles=profile_payload,
+        holdout_metrics=[
+            {
+                "dimension": dimension,
+                "stratum": "manual/unknown/fact/unknown",
+                "n": 10,
+                "brier": 0.1,
+                "ece": 0.05,
+                "covered_stratum": True,
+            }
+            for dimension in ("taxonomy", "retention", "epistemic")
+        ],
+        unsupported_strata=[],
+        floor_results=floor_result.model_dump(mode="json"),
+        floors_satisfied=True,
+        authoritative_recall_evidence_digest=proof_digest,
+    )
+    artifact_path = tmp_path / "profiles.json"
+    artifact_path.write_bytes(bundle.to_loader_payload())
+    mismatch = prove_mismatch_uncalibrated(
+        profiles,
+        deployed,
+        target_identity_digest=identity.identity_digest(),
+        artifact_digest=bundle.artifact_digest(),
+    )
     kwargs = dict(
         artifact_path=artifact_path,
         bundle=bundle,
@@ -787,7 +1138,31 @@ def test_gate_requires_bound_authoritative_recall_and_mismatch_proofs(tmp_path: 
     absent = gate_checks(**kwargs, authoritative_recall_evidence_path=None)
     assert absent["recommendation"] == "KEEP_DISABLED"
     passed = gate_checks(**kwargs, authoritative_recall_evidence_path=proof_path)
-    assert passed["recommendation"] == "ENABLE_DOGFOOD_SHADOW_SELECTION"
+    assert passed["recommendation"] == "ENABLE_DOGFOOD_SHADOW_SELECTION", [
+        key for key, value in passed["checks"].items() if value is not True
+    ]
+    assert passed["checks"]["holdout_calibrated_performance"] is True
+    invalid_metric_sets = [
+        [{**metric, "brier": 1.0} for metric in bundle.holdout_metrics],
+        [{**metric, "brier": float("nan")} for metric in bundle.holdout_metrics],
+        [{**metric, "n": 9} for metric in bundle.holdout_metrics],
+        [*bundle.holdout_metrics, bundle.holdout_metrics[0]],
+    ]
+    for invalid_metrics in invalid_metric_sets:
+        bad_holdout_bundle = bundle.model_copy(update={"holdout_metrics": invalid_metrics})
+        bad_holdout = gate_checks(
+            **{**kwargs, "bundle": bad_holdout_bundle},
+            authoritative_recall_evidence_path=proof_path,
+        )
+        assert bad_holdout["checks"]["holdout_calibrated_performance"] is False
+    duplicate_profile_bundle = bundle.model_copy(
+        update={"profiles": [*bundle.profiles, bundle.profiles[0]]}
+    )
+    duplicate_profile_gate = gate_checks(
+        **{**kwargs, "bundle": duplicate_profile_bundle},
+        authoritative_recall_evidence_path=proof_path,
+    )
+    assert duplicate_profile_gate["checks"]["holdout_calibrated_performance"] is False
     failed_mismatch = mismatch.model_copy(
         update={"checks": {**mismatch.checks, "mismatch_provider_stays_uncalibrated": False}}
     )
