@@ -1,0 +1,87 @@
+name: CI Formatting
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  changed-python-format:
+    name: changed-python-format
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve formatting comparison
+        id: comparison
+        env:
+          CI_EVENT_NAME: ${{ github.event_name }}
+          CI_PUSH_BASE_SHA: ${{ github.event.before }}
+          CI_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CI_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CI_WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          empty_tree=4b825dc642cb6eb9a060e54bf8d69288fbee4904
+
+          if [[ "$CI_EVENT_NAME" == "pull_request" ]]; then
+            comparison_base=$CI_PR_BASE_SHA
+            comparison_head=$CI_PR_HEAD_SHA
+          else
+            comparison_base=$CI_PUSH_BASE_SHA
+            comparison_head=$CI_WORKFLOW_SHA
+          fi
+
+          if [[ -z "$comparison_base" || "$comparison_base" =~ ^0+$ ]]; then
+            comparison_base=$empty_tree
+          fi
+
+          echo "base=$comparison_base" >> "$GITHUB_OUTPUT"
+          echo "head=$comparison_head" >> "$GITHUB_OUTPUT"
+
+          echo "Formatting comparison: $comparison_base..$comparison_head"
+          python scripts/format_changed.py \
+            --base "$comparison_base" \
+            --head "$comparison_head" \
+            --list \
+            | tee /tmp/engram-format-files.txt
+
+          if [[ -s /tmp/engram-format-files.txt ]]; then
+            echo "has_python=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_python=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        if: steps.comparison.outputs.has_python == 'true'
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        if: steps.comparison.outputs.has_python == 'true'
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.29"
+
+      - name: Install locked development toolchain
+        if: steps.comparison.outputs.has_python == 'true'
+        run: uv sync --frozen --extra dev
+
+      - name: Check changed Python formatting
+        if: steps.comparison.outputs.has_python == 'true'
+        run: |
+          .venv/bin/python scripts/format_changed.py \
+            --base "${{ steps.comparison.outputs.base }}" \
+            --head "${{ steps.comparison.outputs.head }}" \
+            --ruff .venv/bin/ruff \
+            --check
