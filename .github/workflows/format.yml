@@ -73,9 +73,9 @@ jobs:
         with:
           version: "0.11.29"
 
-      - name: Install locked development toolchain
+      - name: Install locked Ruff toolchain
         if: steps.comparison.outputs.has_python == 'true'
-        run: uv sync --frozen --extra dev
+        run: uv sync --frozen --package engram --extra dev
 
       - name: Check changed Python formatting
         if: steps.comparison.outputs.has_python == 'true'
