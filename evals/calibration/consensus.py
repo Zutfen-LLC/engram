@@ -1464,18 +1464,21 @@ def build_correlation_report(
                 if record.execution is not None
             ]
             entry["service_by_attestation"] = sorted(
+                {str(a.get("service", "")) for a in attestations if isinstance(a, dict)}
+            )
+            # FIX-1: the public-safe correlation provenance reports the
+            # FROZEN user-visible selected model name for the lane (the
+            # immutable lane authority recorded at initialization), never a
+            # per-batch display string that could drift.
+            entry["frozen_user_visible_model_name"] = sorted(
                 {
-                    str(a.get("service", ""))
+                    str(a.get("user_visible_model_name", ""))
                     for a in attestations
                     if isinstance(a, dict)
                 }
             )
             entry["attestation_digests"] = sorted(
-                {
-                    str(a.get("attestation_digest", ""))
-                    for a in attestations
-                    if isinstance(a, dict)
-                }
+                {str(a.get("attestation_digest", "")) for a in attestations if isinstance(a, dict)}
             )
             entry["provider_metadata_available"] = False
             entry["provider_execution_identity_operator_attested"] = True

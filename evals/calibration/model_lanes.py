@@ -175,6 +175,9 @@ def load_lane_records(protected_root: Path, reviewer_slot: str) -> dict[str, Mod
             "lane-freeze.json",
             "lane.json",
             "neutral-packet.json",
+            # #209 FIX-1: the frozen visible-model lane authority is not a
+            # review record.
+            "subscription-authority.json",
         } or path.name.endswith(".manifest.json"):
             continue
         record = ModelReviewRecord.model_validate(json.loads(path.read_text()))

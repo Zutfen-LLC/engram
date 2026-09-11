@@ -595,30 +595,40 @@ def init_subscription_lane(
     source_packet_digest: str,
     neutral_packet_path: Path,
     neutral_packet_manifest: Path,
+    user_visible_model_name: str,
+    operator_reference: str,
 ) -> LaneSession:
     """Initialize one lane in #209 subscription-UI provenance mode.
 
     Narrowly scoped: the campaign/protocol pair must be in the frozen
     ``SUBSCRIPTION_UI_OPTED_CAMPAIGNS`` opt-in list, the reviewer identity
     must be the frozen subscription identity for the slot, and the lane must
-    not already exist in another mode. Everything else (neutral packet
-    byte-verification, authority binding, retained packet bytes) is the
-    unchanged ``LaneSession.init`` path.
+    not already exist in another mode. FIX-1: the exact user-visible
+    selected model name/version and the operator reference are REQUIRED and
+    frozen here — before any output exists — as a digest-bound
+    ``SubscriptionLaneAuthority`` inside the lane root; every later batch
+    attestation must match this frozen authority exactly. Everything else
+    (neutral packet byte-verification, authority binding, retained packet
+    bytes) is the unchanged ``LaneSession.init`` path.
     """
     from evals.calibration.subscription_ui import (
         SERVICE_BY_SLOT,
         SUBSCRIPTION_MODEL_BY_SLOT,
+        build_subscription_lane_authority,
         subscription_mode_permitted,
+        write_subscription_lane_authority,
     )
 
     if not subscription_mode_permitted(campaign_id, CONSENSUS_PROTOCOL_VERSION):
         raise ValueError("subscription_ui_mode_not_opted_in_for_campaign")
-    if reviewer.provider_model_identifier != SUBSCRIPTION_MODEL_BY_SLOT.get(
-        reviewer.reviewer_slot
-    ):
+    if reviewer.provider_model_identifier != SUBSCRIPTION_MODEL_BY_SLOT.get(reviewer.reviewer_slot):
         raise ValueError("subscription_lane_requires_frozen_subscription_identity")
     if SERVICE_BY_SLOT.get(reviewer.reviewer_slot) is None:
         raise ValueError("unknown_reviewer_slot")
+    if not user_visible_model_name:
+        raise ValueError("subscription_lane_requires_user_visible_model_name")
+    if not operator_reference:
+        raise ValueError("subscription_lane_requires_operator_reference")
     lane_root = protected_root / "lanes" / reviewer.reviewer_slot
     authority_path = lane_root / "lane.json"
     if authority_path.exists():
@@ -626,7 +636,7 @@ def init_subscription_lane(
         if existing_mode != "operator_attested_subscription_ui":
             raise ValueError("lane_already_initialized_in_other_provenance_mode")
         raise ValueError("lane_already_initialized")
-    return LaneSession.init(
+    session = LaneSession.init(
         protected_root,
         reviewer=reviewer,
         campaign_id=campaign_id,
@@ -636,6 +646,20 @@ def init_subscription_lane(
         neutral_packet_manifest=neutral_packet_manifest,
         provenance_mode="operator_attested_subscription_ui",
     )
+    # FIX-1: freeze the visible selected model BEFORE any output exists.
+    # Exclusive-create semantics: the protected write below refuses to
+    # overwrite, so the first frozen authority is immutable.
+    write_subscription_lane_authority(
+        lane_root,
+        build_subscription_lane_authority(
+            campaign_id=campaign_id,
+            reviewer_slot=reviewer.reviewer_slot,
+            user_visible_model_name=user_visible_model_name,
+            operator_reference=operator_reference,
+            lane_identity_digest=reviewer.lane_identity_digest(),
+        ),
+    )
+    return session
 
 
 def verify_reviewer_prompt_binding(reviewer: ReviewerIdentity) -> None:
