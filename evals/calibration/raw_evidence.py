@@ -217,6 +217,22 @@ def validate_lane_provenance_with_raw(
         campaign_id=campaign_id,
         neutral_packet_sha256=lane.neutral_packet_sha256,
     )
-    require_machine_verified_execution_identity(
-        records, lane_root=lane_root_for(protected_root, lane.reviewer.reviewer_slot)
-    )
+    from evals.calibration.ingestion import lane_provenance_mode
+
+    if lane_provenance_mode(lane_root_for(protected_root, lane.reviewer.reviewer_slot)) == (
+        "operator_attested_subscription_ui"
+    ):
+        # #209 opt-in: the operator-attested subscription gate replaces the
+        # machine-verified identity gate at this final boundary too; every
+        # other check above is unchanged.
+        from evals.calibration.subscription_ui import require_subscription_attested_identity
+
+        require_subscription_attested_identity(
+            records,
+            lane_root=lane_root_for(protected_root, lane.reviewer.reviewer_slot),
+            protected_root=protected_root,
+        )
+    else:
+        require_machine_verified_execution_identity(
+            records, lane_root=lane_root_for(protected_root, lane.reviewer.reviewer_slot)
+        )

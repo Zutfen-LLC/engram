@@ -9,6 +9,10 @@ Available subcommands:
   model-lane-request emit only this lane's pending neutral case requests (#206 FIX-6)
   model-lane-ingest  mechanically ingest structured model responses (#206 FIX-6)
   model-lane-status  completion/missing/failure counts for one lane (#206 FIX-6)
+  sub-lane-init     initialize one lane in operator-attested subscription-UI mode (#209)
+  sub-batches       export deterministic paste-ready logical review batches (#209)
+  sub-batch-show    print one batch's paste-ready prompt (#209)
+  sub-import        ingest one verbatim subscription-UI batch response (#209)
   freeze-model-lane  freeze one completed frontier-model reviewer lane (#206)
   model-report    public-safe correlation report after all three lanes freeze (#206)
   human-queue     build the mandatory human queue from frozen lanes (#206)
@@ -52,7 +56,11 @@ from evals.calibration.freeze import (
     validate_split_membership,
 )
 from evals.calibration.human_queue import build_queue, write_queue
-from evals.calibration.ingestion import LaneSession, load_neutral_packet_verified
+from evals.calibration.ingestion import (
+    LaneSession,
+    init_subscription_lane,
+    load_neutral_packet_verified,
+)
 from evals.calibration.model_lanes import (
     NeutralModelPacket,
     freeze_lane,
@@ -654,6 +662,94 @@ def cmd_model_lane_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sub_lane_init(args: argparse.Namespace) -> int:
+    """Initialize one lane in #209 subscription-UI provenance mode."""
+    from evals.calibration.subscription_ui import subscription_reviewer_identity
+
+    sampling = SamplingManifest.model_validate(json.loads(Path(args.sampling_manifest).read_text()))
+    reviewer = subscription_reviewer_identity(
+        args.reviewer_slot,
+        reviewer_config_digest=args.reviewer_config_digest,
+        prompt_digest=_labeling_prompt_digest(),
+    )
+    init_subscription_lane(
+        Path(args.protected_dir),
+        reviewer=reviewer,
+        campaign_id=CAMPAIGN_ID,
+        sampling=sampling,
+        source_packet_digest=args.source_packet_digest,
+        neutral_packet_path=Path(args.neutral_packet),
+        neutral_packet_manifest=Path(args.neutral_packet_manifest),
+    )
+    print(
+        json.dumps(
+            {
+                "reviewer_slot": reviewer.reviewer_slot,
+                "provenance_mode": "operator_attested_subscription_ui",
+                "lane_identity_digest": reviewer.lane_identity_digest(),
+            }
+        )
+    )
+    return 0
+
+
+def _labeling_prompt_digest() -> str:
+    from evals.calibration.ingestion import labeling_instructions_digest
+
+    return labeling_instructions_digest()
+
+
+def cmd_sub_batches(args: argparse.Namespace) -> int:
+    """Export the deterministic paste-ready logical review batches (#209)."""
+    from evals.calibration import subscription_ui
+
+    sampling = SamplingManifest.model_validate(json.loads(Path(args.sampling_manifest).read_text()))
+    summary = subscription_ui.export_review_batches(
+        Path(args.protected_dir),
+        campaign_id=CAMPAIGN_ID,
+        sampling=sampling,
+        neutral_packet_path=Path(args.neutral_packet),
+        neutral_packet_manifest=Path(args.neutral_packet_manifest),
+        source_packet_digest=args.source_packet_digest,
+    )
+    print(json.dumps(summary, sort_keys=True))
+    return 0
+
+
+def cmd_sub_batch_show(args: argparse.Namespace) -> int:
+    """Print one batch's paste-ready prompt (maintainer handoff, #209)."""
+    from evals.calibration import subscription_ui
+
+    subscription_ui.verify_review_batches(Path(args.protected_dir))
+    path = subscription_ui.batch_prompt_path(Path(args.protected_dir), args.batch_id)
+    if not path.is_file():
+        raise SystemExit("subscription_batch_not_in_canonical_manifest")
+    print(path.read_text(), end="")
+    return 0
+
+
+def cmd_sub_import(args: argparse.Namespace) -> int:
+    """Ingest one verbatim subscription-UI batch response (#209)."""
+    from evals.calibration import subscription_ui
+
+    sampling = SamplingManifest.model_validate(json.loads(Path(args.sampling_manifest).read_text()))
+    raw_response = Path(args.raw_response).read_text()
+    result = subscription_ui.import_batch_response(
+        Path(args.protected_dir),
+        reviewer_slot=args.reviewer_slot,
+        batch_id=args.batch_id,
+        raw_response=raw_response,
+        service=args.service,
+        user_visible_model_name=args.model_name,
+        operator_reference=args.operator,
+        sampling=sampling,
+        conversation_reference=args.conversation_reference,
+        retry_mechanical_failure=args.retry_mechanical_failure,
+    )
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -790,6 +886,80 @@ def main() -> int:
     command.add_argument("--source-packet-digest", required=True)
     command.add_argument("--protected-dir", required=True)
     command.set_defaults(func=cmd_model_lane_status)
+
+    # -- #209 subscription-UI lanes ---------------------------------------------
+
+    command = sub.add_parser(
+        "sub-lane-init",
+        help="initialize one lane in operator-attested subscription-UI mode (#209)",
+    )
+    command.add_argument("--sampling-manifest", required=True)
+    command.add_argument(
+        "--reviewer-slot", required=True, choices=list(REVIEWER_SLOTS)
+    )
+    command.add_argument(
+        "--reviewer-config-digest",
+        required=True,
+        help="frozen reviewer configuration digest (sha256:<64hex>)",
+    )
+    command.add_argument("--source-packet-digest", required=True)
+    command.add_argument("--neutral-packet", required=True)
+    command.add_argument("--neutral-packet-manifest", required=True)
+    command.add_argument("--protected-dir", required=True)
+    command.set_defaults(func=cmd_sub_lane_init)
+
+    command = sub.add_parser(
+        "sub-batches",
+        help="export deterministic paste-ready logical review batches (#209)",
+    )
+    command.add_argument("--sampling-manifest", required=True)
+    command.add_argument("--neutral-packet", required=True)
+    command.add_argument("--neutral-packet-manifest", required=True)
+    command.add_argument("--source-packet-digest", required=True)
+    command.add_argument("--protected-dir", required=True)
+    command.set_defaults(func=cmd_sub_batches)
+
+    command = sub.add_parser(
+        "sub-batch-show",
+        help="print one batch's paste-ready prompt for maintainer handoff (#209)",
+    )
+    command.add_argument("--protected-dir", required=True)
+    command.add_argument("--batch-id", required=True)
+    command.set_defaults(func=cmd_sub_batch_show)
+
+    command = sub.add_parser(
+        "sub-import",
+        help="ingest one verbatim subscription-UI batch response (#209)",
+    )
+    command.add_argument("--sampling-manifest", required=True)
+    command.add_argument("--reviewer-slot", required=True, choices=list(REVIEWER_SLOTS))
+    command.add_argument("--batch-id", required=True)
+    command.add_argument(
+        "--raw-response", required=True, help="file containing the exact copied raw response"
+    )
+    command.add_argument(
+        "--service",
+        required=True,
+        choices=["claude_ai", "chatgpt", "z_ai"],
+        help="consumer subscription service the response came from",
+    )
+    command.add_argument(
+        "--model-name",
+        required=True,
+        help="exact model display name/version visible in the service UI",
+    )
+    command.add_argument(
+        "--operator", required=True, help="operator reference attesting the execution"
+    )
+    command.add_argument("--conversation-reference", default=None)
+    command.add_argument(
+        "--retry-mechanical-failure",
+        action="store_true",
+        help="explicit mechanical-failure retry (failed attempt evidence retained)",
+    )
+    command.add_argument("--source-packet-digest", required=True)
+    command.add_argument("--protected-dir", required=True)
+    command.set_defaults(func=cmd_sub_import)
 
     # -- human queue operation (FIX-R3-9) -------------------------------------
 
