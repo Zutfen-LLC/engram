@@ -479,8 +479,11 @@ def observe_execution(
     request_generation: int,
     executor_identity: str,
     executor_status: Literal["completed", "provider_error"],
-    identity_source: Literal["provider_metadata", "executor_attestation"],
+    identity_source: Literal[
+        "provider_metadata", "executor_attestation", "operator_attested_subscription_ui"
+    ],
     provider_metadata_artifact: ProviderMetadataArtifact | None = None,
+    subscription_attestation: Mapping[str, Any] | None = None,
     executed_at: datetime | None = None,
 ) -> ExecutionReceipt:
     """FIX-R5-1 / FIX-R6-2: build a truthful execution receipt from OBSERVED
@@ -532,6 +535,10 @@ def observe_execution(
             raise ValueError("executor_attestation_must_not_claim_provider_metadata")
         provider_request_id = None
         provider_response_id = None
+    if identity_source == "operator_attested_subscription_ui" and (
+        provider_metadata_artifact is not None
+    ):
+        raise ValueError("subscription_ui_must_not_claim_provider_metadata")
     evidence = ExecutionEvidence(
         campaign_id=campaign_id,
         actual_reviewer_slot=actual_reviewer_slot,  # type: ignore[arg-type]
@@ -552,8 +559,115 @@ def observe_execution(
             if provider_metadata_artifact is not None
             else None
         ),
+        subscription_attestation=dict(subscription_attestation)
+        if subscription_attestation is not None
+        else None,
     )
     return ExecutionReceipt.from_evidence(evidence)
+
+
+def lane_provenance_mode(lane_root: Path) -> str:
+    """The lane's frozen provenance mode (``provider_metadata`` default).
+
+    #209: a lane initialized with the explicit subscription-UI opt-in
+    records ``operator_attested_subscription_ui`` in its immutable authority
+    file; the marker is exclusive-create and can never be flipped on an
+    existing machine-verified lane. Every freeze/load/verify boundary reads
+    the mode from the authority bytes (never a caller argument) and applies
+    the corresponding provenance gate.
+    """
+    authority_path = lane_root / "lane.json"
+    if not authority_path.is_file():
+        return "provider_metadata"
+    payload = json.loads(authority_path.read_text())
+    mode = payload.get("provenance_mode", "provider_metadata")
+    if mode not in ("provider_metadata", "operator_attested_subscription_ui"):
+        raise ValueError("lane_unknown_provenance_mode")
+    return str(mode)
+
+
+def init_subscription_lane(
+    protected_root: Path,
+    *,
+    reviewer: ReviewerIdentity,
+    campaign_id: str,
+    sampling: SamplingManifest,
+    source_packet_digest: str,
+    neutral_packet_path: Path,
+    neutral_packet_manifest: Path,
+    user_visible_model_name: str,
+    operator_reference: str,
+) -> LaneSession:
+    """Initialize one lane in #209 subscription-UI provenance mode.
+
+    Narrowly scoped: the campaign/protocol pair must be in the frozen
+    ``SUBSCRIPTION_UI_OPTED_CAMPAIGNS`` opt-in list, the reviewer identity
+    must be the frozen subscription identity for the slot, and the lane must
+    not already exist in another mode. FIX-1: the exact user-visible
+    selected model name/version and the operator reference are REQUIRED and
+    frozen here — before any output exists — as a digest-bound
+    ``SubscriptionLaneAuthority`` inside the lane root; every later batch
+    attestation must match this frozen authority exactly. Everything else
+    (neutral packet byte-verification, authority binding, retained packet
+    bytes) is the unchanged ``LaneSession.init`` path.
+    """
+    from evals.calibration.consensus import FAMILY_BY_SLOT
+    from evals.calibration.subscription_ui import (
+        SERVICE_BY_SLOT,
+        SUBSCRIPTION_MODEL_BY_SLOT,
+        build_subscription_lane_authority,
+        subscription_mode_permitted,
+        validate_visible_model_family,
+        write_subscription_lane_authority,
+    )
+
+    if not subscription_mode_permitted(campaign_id, CONSENSUS_PROTOCOL_VERSION):
+        raise ValueError("subscription_ui_mode_not_opted_in_for_campaign")
+    if reviewer.provider_model_identifier != SUBSCRIPTION_MODEL_BY_SLOT.get(reviewer.reviewer_slot):
+        raise ValueError("subscription_lane_requires_frozen_subscription_identity")
+    if SERVICE_BY_SLOT.get(reviewer.reviewer_slot) is None:
+        raise ValueError("unknown_reviewer_slot")
+    if not user_visible_model_name:
+        raise ValueError("subscription_lane_requires_user_visible_model_name")
+    # FIX-1 (round 3): positive family identification BEFORE any lane state
+    # is created — a wrong-family visible label (Opus lane + Sonnet/Haiku,
+    # Astra lane + GPT-4o, Max lane + another GLM variant) STOPs
+    # initialization with an explicit error so the maintainer can decide
+    # before any output exists.
+    validate_visible_model_family(FAMILY_BY_SLOT[reviewer.reviewer_slot], user_visible_model_name)
+    if not operator_reference:
+        raise ValueError("subscription_lane_requires_operator_reference")
+    lane_root = protected_root / "lanes" / reviewer.reviewer_slot
+    authority_path = lane_root / "lane.json"
+    if authority_path.exists():
+        existing_mode = lane_provenance_mode(lane_root)
+        if existing_mode != "operator_attested_subscription_ui":
+            raise ValueError("lane_already_initialized_in_other_provenance_mode")
+        raise ValueError("lane_already_initialized")
+    session = LaneSession.init(
+        protected_root,
+        reviewer=reviewer,
+        campaign_id=campaign_id,
+        sampling=sampling,
+        source_packet_digest=source_packet_digest,
+        neutral_packet_path=neutral_packet_path,
+        neutral_packet_manifest=neutral_packet_manifest,
+        provenance_mode="operator_attested_subscription_ui",
+    )
+    # FIX-1: freeze the visible selected model BEFORE any output exists.
+    # Exclusive-create semantics: the protected write below refuses to
+    # overwrite, so the first frozen authority is immutable.
+    write_subscription_lane_authority(
+        lane_root,
+        build_subscription_lane_authority(
+            campaign_id=campaign_id,
+            reviewer_slot=reviewer.reviewer_slot,
+            user_visible_model_name=user_visible_model_name,
+            operator_reference=operator_reference,
+            lane_identity_digest=reviewer.lane_identity_digest(),
+        ),
+    )
+    return session
 
 
 def verify_reviewer_prompt_binding(reviewer: ReviewerIdentity) -> None:
@@ -669,6 +783,13 @@ class LaneAuthority(Record):
     # request emission re-reads and re-hashes the packet file and refuses any
     # byte disagreement BEFORE any reviewer request is emitted.
     neutral_packet_sha256: str
+    # #209: the lane's frozen provenance mode. Default (and unchanged
+    # meaning for every existing lane): machine-verified provider metadata.
+    # ``operator_attested_subscription_ui`` is settable ONLY at
+    # subscription-lane init under the frozen campaign opt-in.
+    provenance_mode: Literal["provider_metadata", "operator_attested_subscription_ui"] = (
+        "provider_metadata"
+    )
 
     @model_validator(mode="after")
     def authority_contract(self) -> Self:
@@ -766,6 +887,9 @@ class LaneSession:
         source_packet_digest: str,
         neutral_packet_path: Path,
         neutral_packet_manifest: Path,
+        provenance_mode: Literal["provider_metadata", "operator_attested_subscription_ui"] = (
+            "provider_metadata"
+        ),
     ) -> LaneSession:
         """Bind one lane to one frozen reviewer identity (exclusive-create).
 
@@ -798,6 +922,7 @@ class LaneSession:
             sampling_manifest_digest=sampling.manifest_digest(),
             source_packet_digest=source_packet_digest,
             neutral_packet_sha256=packet_sha,
+            provenance_mode=provenance_mode,
         )
         payload = (json.dumps(authority.model_dump(mode="json"), sort_keys=True) + "\n").encode()
         lane_path = protected_root / "lanes" / reviewer.reviewer_slot / "lane.json"

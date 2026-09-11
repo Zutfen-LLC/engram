@@ -175,6 +175,9 @@ def load_lane_records(protected_root: Path, reviewer_slot: str) -> dict[str, Mod
             "lane-freeze.json",
             "lane.json",
             "neutral-packet.json",
+            # #209 FIX-1: the frozen visible-model lane authority is not a
+            # review record.
+            "subscription-authority.json",
         } or path.name.endswith(".manifest.json"):
             continue
         record = ModelReviewRecord.model_validate(json.loads(path.read_text()))
@@ -239,12 +242,32 @@ def freeze_lane(
         neutral_packet_sha256=neutral_packet_sha256,
     )
     # FIX-R5-1: unverified (attested-only) actual executor identity can
-    # never freeze as a valid consensus reviewer lane.
-    from evals.calibration.ingestion import require_machine_verified_execution_identity
-
-    require_machine_verified_execution_identity(
-        records, lane_root=lane_directory(protected_root, reviewer.reviewer_slot)
+    # never freeze as a valid consensus reviewer lane — UNLESS the lane is
+    # explicitly in #209 subscription-UI mode, where the operator-attested
+    # provenance gate replaces the machine-verified gate without weakening
+    # any other check (see evals.calibration.subscription_ui).
+    from evals.calibration.ingestion import (
+        lane_provenance_mode,
+        require_machine_verified_execution_identity,
     )
+
+    if lane_provenance_mode(lane_directory(protected_root, reviewer.reviewer_slot)) == (
+        "operator_attested_subscription_ui"
+    ):
+        from evals.calibration.subscription_ui import (
+            require_subscription_attested_identity,
+        )
+
+        require_subscription_attested_identity(
+            records,
+            lane_root=lane_directory(protected_root, reviewer.reviewer_slot),
+            protected_root=protected_root,
+            sampling=sampling,
+        )
+    else:
+        require_machine_verified_execution_identity(
+            records, lane_root=lane_directory(protected_root, reviewer.reviewer_slot)
+        )
     # FIX-R2-4: raw model evidence is freeze-bound — every accepted record
     # must have its protected raw bytes present and hashing to the claimed
     # digest (provider_error records must claim none).
@@ -321,12 +344,29 @@ def _load_one_frozen_lane(
         neutral_packet_sha256=lane.neutral_packet_sha256,
     )
     # FIX-R5-1: a frozen lane whose records lack machine-verified actual
-    # executor identity cannot load as a valid consensus reviewer lane.
-    from evals.calibration.ingestion import require_machine_verified_execution_identity
-
-    require_machine_verified_execution_identity(
-        records, lane_root=lane_directory(protected_root, reviewer.reviewer_slot)
+    # executor identity cannot load as a valid consensus reviewer lane —
+    # except under the #209 subscription-UI mode opt-in, whose attestation
+    # gate runs the same re-verification here.
+    from evals.calibration.ingestion import (
+        lane_provenance_mode,
+        require_machine_verified_execution_identity,
     )
+
+    if lane_provenance_mode(lane_directory(protected_root, reviewer.reviewer_slot)) == (
+        "operator_attested_subscription_ui"
+    ):
+        from evals.calibration.subscription_ui import require_subscription_attested_identity
+
+        require_subscription_attested_identity(
+            records,
+            lane_root=lane_directory(protected_root, reviewer.reviewer_slot),
+            protected_root=protected_root,
+            sampling=sampling,
+        )
+    else:
+        require_machine_verified_execution_identity(
+            records, lane_root=lane_directory(protected_root, reviewer.reviewer_slot)
+        )
     return lane
 
 

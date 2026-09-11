@@ -138,6 +138,16 @@ CriticalFieldVocabulary: dict[str, set[str]] = {
     "consequence": {"low", "medium", "high", "unknown"},
     "acceptable_abstention": {"yes", "no", "unknown"},
 }
+# How the actual executor identity was observed (#206 + #209):
+# - ``provider_metadata``: machine-verifiable provider metadata;
+# - ``executor_attestation``: honest executor self-report, can NEVER freeze;
+# - ``operator_attested_subscription_ui`` (#209): the human operator attests
+#   the consumer service/model through a digest-bound
+#   ``SubscriptionReviewAttestation``; freezable ONLY under the explicit
+#   campaign opt-in (see evals.calibration.subscription_ui).
+IdentitySource = Literal[
+    "provider_metadata", "executor_attestation", "operator_attested_subscription_ui"
+]
 # Every Dimensions field that is not consensus-critical is diagnostic-only:
 # reviewers MAY return these fields, and disagreement on them NEVER creates a
 # human case or blocks consensus acceptance.
@@ -287,7 +297,7 @@ class ExecutionEvidence(Record):
     executor_status: Literal["completed", "provider_error"]
     # Executor/session/run identity — who actually executed the request.
     executor_identity: str
-    identity_source: Literal["provider_metadata", "executor_attestation"]
+    identity_source: IdentitySource
     # Optional provider-reported request/response IDs, preserved and bound.
     provider_request_id: str | None = None
     provider_response_id: str | None = None
@@ -297,6 +307,12 @@ class ExecutionEvidence(Record):
     # (verified at schema validation and re-derived at every boundary).
     # Structurally impossible for ``executor_attestation`` (None).
     provider_metadata: dict[str, Any] | None = None
+    # #209: the digest-bound operator attestation. REQUIRED for
+    # ``identity_source == "operator_attested_subscription_ui"`` (verified at
+    # schema validation by the lazy subscription validator). Structurally
+    # impossible for the other two sources (None), so a subscription-UI
+    # record can never validate as provider metadata and vice versa.
+    subscription_attestation: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def evidence_contract(self) -> Self:
@@ -309,9 +325,23 @@ class ExecutionEvidence(Record):
             # VERIFICATION — the embedded artifact must digest-bind its raw
             # metadata and mechanically derive the claimed identity.
             verify_evidence_against_artifact(self)
+            if self.subscription_attestation is not None:
+                raise ValueError("provider_metadata_must_not_claim_subscription_attestation")
+        elif self.identity_source == "operator_attested_subscription_ui":
+            if self.provider_metadata is not None:
+                raise ValueError("subscription_ui_must_not_claim_provider_metadata")
+            if self.provider_request_id is not None or self.provider_response_id is not None:
+                raise ValueError("subscription_ui_must_not_claim_provider_ids")
+            from evals.calibration.subscription_ui import (
+                verify_evidence_subscription_attestation,
+            )
+
+            verify_evidence_subscription_attestation(self)
         else:
             if self.provider_metadata is not None:
                 raise ValueError("executor_attestation_must_not_claim_provider_metadata")
+            if self.subscription_attestation is not None:
+                raise ValueError("executor_attestation_must_not_claim_subscription_attestation")
         if not self.executor_identity:
             raise ValueError("execution_evidence_requires_executor_identity")
         return self
@@ -358,10 +388,12 @@ class ExecutionReceipt(Record):
     executed_at: AwareDatetime
     executor_status: Literal["completed", "provider_error"]
     executor_identity: str
-    identity_source: Literal["provider_metadata", "executor_attestation"]
+    identity_source: IdentitySource
     provider_request_id: str | None = None
     provider_response_id: str | None = None
     provider_metadata: dict[str, Any] | None = None
+    # #209: carried verbatim from the evidence for subscription-UI records.
+    subscription_attestation: dict[str, Any] | None = None
     evidence: ExecutionEvidence
     evidence_digest: Digest
 
@@ -384,6 +416,7 @@ class ExecutionReceipt(Record):
             and self.provider_request_id == evidence.provider_request_id
             and self.provider_response_id == evidence.provider_response_id
             and self.provider_metadata == evidence.provider_metadata
+            and self.subscription_attestation == evidence.subscription_attestation
         )
         if not derived_fields:
             raise ValueError("execution_receipt_not_derived_from_its_evidence")
@@ -410,6 +443,7 @@ class ExecutionReceipt(Record):
             provider_request_id=evidence.provider_request_id,
             provider_response_id=evidence.provider_response_id,
             provider_metadata=evidence.provider_metadata,
+            subscription_attestation=evidence.subscription_attestation,
             evidence=evidence,
             evidence_digest=evidence.evidence_digest(),
         )
@@ -1255,6 +1289,12 @@ class CorrelationReport(Record):
     threeway_agreement: dict[str, int]
     aggregate_by_axis: dict[str, dict[str, dict[str, int]]]
     audit: dict[str, Any]
+    # #209: honest execution provenance. ``by_lane`` records each lane's
+    # ``identity_source`` (and, for subscription lanes, the operator-visible
+    # service/model attestation digests) so the report distinguishes
+    # machine-verified from operator-attested execution. ``note`` states the
+    # boundary in plain text for public consumption.
+    execution_provenance: dict[str, Any] = {}
 
     @model_validator(mode="after")
     def report_contract(self) -> Self:
@@ -1404,6 +1444,62 @@ def build_correlation_report(
     }
     audit_payload["audit_count"] = len(audit_selected)
     workload = len(set(queue_ids) | set(audit_selected))
+    # #209: honest per-lane execution provenance, derived from the records.
+    provenance_by_lane: dict[str, Any] = {}
+    for lane in lanes:
+        slot = lane.reviewer.reviewer_slot
+        lane_records = records_by_lane[slot]
+        sources = {
+            (record.execution.identity_source if record.execution else None)
+            for record in lane_records.values()
+        }
+        if len(sources) != 1:
+            raise ValueError(f"lane_provenance_source_mixed:{slot}")
+        source = sources.pop()
+        entry: dict[str, Any] = {"identity_source": source}
+        if source == "operator_attested_subscription_ui":
+            attestations = [
+                record.execution.subscription_attestation
+                for record in lane_records.values()
+                if record.execution is not None
+            ]
+            entry["service_by_attestation"] = sorted(
+                {str(a.get("service", "")) for a in attestations if isinstance(a, dict)}
+            )
+            # FIX-1: the public-safe correlation provenance reports the
+            # FROZEN user-visible selected model name for the lane (the
+            # immutable lane authority recorded at initialization), never a
+            # per-batch display string that could drift.
+            entry["frozen_user_visible_model_name"] = sorted(
+                {
+                    str(a.get("user_visible_model_name", ""))
+                    for a in attestations
+                    if isinstance(a, dict)
+                }
+            )
+            entry["attestation_digests"] = sorted(
+                {str(a.get("attestation_digest", "")) for a in attestations if isinstance(a, dict)}
+            )
+            entry["provider_metadata_available"] = False
+            entry["provider_execution_identity_operator_attested"] = True
+        elif source == "provider_metadata":
+            entry["provider_execution_identity_machine_verified"] = True
+        provenance_by_lane[slot] = entry
+    operator_attested = any(
+        value.get("identity_source") == "operator_attested_subscription_ui"
+        for value in provenance_by_lane.values()
+    )
+    provenance_summary = {
+        "by_lane": provenance_by_lane,
+        "note": (
+            "Execution provenance for one or more lanes is operator-attested"
+            " subscription-UI (provider execution identity attested by the human"
+            " operator from the visible subscription UI, not API-metadata"
+            " verified)."
+            if operator_attested
+            else "All lanes machine-verified via provider metadata."
+        ),
+    }
     return CorrelationReport(
         protocol_version=CONSENSUS_PROTOCOL_VERSION,
         campaign_id=campaign_id,
@@ -1434,6 +1530,7 @@ def build_correlation_report(
         },
         pairwise_agreement=pairwise,
         threeway_agreement=threeway,
+        execution_provenance=provenance_summary,
         aggregate_by_axis=aggregate_axis,
         audit=audit_payload,
     )
