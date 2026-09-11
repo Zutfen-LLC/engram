@@ -330,6 +330,20 @@ _WRONG_FAMILY_LABELS_BY_SLOT = {
         "GLM-5.3-Flash",
         "GLM-4.7",
         "GLM-5 Max",  # missing the 5.3 version identity
+        # FIX-R4-2: accidental-"53" / adjacent-number false positives
+        "GLM 15.3 Max",
+        "GLM 5.30 Max",
+        "GLM 53 Max",
+        "GLM-53-Max",
+        "GLM 5.3.3 Max",
+        "GLM 5.13 Max",
+        "GLM 153 Max",
+        "GLM 5..3 Max",
+        "GLM 5 3 7 Max",
+        "GLM 5.-3 Max",
+        "GLM05.3 Max",
+        "Max 5.3 GLM",
+        "GLM v5.3 Max",
     ],
 }
 
@@ -365,6 +379,8 @@ def _init_label(tmp_path: Path, slot: str, label: str):
         ("model_b", "gpt astra (preview)"),
         ("model_c", "GLM-5.3-Max"),
         ("model_c", "glm 5.3 max"),
+        ("model_c", "GLM 5.3 Max (Preview)"),
+        ("model_c", "GLM_5.3_Max"),
     ],
 )
 def test_correct_family_label_initializes(tmp_path: Path, slot: str, label: str):
@@ -1109,6 +1125,162 @@ def test_truncated_json_remains_retryable(campaign):
     assert record.mechanical_failure_reason == "truncated_json"
     result2 = _import(campaign, "model_c", entries[0], good, retry_mechanical_failure=True)
     assert result2["outcome"] == "completed_structured"
+
+
+# =============================================================================
+# FIX-R4-1 — truncated_json requires mechanically provable EOF truncation
+# =============================================================================
+
+
+def _classify_raw(campaign, slot, entry, raw):
+    result = _import(campaign, slot, entry, raw)
+    lane_root, _attempts = _attempt_paths(campaign, slot, entry["batch_id"])
+    record, _att, preserved = load_attempt(lane_root, str(entry["batch_id"]), 1)
+    return result, record, preserved
+
+
+def test_truncated_canonical_response_full_contract(campaign):
+    """(A) A genuinely truncated canonical response: byte-preserved,
+    mechanically_incomplete, truncated_json, retryable ONLY with the
+    explicit flag, original attempt retained after the retry."""
+    entries = _manifest(campaign)
+    good = _batch_response(entries[0], "model_a")
+    truncated = good[: len(good) // 2]
+    result, record, preserved = _classify_raw(campaign, "model_a", entries[0], truncated)
+    assert result["outcome"] == "mechanically_incomplete"
+    assert record.mechanical_failure_reason == "truncated_json"
+    assert preserved == truncated.encode()  # byte-for-byte
+    # Different bytes without the flag: refused.
+    with pytest.raises(ValueError, match="subscription_batch_raw_conflict_retry_required"):
+        _import(campaign, "model_a", entries[0], good)
+    # Explicit retry succeeds and RETAINS attempt 1.
+    result2 = _import(campaign, "model_a", entries[0], good, retry_mechanical_failure=True)
+    assert result2["outcome"] == "completed_structured"
+    assert result2["attempt"] == 2
+    lane_root, _attempts = _attempt_paths(campaign, "model_a", entries[0]["batch_id"])
+    record1_again, _att, raw1_again = load_attempt(lane_root, str(entries[0]["batch_id"]), 1)
+    assert raw1_again == truncated.encode()
+    assert record1_again.outcome == "mechanically_incomplete"
+    assert record1_again.mechanical_failure_reason == "truncated_json"
+
+
+def test_fenced_complete_json_is_substantive_malformed(campaign):
+    """(B) A COMPLETE fenced JSON response: preserved, substantive_malformed,
+    escalated, non-retryable even with the retry flag."""
+    entries = _manifest(campaign)
+    good = _batch_response(entries[0], "model_a")
+    fenced = f"```json\n{good}\n```"
+    result, record, preserved = _classify_raw(campaign, "model_a", entries[0], fenced)
+    assert result["outcome"] == "substantive_malformed"
+    assert result["escalated"] == entries[0]["case_count"]
+    assert record.outcome == "substantive_malformed"
+    assert record.mechanical_failure_reason is None
+    assert preserved == fenced.encode()
+    with pytest.raises(ValueError, match="subscription_attempt_substantive_cannot_be_retried"):
+        _import(campaign, "model_a", entries[0], good, retry_mechanical_failure=True)
+
+
+def test_trailing_prose_after_valid_json_is_substantive_malformed(campaign):
+    """(C) Valid JSON + trailing prose (json Extra data) is substantive
+    malformed and non-retryable, with the flag supplied too."""
+    entries = _manifest(campaign)
+    good = _batch_response(entries[0], "model_b")
+    trailing = f"{good} trailing"
+    result, record, preserved = _classify_raw(campaign, "model_b", entries[0], trailing)
+    assert result["outcome"] == "substantive_malformed"
+    assert record.mechanical_failure_reason is None
+    assert preserved == trailing.encode()
+    with pytest.raises(ValueError, match="subscription_attempt_substantive_cannot_be_retried"):
+        _import(campaign, "model_b", entries[0], good, retry_mechanical_failure=True)
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        '{"a" 1}',  # missing colon
+        '{"a": 1 "b": 2}',  # missing comma
+        "{a: 1}",  # unquoted key
+        '{"a": [1, 2}, "b": 3]}',  # mismatched delimiter BEFORE EOF, unmatched braces remain
+        '[{"a": 1, "b": [2, 3}]',  # ] while inner object open — error before EOF
+        '{"a": tru}',  # invalid literal
+        '{"a": 01}',  # leading zero
+    ],
+)
+def test_malformed_pre_eof_syntax_is_substantive_malformed(campaign, malformed):
+    """(D) Malformed non-EOF syntax beginning with { is substantive
+    malformed and non-retryable — including shapes with unmatched
+    containers where the ERROR occurs before EOF (a naive brace-depth
+    implementation would falsely pass these)."""
+    entries = _manifest(campaign)
+    good = _batch_response(entries[0], "model_c")
+    result, record, preserved = _classify_raw(campaign, "model_c", entries[0], malformed)
+    assert result["outcome"] == "substantive_malformed"
+    assert record.mechanical_failure_reason is None
+    assert preserved == malformed.encode()
+    with pytest.raises(ValueError, match="subscription_attempt_substantive_cannot_be_retried"):
+        _import(campaign, "model_c", entries[0], good, retry_mechanical_failure=True)
+
+
+def test_extra_data_minimal_shape_direct(campaign):
+    """(C-minimal) The spec's exact minimal fixture `{"results": []} trailing`
+    classifies substantive malformed via the direct classifier."""
+    from evals.calibration.subscription_ui import _mechanical_failure_reason
+
+    exc = ValueError("subscription_batch_response_unparseable")
+    assert (
+        _mechanical_failure_reason(exc, b'{"results": []} trailing') is None
+    )  # -> substantive, not mechanical
+
+
+@pytest.mark.parametrize(
+    "truncated",
+    [
+        '{"results": [{"sample_i',
+        '{"a": "unterminated',
+        "[[[[[",
+        '{"a": [1, 2',
+        '{"a": 1',
+        '{"key": ',
+        '{"a": fals',
+    ],
+)
+def test_provable_eof_truncation_shapes_direct(truncated):
+    """Direct classifier regressions: each shape IS provable EOF truncation."""
+    from evals.calibration.subscription_ui import _mechanical_failure_reason
+
+    exc = ValueError("subscription_batch_response_unparseable")
+    assert _mechanical_failure_reason(exc, truncated.encode()) == "truncated_json"
+
+
+@pytest.mark.parametrize(
+    "completed",
+    [
+        "```json\n" + '{"results": []}' + "\n```",
+        '{"results": []} trailing',
+        '{"a" 1}',
+        '{"a": [1, 2}, "b": 3]}',
+        "Here is the answer: " + '{"results": []}',
+        '{"results": []}' + " second doc {}",
+    ],
+)
+def test_completed_shapes_direct(completed):
+    """Direct classifier regressions: none of these is mechanical."""
+    from evals.calibration.subscription_ui import _mechanical_failure_reason
+
+    exc = ValueError("subscription_batch_response_unparseable")
+    assert _mechanical_failure_reason(exc, completed.encode()) is None
+
+
+def test_invalid_utf8_is_substantive_not_mechanical():
+    """Undecodable completed bytes fail closed to substantive (direct
+    classifier: the import API takes str, so undecodable bytes are
+    exercised at the classifier boundary)."""
+    from evals.calibration.subscription_ui import _mechanical_failure_reason
+
+    exc = ValueError("subscription_batch_response_unparseable")
+    assert _mechanical_failure_reason(exc, b"\xff\xfe{") is None
+    assert _mechanical_failure_reason(exc, b"\xff\xfe\xfd") is None
+    assert _mechanical_failure_reason(exc, b"{\xff\xfe") is None
 
 
 # =============================================================================

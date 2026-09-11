@@ -149,25 +149,92 @@ VISIBLE_MODEL_FAMILY_RULES: dict[str, _FamilyRule] = {
         frozenset({"4o", "o1", "o3", "o4"}),
         ("gpt3", "gpt4", "gpt5"),
     ),
+    # FIX-R4-2: the version identity "5.3" is NO LONGER established by the
+    # substring "53" in the punctuation-stripped join — that accepted
+    # 15.3 / 5.30 / 53 false positives. The family rule here only
+    # establishes provider + Max identity and forbids sibling markers; the
+    # exact version is established with numeric boundaries by
+    # VISIBLE_MODEL_VERSION_RULES below.
     "glm-5-3-max": (
-        frozenset({"max"}),
-        ("glm", "53"),
+        frozenset({"glm", "max"}),
+        (),
         frozenset({"air", "flash", "lite"}),
         (),
     ),
 }
 
+#: FIX-R4-2: families whose version must be positively established with
+#: numeric boundaries, mapped to (provider token, ordered exact version
+#: token sequence). The version numbers must appear as a contiguous run of
+#: standalone numeric word tokens — each exactly equal to the required
+#: sequence element — immediately after the provider token, with no extra
+#: numeric token continuing the run. ``GLM 15.3`` -> ("15", "3") != ("5",
+#: "3"); ``GLM 5.30`` -> ("5", "30") != ("5", "3"); ``GLM 53`` -> ("53",)
+#: != ("5", "3"); ``GLM 5.3.3`` fails because the run continues with a
+#: third numeric token. Version coincidence substrings never match.
+_VISIBLE_VERSION_RULES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "glm-5-3-max": ("glm", ("5", "3")),
+}
 
-def _visible_label_tokens(name: str) -> tuple[frozenset[str], str]:
+_NUMERIC_TOKEN_PATTERN = re.compile(r"[0-9]+")
+
+
+def _version_established_after_provider(
+    name: str, ordered_tokens: list[str], provider_token: str, version_sequence: tuple[str, ...]
+) -> bool:
+    """FIX-R4-2: deterministically establish a provider version with numeric
+    boundaries from the label's ORDERED word tokens AND raw formatting.
+
+    Two conjunctive requirements, both derived from the label itself:
+
+    1. Token-sequence semantics: the exact version numbers must appear as
+       standalone numeric word tokens, contiguous, immediately after the
+       provider token, with no extra numeric token continuing the run —
+       so ``15.3``/``5.30``/``53``/``5.3.3`` can never satisfy ``("5", "3")``.
+    2. Single-separator formatting: in the RAW lowercased label, the
+       version elements must be separated by exactly one punctuation
+       separator each — so ``5..3`` (double separator) never masquerades
+       as ``5.3``.
+
+    Fail closed on anything else: the version is never inferred from
+    substring coincidence such as ``"53" in "glm153max"``.
+    """
+    sequence = list(version_sequence)
+    tokens_ok = False
+    for start, token in enumerate(ordered_tokens):
+        if token != provider_token:
+            continue
+        end = start + 1 + len(sequence)
+        if ordered_tokens[start + 1 : end] != sequence:
+            continue
+        if end < len(ordered_tokens) and _NUMERIC_TOKEN_PATTERN.fullmatch(ordered_tokens[end]):
+            continue  # the numeric run continues past the required version
+        tokens_ok = True
+        break
+    if not tokens_ok:
+        return False
+    separator = r"[-._ ]"
+    pattern = re.compile(
+        re.escape(provider_token)
+        + separator
+        + "?"
+        + separator.join(re.escape(part) for part in sequence)
+        + r"(?![0-9])"
+    )
+    return bool(pattern.search(name.lower()))
+
+
+def _visible_label_tokens(name: str) -> tuple[frozenset[str], list[str], str]:
     """Normalize a visible label: lowercase, punctuation -> separators.
 
-    Returns (word tokens, punctuation-stripped ordered join). ``Claude Opus
-    4.8`` -> (``{claude, opus, 4, 8}``, ``"claudeopus48"``); ``GLM-5.3-Max``
-    -> (``{glm, 5, 3, max}``, ``"glm53max"``).
+    Returns (word tokens as a set, ORDERED word tokens, punctuation-stripped
+    ordered join). ``Claude Opus 4.8`` -> (``{claude, opus, 4, 8}``,
+    ``[claude, opus, 4, 8]``, ``"claudeopus48"``); ``GLM-5.3-Max`` ->
+    (``{glm, 5, 3, max}``, ``[glm, 5, 3, max]``, ``"glm53max"``).
     """
     lowered = name.lower()
     parts = [part for part in re.split(r"[^a-z0-9]+", lowered) if part]
-    return frozenset(parts), "".join(parts)
+    return frozenset(parts), parts, "".join(parts)
 
 
 def validate_visible_model_family(reviewer_family: str, user_visible_model_name: str) -> None:
@@ -180,19 +247,30 @@ def validate_visible_model_family(reviewer_family: str, user_visible_model_name:
     initialization with an explicit error — before any output exists. The
     exact original visible string is preserved unchanged in the frozen
     authority after validation.
+
+    FIX-R4-2: families listed in ``_VISIBLE_VERSION_RULES`` must ALSO have
+    their version positively established with numeric token boundaries —
+    never from substring coincidence such as ``"53" in "glm153max"``.
     """
     rule = VISIBLE_MODEL_FAMILY_RULES.get(reviewer_family)
     if rule is None:
         raise ValueError(f"subscription_visible_model_family_unknown:{reviewer_family}")
     required_tokens, required_substrings, forbidden_tokens, forbidden_substrings = rule
-    tokens, joined = _visible_label_tokens(user_visible_model_name)
+    tokens, ordered_tokens, joined = _visible_label_tokens(user_visible_model_name)
     if any(token in tokens for token in forbidden_tokens) or any(
         fragment in joined for fragment in forbidden_substrings
     ):
         raise ValueError(f"subscription_visible_model_family_conflict:{reviewer_family}")
     missing_tokens = [token for token in sorted(required_tokens) if token not in tokens]
     missing_substrings = [frag for frag in required_substrings if frag not in joined]
-    if missing_tokens or missing_substrings:
+    version_rule = _VISIBLE_VERSION_RULES.get(reviewer_family)
+    version_established = version_rule is not None and _version_established_after_provider(
+        user_visible_model_name, ordered_tokens, version_rule[0], version_rule[1]
+    )
+    not_established = bool(missing_tokens or missing_substrings)
+    if version_rule is not None:
+        not_established = not_established or not version_established
+    if not_established:
         raise ValueError(f"subscription_visible_model_family_not_established:{reviewer_family}")
 
 
@@ -1500,30 +1578,294 @@ def _classify_substantive(raw: bytes) -> tuple[AttemptOutcome, str | None]:
     return "substantive_refusal", error_code
 
 
+def _scan_json_prefix_complete(text: str) -> bool:
+    """FIX-R4-1: deterministically decide whether *text* is a syntactically
+    valid prefix of exactly one JSON document that ends at EOF while a
+    value, container, or string is still incomplete.
+
+    Returns True ONLY on mechanically provable EOF truncation: the bytes
+    so far violate no JSON grammar rule, and EOF arrives while a container
+    is unclosed, a string is unterminated, or a value/member/element is
+    still required but absent. Every completed output — a complete JSON
+    document (with or without trailing prose), a fenced response, or any
+    syntax error occurring BEFORE EOF — returns False. Ambiguity can never
+    produce True (fail closed to substantive).
+
+    Structural string-state scanning over the raw JSON grammar: strings
+    (with escapes), object/array containers with per-frame member phase,
+    literals, and numbers. No fence stripping, no first-character heuristic,
+    no generic JSONDecodeError.
+    """
+    n = len(text)
+    i = 0
+
+    def mark_value_read() -> None:
+        if stack:
+            frame = stack[-1]
+            if frame[0]:
+                frame[1] = 3
+            else:
+                frame[2] = True
+
+    def close_container() -> bool:
+        # Pop the closing frame. Returns True when the WHOLE document just
+        # completed at top level; the caller then continues the loop, so
+        # trailing whitespace is consumed (EOF -> False, complete) and any
+        # non-space trailing bytes return False (completed output).
+        stack.pop()
+        if not stack:
+            return True
+        mark_value_read()
+        return False
+
+    # Each frame: [is_object, phase, elem_done]
+    #   object phase: 0 = key-or-}, 1 = colon, 2 = value, 3 = value read
+    #   array: elem_done = whether an element was read (comma or ] next)
+    stack: list[list[Any]] = []
+    document_closed = False  # a top-level container finished
+
+    while i < n:
+        ch = text[i]
+        if ch in " \t\r\n":
+            i += 1
+            continue
+        if document_closed:
+            # The document already completed; anything but whitespace
+            # after it is trailing data — completed output.
+            return False
+        if not stack and ch not in "{[":
+            # Top-level scalar documents reach the caller only when the
+            # strict parser failed; treat conservatively (substantive).
+            return False
+        is_obj = bool(stack and stack[-1][0])
+
+        if is_obj:
+            phase = stack[-1][1]
+            if phase == 1:
+                if ch == ":":
+                    stack[-1][1] = 2
+                    i += 1
+                    continue
+                return False  # key not followed by colon
+            if phase == 3:
+                if ch == ",":
+                    stack[-1][1] = 0
+                    i += 1
+                    continue
+                if ch == "}":
+                    document_closed = close_container()
+                    i += 1
+                    continue
+                return False  # junk after a member value
+            if phase == 0 and ch == "}":
+                # Only a truly empty innermost object closes here.
+                if stack[-1][2]:
+                    return False
+                document_closed = close_container()
+                i += 1
+                continue
+        else:
+            elem_done = bool(stack and stack[-1][2])
+            if elem_done:
+                if ch == ",":
+                    stack[-1][2] = False
+                    i += 1
+                    continue
+                if ch == "]":
+                    document_closed = close_container()
+                    i += 1
+                    continue
+                return False  # junk after an element
+            if ch == "]":
+                document_closed = close_container()
+                i += 1
+                continue
+
+        # Value positions: object key, object value, array element.
+        if is_obj and stack[-1][1] == 0:
+            if ch != '"':
+                return False  # object keys must be strings
+            key_verdict = _scan_json_string(text, i)
+            if key_verdict is not None:
+                return key_verdict is True
+            stack[-1][1] = 1  # colon expected next
+            i = _skip_string_end(text, i)
+            continue
+
+        if ch == "{":
+            stack.append([True, 0, False])
+            i += 1
+            continue
+        if ch == "[":
+            stack.append([False, 0, False])
+            i += 1
+            continue
+        if ch == '"':
+            string_verdict = _scan_json_string(text, i)
+            if string_verdict is not None:
+                return string_verdict is True
+            mark_value_read()
+            i = _skip_string_end(text, i)
+            continue
+        if ch in "tfn":
+            word = _match_literal(text, i)
+            if word is None:
+                # Literal token cut at EOF ("tru", "fals", "nul") is a valid
+                # prefix; anything else is invalid before EOF.
+                rest = text[i:]
+                return any(
+                    len(rest) < len(w) and w.startswith(rest) for w in ("true", "false", "null")
+                )
+            i += len(word)
+            mark_value_read()
+            continue
+        if ch == "-" or "0" <= ch <= "9":
+            number_verdict = _scan_json_number(text, i)
+            if number_verdict is True:
+                return True  # EOF mid-number (fraction/exponent/digits)
+            if number_verdict is None:
+                return False  # invalid number token before EOF
+            i = number_verdict
+            mark_value_read()
+            continue
+        return False  # any other character: invalid syntax before EOF
+
+    return bool(stack)  # container still open at EOF: provable truncation
+
+
+def _scan_json_string(text: str, start: int) -> bool | None:
+    """Scan a JSON string starting at ``text[start] == '"'``.
+
+    Returns None when the string is complete, True at EOF inside the
+    string/escape (truncation), False on a raw control character or an
+    invalid escape/hex sequence occurring before EOF.
+    """
+    n = len(text)
+    i = start + 1
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            if i + 1 >= n:
+                return True  # EOF inside an escape
+            esc = text[i + 1]
+            if esc not in '"\\/bfnrtu':
+                return False  # invalid escape character before EOF
+            if esc == "u":
+                hex_start = i + 2
+                for k in range(hex_start, min(hex_start + 4, n)):
+                    if text[k] not in "0123456789abcdefABCDEF":
+                        return False  # non-hex digit before EOF
+                if hex_start + 4 > n:
+                    return True  # \u escape cut at EOF
+                i = hex_start + 4
+                continue
+            i += 2
+            continue
+        if c == '"':
+            return None
+        if ord(c) < 0x20:
+            return False  # raw control character before EOF
+        i += 1
+    return True  # EOF inside the string
+
+
+def _skip_string_end(text: str, start: int) -> int:
+    """Return the index just past a COMPLETE validated string at start."""
+    i = start + 1
+    while text[i] != '"':
+        if text[i] == "\\":
+            i += 2 if text[i + 1] != "u" else 6
+        else:
+            i += 1
+    return i + 1
+
+
+def _match_literal(text: str, start: int) -> str | None:
+    """Return the exact literal (true/false/null) at start, else None."""
+    for word in ("true", "false", "null"):
+        if text[start : start + len(word)] == word:
+            return word
+    return None
+
+
+def _scan_json_number(text: str, start: int) -> int | bool | None:
+    """Scan a JSON number at start.
+
+    Returns True at EOF mid-number (possible cut), None on invalid number
+    syntax before EOF, or the index just past a complete number.
+    """
+    n = len(text)
+    i = start + 1 if text[start] == "-" else start
+    if i >= n:
+        return True  # bare "-" at EOF
+    if text[i] == "0":
+        i += 1
+    elif "0" <= text[i] <= "9":
+        while i < n and "0" <= text[i] <= "9":
+            i += 1
+    else:
+        return None  # "-" not followed by a digit
+    if i >= n:
+        return True  # integer digits ran to EOF — may be cut
+    if text[i] == ".":
+        i += 1
+        if i >= n:
+            return True
+        if not ("0" <= text[i] <= "9"):
+            return None
+        while i < n and "0" <= text[i] <= "9":
+            i += 1
+        if i >= n:
+            return True
+    if text[i] in "eE":
+        i += 1
+        if i < n and text[i] in "+-":
+            i += 1
+        if i >= n:
+            return True
+        if not ("0" <= text[i] <= "9"):
+            return None
+        while i < n and "0" <= text[i] <= "9":
+            i += 1
+        if i >= n:
+            return True
+    return i  # complete number; text[i] is the next structural char
+
+
 def _mechanical_failure_reason(exc: ValueError, raw: bytes) -> str | None:
     """A mechanical (retryable) failure ONLY for capture/transport-shaped
     incompleteness, never for substantive model noncompliance (round-3
-    FIX-3):
+    FIX-3, tightened by FIX-R4-1):
 
     - ``empty_capture`` — empty or whitespace-only capture (nothing was
       actually returned);
-    - ``truncated_json`` — the text opens a JSON object/array (``{``/``[``)
-      but the bytes end mid-structure: the structured contract was being
-      followed and the capture is completion-shaped truncation.
+    - ``truncated_json`` — the ENTIRE captured text is a syntactically
+      valid prefix of one JSON document that ends at EOF while a value,
+      container, or string is still incomplete. Proven by deterministic
+      structural scanning (_scan_json_prefix_complete): no fence
+      stripping, no first-character heuristic, no generic
+      JSONDecodeError. Fenced responses, complete JSON with trailing
+      prose (Extra data), and any invalid token occurring BEFORE EOF are
+      completed substantive output, not transport evidence.
 
-    Everything else — a syntactically complete returned object with missing
-    cases, extra cases, duplicate IDs, out-of-order IDs, missing/extra
-    result fields, or a wrong complete ``results`` shape — is substantive
-    completed evidence of response-contract noncompliance and is NOT
-    retryable here. Consumer-UI contract noncompliance alone is never
-    treated as proof of transport failure.
+    Everything else — a fenced complete response, valid JSON with extra
+    trailing bytes, malformed-but-completed syntax, a syntactically
+    complete returned object with missing cases, extra cases, duplicate
+    IDs, out-of-order IDs, missing/extra result fields, or a wrong
+    complete ``results`` shape — is substantive completed evidence of
+    response-contract noncompliance and is NOT retryable here.
+    Consumer-UI contract noncompliance alone is never treated as proof of
+    transport failure.
     """
     message = str(exc)
     if message == "subscription_batch_response_unparseable":
         if not raw.strip():
             return "empty_capture"
-        stripped = _strip_fences(raw.decode("utf-8", errors="replace")).lstrip()
-        if stripped[:1] in ("{", "["):
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None  # undecodable completed bytes: substantive, never retryable
+        if _scan_json_prefix_complete(text):
             return "truncated_json"
         return None
     return None
