@@ -1,10 +1,29 @@
-.PHONY: lint typecheck test check setup-python-dev compose-ci compose-ci-down compose-validate
+.PHONY: lint format format-check format-changed format-check-changed typecheck test check setup-python-dev compose-ci compose-ci-down compose-validate
 
 # Use virtual environment executables
 VENV_BIN = .venv/bin
+FORMAT_BASE ?= origin/main
+FORMAT_HEAD ?= HEAD
 
 lint:
 	$(VENV_BIN)/ruff check .
+
+# Full-repository formatter targets. `format-check` intentionally is not part of
+# `check` until the existing formatting backlog is cleaned up; CI ratchets the
+# repository by enforcing formatting on new/modified Python files instead.
+format:
+	$(VENV_BIN)/ruff format .
+
+format-check:
+	$(VENV_BIN)/ruff format --check .
+
+format-changed:
+	$(VENV_BIN)/python scripts/format_changed.py \
+		--base $(FORMAT_BASE) --head $(FORMAT_HEAD) --ruff $(VENV_BIN)/ruff
+
+format-check-changed:
+	$(VENV_BIN)/python scripts/format_changed.py \
+		--base $(FORMAT_BASE) --head $(FORMAT_HEAD) --ruff $(VENV_BIN)/ruff --check
 
 typecheck:
 	$(VENV_BIN)/mypy engram/
