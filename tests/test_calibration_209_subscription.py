@@ -13,7 +13,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -22,6 +22,7 @@ from evals.calibration.consensus import (
     CONSENSUS_PROTOCOL_VERSION,
     REVIEWER_SLOTS,
     ExecutionEvidence,
+    SlotName,
 )
 from evals.calibration.freeze import SamplingManifest, protected_frame_digest
 from evals.calibration.ingestion import (
@@ -44,6 +45,7 @@ from evals.calibration.subscription_ui import (
     SUBSCRIPTION_MODEL_BY_SLOT,
     SubscriptionLaneAuthority,
     SubscriptionReviewAttestation,
+    attempt_attestation_path,
     attempt_raw_path,
     batch_prompt_path,
     build_attestation,
@@ -307,28 +309,169 @@ def test_import_takes_no_service_or_model_claims():
         assert forbidden not in signature.parameters
 
 
+# --- FIX-1 (round 3): wrong-family visible model must fail at INITIALIZATION ---
+
+_WRONG_FAMILY_LABELS_BY_SLOT = {
+    "model_a": [
+        "Claude Sonnet 4.5",
+        "Claude Haiku 4.5",
+        "Claude 4 Bash",
+        "GPT-Astra 2.4",
+    ],
+    "model_b": [
+        "GPT-4o",
+        "GPT-4.1",
+        "GPT-5",
+        "o4-mini",
+        "ChatGPT 5.2 Standard",
+    ],
+    "model_c": [
+        "GLM-5.3-Air",
+        "GLM-5.3-Flash",
+        "GLM-4.7",
+        "GLM-5 Max",  # missing the 5.3 version identity
+    ],
+}
+
+
+def _init_label(tmp_path: Path, slot: str, label: str):
+    """Drive the REAL init path (not a later attestation) with one label."""
+    sampling = _sampling()
+    packet = _packet()
+    packet_path, packet_manifest = _write_packet(tmp_path / f"init-{abs(hash(label))}", packet)
+    return init_subscription_lane(
+        tmp_path / f"init-{abs(hash(label))}",
+        reviewer=subscription_reviewer_identity(
+            cast("SlotName", slot),
+            reviewer_config_digest=CONFIG_DIGEST,
+            prompt_digest=labeling_instructions_digest(),
+        ),
+        campaign_id=CAMPAIGN,
+        sampling=sampling,
+        source_packet_digest=SOURCE_DIGEST,
+        neutral_packet_path=packet_path,
+        neutral_packet_manifest=packet_manifest,
+        user_visible_model_name=label,
+        operator_reference=OPERATOR,
+    )
+
+
+@pytest.mark.parametrize(
+    ("slot", "label"),
+    [
+        ("model_a", "Claude Opus 4.8"),
+        ("model_a", "claude opus 4.6"),
+        ("model_b", "GPT-Astra 2.4"),
+        ("model_b", "gpt astra (preview)"),
+        ("model_c", "GLM-5.3-Max"),
+        ("model_c", "glm 5.3 max"),
+    ],
+)
+def test_correct_family_label_initializes(tmp_path: Path, slot: str, label: str):
+    """Direct initialization pass matrix: correct visible labels pass the
+    real init path and freeze the EXACT original label."""
+    session = _init_label(tmp_path, slot, label)
+    authority = load_subscription_lane_authority(session.lane_root)
+    assert authority.user_visible_model_name == label  # exact original kept
+
+
+@pytest.mark.parametrize(
+    ("slot", "label"),
+    [(slot, label) for slot, labels in _WRONG_FAMILY_LABELS_BY_SLOT.items() for label in labels],
+)
+def test_wrong_family_visible_label_cannot_initialize(tmp_path: Path, slot: str, label: str):
+    """Direct initialization fail matrix: a wrong-family visible label STOPs
+    the REAL init path with an explicit error — before any lane state or
+    output exists (never silently inferred from the slot)."""
+    root = tmp_path / f"init-{abs(hash(label))}"
+    with pytest.raises(
+        ValueError,
+        match="subscription_visible_model_family_conflict|subscription_visible_model_family_not_established",
+    ):
+        _init_label(tmp_path, slot, label)
+    # Fail-closed: no lane directory was created at all.
+    assert not (root / "lanes" / slot).exists()
+
+
+def test_unmappable_visible_label_fails_closed(tmp_path: Path):
+    """A label that cannot mechanically establish any family (no family
+    token at all) fails closed rather than being inferred from the slot."""
+    with pytest.raises(ValueError, match="subscription_visible_model_family_not_established"):
+        _init_label(tmp_path, "model_a", "Claude 4.5 Preview Plus")
+    with pytest.raises(ValueError, match="subscription_visible_model_family_not_established"):
+        _init_label(tmp_path, "model_b", "ChatGPT Plus")
+    with pytest.raises(ValueError, match="subscription_visible_model_family_not_established"):
+        _init_label(tmp_path, "model_c", "Z.ai Assistant")
+
+
+def test_wrong_family_visible_label_rejected_at_cli_sub_lane_init(tmp_path: Path):
+    """The CLI initialization path fails closed on a wrong-family label."""
+    sampling = _sampling()
+    packet = _packet()
+    work = tmp_path / "cli"
+    work.mkdir(parents=True)
+    packet_path, packet_manifest = _write_packet(work, packet)
+    sampling_file = work / "sampling-manifest.json"
+    sampling_file.write_text(json.dumps(sampling.model_dump(mode="json")))
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "evals.calibration",
+            "sub-lane-init",
+            "--sampling-manifest",
+            str(sampling_file),
+            "--reviewer-slot",
+            "model_a",
+            "--reviewer-config-digest",
+            CONFIG_DIGEST,
+            "--source-packet-digest",
+            SOURCE_DIGEST,
+            "--neutral-packet",
+            str(packet_path),
+            "--neutral-packet-manifest",
+            str(packet_manifest),
+            "--visible-model-name",
+            "Claude Sonnet 4.5",
+            "--operator",
+            OPERATOR,
+            "--protected-dir",
+            str(work / "protected"),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+    )
+    assert result.returncode != 0
+    assert "subscription_visible_model_family" in (result.stderr + result.stdout)
+
+
 def test_sonnet_display_cannot_label_opus_frozen_lane(campaign):
     """model_a + Claude Sonnet display name cannot be accepted for an
     Opus-frozen lane: an attestation carrying a different visible model than
     the frozen lane authority fails closed at the authority gate."""
     slot = "model_a"
     lane_root = campaign["root"] / "lanes" / slot
-    sonnet_authority = build_subscription_lane_authority(
+    # Round 3: a Sonnet lane authority can no longer even be BUILT or loaded
+    # — forge the digest-bound ATTESTATION directly (exactly what a later
+    # substituted attestation would look like) and prove the frozen-lane
+    # authority gate still rejects it.
+    correct = load_subscription_lane_authority(lane_root)
+    base = build_attestation(
         campaign_id=CAMPAIGN,
         reviewer_slot=slot,
-        user_visible_model_name="Claude Sonnet 4.5",
-        operator_reference=OPERATOR,
-        lane_identity_digest=campaign["reviewers"][slot].lane_identity_digest(),
-        frozen_at=NOW.isoformat(),
-    )
-    forged = build_attestation(
-        campaign_id=CAMPAIGN,
-        reviewer_slot=slot,
-        lane_authority=sonnet_authority,
+        lane_authority=correct,
         request_batch_digest="b" * 64,
         raw_response_digest="c" * 64,
         attested_at=NOW.isoformat(),
     )
+    sonnet_payload = dict(base.payload())
+    sonnet_payload["user_visible_model_name"] = "Claude Sonnet 4.5"
+    sonnet_payload["attestation_digest"] = subscription_ui._attestation_digest_payload(
+        sonnet_payload
+    )
+    forged = SubscriptionReviewAttestation.model_validate(sonnet_payload)
+    assert forged.user_visible_model_name == "Claude Sonnet 4.5"
     with pytest.raises(ValueError, match="subscription_attestation_visible_model_mismatch"):
         require_lane_visible_model_authority(lane_root, forged)
 
@@ -337,13 +480,16 @@ def test_changed_visible_model_after_batch1_fails(campaign):
     entries = _manifest(campaign)
     _import(campaign, "model_a", entries[0], _batch_response(entries[0], "model_a"))
     # Maintainer changes the selected model after output exists: rewrite the
-    # lane's frozen authority to a different visible model.
+    # lane's frozen authority to a different (family-correct, e.g. newer
+    # version) visible model — a wrong-family label would now be rejected by
+    # the schema itself, so the digest-binding proof uses a valid-family
+    # different label, which is the realistic mid-campaign change.
     lane_root = campaign["root"] / "lanes" / "model_a"
     authority = load_subscription_lane_authority(lane_root)
     changed = build_subscription_lane_authority(
         campaign_id=CAMPAIGN,
         reviewer_slot="model_a",
-        user_visible_model_name="Claude Sonnet 4.5",
+        user_visible_model_name="Claude Opus 5.1",
         operator_reference=OPERATOR,
         lane_identity_digest=authority.lane_identity_digest,
         frozen_at=authority.frozen_at,
@@ -357,39 +503,25 @@ def test_changed_visible_model_after_batch1_fails(campaign):
 
 
 def test_wrong_service_and_wrong_family_authority_fail():
+    # Round 3: build from a family-CORRECT authority, then tamper service /
+    # family (with a fresh digest so the slot-mapping checks are what fire).
+    base = build_subscription_lane_authority(
+        campaign_id=CAMPAIGN,
+        reviewer_slot="model_a",
+        user_visible_model_name="Claude Opus 4.8",
+        operator_reference="o",
+        lane_identity_digest="1" * 64,
+    ).payload()
+    forged_service = dict(base)
+    forged_service["service"] = "chatgpt"
+    forged_service["authority_digest"] = subscription_ui._authority_digest_payload(forged_service)
     with pytest.raises(ValueError, match="service_does_not_match_slot"):
-        build_subscription_lane_authority(
-            campaign_id=CAMPAIGN,
-            reviewer_slot="model_a",
-            user_visible_model_name="x",
-            operator_reference="o",
-            lane_identity_digest="1" * 64,
-        ).model_validate(
-            {
-                **build_subscription_lane_authority(
-                    campaign_id=CAMPAIGN,
-                    reviewer_slot="model_a",
-                    user_visible_model_name="x",
-                    operator_reference="o",
-                    lane_identity_digest="1" * 64,
-                ).payload(),
-                "service": "chatgpt",
-            }
-        )
+        SubscriptionLaneAuthority.model_validate(forged_service)
+    forged_family = dict(base)
+    forged_family["reviewer_family"] = "gpt-astra"
+    forged_family["authority_digest"] = subscription_ui._authority_digest_payload(forged_family)
     with pytest.raises(ValueError, match="family_does_not_match_slot"):
-        SubscriptionLaneAuthority.model_validate(
-            {
-                **build_subscription_lane_authority(
-                    campaign_id=CAMPAIGN,
-                    reviewer_slot="model_a",
-                    user_visible_model_name="x",
-                    operator_reference="o",
-                    lane_identity_digest="1" * 64,
-                ).payload(),
-                "reviewer_family": "gpt-astra",
-                "authority_digest": "0" * 64,
-            }
-        )
+        SubscriptionLaneAuthority.model_validate(forged_family)
 
 
 def test_wrong_service_attestation_fails(campaign):
@@ -833,19 +965,111 @@ def test_batch_level_refusal_reaches_human_escalation(campaign):
     assert report.human_queue_count_before_audit >= len(refused_ids)
 
 
-def test_membership_drift_is_mechanical_and_preserved(campaign):
+def test_membership_drift_is_substantive_malformed_not_retryable(campaign):
+    """FIX-3 (round 3): complete valid JSON whose membership drifts from the
+    batch contract is substantive evidence of noncompliance — preserved,
+    escalated, and NON-retryable (never a mechanical transport failure)."""
     entries = _manifest(campaign)
 
     def mutate(payload):
         payload["results"].pop()  # missing case
 
-    result = _import(
-        campaign, "model_a", entries[0], _batch_response(entries[0], "model_a", mutate=mutate)
-    )
-    assert result["outcome"] == "mechanically_incomplete"
+    raw = _batch_response(entries[0], "model_a", mutate=mutate)
+    result = _import(campaign, "model_a", entries[0], raw)
+    assert result["outcome"] == "substantive_malformed"
+    assert result["escalated"] == entries[0]["case_count"]
     lane_root, attempts = _attempt_paths(campaign, "model_a", entries[0]["batch_id"])
-    assert (attempts / "attempt-01" / "raw.resp").exists()
-    # And a clean retry completes the batch.
+    assert (attempts / "attempt-01" / "raw.resp").read_bytes() == raw.encode()
+    record, _att, preserved = load_attempt(lane_root, str(entries[0]["batch_id"]), 1)
+    assert record.outcome == "substantive_malformed"
+    assert record.mechanical_failure_reason is None
+    assert preserved == raw.encode()
+    # Every case entered escalation as malformed.
+    records = load_lane_records(campaign["root"], "model_a")
+    for sid in entries[0]["sample_ids"]:
+        assert records[str(sid)].outcome_status == "malformed"
+    # A second different response is refused even WITH the retry flag.
+    with pytest.raises(ValueError, match="subscription_attempt_substantive_cannot_be_retried"):
+        _import(
+            campaign,
+            "model_a",
+            entries[0],
+            _batch_response(entries[0], "model_a"),
+            retry_mechanical_failure=True,
+        )
+    # Attempt 1 remains byte-identical.
+    assert load_attempt(lane_root, str(entries[0]["batch_id"]), 1)[2] == raw.encode()
+
+
+_DRIFT_MUTATIONS = {
+    "missing_case": lambda r: r.pop(),
+    "extra_case": lambda r: r.append(dict(r[0])),
+    "duplicate_case_id": lambda r: r.append(dict(r[-1])),
+    "reversed_order": lambda r: r.reverse(),
+    "missing_field": lambda r: r[0].pop("consequence"),
+    "extra_field": lambda r: r[0].update({"forged": "x"}),
+    "wrong_results_shape": None,  # handled inline: results is an object, not array
+}
+
+
+@pytest.mark.parametrize("drift", sorted(_DRIFT_MUTATIONS))
+def test_complete_schema_drift_is_non_retryable_substantive_malformed(campaign, drift):
+    """FIX-3 (round 3): each complete-response contract violation — missing
+    case, extra case, duplicate ID, reversed order, missing/extra result
+    field, wrong complete results shape — is substantive malformed evidence:
+    preserved exactly, escalated for every case, non-retryable."""
+    entries = _manifest(campaign)
+    mutate_payload = _DRIFT_MUTATIONS[drift]
+    if drift == "wrong_results_shape":
+        raw = json.dumps({"results": {"s001": "forged"}})
+    else:
+        raw = _batch_response(entries[0], "model_a", mutate=lambda p: mutate_payload(p["results"]))
+    result = _import(campaign, "model_a", entries[0], raw)
+    assert result["outcome"] == "substantive_malformed", drift
+    assert result["escalated"] == entries[0]["case_count"]
+    lane_root, attempts = _attempt_paths(campaign, "model_a", entries[0]["batch_id"])
+    assert (attempts / "attempt-01" / "raw.resp").read_bytes() == raw.encode()
+    record, _att, _preserved = load_attempt(lane_root, str(entries[0]["batch_id"]), 1)
+    assert record.outcome == "substantive_malformed"
+    assert record.mechanical_failure_reason is None
+    records = load_lane_records(campaign["root"], "model_a")
+    for sid in entries[0]["sample_ids"]:
+        assert records[str(sid)].outcome_status == "malformed"
+    with pytest.raises(ValueError, match="subscription_attempt_substantive_cannot_be_retried"):
+        _import(
+            campaign,
+            "model_a",
+            entries[0],
+            _batch_response(entries[0], "model_a"),
+            retry_mechanical_failure=True,
+        )
+
+
+def test_empty_capture_is_preserved_mechanical_attempt_evidence(campaign):
+    """FIX-2 (round 3): the exact empty string is valid attempt evidence —
+    preserved as zero-byte raw.resp, attested, recorded, classified
+    mechanically_incomplete/empty_capture, and explicitly retryable."""
+    entries = _manifest(campaign)
+    result = _import(campaign, "model_a", entries[0], "")
+    assert result["outcome"] == "mechanically_incomplete"
+    assert result["accepted"] == 0
+    lane_root, attempts = _attempt_paths(campaign, "model_a", entries[0]["batch_id"])
+    raw_path = attempts / "attempt-01" / "raw.resp"
+    assert raw_path.read_bytes() == b""  # zero bytes preserved
+    empty_sha = hashlib.sha256(b"").hexdigest()
+    assert result["raw_response_digest"] == empty_sha
+    record, attestation, preserved = load_attempt(lane_root, str(entries[0]["batch_id"]), 1)
+    assert len(preserved) == 0
+    assert record.outcome == "mechanically_incomplete"
+    assert record.mechanical_failure_reason == "empty_capture"
+    assert attestation.raw_response_digest == empty_sha
+    assert raw_path.stat().st_size == 0
+    # No review records were accepted from an empty capture.
+    assert not load_lane_records(campaign["root"], "model_a")
+    # Retry without the explicit flag fails...
+    with pytest.raises(ValueError, match="subscription_batch_raw_conflict_retry_required"):
+        _import(campaign, "model_a", entries[0], _batch_response(entries[0], "model_a"))
+    # ...with the flag, attempt 2 completes the batch...
     result2 = _import(
         campaign,
         "model_a",
@@ -853,6 +1077,37 @@ def test_membership_drift_is_mechanical_and_preserved(campaign):
         _batch_response(entries[0], "model_a"),
         retry_mechanical_failure=True,
     )
+    assert result2["outcome"] == "completed_structured"
+    assert result2["attempt"] == 2
+    # ...and attempt 1 remains byte-identical zero bytes.
+    record1_again, _att, raw1_again = load_attempt(lane_root, str(entries[0]["batch_id"]), 1)
+    assert raw1_again == b""
+    assert record1_again.outcome == "mechanically_incomplete"
+    assert record1_again.mechanical_failure_reason == "empty_capture"
+
+
+def test_whitespace_capture_still_mechanical_empty(campaign):
+    """Whitespace-only capture continues to classify as empty_capture."""
+    entries = _manifest(campaign)
+    result = _import(campaign, "model_b", entries[0], "  \n\t ")
+    assert result["outcome"] == "mechanically_incomplete"
+    lane_root, _attempts = _attempt_paths(campaign, "model_b", entries[0]["batch_id"])
+    record, _att, preserved = load_attempt(lane_root, str(entries[0]["batch_id"]), 1)
+    assert record.mechanical_failure_reason == "empty_capture"
+    assert preserved == b"  \n\t "
+
+
+def test_truncated_json_remains_retryable(campaign):
+    """FIX-3 retains retryability for demonstrably truncated JSON."""
+    entries = _manifest(campaign)
+    good = _batch_response(entries[0], "model_c")
+    truncated = good[: len(good) // 2]
+    result = _import(campaign, "model_c", entries[0], truncated)
+    assert result["outcome"] == "mechanically_incomplete"
+    lane_root, _attempts = _attempt_paths(campaign, "model_c", entries[0]["batch_id"])
+    record, _att, _preserved = load_attempt(lane_root, str(entries[0]["batch_id"]), 1)
+    assert record.mechanical_failure_reason == "truncated_json"
+    result2 = _import(campaign, "model_c", entries[0], good, retry_mechanical_failure=True)
     assert result2["outcome"] == "completed_structured"
 
 
@@ -1135,6 +1390,135 @@ def test_real_corpus_batch_count_and_sizes(tmp_path: Path):
         payload = batch_prompt_path(tmp_path, str(batch["batch_id"])).read_bytes()
         assert len(payload) == batch["serialized_bytes"]
         assert len(payload) <= BATCH_MAX_SERIALIZED_BYTES
+
+
+# =============================================================================
+# FIX-4 (round 3) — partial-attempt crash recovery
+# =============================================================================
+
+
+def _crash_after_raw(campaign, slot, batch_id, raw):
+    """Simulate a crash after raw.resp but before attestation/attempt.json."""
+    from evals.calibration.review import write_protected_file
+
+    lane_root = campaign["root"] / "lanes" / slot
+    write_protected_file(attempt_raw_path(lane_root, str(batch_id), 1), raw.encode())
+    return lane_root
+
+
+def _crash_after_attestation(campaign, slot, batch_id, raw):
+    """Simulate a crash after raw.resp + attestation.json, before attempt.json."""
+    lane_root = campaign["root"] / "lanes" / slot
+    authority = load_subscription_lane_authority(lane_root)
+    manifest = json.loads(subscription_ui.batch_manifest_path(campaign["root"]).read_text())
+    entry = next(e for e in manifest["batches"] if str(e["batch_id"]) == str(batch_id))
+    attestation = build_attestation(
+        campaign_id=CAMPAIGN,
+        reviewer_slot=slot,
+        lane_authority=authority,
+        request_batch_digest=str(entry["prompt_sha256"]),
+        raw_response_digest=hashlib.sha256(raw.encode()).hexdigest(),
+        attested_at=NOW.isoformat(),
+    )
+    from evals.calibration.review import write_protected_file
+
+    write_protected_file(attempt_raw_path(lane_root, str(batch_id), 1), raw.encode())
+    write_protected_file(
+        attempt_attestation_path(lane_root, str(batch_id), 1),
+        (json.dumps(attestation.payload(), sort_keys=True) + "\n").encode(),
+    )
+    return lane_root
+
+
+def test_crash_after_raw_only_same_bytes_completes_same_attempt(campaign):
+    """raw-only partial + exact resupply finishes the SAME attempt
+    deterministically; no data loss, no evidence replacement."""
+    entries = _manifest(campaign)
+    raw = _batch_response(entries[0], "model_a")
+    _crash_after_raw(campaign, "model_a", entries[0]["batch_id"], raw)
+    result = _import(campaign, "model_a", entries[0], raw)
+    assert result["attempt"] == 1  # same attempt completed, not a new one
+    assert result["outcome"] == "completed_structured"
+    assert result["accepted"] == entries[0]["case_count"]
+    lane_root, _attempts = _attempt_paths(campaign, "model_a", entries[0]["batch_id"])
+    record, att, preserved = load_attempt(lane_root, str(entries[0]["batch_id"]), 1)
+    assert preserved == raw.encode()
+    assert att.raw_response_digest == hashlib.sha256(raw.encode()).hexdigest()
+    assert record.attempt == 1
+
+
+def test_crash_after_raw_only_different_bytes_requires_explicit_retry(campaign):
+    """raw-only partial + DIFFERENT bytes: without the flag it STOPs; with
+    the flag the partial attempt is quarantined (never deleted) and a new
+    attempt is created."""
+    entries = _manifest(campaign)
+    crashed_bytes = _batch_response(entries[0], "model_a").replace("fact", "doctrine")
+    lane_root = _crash_after_raw(campaign, "model_a", entries[0]["batch_id"], crashed_bytes)
+    good = _batch_response(entries[0], "model_a")
+    with pytest.raises(ValueError, match="subscription_partial_attempt_retry_required"):
+        _import(campaign, "model_a", entries[0], good)
+    result = _import(campaign, "model_a", entries[0], good, retry_mechanical_failure=True)
+    assert result["attempt"] == 2
+    assert result["outcome"] == "completed_structured"
+    _, attempts = _attempt_paths(campaign, "model_a", entries[0]["batch_id"])
+    quarantined = list(attempts.glob("attempt-01.quarantined-*"))
+    assert len(quarantined) == 1
+    # The quarantined partial bytes are retained, never deleted.
+    assert (quarantined[0] / "raw.resp").read_bytes() == crashed_bytes.encode()
+    # The committed attempt 2 is complete and the only numeric attempt-01 is gone.
+    assert not (attempts / "attempt-01").exists()
+    record2, _att, raw2 = load_attempt(lane_root, str(entries[0]["batch_id"]), 2)
+    assert raw2 == good.encode()
+    assert record2.retry_of_attempt is None
+
+
+def test_crash_after_raw_and_attestation_completes_record(campaign):
+    """raw + attestation partial: the preserved attestation is verified
+    against the resupplied bytes and the SAME attempt record is completed."""
+    entries = _manifest(campaign)
+    raw = _batch_response(entries[0], "model_b")
+    _crash_after_attestation(campaign, "model_b", entries[0]["batch_id"], raw)
+    result = _import(campaign, "model_b", entries[0], raw)
+    assert result["attempt"] == 1
+    assert result["outcome"] == "completed_structured"
+    lane_root, _attempts = _attempt_paths(campaign, "model_b", entries[0]["batch_id"])
+    record, att, preserved = load_attempt(lane_root, str(entries[0]["batch_id"]), 1)
+    assert preserved == raw.encode()
+    assert record.outcome == "completed_structured"
+    # The completed record embeds the PRESERVED attestation, not a new one.
+    assert result["attestation_digest"] == att.attestation_digest
+
+
+def test_crash_after_raw_and_attestation_mismatch_quarantines(campaign):
+    """raw + attestation partial whose attestation binds DIFFERENT bytes:
+    quarantined, explicit retry required, partial bytes retained."""
+    entries = _manifest(campaign)
+    crashed_bytes = _batch_response(entries[0], "model_c")
+    _crash_after_attestation(campaign, "model_c", entries[0]["batch_id"], crashed_bytes)
+    good = _batch_response(entries[0], "model_c").replace("fact", "doctrine")
+    with pytest.raises(ValueError, match="subscription_partial_attempt_retry_required"):
+        _import(campaign, "model_c", entries[0], good)
+    result = _import(campaign, "model_c", entries[0], good, retry_mechanical_failure=True)
+    assert result["attempt"] == 2
+    _, attempts = _attempt_paths(campaign, "model_c", entries[0]["batch_id"])
+    quarantined = list(attempts.glob("attempt-01.quarantined-*"))
+    assert len(quarantined) == 1
+    assert (quarantined[0] / "raw.resp").read_bytes() == crashed_bytes.encode()
+
+
+def test_committed_attempt_unaffected_by_recovery_logic(campaign):
+    """A fully committed attempt is immutable under the recovery machinery:
+    exact resupply is idempotent, different bytes are refused."""
+    entries = _manifest(campaign)
+    raw = _batch_response(entries[0], "model_a")
+    _import(campaign, "model_a", entries[0], raw)
+    # Exact resupply is the idempotent resume path.
+    again = _import(campaign, "model_a", entries[0], raw)
+    assert again["attempt"] == 1
+    assert again["resumed_duplicates"] == entries[0]["case_count"]
+    # Different bytes cannot replace a committed attempt.
+    with pytest.raises(ValueError, match="subscription_attempt_accepted_cannot_be_replaced"):
+        _import(campaign, "model_a", entries[0], raw.replace("fact", "doctrine"))
 
 
 # =============================================================================

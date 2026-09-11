@@ -611,11 +611,13 @@ def init_subscription_lane(
     (neutral packet byte-verification, authority binding, retained packet
     bytes) is the unchanged ``LaneSession.init`` path.
     """
+    from evals.calibration.consensus import FAMILY_BY_SLOT
     from evals.calibration.subscription_ui import (
         SERVICE_BY_SLOT,
         SUBSCRIPTION_MODEL_BY_SLOT,
         build_subscription_lane_authority,
         subscription_mode_permitted,
+        validate_visible_model_family,
         write_subscription_lane_authority,
     )
 
@@ -627,6 +629,12 @@ def init_subscription_lane(
         raise ValueError("unknown_reviewer_slot")
     if not user_visible_model_name:
         raise ValueError("subscription_lane_requires_user_visible_model_name")
+    # FIX-1 (round 3): positive family identification BEFORE any lane state
+    # is created — a wrong-family visible label (Opus lane + Sonnet/Haiku,
+    # Astra lane + GPT-4o, Max lane + another GLM variant) STOPs
+    # initialization with an explicit error so the maintainer can decide
+    # before any output exists.
+    validate_visible_model_family(FAMILY_BY_SLOT[reviewer.reviewer_slot], user_visible_model_name)
     if not operator_reference:
         raise ValueError("subscription_lane_requires_operator_reference")
     lane_root = protected_root / "lanes" / reviewer.reviewer_slot

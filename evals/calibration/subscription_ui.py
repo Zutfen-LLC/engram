@@ -47,6 +47,7 @@ import hashlib
 import hmac
 import json
 import re
+import secrets
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -120,6 +121,80 @@ SUBSCRIPTION_MODEL_BY_SLOT: dict[str, str] = {
     "model_b": "gpt-astra@chatgpt-subscription-ui",
     "model_c": "glm-5-3-max@z-ai-subscription-ui",
 }
+
+#: FIX-1 (round 3): frozen visible-model-family identification rules per
+#: asserted reviewer family. A user-visible model label may only freeze a
+#: lane when it POSITIVELY identifies the requested family: every required
+#: token must be present (word-separated) and/or every required substring in
+#: the punctuation-stripped join, and no visibly different family marker for
+#: the same provider may appear. Anything else fails CLOSED — the family is
+#: never inferred from the reviewer slot alone.
+#:
+#: Rule tuple: (required word tokens, required substrings in the
+#: punctuation-stripped ordered join, forbidden word tokens, forbidden
+#: substrings). For this frozen campaign the three requested families are
+#: explicitly enumerated; an unmapped family is itself a fail-closed error.
+_FamilyRule = tuple[frozenset[str], tuple[str, ...], frozenset[str], tuple[str, ...]]
+
+VISIBLE_MODEL_FAMILY_RULES: dict[str, _FamilyRule] = {
+    "claude-opus": (
+        frozenset({"opus"}),
+        (),
+        frozenset({"sonnet", "haiku", "instant"}),
+        (),
+    ),
+    "gpt-astra": (
+        frozenset({"astra"}),
+        (),
+        frozenset({"4o", "o1", "o3", "o4"}),
+        ("gpt3", "gpt4", "gpt5"),
+    ),
+    "glm-5-3-max": (
+        frozenset({"max"}),
+        ("glm", "53"),
+        frozenset({"air", "flash", "lite"}),
+        (),
+    ),
+}
+
+
+def _visible_label_tokens(name: str) -> tuple[frozenset[str], str]:
+    """Normalize a visible label: lowercase, punctuation -> separators.
+
+    Returns (word tokens, punctuation-stripped ordered join). ``Claude Opus
+    4.8`` -> (``{claude, opus, 4, 8}``, ``"claudeopus48"``); ``GLM-5.3-Max``
+    -> (``{glm, 5, 3, max}``, ``"glm53max"``).
+    """
+    lowered = name.lower()
+    parts = [part for part in re.split(r"[^a-z0-9]+", lowered) if part]
+    return frozenset(parts), "".join(parts)
+
+
+def validate_visible_model_family(reviewer_family: str, user_visible_model_name: str) -> None:
+    """FIX-1 (round 3): fail closed unless the user-visible model label
+    POSITIVELY identifies the frozen slot/family.
+
+    Wrong-family labels (``model_a`` + ``Claude Sonnet ...``), visibly
+    different variants of the same provider (Haiku, GPT-4o, GLM-5-Air), and
+    labels that cannot mechanically establish any family all STOP
+    initialization with an explicit error — before any output exists. The
+    exact original visible string is preserved unchanged in the frozen
+    authority after validation.
+    """
+    rule = VISIBLE_MODEL_FAMILY_RULES.get(reviewer_family)
+    if rule is None:
+        raise ValueError(f"subscription_visible_model_family_unknown:{reviewer_family}")
+    required_tokens, required_substrings, forbidden_tokens, forbidden_substrings = rule
+    tokens, joined = _visible_label_tokens(user_visible_model_name)
+    if any(token in tokens for token in forbidden_tokens) or any(
+        fragment in joined for fragment in forbidden_substrings
+    ):
+        raise ValueError(f"subscription_visible_model_family_conflict:{reviewer_family}")
+    missing_tokens = [token for token in sorted(required_tokens) if token not in tokens]
+    missing_substrings = [frag for frag in required_substrings if frag not in joined]
+    if missing_tokens or missing_substrings:
+        raise ValueError(f"subscription_visible_model_family_not_established:{reviewer_family}")
+
 
 #: The COMPLETE campaign opt-in for the subscription-UI provenance mode:
 #: (campaign_id, consensus protocol version) pairs. Anything not listed can
@@ -271,6 +346,11 @@ class SubscriptionLaneAuthority(Record):
             raise ValueError("subscription_authority_service_does_not_match_slot")
         if not self.user_visible_model_name:
             raise ValueError("subscription_authority_requires_user_visible_model_name")
+        # FIX-1 (round 3): the visible label must POSITIVELY identify the
+        # frozen family — a non-empty wrong-family label (Sonnet/Haiku for
+        # an Opus lane, another GLM variant for a Max lane) fails closed
+        # here, at initialization, before any output exists.
+        validate_visible_model_family(self.reviewer_family, self.user_visible_model_name)
         if not self.operator_reference:
             raise ValueError("subscription_authority_requires_operator_reference")
         if not self.frozen_at:
@@ -301,6 +381,9 @@ def build_subscription_lane_authority(
     """Construct the digest-bound frozen visible-model lane authority."""
     if reviewer_slot not in REVIEWER_SLOTS:
         raise ValueError("unknown_reviewer_slot")
+    # FIX-1 (round 3): positive family identification at freeze time —
+    # validate BEFORE constructing/freeze any authority bytes.
+    validate_visible_model_family(FAMILY_BY_SLOT[reviewer_slot], user_visible_model_name)
     payload: dict[str, Any] = {
         "lane_authority_schema": SUBSCRIPTION_LANE_AUTHORITY_SCHEMA,
         "campaign_id": campaign_id,
@@ -1137,6 +1220,107 @@ def latest_attempt(lane_root: Path, batch_id: str) -> int:
     return latest
 
 
+def latest_committed_attempt(lane_root: Path, batch_id: str) -> int:
+    """Highest attempt number whose full evidence triple exists (raw.resp +
+    attestation.json + attempt.json) — the committed-attempt watermark.
+
+    FIX-4 (round 3): an interruption can leave a PARTIAL ``attempt-N/``
+    directory (crash between the raw write and the attempt-record write).
+    Only a complete triple is a committed attempt; partial directories are
+    reconciled deterministically by ``_reconcile_partial_attempts`` instead
+    of bricking the batch.
+    """
+    root = batch_attempts_dir(lane_root, batch_id)
+    if not root.is_dir():
+        return 0
+    latest = 0
+    for path in root.glob("attempt-*"):
+        suffix = path.name.rsplit("-", 1)[-1]
+        if not suffix.isdigit():
+            continue  # quarantined partial attempts are never committed
+        number = int(suffix)
+        if number <= latest:
+            continue
+        if (
+            (path / "raw.resp").is_file()
+            and (path / "attestation.json").is_file()
+            and (path / "attempt.json").is_file()
+        ):
+            latest = number
+    return latest
+
+
+def _quarantine_partial_attempt(lane_root: Path, batch_id: str, attempt: int) -> None:
+    """Retain — never delete — a partial attempt that cannot be completed
+    deterministically, by renaming its directory out of the numeric attempt
+    sequence. The bytes stay on disk for audit; nothing is overwritten."""
+    directory = attempt_dir(lane_root, batch_id, attempt)
+    target = directory.parent / f"{directory.name}.quarantined-{secrets.token_hex(6)}"
+    directory.rename(target)
+
+
+def _reconcile_partial_attempts(
+    lane_root: Path,
+    batch_id: str,
+    *,
+    raw_digest: str,
+    batch_digest: str,
+    retry_permitted: bool,
+) -> tuple[int, SubscriptionReviewAttestation | None]:
+    """FIX-4 (round 3): deterministic crash recovery for partial attempts.
+
+    A crash between ``raw.resp`` and ``attempt.json`` leaves a partial
+    directory above the committed watermark. Recovery rules (never deleting
+    evidence, never overwriting mismatching bytes):
+
+    - raw only, and the resupplied bytes match exactly: finish the SAME
+      attempt deterministically (the caller re-derives classification and
+      writes the missing attestation/attempt record);
+    - raw + attestation, both digest-consistent with the resupplied bytes
+      and this batch: reuse the preserved attestation and complete only the
+      attempt record;
+    - anything else (mismatching bytes, inconsistent attestation): quarantine
+      the partial directory and require an explicit mechanical retry before
+      a new attempt number is used.
+    """
+    from pydantic import ValidationError
+
+    attempt = latest_committed_attempt(lane_root, batch_id) + 1
+    while True:
+        directory = attempt_dir(lane_root, batch_id, attempt)
+        if not directory.is_dir():
+            return attempt, None
+        raw_path = attempt_raw_path(lane_root, batch_id, attempt)
+        attestation_path = attempt_attestation_path(lane_root, batch_id, attempt)
+        record_path = attempt_record_path(lane_root, batch_id, attempt)
+        if record_path.is_file():  # pragma: no cover - defensive
+            raise ValueError(f"subscription_attempt_unexpected_committed:{attempt}")
+        if raw_path.is_file() and not attestation_path.is_file():
+            if hmac.compare_digest(_sha256(raw_path.read_bytes()), raw_digest):
+                return attempt, None
+        elif raw_path.is_file() and attestation_path.is_file():
+            existing: SubscriptionReviewAttestation | None = None
+            try:
+                existing = SubscriptionReviewAttestation.model_validate(
+                    json.loads(attestation_path.read_text())
+                )
+                preserved_digest = _sha256(raw_path.read_bytes())
+                consistent = (
+                    existing is not None
+                    and hmac.compare_digest(existing.raw_response_digest, preserved_digest)
+                    and hmac.compare_digest(existing.raw_response_digest, raw_digest)
+                    and hmac.compare_digest(existing.request_batch_digest, batch_digest)
+                )
+            except (ValueError, ValidationError, OSError):
+                consistent = False
+            if consistent:
+                return attempt, existing
+        if not retry_permitted:
+            raise ValueError(f"subscription_partial_attempt_retry_required:{attempt}")
+        _quarantine_partial_attempt(lane_root, batch_id, attempt)
+        attempt += 1
+
+
 class SubscriptionBatchAttempt(Record):
     """FIX-3: protected per-attempt evidence for one logical batch import.
 
@@ -1317,16 +1501,22 @@ def _classify_substantive(raw: bytes) -> tuple[AttemptOutcome, str | None]:
 
 
 def _mechanical_failure_reason(exc: ValueError, raw: bytes) -> str | None:
-    """A mechanical (retryable) failure only when the bytes look like a
-    capture/transport artifact, never a substantive model answer:
+    """A mechanical (retryable) failure ONLY for capture/transport-shaped
+    incompleteness, never for substantive model noncompliance (round-3
+    FIX-3):
 
-    - empty/whitespace capture (nothing was actually returned);
-    - truncated structured capture: the text opens a JSON object/array
-      (``{``/``[``) but the bytes end mid-structure — the structured
-      contract was being followed; the truncation is completion-shaped;
-    - the response parses as a ``results``-shaped object but drifts on
-      membership/order/shape (the structured contract was being followed;
-      the drift is completion-shaped).
+    - ``empty_capture`` — empty or whitespace-only capture (nothing was
+      actually returned);
+    - ``truncated_json`` — the text opens a JSON object/array (``{``/``[``)
+      but the bytes end mid-structure: the structured contract was being
+      followed and the capture is completion-shaped truncation.
+
+    Everything else — a syntactically complete returned object with missing
+    cases, extra cases, duplicate IDs, out-of-order IDs, missing/extra
+    result fields, or a wrong complete ``results`` shape — is substantive
+    completed evidence of response-contract noncompliance and is NOT
+    retryable here. Consumer-UI contract noncompliance alone is never
+    treated as proof of transport failure.
     """
     message = str(exc)
     if message == "subscription_batch_response_unparseable":
@@ -1336,15 +1526,6 @@ def _mechanical_failure_reason(exc: ValueError, raw: bytes) -> str | None:
         if stripped[:1] in ("{", "["):
             return "truncated_json"
         return None
-    drift_markers = (
-        "subscription_batch_response_case_count_mismatch",
-        "subscription_batch_result_out_of_order_or_unknown",
-        "subscription_batch_duplicate_result",
-        "subscription_batch_result_missing_fields",
-        "subscription_batch_result_requires_sample_id",
-    )
-    if any(marker in message for marker in drift_markers):
-        return message.split(":", 1)[0]
     return None
 
 
@@ -1441,7 +1622,12 @@ def import_batch_response(
     from evals.calibration.ingestion import LaneSession, lane_provenance_mode
     from evals.calibration.review import write_protected_file
 
-    if not isinstance(raw_response, str) or not raw_response:
+    # FIX-2 (round 3): the import boundary requires only a STRING. The exact
+    # empty string is valid attempt evidence (empty_capture): it must reach
+    # the preserved mechanical-attempt path — raw.resp (zero bytes),
+    # attestation, attempt.json, mechanically_incomplete/empty_capture —
+    # exactly like every other returned attempt.
+    if not isinstance(raw_response, str):
         raise ValueError("subscription_import_requires_raw_response_text")
     if batch_id != batch_id.strip() or not _BATCH_ID_PATTERN.fullmatch(batch_id):
         raise ValueError("subscription_batch_id_not_canonical")
@@ -1468,26 +1654,37 @@ def import_batch_response(
     # sample IDs are never byte-identical; identical bytes mean replay (or
     # cross-service contamination), and both are refused. The idempotent
     # resupply exception is ONLY the same lane+batch attempt being re-supplied
-    # with its own exact bytes.
-    for other_slot in REVIEWER_SLOTS:
-        other_attempts_root = protected_root / "lanes" / other_slot / "raw-batches"
-        if not other_attempts_root.is_dir():
-            continue
-        for existing in sorted(other_attempts_root.glob("*.attempts/attempt-*/raw.resp")):
-            same_batch = existing.parent.parent.name == f"{batch_id}.attempts"
-            if other_slot == reviewer_slot and same_batch:
-                continue  # handled by attempt conflict semantics below
-            if hmac.compare_digest(_sha256(existing.read_bytes()), raw_digest):
-                raise ValueError(
-                    "subscription_batch_response_replay_refused:"
-                    f"{other_slot}:{existing.parent.parent.name}"
-                )
+    # with its own exact bytes. FIX-2 (round 3): an empty/whitespace-only
+    # capture carries no content identity — byte-identity replay detection is
+    # meaningless for it and is skipped (each lane's empty capture is its own
+    # preserved mechanical attempt).
+    if raw_bytes.strip():
+        for other_slot in REVIEWER_SLOTS:
+            other_attempts_root = protected_root / "lanes" / other_slot / "raw-batches"
+            if not other_attempts_root.is_dir():
+                continue
+            for existing in sorted(other_attempts_root.glob("*.attempts/attempt-*/raw.resp")):
+                same_batch = existing.parent.parent.name == f"{batch_id}.attempts"
+                if other_slot == reviewer_slot and same_batch:
+                    continue  # handled by attempt conflict semantics below
+                if hmac.compare_digest(_sha256(existing.read_bytes()), raw_digest):
+                    raise ValueError(
+                        "subscription_batch_response_replay_refused:"
+                        f"{other_slot}:{existing.parent.parent.name}"
+                    )
 
-    current = latest_attempt(session.lane_root, batch_id)
-    attempt = current + 1
+    # FIX-4 (round 3): only a COMPLETE evidence triple (raw + attestation +
+    # attempt record) is a committed attempt. A crash between writes leaves
+    # a partial directory that is reconciled deterministically below —
+    # an interruption can never permanently brick the batch.
+    current = latest_committed_attempt(session.lane_root, batch_id)
+    attempt = 0
     retry_of: int | None = None
     mechanical_reason: str | None = None
-    record_outcome: AttemptOutcome | None
+    record_outcome: AttemptOutcome | None = None
+    refusal_code: str | None = None
+    results: list[dict[str, Any]] | None = None
+    attestation: SubscriptionReviewAttestation | None = None
     if current:
         record, preserved_attestation, preserved_raw = load_attempt(
             session.lane_root, batch_id, current
@@ -1497,8 +1694,6 @@ def import_batch_response(
             # re-derive the same classification and resume ingestion.
             attempt = current
             record_outcome = record.outcome
-            refusal_code = None
-            results: list[dict[str, Any]] | None = None
             if record_outcome == "completed_structured":
                 results = _parse_batch_response(preserved_raw, expected_ids)
             attestation = preserved_attestation
@@ -1513,17 +1708,24 @@ def import_batch_response(
             if _lane_records_bound_to_batch(session, batch_id):
                 raise ValueError("subscription_batch_retry_has_accepted_records")
             retry_of = current
-            record_outcome = None
-            refusal_code = None
-            results = None
-            attestation = None
-    else:
-        record_outcome = None
-        refusal_code = None
-        results = None
-        attestation = None
 
-    if attestation is None:
+    if attestation is None or record_outcome is None:
+        # FIX-4 (round 3): the next attempt slot may hold a PARTIAL directory
+        # from an interrupted import. Reconcile it deterministically: matching
+        # bytes finish the SAME attempt; raw+attestation reuse the preserved
+        # attestation; anything else is quarantined (never deleted) and needs
+        # an explicit mechanical retry.
+        attempt, recovered_attestation = _reconcile_partial_attempts(
+            session.lane_root,
+            batch_id,
+            raw_digest=raw_digest,
+            batch_digest=batch_digest,
+            retry_permitted=retry_mechanical_failure,
+        )
+        if recovered_attestation is not None:
+            attestation = recovered_attestation
+
+    if attestation is None or record_outcome is None:
         # FIX-3 preserve-first ordering: exact raw bytes land on disk BEFORE
         # any substantive parse/classification changes campaign state.
         raw_path = attempt_raw_path(session.lane_root, batch_id, attempt)
@@ -1544,19 +1746,21 @@ def import_batch_response(
                 record_outcome = classified
                 if classified == "substantive_malformed":
                     refusal_code = None
-        attestation = build_attestation(
-            campaign_id=campaign_id,
-            reviewer_slot=reviewer_slot,
-            lane_authority=lane_authority,
-            request_batch_digest=batch_digest,
-            raw_response_digest=raw_digest,
-            attested_at=attested_at,
-            conversation_reference=conversation_reference,
-        )
-        write_protected_file(
-            attempt_attestation_path(session.lane_root, batch_id, attempt),
-            (json.dumps(attestation.payload(), sort_keys=True) + "\n").encode(),
-        )
+        if attestation is None:
+            attestation = build_attestation(
+                campaign_id=campaign_id,
+                reviewer_slot=reviewer_slot,
+                lane_authority=lane_authority,
+                request_batch_digest=batch_digest,
+                raw_response_digest=raw_digest,
+                attested_at=attested_at,
+                conversation_reference=conversation_reference,
+            )
+            write_protected_file(
+                attempt_attestation_path(session.lane_root, batch_id, attempt),
+                (json.dumps(attestation.payload(), sort_keys=True) + "\n").encode(),
+            )
+        assert record_outcome is not None
         attempt_record = SubscriptionBatchAttempt(
             campaign_id=campaign_id,
             protocol_version=CONSENSUS_PROTOCOL_VERSION,
@@ -1578,6 +1782,7 @@ def import_batch_response(
             attempt_record_path(session.lane_root, batch_id, attempt),
             _canonical_json_bytes(attempt_record.payload()),
         )
+    assert attestation is not None
 
     accepted = 0
     resumed = 0
@@ -1828,8 +2033,13 @@ def require_subscription_attested_identity(
             raise ValueError(f"subscription_batch_raw_evidence_missing:{sample_id}")
         if not hmac.compare_digest(_sha256(raw.read_bytes()), attestation.raw_response_digest):
             raise ValueError(f"subscription_batch_raw_evidence_digest_mismatch:{sample_id}")
+        record_path = preserved_dir / "attempt.json"
+        if not record_path.is_file():
+            # FIX-4 (round 3): a partial (uncommitted) attempt directory can
+            # never back a frozen record.
+            raise ValueError(f"subscription_attestation_missing_preserved_attempt:{sample_id}")
         attempt_record = SubscriptionBatchAttempt.model_validate(
-            json.loads((preserved_dir / "attempt.json").read_text())
+            json.loads(record_path.read_text())
         )
         # The preserved attempt's outcome class must honestly match the
         # record it backs: judged records only ever back completed_structured
