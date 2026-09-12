@@ -153,12 +153,19 @@ class _EvidenceCapability:
 
 
 class ProviderCase216(Record):
-    """One provider-run case record, parsed BEFORE any dict conversion."""
+    """One provider-run case record, parsed BEFORE any dict conversion.
+
+    Retained evidence fields (content hash binding, governed kind, observed
+    model) are carried for provenance; only ``values`` feeds calibration.
+    """
 
     sample_id: str
     status: Literal["ok", "error", "abstained"]
     values: dict[str, Any] | None = None
     error_type: str | None = None
+    content_sha256: str | None = None
+    governed_kind: str | None = None
+    model: str | None = None
 
     @model_validator(mode="after")
     def status_shape(self) -> ProviderCase216:
