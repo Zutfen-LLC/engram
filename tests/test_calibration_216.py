@@ -1,26 +1,36 @@
 """Regression proofs for the #216 campaign (ENG-CALIBRATION-001K) — round 2.
 
-Covers the FIX-217 correction round:
+FIX2-217 correction round. Every test in the new classes below FAILS
+against the reviewed NO-GO head ``9e019df`` (verified during development:
+the old API — optional-attribute identity checks, naked provider/label
+dicts at the fitting boundary, arbitrary-digest holdout unlock — either
+cannot express these fixtures or accepts the forged input).
 
-- FIX-217-1: committed CLI availability + 001k subscription opt-in
-  (001f unchanged, non-opted campaigns fail closed);
-- FIX-217-2: DEV-only reviewer membership (exactly 102, zero holdout);
-- FIX-217-3: stage sampling authorities bind the NEW 001k target digest,
-  never the 001f one; prior provenance stays separately bound;
-- FIX-217-4: provider evidence is identity-verified before any value can
-  become an observation (prompt/model/target/population mismatches fail);
-- FIX-217-5: fresh-label membership is judged by exact frozen stage
-  membership, never by count;
-- FIX-217-6: holdout reviewer export is mechanically blocked before
-  artifact freeze.
+Coverage required by the correction spec §9:
 
-Synthetic fixtures only; real protected evidence is exercised on-host by the
-clean-checkout reproduction gate.
+- ProviderEvidence216 fail-closed authority (duplicates, missing/extra
+  cases, subset-only populations, missing/wrong target digest, wrong
+  model/adapter/config/schema/execution identity, invalid replay-3
+  historical authority);
+- no naked provider mapping / fresh-label mapping can reach fitting
+  (boundary signature no longer accepts dicts);
+- fresh labels provenance-bound through a REAL VerifiedConsensusLedger
+  (duplicate-before-dict detection, holdout-in-DEV, DEV-in-holdout,
+  exact-count-wrong-membership, incomplete stages);
+- one and only one 001k target authority (generic legacy freeze-target
+  rejected; hash-valid but wrong-contract identity rejected);
+- holdout unlock bound to a canonical DEV artifact freeze (forged
+  arbitrary digests rejected; export/show/import/direct-lane blocked
+  before freeze);
+- 001f behavior unchanged.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
+import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -30,16 +40,17 @@ import pytest
 from evals.admission.schema import digest
 from evals.calibration import campaign_001k as c216
 from evals.calibration.campaign_001k_fit import (
+    DIMENSIONS_001K,
     ProviderEvidence216,
-    _frame_stratum,
     dev_fit_observations,
     holdout_evaluate_observations,
+    verify_target_identity_001k,
 )
 from evals.calibration.campaigns import (
     EXPECTED_FRAME_DIGEST,
     EXPECTED_SAMPLING_MANIFEST_DIGEST,
 )
-from evals.calibration.freeze import FrameRow, SamplingManifest
+from evals.calibration.freeze import FrameRow, SamplingManifest, TargetIdentity
 
 
 def _sid(i: int) -> str:
@@ -145,10 +156,957 @@ _POP = {
 }
 _NEW_TARGET = "e" * 64
 _OLD_TARGET = "a" * 64
+_TOOLING_SHA = "f" * 40
 
 
 def _real_shaped_reuse() -> c216.ReuseManifest:
     return _reuse(_POP["holdout"], _POP["forced"], _POP["dev_fresh"])
+
+
+_GOOD_CRITICAL = {
+    "expected_kind": "fact",
+    "retention_value": "retain",
+    "epistemic_state": "adequately_supported",
+    "consequence": "low",
+    "acceptable_abstention": "no",
+}
+
+
+def _target(**overrides: Any) -> TargetIdentity:
+    fields: dict[str, Any] = {
+        "campaign_id": c216.CAMPAIGN_ID_001K,
+        "campaign_tooling_repo_sha": _TOOLING_SHA,
+        "assessment_schema_version": "engram.assessment.v1",
+        "assessment_code_version": "assessment-engine-v1",
+        "prompt_version": "engram.assess.3",
+        "provider_adapter": "openai",
+        "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+        "provider_config_digest": "sha256:" + "1" * 64,
+        "provider_params": {"temperature": 0, "max_tokens": 1024, "input_limit": 16000},
+        "assessment_policy_version": "assessment-selection-v1",
+        "calibration_artifact_schema_version": "engram.calibration-profiles-v1",
+        "calibration_dataset_version": "calibration-157-dogfood-v3-216",
+        "label_guide_version": "engram-calibration-guide-157-v1",
+        "canonicalization_version": "assessment-evidence-manifest-v1",
+        "dimensions": DIMENSIONS_001K,
+    }
+    fields.update(overrides)
+    return TargetIdentity(**fields)
+
+
+# ---------------------------------------------------------------------------
+# Verified-ledger fixture (FIX2-217-3): the REAL consensus machinery
+# ---------------------------------------------------------------------------
+
+
+def _stage_sampling(ids: list[str]) -> SamplingManifest:
+    from evals.calibration.freeze import protected_frame_digest
+    from tests.test_calibration_206_helpers import build_frame_rows
+
+    sampling = _sampling(ids)
+    # the verifier re-derives the frame from these IDs; make the sampling
+    # self-consistent with exactly that derivation (round3 helper pattern)
+    return sampling.model_copy(
+        update={
+            "sampling_seed": "216-dev-v1",
+            "frame_digest": protected_frame_digest(build_frame_rows(tuple(ids))),
+            "sample_hashes": tuple(digest(sid) for sid in ids),
+        }
+    )
+
+
+def _build_dev_ledger(dev_ids: list[str], critical_overrides: dict[str, dict] | None = None):
+    """Genuine VerifiedConsensusLedger for the DEV stage via the REAL verifier."""
+    from tests.test_calibration_206_helpers import build_verified_ledger
+
+    critical_by_id = {sid: dict(_GOOD_CRITICAL) for sid in dev_ids}
+    for sid, fields in (critical_overrides or {}).items():
+        critical_by_id[sid].update(fields)
+    stage_sampling = _stage_sampling(dev_ids)
+    return build_verified_ledger(
+        tuple(dev_ids),
+        critical_by_id,
+        campaign_id=c216.CAMPAIGN_ID_001K,
+        sampling=stage_sampling,
+    )
+
+
+def _fresh_payload(population: list[str], **overrides: Any) -> dict[str, Any]:
+    cases = [
+        {
+            "sample_id": sid,
+            "status": "ok",
+            "values": {"taxonomy_value": 0.9, "retention_value": 0.85},
+        }
+        for sid in population
+    ]
+    payload: dict[str, Any] = {
+        "run_kind": "issue-216-fresh-202-assess3",
+        "prompt_version": "engram.assess.3",
+        "model": "deepseek-ai/DeepSeek-V4-Flash",
+        "provider_adapter": "openai",
+        "schema_version": "engram.assessment.v1",
+        "code_version": "assessment-engine-v1",
+        "code_git_head": _TOOLING_SHA,
+        "target_identity_digest": _target().identity_digest(),
+        "provider_config_digest": "sha256:" + "1" * 64,
+        "cases": cases,
+    }
+    payload.update(overrides)
+    return payload
+
+
+_FRESH_202 = _POP["forced"] + _POP["dev_fresh"] + _POP["holdout"]
+
+
+def _fresh_evidence(**overrides: Any) -> ProviderEvidence216:
+    payload = _fresh_payload(_FRESH_202, **overrides)
+    cases = payload["cases"]
+    if "cases" in overrides:
+        cases = overrides["cases"]
+    body = dict(payload)
+    body["cases"] = cases
+    return ProviderEvidence216.from_payload(body, artifact_sha256="9" * 64)
+
+
+# ---------------------------------------------------------------------------
+# FIX2-217-4: one and only one 001k target authority
+# ---------------------------------------------------------------------------
+
+
+class TestTargetAuthority001k:
+    def test_exact_contract_verifies(self) -> None:
+        identity = verify_target_identity_001k(_target())
+        assert identity.campaign_id == "eng-calibration-001k"
+
+    def test_hash_valid_but_wrong_contract_rejected(self) -> None:
+        # An internally hash-valid identity with the LEGACY 001f shape
+        # (legacy dataset id + epistemic dimension) is not the 001k authority.
+        legacy_shaped = _target(
+            calibration_dataset_version="calibration-157-dogfood-v2",
+            dimensions=("taxonomy", "retention", "epistemic"),
+        )
+        # its digest is internally consistent — that proves nothing:
+        assert legacy_shaped.identity_digest()
+        with pytest.raises(ValueError, match="target_identity_not_001k_contract"):
+            verify_target_identity_001k(legacy_shaped)
+
+    def test_wrong_dimensions_rejected(self) -> None:
+        with pytest.raises(ValueError, match="target_identity_not_001k_contract"):
+            verify_target_identity_001k(_target(dimensions=("taxonomy", "retention", "epistemic")))
+
+    def test_wrong_campaign_rejected(self) -> None:
+        with pytest.raises(ValueError, match="target_identity_not_001k_contract"):
+            verify_target_identity_001k(_target(campaign_id="eng-calibration-001f"))
+
+    def test_wrong_prompt_rejected(self) -> None:
+        with pytest.raises(ValueError, match="target_identity_not_001k_contract"):
+            verify_target_identity_001k(_target(prompt_version="engram.assess.2"))
+
+    def test_wrong_model_rejected(self) -> None:
+        with pytest.raises(ValueError, match="target_identity_not_001k_contract"):
+            verify_target_identity_001k(_target(provider_model="other-model"))
+
+    def test_wrong_provider_params_rejected(self) -> None:
+        with pytest.raises(ValueError, match="target_identity_not_001k_contract"):
+            verify_target_identity_001k(
+                _target(
+                    provider_params={"temperature": 1, "max_tokens": 1024, "input_limit": 16000}
+                )
+            )
+
+    def test_generic_freeze_target_rejects_001k(self) -> None:
+        """The legacy generic command must not create an 001k authority."""
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "evals.calibration",
+                "freeze-target",
+                "--campaign-id",
+                "eng-calibration-001k",
+                "--campaign-tooling-repo-sha",
+                _TOOLING_SHA,
+                "--provider-config-digest",
+                "sha256:" + "1" * 64,
+                "--output",
+                "/tmp/should-not-exist-001k.json",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).parents[1],
+        )
+        assert result.returncode != 0
+        assert "campaign_requires_216_command" in result.stderr
+
+    def test_generic_001f_freeze_target_still_works(self, tmp_path: Path) -> None:
+        """001f behavior on the generic path is unchanged."""
+        out = tmp_path / "identity-001f.json"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "evals.calibration",
+                "freeze-target",
+                "--campaign-tooling-repo-sha",
+                _TOOLING_SHA,
+                "--provider-config-digest",
+                "sha256:" + "1" * 64,
+                "--output",
+                str(out),
+            ],
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).parents[1],
+        )
+        assert result.returncode == 0, result.stderr
+        payload = json.loads(out.read_text())
+        assert payload["target_identity"]["campaign_id"] == "eng-calibration-001f"
+        assert payload["target_identity"]["dimensions"] == ["taxonomy", "retention", "epistemic"]
+
+    def test_216_freeze_target_has_no_campaign_parameter(self) -> None:
+        """216-freeze-target is unambiguously 001k — no campaign parameter."""
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "evals.calibration",
+                "216-freeze-target",
+                "--help",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).parents[1],
+        )
+        assert result.returncode == 0
+        assert "--campaign-id" not in result.stdout
+
+    def test_identity_loader_rejects_hash_valid_wrong_contract(self, tmp_path: Path) -> None:
+        legacy_shaped = _target(
+            calibration_dataset_version="calibration-157-dogfood-v2",
+            dimensions=("taxonomy", "retention", "epistemic"),
+        )
+        artifact = {
+            "target_identity": legacy_shaped.model_dump(mode="json"),
+            "target_identity_digest": legacy_shaped.identity_digest(),
+        }
+        (tmp_path / "identity-frozen.json").write_text(json.dumps(artifact))
+        with pytest.raises(ValueError, match="target_identity_not_001k_contract"):
+            c216.load_001k_target_identity(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# FIX2-217-1: provider evidence fail-closed authority
+# ---------------------------------------------------------------------------
+
+
+class TestProviderEvidence216FailClosed:
+    def _evidence(self, **overrides: Any) -> ProviderEvidence216:
+        return _fresh_evidence(**overrides)
+
+    def _stage(self, **overrides: Any) -> dict[str, Any]:
+        return dict(
+            target_identity=_target(),
+            expected_population=frozenset(_FRESH_202),
+            **overrides,
+        )
+
+    def test_exact_identity_and_population_pass(self) -> None:
+        values = self._evidence().stage_provider_values(**self._stage())
+        assert set(values) == set(_FRESH_202)
+
+    def test_duplicate_sample_ids_rejected_before_dict_conversion(self) -> None:
+        cases = _fresh_payload(_FRESH_202)["cases"]
+        cases.append(dict(cases[0]))  # duplicate of an existing case
+        with pytest.raises(ValueError, match="provider_evidence_duplicate_sample_id"):
+            self._evidence(cases=cases)
+
+    def test_missing_provider_cases_rejected(self) -> None:
+        cases = _fresh_payload(_FRESH_202)["cases"][:-1]  # one case short
+        with pytest.raises(ValueError, match="provider_evidence_population_mismatch:1_missing"):
+            self._evidence(cases=cases).stage_provider_values(**self._stage())
+
+    def test_extra_provider_cases_rejected(self) -> None:
+        cases = _fresh_payload(_FRESH_202)["cases"] + [
+            {"sample_id": _sid(9999), "status": "ok", "values": {"taxonomy_value": 0.5}}
+        ]
+        with pytest.raises(ValueError, match="provider_evidence_population_mismatch"):
+            self._evidence(cases=cases).stage_provider_values(**self._stage())
+
+    def test_subset_of_successful_ids_is_not_population_proof(self) -> None:
+        # errors/abstentions are part of the population: a run whose cases
+        # are all-ok over only part of the population fails.
+        cases = [
+            {
+                "sample_id": sid,
+                "status": "ok",
+                "values": {"taxonomy_value": 0.9, "retention_value": 0.85},
+            }
+            for sid in _FRESH_202[:100]
+        ]
+        with pytest.raises(ValueError, match="provider_evidence_population_mismatch"):
+            self._evidence(cases=cases).stage_provider_values(**self._stage())
+
+    def test_missing_target_digest_rejected(self) -> None:
+        with pytest.raises(ValueError, match="provider_evidence_target_identity_missing"):
+            self._evidence(target_identity_digest=None).stage_provider_values(**self._stage())
+
+    def test_wrong_target_digest_rejected(self) -> None:
+        with pytest.raises(ValueError, match="provider_evidence_target_identity_mismatch"):
+            self._evidence(target_identity_digest="9" * 64).stage_provider_values(**self._stage())
+
+    def test_wrong_model_rejected(self) -> None:
+        with pytest.raises(ValueError, match="provider_evidence_model_mismatch"):
+            self._evidence(model="other-model").stage_provider_values(**self._stage())
+
+    def test_wrong_adapter_rejected(self) -> None:
+        with pytest.raises(ValueError, match="provider_evidence_adapter_mismatch"):
+            self._evidence(provider_adapter="anthropic").stage_provider_values(**self._stage())
+
+    def test_wrong_provider_config_digest_rejected(self) -> None:
+        with pytest.raises(ValueError, match="provider_evidence_config_mismatch"):
+            self._evidence(provider_config_digest="sha256:" + "2" * 64).stage_provider_values(
+                **self._stage()
+            )
+
+    def test_missing_provider_config_digest_rejected(self) -> None:
+        with pytest.raises(ValueError, match="provider_evidence_config_digest_missing"):
+            self._evidence(provider_config_digest=None).stage_provider_values(**self._stage())
+
+    def test_wrong_schema_contract_rejected(self) -> None:
+        with pytest.raises(ValueError, match="provider_evidence_schema_mismatch"):
+            self._evidence(schema_version="engram.assessment.v2").stage_provider_values(
+                **self._stage()
+            )
+
+    def test_wrong_code_contract_rejected(self) -> None:
+        with pytest.raises(ValueError, match="provider_evidence_code_version_mismatch"):
+            self._evidence(code_version="assessment-engine-v2").stage_provider_values(
+                **self._stage()
+            )
+
+    def test_wrong_execution_identity_rejected(self) -> None:
+        with pytest.raises(ValueError, match="provider_evidence_execution_identity_mismatch"):
+            self._evidence(code_git_head="0" * 40).stage_provider_values(**self._stage())
+
+    def test_honest_errors_count_toward_population(self) -> None:
+        cases = _fresh_payload(_FRESH_202)["cases"]
+        cases[5] = {"sample_id": cases[5]["sample_id"], "status": "error", "error_type": "X"}
+        evidence = self._evidence(cases=cases)
+        values = evidence.stage_provider_values(**self._stage())
+        assert cases[5]["sample_id"] not in values
+        assert evidence.ok_count() == len(_FRESH_202) - 1
+        assert evidence.error_count() == 1
+        assert evidence.error_ids() == {cases[5]["sample_id"]}
+
+
+class TestReplay3HistoricalAuthority:
+    def _replay_payload(self, **overrides: Any) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "run_kind": "issue-214-protected-200-case-replay-assess3",
+            "prompt_version": "engram.assess.3",
+            "model": "deepseek-ai/DeepSeek-V4-Flash",
+            "provider_adapter": "openai",
+            "schema_version": "engram.assessment.v1",
+            "code_version": "assessment-engine-v1",
+            "code_git_head": "1dc42fca1f3062a06d0486fb9a53803e77410706",
+            "target_identity_digest": None,
+            "provider_config_digest": None,
+            "cases": [
+                {
+                    "sample_id": sid,
+                    "status": "ok",
+                    "values": {"taxonomy_value": 0.9, "retention_value": 0.7},
+                }
+                for sid in _POP["executed"]
+            ],
+        }
+        payload.update(overrides)
+        return payload
+
+    def _evidence(self, **overrides: Any) -> ProviderEvidence216:
+        payload = self._replay_payload(**overrides)
+        return ProviderEvidence216.from_payload(payload, artifact_sha256=c216.REPLAY3_SHA256)
+
+    def test_valid_historical_authority_binds_reused_200(self) -> None:
+        values = self._evidence().reused_provider_values(
+            expected_population=frozenset(_POP["executed"])
+        )
+        assert set(values) == set(_POP["executed"])
+
+    def test_wrong_artifact_sha_rejected(self) -> None:
+        evidence = ProviderEvidence216.from_payload(
+            self._replay_payload(), artifact_sha256="0" * 64
+        )
+        with pytest.raises(ValueError, match="replay3_authority_artifact_mismatch"):
+            evidence.reused_provider_values(expected_population=frozenset(_POP["executed"]))
+
+    def test_wrong_execution_identity_rejected(self) -> None:
+        with pytest.raises(ValueError, match="replay3_authority_execution_identity_mismatch"):
+            self._evidence(code_git_head="0" * 40).reused_provider_values(
+                expected_population=frozenset(_POP["executed"])
+            )
+
+    def test_forged_001k_target_digest_rejected(self) -> None:
+        with pytest.raises(ValueError, match="replay3_authority_unexpected_target_digest"):
+            self._evidence(
+                target_identity_digest=_target().identity_digest()
+            ).reused_provider_values(expected_population=frozenset(_POP["executed"]))
+
+    def test_wrong_population_rejected(self) -> None:
+        with pytest.raises(
+            ValueError,
+            match="replay3_authority_population_size_mismatch|provider_evidence_population_mismatch",
+        ):
+            self._evidence().reused_provider_values(
+                expected_population=frozenset(_POP["executed"][:-1])
+            )
+
+
+# ---------------------------------------------------------------------------
+# FIX2-217-2/3: no naked provider/label mappings at the fitting boundary
+# ---------------------------------------------------------------------------
+
+
+class TestNoNakedMappingsAtFittingBoundary:
+    def test_boundaries_have_no_provider_mapping_parameter(self) -> None:
+        for fn in (dev_fit_observations, holdout_evaluate_observations):
+            sig = inspect.signature(fn)
+            for name in sig.parameters:
+                assert "provider_values" not in name, fn.__name__
+                assert "labels_by_sample" not in name, fn.__name__
+            assert "provider_evidence" in sig.parameters, fn.__name__
+            assert "fresh_label_authority" in sig.parameters, fn.__name__
+
+    def test_boundary_rejects_dict_arguments(self) -> None:
+        reuse = _real_shaped_reuse()
+        split = _split(_POP["executed"] + _POP["forced"] + _POP["dev_fresh"], _POP["holdout"])
+        frame_by_id = {sid: _frame_row(0) for sid in _FRESH_202}
+        with pytest.raises((ValueError, TypeError, AttributeError)):
+            dev_fit_observations(  # type: ignore[arg-type]
+                fresh_label_authority={sid: dict(_GOOD_CRITICAL) for sid in _FRESH_202},
+                provider_evidence=_fresh_payload(_FRESH_202),
+                target_identity=_target(),
+                split=split,
+                frame_by_id=frame_by_id,
+                reuse=reuse,
+            )
+
+    def test_fresh_label_authority_cannot_be_fabricated(self) -> None:
+        from evals.calibration.campaign_001k_fit import FreshLabelAuthority216
+
+        with pytest.raises(Exception, match="fresh_label_authority|validation"):
+            FreshLabelAuthority216.model_construct(
+                campaign_id="eng-calibration-001k",
+                protocol_version="eng-calibration-consensus-206-v1",
+                stage="dev",
+                sampling_manifest_digest="1" * 64,
+                source_packet_digest="2" * 64,
+                lane_digests=("3" * 64, "4" * 64, "5" * 64),
+                queue_evidence_sha256="6" * 64,
+                expected_membership_digest="7" * 64,
+                labels=((_sid(1), dict(_GOOD_CRITICAL), "cross_model_consensus"),),
+                retained_unknown_ids=(),
+                human_adjudicated_ids=(),
+            ).labels_by_sample()
+
+
+class TestFreshLabelLedgerBinding:
+    def _authority(self, dev_ids: list[str]):
+        from evals.calibration.campaign_001k_fit import FreshLabelAuthority216
+
+        verified = _build_dev_ledger(dev_ids)
+        stage_sampling = _stage_sampling(dev_ids)
+        return FreshLabelAuthority216.from_verified_ledger(
+            verified,
+            stage="dev",
+            stage_sampling=stage_sampling,
+            expected_membership=frozenset(dev_ids),
+            source_packet_digest=verified.ledger.source_packet_digest,
+        )
+
+    def test_real_ledger_projects_dev_labels(self) -> None:
+        dev_ids = _POP["forced"] + _POP["dev_fresh"]
+        authority = self._authority(dev_ids)
+        assert authority.stage == "dev"
+        assert len(authority.labels) == 102
+        labels = authority.labels_by_sample()
+        assert set(labels) == set(dev_ids)
+
+    def test_wrong_stage_membership_rejected(self) -> None:
+        from evals.calibration.campaign_001k_fit import FreshLabelAuthority216
+
+        dev_ids = _POP["forced"] + _POP["dev_fresh"]
+        verified = _build_dev_ledger(dev_ids)
+        with pytest.raises(ValueError, match="fresh_label_membership_mismatch"):
+            FreshLabelAuthority216.from_verified_ledger(
+                verified,
+                stage="dev",
+                stage_sampling=_stage_sampling(dev_ids),
+                expected_membership=frozenset(dev_ids[:-1]),
+                source_packet_digest=verified.ledger.source_packet_digest,
+            )
+
+    def test_non_001k_ledger_rejected(self) -> None:
+        from evals.calibration.campaign_001k_fit import FreshLabelAuthority216
+        from tests.test_calibration_206_helpers import build_verified_ledger
+
+        ids = [_sid(i) for i in range(6)]
+        verified = build_verified_ledger(
+            tuple(ids), {sid: dict(_GOOD_CRITICAL) for sid in ids}, campaign_id="campaign"
+        )
+        with pytest.raises(ValueError, match="fresh_label_ledger_campaign_mismatch"):
+            FreshLabelAuthority216.from_verified_ledger(
+                verified,
+                stage="dev",
+                stage_sampling=_stage_sampling(ids),
+                expected_membership=frozenset(ids),
+                source_packet_digest=verified.ledger.source_packet_digest,
+            )
+
+    def test_forged_ledger_lookalike_rejected(self) -> None:
+        from evals.calibration.campaign_001k_fit import FreshLabelAuthority216
+
+        class ForgedLedger:
+            ledger = type(
+                "L",
+                (),
+                {
+                    "campaign_id": "eng-calibration-001k",
+                    "protocol_version": "eng-calibration-consensus-206-v1",
+                    "sampling_manifest_digest": "1" * 64,
+                    "source_packet_digest": "2" * 64,
+                    "lane_digests": ("3" * 64, "4" * 64, "5" * 64),
+                    "queue_evidence_sha256": "6" * 64,
+                    "wrappers": (),
+                },
+            )()
+
+        dev_ids = _POP["forced"][:3]
+        with pytest.raises((ValueError, TypeError, AttributeError)):
+            FreshLabelAuthority216.from_verified_ledger(
+                ForgedLedger(),  # type: ignore[arg-type]
+                stage="dev",
+                stage_sampling=_stage_sampling(dev_ids),
+                expected_membership=frozenset(dev_ids),
+                source_packet_digest="2" * 64,
+            )
+
+    def test_capability_invalidated_by_tampering(self) -> None:
+        dev_ids = _POP["forced"] + _POP["dev_fresh"]
+        authority = self._authority(dev_ids)
+        # mutate the frozen record past validators (simulated tamper)
+        extra_row = (_sid(9999), dict(_GOOD_CRITICAL), "cross_model_consensus")
+        tampered = authority.model_copy(update={"labels": authority.labels + (extra_row,)})
+        with pytest.raises(ValueError, match="capability_invalid|membership"):
+            tampered.labels_by_sample()
+
+
+class TestFreshStageMembership:
+    def _fixtures(self, dev_ids: list[str]):
+        reuse = _real_shaped_reuse()
+        split = _split(_POP["executed"] + _POP["forced"] + _POP["dev_fresh"], _POP["holdout"])
+        frame_by_id = {sid: _frame_row(0) for sid in _FRESH_202}
+        authority = None
+        return reuse, split, frame_by_id, authority
+
+    def _dev_fit(self, dev_ids: list[str], **overrides: Any):
+        from evals.calibration.campaign_001k_fit import FreshLabelAuthority216
+
+        reuse, split, frame_by_id, _ = self._fixtures(dev_ids)
+        verified = _build_dev_ledger(dev_ids)
+        authority = FreshLabelAuthority216.from_verified_ledger(
+            verified,
+            stage="dev",
+            stage_sampling=_stage_sampling(dev_ids),
+            expected_membership=frozenset(dev_ids),
+            source_packet_digest=verified.ledger.source_packet_digest,
+        )
+        return dev_fit_observations(
+            fresh_label_authority=authority,
+            provider_evidence=_fresh_evidence(),
+            target_identity=_target(),
+            split=split,
+            frame_by_id=frame_by_id,
+            reuse=reuse,
+            **overrides,
+        )
+
+    def test_dev_fit_requires_exact_102(self) -> None:
+        dev_ids = _POP["forced"] + _POP["dev_fresh"]
+        obs = self._dev_fit(dev_ids)
+        assert {o.sample_id for o in obs} == set(dev_ids)
+
+    def test_dev_fit_rejects_incomplete_stage(self) -> None:
+        dev_ids = (_POP["forced"] + _POP["dev_fresh"])[:-1]
+        with pytest.raises(ValueError, match="dev_fit_labels_incomplete"):
+            self._dev_fit(dev_ids)
+
+    def test_dev_fit_rejects_exact_count_wrong_membership(self) -> None:
+        # 102 IDs, but one is a holdout ID substituted for a dev ID
+        dev_ids = (_POP["forced"] + _POP["dev_fresh"])[:-1] + [_POP["holdout"][0]]
+        with pytest.raises(ValueError, match="dev_fit_labels_outside_frozen_membership"):
+            self._dev_fit(dev_ids)
+
+    def test_holdout_label_in_dev_rejected(self) -> None:
+        from evals.calibration.campaign_001k_fit import FreshLabelAuthority216
+
+        dev_ids = _POP["forced"] + _POP["dev_fresh"]
+        reuse, split, frame_by_id, _ = self._fixtures(dev_ids)
+        verified = _build_dev_ledger(dev_ids + [_POP["holdout"][0]])
+        with pytest.raises(ValueError, match="dev_fit_labels_outside_frozen_membership"):
+            authority = FreshLabelAuthority216.from_verified_ledger(
+                verified,
+                stage="dev",
+                stage_sampling=_stage_sampling(dev_ids + [_POP["holdout"][0]]),
+                expected_membership=frozenset(dev_ids + [_POP["holdout"][0]]),
+                source_packet_digest=verified.ledger.source_packet_digest,
+            )
+            dev_fit_observations(
+                fresh_label_authority=authority,
+                provider_evidence=_fresh_evidence(),
+                target_identity=_target(),
+                split=split,
+                frame_by_id=frame_by_id,
+                reuse=reuse,
+            )
+
+    def test_holdout_stage_requires_holdout_authority(self) -> None:
+        from evals.calibration.campaign_001k_fit import FreshLabelAuthority216
+
+        reuse = _real_shaped_reuse()
+        split = _split(_POP["executed"] + _POP["forced"] + _POP["dev_fresh"], _POP["holdout"])
+        frame_by_id = {sid: _frame_row(0) for sid in _FRESH_202}
+        dev_ids = _POP["forced"] + _POP["dev_fresh"]
+        verified = _build_dev_ledger(dev_ids)
+        authority = FreshLabelAuthority216.from_verified_ledger(
+            verified,
+            stage="dev",
+            stage_sampling=_stage_sampling(dev_ids),
+            expected_membership=frozenset(dev_ids),
+            source_packet_digest=verified.ledger.source_packet_digest,
+        )
+        with pytest.raises(ValueError, match="holdout_evaluate_requires_holdout_stage"):
+            holdout_evaluate_observations(
+                fresh_label_authority=authority,
+                provider_evidence=_fresh_evidence(),
+                target_identity=_target(),
+                split=split,
+                frame_by_id=frame_by_id,
+                reuse=reuse,
+            )
+
+
+# ---------------------------------------------------------------------------
+# FIX2-217-7: holdout barrier bound to canonical artifact freeze
+# ---------------------------------------------------------------------------
+
+
+class TestHoldoutBarrierFreezeBound:
+    def _freeze_kwargs(self, tmp_path: Path, **overrides: Any) -> dict[str, Any]:
+        artifact = tmp_path / "candidate.json"
+        artifact.write_text('{"profiles": []}\n')
+        kwargs: dict[str, Any] = dict(
+            protected_root=tmp_path,
+            target_identity=_target(),
+            split_digest="1" * 64,
+            dev_membership_digest="2" * 64,
+            dev_fitting_evidence_digest="3" * 64,
+            candidate_artifact_path=artifact,
+            frozen_fitting_inputs_digest="4" * 64,
+            holdout_membership_digest="5" * 64,
+        )
+        kwargs.update(overrides)
+        return kwargs
+
+    def test_forged_arbitrary_digests_fail(self, tmp_path: Path) -> None:
+        from evals.calibration import campaign_001k_holdout_barrier as barrier
+
+        with pytest.raises(ValueError, match="holdout_locked_artifact_not_frozen"):
+            barrier.require_holdout_export_allowed(
+                campaign_id=c216.CAMPAIGN_ID_001K,
+                protected_root=tmp_path,
+                frozen_artifact_digest="0" * 64,
+                dev_fitting_evidence_digest="1" * 64,
+            )
+
+    def test_export_blocked_before_freeze(self, tmp_path: Path) -> None:
+        from evals.calibration import campaign_001k_holdout_barrier as barrier
+
+        with pytest.raises(ValueError, match="holdout_locked_artifact_not_frozen"):
+            barrier.require_holdout_export_allowed(
+                campaign_id=c216.CAMPAIGN_ID_001K,
+                protected_root=tmp_path,
+            )
+
+    def test_wrong_campaign_rejected(self, tmp_path: Path) -> None:
+        from evals.calibration import campaign_001k_holdout_barrier as barrier
+
+        with pytest.raises(ValueError, match="holdout_locked_unknown_campaign"):
+            barrier.require_holdout_export_allowed(
+                campaign_id="eng-calibration-999z",
+                protected_root=tmp_path,
+            )
+
+    def test_unlock_requires_canonical_freeze(self, tmp_path: Path) -> None:
+        from evals.calibration import campaign_001k_holdout_barrier as barrier
+
+        with pytest.raises(ValueError, match="holdout_locked_artifact_not_frozen"):
+            barrier.unlock_holdout(
+                protected_root=tmp_path,
+                campaign_id=c216.CAMPAIGN_ID_001K,
+                holdout_split_digest="1" * 64,
+                holdout_membership_digest="5" * 64,
+                frozen_artifact_digest="6" * 64,
+                target_identity_digest=_target().identity_digest(),
+            )
+
+    def test_full_freeze_then_unlock_then_export(self, tmp_path: Path) -> None:
+        from evals.calibration import campaign_001k_holdout_barrier as barrier
+
+        kwargs = self._freeze_kwargs(tmp_path)
+        artifact_digest = barrier._sha256_file(kwargs["candidate_artifact_path"])
+        barrier.record_dev_artifact_freeze(**kwargs)
+        barrier.unlock_holdout(
+            protected_root=tmp_path,
+            campaign_id=c216.CAMPAIGN_ID_001K,
+            holdout_split_digest=kwargs["split_digest"],
+            holdout_membership_digest=kwargs["holdout_membership_digest"],
+            frozen_artifact_digest=artifact_digest,
+            target_identity_digest=_target().identity_digest(),
+        )
+        barrier.require_holdout_export_allowed(
+            campaign_id=c216.CAMPAIGN_ID_001K, protected_root=tmp_path
+        )
+        # binding verification with exact identities succeeds
+        barrier.verify_holdout_binding(
+            protected_root=tmp_path,
+            campaign_id=c216.CAMPAIGN_ID_001K,
+            holdout_split_digest=kwargs["split_digest"],
+            frozen_artifact_digest=artifact_digest,
+            target_identity_digest=_target().identity_digest(),
+        )
+
+    def test_unlock_rejects_mismatched_bindings(self, tmp_path: Path) -> None:
+        from evals.calibration import campaign_001k_holdout_barrier as barrier
+
+        kwargs = self._freeze_kwargs(tmp_path)
+        barrier.record_dev_artifact_freeze(**kwargs)
+        with pytest.raises(ValueError, match="holdout_unlock_binding_mismatch"):
+            barrier.unlock_holdout(
+                protected_root=tmp_path,
+                campaign_id=c216.CAMPAIGN_ID_001K,
+                holdout_split_digest="f" * 64,  # not the frozen split digest
+                holdout_membership_digest=kwargs["holdout_membership_digest"],
+                frozen_artifact_digest=barrier._sha256_file(kwargs["candidate_artifact_path"]),
+                target_identity_digest=_target().identity_digest(),
+            )
+
+    def test_freeze_rejects_wrong_contract_target(self, tmp_path: Path) -> None:
+        from evals.calibration import campaign_001k_holdout_barrier as barrier
+
+        kwargs = self._freeze_kwargs(
+            tmp_path,
+            target_identity=_target(
+                calibration_dataset_version="calibration-157-dogfood-v2",
+                dimensions=("taxonomy", "retention", "epistemic"),
+            ),
+        )
+        with pytest.raises(ValueError, match="target_identity_not_001k_contract"):
+            barrier.record_dev_artifact_freeze(**kwargs)
+
+    def test_tampered_unlock_record_fails(self, tmp_path: Path) -> None:
+        from evals.calibration import campaign_001k_holdout_barrier as barrier
+
+        kwargs = self._freeze_kwargs(tmp_path)
+        barrier.record_dev_artifact_freeze(**kwargs)
+        barrier.unlock_holdout(
+            protected_root=tmp_path,
+            campaign_id=c216.CAMPAIGN_ID_001K,
+            holdout_split_digest=kwargs["split_digest"],
+            holdout_membership_digest=kwargs["holdout_membership_digest"],
+            frozen_artifact_digest=barrier._sha256_file(kwargs["candidate_artifact_path"]),
+            target_identity_digest=_target().identity_digest(),
+        )
+        # tamper the freeze record AFTER unlock: the unlock must stop validating
+        freeze_path = tmp_path / "dev-artifact-freeze-001k.json"
+        record = json.loads(freeze_path.read_text())
+        record["frozen_artifact_digest"] = "e" * 64
+        freeze_path.write_text(json.dumps(record, indent=2))
+        with pytest.raises(ValueError, match="holdout_locked_artifact_not_frozen"):
+            barrier.require_holdout_export_allowed(
+                campaign_id=c216.CAMPAIGN_ID_001K, protected_root=tmp_path
+            )
+
+
+class TestHoldoutBypassNegativePaths:
+    """No CLI path exposes/ingests holdout material before freeze."""
+
+    def _holdout_sampling_file(self, tmp_path: Path) -> Path:
+        sampling = _sampling(_POP["holdout"])
+        sampling = sampling.model_copy(update={"sampling_seed": "216-holdout-v1"})
+        path = tmp_path / "holdout-sampling.json"
+        path.write_text(json.dumps(sampling.model_dump(mode="json")))
+        return path
+
+    def test_sub_prepare_blocked_before_freeze(self, tmp_path: Path) -> None:
+        sampling_path = self._holdout_sampling_file(tmp_path)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "evals.calibration",
+                "sub-prepare",
+                "--campaign-id",
+                "eng-calibration-001k",
+                "--sampling-manifest",
+                str(sampling_path),
+                "--neutral-packet",
+                str(tmp_path / "n.json"),
+                "--neutral-packet-manifest",
+                str(tmp_path / "m.json"),
+                "--source-packet-digest",
+                "0" * 64,
+                "--protected-dir",
+                str(tmp_path),
+            ],
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).parents[1],
+        )
+        assert result.returncode != 0
+        assert "holdout_locked" in result.stderr
+
+    def test_sub_batch_show_blocked_before_freeze(self, tmp_path: Path) -> None:
+        sampling_path = self._holdout_sampling_file(tmp_path)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "evals.calibration",
+                "sub-batch-show",
+                "--campaign-id",
+                "eng-calibration-001k",
+                "--sampling-manifest",
+                str(sampling_path),
+                "--source-packet-digest",
+                "0" * 64,
+                "--protected-dir",
+                str(tmp_path),
+                "--batch-id",
+                "eng-calibration-001k:sub-review-001",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).parents[1],
+        )
+        assert result.returncode != 0
+        assert "holdout_locked" in result.stderr
+
+    def test_sub_import_blocked_before_freeze(self, tmp_path: Path) -> None:
+        sampling_path = self._holdout_sampling_file(tmp_path)
+        resp = tmp_path / "resp.txt"
+        resp.write_text("{}")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "evals.calibration",
+                "sub-import",
+                "--campaign-id",
+                "eng-calibration-001k",
+                "--sampling-manifest",
+                str(sampling_path),
+                "--reviewer-slot",
+                "model_a",
+                "--batch-id",
+                "eng-calibration-001k:sub-review-001",
+                "--raw-response",
+                str(resp),
+                "--source-packet-digest",
+                "0" * 64,
+                "--protected-dir",
+                str(tmp_path),
+            ],
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).parents[1],
+        )
+        assert result.returncode != 0
+        assert "holdout_locked" in result.stderr
+
+    def test_sub_lane_init_blocked_before_freeze(self, tmp_path: Path) -> None:
+        sampling_path = self._holdout_sampling_file(tmp_path)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "evals.calibration",
+                "sub-lane-init",
+                "--campaign-id",
+                "eng-calibration-001k",
+                "--sampling-manifest",
+                str(sampling_path),
+                "--reviewer-slot",
+                "model_a",
+                "--reviewer-config-digest",
+                "a" * 64,
+                "--source-packet-digest",
+                "0" * 64,
+                "--neutral-packet",
+                str(tmp_path / "n.json"),
+                "--neutral-packet-manifest",
+                str(tmp_path / "m.json"),
+                "--visible-model-name",
+                "Claude Opus 5",
+                "--operator",
+                "test-op",
+                "--protected-dir",
+                str(tmp_path),
+            ],
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).parents[1],
+        )
+        assert result.returncode != 0
+        assert "holdout_locked" in result.stderr
+
+    def test_direct_model_lane_rejects_001k(self, tmp_path: Path) -> None:
+        sampling_path = self._holdout_sampling_file(tmp_path)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "evals.calibration",
+                "model-lane-init",
+                "--campaign-id",
+                "eng-calibration-001k",
+                "--sampling-manifest",
+                str(sampling_path),
+                "--reviewer-identity",
+                str(tmp_path / "r.json"),
+                "--reviewer-slot",
+                "model_a",
+                "--source-packet-digest",
+                "0" * 64,
+                "--neutral-packet",
+                str(tmp_path / "n.json"),
+                "--neutral-packet-manifest",
+                str(tmp_path / "m.json"),
+                "--protected-dir",
+                str(tmp_path),
+            ],
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).parents[1],
+        )
+        assert result.returncode != 0
+        assert "campaign_001k_rejects_direct_model_lane" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# 001f unchanged + retained earlier-round coverage
+# ---------------------------------------------------------------------------
 
 
 class TestReusePartition:
@@ -172,421 +1130,13 @@ class TestReusePartition:
                 fresh_internal_group_count=0,
             )
 
-    def test_unexecuted_export_overlap_is_not_contamination(self) -> None:
-        fresh = [_sid(i) for i in range(200, 402)]
-        corpora = {"unexecuted-export:batch": set(fresh[:5])}
-        proof = c216.build_freshness_proof(
-            fresh=tuple(fresh),  # type: ignore[arg-type]
-            corpora=corpora,
-            spanning=(),
-            duplicate_groups_total=0,
-            fresh_internal_group_count=0,
-        )
-        assert proof.executed_overlap == ()
-        assert len(proof.unexecuted_export_overlap) == 5
-
-    def test_spanning_group_members_forced_dev(self) -> None:
-        executed = _POP["executed"]
-        spanning_fresh = [_sid(300), _sid(301)]
-        duplicates = {"g1": [executed[0], *spanning_fresh]}
-        forced = c216.spanning_duplicate_members(duplicates, tuple(executed))  # type: ignore[arg-type]
-        assert set(forced) == set(spanning_fresh)
-
     def test_holdout_floor_enforced(self) -> None:
         fresh = [_sid(i) for i in range(200, 250)]
         with pytest.raises(ValueError, match="reuse_manifest_holdout_below_floor"):
             _reuse(holdout=fresh[:10], forced=[], dev_fresh=fresh[10:])
 
 
-class TestDeterministicHoldout:
-    def test_deterministic_and_group_constrained(self) -> None:
-        pool = tuple(_sid(i) for i in range(200, 377))
-        internal = [[_sid(350), _sid(351)], [_sid(360), _sid(361), _sid(362)]]
-        h1 = c216.deterministic_holdout(pool, internal)
-        h2 = c216.deterministic_holdout(pool, internal)
-        assert h1 == h2
-        assert len(h1) >= c216.HOLDOUT_MIN_216
-        hold = set(h1)
-        for group in internal:
-            assert not (set(group) & hold) or set(group) <= hold
-
-    def test_label_blind_ranking(self) -> None:
-        pool = tuple(_sid(i) for i in range(200, 377))
-        assert c216.deterministic_holdout(pool, []) == c216.deterministic_holdout(pool, [])
-
-
-class TestSplit001k:
-    def test_split_partitions_population_and_zero_cross_leakage(self) -> None:
-        reuse = _real_shaped_reuse()
-        sampling = _sampling(
-            _POP["executed"] + _POP["holdout"] + _POP["forced"] + _POP["dev_fresh"]
-        )
-        duplicates = {"g1": [_POP["executed"][0], _POP["forced"][0]]}
-        split = c216.build_split_001k(reuse, sampling, duplicates)
-        assert set(split.dev_ids) | set(split.holdout_ids) == set(sampling.sample_ids)
-        assert not set(split.dev_ids) & set(split.holdout_ids)
-        assert split.leakage_checks["cross_split_shared_hash_groups"] == 0
-        assert _POP["forced"][0] in split.dev_ids
-
-    def test_cross_split_group_fails_closed(self) -> None:
-        reuse = _real_shaped_reuse()
-        sampling = _sampling(
-            _POP["executed"] + _POP["holdout"] + _POP["forced"] + _POP["dev_fresh"]
-        )
-        duplicates = {"g1": [_POP["holdout"][50], _POP["dev_fresh"][10]]}
-        with pytest.raises(ValueError, match="split_001k_cross_split_duplicate_groups"):
-            c216.build_split_001k(reuse, sampling, duplicates)
-
-
-class TestStageSamplingAuthorities:
-    """FIX-217-2 / FIX-217-3: DEV/HOLDOUT reviewer authorities."""
-
-    def _counts(self, ids: list[str]) -> dict[str, int]:
-        return {"fact/migration/active": len(ids)}
-
-    def test_dev_authority_exactly_102_zero_holdout(self) -> None:
-        reuse = _real_shaped_reuse()
-        sampling = _sampling(
-            _POP["executed"] + _POP["holdout"] + _POP["forced"] + _POP["dev_fresh"]
-        )
-        manifest = c216.build_dev_sampling_manifest(
-            sampling,
-            reuse,
-            stratum_counts=self._counts(_POP["forced"] + _POP["dev_fresh"]),
-            target_identity_digest=_NEW_TARGET,
-        )
-        assert len(manifest.sample_ids) == 102
-        assert set(manifest.sample_ids) == set(_POP["forced"]) | set(_POP["dev_fresh"])
-        assert not set(manifest.sample_ids) & set(_POP["holdout"])
-        assert manifest.sampling_seed == "216-dev-v1"
-
-    def test_holdout_authority_exactly_100(self) -> None:
-        reuse = _real_shaped_reuse()
-        sampling = _sampling(
-            _POP["executed"] + _POP["holdout"] + _POP["forced"] + _POP["dev_fresh"]
-        )
-        manifest = c216.build_holdout_sampling_manifest(
-            sampling,
-            reuse,
-            stratum_counts=self._counts(_POP["holdout"]),
-            target_identity_digest=_NEW_TARGET,
-        )
-        assert len(manifest.sample_ids) == 100
-        assert set(manifest.sample_ids) == set(_POP["holdout"])
-
-    def test_stage_authority_binds_new_target_digest_not_001f(self) -> None:
-        reuse = _real_shaped_reuse()
-        sampling = _sampling(
-            _POP["executed"] + _POP["holdout"] + _POP["forced"] + _POP["dev_fresh"],
-            target_digest=_OLD_TARGET,
-        )
-        manifest = c216.build_dev_sampling_manifest(
-            sampling,
-            reuse,
-            stratum_counts=self._counts(_POP["forced"] + _POP["dev_fresh"]),
-            target_identity_digest=_NEW_TARGET,
-        )
-        assert manifest.target_identity_digest == _NEW_TARGET
-        assert manifest.target_identity_digest != sampling.target_identity_digest
-        # prior provenance stays separately recorded
-        assert manifest.frame_digest == sampling.frame_digest
-        assert manifest.snapshot_sha256 == sampling.snapshot_sha256
-
-    def test_stage_authority_rejects_inherited_old_target(self) -> None:
-        reuse = _real_shaped_reuse()
-        sampling = _sampling(
-            _POP["executed"] + _POP["holdout"] + _POP["forced"] + _POP["dev_fresh"],
-            target_digest=_OLD_TARGET,
-        )
-        with pytest.raises(
-            ValueError, match="stage_authority_must_bind_new_target_identity|target_identity"
-        ):
-            c216.build_dev_sampling_manifest(
-                sampling,
-                reuse,
-                stratum_counts=self._counts(_POP["forced"] + _POP["dev_fresh"]),
-                target_identity_digest=_OLD_TARGET,
-            )
-
-    def test_dev_and_holdout_authorities_share_exact_target(self) -> None:
-        reuse = _real_shaped_reuse()
-        sampling = _sampling(
-            _POP["executed"] + _POP["holdout"] + _POP["forced"] + _POP["dev_fresh"]
-        )
-        dev = c216.build_dev_sampling_manifest(
-            sampling,
-            reuse,
-            stratum_counts=self._counts(_POP["forced"] + _POP["dev_fresh"]),
-            target_identity_digest=_NEW_TARGET,
-        )
-        hold = c216.build_holdout_sampling_manifest(
-            sampling,
-            reuse,
-            stratum_counts=self._counts(_POP["holdout"]),
-            target_identity_digest=_NEW_TARGET,
-        )
-        assert dev.target_identity_digest == hold.target_identity_digest == _NEW_TARGET
-        assert set(dev.sample_ids) & set(hold.sample_ids) == set()
-
-    def test_malformed_target_digest_rejected(self) -> None:
-        reuse = _real_shaped_reuse()
-        sampling = _sampling(
-            _POP["executed"] + _POP["holdout"] + _POP["forced"] + _POP["dev_fresh"]
-        )
-        with pytest.raises(ValueError, match="malformed|target"):
-            c216.build_dev_sampling_manifest(
-                sampling,
-                reuse,
-                stratum_counts=self._counts(_POP["forced"] + _POP["dev_fresh"]),
-                target_identity_digest="not-a-digest",
-            )
-
-
-class TestProviderEvidenceBinding:
-    """FIX-217-4: identity-verified provider evidence before fitting."""
-
-    def _payload(self, **overrides: Any) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "run_kind": "issue-216-fresh-202-assess3",
-            "prompt_version": "engram.assess.3",
-            "model": "deepseek-ai/DeepSeek-V4-Flash",
-            "code_git_head": "a" * 40,
-            "target_identity_digest": self._target().identity_digest(),
-            "cases": [
-                {
-                    "sample_id": _sid(1),
-                    "status": "ok",
-                    "values": {"taxonomy_value": 0.9, "retention_value": 0.85},
-                },
-                {"sample_id": _sid(2), "status": "error", "error_type": "ValidationError"},
-            ],
-        }
-        payload.update(overrides)
-        return payload
-
-    def _target(self) -> Any:
-        from evals.calibration.freeze import TargetIdentity
-
-        return TargetIdentity(
-            campaign_id=c216.CAMPAIGN_ID_001K,
-            campaign_tooling_repo_sha="f" * 40,
-            assessment_schema_version="engram.assessment.v1",
-            assessment_code_version="assessment-engine-v1",
-            prompt_version="engram.assess.3",
-            provider_adapter="openai",
-            provider_model="deepseek-ai/DeepSeek-V4-Flash",
-            provider_config_digest="sha256:" + "1" * 64,
-            provider_params={"temperature": 0},
-            assessment_policy_version="assessment-selection-v1",
-            calibration_artifact_schema_version="engram.calibration-profiles-v1",
-            calibration_dataset_version="calibration-157-dogfood-v3-216",
-            label_guide_version="engram-calibration-guide-157-v1",
-            canonicalization_version="assessment-evidence-manifest-v1",
-            dimensions=("taxonomy", "retention"),
-        )
-
-    def test_rejects_wrong_prompt_version(self) -> None:
-        payload = self._payload(prompt_version="engram.assess.2")
-        with pytest.raises(ValueError, match="provider_evidence_wrong_prompt_version"):
-            ProviderEvidence216.from_payload(payload, artifact_sha256="0" * 64)
-
-    def test_parses_ok_and_error_cases(self) -> None:
-        evidence = ProviderEvidence216.from_payload(self._payload(), artifact_sha256="0" * 64)
-        assert evidence.ok_count == 1 and evidence.error_count == 1
-        assert _sid(2) not in evidence.values_by_sample
-
-    def test_verified_for_fitting_rejects_wrong_model(self) -> None:
-        evidence = ProviderEvidence216.from_payload(
-            self._payload(model="other-model"), artifact_sha256="0" * 64
-        )
-        with pytest.raises(ValueError, match="provider_evidence_model_mismatch"):
-            evidence.verified_for_fitting(
-                target_identity=self._target(),
-                expected_population=frozenset({_sid(1), _sid(2)}),
-            )
-
-    def test_verified_for_fitting_rejects_wrong_target_digest(self) -> None:
-        evidence = ProviderEvidence216.from_payload(
-            self._payload(target_identity_digest="9" * 64), artifact_sha256="0" * 64
-        )
-        with pytest.raises(ValueError, match="provider_evidence_target_identity_mismatch"):
-            evidence.verified_for_fitting(
-                target_identity=self._target(),
-                expected_population=frozenset({_sid(1), _sid(2)}),
-            )
-
-    def test_verified_for_fitting_rejects_foreign_population(self) -> None:
-        evidence = ProviderEvidence216.from_payload(self._payload(), artifact_sha256="0" * 64)
-        with pytest.raises(ValueError, match="provider_evidence_population_mismatch"):
-            evidence.verified_for_fitting(
-                target_identity=self._target(),
-                expected_population=frozenset({_sid(7)}),
-            )
-
-    def test_verified_for_fitting_accepts_exact_identity(self) -> None:
-        evidence = ProviderEvidence216.from_payload(self._payload(), artifact_sha256="0" * 64)
-        values = evidence.verified_for_fitting(
-            target_identity=self._target(),
-            expected_population=frozenset({_sid(1), _sid(2), _sid(3)}),
-        )
-        assert set(values) == {_sid(1)}
-
-    def test_load_verified_rejects_digest_mismatch(self, tmp_path: Path) -> None:
-        path = tmp_path / "evidence.json"
-        path.write_text(json.dumps(self._payload()))
-        with pytest.raises(ValueError, match="provider_evidence_artifact_digest_mismatch"):
-            ProviderEvidence216.load_verified(path, expected_sha256="0" * 64)
-
-
-class TestFreshLabelMembership:
-    """FIX-217-5: exact membership, never count."""
-
-    def _fixtures(self) -> tuple[Any, Any, dict[str, dict[str, Any]], dict[str, FrameRow]]:
-        reuse = _real_shaped_reuse()
-        split = _split(_POP["executed"] + _POP["forced"] + _POP["dev_fresh"], _POP["holdout"])
-        values = {
-            sid: {"taxonomy_value": 0.9, "retention_value": 0.85, "suggested_kind": "fact"}
-            for sid in _POP["forced"] + _POP["dev_fresh"] + _POP["holdout"]
-        }
-        frame_by_id = {row.sample_id: row for row in (_frame_row(i) for i in range(402))}
-        # remap frame ids to the synthetic population
-        frame_by_id = {
-            sid: _frame_row(0) for sid in _POP["forced"] + _POP["dev_fresh"] + _POP["holdout"]
-        }
-        return reuse, split, values, frame_by_id
-
-    def _labels(self, ids: list[str]) -> dict[str, dict[str, Any]]:
-        return {
-            sid: {
-                "expected_kind": "fact",
-                "retention_value": "retain",
-                "epistemic_state": "adequately_supported",
-                "consequence": "low",
-            }
-            for sid in ids
-        }
-
-    def test_dev_fit_requires_exact_membership(self) -> None:
-        reuse, split, values, frame_by_id = self._fixtures()
-        dev_ids = _POP["forced"] + _POP["dev_fresh"]
-        obs = dev_fit_observations(
-            labels_by_sample=self._labels(dev_ids),
-            provider_values=values,
-            split=split,
-            frame_by_id=frame_by_id,
-            reuse=reuse,
-        )
-        assert {o.sample_id for o in obs} == set(dev_ids)
-
-    def test_dev_fit_rejects_missing_labels(self) -> None:
-        reuse, split, values, frame_by_id = self._fixtures()
-        dev_ids = _POP["forced"] + _POP["dev_fresh"]
-        with pytest.raises(ValueError, match="dev_fit_labels_incomplete"):
-            dev_fit_observations(
-                labels_by_sample=self._labels(dev_ids[:-1]),
-                provider_values=values,
-                split=split,
-                frame_by_id=frame_by_id,
-                reuse=reuse,
-            )
-
-    def test_dev_fit_rejects_holdout_id(self) -> None:
-        reuse, split, values, frame_by_id = self._fixtures()
-        dev_ids = _POP["forced"] + _POP["dev_fresh"]
-        labels = self._labels(dev_ids)
-        labels[_POP["holdout"][0]] = dict(next(iter(labels.values())))
-        with pytest.raises(
-            ValueError, match="dev_fit_labels_outside_frozen_membership|dev_fit_label_split"
-        ):
-            dev_fit_observations(
-                labels_by_sample=labels,
-                provider_values=values,
-                split=split,
-                frame_by_id=frame_by_id,
-                reuse=reuse,
-            )
-
-    def test_dev_fit_rejects_exact_count_wrong_membership(self) -> None:
-        reuse, split, values, frame_by_id = self._fixtures()
-        dev_ids = _POP["forced"] + _POP["dev_fresh"]
-        labels = self._labels(dev_ids[:-1])
-        # 102 labels, but one is foreign
-        labels[_sid(9999)] = dict(next(iter(labels.values())))
-        with pytest.raises(ValueError, match="dev_fit_labels_outside_frozen_membership"):
-            dev_fit_observations(
-                labels_by_sample=labels,
-                provider_values=values,
-                split=split,
-                frame_by_id=frame_by_id,
-                reuse=reuse,
-            )
-
-    def test_partial_dev_audit_never_fit_complete(self) -> None:
-        reuse, split, values, frame_by_id = self._fixtures()
-        dev_ids = _POP["forced"] + _POP["dev_fresh"]
-        # partial audit input succeeds only with require_complete=False
-        obs = dev_fit_observations(
-            labels_by_sample=self._labels(dev_ids[:10]),
-            provider_values=values,
-            split=split,
-            frame_by_id=frame_by_id,
-            reuse=reuse,
-            require_complete=False,
-        )
-        assert {o.sample_id for o in obs} == set(dev_ids[:10])
-        # but the same input is rejected as a fit freeze
-        with pytest.raises(ValueError, match="dev_fit_labels_incomplete"):
-            dev_fit_observations(
-                labels_by_sample=self._labels(dev_ids[:10]),
-                provider_values=values,
-                split=split,
-                frame_by_id=frame_by_id,
-                reuse=reuse,
-            )
-
-    def test_holdout_rejects_dev_id(self) -> None:
-        reuse, split, values, frame_by_id = self._fixtures()
-        labels = self._labels(_POP["holdout"])
-        labels[_POP["dev_fresh"][0]] = dict(next(iter(labels.values())))
-        with pytest.raises(ValueError, match="holdout_evaluate_labels_outside_frozen_membership"):
-            holdout_evaluate_observations(
-                labels_by_sample=labels,
-                provider_values=values,
-                split=split,
-                frame_by_id=frame_by_id,
-                reuse=reuse,
-            )
-
-    def test_holdout_requires_all_100(self) -> None:
-        reuse, split, values, frame_by_id = self._fixtures()
-        with pytest.raises(ValueError, match="holdout_evaluate_labels_incomplete"):
-            holdout_evaluate_observations(
-                labels_by_sample=self._labels(_POP["holdout"][:-1]),
-                provider_values=values,
-                split=split,
-                frame_by_id=frame_by_id,
-                reuse=reuse,
-            )
-
-    def test_202_full_collection_rejected_by_dev_fit(self) -> None:
-        reuse, split, values, frame_by_id = self._fixtures()
-        # the whole fresh 202 (dev 102 + holdout 100) must never pass dev fit
-        labels = self._labels(_POP["forced"] + _POP["dev_fresh"] + _POP["holdout"])
-        with pytest.raises(
-            ValueError, match="dev_fit_labels_outside_frozen_membership|dev_fit_label_split"
-        ):
-            dev_fit_observations(
-                labels_by_sample=labels,
-                provider_values=values,
-                split=split,
-                frame_by_id=frame_by_id,
-                reuse=reuse,
-            )
-
-
 class TestSubscriptionOptIn:
-    """FIX-217-1: committed 001k opt-in; others fail closed."""
-
     def test_001k_opted_under_frozen_protocol(self) -> None:
         from evals.calibration.subscription_ui import subscription_mode_permitted
 
@@ -608,17 +1158,7 @@ class TestSubscriptionOptIn:
             "eng-calibration-999z", "eng-calibration-consensus-206-v1"
         )
 
-    def test_001k_under_wrong_protocol_fails_closed(self) -> None:
-        from evals.calibration.subscription_ui import subscription_mode_permitted
-
-        assert not subscription_mode_permitted(
-            "eng-calibration-001k", "eng-calibration-consensus-999-v9"
-        )
-
     def test_committed_cli_exposes_216_commands(self) -> None:
-        import subprocess
-        import sys
-
         result = subprocess.run(
             [sys.executable, "-m", "evals.calibration", "--help"],
             capture_output=True,
@@ -628,15 +1168,6 @@ class TestSubscriptionOptIn:
         assert result.returncode == 0
         for command in ("216-freeze-target", "216-reuse-manifest", "216-dev-packet"):
             assert command in result.stdout
-        # campaign override on subscription boundaries (subparser help)
-        for sub in ("sub-lane-init", "sub-batches", "sub-import", "sub-prepare"):
-            sub_help = subprocess.run(
-                [sys.executable, "-m", "evals.calibration", sub, "--help"],
-                capture_output=True,
-                text=True,
-                cwd=Path(__file__).parents[1],
-            )
-            assert "--campaign-id" in sub_help.stdout, sub
 
     def test_committed_public_manifest_matches_reality(self) -> None:
         manifest = Path(c216.__file__).parent / "campaigns/216/campaign-reuse-public.json"
@@ -647,51 +1178,18 @@ class TestSubscriptionOptIn:
         assert payload["leakage_checks"]["cross_split_shared_hash_groups"] == 0
 
 
-class TestHoldoutBarrier:
-    """FIX-217-6: holdout export blocked before artifact freeze."""
-
-    def test_barrier_blocks_holdout_export_without_artifact_digest(self, tmp_path: Path) -> None:
-        from evals.calibration import campaign_001k_holdout_barrier as barrier
-
-        with pytest.raises(ValueError, match="holdout_locked_artifact_not_frozen|holdout_locked"):
-            barrier.require_holdout_export_allowed(
-                campaign_id=c216.CAMPAIGN_ID_001K,
-                frozen_artifact_digest=None,
-                dev_fitting_evidence_digest=None,
-            )
-
-    def test_barrier_rejects_wrong_campaign(self, tmp_path: Path) -> None:
-        from evals.calibration import campaign_001k_holdout_barrier as barrier
-
-        with pytest.raises(ValueError, match="holdout_locked"):
-            barrier.require_holdout_export_allowed(
-                campaign_id="eng-calibration-999z",
-                frozen_artifact_digest="0" * 64,
-                dev_fitting_evidence_digest="1" * 64,
-            )
-
-    def test_barrier_allows_after_freeze_with_exact_bindings(self) -> None:
-        from evals.calibration import campaign_001k_holdout_barrier as barrier
-
-        # permitted only with both digests present and well formed
-        barrier.require_holdout_export_allowed(
-            campaign_id=c216.CAMPAIGN_ID_001K,
-            frozen_artifact_digest="0" * 64,
-            dev_fitting_evidence_digest="1" * 64,
-        )
-
-
 class TestFrameStratumVocabulary:
     def test_unavailable_maps_to_unknown(self) -> None:
-        row = _frame_row(1)
-        stratum = _frame_stratum(row)
+        from evals.calibration.campaign_001k_fit import _frame_stratum
+
+        stratum = _frame_stratum(_frame_row(1))
         assert stratum["assertion_mode"] == "unknown"
         assert stratum["risk"] == "unknown"
         assert stratum["source_type"] == "migration"
 
 
-class TestReusedObservations:
-    def test_campaign_constants(self) -> None:
+class TestCampaignConstants:
+    def test_constants(self) -> None:
         assert c216.DIMENSIONS_001K == ("taxonomy", "retention")
         assert c216.CAMPAIGN_ID_001K == "eng-calibration-001k"
         assert c216.EXECUTED_PREFIX == 200

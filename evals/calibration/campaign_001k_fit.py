@@ -1,24 +1,25 @@
 """Campaign 001k (#216) Phases 3-7: observations, fitting, holdout, artifact.
 
-Builds on the frozen #157/#202 fitting contract (``evals.calibration.fit``)
-with the one reviewed extension the #216 campaign requires:
+FIX2-217 correction round. The fitting boundary now accepts ONLY verified
+capabilities:
 
-- dimension adaptation — the frozen 001k target identity calibrates exactly
-  ``("taxonomy", "retention")`` under the #214 semantic boundary (assess.3
-  emits no epistemic numeric). ``observations_001k`` derives per-dimension
-  outcomes through the SAME frozen ``LabeledObservation.from_review`` mapping
-  and drops dimensions outside the frozen target. The shared floor evaluator
-  vocabulary in ``fit.py`` is consumed through ``dimension_vocabulary`` so
-  per-dimension floors apply to exactly the frozen dimensions.
-- dual-source labels — dev observations join (a) the reused-200 labels
-  (digest-verified #213 synthesis via ``ReusedLabelSet``) and (b) fresh-202
-  labels verified from frozen #206/#208-style consensus evidence, once the
-  fresh lanes complete. Holdout observations come ONLY from fresh labels.
-
-Fitting, holdout evaluation, artifact construction, and floor evaluation are
-reused UNCHANGED from ``evals.calibration.fit`` (deterministic
-exact-stratum-reliability-bins-v1, MIN_CALIBRATION_SAMPLES bin floor,
-uncalibrated undersupported strata).
+- provider outputs enter exclusively through ``ProviderEvidence216`` (a
+  run-identity-BOUND record whose fields are validated, never optional
+  private-attribute fallthroughs) consumed via ``stage_provider_values`` /
+  ``reused_provider_values`` — there is no ``dict[str, dict[str, Any]]``
+  provider-mapping parameter anywhere on a fitting/evaluation boundary;
+- fresh DEV/HOLDOUT labels enter exclusively through
+  ``FreshLabelAuthority216`` — a capability derived ONLY from a
+  ``VerifiedConsensusLedger`` (the frozen #206 consensus machinery:
+  three provenance-bound lanes, deterministic audit selection, protected
+  human queue, full re-derivation) that additionally proves the exact #216
+  stage bindings (campaign, protocol, stage membership, sampling-manifest
+  digest, source packet digest, lane digests, queue evidence digest) —
+  free-form ``labels_by_sample`` dicts are no longer accepted anywhere;
+- fitting, holdout evaluation, artifact construction, and floor evaluation
+  remain reused UNCHANGED from ``evals.calibration.fit`` (deterministic
+  exact-stratum-reliability-bins-v1, MIN_CALIBRATION_SAMPLES bin floor,
+  uncalibrated undersupported strata).
 """
 
 from __future__ import annotations
@@ -29,229 +30,86 @@ import json
 from pathlib import Path
 from typing import Any, Literal
 
+from pydantic import model_validator
+
 from evals.admission.schema import Record
 from evals.calibration.campaign_001k import (
     DIMENSIONS_001K,
+    REPLAY3_SHA256,
     ReusedLabelSet,
 )
 from evals.calibration.fit import LabeledObservation
-from evals.calibration.freeze import FrameRow, SplitManifest, TargetIdentity
+from evals.calibration.freeze import FrameRow, SamplingManifest, SplitManifest, TargetIdentity
+
+# ---------------------------------------------------------------------------
+# FIX2-217-4: the one and only valid 001k target authority
+# ---------------------------------------------------------------------------
+
+#: The exact frozen #216 contract every 001k target identity must satisfy
+#: field-exactly (FIX2-217-4). A hash-valid artifact that is not this exact
+#: contract is NOT the 001k authority.
+TARGET_001K_CONTRACT: dict[str, Any] = {
+    "campaign_id": "eng-calibration-001k",
+    "prompt_version": "engram.assess.3",
+    "dimensions": ("taxonomy", "retention"),
+    "assessment_schema_version": "engram.assessment.v1",
+    "assessment_code_version": "assessment-engine-v1",
+    "provider_adapter": "openai",
+    "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+    "calibration_dataset_version": "calibration-157-dogfood-v3-216",
+    "assessment_policy_version": "assessment-selection-v1",
+    "calibration_artifact_schema_version": "engram.calibration-profiles-v1",
+    "label_guide_version": "engram-calibration-guide-157-v1",
+    "canonicalization_version": "assessment-evidence-manifest-v1",
+}
+#: Canonical frozen provider parameters (ordering-independent comparison).
+TARGET_001K_PROVIDER_PARAMS: dict[str, Any] = {
+    "temperature": 0,
+    "max_tokens": 1024,
+    "input_limit": 16000,
+}
+
+_CONTRACT_STRING_FIELDS = (
+    "campaign_id",
+    "prompt_version",
+    "assessment_schema_version",
+    "assessment_code_version",
+    "provider_adapter",
+    "provider_model",
+    "calibration_dataset_version",
+    "assessment_policy_version",
+    "calibration_artifact_schema_version",
+    "label_guide_version",
+    "canonicalization_version",
+)
 
 
-def _reused_dimensions_view(label: Any) -> Any:
-    """Adapt a reused/consensus critical-fields dict to the Dimensions API."""
+def verify_target_identity_001k(identity: TargetIdentity) -> TargetIdentity:
+    """Mechanically require the frozen #216 001k contract, field-exactly.
 
-    class _View:
-        __slots__ = ("expected_kind", "retention_value", "epistemic_state", "consequence")
-
-        def __init__(self, critical: dict[str, Any]):
-            self.expected_kind = critical.get("expected_kind", "unknown")
-            self.retention_value = critical.get("retention_value", "uncertain")
-            self.epistemic_state = critical.get("epistemic_state", "unknown")
-            self.consequence = critical.get("consequence", "unknown")
-
-    critical = getattr(label, "final", None)
-    if critical is None and isinstance(label, dict):
-        critical = label.get("final", label)
-    if not isinstance(critical, dict):
-        raise ValueError("label_missing_final_dimensions")
-    return _View(critical)
-
-
-def _frame_stratum(row: FrameRow) -> dict[str, str]:
-    """Frozen frame stratum -> observation vocabulary.
-
-    The frame records absent decision-time fields as ``unavailable``; the
-    calibration observation vocabulary (and therefore CalibrationProfile)
-    uses the closed ``unknown`` literals. This mapping is part of the frozen
-    #202 joining contract (frame ``unavailable`` -> stratum ``unknown``).
+    Digest self-consistency alone proves nothing (FIX2-217-4): this checks
+    every frozen contract axis — campaign, prompt, dimensions, schema and
+    code-contract versions, provider adapter/model, canonical provider
+    parameters, dataset identity — and returns the VERIFIED identity for use
+    downstream. The provider config digest must be in production form
+    (``sha256:<64hex>``); the exact value is deployment-bound and validated
+    separately by the campaign freeze against the deployed contract.
     """
-    return {
-        "source_type": row.source_type,
-        "assertion_mode": "unknown" if row.assertion_mode == "unavailable" else row.assertion_mode,
-        "kind": row.kind,
-        "risk": "unknown" if row.risk == "unavailable" else row.risk,
-    }
+    for field in _CONTRACT_STRING_FIELDS:
+        if getattr(identity, field) != TARGET_001K_CONTRACT[field]:
+            raise ValueError(f"target_identity_not_001k_contract:{field}")
+    if tuple(identity.dimensions) != TARGET_001K_CONTRACT["dimensions"]:
+        raise ValueError("target_identity_not_001k_contract:dimensions")
+    if dict(identity.provider_params) != TARGET_001K_PROVIDER_PARAMS:
+        raise ValueError("target_identity_not_001k_contract:provider_params")
+    if not identity.provider_config_digest.startswith("sha256:"):
+        raise ValueError("target_identity_not_001k_contract:provider_config_digest_form")
+    return identity
 
 
-def observations_from_reused(
-    *,
-    reused: ReusedLabelSet,
-    provider_values: dict[str, dict[str, Any]],
-    split: SplitManifest,
-    frame_by_id: dict[str, FrameRow],
-    dimensions: tuple[str, ...] = DIMENSIONS_001K,
-) -> list[LabeledObservation]:
-    """Dev observations for the reused-200 from synthesis labels + assess.3 outputs.
-
-    ``provider_values`` maps sample_id -> assess.3 values dict (taxonomy_value,
-    retention_value, suggested_kind) from the digest-verified #214 replay-3
-    evidence. Labels are never provider input; provider outputs are never
-    label input. The join is the frozen ``from_review`` mapping.
-    """
-    split_by_id = {sid: "dev" for sid in split.dev_ids}
-    split_by_id.update({sid: "holdout" for sid in split.holdout_ids})
-    out: list[LabeledObservation] = []
-    for label in reused.labels:
-        sid = label.sample_id
-        if split_by_id.get(sid) != "dev":
-            raise ValueError("reused_label_must_be_dev_side")
-        row = frame_by_id[sid]
-        values = provider_values.get(sid)
-        if values is None:
-            # Provider abstention / strict parse failure on the frozen #214
-            # replay: the label still counts as reviewed, but contributes no
-            # provider numeric (raw_value None never enters bin support).
-            raw_scores: dict[str, float | None] = {
-                "taxonomy_value": None,
-                "retention_value": None,
-                "epistemic_value": None,
-            }
-            suggested: str | None = None
-        else:
-            raw_scores = {
-                "taxonomy_value": values.get("taxonomy_value"),
-                "retention_value": values.get("retention_value"),
-                "epistemic_value": values.get("epistemic_value"),
-            }
-            suggested = values.get("suggested_kind")
-        obs = LabeledObservation.from_review(
-            sample_id=sid,
-            split="dev",
-            dimensions=_reused_dimensions_view(label),
-            raw_scores=raw_scores,
-            suggested_kind=suggested,
-            stratum=_frame_stratum(row),
-        )
-        out.extend(o for o in obs if o.dimension in dimensions)
-    return out
-
-
-def _fresh_stage_observations(
-    *,
-    labels_by_sample: dict[str, dict[str, Any]],
-    provider_values: dict[str, dict[str, Any]],
-    split: SplitManifest,
-    frame_by_id: dict[str, FrameRow],
-    expected_ids: frozenset[str],
-    expected_split: Literal["dev", "holdout"],
-    stage: Literal["dev_fit", "holdout_evaluate"],
-    dimensions: tuple[str, ...],
-    require_complete: bool,
-) -> list[LabeledObservation]:
-    """Shared strict stage join (FIX-217-5).
-
-    Membership is judged against the EXACT frozen stage population — never by
-    count. ``require_complete`` demands equality (fit freeze / holdout
-    evaluation); partial inputs are audit-only and can never be fit-complete.
-    """
-    label_ids = set(labels_by_sample)
-    if len(label_ids) != len(labels_by_sample):
-        raise ValueError(f"{stage}_duplicate_label_ids")
-    if not label_ids <= expected_ids:
-        foreign = sorted(label_ids - expected_ids)[:3]
-        raise ValueError(f"{stage}_labels_outside_frozen_membership:{foreign}")
-    if require_complete and label_ids != expected_ids:
-        missing = len(expected_ids - label_ids)
-        raise ValueError(f"{stage}_labels_incomplete:{missing}_missing")
-    # stage/split coherence: a holdout ID may never enter the DEV fitting
-    # path and a DEV-fresh ID may never enter holdout evaluation.
-    split_by_id = {sid: "dev" for sid in split.dev_ids}
-    split_by_id.update({sid: "holdout" for sid in split.holdout_ids})
-    for sid in label_ids:
-        if split_by_id.get(sid) != expected_split:
-            raise ValueError(f"{stage}_label_split_mismatch:{sid}")
-    out: list[LabeledObservation] = []
-    for sid in sorted(label_ids):
-        row = frame_by_id[sid]
-        values = provider_values.get(sid)
-        if values is None:
-            # Honest abstention/parse failure: no provider numeric. The label
-            # still counts toward review totals via the floor evaluator.
-            raw_scores: dict[str, float | None] = {
-                "taxonomy_value": None,
-                "retention_value": None,
-                "epistemic_value": None,
-            }
-            suggested: str | None = None
-        else:
-            raw_scores = {
-                "taxonomy_value": values.get("taxonomy_value"),
-                "retention_value": values.get("retention_value"),
-                "epistemic_value": values.get("epistemic_value"),
-            }
-            suggested = values.get("suggested_kind")
-        obs = LabeledObservation.from_review(
-            sample_id=sid,
-            split=expected_split,
-            dimensions=_reused_dimensions_view(labels_by_sample[sid]),
-            raw_scores=raw_scores,
-            suggested_kind=suggested,
-            stratum=_frame_stratum(row),
-        )
-        out.extend(o for o in obs if o.dimension in dimensions)
-    return out
-
-
-def dev_fit_observations(
-    *,
-    labels_by_sample: dict[str, dict[str, Any]],
-    provider_values: dict[str, dict[str, Any]],
-    split: SplitManifest,
-    frame_by_id: dict[str, FrameRow],
-    reuse: Any,
-    dimensions: tuple[str, ...] = DIMENSIONS_001K,
-    require_complete: bool = True,
-) -> list[LabeledObservation]:
-    """DEV-fitting observations from fresh DEV labels only (FIX-217-2/5).
-
-    ``reuse`` is the frozen ReuseManifest; the expected population is exactly
-    ``forced_dev_fresh_ids ∪ dev_fresh_ids`` (102). A holdout ID in the input
-    fails closed. Partial sets (``require_complete=False``) are audit/status
-    views only and downstream fit-freeze MUST re-validate with equality.
-    """
-    expected = frozenset(reuse.forced_dev_fresh_ids) | frozenset(reuse.dev_fresh_ids)
-    return _fresh_stage_observations(
-        labels_by_sample=labels_by_sample,
-        provider_values=provider_values,
-        split=split,
-        frame_by_id=frame_by_id,
-        expected_ids=expected,
-        expected_split="dev",
-        stage="dev_fit",
-        dimensions=dimensions,
-        require_complete=require_complete,
-    )
-
-
-def holdout_evaluate_observations(
-    *,
-    labels_by_sample: dict[str, dict[str, Any]],
-    provider_values: dict[str, dict[str, Any]],
-    split: SplitManifest,
-    frame_by_id: dict[str, FrameRow],
-    reuse: Any,
-    dimensions: tuple[str, ...] = DIMENSIONS_001K,
-) -> list[LabeledObservation]:
-    """Holdout-evaluation observations from frozen holdout labels only.
-
-    Exact equality against the frozen 100 holdout IDs; a DEV-fresh ID in the
-    input fails closed. Callable only after artifact freeze (enforced by the
-    campaign holdout barrier).
-    """
-    expected = frozenset(reuse.holdout_ids)
-    return _fresh_stage_observations(
-        labels_by_sample=labels_by_sample,
-        provider_values=provider_values,
-        split=split,
-        frame_by_id=frame_by_id,
-        expected_ids=expected,
-        expected_split="holdout",
-        stage="holdout_evaluate",
-        dimensions=dimensions,
-        require_complete=True,
-    )
-
+# ---------------------------------------------------------------------------
+# FIX2-217-1: provider evidence as a real verified capability
+# ---------------------------------------------------------------------------
 
 #: Runs whose outputs may back fitting, by allowed campaign stage.
 FITTING_RUN_KINDS: tuple[str, ...] = (
@@ -259,24 +117,122 @@ FITTING_RUN_KINDS: tuple[str, ...] = (
     "issue-216-fresh-202-assess3",  # fresh stages (dev/holdout split upstream)
 )
 
+_RUN_KIND_TO_STAGE: dict[str, Literal["dev", "holdout"]] = {
+    "issue-214-protected-200-case-replay-assess3": "dev",
+    "issue-216-fresh-202-assess3": "dev",  # split applied at the stage boundary
+}
+
+_CASE_STATUSES: tuple[str, ...] = ("ok", "error", "abstained")
+
+#: The reviewed historical-authority contract for the #214 replay-3 run
+#: (FIX2-217-1). The replay predates the 001k target identity, so it cannot
+#: carry a 001k target digest; it is bound through its OWN accepted execution
+#: identity: exact protected artifact SHA-256, exact run kind, prompt, model,
+#: the contract axes the retained evidence records, its 200-case population,
+#: and its preserved strict-parser failures.
+REPLAY3_HISTORICAL_AUTHORITY: dict[str, Any] = {
+    "artifact_sha256": REPLAY3_SHA256,
+    "run_kind": "issue-214-protected-200-case-replay-assess3",
+    "prompt_version": "engram.assess.3",
+    "provider_adapter": "openai",
+    "provider_model": "deepseek-ai/DeepSeek-V4-Flash",
+    "schema_version": "engram.assessment.v1",
+    "code_version": "assessment-engine-v1",
+    "execution_identity": "1dc42fca1f3062a06d0486fb9a53803e77410706",
+    "expected_population": 200,
+}
+
+
+class _EvidenceCapability:
+    """Opaque module-private seal: only ``ProviderEvidence216`` issues it."""
+
+    __slots__ = ("payload_digest",)
+
+    def __init__(self, payload_digest: str) -> None:
+        self.payload_digest = payload_digest
+
+
+class ProviderCase216(Record):
+    """One provider-run case record, parsed BEFORE any dict conversion."""
+
+    sample_id: str
+    status: Literal["ok", "error", "abstained"]
+    values: dict[str, Any] | None = None
+    error_type: str | None = None
+
+    @model_validator(mode="after")
+    def status_shape(self) -> ProviderCase216:
+        if self.status == "ok":
+            if not isinstance(self.values, dict) or not self.values:
+                raise ValueError("provider_case_ok_requires_values")
+            if self.error_type is not None:
+                raise ValueError("provider_case_ok_forbids_error_type")
+        else:
+            if self.values is not None:
+                raise ValueError("provider_case_failure_forbids_values")
+            if not self.error_type:
+                raise ValueError("provider_case_failure_requires_error_type")
+        return self
+
 
 class ProviderEvidence216(Record):
     """Identity-BOUND assess.3 provider outputs for a 001k population stage.
 
-    FIX-217-4: values never enter fitting merely because a payload says
-    ``engram.assess.3``. ``verified_for_fitting`` mechanically proves the run
-    identity against the frozen 001k target BEFORE any value is returned.
+    FIX2-217-1: every identity field is a REQUIRED validated field — never an
+    optional private attribute or ``getattr(..., None)`` fallthrough. A run
+    that cannot represent its identity fails at parse time.
+
+    FIX2-217-2: ``values_by_sample`` is private. Verified stage-scoped views
+    are issued only through ``stage_provider_values`` (fresh runs) /
+    ``reused_provider_values`` (historical replay runs), each of which proves
+    the complete run identity against the frozen 001k target authority or the
+    reviewed historical replay-3 authority BEFORE anything is returned.
     """
 
+    evidence_schema: Literal["engram-calibration-provider-evidence-216-v2"] = (
+        "engram-calibration-provider-evidence-216-v2"
+    )
     run_kind: str
     prompt_version: str
-    model: str
+    provider_adapter: str
+    provider_model: str
+    schema_version: str
+    code_version: str
     code_git_head: str
-    target_identity_digest: str
+    target_identity_digest: str | None
+    provider_config_digest: str | None
     artifact_sha256: str
-    values_by_sample: dict[str, dict[str, Any]]
-    ok_count: int
-    error_count: int
+    case_count: int
+    cases: tuple[ProviderCase216, ...]
+
+    @model_validator(mode="after")
+    def run_identity_shape(self) -> ProviderEvidence216:
+        if self.run_kind not in FITTING_RUN_KINDS:
+            raise ValueError("provider_evidence_unknown_run_kind")
+        if self.prompt_version != "engram.assess.3":
+            raise ValueError("provider_evidence_wrong_prompt_version")
+        # FIX2-217-1: code_git_head participates in the run identity — for
+        # fresh 001k runs it must equal the target's campaign tooling SHA;
+        # for the historical replay it must equal the accepted historical
+        # execution identity. The comparison happens in the stage/reuse
+        # verifiers below; here it must merely be a recorded 40-hex SHA.
+        if len(self.code_git_head) != 40 or any(
+            c not in "0123456789abcdef" for c in self.code_git_head
+        ):
+            raise ValueError("provider_evidence_missing_execution_identity")
+        ids = [case.sample_id for case in self.cases]
+        if len(set(ids)) != len(ids):
+            # Duplicates are rejected mechanically BEFORE any dictionary
+            # conversion could normalize them away.
+            raise ValueError("provider_evidence_duplicate_sample_id")
+        if self.case_count != len(self.cases):
+            raise ValueError("provider_evidence_case_count_mismatch")
+        for case in self.cases:
+            if case.status not in _CASE_STATUSES:
+                raise ValueError(f"provider_evidence_unknown_case_status:{case.status}")
+        return self
+
+    # -- construction from protected bytes ------------------------------------
 
     @classmethod
     def from_payload(
@@ -285,28 +241,34 @@ class ProviderEvidence216(Record):
         *,
         artifact_sha256: str,
     ) -> ProviderEvidence216:
-        if payload.get("prompt_version") != "engram.assess.3":
-            raise ValueError("provider_evidence_wrong_prompt_version")
-        if payload.get("run_kind") not in FITTING_RUN_KINDS:
-            raise ValueError("provider_evidence_unknown_run_kind")
-        values: dict[str, dict[str, Any]] = {}
-        ok = err = 0
-        for case in payload["cases"]:
-            if case.get("status") == "ok":
-                values[case["sample_id"]] = case["values"]
-                ok += 1
-            else:
-                err += 1
+        """Parse case records FIRST (each validated), then build the record."""
+        raw_cases = payload.get("cases")
+        if not isinstance(raw_cases, list) or not raw_cases:
+            raise ValueError("provider_evidence_cases_missing")
+        # Mechanical duplicate detection over the authoritative LIST before
+        # any keyed form exists.
+        seen: set[str] = set()
+        for case in raw_cases:
+            sid = case.get("sample_id") if isinstance(case, dict) else None
+            if not isinstance(sid, str) or not sid:
+                raise ValueError("provider_evidence_case_missing_sample_id")
+            if sid in seen:
+                raise ValueError("provider_evidence_duplicate_sample_id")
+            seen.add(sid)
+        cases = tuple(ProviderCase216.model_validate(case) for case in raw_cases)
         return cls(
-            run_kind=payload["run_kind"],
-            prompt_version=payload["prompt_version"],
-            model=str(payload.get("model", "")),
+            run_kind=str(payload["run_kind"]),
+            prompt_version=str(payload["prompt_version"]),
+            provider_adapter=str(payload.get("provider_adapter", "")),
+            provider_model=str(payload.get("model", "")),
+            schema_version=str(payload.get("schema_version", "")),
+            code_version=str(payload.get("code_version", "")),
             code_git_head=str(payload.get("code_git_head", "")),
-            target_identity_digest=str(payload.get("target_identity_digest", "")),
+            target_identity_digest=payload.get("target_identity_digest"),
+            provider_config_digest=payload.get("provider_config_digest"),
             artifact_sha256=artifact_sha256,
-            values_by_sample=values,
-            ok_count=ok,
-            error_count=err,
+            case_count=len(cases),
+            cases=cases,
         )
 
     @classmethod
@@ -323,57 +285,495 @@ class ProviderEvidence216(Record):
             raise ValueError("provider_evidence_artifact_digest_mismatch")
         return cls.from_payload(json.loads(payload_bytes), artifact_sha256=expected_sha256)
 
-    def verified_for_fitting(
+    # -- verified accessors ----------------------------------------------------
+
+    def _values_by_sample(self) -> dict[str, dict[str, Any]]:
+        """Private keyed view over the validated case records."""
+        return {
+            case.sample_id: dict(case.values or {}) for case in self.cases if case.status == "ok"
+        }
+
+    def successful_ids(self) -> frozenset[str]:
+        return frozenset(c.sample_id for c in self.cases if c.status == "ok")
+
+    def error_ids(self) -> frozenset[str]:
+        """Explicit error/abstention IDs (never fabricated into values)."""
+        return frozenset(c.sample_id for c in self.cases if c.status != "ok")
+
+    def all_case_ids(self) -> frozenset[str]:
+        return frozenset(c.sample_id for c in self.cases)
+
+    def ok_count(self) -> int:
+        return sum(1 for c in self.cases if c.status == "ok")
+
+    def error_count(self) -> int:
+        return sum(1 for c in self.cases if c.status != "ok")
+
+    def _require_identity(
+        self, *, prompt: str, adapter: str, model: str, schema: str, code: str
+    ) -> None:
+        if self.prompt_version != prompt:
+            raise ValueError("provider_evidence_prompt_mismatch")
+        if adapter and self.provider_adapter != adapter:
+            raise ValueError("provider_evidence_adapter_mismatch")
+        if self.provider_model != model:
+            raise ValueError("provider_evidence_model_mismatch")
+        if self.schema_version != schema:
+            raise ValueError("provider_evidence_schema_mismatch")
+        if self.code_version != code:
+            raise ValueError("provider_evidence_code_version_mismatch")
+
+    def stage_provider_values(
         self,
         *,
         target_identity: TargetIdentity,
         expected_population: frozenset[str],
     ) -> dict[str, dict[str, Any]]:
-        """Return values ONLY after proving the exact frozen identities.
+        """Verified values for a FRESH 001k provider run (FIX2-217-1).
 
-        Fail-closed checks (a mismatch NEVER normalizes into a pass):
+        Fails closed on the complete run authority BEFORE returning anything:
 
-        - exact prompt version == target prompt (assess.3);
-        - exact provider adapter/model == target;
-        - exact provider config digest where the run recorded one;
-        - exact schema/code contract versions where recorded;
-        - exact 001k target identity digest;
-        - run covers the expected stage population (ok + abstentions).
+        - exact prompt / adapter / model / schema / code contract == target;
+        - the run MUST record the exact frozen 001k target identity digest
+          (a missing digest is a failure, never "skip target verification");
+        - the run's recorded provider-config digest MUST equal the target's;
+        - ``code_git_head`` MUST equal the target's campaign tooling SHA
+          (the execution identity the freeze was bound to);
+        - population proof is EXACT equality over all case IDs (successful
+          plus errors/abstentions) — never a subset of successful IDs.
         """
-        if self.prompt_version != target_identity.prompt_version:
-            raise ValueError("provider_evidence_prompt_mismatch")
-        if self.model != target_identity.provider_model:
-            raise ValueError("provider_evidence_model_mismatch")
-        recorded_config = getattr(self, "_recorded_config_digest", None)
-        if recorded_config is not None and not hmac.compare_digest(
-            recorded_config, target_identity.provider_config_digest
+        verify_target_identity_001k(target_identity)
+        self._require_identity(
+            prompt=target_identity.prompt_version,
+            adapter=target_identity.provider_adapter,
+            model=target_identity.provider_model,
+            schema=target_identity.assessment_schema_version,
+            code=target_identity.assessment_code_version,
+        )
+        recorded_target = self.target_identity_digest
+        if not recorded_target:
+            raise ValueError("provider_evidence_target_identity_missing")
+        if not hmac.compare_digest(recorded_target, target_identity.identity_digest()):
+            raise ValueError("provider_evidence_target_identity_mismatch")
+        if self.provider_config_digest is None:
+            raise ValueError("provider_evidence_config_digest_missing")
+        if not hmac.compare_digest(
+            self.provider_config_digest, target_identity.provider_config_digest
         ):
             raise ValueError("provider_evidence_config_mismatch")
-        if self.target_identity_digest:
-            # 214 replay-3 predates the 001k identity: it binds the reused-200
-            # stage through its own accepted run identity and carries no 001k
-            # digest; every run that DOES record one must match exactly.
-            digest_now = target_identity.identity_digest()
-            if not hmac.compare_digest(self.target_identity_digest, digest_now):
-                raise ValueError("provider_evidence_target_identity_mismatch")
-        covered = set(self.values_by_sample)
-        if not covered <= expected_population:
-            foreign = sorted(covered - expected_population)[:3]
-            raise ValueError(f"provider_evidence_population_mismatch:{foreign}")
-        if not self._recorded_schema_ok(target_identity):
-            raise ValueError("provider_evidence_contract_mismatch")
-        return self.values_by_sample
+        if not hmac.compare_digest(self.code_git_head, target_identity.campaign_tooling_repo_sha):
+            raise ValueError("provider_evidence_execution_identity_mismatch")
+        self._prove_population(expected_population)
+        return self._values_by_sample()
 
-    def _recorded_schema_ok(self, target_identity: TargetIdentity) -> bool:
-        recorded = getattr(self, "_recorded_contract", None)
-        if recorded is None:
-            return True
-        expected = {
-            "schema_version": target_identity.assessment_schema_version,
-            "code_version": target_identity.assessment_code_version,
-        }
-        return bool(recorded == expected)
+    def reused_provider_values(
+        self,
+        *,
+        expected_population: frozenset[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Verified values for the HISTORICAL #214 replay-3 run (FIX2-217-1).
 
-    def abstentions(self) -> frozenset[str]:
-        """Cases the run recorded as failures/abstentions (no fabricated values)."""
-        return frozenset(getattr(self, "_abstained_ids", ()) or ())
+        The replay predates the 001k target identity; it is bound through the
+        reviewed historical-authority contract (exact artifact SHA-256, run
+        kind, prompt, adapter/model, schema/code axes, execution identity,
+        and its exact 200-case population). The retained evidence genuinely
+        lacks a provider-config digest; that absence is handled HERE, in the
+        explicit reviewed contract — never by silently skipping verification.
+        """
+        auth = REPLAY3_HISTORICAL_AUTHORITY
+        if not hmac.compare_digest(self.artifact_sha256, auth["artifact_sha256"]):
+            raise ValueError("replay3_authority_artifact_mismatch")
+        if self.run_kind != auth["run_kind"]:
+            raise ValueError("replay3_authority_run_kind_mismatch")
+        self._require_identity(
+            prompt=auth["prompt_version"],
+            adapter=auth["provider_adapter"],
+            model=auth["provider_model"],
+            schema=auth["schema_version"],
+            code=auth["code_version"],
+        )
+        if not hmac.compare_digest(self.code_git_head, auth["execution_identity"]):
+            raise ValueError("replay3_authority_execution_identity_mismatch")
+        if self.target_identity_digest is not None:
+            # The historical replay cannot truthfully claim a 001k identity.
+            raise ValueError("replay3_authority_unexpected_target_digest")
+        if len(expected_population) != auth["expected_population"]:
+            raise ValueError("replay3_authority_population_size_mismatch")
+        self._prove_population(expected_population)
+        return self._values_by_sample()
+
+    def _prove_population(self, expected_population: frozenset[str]) -> None:
+        """all_case_ids == expected_population — exactly (FIX2-217-1).
+
+        Missing IDs, extra IDs, duplicated IDs (rejected at parse), or
+        foreign IDs all fail. A subset of successful IDs is NOT a population
+        proof because errors/abstentions are part of the population.
+        """
+        all_ids = self.all_case_ids()
+        if all_ids != expected_population:
+            missing = len(expected_population - all_ids)
+            extra = sorted(all_ids - expected_population)[:3]
+            raise ValueError(
+                f"provider_evidence_population_mismatch:{missing}_missing:extra={extra}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# FIX2-217-3: fresh labels as a verified campaign-ledger capability
+# ---------------------------------------------------------------------------
+
+
+class _LabelCapability:
+    """Opaque module-private seal for the fresh-label authority."""
+
+    __slots__ = ("binding_digest",)
+
+    def __init__(self, binding_digest: str) -> None:
+        self.binding_digest = binding_digest
+
+
+class FreshLabelAuthority216(Record):
+    """Verified fresh-label authority for ONE 001k stage (FIX2-217-3).
+
+    The ONLY constructor is :meth:`from_verified_ledger`, which requires a
+    genuine ``VerifiedConsensusLedger`` (capability-checked) plus the exact
+    frozen #216 stage bindings. Labels reach ``LabeledObservation`` projection
+    exclusively through this capability; duplicate labels are detected while
+    reading the authoritative ledger wrapper list, BEFORE any keyed form.
+    """
+
+    authority_schema: Literal["engram-calibration-fresh-labels-216-v1"] = (
+        "engram-calibration-fresh-labels-216-v1"
+    )
+    campaign_id: str
+    protocol_version: str
+    stage: Literal["dev", "holdout"]
+    sampling_manifest_digest: str
+    source_packet_digest: str
+    lane_digests: tuple[str, ...]
+    queue_evidence_sha256: str
+    expected_membership_digest: str
+    labels: tuple[tuple[str, dict[str, Any], str], ...]  # (sample_id, critical, origin)
+    retained_unknown_ids: tuple[str, ...]
+    human_adjudicated_ids: tuple[str, ...]
+    _label_capability: Any = None
+
+    @model_validator(mode="after")
+    def stage_shape(self) -> FreshLabelAuthority216:
+        if self.campaign_id != "eng-calibration-001k":
+            raise ValueError("fresh_label_authority_campaign_mismatch")
+        if self.protocol_version != "eng-calibration-consensus-206-v1":
+            raise ValueError("fresh_label_authority_protocol_mismatch")
+        if len(self.lane_digests) != 3:
+            raise ValueError("fresh_label_authority_lane_count")
+        ids = [row[0] for row in self.labels]
+        if len(set(ids)) != len(ids):
+            raise ValueError("fresh_label_authority_duplicate_sample_id")
+        if not set(self.retained_unknown_ids) <= set(ids):
+            raise ValueError("fresh_label_authority_unknown_not_subset")
+        if not set(self.human_adjudicated_ids) <= set(ids):
+            raise ValueError("fresh_label_authority_human_not_subset")
+        return self
+
+    @classmethod
+    def from_verified_ledger(
+        cls,
+        verified_ledger: Any,
+        *,
+        stage: Literal["dev", "holdout"],
+        stage_sampling: SamplingManifest,
+        expected_membership: frozenset[str],
+        source_packet_digest: str,
+    ) -> FreshLabelAuthority216:
+        """Derive the stage authority from a REAL verified consensus ledger.
+
+        Binds: campaign ID, consensus protocol, stage, the exact stage
+        sampling-manifest digest, the source/neutral packet digest, the three
+        frozen lane digests, the human-queue evidence digest, the exact stage
+        membership, consensus results (final dimensions + origins), retained
+        unknown/abstention states, and required human adjudications.
+        """
+        from evals.calibration.ledger import require_verification_capability
+
+        require_verification_capability(verified_ledger)
+        ledger = verified_ledger.ledger
+        if ledger.campaign_id != "eng-calibration-001k":
+            raise ValueError("fresh_label_ledger_campaign_mismatch")
+        expected_digest = stage_sampling.manifest_digest()
+        if ledger.sampling_manifest_digest != expected_digest:
+            raise ValueError("fresh_label_stage_sampling_mismatch")
+        if not hmac.compare_digest(ledger.source_packet_digest, source_packet_digest):
+            raise ValueError("fresh_label_source_packet_mismatch")
+        membership = {wrapper.sample_id for wrapper in ledger.wrappers}
+        if membership != expected_membership:
+            missing = len(expected_membership - membership)
+            foreign = sorted(membership - expected_membership)[:3]
+            raise ValueError(f"fresh_label_membership_mismatch:{missing}_missing:foreign={foreign}")
+        labels: list[tuple[str, dict[str, Any], str]] = []
+        retained_unknown: list[str] = []
+        human_ids: list[str] = []
+        for wrapper in ledger.wrappers:
+            critical = dict(wrapper.final_dimensions)
+            labels.append((wrapper.sample_id, critical, wrapper.final_label_origin))
+            if wrapper.final_label_origin == "human_adjudicated":
+                human_ids.append(wrapper.sample_id)
+            vals = [
+                critical.get(field)
+                for field in ("expected_kind", "retention_value", "epistemic_state", "consequence")
+                if field in critical
+            ]
+            if any(v in ("unknown", "uncertain", "ambiguous", "unverifiable") for v in vals):
+                retained_unknown.append(wrapper.sample_id)
+        authority = cls(
+            campaign_id=ledger.campaign_id,
+            protocol_version=ledger.protocol_version,
+            stage=stage,
+            sampling_manifest_digest=expected_digest,
+            source_packet_digest=ledger.source_packet_digest,
+            lane_digests=tuple(ledger.lane_digests),
+            queue_evidence_sha256=ledger.queue_evidence_sha256,
+            expected_membership_digest=expected_membership_digest_of(expected_membership),
+            labels=tuple(sorted(labels, key=lambda row: row[0])),
+            retained_unknown_ids=tuple(sorted(retained_unknown)),
+            human_adjudicated_ids=tuple(sorted(human_ids)),
+        )
+        object.__setattr__(
+            authority,
+            "_label_capability",
+            _LabelCapability(authority._binding_digest()),
+        )
+        return authority
+
+    def _binding_digest(self) -> str:
+        payload = {k: v for k, v in self.model_dump(mode="json").items() if not k.startswith("_")}
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    def _require_capability(self) -> None:
+        cap = getattr(self, "_label_capability", None)
+        if not isinstance(cap, _LabelCapability) or cap.binding_digest != self._binding_digest():
+            raise ValueError("fresh_label_authority_capability_invalid")
+
+    def labels_by_sample(self) -> dict[str, dict[str, Any]]:
+        """Stage-scoped immutable-ish keyed view, authority-bound."""
+        self._require_capability()
+        return {sid: dict(critical) for sid, critical, _origin in self.labels}
+
+
+def expected_membership_digest_of(membership: frozenset[str]) -> str:
+    return hashlib.sha256(
+        json.dumps(sorted(membership), separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Observation construction (the ONLY fitting/evaluation boundary)
+# ---------------------------------------------------------------------------
+
+
+def _dimensions_view(critical: dict[str, Any]) -> Any:
+    """Adapt a final critical-fields dict to the frozen Dimensions API."""
+
+    class _View:
+        __slots__ = ("expected_kind", "retention_value", "epistemic_state", "consequence")
+
+        def __init__(self, fields: dict[str, Any]):
+            self.expected_kind = fields.get("expected_kind", "unknown")
+            self.retention_value = fields.get("retention_value", "uncertain")
+            self.epistemic_state = fields.get("epistemic_state", "unknown")
+            self.consequence = fields.get("consequence", "unknown")
+
+    if not isinstance(critical, dict):
+        raise ValueError("label_missing_final_dimensions")
+    return _View(critical)
+
+
+def _frame_stratum(row: FrameRow) -> dict[str, str]:
+    """Frozen frame stratum -> observation vocabulary (unavailable->unknown)."""
+    return {
+        "source_type": row.source_type,
+        "assertion_mode": "unknown" if row.assertion_mode == "unavailable" else row.assertion_mode,
+        "kind": row.kind,
+        "risk": "unknown" if row.risk == "unavailable" else row.risk,
+    }
+
+
+def _provider_case_values(
+    provider_values: dict[str, dict[str, Any]], sid: str
+) -> tuple[dict[str, float | None], str | None]:
+    values = provider_values.get(sid)
+    if values is None:
+        # Honest abstention/parse failure: no provider numeric; the label
+        # still counts toward review totals via the floor evaluator.
+        return {
+            "taxonomy_value": None,
+            "retention_value": None,
+            "epistemic_value": None,
+        }, None
+    return {
+        "taxonomy_value": values.get("taxonomy_value"),
+        "retention_value": values.get("retention_value"),
+        "epistemic_value": values.get("epistemic_value"),
+    }, values.get("suggested_kind")
+
+
+def observations_from_reused(
+    *,
+    reused: ReusedLabelSet,
+    replay_evidence: ProviderEvidence216,
+    expected_population: frozenset[str],
+    split: SplitManifest,
+    frame_by_id: dict[str, FrameRow],
+    dimensions: tuple[str, ...] = DIMENSIONS_001K,
+) -> list[LabeledObservation]:
+    """Dev observations for the reused-200 from synthesis labels + replay-3.
+
+    FIX2-217-2: provider values enter ONLY through the verified historical
+    replay-3 capability (``reused_provider_values``); there is no naked
+    provider-mapping parameter.
+    """
+    provider_values = replay_evidence.reused_provider_values(
+        expected_population=expected_population
+    )
+    split_by_id = {sid: "dev" for sid in split.dev_ids}
+    split_by_id.update({sid: "holdout" for sid in split.holdout_ids})
+    out: list[LabeledObservation] = []
+    for label in reused.labels:
+        sid = label.sample_id
+        if split_by_id.get(sid) != "dev":
+            raise ValueError("reused_label_must_be_dev_side")
+        row = frame_by_id[sid]
+        raw_scores, suggested = _provider_case_values(provider_values, sid)
+        obs = LabeledObservation.from_review(
+            sample_id=sid,
+            split="dev",
+            dimensions=_dimensions_view(label.final),
+            raw_scores=raw_scores,
+            suggested_kind=suggested,
+            stratum=_frame_stratum(row),
+        )
+        out.extend(o for o in obs if o.dimension in dimensions)
+    return out
+
+
+def _fresh_stage_observations(
+    *,
+    label_authority: FreshLabelAuthority216,
+    provider_values: dict[str, dict[str, Any]],
+    split: SplitManifest,
+    frame_by_id: dict[str, FrameRow],
+    expected_ids: frozenset[str],
+    expected_split: Literal["dev", "holdout"],
+    stage: Literal["dev_fit", "holdout_evaluate"],
+    dimensions: tuple[str, ...],
+    require_complete: bool,
+) -> list[LabeledObservation]:
+    """Shared strict stage join over the VERIFIED label authority."""
+    label_authority._require_capability()
+    label_ids = {sid for sid, _critical, _origin in label_authority.labels}
+    if label_ids - expected_ids:
+        foreign = sorted(label_ids - expected_ids)[:3]
+        raise ValueError(f"{stage}_labels_outside_frozen_membership:{foreign}")
+    if require_complete and label_ids != expected_ids:
+        missing = len(expected_ids - label_ids)
+        raise ValueError(f"{stage}_labels_incomplete:{missing}_missing")
+    split_by_id = {sid: "dev" for sid in split.dev_ids}
+    split_by_id.update({sid: "holdout" for sid in split.holdout_ids})
+    for sid in label_ids:
+        if split_by_id.get(sid) != expected_split:
+            raise ValueError(f"{stage}_label_split_mismatch:{sid}")
+    critical_by_id = label_authority.labels_by_sample()
+    out: list[LabeledObservation] = []
+    for sid in sorted(label_ids):
+        row = frame_by_id[sid]
+        raw_scores, suggested = _provider_case_values(provider_values, sid)
+        obs = LabeledObservation.from_review(
+            sample_id=sid,
+            split=expected_split,
+            dimensions=_dimensions_view(critical_by_id[sid]),
+            raw_scores=raw_scores,
+            suggested_kind=suggested,
+            stratum=_frame_stratum(row),
+        )
+        out.extend(o for o in obs if o.dimension in dimensions)
+    return out
+
+
+def dev_fit_observations(
+    *,
+    fresh_label_authority: FreshLabelAuthority216,
+    provider_evidence: ProviderEvidence216,
+    target_identity: TargetIdentity,
+    split: SplitManifest,
+    frame_by_id: dict[str, FrameRow],
+    reuse: Any,
+    dimensions: tuple[str, ...] = DIMENSIONS_001K,
+    require_complete: bool = True,
+) -> list[LabeledObservation]:
+    """DEV-fitting observations from fresh DEV labels only.
+
+    FIX2-217-2/FIX2-217-3: ``fresh_label_authority`` is the verified campaign
+    ledger capability (stage == "dev"); ``provider_evidence`` is verified
+    against the frozen 001k target with the exact fresh-202 population. The
+    expected fitting population is exactly ``forced_dev_fresh ∪ dev_fresh``
+    (102); a holdout ID in either input fails closed.
+    """
+    if fresh_label_authority.stage != "dev":
+        raise ValueError("dev_fit_requires_dev_stage_authority")
+    expected = frozenset(reuse.forced_dev_fresh_ids) | frozenset(reuse.dev_fresh_ids)
+    provider_values = provider_evidence.stage_provider_values(
+        target_identity=target_identity,
+        expected_population=frozenset(reuse.forced_dev_fresh_ids)
+        | frozenset(reuse.dev_fresh_ids)
+        | frozenset(reuse.holdout_ids),
+    )
+    return _fresh_stage_observations(
+        label_authority=fresh_label_authority,
+        provider_values=provider_values,
+        split=split,
+        frame_by_id=frame_by_id,
+        expected_ids=expected,
+        expected_split="dev",
+        stage="dev_fit",
+        dimensions=dimensions,
+        require_complete=require_complete,
+    )
+
+
+def holdout_evaluate_observations(
+    *,
+    fresh_label_authority: FreshLabelAuthority216,
+    provider_evidence: ProviderEvidence216,
+    target_identity: TargetIdentity,
+    split: SplitManifest,
+    frame_by_id: dict[str, FrameRow],
+    reuse: Any,
+    dimensions: tuple[str, ...] = DIMENSIONS_001K,
+) -> list[LabeledObservation]:
+    """Holdout-evaluation observations from frozen holdout labels only.
+
+    FIX2-217-2/FIX2-217-3: exact equality against the frozen 100 holdout
+    IDs; a DEV-fresh ID in the input fails closed. Callable only after
+    artifact freeze (enforced by the campaign holdout barrier).
+    """
+    if fresh_label_authority.stage != "holdout":
+        raise ValueError("holdout_evaluate_requires_holdout_stage_authority")
+    expected = frozenset(reuse.holdout_ids)
+    provider_values = provider_evidence.stage_provider_values(
+        target_identity=target_identity,
+        expected_population=frozenset(reuse.forced_dev_fresh_ids)
+        | frozenset(reuse.dev_fresh_ids)
+        | frozenset(reuse.holdout_ids),
+    )
+    return _fresh_stage_observations(
+        label_authority=fresh_label_authority,
+        provider_values=provider_values,
+        split=split,
+        frame_by_id=frame_by_id,
+        expected_ids=expected,
+        expected_split="holdout",
+        stage="holdout_evaluate",
+        dimensions=dimensions,
+        require_complete=True,
+    )

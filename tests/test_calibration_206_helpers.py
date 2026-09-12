@@ -263,6 +263,7 @@ def build_verified_ledger(
     ids: tuple[str, ...],
     critical_by_id: dict[str, dict],
     origin: str = "cross_model_consensus",
+    campaign_id: str = "campaign",
     *,
     sampling: SamplingManifest | None = None,
     split: SplitManifest | None = None,
@@ -314,7 +315,7 @@ def build_verified_ledger(
     frame_rows_list = build_frame_rows(ids)
     if sampling is None:
         sampling = SamplingManifest(
-            campaign_id="campaign",
+            campaign_id=campaign_id,
             target_identity_digest="1" * 64,
             # FIX-R4-3: derived from the actual frame rows so the canonical
             # frozen-frame validator can verify them at the ledger boundary.
@@ -400,7 +401,7 @@ def build_verified_ledger(
             session = LaneSession.init(
                 tmp_path,
                 reviewer=reviewers[slot],
-                campaign_id="campaign",
+                campaign_id=campaign_id,
                 sampling=sampling,
                 source_packet_digest="f" * 64,
                 neutral_packet_path=packet_path,
@@ -434,13 +435,13 @@ def build_verified_ledger(
                         reviewers[slot],
                         sample_id,
                         request_generation=1,
-                        campaign_id="campaign",
+                        campaign_id=campaign_id,
                         executor_status="completed",
                     ),
                 )
                 record = ModelReviewRecord(
                     protocol_version=CONSENSUS_PROTOCOL_VERSION,
-                    campaign_id="campaign",
+                    campaign_id=campaign_id,
                     sampling_manifest_digest=sampling.manifest_digest(),
                     source_packet_digest="f" * 64,
                     sample_id=sample_id,
@@ -489,7 +490,7 @@ def build_verified_ledger(
         write_queue(
             HumanQueueManifest(
                 protocol_version=CONSENSUS_PROTOCOL_VERSION,
-                campaign_id="campaign",
+                campaign_id=campaign_id,
                 sampling_manifest_digest=sampling.manifest_digest(),
                 source_packet_digest="f" * 64,
                 entries=tuple(entries),
@@ -500,7 +501,7 @@ def build_verified_ledger(
             freeze_lane(
                 protected_root=tmp_path,
                 reviewer=reviewers[slot],
-                campaign_id="campaign",
+                campaign_id=campaign_id,
                 sampling=sampling,
                 source_packet_digest="f" * 64,
                 neutral_packet_sha256=hashlib.sha256(packet_payload).hexdigest(),
@@ -514,7 +515,7 @@ def build_verified_ledger(
                 HumanQueueJudgment.model_validate(
                     {
                         "protocol_version": CONSENSUS_PROTOCOL_VERSION,
-                        "campaign_id": "campaign",
+                        "campaign_id": campaign_id,
                         "sampling_manifest_digest": sampling.manifest_digest(),
                         "source_packet_digest": "f" * 64,
                         "sample_id": sid,
@@ -535,7 +536,7 @@ def build_verified_ledger(
                     slot: records_by_lane[slot][sid] for slot in REVIEWER_SLOTS
                 },
                 lane_digests=lane_digests,
-                campaign_id="campaign",
+                campaign_id=campaign_id,
                 sampling_manifest_digest=sampling.manifest_digest(),
                 source_packet_digest="f" * 64,
             )
@@ -548,14 +549,14 @@ def build_verified_ledger(
                     slot: records_by_lane[slot][sid] for slot in REVIEWER_SLOTS
                 },
                 lane_digests=lane_digests,
-                campaign_id="campaign",
+                campaign_id=campaign_id,
                 sampling_manifest_digest=sampling.manifest_digest(),
                 source_packet_digest="f" * 64,
             )
         from evals.calibration.ledger import verify_consensus_ledger
 
         return verify_consensus_ledger(
-            campaign_id="campaign",
+            campaign_id=campaign_id,
             sampling=sampling,
             source_packet_digest="f" * 64,
             lanes=lanes,

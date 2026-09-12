@@ -580,9 +580,16 @@ def build_split_001k(
 # ---------------------------------------------------------------------------
 
 
-def load_001k_target_identity_digest(protected_root: Path) -> str:
-    """Load the EXACT frozen 001k target identity digest from the protected
-    identity artifact (never hardcoded from a report)."""
+def load_001k_target_identity(protected_root: Path) -> TargetIdentity:
+    """Load and verify the EXACT frozen 001k target identity (FIX2-217-4).
+
+    Digest self-consistency proves nothing: the loaded identity must both
+    hash to the recorded digest AND satisfy the frozen #216 contract
+    field-exactly (``verify_target_identity_001k``). Returns the verified
+    ``TargetIdentity`` for downstream use, not just a digest.
+    """
+    from evals.calibration.campaign_001k_fit import verify_target_identity_001k
+
     payload = json.loads((protected_root / "identity-frozen.json").read_text())
     digest_value = str(payload["target_identity_digest"])
     if not re.fullmatch(r"[0-9a-f]{64}", digest_value):
@@ -590,7 +597,12 @@ def load_001k_target_identity_digest(protected_root: Path) -> str:
     identity = TargetIdentity.model_validate(payload["target_identity"])
     if not hmac.compare_digest(identity.identity_digest(), digest_value):
         raise ValueError("identity_artifact_digest_mismatch")
-    return digest_value
+    return verify_target_identity_001k(identity)
+
+
+def load_001k_target_identity_digest(protected_root: Path) -> str:
+    """The EXACT frozen 001k target identity digest (verified contract)."""
+    return load_001k_target_identity(protected_root).identity_digest()
 
 
 def _stage_sampling_manifest(

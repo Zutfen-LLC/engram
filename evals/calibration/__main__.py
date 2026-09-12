@@ -89,6 +89,38 @@ def _campaign(args: argparse.Namespace) -> str:
     return value
 
 
+def _campaign_001f_only(args: argparse.Namespace) -> str:
+    """FIX2-217-4: generic legacy campaign commands are 001f-only.
+
+    The legacy generic freeze/sample/packets/model-lane path cannot
+    mechanically enforce the #216 stage contract (exact 001k target
+    authority, DEV/HOLDOUT stage separation, holdout barrier). An
+    ``eng-calibration-001k`` invocation on those commands fails closed
+    instead of creating an incompatible alternate 001k authority.
+    """
+    value = _campaign(args)
+    if value != CAMPAIGN_ID:
+        raise SystemExit(
+            f"campaign_requires_216_command:{value}:use 216-freeze-target / "
+            "216-reuse-manifest / 216-dev-packet and the subscription lanes"
+        )
+    return value
+
+
+def _campaign_001k_lane(args: argparse.Namespace) -> str:
+    """FIX2-217-7: direct model-lane commands are 001f-only.
+
+    The #206 direct model-lane commands cannot cleanly enforce the #216
+    stage contract (holdout material only after canonical artifact freeze);
+    campaign 001k must use the subscription lanes whose prepare/show/import
+    boundaries apply the mechanical holdout barrier.
+    """
+    value = _campaign(args)
+    if value != CAMPAIGN_ID:
+        raise SystemExit(f"campaign_001k_rejects_direct_model_lane:{value}")
+    return value
+
+
 DATASET_VERSION = "calibration-157-dogfood-v2"
 SAMPLING_SEED = "202-sample-v2"
 SPLIT_SEED = "202-split-v2"
@@ -127,7 +159,7 @@ def _resolve_provider_config_digest(args: argparse.Namespace) -> str:
 
 def cmd_freeze_target(args: argparse.Namespace) -> int:
     identity = TargetIdentity(
-        campaign_id=_campaign(args),
+        campaign_id=_campaign_001f_only(args),
         campaign_tooling_repo_sha=args.campaign_tooling_repo_sha,
         assessment_schema_version="engram.assessment.v1",
         assessment_code_version="assessment-engine-v1",
@@ -144,7 +176,7 @@ def cmd_freeze_target(args: argparse.Namespace) -> int:
         dimensions=("taxonomy", "retention", "epistemic"),
     )
     floors = EvidenceFloors(
-        campaign_id=_campaign(args),
+        campaign_id=_campaign_001f_only(args),
         total_reviewed_min=300,
         per_dimension_labeled_min=150,
         per_dimension_non_unknown_fraction_min=0.50,
@@ -178,14 +210,14 @@ def cmd_sample(args: argparse.Namespace) -> int:
     )
     sample_ids, stratum_counts, coverage = stratified_sample(
         frame,
-        campaign_id=_campaign(args),
+        campaign_id=_campaign_001f_only(args),
         sampling_seed=SAMPLING_SEED,
         coverage_min=COVERAGE_MIN,
         allocation_fraction=ALLOCATION_FRACTION,
     )
     hash_by_id = {sample_id_for(row.item_uuid): row.content_hash for row in frame}
     sampling = SamplingManifest(
-        campaign_id=_campaign(args),
+        campaign_id=_campaign_001f_only(args),
         target_identity_digest=frame_data["target_identity_digest"],
         frame_digest=protected_frame_digest(frame),
         snapshot_sha256=frame_data["snapshot_sha256"],
@@ -206,12 +238,12 @@ def cmd_sample(args: argparse.Namespace) -> int:
     dev_ids, holdout_ids, checks, groups = assign_splits(
         frame,
         sample_ids=sample_ids,
-        campaign_id=_campaign(args),
+        campaign_id=_campaign_001f_only(args),
         split_seed=SPLIT_SEED,
         dev_fraction=DEV_FRACTION,
     )
     split = SplitManifest(
-        campaign_id=_campaign(args),
+        campaign_id=_campaign_001f_only(args),
         sampling_manifest_digest=sampling.manifest_digest(),
         sampling_membership_digest=digest(sorted(sample_ids)),
         split_seed=SPLIT_SEED,
@@ -252,6 +284,7 @@ def cmd_sample(args: argparse.Namespace) -> int:
 
 
 def cmd_packets(args: argparse.Namespace) -> int:
+    _campaign_001f_only(args)  # FIX2-217-4: generic packets path is 001f-only
     sampling = SamplingManifest.model_validate(json.loads(Path(args.sampling_manifest).read_text()))
     samples = json.loads(Path(args.samples).read_text())["samples"]
     packets = build_packets(
@@ -266,6 +299,7 @@ def cmd_packets(args: argparse.Namespace) -> int:
 
 def cmd_model_packet(args: argparse.Namespace) -> int:
     """Project the frozen blind packet into the neutral model-review packet."""
+    _campaign_001f_only(args)  # FIX2-217-4: generic packet path is 001f-only
     blind = BlindPacket.model_validate(json.loads(Path(args.blind_packet).read_text()))
     neutral = NeutralModelPacket.from_blind(blind, protocol_version=CONSENSUS_PROTOCOL_VERSION)
     if neutral.sampling_manifest_digest != blind.sampling_manifest_digest:
@@ -282,7 +316,7 @@ def cmd_freeze_model_lane(args: argparse.Namespace) -> int:
     lane = freeze_lane(
         protected_root=Path(args.protected_dir),
         reviewer=reviewer,
-        campaign_id=_campaign(args),
+        campaign_id=_campaign_001f_only(args),
         sampling=sampling,
         source_packet_digest=args.source_packet_digest,
     )
@@ -305,7 +339,7 @@ def cmd_model_report(args: argparse.Namespace) -> int:
     }
     lanes = load_frozen_lanes(
         Path(args.protected_dir),
-        campaign_id=_campaign(args),
+        campaign_id=_campaign_001f_only(args),
         sampling=sampling,
         source_packet_digest=args.source_packet_digest,
         reviewers=reviewers,
@@ -313,7 +347,7 @@ def cmd_model_report(args: argparse.Namespace) -> int:
     records_by_lane = records_by_lane_from_files(Path(args.protected_dir))
     frame_rows = _load_frame_rows(args.frame, sampling)
     report = build_correlation_report(
-        campaign_id=_campaign(args),
+        campaign_id=_campaign_001f_only(args),
         lanes=lanes,
         records_by_lane=records_by_lane,
         sampling=sampling,
@@ -352,7 +386,7 @@ def cmd_human_queue(args: argparse.Namespace) -> int:
     }
     load_frozen_lanes(
         Path(args.protected_dir),
-        campaign_id=_campaign(args),
+        campaign_id=_campaign_001f_only(args),
         sampling=sampling,
         source_packet_digest=args.source_packet_digest,
         reviewers=reviewers,
@@ -360,7 +394,7 @@ def cmd_human_queue(args: argparse.Namespace) -> int:
     records_by_lane = records_by_lane_from_files(Path(args.protected_dir))
     frame_rows = _load_frame_rows(args.frame, sampling)
     queue = build_queue(
-        campaign_id=_campaign(args),
+        campaign_id=_campaign_001f_only(args),
         sampling=sampling,
         source_packet_digest=args.source_packet_digest,
         records_by_lane=records_by_lane,
@@ -386,7 +420,7 @@ def _queue_context(
     }
     lanes = load_frozen_lanes(
         Path(args.protected_dir),
-        campaign_id=_campaign(args),
+        campaign_id=_campaign_001f_only(args),
         sampling=sampling,
         source_packet_digest=args.source_packet_digest,
         reviewers=reviewers,
@@ -428,7 +462,7 @@ def cmd_queue_case(args: argparse.Namespace) -> int:
     require_queued_sample(
         Path(args.queue_dir),
         args.sample_id,
-        campaign_id=_campaign(args),
+        campaign_id=_campaign_001f_only(args),
         sampling_manifest_digest=sampling.manifest_digest(),
         source_packet_digest=args.source_packet_digest,
     )
@@ -468,7 +502,7 @@ def cmd_queue_initial(args: argparse.Namespace) -> int:
     entry = require_queued_sample(
         Path(args.queue_dir),
         args.sample_id,
-        campaign_id=_campaign(args),
+        campaign_id=_campaign_001f_only(args),
         sampling_manifest_digest=sampling.manifest_digest(),
         source_packet_digest=args.source_packet_digest,
     )
@@ -499,7 +533,7 @@ def cmd_queue_reveal(args: argparse.Namespace) -> int:
     require_queued_sample(
         Path(args.queue_dir),
         args.sample_id,
-        campaign_id=_campaign(args),
+        campaign_id=_campaign_001f_only(args),
         sampling_manifest_digest=sampling.manifest_digest(),
         source_packet_digest=args.source_packet_digest,
     )
@@ -510,7 +544,7 @@ def cmd_queue_reveal(args: argparse.Namespace) -> int:
             slot: records_by_lane[slot][args.sample_id] for slot in REVIEWER_SLOTS
         },
         lane_digests=tuple(lane_digests[slot] for slot in REVIEWER_SLOTS),
-        campaign_id=_campaign(args),
+        campaign_id=_campaign_001f_only(args),
         sampling_manifest_digest=sampling.manifest_digest(),
         source_packet_digest=args.source_packet_digest,
     )
@@ -539,7 +573,7 @@ def cmd_queue_resolve(args: argparse.Namespace) -> int:
     require_queued_sample(
         Path(args.queue_dir),
         args.sample_id,
-        campaign_id=_campaign(args),
+        campaign_id=_campaign_001f_only(args),
         sampling_manifest_digest=sampling.manifest_digest(),
         source_packet_digest=args.source_packet_digest,
     )
@@ -553,7 +587,7 @@ def cmd_queue_resolve(args: argparse.Namespace) -> int:
             slot: records_by_lane[slot][args.sample_id] for slot in REVIEWER_SLOTS
         },
         lane_digests=tuple(lane_digests[slot] for slot in REVIEWER_SLOTS),
-        campaign_id=_campaign(args),
+        campaign_id=_campaign_001f_only(args),
         sampling_manifest_digest=sampling.manifest_digest(),
         source_packet_digest=args.source_packet_digest,
         note=args.note,
@@ -605,6 +639,7 @@ def _load_frame_rows(frame_path: str | None, sampling: SamplingManifest) -> dict
 
 
 def _load_lane_session(args: argparse.Namespace) -> tuple[LaneSession, SamplingManifest]:
+    _campaign_001k_lane(args)  # FIX2-217-7: direct model lanes are 001f-only
     sampling = SamplingManifest.model_validate(json.loads(Path(args.sampling_manifest).read_text()))
     session = LaneSession(Path(args.protected_dir), args.reviewer_slot)
     if session.source_packet_digest != args.source_packet_digest:
@@ -614,6 +649,7 @@ def _load_lane_session(args: argparse.Namespace) -> tuple[LaneSession, SamplingM
 
 def cmd_model_lane_init(args: argparse.Namespace) -> int:
     """Bind one lane to one frozen ReviewerIdentity (FIX-6, FIX-R3-3)."""
+    _campaign_001k_lane(args)  # FIX2-217-7: direct model lanes are 001f-only
     sampling = SamplingManifest.model_validate(json.loads(Path(args.sampling_manifest).read_text()))
     reviewer = ReviewerIdentity.model_validate(json.loads(Path(args.reviewer_identity).read_text()))
     LaneSession.init(
@@ -680,10 +716,13 @@ def cmd_sub_lane_init(args: argparse.Namespace) -> int:
 
     FIX-1: requires and freezes the exact user-visible selected model
     name/version and the operator reference BEFORE any output exists.
+    FIX2-217-7: the 001k stage barrier applies here too — a holdout-stage
+    authority cannot even initialize a lane before artifact freeze.
     """
     from evals.calibration.subscription_ui import subscription_reviewer_identity
 
     sampling = SamplingManifest.model_validate(json.loads(Path(args.sampling_manifest).read_text()))
+    _require_216_stage_barrier(args, sampling)
     reviewer = subscription_reviewer_identity(
         args.reviewer_slot,
         reviewer_config_digest=args.reviewer_config_digest,
@@ -692,7 +731,7 @@ def cmd_sub_lane_init(args: argparse.Namespace) -> int:
     session = init_subscription_lane(
         Path(args.protected_dir),
         reviewer=reviewer,
-        campaign_id=getattr(args, "campaign_id", None) or CAMPAIGN_ID,
+        campaign_id=_campaign(args),
         sampling=sampling,
         source_packet_digest=args.source_packet_digest,
         neutral_packet_path=Path(args.neutral_packet),
@@ -750,25 +789,42 @@ def _add_config_source_args(command: argparse.ArgumentParser) -> None:
 
 
 def cmd_216_freeze_target(args: argparse.Namespace) -> int:
-    """Phase 0: freeze the 001k target identity + floors for engram.assess.3."""
-    from evals.calibration.campaign_001k import CAMPAIGN_ID_001K, DIMENSIONS_001K
+    """Phase 0: freeze the 001k target identity + floors for engram.assess.3.
 
-    identity = TargetIdentity(
-        campaign_id=CAMPAIGN_ID_001K,
-        campaign_tooling_repo_sha=args.campaign_tooling_repo_sha,
-        assessment_schema_version="engram.assessment.v1",
-        assessment_code_version="assessment-engine-v1",
-        prompt_version="engram.assess.3",
-        provider_adapter="openai",
-        provider_model="deepseek-ai/DeepSeek-V4-Flash",
-        provider_config_digest=_resolve_provider_config_digest(args),
-        provider_params={"temperature": 0, "max_tokens": 1024, "input_limit": 16000},
-        assessment_policy_version="assessment-selection-v1",
-        calibration_artifact_schema_version="engram.calibration-profiles-v1",
-        calibration_dataset_version=DATASET_VERSION_001K,
-        label_guide_version="engram-calibration-guide-157-v1",
-        canonicalization_version="assessment-evidence-manifest-v1",
-        dimensions=DIMENSIONS_001K,
+    FIX2-217-4: this command is unambiguously 001k — the campaign identity
+    is the frozen constant, not a parameter. The constructed identity is
+    verified against the frozen #216 contract before anything is written,
+    and the campaign tooling SHA must be exactly 40-hex (it participates in
+    the verified run identity: fresh provider runs must record the same SHA).
+    """
+    import re as _re
+
+    from evals.calibration.campaign_001k import CAMPAIGN_ID_001K, DIMENSIONS_001K
+    from evals.calibration.campaign_001k_fit import verify_target_identity_001k
+
+    if not _re.fullmatch(r"[0-9a-f]{40}", args.campaign_tooling_repo_sha):
+        raise SystemExit(
+            "campaign tooling SHA must be the exact 40-hex committed revision "
+            "the freeze is executed from"
+        )
+    identity = verify_target_identity_001k(
+        TargetIdentity(
+            campaign_id=CAMPAIGN_ID_001K,
+            campaign_tooling_repo_sha=args.campaign_tooling_repo_sha,
+            assessment_schema_version="engram.assessment.v1",
+            assessment_code_version="assessment-engine-v1",
+            prompt_version="engram.assess.3",
+            provider_adapter="openai",
+            provider_model="deepseek-ai/DeepSeek-V4-Flash",
+            provider_config_digest=_resolve_provider_config_digest(args),
+            provider_params={"temperature": 0, "max_tokens": 1024, "input_limit": 16000},
+            assessment_policy_version="assessment-selection-v1",
+            calibration_artifact_schema_version="engram.calibration-profiles-v1",
+            calibration_dataset_version=DATASET_VERSION_001K,
+            label_guide_version="engram-calibration-guide-157-v1",
+            canonicalization_version="assessment-evidence-manifest-v1",
+            dimensions=DIMENSIONS_001K,
+        )
     )
     floors = EvidenceFloors(
         campaign_id=CAMPAIGN_ID_001K,
@@ -958,7 +1014,7 @@ def _run_sub_prepare(args: argparse.Namespace) -> int:
     _require_216_stage_barrier(args, sampling)
     result = subscription_ui.prepare_subscription_campaign(
         Path(args.protected_dir),
-        campaign_id=getattr(args, "campaign_id", None) or CAMPAIGN_ID,
+        campaign_id=_campaign(args),
         sampling=sampling,
         source_packet_digest=args.source_packet_digest,
         neutral_packet_path=Path(args.neutral_packet),
@@ -1041,11 +1097,6 @@ def main() -> int:
     )
     _add_config_source_args(command)
     command.add_argument("--output", type=Path, required=True)
-    command.add_argument(
-        "--campaign-id",
-        default=None,
-        help="explicit campaign selection (default 001f; #216 uses 001k)",
-    )
     command.set_defaults(func=cmd_216_freeze_target)
 
     command = sub.add_parser(
