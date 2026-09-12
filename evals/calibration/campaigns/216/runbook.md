@@ -1,7 +1,7 @@
 # ENG-CALIBRATION-001K (#216) operator runbook — FIX3 pre-review stage
 
-Status: AWAITING MAINTAINER RE-REVIEW.  Do not paste reviewer prompts, import
-reviewer responses, execute HOLDOUT, fit external labels, merge PR #217, or
+Status: Stage-A DEV reviewer execution authorized. No reviewer response has
+been imported. Do not execute HOLDOUT, fit external labels, merge PR #217, or
 close #216.
 
 ## FIX3 execution identities
@@ -146,3 +146,13 @@ rather than self-referentially inside this commit.
   no provider/reviewer/evaluation execution. Serving invariants unchanged.
 
 STOP: reviewer batches remain unexecuted; no consensus, Phase-5 fit, candidate freeze, HOLDOUT unlock, or HOLDOUT evaluation occurred.
+
+## Deferred pre-Phase-5 proof
+
+`DEFERRED_PRE_PHASE5_REAL_LEDGER_PROOF`: the earlier real-shaped synthetic-label
+experiment did not prove a fitting-path defect. Its helper-manufactured frame
+digest differed from the authoritative campaign frame digest. After genuine DEV
+reviewer responses and human adjudication create the real
+`VerifiedConsensusLedger`, verify the authoritative frame, genuine ledger, and
+sealed provider evidence integration before any real Phase-5 candidate
+fit/freeze. HOLDOUT remains inaccessible until that later gate passes.
