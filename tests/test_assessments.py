@@ -257,7 +257,14 @@ async def test_human_review_during_provider_call_makes_result_stale(assessment_s
                         "finish_reason": "stop",
                         "message": {
                             "role": "assistant",
-                            "content": json.dumps({"retention_value": 0.9}),
+                            "content": json.dumps(
+                                {
+                                    "suggested_kind": None,
+                                    "taxonomy_value": None,
+                                    "retention_value": 0.9,
+                                    "retention_disposition": "retain",
+                                }
+                            ),
                         },
                     }
                 ],
@@ -459,14 +466,18 @@ async def test_dead_request_recovery_can_be_completed_by_another_reviewer(
         assert (await client.get(status_url)).json()["job_status"] == "dead"
         async with owner.connect() as conn:
             failed_before = (
-                await conn.execute(
-                    text(
-                        "SELECT id,attempt,state,receipt FROM memory_assessments "
-                        "WHERE request_id=:r"
-                    ),
-                    {"r": request_id},
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT id,attempt,state,receipt FROM memory_assessments "
+                            "WHERE request_id=:r"
+                        ),
+                        {"r": request_id},
+                    )
                 )
-            ).mappings().all()
+                .mappings()
+                .all()
+            )
             original_request_principal = await conn.scalar(
                 text("SELECT principal_id FROM assessment_requests WHERE id=:r"),
                 {"r": request_id},
@@ -483,9 +494,7 @@ async def test_dead_request_recovery_can_be_completed_by_another_reviewer(
         duplicate = await client.post(f"/v1/items/{item_id}/reassess", json={})
         assert duplicate.status_code == 200, duplicate.text
         assert duplicate.json()["request_id"] == request_id
-        retried = await client.post(
-            status_url + "/retry", json={"reason": "provider_recovery"}
-        )
+        retried = await client.post(status_url + "/retry", json={"reason": "provider_recovery"})
         assert retried.status_code == 200, retried.text
         await run_job(assessment_stack)
 
@@ -496,23 +505,31 @@ async def test_dead_request_recovery_can_be_completed_by_another_reviewer(
             )
             assert request_row.scalar_one() == original_request_principal == principal_a
             attempts = (
-                await conn.execute(
-                    text(
-                        "SELECT id,attempt,state,receipt FROM memory_assessments "
-                        "WHERE request_id=:r ORDER BY attempt"
-                    ),
-                    {"r": request_id},
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT id,attempt,state,receipt FROM memory_assessments "
+                            "WHERE request_id=:r ORDER BY attempt"
+                        ),
+                        {"r": request_id},
+                    )
                 )
-            ).mappings().all()
+                .mappings()
+                .all()
+            )
             retry_event = (
-                await conn.execute(
-                    text(
-                        "SELECT actor_principal_id,reason,new_value FROM item_events "
-                        "WHERE item_id=:i AND field_name='assessment_retry'"
-                    ),
-                    {"i": item_id},
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT actor_principal_id,reason,new_value FROM item_events "
+                            "WHERE item_id=:i AND field_name='assessment_retry'"
+                        ),
+                        {"i": item_id},
+                    )
                 )
-            ).mappings().one()
+                .mappings()
+                .one()
+            )
 
         assert len(attempts) == 2
         assert attempts[0]["state"] == "failed"
@@ -913,9 +930,7 @@ async def test_batch_reassessment_returns_controlled_error_for_invalid_evidence(
         raise ValueError("assessment evidence exceeds 64 extraction links")
 
     monkeypatch.setattr(assessment_routes, "request_assessment", invalid_request)
-    response = await client.post(
-        "/v1/assessments/reassess", json={"limit": 1}
-    )
+    response = await client.post("/v1/assessments/reassess", json={"limit": 1})
     assert response.status_code == 422
     assert response.json()["detail"] == "assessment evidence exceeds 64 extraction links"
 
@@ -1035,7 +1050,14 @@ async def test_calibration_uses_verified_snapshot_during_provider_call(
                         "finish_reason": "stop",
                         "message": {
                             "role": "assistant",
-                            "content": json.dumps({"retention_value": 0.9}),
+                            "content": json.dumps(
+                                {
+                                    "suggested_kind": None,
+                                    "taxonomy_value": None,
+                                    "retention_value": 0.9,
+                                    "retention_disposition": "retain",
+                                }
+                            ),
                         },
                     }
                 ],
@@ -1114,7 +1136,14 @@ async def test_changed_content_or_evidence_cannot_bind(assessment_stack, monkeyp
                         "finish_reason": "stop",
                         "message": {
                             "role": "assistant",
-                            "content": json.dumps({"retention_value": 0.9}),
+                            "content": json.dumps(
+                                {
+                                    "suggested_kind": None,
+                                    "taxonomy_value": None,
+                                    "retention_value": 0.9,
+                                    "retention_disposition": "retain",
+                                }
+                            ),
                         },
                     }
                 ],
