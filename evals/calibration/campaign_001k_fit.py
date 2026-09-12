@@ -32,13 +32,14 @@ from typing import Any, Literal
 
 from pydantic import model_validator
 
+from engram.assessment_schema import AssessmentContract
 from evals.admission.schema import Record
 from evals.calibration.campaign_001k import (
     DIMENSIONS_001K,
     REPLAY3_SHA256,
     ReusedLabelSet,
 )
-from evals.calibration.fit import LabeledObservation
+from evals.calibration.fit import LabeledObservation, fit_profiles
 from evals.calibration.freeze import FrameRow, SamplingManifest, SplitManifest, TargetIdentity
 
 # ---------------------------------------------------------------------------
@@ -114,12 +115,14 @@ def verify_target_identity_001k(identity: TargetIdentity) -> TargetIdentity:
 #: Runs whose outputs may back fitting, by allowed campaign stage.
 FITTING_RUN_KINDS: tuple[str, ...] = (
     "issue-214-protected-200-case-replay-assess3",  # reused-200 dev only
-    "issue-216-fresh-202-assess3",  # fresh stages (dev/holdout split upstream)
+    "issue-216-dev-102-assess3",  # exact fresh DEV stage
+    "issue-216-holdout-100-assess3",  # exact fresh HOLDOUT stage
 )
 
 _RUN_KIND_TO_STAGE: dict[str, Literal["dev", "holdout"]] = {
     "issue-214-protected-200-case-replay-assess3": "dev",
-    "issue-216-fresh-202-assess3": "dev",  # split applied at the stage boundary
+    "issue-216-dev-102-assess3": "dev",
+    "issue-216-holdout-100-assess3": "holdout",
 }
 
 _CASE_STATUSES: tuple[str, ...] = ("ok", "error", "abstained")
@@ -211,6 +214,7 @@ class ProviderEvidence216(Record):
     artifact_sha256: str
     case_count: int
     cases: tuple[ProviderCase216, ...]
+    _evidence_capability: Any = None
 
     @model_validator(mode="after")
     def run_identity_shape(self) -> ProviderEvidence216:
@@ -248,7 +252,13 @@ class ProviderEvidence216(Record):
         *,
         artifact_sha256: str,
     ) -> ProviderEvidence216:
-        """Parse case records FIRST (each validated), then build the record."""
+        """Parse untrusted payload bytes into an UNSEALED record.
+
+        This deliberately does not grant access to provider values.  The
+        caller-provided digest is retained as parsed metadata only; it is not
+        evidence that any bytes were checked.  Only ``load_verified`` may
+        attach the private verification capability.
+        """
         raw_cases = payload.get("cases")
         if not isinstance(raw_cases, list) or not raw_cases:
             raise ValueError("provider_evidence_cases_missing")
@@ -290,7 +300,27 @@ class ProviderEvidence216(Record):
         actual = hashlib.sha256(payload_bytes).hexdigest()
         if not hmac.compare_digest(actual, expected_sha256):
             raise ValueError("provider_evidence_artifact_digest_mismatch")
-        return cls.from_payload(json.loads(payload_bytes), artifact_sha256=expected_sha256)
+        evidence = cls.from_payload(json.loads(payload_bytes), artifact_sha256=actual)
+        object.__setattr__(
+            evidence,
+            "_evidence_capability",
+            _EvidenceCapability(evidence._binding_digest()),
+        )
+        return evidence
+
+    def _binding_digest(self) -> str:
+        """Bind the complete parsed state, not a caller-supplied digest claim."""
+        payload = self.model_dump(mode="json")
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    def _require_capability(self) -> None:
+        cap = getattr(self, "_evidence_capability", None)
+        if not isinstance(cap, _EvidenceCapability) or not hmac.compare_digest(
+            cap.payload_digest, self._binding_digest()
+        ):
+            raise ValueError("provider_evidence_capability_invalid")
 
     # -- verified accessors ----------------------------------------------------
 
@@ -335,6 +365,7 @@ class ProviderEvidence216(Record):
         *,
         target_identity: TargetIdentity,
         expected_population: frozenset[str],
+        expected_stage: Literal["dev", "holdout"],
     ) -> dict[str, dict[str, Any]]:
         """Verified values for a FRESH 001k provider run (FIX2-217-1).
 
@@ -349,6 +380,9 @@ class ProviderEvidence216(Record):
         - population proof is EXACT equality over all case IDs (successful
           plus errors/abstentions) — never a subset of successful IDs.
         """
+        self._require_capability()
+        if _RUN_KIND_TO_STAGE.get(self.run_kind) != expected_stage:
+            raise ValueError("provider_evidence_stage_mismatch")
         verify_target_identity_001k(target_identity)
         self._require_identity(
             prompt=target_identity.prompt_version,
@@ -371,6 +405,9 @@ class ProviderEvidence216(Record):
         if not hmac.compare_digest(self.code_git_head, target_identity.campaign_tooling_repo_sha):
             raise ValueError("provider_evidence_execution_identity_mismatch")
         self._prove_population(expected_population)
+        expected_count = 102 if expected_stage == "dev" else 100
+        if self.case_count != expected_count:
+            raise ValueError("provider_evidence_stage_case_count_mismatch")
         return self._values_by_sample()
 
     def reused_provider_values(
@@ -387,6 +424,7 @@ class ProviderEvidence216(Record):
         lacks a provider-config digest; that absence is handled HERE, in the
         explicit reviewed contract — never by silently skipping verification.
         """
+        self._require_capability()
         auth = REPLAY3_HISTORICAL_AUTHORITY
         if not hmac.compare_digest(self.artifact_sha256, auth["artifact_sha256"]):
             raise ValueError("replay3_authority_artifact_mismatch")
@@ -575,6 +613,78 @@ def expected_membership_digest_of(membership: frozenset[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Phase 5 DEV fitting authority
+# ---------------------------------------------------------------------------
+
+
+class _DevFitCapability:
+    __slots__ = ("binding_digest",)
+
+    def __init__(self, binding_digest: str) -> None:
+        self.binding_digest = binding_digest
+
+
+class DevFitAuthority216:
+    """Opaque result of canonical pre-holdout DEV fitting."""
+
+    __slots__ = (
+        "target_identity_digest",
+        "split_digest",
+        "dev_membership_digest",
+        "dev_fitting_evidence_digest",
+        "fitting_inputs_digest",
+        "holdout_membership_digest",
+        "candidate_bytes",
+        "_capability",
+    )
+
+    def __init__(
+        self,
+        *,
+        target_identity_digest: str,
+        split_digest: str,
+        dev_membership_digest: str,
+        dev_fitting_evidence_digest: str,
+        fitting_inputs_digest: str,
+        holdout_membership_digest: str,
+        candidate_bytes: bytes,
+        capability: _DevFitCapability | None = None,
+    ) -> None:
+        self.target_identity_digest = target_identity_digest
+        self.split_digest = split_digest
+        self.dev_membership_digest = dev_membership_digest
+        self.dev_fitting_evidence_digest = dev_fitting_evidence_digest
+        self.fitting_inputs_digest = fitting_inputs_digest
+        self.holdout_membership_digest = holdout_membership_digest
+        self.candidate_bytes = candidate_bytes
+        self._capability = capability
+
+    def _binding_digest(self) -> str:
+        payload = {
+            "target_identity_digest": self.target_identity_digest,
+            "split_digest": self.split_digest,
+            "dev_membership_digest": self.dev_membership_digest,
+            "dev_fitting_evidence_digest": self.dev_fitting_evidence_digest,
+            "fitting_inputs_digest": self.fitting_inputs_digest,
+            "holdout_membership_digest": self.holdout_membership_digest,
+            "candidate_sha256": hashlib.sha256(self.candidate_bytes).hexdigest(),
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _require_capability(self) -> None:
+        if not isinstance(self._capability, _DevFitCapability) or not hmac.compare_digest(
+            self._capability.binding_digest, self._binding_digest()
+        ):
+            raise ValueError("dev_fit_authority_capability_invalid")
+
+    def unlock_holdout(self, protected_root: Path) -> Path:
+        from evals.calibration.campaign_001k_holdout_barrier import unlock_holdout
+
+        return unlock_holdout(protected_root=protected_root, authority=self)
+
+
+# ---------------------------------------------------------------------------
 # Observation construction (the ONLY fitting/evaluation boundary)
 # ---------------------------------------------------------------------------
 
@@ -731,9 +841,8 @@ def dev_fit_observations(
     expected = frozenset(reuse.forced_dev_fresh_ids) | frozenset(reuse.dev_fresh_ids)
     provider_values = provider_evidence.stage_provider_values(
         target_identity=target_identity,
-        expected_population=frozenset(reuse.forced_dev_fresh_ids)
-        | frozenset(reuse.dev_fresh_ids)
-        | frozenset(reuse.holdout_ids),
+        expected_population=expected,
+        expected_stage="dev",
     )
     return _fresh_stage_observations(
         label_authority=fresh_label_authority,
@@ -746,6 +855,133 @@ def dev_fit_observations(
         dimensions=dimensions,
         require_complete=require_complete,
     )
+
+
+def fit_canonical_dev_authority(
+    *,
+    protected_root: Path,
+    fresh_label_authority: FreshLabelAuthority216,
+    provider_evidence: ProviderEvidence216,
+    reused_labels: ReusedLabelSet,
+    replay_evidence: ProviderEvidence216,
+    frame_by_id: dict[str, FrameRow],
+    contract: AssessmentContract,
+) -> DevFitAuthority216:
+    """Issue a sealed candidate from canonical DEV-102 fitting inputs only.
+
+    Target, split, reuse manifest and DEV sampling authority are loaded from
+    ``protected_root``.  A caller-created ``TargetIdentity`` never crosses
+    this execution boundary; HOLDOUT provider or label material is not an
+    input to this operation.
+    """
+    from evals.calibration import campaign_001k as c216
+    from evals.calibration.campaign_001k_stage_authority import verify_stage_authority
+
+    identity = c216.load_001k_target_identity(protected_root)
+    reuse = c216.ReuseManifest.model_validate(
+        json.loads((protected_root / "reuse-manifest.json").read_text())
+    )
+    split = SplitManifest.model_validate(
+        json.loads((protected_root / "split-manifest-001k.json").read_text())
+    )
+    sampling = SamplingManifest.model_validate(
+        json.loads((protected_root / "dev-sampling-manifest.json").read_text())
+    )
+    stage = verify_stage_authority(
+        protected_root=protected_root,
+        sampling=sampling,
+        source_packet_digest=fresh_label_authority.source_packet_digest,
+    )
+    stage.require_capability()
+    fresh_label_authority._require_capability()
+    if fresh_label_authority.stage != "dev" or not hmac.compare_digest(
+        fresh_label_authority.expected_membership_digest, stage.membership_digest
+    ):
+        raise ValueError("dev_fit_authority_label_stage_mismatch")
+    canonical_reused_path = protected_root / "reused-labels-001k.json"
+    if not canonical_reused_path.is_file():
+        raise ValueError("dev_fit_authority_reused_labels_missing")
+    canonical_reused = ReusedLabelSet.model_validate(json.loads(canonical_reused_path.read_text()))
+    if not hmac.compare_digest(canonical_reused.set_digest(), reused_labels.set_digest()):
+        raise ValueError("dev_fit_authority_reused_labels_mismatch")
+    reused_observations = observations_from_reused(
+        reused=canonical_reused,
+        replay_evidence=replay_evidence,
+        expected_population=frozenset(label.sample_id for label in canonical_reused.labels),
+        split=split,
+        frame_by_id=frame_by_id,
+    )
+    if len({row.sample_id for row in reused_observations}) != 200:
+        raise ValueError("dev_fit_authority_reused_count_mismatch")
+    observations = reused_observations + dev_fit_observations(
+        fresh_label_authority=fresh_label_authority,
+        provider_evidence=provider_evidence,
+        target_identity=identity,
+        split=split,
+        frame_by_id=frame_by_id,
+        reuse=reuse,
+    )
+    if len({row.sample_id for row in observations}) != 302:
+        raise ValueError("dev_fit_authority_dev_population_mismatch")
+    profiles = fit_profiles(observations, identity=identity, contract=contract, split=split)
+    inputs = {
+        "target": identity.identity_digest(),
+        "split": split.split_digest(),
+        "reuse": reuse.manifest_digest(),
+        "reused_labels": canonical_reused.set_digest(),
+        "replay": replay_evidence._binding_digest(),
+        "fresh_labels": fresh_label_authority._binding_digest(),
+        "provider": provider_evidence._binding_digest(),
+        "frame": {sid: row.model_dump(mode="json") for sid, row in sorted(frame_by_id.items())},
+        "contract": contract.model_dump(mode="json"),
+    }
+    inputs_digest = hashlib.sha256(
+        json.dumps(inputs, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    reused_membership = frozenset(label.sample_id for label in canonical_reused.labels)
+    all_dev_membership = (
+        reused_membership | frozenset(reuse.forced_dev_fresh_ids) | frozenset(reuse.dev_fresh_ids)
+    )
+    if len(all_dev_membership) != 302:
+        raise ValueError("dev_fit_authority_dev_membership_count_mismatch")
+    dev_evidence_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "reused_labels": canonical_reused.set_digest(),
+                "replay": replay_evidence._binding_digest(),
+                "fresh_labels": fresh_label_authority._binding_digest(),
+                "fresh_provider": provider_evidence._binding_digest(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    candidate_bytes = json.dumps(
+        {
+            "candidate_schema": "engram-calibration-pre-holdout-candidate-216-v1",
+            "target_identity_digest": identity.identity_digest(),
+            "split_digest": split.split_digest(),
+            "dev_fresh_count": 102,
+            "reused_count": 200,
+            "dev_total": 302,
+            "fitting_methodology": "deterministic-exact-stratum-reliability-bins-v1",
+            "fitting_inputs_digest": inputs_digest,
+            "profiles": [profile.model_dump(mode="json") for profile in profiles],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    authority = DevFitAuthority216(
+        target_identity_digest=identity.identity_digest(),
+        split_digest=split.split_digest(),
+        dev_membership_digest=expected_membership_digest_of(all_dev_membership),
+        dev_fitting_evidence_digest=dev_evidence_digest,
+        fitting_inputs_digest=inputs_digest,
+        holdout_membership_digest=expected_membership_digest_of(frozenset(reuse.holdout_ids)),
+        candidate_bytes=candidate_bytes,
+    )
+    authority._capability = _DevFitCapability(authority._binding_digest())
+    return authority
 
 
 def holdout_evaluate_observations(
@@ -769,9 +1005,8 @@ def holdout_evaluate_observations(
     expected = frozenset(reuse.holdout_ids)
     provider_values = provider_evidence.stage_provider_values(
         target_identity=target_identity,
-        expected_population=frozenset(reuse.forced_dev_fresh_ids)
-        | frozenset(reuse.dev_fresh_ids)
-        | frozenset(reuse.holdout_ids),
+        expected_population=expected,
+        expected_stage="holdout",
     )
     return _fresh_stage_observations(
         label_authority=fresh_label_authority,

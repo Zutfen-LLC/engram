@@ -312,11 +312,13 @@ def cmd_model_packet(args: argparse.Namespace) -> int:
 def cmd_freeze_model_lane(args: argparse.Namespace) -> int:
     """Freeze one completed reviewer lane after exact membership is proven."""
     sampling = SamplingManifest.model_validate(json.loads(Path(args.sampling_manifest).read_text()))
+    campaign_id = _campaign(args)
+    _require_216_stage_barrier(args, sampling, source_packet_digest=args.source_packet_digest)
     reviewer = ReviewerIdentity.model_validate(json.loads(Path(args.reviewer_identity).read_text()))
     lane = freeze_lane(
         protected_root=Path(args.protected_dir),
         reviewer=reviewer,
-        campaign_id=_campaign_001f_only(args),
+        campaign_id=campaign_id,
         sampling=sampling,
         source_packet_digest=args.source_packet_digest,
     )
@@ -333,13 +335,15 @@ def cmd_model_report(args: argparse.Namespace) -> int:
     uses. The global-HMAC fallback is unreachable from campaign commands.
     """
     sampling = SamplingManifest.model_validate(json.loads(Path(args.sampling_manifest).read_text()))
+    campaign_id = _campaign(args)
+    _require_216_stage_barrier(args, sampling, source_packet_digest=args.source_packet_digest)
     reviewers = {
         slot: ReviewerIdentity.model_validate(json.loads(path.read_text()))
         for slot, path in zip(REVIEWER_SLOTS, args.reviewer_identities, strict=True)
     }
     lanes = load_frozen_lanes(
         Path(args.protected_dir),
-        campaign_id=_campaign_001f_only(args),
+        campaign_id=campaign_id,
         sampling=sampling,
         source_packet_digest=args.source_packet_digest,
         reviewers=reviewers,
@@ -347,7 +351,7 @@ def cmd_model_report(args: argparse.Namespace) -> int:
     records_by_lane = records_by_lane_from_files(Path(args.protected_dir))
     frame_rows = _load_frame_rows(args.frame, sampling)
     report = build_correlation_report(
-        campaign_id=_campaign_001f_only(args),
+        campaign_id=campaign_id,
         lanes=lanes,
         records_by_lane=records_by_lane,
         sampling=sampling,
@@ -380,13 +384,15 @@ def cmd_human_queue(args: argparse.Namespace) -> int:
     marginal-coverage algorithm, identical to ``model-report``.
     """
     sampling = SamplingManifest.model_validate(json.loads(Path(args.sampling_manifest).read_text()))
+    campaign_id = _campaign(args)
+    _require_216_stage_barrier(args, sampling, source_packet_digest=args.source_packet_digest)
     reviewers = {
         slot: ReviewerIdentity.model_validate(json.loads(path.read_text()))
         for slot, path in zip(REVIEWER_SLOTS, args.reviewer_identities, strict=True)
     }
     load_frozen_lanes(
         Path(args.protected_dir),
-        campaign_id=_campaign_001f_only(args),
+        campaign_id=campaign_id,
         sampling=sampling,
         source_packet_digest=args.source_packet_digest,
         reviewers=reviewers,
@@ -394,7 +400,7 @@ def cmd_human_queue(args: argparse.Namespace) -> int:
     records_by_lane = records_by_lane_from_files(Path(args.protected_dir))
     frame_rows = _load_frame_rows(args.frame, sampling)
     queue = build_queue(
-        campaign_id=_campaign_001f_only(args),
+        campaign_id=campaign_id,
         sampling=sampling,
         source_packet_digest=args.source_packet_digest,
         records_by_lane=records_by_lane,
@@ -414,13 +420,15 @@ def _queue_context(
 ]:
     """Shared loader for the queue-operate commands (FIX-R3-9)."""
     sampling = SamplingManifest.model_validate(json.loads(Path(args.sampling_manifest).read_text()))
+    campaign_id = _campaign(args)
+    _require_216_stage_barrier(args, sampling, source_packet_digest=args.source_packet_digest)
     reviewers = {
         slot: ReviewerIdentity.model_validate(json.loads(path.read_text()))
         for slot, path in zip(REVIEWER_SLOTS, args.reviewer_identities, strict=True)
     }
     lanes = load_frozen_lanes(
         Path(args.protected_dir),
-        campaign_id=_campaign_001f_only(args),
+        campaign_id=campaign_id,
         sampling=sampling,
         source_packet_digest=args.source_packet_digest,
         reviewers=reviewers,
@@ -462,7 +470,7 @@ def cmd_queue_case(args: argparse.Namespace) -> int:
     require_queued_sample(
         Path(args.queue_dir),
         args.sample_id,
-        campaign_id=_campaign_001f_only(args),
+        campaign_id=_campaign(args),
         sampling_manifest_digest=sampling.manifest_digest(),
         source_packet_digest=args.source_packet_digest,
     )
@@ -502,7 +510,7 @@ def cmd_queue_initial(args: argparse.Namespace) -> int:
     entry = require_queued_sample(
         Path(args.queue_dir),
         args.sample_id,
-        campaign_id=_campaign_001f_only(args),
+        campaign_id=_campaign(args),
         sampling_manifest_digest=sampling.manifest_digest(),
         source_packet_digest=args.source_packet_digest,
     )
@@ -533,7 +541,7 @@ def cmd_queue_reveal(args: argparse.Namespace) -> int:
     require_queued_sample(
         Path(args.queue_dir),
         args.sample_id,
-        campaign_id=_campaign_001f_only(args),
+        campaign_id=_campaign(args),
         sampling_manifest_digest=sampling.manifest_digest(),
         source_packet_digest=args.source_packet_digest,
     )
@@ -544,7 +552,7 @@ def cmd_queue_reveal(args: argparse.Namespace) -> int:
             slot: records_by_lane[slot][args.sample_id] for slot in REVIEWER_SLOTS
         },
         lane_digests=tuple(lane_digests[slot] for slot in REVIEWER_SLOTS),
-        campaign_id=_campaign_001f_only(args),
+        campaign_id=_campaign(args),
         sampling_manifest_digest=sampling.manifest_digest(),
         source_packet_digest=args.source_packet_digest,
     )
@@ -573,7 +581,7 @@ def cmd_queue_resolve(args: argparse.Namespace) -> int:
     require_queued_sample(
         Path(args.queue_dir),
         args.sample_id,
-        campaign_id=_campaign_001f_only(args),
+        campaign_id=_campaign(args),
         sampling_manifest_digest=sampling.manifest_digest(),
         source_packet_digest=args.source_packet_digest,
     )
@@ -587,7 +595,7 @@ def cmd_queue_resolve(args: argparse.Namespace) -> int:
             slot: records_by_lane[slot][args.sample_id] for slot in REVIEWER_SLOTS
         },
         lane_digests=tuple(lane_digests[slot] for slot in REVIEWER_SLOTS),
-        campaign_id=_campaign_001f_only(args),
+        campaign_id=_campaign(args),
         sampling_manifest_digest=sampling.manifest_digest(),
         source_packet_digest=args.source_packet_digest,
         note=args.note,
@@ -722,7 +730,7 @@ def cmd_sub_lane_init(args: argparse.Namespace) -> int:
     from evals.calibration.subscription_ui import subscription_reviewer_identity
 
     sampling = SamplingManifest.model_validate(json.loads(Path(args.sampling_manifest).read_text()))
-    _require_216_stage_barrier(args, sampling)
+    _require_216_stage_barrier(args, sampling, source_packet_digest=args.source_packet_digest)
     reviewer = subscription_reviewer_identity(
         args.reviewer_slot,
         reviewer_config_digest=args.reviewer_config_digest,
@@ -979,29 +987,40 @@ def cmd_216_fresh_packet(args: argparse.Namespace) -> int:
     return 0
 
 
-def _require_216_stage_barrier(args: argparse.Namespace, sampling: SamplingManifest) -> None:
-    """FIX-217-6: no ordinary command sequence may expose the 100 holdout
-    cases before artifact freeze.
+def _require_216_stage_barrier(
+    args: argparse.Namespace,
+    sampling: SamplingManifest,
+    *,
+    source_packet_digest: str | None = None,
+) -> None:
+    """Require the canonical 001k stage capability at every stage boundary.
 
-    For campaign 001k, a reviewer sampling authority whose seed is the
-    holdout stage (``216-holdout-v1``) is exportable/showable/importable
-    ONLY when the mechanical holdout barrier is unlocked (exact frozen
-    artifact digest + DEV-fitting evidence digest). The DEV stage authority
-    (``216-dev-v1``) is always allowed; the legacy 001f path is untouched.
+    ``sampling_seed`` is metadata only.  The stage is mechanically derived
+    from immutable target/reuse/split/stage-manifest authority and exact
+    membership; a forged DEV seed cannot authorize holdout IDs.
     """
     if _campaign(args) != "eng-calibration-001k":
         return
     from evals.calibration import campaign_001k_holdout_barrier as barrier
+    from evals.calibration.campaign_001k_stage_authority import verify_stage_authority
 
-    if sampling.sampling_seed == "216-holdout-v1":
+    authority = verify_stage_authority(
+        protected_root=Path(args.protected_dir),
+        sampling=sampling,
+    )
+    authority.require_capability()
+    if authority.stage == "holdout":
         barrier.require_holdout_export_allowed(
             campaign_id="eng-calibration-001k",
-            frozen_artifact_digest=None,
-            dev_fitting_evidence_digest=None,
             protected_root=Path(args.protected_dir),
         )
-    elif sampling.sampling_seed != "216-dev-v1":
-        raise SystemExit(f"subscription_001k_requires_stage_authority:{sampling.sampling_seed}")
+    if source_packet_digest is not None:
+        verified_source = verify_stage_authority(
+            protected_root=Path(args.protected_dir),
+            sampling=sampling,
+            source_packet_digest=source_packet_digest,
+        )
+        verified_source.require_capability()
 
 
 def _run_sub_prepare(args: argparse.Namespace) -> int:
@@ -1011,7 +1030,7 @@ def _run_sub_prepare(args: argparse.Namespace) -> int:
     from evals.calibration import subscription_ui
 
     sampling = SamplingManifest.model_validate(json.loads(Path(args.sampling_manifest).read_text()))
-    _require_216_stage_barrier(args, sampling)
+    _require_216_stage_barrier(args, sampling, source_packet_digest=args.source_packet_digest)
     result = subscription_ui.prepare_subscription_campaign(
         Path(args.protected_dir),
         campaign_id=_campaign(args),
@@ -1042,7 +1061,7 @@ def cmd_sub_batch_show(args: argparse.Namespace) -> int:
     from evals.calibration import subscription_ui
 
     sampling = SamplingManifest.model_validate(json.loads(Path(args.sampling_manifest).read_text()))
-    _require_216_stage_barrier(args, sampling)
+    _require_216_stage_barrier(args, sampling, source_packet_digest=args.source_packet_digest)
     subscription_ui.verify_review_batches(
         Path(args.protected_dir), sampling=sampling, source_packet_digest=args.source_packet_digest
     )
@@ -1064,7 +1083,7 @@ def cmd_sub_import(args: argparse.Namespace) -> int:
     from evals.calibration import subscription_ui
 
     sampling = SamplingManifest.model_validate(json.loads(Path(args.sampling_manifest).read_text()))
-    _require_216_stage_barrier(args, sampling)
+    _require_216_stage_barrier(args, sampling, source_packet_digest=args.source_packet_digest)
     raw_response = Path(args.raw_response).read_text()
     result = subscription_ui.import_batch_response(
         Path(args.protected_dir),

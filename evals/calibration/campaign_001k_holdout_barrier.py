@@ -39,12 +39,13 @@ import re
 from pathlib import Path
 from typing import Any
 
-from evals.calibration.freeze import TargetIdentity
+from evals.calibration.campaign_001k_fit import DevFitAuthority216
 
 #: The ONLY campaign this barrier governs.
 _BARRIER_CAMPAIGN = "eng-calibration-001k"
 _FREEZE_FILENAME = "dev-artifact-freeze-001k.json"
 _UNLOCK_FILENAME = "holdout-unlock-001k.json"
+_CANDIDATE_FILENAME = "candidate-calibration-001k.json"
 _DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 #: Frozen fitting methodology identity for the 001k campaign (reused from
@@ -77,7 +78,10 @@ def _load_json(path: Path) -> dict[str, Any] | None:
     return record
 
 
-def _valid_freeze(record: dict[str, Any]) -> bool:
+def _valid_freeze(record: dict[str, Any], protected_root: Path) -> bool:
+    candidate_path = protected_root / _CANDIDATE_FILENAME
+    if not candidate_path.is_file():
+        return False
     return (
         record.get("freeze_schema") == "engram-calibration-dev-artifact-freeze-001k-v1"
         and record.get("campaign_id") == _BARRIER_CAMPAIGN
@@ -86,46 +90,44 @@ def _valid_freeze(record: dict[str, Any]) -> bool:
         and _well_formed(record.get("dev_membership_digest"))
         and _well_formed(record.get("dev_fitting_evidence_digest"))
         and _well_formed(record.get("frozen_artifact_digest"))
+        and hmac.compare_digest(_sha256_file(candidate_path), str(record["frozen_artifact_digest"]))
         and record.get("fitting_methodology") == FITTING_METHODOLOGY
         and _well_formed(record.get("frozen_fitting_inputs_digest"))
         and _well_formed(record.get("holdout_membership_digest"))
     )
 
 
-def record_dev_artifact_freeze(
-    *,
-    protected_root: Path,
-    target_identity: TargetIdentity,
-    split_digest: str,
-    dev_membership_digest: str,
-    dev_fitting_evidence_digest: str,
-    candidate_artifact_path: Path,
-    frozen_fitting_inputs_digest: str,
-    holdout_membership_digest: str,
-) -> Path:
+def record_dev_artifact_freeze(*, protected_root: Path, authority: DevFitAuthority216) -> Path:
     """Write the canonical DEV artifact-freeze record (Phase 5 output).
 
-    Called only by the actual fitting/artifact-freeze operation. Binds
-    mechanically: campaign, the VERIFIED 001k target identity digest, split
-    digest, DEV membership/evidence digests, the exact candidate artifact
-    bytes digest (hashed from the real file), fitting methodology/version,
-    frozen fitting inputs, and the frozen holdout membership digest.
+    The authority is the only input.  It is issued by the canonical DEV fit
+    operation and carries actual candidate bytes; no caller-supplied digest
+    claim participates in a freeze or unlock.
     """
-    from evals.calibration.campaign_001k_fit import verify_target_identity_001k
-
-    verify_target_identity_001k(target_identity)
-    frozen_artifact_digest = _sha256_file(candidate_artifact_path)
+    if not isinstance(authority, DevFitAuthority216):
+        raise ValueError("dev_fit_authority_capability_invalid")
+    authority._require_capability()
+    candidate_path = protected_root / _CANDIDATE_FILENAME
+    authority_candidate_digest = hashlib.sha256(authority.candidate_bytes).hexdigest()
+    if candidate_path.exists():
+        if not hmac.compare_digest(_sha256_file(candidate_path), authority_candidate_digest):
+            raise ValueError("dev_artifact_candidate_conflict_not_deterministic")
+    else:
+        candidate_path.parent.mkdir(parents=True, exist_ok=True)
+        candidate_path.write_bytes(authority.candidate_bytes)
+        candidate_path.chmod(0o600)
+    frozen_artifact_digest = _sha256_file(candidate_path)
     payload = {
         "freeze_schema": "engram-calibration-dev-artifact-freeze-001k-v1",
         "campaign_id": _BARRIER_CAMPAIGN,
-        "target_identity_digest": target_identity.identity_digest(),
-        "split_digest": split_digest,
-        "dev_membership_digest": dev_membership_digest,
-        "dev_fitting_evidence_digest": dev_fitting_evidence_digest,
+        "target_identity_digest": authority.target_identity_digest,
+        "split_digest": authority.split_digest,
+        "dev_membership_digest": authority.dev_membership_digest,
+        "dev_fitting_evidence_digest": authority.dev_fitting_evidence_digest,
         "frozen_artifact_digest": frozen_artifact_digest,
         "fitting_methodology": FITTING_METHODOLOGY,
-        "frozen_fitting_inputs_digest": frozen_fitting_inputs_digest,
-        "holdout_membership_digest": holdout_membership_digest,
+        "frozen_fitting_inputs_digest": authority.fitting_inputs_digest,
+        "holdout_membership_digest": authority.holdout_membership_digest,
     }
     body = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode()
     path = _freeze_path(protected_root)
@@ -142,7 +144,7 @@ def record_dev_artifact_freeze(
 def load_verified_freeze(protected_root: Path) -> dict[str, Any]:
     """Load and fully validate the canonical DEV artifact-freeze record."""
     record = _load_json(_freeze_path(protected_root))
-    if record is None or not _valid_freeze(record):
+    if record is None or not _valid_freeze(record, protected_root):
         raise ValueError("holdout_locked_artifact_not_frozen")
     return record
 
@@ -170,15 +172,7 @@ def require_holdout_export_allowed(
         raise ValueError("holdout_locked_artifact_not_frozen")
 
 
-def unlock_holdout(
-    *,
-    protected_root: Path,
-    campaign_id: str,
-    holdout_split_digest: str,
-    holdout_membership_digest: str,
-    frozen_artifact_digest: str,
-    target_identity_digest: str,
-) -> Path:
+def unlock_holdout(*, protected_root: Path, authority: DevFitAuthority216) -> Path:
     """Write the protected unlock record (callable only at artifact freeze).
 
     FIX2-217-7: the unlock is created ONLY from the verified canonical DEV
@@ -186,18 +180,25 @@ def unlock_holdout(
     field-exactly, and the freeze record must itself be valid. There is no
     parameter path around the freeze record.
     """
-    if campaign_id != _BARRIER_CAMPAIGN:
-        raise ValueError(f"holdout_unlock_unknown_campaign:{campaign_id}")
+    authority._require_capability()
     freeze = load_verified_freeze(protected_root)
     bindings = (
-        ("target_identity_digest", target_identity_digest, freeze["target_identity_digest"]),
-        ("holdout_split_digest", holdout_split_digest, freeze["split_digest"]),
+        (
+            "target_identity_digest",
+            authority.target_identity_digest,
+            freeze["target_identity_digest"],
+        ),
+        ("holdout_split_digest", authority.split_digest, freeze["split_digest"]),
         (
             "holdout_membership_digest",
-            holdout_membership_digest,
+            authority.holdout_membership_digest,
             freeze["holdout_membership_digest"],
         ),
-        ("frozen_artifact_digest", frozen_artifact_digest, freeze["frozen_artifact_digest"]),
+        (
+            "frozen_artifact_digest",
+            hashlib.sha256(authority.candidate_bytes).hexdigest(),
+            freeze["frozen_artifact_digest"],
+        ),
     )
     for name, supplied, expected in bindings:
         if not _well_formed(supplied):
@@ -206,11 +207,11 @@ def unlock_holdout(
             raise ValueError(f"holdout_unlock_binding_mismatch:{name}")
     payload = {
         "barrier_schema": "engram-calibration-holdout-barrier-001k-v2",
-        "campaign_id": campaign_id,
-        "holdout_split_digest": holdout_split_digest,
-        "holdout_membership_digest": holdout_membership_digest,
-        "frozen_artifact_digest": frozen_artifact_digest,
-        "target_identity_digest": target_identity_digest,
+        "campaign_id": _BARRIER_CAMPAIGN,
+        "holdout_split_digest": authority.split_digest,
+        "holdout_membership_digest": authority.holdout_membership_digest,
+        "frozen_artifact_digest": hashlib.sha256(authority.candidate_bytes).hexdigest(),
+        "target_identity_digest": authority.target_identity_digest,
         "dev_fitting_evidence_digest": freeze["dev_fitting_evidence_digest"],
         "derived_from_freeze": _FREEZE_FILENAME,
     }
@@ -255,7 +256,7 @@ def verify_holdout_binding(
 def _valid_unlock(record: dict[str, Any], protected_root: Path) -> bool:
     """A valid unlock must derive field-exactly from a valid canonical freeze."""
     freeze = _load_json(_freeze_path(protected_root))
-    if freeze is None or not _valid_freeze(freeze):
+    if freeze is None or not _valid_freeze(freeze, protected_root):
         return False
     return (
         record.get("barrier_schema") == "engram-calibration-holdout-barrier-001k-v2"

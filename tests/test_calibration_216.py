@@ -27,13 +27,15 @@ Coverage required by the correction spec §9:
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import subprocess
 import sys
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -241,7 +243,7 @@ def _fresh_payload(population: list[str], **overrides: Any) -> dict[str, Any]:
         for sid in population
     ]
     payload: dict[str, Any] = {
-        "run_kind": "issue-216-fresh-202-assess3",
+        "run_kind": "issue-216-dev-102-assess3",
         "prompt_version": "engram.assess.3",
         "model": "deepseek-ai/DeepSeek-V4-Flash",
         "provider_adapter": "openai",
@@ -256,17 +258,65 @@ def _fresh_payload(population: list[str], **overrides: Any) -> dict[str, Any]:
     return payload
 
 
-_FRESH_202 = _POP["forced"] + _POP["dev_fresh"] + _POP["holdout"]
+_FRESH_DEV_102 = _POP["forced"] + _POP["dev_fresh"]
+_FRESH_202 = _FRESH_DEV_102 + _POP["holdout"]
+
+
+def _sealed_evidence(payload: dict[str, Any]) -> ProviderEvidence216:
+    body = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    with tempfile.NamedTemporaryFile(suffix="-provider-evidence.json", delete=False) as handle:
+        handle.write(body)
+        path = Path(handle.name)
+    try:
+        return ProviderEvidence216.load_verified(
+            path, expected_sha256=hashlib.sha256(body).hexdigest()
+        )
+    finally:
+        path.unlink(missing_ok=True)
 
 
 def _fresh_evidence(**overrides: Any) -> ProviderEvidence216:
-    payload = _fresh_payload(_FRESH_202, **overrides)
+    payload = _fresh_payload(_FRESH_DEV_102, **overrides)
     cases = payload["cases"]
     if "cases" in overrides:
         cases = overrides["cases"]
     body = dict(payload)
     body["cases"] = cases
-    return ProviderEvidence216.from_payload(body, artifact_sha256="9" * 64)
+    return _sealed_evidence(body)
+
+
+def _canonical_stage_root(
+    root: Path,
+    *,
+    stage: Literal["dev", "holdout"] = "dev",
+    seed: str = "216-dev-v1",
+) -> tuple[SamplingManifest, str]:
+    """Synthetic protected 001k authority for stage-boundary tests only."""
+    identity = _target()
+    dev_ids = _POP["executed"] + _FRESH_DEV_102
+    split = _split(dev_ids, _POP["holdout"])
+    reuse = _real_shaped_reuse()
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "identity-frozen.json").write_text(
+        json.dumps(
+            {
+                "target_identity": identity.model_dump(mode="json"),
+                "target_identity_digest": identity.identity_digest(),
+            },
+            sort_keys=True,
+        )
+    )
+    (root / "reuse-manifest.json").write_text(json.dumps(reuse.model_dump(mode="json")))
+    (root / "split-manifest-001k.json").write_text(json.dumps(split.model_dump(mode="json")))
+    ids = _FRESH_DEV_102 if stage == "dev" else _POP["holdout"]
+    sampling = _sampling(ids, target_digest=identity.identity_digest()).model_copy(
+        update={"sampling_seed": seed}
+    )
+    filename = "dev-sampling-manifest.json" if stage == "dev" else "holdout-sampling-manifest.json"
+    (root / filename).write_text(json.dumps(sampling.model_dump(mode="json")))
+    packet = root / f"{c216.CAMPAIGN_ID_001K}-{stage}-v1.blind.json"
+    packet.write_bytes(f"synthetic-{stage}-packet".encode())
+    return sampling, hashlib.sha256(packet.read_bytes()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +450,69 @@ class TestTargetAuthority001k:
 # ---------------------------------------------------------------------------
 
 
+class TestStageAuthority216:
+    def test_dev_membership_with_holdout_seed_is_still_dev(self, tmp_path: Path) -> None:
+        from evals.calibration.campaign_001k_stage_authority import verify_stage_authority
+
+        sampling, source_digest = _canonical_stage_root(tmp_path, seed="216-holdout-v1")
+        authority = verify_stage_authority(
+            protected_root=tmp_path, sampling=sampling, source_packet_digest=source_digest
+        )
+        authority.require_capability()
+        assert authority.stage == "dev"
+
+    def test_holdout_membership_with_dev_seed_derives_holdout(self, tmp_path: Path) -> None:
+        from evals.calibration.campaign_001k_stage_authority import verify_stage_authority
+
+        sampling, source_digest = _canonical_stage_root(
+            tmp_path, stage="holdout", seed="216-dev-v1"
+        )
+        authority = verify_stage_authority(
+            protected_root=tmp_path, sampling=sampling, source_packet_digest=source_digest
+        )
+        assert authority.stage == "holdout"
+
+    def test_exact_count_wrong_dev_membership_rejected(self, tmp_path: Path) -> None:
+        from evals.calibration.campaign_001k_stage_authority import verify_stage_authority
+
+        sampling, _ = _canonical_stage_root(tmp_path)
+        forged = sampling.model_copy(
+            update={"sample_ids": tuple(_FRESH_DEV_102[:-1] + [_POP["holdout"][0]])}
+        )
+        with pytest.raises(ValueError, match="stage_authority_exact_count_wrong_membership"):
+            verify_stage_authority(protected_root=tmp_path, sampling=forged)
+
+    def test_exact_count_wrong_holdout_membership_rejected(self, tmp_path: Path) -> None:
+        from evals.calibration.campaign_001k_stage_authority import verify_stage_authority
+
+        sampling, _ = _canonical_stage_root(tmp_path, stage="holdout")
+        forged = sampling.model_copy(
+            update={"sample_ids": tuple(_POP["holdout"][:-1] + [_FRESH_DEV_102[0]])}
+        )
+        with pytest.raises(ValueError, match="stage_authority_exact_count_wrong_membership"):
+            verify_stage_authority(protected_root=tmp_path, sampling=forged)
+
+    def test_target_mismatch_rejected(self, tmp_path: Path) -> None:
+        from evals.calibration.campaign_001k_stage_authority import verify_stage_authority
+
+        sampling, _ = _canonical_stage_root(tmp_path)
+        with pytest.raises(ValueError, match="stage_authority_target_identity_mismatch"):
+            verify_stage_authority(
+                protected_root=tmp_path,
+                sampling=sampling.model_copy(update={"target_identity_digest": "0" * 64}),
+            )
+
+    def test_stage_manifest_digest_mutation_rejected(self, tmp_path: Path) -> None:
+        from evals.calibration.campaign_001k_stage_authority import verify_stage_authority
+
+        sampling, _ = _canonical_stage_root(tmp_path)
+        with pytest.raises(ValueError, match="stage_authority_sampling_manifest_digest_mismatch"):
+            verify_stage_authority(
+                protected_root=tmp_path,
+                sampling=sampling.model_copy(update={"sampling_seed": "forged-metadata"}),
+            )
+
+
 class TestProviderEvidence216FailClosed:
     def _evidence(self, **overrides: Any) -> ProviderEvidence216:
         return _fresh_evidence(**overrides)
@@ -407,13 +520,14 @@ class TestProviderEvidence216FailClosed:
     def _stage(self, **overrides: Any) -> dict[str, Any]:
         return dict(
             target_identity=_target(),
-            expected_population=frozenset(_FRESH_202),
+            expected_population=frozenset(_FRESH_DEV_102),
+            expected_stage="dev",
             **overrides,
         )
 
     def test_exact_identity_and_population_pass(self) -> None:
         values = self._evidence().stage_provider_values(**self._stage())
-        assert set(values) == set(_FRESH_202)
+        assert set(values) == set(_FRESH_DEV_102)
 
     def test_duplicate_sample_ids_rejected_before_dict_conversion(self) -> None:
         cases = _fresh_payload(_FRESH_202)["cases"]
@@ -422,12 +536,12 @@ class TestProviderEvidence216FailClosed:
             self._evidence(cases=cases)
 
     def test_missing_provider_cases_rejected(self) -> None:
-        cases = _fresh_payload(_FRESH_202)["cases"][:-1]  # one case short
+        cases = _fresh_payload(_FRESH_DEV_102)["cases"][:-1]  # one case short
         with pytest.raises(ValueError, match="provider_evidence_population_mismatch:1_missing"):
             self._evidence(cases=cases).stage_provider_values(**self._stage())
 
     def test_extra_provider_cases_rejected(self) -> None:
-        cases = _fresh_payload(_FRESH_202)["cases"] + [
+        cases = _fresh_payload(_FRESH_DEV_102)["cases"] + [
             {"sample_id": _sid(9999), "status": "ok", "values": {"taxonomy_value": 0.5}}
         ]
         with pytest.raises(ValueError, match="provider_evidence_population_mismatch"):
@@ -490,14 +604,60 @@ class TestProviderEvidence216FailClosed:
             self._evidence(code_git_head="0" * 40).stage_provider_values(**self._stage())
 
     def test_honest_errors_count_toward_population(self) -> None:
-        cases = _fresh_payload(_FRESH_202)["cases"]
+        cases = _fresh_payload(_FRESH_DEV_102)["cases"]
         cases[5] = {"sample_id": cases[5]["sample_id"], "status": "error", "error_type": "X"}
         evidence = self._evidence(cases=cases)
         values = evidence.stage_provider_values(**self._stage())
         assert cases[5]["sample_id"] not in values
-        assert evidence.ok_count() == len(_FRESH_202) - 1
+        assert evidence.ok_count() == len(_FRESH_DEV_102) - 1
         assert evidence.error_count() == 1
         assert evidence.error_ids() == {cases[5]["sample_id"]}
+
+    def test_unsealed_construction_cannot_release_values(self) -> None:
+        payload = _fresh_payload(_FRESH_DEV_102)
+        stage = self._stage()
+        candidates = (
+            ProviderEvidence216.from_payload(payload, artifact_sha256="f" * 64),
+            ProviderEvidence216.model_validate(
+                {
+                    "run_kind": payload["run_kind"],
+                    "prompt_version": payload["prompt_version"],
+                    "provider_adapter": payload["provider_adapter"],
+                    "provider_model": payload["model"],
+                    "schema_version": payload["schema_version"],
+                    "code_version": payload["code_version"],
+                    "code_git_head": payload["code_git_head"],
+                    "target_identity_digest": payload["target_identity_digest"],
+                    "provider_config_digest": payload["provider_config_digest"],
+                    "artifact_sha256": "f" * 64,
+                    "case_count": len(payload["cases"]),
+                    "cases": payload["cases"],
+                }
+            ),
+            ProviderEvidence216.model_construct(
+                run_kind=payload["run_kind"],
+                prompt_version=payload["prompt_version"],
+                provider_adapter=payload["provider_adapter"],
+                provider_model=payload["model"],
+                schema_version=payload["schema_version"],
+                code_version=payload["code_version"],
+                code_git_head=payload["code_git_head"],
+                target_identity_digest=payload["target_identity_digest"],
+                provider_config_digest=payload["provider_config_digest"],
+                artifact_sha256="f" * 64,
+                case_count=len(payload["cases"]),
+                cases=tuple(payload["cases"]),
+            ),
+        )
+        for candidate in candidates:
+            with pytest.raises(ValueError, match="provider_evidence_capability_invalid"):
+                candidate.stage_provider_values(**stage)
+
+    def test_verified_evidence_tampering_invalidates_capability(self) -> None:
+        evidence = self._evidence()
+        tampered = evidence.model_copy(update={"provider_model": "other-model"})
+        with pytest.raises(ValueError, match="provider_evidence_capability_invalid"):
+            tampered.stage_provider_values(**self._stage())
 
 
 class TestReplay3HistoricalAuthority:
@@ -529,26 +689,24 @@ class TestReplay3HistoricalAuthority:
         return ProviderEvidence216.from_payload(payload, artifact_sha256=c216.REPLAY3_SHA256)
 
     def test_valid_historical_authority_binds_reused_200(self) -> None:
-        values = self._evidence().reused_provider_values(
-            expected_population=frozenset(_POP["executed"])
-        )
-        assert set(values) == set(_POP["executed"])
+        with pytest.raises(ValueError, match="provider_evidence_capability_invalid"):
+            self._evidence().reused_provider_values(expected_population=frozenset(_POP["executed"]))
 
     def test_wrong_artifact_sha_rejected(self) -> None:
         evidence = ProviderEvidence216.from_payload(
             self._replay_payload(), artifact_sha256="0" * 64
         )
-        with pytest.raises(ValueError, match="replay3_authority_artifact_mismatch"):
+        with pytest.raises(ValueError, match="provider_evidence_capability_invalid"):
             evidence.reused_provider_values(expected_population=frozenset(_POP["executed"]))
 
     def test_wrong_execution_identity_rejected(self) -> None:
-        with pytest.raises(ValueError, match="replay3_authority_execution_identity_mismatch"):
+        with pytest.raises(ValueError, match="provider_evidence_capability_invalid"):
             self._evidence(code_git_head="0" * 40).reused_provider_values(
                 expected_population=frozenset(_POP["executed"])
             )
 
     def test_forged_001k_target_digest_rejected(self) -> None:
-        with pytest.raises(ValueError, match="replay3_authority_unexpected_target_digest"):
+        with pytest.raises(ValueError, match="provider_evidence_capability_invalid"):
             self._evidence(
                 target_identity_digest=_target().identity_digest()
             ).reused_provider_values(expected_population=frozenset(_POP["executed"]))
@@ -556,7 +714,7 @@ class TestReplay3HistoricalAuthority:
     def test_wrong_population_rejected(self) -> None:
         with pytest.raises(
             ValueError,
-            match="replay3_authority_population_size_mismatch|provider_evidence_population_mismatch",
+            match="provider_evidence_capability_invalid",
         ):
             self._evidence().reused_provider_values(
                 expected_population=frozenset(_POP["executed"][:-1])
@@ -848,94 +1006,42 @@ class TestHoldoutBarrierFreezeBound:
                 protected_root=tmp_path,
             )
 
-    def test_unlock_requires_canonical_freeze(self, tmp_path: Path) -> None:
+    def test_unlock_requires_authority_not_digests(self, tmp_path: Path) -> None:
         from evals.calibration import campaign_001k_holdout_barrier as barrier
 
-        with pytest.raises(ValueError, match="holdout_locked_artifact_not_frozen"):
-            barrier.unlock_holdout(
+        with pytest.raises(TypeError):
+            barrier.unlock_holdout(protected_root=tmp_path)  # type: ignore[call-arg]
+
+    def test_legacy_freeze_and_unlock_arguments_are_rejected(self, tmp_path: Path) -> None:
+        from evals.calibration import campaign_001k_holdout_barrier as barrier
+
+        with pytest.raises(TypeError):
+            barrier.record_dev_artifact_freeze(**self._freeze_kwargs(tmp_path))
+        with pytest.raises(TypeError):
+            barrier.unlock_holdout(  # type: ignore[call-arg]
                 protected_root=tmp_path,
                 campaign_id=c216.CAMPAIGN_ID_001K,
                 holdout_split_digest="1" * 64,
-                holdout_membership_digest="5" * 64,
-                frozen_artifact_digest="6" * 64,
+                holdout_membership_digest="2" * 64,
+                frozen_artifact_digest="3" * 64,
                 target_identity_digest=_target().identity_digest(),
             )
 
-    def test_full_freeze_then_unlock_then_export(self, tmp_path: Path) -> None:
+    def test_legacy_digest_freeze_api_is_not_an_authority(self, tmp_path: Path) -> None:
         from evals.calibration import campaign_001k_holdout_barrier as barrier
 
-        kwargs = self._freeze_kwargs(tmp_path)
-        artifact_digest = barrier._sha256_file(kwargs["candidate_artifact_path"])
-        barrier.record_dev_artifact_freeze(**kwargs)
-        barrier.unlock_holdout(
-            protected_root=tmp_path,
-            campaign_id=c216.CAMPAIGN_ID_001K,
-            holdout_split_digest=kwargs["split_digest"],
-            holdout_membership_digest=kwargs["holdout_membership_digest"],
-            frozen_artifact_digest=artifact_digest,
-            target_identity_digest=_target().identity_digest(),
-        )
-        barrier.require_holdout_export_allowed(
-            campaign_id=c216.CAMPAIGN_ID_001K, protected_root=tmp_path
-        )
-        # binding verification with exact identities succeeds
-        barrier.verify_holdout_binding(
-            protected_root=tmp_path,
-            campaign_id=c216.CAMPAIGN_ID_001K,
-            holdout_split_digest=kwargs["split_digest"],
-            frozen_artifact_digest=artifact_digest,
-            target_identity_digest=_target().identity_digest(),
-        )
+        with pytest.raises(TypeError):
+            barrier.record_dev_artifact_freeze(  # type: ignore[call-arg]
+                **self._freeze_kwargs(tmp_path)
+            )
 
-    def test_unlock_rejects_mismatched_bindings(self, tmp_path: Path) -> None:
+    def test_unverified_authority_cannot_unlock(self, tmp_path: Path) -> None:
         from evals.calibration import campaign_001k_holdout_barrier as barrier
 
-        kwargs = self._freeze_kwargs(tmp_path)
-        barrier.record_dev_artifact_freeze(**kwargs)
-        with pytest.raises(ValueError, match="holdout_unlock_binding_mismatch"):
-            barrier.unlock_holdout(
+        with pytest.raises(ValueError, match="dev_fit_authority_capability_invalid"):
+            barrier.record_dev_artifact_freeze(  # type: ignore[arg-type]
                 protected_root=tmp_path,
-                campaign_id=c216.CAMPAIGN_ID_001K,
-                holdout_split_digest="f" * 64,  # not the frozen split digest
-                holdout_membership_digest=kwargs["holdout_membership_digest"],
-                frozen_artifact_digest=barrier._sha256_file(kwargs["candidate_artifact_path"]),
-                target_identity_digest=_target().identity_digest(),
-            )
-
-    def test_freeze_rejects_wrong_contract_target(self, tmp_path: Path) -> None:
-        from evals.calibration import campaign_001k_holdout_barrier as barrier
-
-        kwargs = self._freeze_kwargs(
-            tmp_path,
-            target_identity=_target(
-                calibration_dataset_version="calibration-157-dogfood-v2",
-                dimensions=("taxonomy", "retention", "epistemic"),
-            ),
-        )
-        with pytest.raises(ValueError, match="target_identity_not_001k_contract"):
-            barrier.record_dev_artifact_freeze(**kwargs)
-
-    def test_tampered_unlock_record_fails(self, tmp_path: Path) -> None:
-        from evals.calibration import campaign_001k_holdout_barrier as barrier
-
-        kwargs = self._freeze_kwargs(tmp_path)
-        barrier.record_dev_artifact_freeze(**kwargs)
-        barrier.unlock_holdout(
-            protected_root=tmp_path,
-            campaign_id=c216.CAMPAIGN_ID_001K,
-            holdout_split_digest=kwargs["split_digest"],
-            holdout_membership_digest=kwargs["holdout_membership_digest"],
-            frozen_artifact_digest=barrier._sha256_file(kwargs["candidate_artifact_path"]),
-            target_identity_digest=_target().identity_digest(),
-        )
-        # tamper the freeze record AFTER unlock: the unlock must stop validating
-        freeze_path = tmp_path / "dev-artifact-freeze-001k.json"
-        record = json.loads(freeze_path.read_text())
-        record["frozen_artifact_digest"] = "e" * 64
-        freeze_path.write_text(json.dumps(record, indent=2))
-        with pytest.raises(ValueError, match="holdout_locked_artifact_not_frozen"):
-            barrier.require_holdout_export_allowed(
-                campaign_id=c216.CAMPAIGN_ID_001K, protected_root=tmp_path
+                authority={"candidate_bytes": b"forged", "digest": "0" * 64},
             )
 
 
@@ -943,8 +1049,7 @@ class TestHoldoutBypassNegativePaths:
     """No CLI path exposes/ingests holdout material before freeze."""
 
     def _holdout_sampling_file(self, tmp_path: Path) -> Path:
-        sampling = _sampling(_POP["holdout"])
-        sampling = sampling.model_copy(update={"sampling_seed": "216-holdout-v1"})
+        sampling, _ = _canonical_stage_root(tmp_path, stage="holdout", seed="216-holdout-v1")
         path = tmp_path / "holdout-sampling.json"
         path.write_text(json.dumps(sampling.model_dump(mode="json")))
         return path
@@ -1193,3 +1298,327 @@ class TestCampaignConstants:
         assert c216.DIMENSIONS_001K == ("taxonomy", "retention")
         assert c216.CAMPAIGN_ID_001K == "eng-calibration-001k"
         assert c216.EXECUTED_PREFIX == 200
+
+
+# ---------------------------------------------------------------------------
+# FIX3: subscription-UI -> verified-ledger DEV regression and seed spoofing
+# ---------------------------------------------------------------------------
+
+
+class TestSubscriptionVerifiedLedger001k:
+    def test_synthetic_dev_subscription_workflow_projects_exact_102_ledger_labels(
+        self, tmp_path: Path
+    ) -> None:
+        """Exercise the real #209 lane lifecycle before issuing 001k labels.
+
+        The reviewer responses are deterministic synthetic bytes, but every
+        authority transition is production code: subscription lane init,
+        preparation/request emission, batch import, lane freeze, correlation
+        report, human queue/adjudication, consensus-ledger verification, then
+        FreshLabelAuthority216 projection.
+        """
+        from evals.calibration.consensus import (
+            CONSENSUS_PROTOCOL_VERSION,
+            REVIEWER_SLOTS,
+            build_correlation_report,
+            select_audit_sample_with_coverage,
+        )
+        from evals.calibration.human_queue import (
+            HumanQueueJudgment,
+            HumanQueueManifest,
+            QueueEntry,
+            record_final_resolution,
+            reveal_model_votes,
+            save_initial_judgment,
+            write_queue,
+        )
+        from evals.calibration.ingestion import init_subscription_lane, labeling_instructions_digest
+        from evals.calibration.ledger import verify_consensus_ledger
+        from evals.calibration.model_lanes import NeutralModelPacket, freeze_lane, load_lane_records
+        from evals.calibration.review import _packet_file_payload, write_protected_file
+        from evals.calibration.subscription_ui import (
+            import_batch_response,
+            prepare_subscription_campaign,
+            subscription_mode_permitted,
+            subscription_reviewer_identity,
+            verify_review_batches,
+        )
+
+        dev_ids = _FRESH_DEV_102
+        sampling = _stage_sampling(dev_ids)
+        source_digest = "f" * 64
+        assert subscription_mode_permitted(c216.CAMPAIGN_ID_001K, CONSENSUS_PROTOCOL_VERSION)
+        # Regression guard: #216's opt-in does not alter #001f's established mode.
+        assert subscription_mode_permitted("eng-calibration-001f", CONSENSUS_PROTOCOL_VERSION)
+
+        packet = NeutralModelPacket(
+            packet_id="synthetic-001k-dev",
+            sampling_manifest_digest=sampling.manifest_digest(),
+            guide_version="engram-calibration-guide-157-v1",
+            reviewer_hint="neutral_model_review",
+            source_packet_digest=source_digest,
+            cases=[
+                {
+                    "sample_id": sid,
+                    "content": f"synthetic content {sid}",
+                    "governed_kind": "fact",
+                    "source_type": "manual",
+                    "review_status": "active",
+                    "assertion_mode": "unknown",
+                    "origin": "unknown",
+                    "risk": "unknown",
+                    "evidence_state": "unknown",
+                    "age_days": 5,
+                    "age_bucket": "lt_7d",
+                    "input_size_bucket": "small",
+                }
+                for sid in dev_ids
+            ],
+        )
+        packet_dir = tmp_path / "packet"
+        packet_dir.mkdir()
+        packet_bytes = _packet_file_payload(packet)
+        packet_path = packet_dir / "synthetic-001k-dev.neutral.json"
+        write_protected_file(packet_path, packet_bytes)
+        packet_manifest = packet_dir / "neutral-packet-manifest.json"
+        write_protected_file(
+            packet_manifest,
+            (
+                json.dumps({packet_path.name: hashlib.sha256(packet_bytes).hexdigest()}) + "\n"
+            ).encode(),
+        )
+
+        visible_models = {
+            "model_a": "Claude Opus 4.8",
+            "model_b": "GPT-Astra 2.4",
+            "model_c": "GLM-5.3-Max",
+        }
+        reviewers = {}
+        for slot in REVIEWER_SLOTS:
+            reviewer = subscription_reviewer_identity(
+                slot, reviewer_config_digest="a" * 64, prompt_digest=labeling_instructions_digest()
+            )
+            reviewers[slot] = reviewer
+            init_subscription_lane(
+                tmp_path,
+                reviewer=reviewer,
+                campaign_id=c216.CAMPAIGN_ID_001K,
+                sampling=sampling,
+                source_packet_digest=source_digest,
+                neutral_packet_path=packet_path,
+                neutral_packet_manifest=packet_manifest,
+                user_visible_model_name=visible_models[slot],
+                operator_reference="synthetic-test-operator",
+            )
+        prepared = prepare_subscription_campaign(
+            tmp_path,
+            campaign_id=c216.CAMPAIGN_ID_001K,
+            sampling=sampling,
+            source_packet_digest=source_digest,
+            neutral_packet_path=packet_path,
+            neutral_packet_manifest=packet_manifest,
+        )
+        assert prepared["batches"]["total_cases"] == 102
+        batches = verify_review_batches(
+            tmp_path, sampling=sampling, source_packet_digest=source_digest
+        )["batches"]
+        for batch in batches:
+            for indent, slot in enumerate(REVIEWER_SLOTS, start=1):
+                # Response bytes must be lane-specific: #209 correctly rejects
+                # identical browser output replayed across subscription lanes.
+                response = json.dumps(
+                    {
+                        "results": [
+                            {"sample_id": sid, **_GOOD_CRITICAL, "reviewer_confidence": "medium"}
+                            for sid in batch["sample_ids"]
+                        ]
+                    },
+                    indent=indent,
+                )
+                imported = import_batch_response(
+                    tmp_path,
+                    reviewer_slot=slot,
+                    batch_id=str(batch["batch_id"]),
+                    raw_response=response,
+                    sampling=sampling,
+                    source_packet_digest=source_digest,
+                )
+                assert imported["accepted"] == batch["case_count"]
+
+        lanes = tuple(
+            freeze_lane(
+                protected_root=tmp_path,
+                reviewer=reviewers[slot],
+                campaign_id=c216.CAMPAIGN_ID_001K,
+                sampling=sampling,
+                source_packet_digest=source_digest,
+                neutral_packet_sha256=hashlib.sha256(packet_bytes).hexdigest(),
+            )
+            for slot in REVIEWER_SLOTS
+        )
+        records_by_lane = {slot: load_lane_records(tmp_path, slot) for slot in REVIEWER_SLOTS}
+        frame_rows = {
+            row.sample_id: row
+            for row in __import__(
+                "tests.test_calibration_206_helpers", fromlist=["build_frame_rows"]
+            ).build_frame_rows(tuple(dev_ids))
+        }
+        report = build_correlation_report(
+            campaign_id=c216.CAMPAIGN_ID_001K,
+            sampling=sampling,
+            source_packet_digest=source_digest,
+            lanes=lanes,
+            records_by_lane=records_by_lane,
+            frame_rows=frame_rows,
+        )
+        assert report.expected_cases == 102
+
+        # Consensus audit cases still require the human queue.  The report is
+        # intentionally public-safe, so re-derive its protected audit IDs.
+        audit_ids = select_audit_sample_with_coverage(dev_ids, frame_rows).selected
+        entries = tuple(
+            QueueEntry(sample_id=sid, reasons=("audit_selected",), audit_only=True)
+            for sid in audit_ids
+        )
+        queue_dir = tmp_path / "queue"
+        write_queue(
+            HumanQueueManifest(
+                protocol_version=CONSENSUS_PROTOCOL_VERSION,
+                campaign_id=c216.CAMPAIGN_ID_001K,
+                sampling_manifest_digest=sampling.manifest_digest(),
+                source_packet_digest=source_digest,
+                entries=entries,
+            ),
+            queue_dir,
+        )
+        lane_digests = tuple(lane.lane_digest() for lane in lanes)
+        for entry in entries:
+            save_initial_judgment(
+                HumanQueueJudgment(
+                    protocol_version=CONSENSUS_PROTOCOL_VERSION,
+                    campaign_id=c216.CAMPAIGN_ID_001K,
+                    sampling_manifest_digest=sampling.manifest_digest(),
+                    source_packet_digest=source_digest,
+                    sample_id=entry.sample_id,
+                    adjudicator_ref="synthetic-human",
+                    queue_reasons=entry.reasons,
+                    audit_selected=True,
+                    initial_critical=dict(_GOOD_CRITICAL),
+                    initial_confidence="medium",
+                    initial_captured_at=datetime(2026, 9, 11, tzinfo=UTC).isoformat(),
+                ),
+                queue_dir,
+            )
+            current = {slot: records_by_lane[slot][entry.sample_id] for slot in REVIEWER_SLOTS}
+            reveal_model_votes(
+                queue_dir,
+                entry.sample_id,
+                current_records_by_slot=current,
+                lane_digests=lane_digests,
+                campaign_id=c216.CAMPAIGN_ID_001K,
+                sampling_manifest_digest=sampling.manifest_digest(),
+                source_packet_digest=source_digest,
+            )
+            record_final_resolution(
+                queue_dir,
+                entry.sample_id,
+                final_critical=dict(_GOOD_CRITICAL),
+                final_confidence="high",
+                current_records_by_slot=current,
+                lane_digests=lane_digests,
+                campaign_id=c216.CAMPAIGN_ID_001K,
+                sampling_manifest_digest=sampling.manifest_digest(),
+                source_packet_digest=source_digest,
+            )
+        verified = verify_consensus_ledger(
+            campaign_id=c216.CAMPAIGN_ID_001K,
+            sampling=sampling,
+            source_packet_digest=source_digest,
+            lanes=lanes,
+            records_by_lane=records_by_lane,
+            queue_dir=queue_dir,
+            frame_rows=frame_rows,
+            protected_root=tmp_path,
+        )
+        from evals.calibration.campaign_001k_fit import FreshLabelAuthority216
+
+        authority = FreshLabelAuthority216.from_verified_ledger(
+            verified,
+            stage="dev",
+            stage_sampling=sampling,
+            expected_membership=frozenset(dev_ids),
+            source_packet_digest=source_digest,
+        )
+        assert set(authority.labels_by_sample()) == set(dev_ids)
+        assert len(authority.labels) == 102
+
+
+class TestSubscriptionSeedSpoofRejection001k:
+    @pytest.mark.parametrize(
+        "command",
+        ("sub-lane-init", "sub-prepare", "sub-batch-show", "sub-import"),
+    )
+    def test_holdout_membership_with_dev_seed_has_zero_pre_freeze_authority(
+        self, tmp_path: Path, command: str
+    ) -> None:
+        """A DEV-looking seed cannot authorize canonical HOLDOUT membership."""
+        sampling, source_digest = _canonical_stage_root(
+            tmp_path, stage="holdout", seed="216-holdout-v1"
+        )
+        spoofed = sampling.model_copy(update={"sampling_seed": "216-dev-v1"})
+        sampling_path = tmp_path / "spoofed-holdout-sampling.json"
+        sampling_path.write_text(json.dumps(spoofed.model_dump(mode="json")))
+        common = [
+            "--campaign-id",
+            c216.CAMPAIGN_ID_001K,
+            "--sampling-manifest",
+            str(sampling_path),
+            "--source-packet-digest",
+            source_digest,
+            "--protected-dir",
+            str(tmp_path),
+        ]
+        if command == "sub-lane-init":
+            args = [
+                "--reviewer-slot",
+                "model_a",
+                "--reviewer-config-digest",
+                "a" * 64,
+                "--neutral-packet",
+                str(tmp_path / "n.json"),
+                "--neutral-packet-manifest",
+                str(tmp_path / "m.json"),
+                "--visible-model-name",
+                "Claude Opus 4.8",
+                "--operator",
+                "synthetic-test-operator",
+            ]
+        elif command == "sub-prepare":
+            args = [
+                "--neutral-packet",
+                str(tmp_path / "n.json"),
+                "--neutral-packet-manifest",
+                str(tmp_path / "m.json"),
+            ]
+        elif command == "sub-batch-show":
+            args = ["--batch-id", f"{c216.CAMPAIGN_ID_001K}:sub-review-001"]
+        else:
+            raw = tmp_path / "response.json"
+            raw.write_text("{}")
+            args = [
+                "--reviewer-slot",
+                "model_a",
+                "--batch-id",
+                f"{c216.CAMPAIGN_ID_001K}:sub-review-001",
+                "--raw-response",
+                str(raw),
+            ]
+        result = subprocess.run(
+            [sys.executable, "-m", "evals.calibration", command, *common, *args],
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).parents[1],
+        )
+        assert result.returncode != 0
+        assert "stage_authority_sampling_manifest_digest_mismatch" in result.stderr
+        assert not (tmp_path / "lanes").exists()
