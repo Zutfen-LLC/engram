@@ -109,6 +109,12 @@ assessment_selection_enabled == false
 CERTIFIED_SERVING_PROFILES == {"legacy"}
 ```
 
-Hosted CI run IDs and final documentation/PR SHA are not recorded yet: they do
-not exist at this point. HOLDOUT provider/reviewer/evaluation execution count
-is 0.
+- hosted CI for documentation/evidence head `1b673a4fbe341ada5f0e7445e735a5b8eba2bcf3`:
+  `repository-safety` and `conformance-vectors` / `runtime-image-smoke` /
+  `compose-real-db` (all four real-Postgres shards) run
+  `34702450366`; `changed-python-format` run `34702450364`; all completed
+  successfully.
+
+HOLDOUT provider/reviewer/evaluation execution count is 0. The final
+PR/documentation head is intentionally recorded in the maintainer handoff
+rather than self-referentially inside this commit.
