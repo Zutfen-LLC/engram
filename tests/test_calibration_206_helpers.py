@@ -268,6 +268,7 @@ def build_verified_ledger(
     sampling: SamplingManifest | None = None,
     split: SplitManifest | None = None,
     expected_split_digest: str | None = None,
+    source_packet_digest: str = "f" * 64,
 ):
     """Genuine VerifiedConsensusLedger built through the REAL verifier.
 
@@ -378,7 +379,7 @@ def build_verified_ledger(
             guide_version="engram-calibration-guide-157-v1",
             reviewer_hint="neutral_model_review",
             cases=cases,
-            source_packet_digest="f" * 64,
+            source_packet_digest=source_packet_digest,
         )
         packet_dir = tmp_path / "packet"
         packet_dir.mkdir(parents=True, exist_ok=True)
@@ -403,7 +404,7 @@ def build_verified_ledger(
                 reviewer=reviewers[slot],
                 campaign_id=campaign_id,
                 sampling=sampling,
-                source_packet_digest="f" * 64,
+                source_packet_digest=source_packet_digest,
                 neutral_packet_path=packet_path,
                 neutral_packet_manifest=packet_manifest,
             )
@@ -443,7 +444,7 @@ def build_verified_ledger(
                     protocol_version=CONSENSUS_PROTOCOL_VERSION,
                     campaign_id=campaign_id,
                     sampling_manifest_digest=sampling.manifest_digest(),
-                    source_packet_digest="f" * 64,
+                    source_packet_digest=source_packet_digest,
                     sample_id=sample_id,
                     reviewer_slot=slot,  # type: ignore[arg-type]
                     reviewer_family=family_by_slot[slot],
@@ -492,7 +493,7 @@ def build_verified_ledger(
                 protocol_version=CONSENSUS_PROTOCOL_VERSION,
                 campaign_id=campaign_id,
                 sampling_manifest_digest=sampling.manifest_digest(),
-                source_packet_digest="f" * 64,
+                source_packet_digest=source_packet_digest,
                 entries=tuple(entries),
             ),
             queue_dir,
@@ -503,7 +504,7 @@ def build_verified_ledger(
                 reviewer=reviewers[slot],
                 campaign_id=campaign_id,
                 sampling=sampling,
-                source_packet_digest="f" * 64,
+                source_packet_digest=source_packet_digest,
                 neutral_packet_sha256=hashlib.sha256(packet_payload).hexdigest(),
             )
             for slot in REVIEWER_SLOTS
@@ -517,7 +518,7 @@ def build_verified_ledger(
                         "protocol_version": CONSENSUS_PROTOCOL_VERSION,
                         "campaign_id": campaign_id,
                         "sampling_manifest_digest": sampling.manifest_digest(),
-                        "source_packet_digest": "f" * 64,
+                        "source_packet_digest": source_packet_digest,
                         "sample_id": sid,
                         "adjudicator_ref": "human-1",
                         "queue_reasons": entry.reasons,
@@ -538,7 +539,7 @@ def build_verified_ledger(
                 lane_digests=lane_digests,
                 campaign_id=campaign_id,
                 sampling_manifest_digest=sampling.manifest_digest(),
-                source_packet_digest="f" * 64,
+                source_packet_digest=source_packet_digest,
             )
             record_final_resolution(
                 queue_dir,
@@ -551,14 +552,14 @@ def build_verified_ledger(
                 lane_digests=lane_digests,
                 campaign_id=campaign_id,
                 sampling_manifest_digest=sampling.manifest_digest(),
-                source_packet_digest="f" * 64,
+                source_packet_digest=source_packet_digest,
             )
         from evals.calibration.ledger import verify_consensus_ledger
 
         return verify_consensus_ledger(
             campaign_id=campaign_id,
             sampling=sampling,
-            source_packet_digest="f" * 64,
+            source_packet_digest=source_packet_digest,
             lanes=lanes,
             records_by_lane=records_by_lane,
             queue_dir=queue_dir,

@@ -33,6 +33,7 @@ import json
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -1622,3 +1623,295 @@ class TestSubscriptionSeedSpoofRejection001k:
         assert result.returncode != 0
         assert "stage_authority_sampling_manifest_digest_mismatch" in result.stderr
         assert not (tmp_path / "lanes").exists()
+
+
+class TestFix4CanonicalPhaseFiveAuthority:
+    """FIX4: canonical frame/contract and whole-freeze-record binding."""
+
+    def _fit(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        mutate_prior: Callable[[Path], None] | None = None,
+    ):
+        from evals.calibration import campaign_001k_fit as fit
+        from evals.calibration.campaign_001k_fit import FreshLabelAuthority216, ProviderEvidence216
+        from evals.calibration.campaigns import __dict__ as campaigns_dict
+        from evals.calibration.freeze import protected_frame_digest
+        from tests.test_calibration_206_helpers import build_frame_rows, build_verified_ledger
+
+        prior = tmp_path / "prior"
+        active = tmp_path / "active"
+        prior.mkdir()
+        all_ids = [_sid(i) for i in range(402)]
+        frame_rows = [_frame_row(i) for i in range(402)]
+        prior_sampling = _sampling(all_ids)
+        frame_digest = protected_frame_digest(frame_rows)
+        sampling_digest = prior_sampling.manifest_digest()
+        synthesis = {
+            "metadata": {"executed_cases": 200},
+            "cases": [
+                {
+                    "sample_id": sid,
+                    "final": dict(_GOOD_CRITICAL),
+                    "field_resolution": {},
+                }
+                for sid in _POP["executed"]
+            ],
+        }
+        replay_payload = _fresh_payload(
+            _POP["executed"],
+            run_kind="issue-214-protected-200-case-replay-assess3",
+            target_identity_digest=None,
+            provider_config_digest=None,
+            code_git_head="1" * 40,
+        )
+        files = {
+            "sampling-manifest.json": json.dumps(prior_sampling.model_dump(mode="json")).encode(),
+            "frame.json": json.dumps([row.model_dump(mode="json") for row in frame_rows]).encode(),
+            "duplicate-groups.json": b"{}",
+            c216.SYNTHESIS_RELPATH: json.dumps(synthesis).encode(),
+            c216.REPLAY3_RELPATH: json.dumps(replay_payload).encode(),
+        }
+        for relpath, body in files.items():
+            path = prior / relpath
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(body)
+        monkeypatch.setattr(
+            c216,
+            "PRIOR_SAMPLING_FILE_SHA256",
+            hashlib.sha256(files["sampling-manifest.json"]).hexdigest(),
+        )
+        monkeypatch.setattr(
+            c216, "PRIOR_FRAME_FILE_SHA256", hashlib.sha256(files["frame.json"]).hexdigest()
+        )
+        monkeypatch.setattr(
+            c216,
+            "PRIOR_DUPLICATES_FILE_SHA256",
+            hashlib.sha256(files["duplicate-groups.json"]).hexdigest(),
+        )
+        monkeypatch.setattr(
+            c216, "SYNTHESIS_SHA256", hashlib.sha256(files[c216.SYNTHESIS_RELPATH]).hexdigest()
+        )
+        monkeypatch.setattr(
+            c216, "REPLAY3_SHA256", hashlib.sha256(files[c216.REPLAY3_RELPATH]).hexdigest()
+        )
+        monkeypatch.setattr(c216, "EXPECTED_FRAME_DIGEST", frame_digest)
+        monkeypatch.setattr(c216, "EXPECTED_SAMPLING_MANIFEST_DIGEST", sampling_digest)
+        monkeypatch.setitem(globals(), "EXPECTED_FRAME_DIGEST", frame_digest)
+        monkeypatch.setitem(globals(), "EXPECTED_SAMPLING_MANIFEST_DIGEST", sampling_digest)
+        monkeypatch.setitem(campaigns_dict, "EXPECTED_FRAME_DIGEST", frame_digest)
+        monkeypatch.setitem(campaigns_dict, "EXPECTED_SAMPLING_MANIFEST_DIGEST", sampling_digest)
+        monkeypatch.setattr(fit, "EXPECTED_FRAME_DIGEST", frame_digest)
+        monkeypatch.setattr(
+            fit,
+            "REPLAY3_HISTORICAL_AUTHORITY",
+            {
+                **fit.REPLAY3_HISTORICAL_AUTHORITY,
+                "artifact_sha256": hashlib.sha256(files[c216.REPLAY3_RELPATH]).hexdigest(),
+                "execution_identity": "1" * 40,
+            },
+        )
+        _canonical_stage_root(active)
+        reused = c216.derive_reused_labels(prior)
+        (active / "reused-labels-001k.json").write_text(json.dumps(reused.model_dump(mode="json")))
+        stage_sampling = SamplingManifest.model_validate(
+            json.loads((active / "dev-sampling-manifest.json").read_text())
+        )
+        ledger_frame = build_frame_rows(tuple(_FRESH_DEV_102))
+        stage_sampling = stage_sampling.model_copy(
+            update={
+                "frame_digest": protected_frame_digest(ledger_frame),
+                "sample_hashes": tuple(row.content_hash for row in ledger_frame),
+            }
+        )
+        (active / "dev-sampling-manifest.json").write_text(
+            json.dumps(stage_sampling.model_dump(mode="json"))
+        )
+        source_digest = hashlib.sha256(
+            (active / f"{c216.CAMPAIGN_ID_001K}-dev-v1.blind.json").read_bytes()
+        ).hexdigest()
+        dev_ids = _FRESH_DEV_102
+        verified = build_verified_ledger(
+            tuple(dev_ids),
+            {sid: dict(_GOOD_CRITICAL) for sid in dev_ids},
+            campaign_id=c216.CAMPAIGN_ID_001K,
+            sampling=stage_sampling,
+            source_packet_digest=source_digest,
+        )
+        labels = FreshLabelAuthority216.from_verified_ledger(
+            verified,
+            stage="dev",
+            stage_sampling=stage_sampling,
+            expected_membership=frozenset(dev_ids),
+            source_packet_digest=source_digest,
+        )
+        fresh = _sealed_evidence(_fresh_payload(dev_ids))
+        replay = ProviderEvidence216.load_verified(
+            prior / c216.REPLAY3_RELPATH,
+            expected_sha256=hashlib.sha256(files[c216.REPLAY3_RELPATH]).hexdigest(),
+        )
+        if mutate_prior is not None:
+            mutate_prior(prior)
+        return (
+            fit.fit_canonical_dev_authority(
+                protected_root=active,
+                prior_protected_root=prior,
+                fresh_label_authority=labels,
+                provider_evidence=fresh,
+                reused_labels=reused,
+                replay_evidence=replay,
+            ),
+            active,
+            prior,
+        )
+
+    def test_positive_canonical_fit_freeze_unlock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from evals.calibration import campaign_001k_holdout_barrier as barrier
+
+        authority, active, _prior = self._fit(tmp_path, monkeypatch)
+        assert json.loads(authority.candidate_bytes)["dev_total"] == 302
+        barrier.record_dev_artifact_freeze(protected_root=active, authority=authority)
+        barrier.unlock_holdout(protected_root=active, authority=authority)
+        barrier.require_holdout_export_allowed(
+            campaign_id=c216.CAMPAIGN_ID_001K, protected_root=active
+        )
+
+    def test_frame_and_contract_are_not_caller_inputs(self) -> None:
+        from evals.calibration.campaign_001k_fit import (
+            canonical_contract_from_target_identity_001k,
+            fit_canonical_dev_authority,
+        )
+
+        assert "frame_by_id" not in inspect.signature(fit_canonical_dev_authority).parameters
+        assert "contract" not in inspect.signature(fit_canonical_dev_authority).parameters
+        contract = canonical_contract_from_target_identity_001k(_target())
+        assert contract.model_dump(mode="json") == {
+            "schema_version": "engram.assessment.v1",
+            "prompt_version": "engram.assess.3",
+            "code_version": "assessment-engine-v1",
+            "provider": "openai",
+            "model": "deepseek-ai/DeepSeek-V4-Flash",
+            "config_version": "sha256:" + "1" * 64,
+            "calibration_version": "uncalibrated",
+            "calibration_digest": None,
+        }
+        for field, value in {
+            "prompt_version": "engram.assess.2",
+            "provider_adapter": "other",
+            "provider_model": "other",
+            "assessment_schema_version": "other",
+            "assessment_code_version": "other",
+        }.items():
+            with pytest.raises(ValueError, match="target_identity_not_001k_contract"):
+                canonical_contract_from_target_identity_001k(_target(**{field: value}))
+
+    @pytest.mark.parametrize(
+        "mutation",
+        (
+            "source_type",
+            "assertion_mode",
+            "kind",
+            "risk",
+            "missing_dev_member",
+            "foreign_member",
+            "duplicate_member",
+        ),
+    )
+    def test_prior_frame_mutation_fails_closed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+    ) -> None:
+        """The fixed prior-frame bytes are the sole frame authority."""
+
+        def mutate_prior(prior: Path) -> None:
+            path = prior / "frame.json"
+            rows = json.loads(path.read_text())
+            if mutation in {"source_type", "assertion_mode", "kind", "risk"}:
+                rows[200][mutation] = "tampered"
+            elif mutation == "missing_dev_member":
+                del rows[200]
+            elif mutation == "foreign_member":
+                rows[200]["sample_id"] = _sid(999)
+            else:
+                rows[201]["sample_id"] = rows[200]["sample_id"]
+            path.write_text(json.dumps(rows))
+
+        with pytest.raises(ValueError, match="protected_evidence_digest_mismatch:frame.json"):
+            self._fit(tmp_path, monkeypatch, mutate_prior=mutate_prior)
+
+    @pytest.mark.parametrize(
+        "field",
+        (
+            "freeze_schema",
+            "campaign_id",
+            "target_identity_digest",
+            "split_digest",
+            "dev_membership_digest",
+            "dev_fitting_evidence_digest",
+            "frozen_artifact_digest",
+            "fitting_methodology",
+            "frozen_fitting_inputs_digest",
+            "holdout_membership_digest",
+        ),
+    )
+    def test_any_freeze_field_mutation_revokes_unlock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str
+    ) -> None:
+        from evals.calibration import campaign_001k_holdout_barrier as barrier
+
+        authority, active, _prior = self._fit(tmp_path, monkeypatch)
+        freeze = barrier.record_dev_artifact_freeze(protected_root=active, authority=authority)
+        barrier.unlock_holdout(protected_root=active, authority=authority)
+        payload = json.loads(freeze.read_text())
+        payload[field] = (
+            "x" if field in ("freeze_schema", "campaign_id", "fitting_methodology") else "0" * 64
+        )
+        freeze.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n")
+        with pytest.raises(ValueError, match="holdout_locked_artifact_not_frozen"):
+            barrier.require_holdout_export_allowed(
+                campaign_id=c216.CAMPAIGN_ID_001K, protected_root=active
+            )
+
+    def test_candidate_mutation_revokes_unlock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from evals.calibration import campaign_001k_holdout_barrier as barrier
+
+        authority, active, _prior = self._fit(tmp_path, monkeypatch)
+        barrier.record_dev_artifact_freeze(protected_root=active, authority=authority)
+        barrier.unlock_holdout(protected_root=active, authority=authority)
+        (active / "candidate-calibration-001k.json").write_bytes(b"candidate mutation")
+        with pytest.raises(ValueError, match="holdout_locked_artifact_not_frozen"):
+            barrier.require_holdout_export_allowed(
+                campaign_id=c216.CAMPAIGN_ID_001K, protected_root=active
+            )
+
+    @pytest.mark.parametrize(
+        "field",
+        (
+            "derived_from_freeze_sha256",
+            "target_identity_digest",
+            "holdout_split_digest",
+            "holdout_membership_digest",
+            "frozen_artifact_digest",
+            "dev_fitting_evidence_digest",
+        ),
+    )
+    def test_any_unlock_field_mutation_revokes_authorization(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str
+    ) -> None:
+        from evals.calibration import campaign_001k_holdout_barrier as barrier
+
+        authority, active, _prior = self._fit(tmp_path, monkeypatch)
+        barrier.record_dev_artifact_freeze(protected_root=active, authority=authority)
+        unlock = barrier.unlock_holdout(protected_root=active, authority=authority)
+        payload = json.loads(unlock.read_text())
+        payload[field] = "0" * 64
+        unlock.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n")
+        with pytest.raises(ValueError, match="holdout_locked_artifact_not_frozen"):
+            barrier.require_holdout_export_allowed(
+                campaign_id=c216.CAMPAIGN_ID_001K, protected_root=active
+            )

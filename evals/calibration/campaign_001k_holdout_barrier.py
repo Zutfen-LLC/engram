@@ -182,6 +182,7 @@ def unlock_holdout(*, protected_root: Path, authority: DevFitAuthority216) -> Pa
     """
     authority._require_capability()
     freeze = load_verified_freeze(protected_root)
+    freeze_record_sha256 = _sha256_file(_freeze_path(protected_root))
     bindings = (
         (
             "target_identity_digest",
@@ -206,7 +207,7 @@ def unlock_holdout(*, protected_root: Path, authority: DevFitAuthority216) -> Pa
         if not hmac.compare_digest(supplied, expected):
             raise ValueError(f"holdout_unlock_binding_mismatch:{name}")
     payload = {
-        "barrier_schema": "engram-calibration-holdout-barrier-001k-v2",
+        "barrier_schema": "engram-calibration-holdout-barrier-001k-v3",
         "campaign_id": _BARRIER_CAMPAIGN,
         "holdout_split_digest": authority.split_digest,
         "holdout_membership_digest": authority.holdout_membership_digest,
@@ -214,6 +215,7 @@ def unlock_holdout(*, protected_root: Path, authority: DevFitAuthority216) -> Pa
         "target_identity_digest": authority.target_identity_digest,
         "dev_fitting_evidence_digest": freeze["dev_fitting_evidence_digest"],
         "derived_from_freeze": _FREEZE_FILENAME,
+        "derived_from_freeze_sha256": freeze_record_sha256,
     }
     body = json.dumps(payload, sort_keys=True, indent=2) + "\n"
     path = _unlock_path(protected_root)
@@ -259,21 +261,28 @@ def _valid_unlock(record: dict[str, Any], protected_root: Path) -> bool:
     if freeze is None or not _valid_freeze(freeze, protected_root):
         return False
     return (
-        record.get("barrier_schema") == "engram-calibration-holdout-barrier-001k-v2"
+        record.get("barrier_schema") == "engram-calibration-holdout-barrier-001k-v3"
         and record.get("campaign_id") == _BARRIER_CAMPAIGN
         and record.get("derived_from_freeze") == _FREEZE_FILENAME
+        and _well_formed(record.get("derived_from_freeze_sha256"))
         and hmac.compare_digest(
-            str(record["target_identity_digest"]), str(freeze["target_identity_digest"])
-        )
-        and hmac.compare_digest(str(record["holdout_split_digest"]), str(freeze["split_digest"]))
-        and hmac.compare_digest(
-            str(record["holdout_membership_digest"]), str(freeze["holdout_membership_digest"])
+            str(record.get("derived_from_freeze_sha256")),
+            _sha256_file(_freeze_path(protected_root)),
         )
         and hmac.compare_digest(
-            str(record["frozen_artifact_digest"]), str(freeze["frozen_artifact_digest"])
+            str(record.get("target_identity_digest")), str(freeze["target_identity_digest"])
         )
         and hmac.compare_digest(
-            str(record["dev_fitting_evidence_digest"]),
+            str(record.get("holdout_split_digest")), str(freeze["split_digest"])
+        )
+        and hmac.compare_digest(
+            str(record.get("holdout_membership_digest")), str(freeze["holdout_membership_digest"])
+        )
+        and hmac.compare_digest(
+            str(record.get("frozen_artifact_digest")), str(freeze["frozen_artifact_digest"])
+        )
+        and hmac.compare_digest(
+            str(record.get("dev_fitting_evidence_digest")),
             str(freeze["dev_fitting_evidence_digest"]),
         )
     )

@@ -28,7 +28,7 @@ import hashlib
 import hmac
 import json
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import model_validator
 
@@ -39,6 +39,7 @@ from evals.calibration.campaign_001k import (
     REPLAY3_SHA256,
     ReusedLabelSet,
 )
+from evals.calibration.campaigns import EXPECTED_FRAME_DIGEST
 from evals.calibration.fit import LabeledObservation, fit_profiles
 from evals.calibration.freeze import FrameRow, SamplingManifest, SplitManifest, TargetIdentity
 
@@ -106,6 +107,30 @@ def verify_target_identity_001k(identity: TargetIdentity) -> TargetIdentity:
     if not identity.provider_config_digest.startswith("sha256:"):
         raise ValueError("target_identity_not_001k_contract:provider_config_digest_form")
     return identity
+
+
+def canonical_contract_from_target_identity_001k(identity: TargetIdentity) -> AssessmentContract:
+    """Derive the only pre-holdout fitting contract from the frozen target.
+
+    A Phase-5 fit is necessarily pre-calibration: its input contract must not
+    claim a calibration version or digest before the candidate exists.  This
+    function deliberately maps every contract axis from the verified frozen
+    target instead of accepting an operator/runtime contract assertion.
+    """
+    verified = verify_target_identity_001k(identity)
+    return AssessmentContract(
+        schema_version=cast(Literal["engram.assessment.v1"], verified.assessment_schema_version),
+        prompt_version=cast(
+            Literal["engram.assess.1", "engram.assess.2", "engram.assess.3"],
+            verified.prompt_version,
+        ),
+        code_version=cast(Literal["assessment-engine-v1"], verified.assessment_code_version),
+        provider=verified.provider_adapter,
+        model=verified.provider_model,
+        config_version=verified.provider_config_digest,
+        calibration_version="uncalibrated",
+        calibration_digest=None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -860,27 +885,43 @@ def dev_fit_observations(
 def fit_canonical_dev_authority(
     *,
     protected_root: Path,
+    prior_protected_root: Path,
     fresh_label_authority: FreshLabelAuthority216,
     provider_evidence: ProviderEvidence216,
     reused_labels: ReusedLabelSet,
     replay_evidence: ProviderEvidence216,
-    frame_by_id: dict[str, FrameRow],
-    contract: AssessmentContract,
 ) -> DevFitAuthority216:
     """Issue a sealed candidate from canonical DEV-102 fitting inputs only.
 
     Target, split, reuse manifest and DEV sampling authority are loaded from
-    ``protected_root``.  A caller-created ``TargetIdentity`` never crosses
-    this execution boundary; HOLDOUT provider or label material is not an
-    input to this operation.
+    ``protected_root``.  The frame is loaded only through the independently
+    retained, digest-verified 001f evidence root.  The AssessmentContract is
+    derived only from the verified frozen target.  Caller-created frames,
+    targets, and contracts therefore cannot cross this execution boundary.
     """
     from evals.calibration import campaign_001k as c216
     from evals.calibration.campaign_001k_stage_authority import verify_stage_authority
 
     identity = c216.load_001k_target_identity(protected_root)
+    contract = canonical_contract_from_target_identity_001k(identity)
+    prior_evidence = c216.load_prior_evidence(prior_protected_root)
+    frame_rows = prior_evidence["frame"]
+    frame_ids = [row.sample_id for row in frame_rows]
+    if any(sid is None for sid in frame_ids) or len(set(frame_ids)) != len(frame_ids):
+        raise ValueError("dev_fit_authority_canonical_frame_duplicate_or_missing_id")
+    frame_by_id = {str(row.sample_id): row for row in frame_rows}
+    prior_sampling = prior_evidence["sampling"]
+    if set(frame_by_id) != set(prior_sampling.sample_ids):
+        raise ValueError("dev_fit_authority_canonical_frame_membership_mismatch")
     reuse = c216.ReuseManifest.model_validate(
         json.loads((protected_root / "reuse-manifest.json").read_text())
     )
+    if not hmac.compare_digest(reuse.prior_frame_digest, EXPECTED_FRAME_DIGEST):
+        raise ValueError("dev_fit_authority_canonical_frame_digest_mismatch")
+    if not hmac.compare_digest(
+        reuse.prior_sampling_manifest_digest, prior_sampling.manifest_digest()
+    ):
+        raise ValueError("dev_fit_authority_canonical_sampling_digest_mismatch")
     split = SplitManifest.model_validate(
         json.loads((protected_root / "split-manifest-001k.json").read_text())
     )
@@ -904,6 +945,14 @@ def fit_canonical_dev_authority(
     canonical_reused = ReusedLabelSet.model_validate(json.loads(canonical_reused_path.read_text()))
     if not hmac.compare_digest(canonical_reused.set_digest(), reused_labels.set_digest()):
         raise ValueError("dev_fit_authority_reused_labels_mismatch")
+    reused_membership = frozenset(label.sample_id for label in canonical_reused.labels)
+    all_dev_membership = (
+        reused_membership | frozenset(reuse.forced_dev_fresh_ids) | frozenset(reuse.dev_fresh_ids)
+    )
+    if len(all_dev_membership) != 302:
+        raise ValueError("dev_fit_authority_dev_membership_count_mismatch")
+    if not all_dev_membership <= set(frame_by_id):
+        raise ValueError("dev_fit_authority_canonical_frame_missing_dev_row")
     reused_observations = observations_from_reused(
         reused=canonical_reused,
         replay_evidence=replay_evidence,
@@ -932,18 +981,15 @@ def fit_canonical_dev_authority(
         "replay": replay_evidence._binding_digest(),
         "fresh_labels": fresh_label_authority._binding_digest(),
         "provider": provider_evidence._binding_digest(),
-        "frame": {sid: row.model_dump(mode="json") for sid, row in sorted(frame_by_id.items())},
+        "canonical_frame_digest": EXPECTED_FRAME_DIGEST,
+        "canonical_frame_rows": {
+            sid: frame_by_id[sid].model_dump(mode="json") for sid in sorted(all_dev_membership)
+        },
         "contract": contract.model_dump(mode="json"),
     }
     inputs_digest = hashlib.sha256(
         json.dumps(inputs, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    reused_membership = frozenset(label.sample_id for label in canonical_reused.labels)
-    all_dev_membership = (
-        reused_membership | frozenset(reuse.forced_dev_fresh_ids) | frozenset(reuse.dev_fresh_ids)
-    )
-    if len(all_dev_membership) != 302:
-        raise ValueError("dev_fit_authority_dev_membership_count_mismatch")
     dev_evidence_digest = hashlib.sha256(
         json.dumps(
             {
