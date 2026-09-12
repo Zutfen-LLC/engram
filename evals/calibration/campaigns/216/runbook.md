@@ -1,10 +1,18 @@
 # ENG-CALIBRATION-001K (#216) operator runbook — pre-review stage
 
-Status: **AWAITING MAINTAINER FRONTIER REVIEW** (Phase 3 fresh-202 labeling).
+Status: **AWAITING MAINTAINER RE-REVIEW** (post round-1 NO-GO correction).
 
-Phases 0, 1, 2, and 4 are complete and frozen. Phase 3 (three subscription
-reviewer lanes over the fresh 202) and Phases 5-7 (fitting, holdout, artifact)
-are pending the maintainer-mediated frontier review and the human queue.
+Round-1 NO-GO (PR #217, reviewed head `ed0565d`) corrected at `d257db1`
+(FIX-217-1..6): all execution-critical 001k changes are now committed and
+clean-checkout reproducible; the reviewer campaign is the strict two-stage
+protocol (Stage A = DEV-only 102 fresh cases; Stage B = artifact freeze;
+Stage C = holdout-100 review, mechanically barred until freeze). The original
+all-202 reviewer exports were NEVER EXECUTED and are quarantined byte-for-byte
+under `protected/quarantined-202-batches-20260912/`.
+
+Phases 0, 1, 2, and 4 remain complete and frozen (re-verified from the
+clean checkout). Stage-A DEV review, Stage-B fitting, and Stage-C holdout
+evaluation are pending maintainer re-review of the corrected authority.
 
 ## Phase 0 — target identity and reconciliation (2026-09-11)
 
@@ -20,7 +28,7 @@ are pending the maintainer-mediated frontier review and the human queue.
 
 Campaign tooling SHA for the 001k freeze: `468cfc0a88119943fd02520c5fdb70a25715c1c8`.
 
-**Target identity (001k)** — `8d2b47c273b1d082cf84c2cafeeb47bf740eb3f46e8b91cab8c636f484e6cf7f`,
+**Target identity (001k)** — `a9d8df3427364d507bc986a83ee4e719e937f23ae1a10dcc66d379ba617ddb42` (re-frozen at `d257db1`; the prior `8d2b47c2…` freeze bound the uncommitted working tree and is superseded — same contract fields, corrected campaign tooling SHA),
 frozen at `~/.local/share/engram/evals/216/protected/identity-frozen.json`
 (0600). Dimensions: `("taxonomy", "retention")` only — the #214 semantic
 boundary: `engram.assess.3` emits taxonomy/retention numerics; epistemic
@@ -80,22 +88,28 @@ frozen dimensions.
 Labels were never provider input; no prompt/model/config change occurred
 after any campaign output.
 
-## Phase 3 — fresh review (IN FLIGHT — maintainer handoff)
+## Stage A — DEV-only review (corrected, awaiting maintainer re-review)
 
-Three subscription-UI lanes initialized (frozen visible-model authorities,
-operator `zutfen-maintainer:216-fresh-review`), 5 deterministic batches
-exported (`~/.local/share/engram/evals/216/protected/batches/`), paste-ready
-prompts in `.../protected/handoff/paste-001k-sub-review-00{1..5}.txt`:
+Three subscription-UI lanes initialized against the DEV-only authority
+(`dev-sampling-manifest.json`, seed `216-dev-v1`, 102 cases, zero holdout),
+three deterministic batches exported and verified:
 
 | Batch | Cases |
 | --- | --- |
-| eng-calibration-001k:sub-review-001..004 | 50 each |
-| eng-calibration-001k:sub-review-005 | 2 |
+| eng-calibration-001k:sub-review-001 | 50 |
+| eng-calibration-001k:sub-review-002 | 50 |
+| eng-calibration-001k:sub-review-003 | 2 |
 
-Import each lane response with `sub-import --campaign-id eng-calibration-001k`
-(the CLI subcommands accept `--campaign-id`; 001f remains the default).
-After three complete lanes: `model-report`, `human-queue`, then the #208-style
-checkpoint adjudication over disagreement/unknown/high-consequence cases.
+Mechanical proofs (clean checkout `d257db1`): batch union == the exact 102
+frozen DEV IDs; batch union ∩ holdout == 0; DEV authority binds the new 001k
+target digest (`a9d8df34…`), not the 001f one; holdout-stage export fails
+closed through the mechanical barrier until artifact freeze.
+
+Paste-ready prompts: `~/.local/share/engram/evals/216/protected/handoff/
+paste-001k-dev-sub-review-00{1..3}.txt`. NOT YET AUTHORIZED FOR EXECUTION —
+maintainer re-review of PR #217 first.
+
+The superseded all-202 exports live quarantined (never executed).
 
 ## Phases 5-7 — fitting, holdout, artifact (pending labels)
 
