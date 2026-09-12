@@ -118,3 +118,31 @@ CERTIFIED_SERVING_PROFILES == {"legacy"}
 HOLDOUT provider/reviewer/evaluation execution count is 0. The final
 PR/documentation head is intentionally recorded in the maintainer handoff
 rather than self-referentially inside this commit.
+
+## FIX4 remote DEV-102 execution
+
+- functional SHA / remote detached checkout: `4ae703e9219a7afd31f202c921e500b63537ce04`;
+- target digest / target-file SHA-256: `49a4ea3a9fd406139fbc8447766e7e50c91236b9d11de1ed809a9290cff01ed1` /
+  `09c72d60f139d108650f149dc4f4f4b2972b69d3e7ff175be10cca77997a6864`;
+- remote provider executor: production `engram.assessment_provider.assess_content`, invoked once per canonical DEV input in an isolated `engram01` container inheriting deployed configuration; no secret material transferred;
+- live provider: `openai` / `deepseek-ai/DeepSeek-V4-Flash` at `api.deepinfra.com`, credential present without disclosure; config digest
+  `sha256:8488c809d9d1ace29470ad85d57cbebb01b997e1a5730a86263c0e40a0384b45`;
+- transfer-manifest SHA-256: `2898d0af63aaaa1aa4a7e301572f8495625bba1ea393284472454738ef9576e0`;
+- sealed provider result SHA-256: `b3272000d8d5baa7d43a270b8257987add2360d5b74893a8fe552653cd76b20a`;
+  102 exact DEV cases, 102 ok / 0 error / 0 abstained, zero HOLDOUT calls;
+- DEV sampling / blind source / neutral / neutral-manifest SHA-256:
+  `0a13ae689842269d5ee7dbce970a36f53b3c0d045f8831266b361305b710bd69` /
+  `d977d441b9534c8237e318e97d95e3ca4b5177c81f73aa7ec5615b2c20ac6458` /
+  `0ebc67c8de87d4738d5bb702e9ae6a7a7d12ce3c2b0866131562abd8cf870428` /
+  `28d4dc65e539c0542e3ab27a49d9f18839a59c9eabc1273eee9c3621ae2feebb`;
+- lane authority digests (a/b/c):
+  `17c863ab3f2c546eb2c57d30fac696c213ab7195c3e07bec87a2748d9cb9114c`,
+  `575be4a55b2ff26e23fbf4d221bf42c859a64716e5fe2d6854e7121a0dad4599`,
+  `67483807f78615212e893aa8c109940fdf2e4f2c03a82e2238a7dc54e71cf9ab`;
+- preparation SHA-256: `245dfe5def1dadcfcd60252fc96a13b4e46cb1e842fd969ede3f04992eb88d86`;
+  batch-manifest digest `b97ab0ab4832cceec92252a105c0cf7ad70fca93e5579761c5210bc9ec89632d`;
+  deterministic batches 50 / 50 / 2, exact DEV union, zero HOLDOUT overlap;
+- reviewer responses/imports: 0. HOLDOUT remains locked: freeze/unlock artifacts absent;
+  no provider/reviewer/evaluation execution. Serving invariants unchanged.
+
+STOP: reviewer batches remain unexecuted; no consensus, Phase-5 fit, candidate freeze, HOLDOUT unlock, or HOLDOUT evaluation occurred.
