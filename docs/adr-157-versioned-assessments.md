@@ -11,7 +11,18 @@ Keep `classification_runs` and the existing promotion evaluator for compatibilit
 Reassessment does not update memory content, governed kind, source prior, or
 legacy classification receipts.
 
-The contract is `engram.assessment.v1`. Its prompt is `engram.assess.1`.
+The contract is `engram.assessment.v1`. Its current provider prompt is
+`engram.assess.2` (#214: the #213 diagnostic showed `engram.assess.1`'s
+embedded JSON-schema dump caused deterministic schema-echo output and
+systematic abstention; `engram.assess.2` states a compact prose value
+contract, marks memory content and governed kind as untrusted data whose
+embedded instructions are never followed, pins the closed canonical
+suggested_kind vocabulary, and enforces key presence, vocabulary, and
+score/judgment coupling fail-closed on provider output).
+Historical assessments recorded under `engram.assess.1` remain valid
+historical evidence and are not rewritten or invalidated by the stricter
+provider-output boundary; calibration tooling continues to fail closed on
+prompt-identity mismatch across the correction.
 Its code contract is `assessment-engine-v1`. A request pins the provider,
 model, prompt, schema, inference configuration, and calibration artifact.
 An unsupported target is rejected. A worker with a different deployed contract

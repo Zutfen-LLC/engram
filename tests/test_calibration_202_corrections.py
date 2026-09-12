@@ -2038,9 +2038,7 @@ def test_campaign_tooling_sha_is_not_a_runtime_trust_signal(tmp_path: Path) -> N
     """A newer runtime SHA is never automatically trusted when the assessment contract differs."""
     fixture = _gate_fixture(tmp_path, deployed_repo_sha="b" * 40)
     kwargs = fixture["kwargs"]
-    drifted = kwargs["deployed_contract"].model_copy(
-        update={"prompt_version": "engram.assess.1"}
-    )
+    drifted = kwargs["deployed_contract"].model_copy(update={"prompt_version": "engram.assess.1"})
     # The gate fixture uses the current corrected identity (engram.assess.2),
     # so drifting to the superseded engram.assess.1 is real contract drift and
     # must fail closed, exactly like any other identity divergence.
