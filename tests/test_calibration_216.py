@@ -34,7 +34,6 @@ from evals.calibration.campaign_001k_fit import (
     _frame_stratum,
     dev_fit_observations,
     holdout_evaluate_observations,
-    observations_from_reused,
 )
 from evals.calibration.campaigns import (
     EXPECTED_FRAME_DIGEST,
