@@ -277,10 +277,14 @@ def validate_visible_model_family(reviewer_family: str, user_visible_model_name:
 #: The COMPLETE campaign opt-in for the subscription-UI provenance mode:
 #: (campaign_id, consensus protocol version) pairs. Anything not listed can
 #: never initialize, ingest, freeze, or verify a subscription-UI lane. #208
-#: executes campaign ``eng-calibration-001f`` under protocol
+#: executes campaign ``eng-calibration-001f`` and #216 executes the fresh-202
+#: review of campaign ``eng-calibration-001k``, both under protocol
 #: ``eng-calibration-consensus-206-v1`` — and nothing else.
 SUBSCRIPTION_UI_OPTED_CAMPAIGNS: frozenset[tuple[str, str]] = frozenset(
-    {("eng-calibration-001f", "eng-calibration-consensus-206-v1")}
+    {
+        ("eng-calibration-001f", "eng-calibration-consensus-206-v1"),
+        ("eng-calibration-001k", "eng-calibration-consensus-206-v1"),
+    }
 )
 
 #: Deterministic logical-batch limits (#209 export requirements).

@@ -76,6 +76,19 @@ from evals.calibration.review import (
 )
 
 CAMPAIGN_ID = "eng-calibration-001f"
+#: Campaigns the CLI may explicitly select (#216 FIX-217-1). 001f remains the
+#: default everywhere; 001k is the reviewed #216 opt-in; nothing else passes.
+CLI_CAMPAIGNS = ("eng-calibration-001f", "eng-calibration-001k")
+
+
+def _campaign(args: argparse.Namespace) -> str:
+    """Explicit, mechanically checked campaign selection at every boundary."""
+    value = getattr(args, "campaign_id", None) or CAMPAIGN_ID
+    if value not in CLI_CAMPAIGNS:
+        raise SystemExit(f"campaign_not_selectable:{value}")
+    return value
+
+
 DATASET_VERSION = "calibration-157-dogfood-v2"
 SAMPLING_SEED = "202-sample-v2"
 SPLIT_SEED = "202-split-v2"
@@ -114,7 +127,7 @@ def _resolve_provider_config_digest(args: argparse.Namespace) -> str:
 
 def cmd_freeze_target(args: argparse.Namespace) -> int:
     identity = TargetIdentity(
-        campaign_id=CAMPAIGN_ID,
+        campaign_id=_campaign(args),
         campaign_tooling_repo_sha=args.campaign_tooling_repo_sha,
         assessment_schema_version="engram.assessment.v1",
         assessment_code_version="assessment-engine-v1",
@@ -131,7 +144,7 @@ def cmd_freeze_target(args: argparse.Namespace) -> int:
         dimensions=("taxonomy", "retention", "epistemic"),
     )
     floors = EvidenceFloors(
-        campaign_id=CAMPAIGN_ID,
+        campaign_id=_campaign(args),
         total_reviewed_min=300,
         per_dimension_labeled_min=150,
         per_dimension_non_unknown_fraction_min=0.50,
@@ -165,14 +178,14 @@ def cmd_sample(args: argparse.Namespace) -> int:
     )
     sample_ids, stratum_counts, coverage = stratified_sample(
         frame,
-        campaign_id=CAMPAIGN_ID,
+        campaign_id=_campaign(args),
         sampling_seed=SAMPLING_SEED,
         coverage_min=COVERAGE_MIN,
         allocation_fraction=ALLOCATION_FRACTION,
     )
     hash_by_id = {sample_id_for(row.item_uuid): row.content_hash for row in frame}
     sampling = SamplingManifest(
-        campaign_id=CAMPAIGN_ID,
+        campaign_id=_campaign(args),
         target_identity_digest=frame_data["target_identity_digest"],
         frame_digest=protected_frame_digest(frame),
         snapshot_sha256=frame_data["snapshot_sha256"],
@@ -193,12 +206,12 @@ def cmd_sample(args: argparse.Namespace) -> int:
     dev_ids, holdout_ids, checks, groups = assign_splits(
         frame,
         sample_ids=sample_ids,
-        campaign_id=CAMPAIGN_ID,
+        campaign_id=_campaign(args),
         split_seed=SPLIT_SEED,
         dev_fraction=DEV_FRACTION,
     )
     split = SplitManifest(
-        campaign_id=CAMPAIGN_ID,
+        campaign_id=_campaign(args),
         sampling_manifest_digest=sampling.manifest_digest(),
         sampling_membership_digest=digest(sorted(sample_ids)),
         split_seed=SPLIT_SEED,
@@ -269,7 +282,7 @@ def cmd_freeze_model_lane(args: argparse.Namespace) -> int:
     lane = freeze_lane(
         protected_root=Path(args.protected_dir),
         reviewer=reviewer,
-        campaign_id=CAMPAIGN_ID,
+        campaign_id=_campaign(args),
         sampling=sampling,
         source_packet_digest=args.source_packet_digest,
     )
@@ -292,7 +305,7 @@ def cmd_model_report(args: argparse.Namespace) -> int:
     }
     lanes = load_frozen_lanes(
         Path(args.protected_dir),
-        campaign_id=CAMPAIGN_ID,
+        campaign_id=_campaign(args),
         sampling=sampling,
         source_packet_digest=args.source_packet_digest,
         reviewers=reviewers,
@@ -300,7 +313,7 @@ def cmd_model_report(args: argparse.Namespace) -> int:
     records_by_lane = records_by_lane_from_files(Path(args.protected_dir))
     frame_rows = _load_frame_rows(args.frame, sampling)
     report = build_correlation_report(
-        campaign_id=CAMPAIGN_ID,
+        campaign_id=_campaign(args),
         lanes=lanes,
         records_by_lane=records_by_lane,
         sampling=sampling,
@@ -339,7 +352,7 @@ def cmd_human_queue(args: argparse.Namespace) -> int:
     }
     load_frozen_lanes(
         Path(args.protected_dir),
-        campaign_id=CAMPAIGN_ID,
+        campaign_id=_campaign(args),
         sampling=sampling,
         source_packet_digest=args.source_packet_digest,
         reviewers=reviewers,
@@ -347,7 +360,7 @@ def cmd_human_queue(args: argparse.Namespace) -> int:
     records_by_lane = records_by_lane_from_files(Path(args.protected_dir))
     frame_rows = _load_frame_rows(args.frame, sampling)
     queue = build_queue(
-        campaign_id=CAMPAIGN_ID,
+        campaign_id=_campaign(args),
         sampling=sampling,
         source_packet_digest=args.source_packet_digest,
         records_by_lane=records_by_lane,
@@ -373,7 +386,7 @@ def _queue_context(
     }
     lanes = load_frozen_lanes(
         Path(args.protected_dir),
-        campaign_id=CAMPAIGN_ID,
+        campaign_id=_campaign(args),
         sampling=sampling,
         source_packet_digest=args.source_packet_digest,
         reviewers=reviewers,
@@ -415,7 +428,7 @@ def cmd_queue_case(args: argparse.Namespace) -> int:
     require_queued_sample(
         Path(args.queue_dir),
         args.sample_id,
-        campaign_id=CAMPAIGN_ID,
+        campaign_id=_campaign(args),
         sampling_manifest_digest=sampling.manifest_digest(),
         source_packet_digest=args.source_packet_digest,
     )
@@ -455,14 +468,14 @@ def cmd_queue_initial(args: argparse.Namespace) -> int:
     entry = require_queued_sample(
         Path(args.queue_dir),
         args.sample_id,
-        campaign_id=CAMPAIGN_ID,
+        campaign_id=_campaign(args),
         sampling_manifest_digest=sampling.manifest_digest(),
         source_packet_digest=args.source_packet_digest,
     )
     critical = json.loads(Path(args.critical).read_text())
     judgment = {
         "protocol_version": CONSENSUS_PROTOCOL_VERSION,
-        "campaign_id": CAMPAIGN_ID,
+        "campaign_id": _campaign(args),
         "sampling_manifest_digest": sampling.manifest_digest(),
         "source_packet_digest": args.source_packet_digest,
         "sample_id": args.sample_id,
@@ -486,7 +499,7 @@ def cmd_queue_reveal(args: argparse.Namespace) -> int:
     require_queued_sample(
         Path(args.queue_dir),
         args.sample_id,
-        campaign_id=CAMPAIGN_ID,
+        campaign_id=_campaign(args),
         sampling_manifest_digest=sampling.manifest_digest(),
         source_packet_digest=args.source_packet_digest,
     )
@@ -497,7 +510,7 @@ def cmd_queue_reveal(args: argparse.Namespace) -> int:
             slot: records_by_lane[slot][args.sample_id] for slot in REVIEWER_SLOTS
         },
         lane_digests=tuple(lane_digests[slot] for slot in REVIEWER_SLOTS),
-        campaign_id=CAMPAIGN_ID,
+        campaign_id=_campaign(args),
         sampling_manifest_digest=sampling.manifest_digest(),
         source_packet_digest=args.source_packet_digest,
     )
@@ -526,7 +539,7 @@ def cmd_queue_resolve(args: argparse.Namespace) -> int:
     require_queued_sample(
         Path(args.queue_dir),
         args.sample_id,
-        campaign_id=CAMPAIGN_ID,
+        campaign_id=_campaign(args),
         sampling_manifest_digest=sampling.manifest_digest(),
         source_packet_digest=args.source_packet_digest,
     )
@@ -540,7 +553,7 @@ def cmd_queue_resolve(args: argparse.Namespace) -> int:
             slot: records_by_lane[slot][args.sample_id] for slot in REVIEWER_SLOTS
         },
         lane_digests=tuple(lane_digests[slot] for slot in REVIEWER_SLOTS),
-        campaign_id=CAMPAIGN_ID,
+        campaign_id=_campaign(args),
         sampling_manifest_digest=sampling.manifest_digest(),
         source_packet_digest=args.source_packet_digest,
         note=args.note,
@@ -606,7 +619,7 @@ def cmd_model_lane_init(args: argparse.Namespace) -> int:
     LaneSession.init(
         Path(args.protected_dir),
         reviewer=reviewer,
-        campaign_id=CAMPAIGN_ID,
+        campaign_id=_campaign(args),
         sampling=sampling,
         source_packet_digest=args.source_packet_digest,
         neutral_packet_path=Path(args.neutral_packet),
@@ -679,7 +692,7 @@ def cmd_sub_lane_init(args: argparse.Namespace) -> int:
     session = init_subscription_lane(
         Path(args.protected_dir),
         reviewer=reviewer,
-        campaign_id=CAMPAIGN_ID,
+        campaign_id=getattr(args, "campaign_id", None) or CAMPAIGN_ID,
         sampling=sampling,
         source_packet_digest=args.source_packet_digest,
         neutral_packet_path=Path(args.neutral_packet),
@@ -712,6 +725,229 @@ def _labeling_prompt_digest() -> str:
     return labeling_instructions_digest()
 
 
+# -- #216 campaign 001k -------------------------------------------------------
+
+
+DATASET_VERSION_001K = "calibration-157-dogfood-v3-216"
+FLOORS_001K_NOTE = (
+    "floors equal the frozen #202 floor set; per_dimension floors apply to the "
+    "two provider-emitted dimensions (taxonomy, retention) under the #214 "
+    "semantic boundary"
+)
+
+
+def _add_config_source_args(command: argparse.ArgumentParser) -> None:
+    config_source = command.add_mutually_exclusive_group(required=True)
+    config_source.add_argument(
+        "--provider-config-digest",
+        help="exact production AssessmentContract.config_version (sha256:<64hex>)",
+    )
+    config_source.add_argument(
+        "--derive-provider-config-digest",
+        action="store_true",
+        help="derive config identity from the deployed runtime via the production helper",
+    )
+
+
+def cmd_216_freeze_target(args: argparse.Namespace) -> int:
+    """Phase 0: freeze the 001k target identity + floors for engram.assess.3."""
+    from evals.calibration.campaign_001k import CAMPAIGN_ID_001K, DIMENSIONS_001K
+
+    identity = TargetIdentity(
+        campaign_id=CAMPAIGN_ID_001K,
+        campaign_tooling_repo_sha=args.campaign_tooling_repo_sha,
+        assessment_schema_version="engram.assessment.v1",
+        assessment_code_version="assessment-engine-v1",
+        prompt_version="engram.assess.3",
+        provider_adapter="openai",
+        provider_model="deepseek-ai/DeepSeek-V4-Flash",
+        provider_config_digest=_resolve_provider_config_digest(args),
+        provider_params={"temperature": 0, "max_tokens": 1024, "input_limit": 16000},
+        assessment_policy_version="assessment-selection-v1",
+        calibration_artifact_schema_version="engram.calibration-profiles-v1",
+        calibration_dataset_version=DATASET_VERSION_001K,
+        label_guide_version="engram-calibration-guide-157-v1",
+        canonicalization_version="assessment-evidence-manifest-v1",
+        dimensions=DIMENSIONS_001K,
+    )
+    floors = EvidenceFloors(
+        campaign_id=CAMPAIGN_ID_001K,
+        total_reviewed_min=300,
+        per_dimension_labeled_min=150,
+        per_dimension_non_unknown_fraction_min=0.50,
+        holdout_min=100,
+        holdout_per_profile_min=10,
+        holdout_calibrated_brier_max=0.25,
+        holdout_calibrated_ece_max=0.15,
+        high_consequence_reviewed_min=20,
+        per_bin_support_min=50,
+        per_stratum_min=10,
+    )
+    payload = {
+        "target_identity": identity.model_dump(mode="json"),
+        "target_identity_digest": identity.identity_digest(),
+        "floors": floors.model_dump(mode="json"),
+        "floors_note": FLOORS_001K_NOTE,
+    }
+    write_protected_file(
+        args.output,
+        (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode(),
+    )
+    print(json.dumps({"target_identity_digest": identity.identity_digest()}, sort_keys=True))
+    return 0
+
+
+def cmd_216_reuse_manifest(args: argparse.Namespace) -> int:
+    """Phase 1: derive + freeze the evidence-reuse boundary before labels."""
+    from evals.calibration import campaign_001k as c216
+
+    prior_root = Path(args.prior_protected_root)
+    corpora = c216.scan_prior_corpora(prior_root)
+    reuse = c216.build_reuse_manifest(prior_root, corpora)
+    evidence = c216.load_prior_evidence(prior_root)
+    split = c216.build_split_001k(reuse, evidence["sampling"], evidence["duplicates"])
+    reused = c216.derive_reused_labels(prior_root)
+    protected = Path(args.protected_dir)
+    artifacts = {
+        "reuse-manifest.json": reuse.model_dump(mode="json"),
+        "split-manifest-001k.json": split.model_dump(mode="json"),
+        "reused-labels-001k.json": reused.model_dump(mode="json"),
+    }
+    for name, payload in artifacts.items():
+        write_protected_file(
+            protected / name,
+            (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode(),
+        )
+    _write_public(
+        args.public_manifest,
+        {
+            "campaign_id": c216.CAMPAIGN_ID_001K,
+            "reuse_manifest_digest": reuse.manifest_digest(),
+            "split_manifest_001k_digest": split.split_digest(),
+            "reused_labels_digest": reused.set_digest(),
+            "executed_200": reuse.executed.executed_case_count,
+            "holdout": len(reuse.holdout_ids),
+            "dev_total": len(reuse.dev_ids(c216.executed_membership(evidence["sampling"]))),
+            "forced_dev_fresh": len(reuse.forced_dev_fresh_ids),
+            "leakage_safe_pool": reuse.freshness.leakage_safe_pool,
+            "leakage_checks": split.leakage_checks,
+            "reuse_rules": list(reuse.reuse_rules),
+            "note": "public aggregates and digests only; exact membership is protected",
+        },
+    )
+    print(
+        json.dumps(
+            {
+                "reuse_manifest_digest": reuse.manifest_digest(),
+                "holdout": len(reuse.holdout_ids),
+                "leakage_safe_pool": reuse.freshness.leakage_safe_pool,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def cmd_216_fresh_packet(args: argparse.Namespace) -> int:
+    """Emit the Stage-A DEV-only reviewer packet + DEV sampling authority.
+
+    FIX-217-2/FIX-217-3: membership is EXACTLY the 102 fresh development
+    cases (forced_dev_fresh ∪ dev_fresh), zero holdout IDs; the authority
+    binds the NEW 001k target identity digest loaded from the frozen identity
+    artifact — never the historical 001f target digest.
+    """
+    import hashlib
+
+    from evals.calibration import campaign_001k as c216
+    from evals.calibration.model_lanes import NeutralModelPacket, write_neutral_packet
+
+    protected = Path(args.protected_dir)
+    prior_root = Path(args.prior_protected_root)
+    evidence = c216.load_prior_evidence(prior_root)
+    sampling: SamplingManifest = evidence["sampling"]
+    reuse = c216.ReuseManifest.model_validate(
+        json.loads((protected / "reuse-manifest.json").read_text())
+    )
+    target_digest = c216.load_001k_target_identity_digest(protected)
+    dev_ids = sorted(set(reuse.forced_dev_fresh_ids) | set(reuse.dev_fresh_ids))
+    samples = json.loads((prior_root / "samples.json").read_text())["samples"]
+    by_id = {s["sample_id"]: s for s in samples}
+    frame_by_id = {row.sample_id: row for row in evidence["frame"]}
+    # stratum key format matches the frozen 001f manifest: kind/source_type/review_status
+    counts: dict[str, int] = {}
+    for sid in dev_ids:
+        row = frame_by_id[sid]
+        key = f"{row.kind}/{row.source_type}/{row.review_status}"
+        counts[key] = counts.get(key, 0) + 1
+    dev_sampling = c216.build_dev_sampling_manifest(
+        sampling,
+        reuse,
+        stratum_counts=counts,
+        target_identity_digest=target_digest,
+    )
+    if set(dev_sampling.sample_ids) & set(reuse.holdout_ids):
+        raise SystemExit("dev_packet_holdout_leakage")
+    dev_samples = [by_id[sid] for sid in dev_sampling.sample_ids]
+    packets = build_packets(
+        sampling=dev_sampling,
+        samples=dev_samples,
+        packet_id=f"{c216.CAMPAIGN_ID_001K}-dev-v1",
+    )
+    # Persist the blind packet bytes: the neutral packet's source_packet_digest
+    # is the blind packet FILE digest (001f authority pattern).
+    blind_bytes = (
+        json.dumps(json.loads(packets[0].model_dump_json()), indent=2, sort_keys=True) + "\n"
+    ).encode()
+    write_protected_file(protected / f"{c216.CAMPAIGN_ID_001K}-dev-v1.blind.json", blind_bytes)
+    blind_file_sha = hashlib.sha256(blind_bytes).hexdigest()
+    neutral = NeutralModelPacket.from_blind(packets[0], protocol_version=CONSENSUS_PROTOCOL_VERSION)
+    manifest = write_neutral_packet(neutral, protected)
+    write_protected_file(
+        protected / "dev-sampling-manifest.json",
+        (
+            json.dumps(dev_sampling.model_dump(mode="json"), sort_keys=True, indent=2) + "\n"
+        ).encode(),
+    )
+    print(
+        json.dumps(
+            {
+                "neutral_packet": manifest,
+                "blind_packet_sha256": blind_file_sha,
+                "dev_cases": len(dev_ids),
+                "target_identity_digest": target_digest,
+                "holdout_overlap": 0,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _require_216_stage_barrier(args: argparse.Namespace, sampling: SamplingManifest) -> None:
+    """FIX-217-6: no ordinary command sequence may expose the 100 holdout
+    cases before artifact freeze.
+
+    For campaign 001k, a reviewer sampling authority whose seed is the
+    holdout stage (``216-holdout-v1``) is exportable/showable/importable
+    ONLY when the mechanical holdout barrier is unlocked (exact frozen
+    artifact digest + DEV-fitting evidence digest). The DEV stage authority
+    (``216-dev-v1``) is always allowed; the legacy 001f path is untouched.
+    """
+    if _campaign(args) != "eng-calibration-001k":
+        return
+    from evals.calibration import campaign_001k_holdout_barrier as barrier
+
+    if sampling.sampling_seed == "216-holdout-v1":
+        barrier.require_holdout_export_allowed(
+            campaign_id="eng-calibration-001k",
+            frozen_artifact_digest=None,
+            dev_fitting_evidence_digest=None,
+            protected_root=Path(args.protected_dir),
+        )
+    elif sampling.sampling_seed != "216-dev-v1":
+        raise SystemExit(f"subscription_001k_requires_stage_authority:{sampling.sampling_seed}")
+
+
 def _run_sub_prepare(args: argparse.Namespace) -> int:
     """Campaign preparation (#209 FIX-4): verify the three frozen lanes,
     emit canonical per-lane #206 request evidence (idempotently), export
@@ -719,9 +955,10 @@ def _run_sub_prepare(args: argparse.Namespace) -> int:
     from evals.calibration import subscription_ui
 
     sampling = SamplingManifest.model_validate(json.loads(Path(args.sampling_manifest).read_text()))
+    _require_216_stage_barrier(args, sampling)
     result = subscription_ui.prepare_subscription_campaign(
         Path(args.protected_dir),
-        campaign_id=CAMPAIGN_ID,
+        campaign_id=getattr(args, "campaign_id", None) or CAMPAIGN_ID,
         sampling=sampling,
         source_packet_digest=args.source_packet_digest,
         neutral_packet_path=Path(args.neutral_packet),
@@ -749,6 +986,7 @@ def cmd_sub_batch_show(args: argparse.Namespace) -> int:
     from evals.calibration import subscription_ui
 
     sampling = SamplingManifest.model_validate(json.loads(Path(args.sampling_manifest).read_text()))
+    _require_216_stage_barrier(args, sampling)
     subscription_ui.verify_review_batches(
         Path(args.protected_dir), sampling=sampling, source_packet_digest=args.source_packet_digest
     )
@@ -770,6 +1008,7 @@ def cmd_sub_import(args: argparse.Namespace) -> int:
     from evals.calibration import subscription_ui
 
     sampling = SamplingManifest.model_validate(json.loads(Path(args.sampling_manifest).read_text()))
+    _require_216_stage_barrier(args, sampling)
     raw_response = Path(args.raw_response).read_text()
     result = subscription_ui.import_batch_response(
         Path(args.protected_dir),
@@ -789,6 +1028,53 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
+    # -- #216 campaign 001k ----------------------------------------------------
+
+    command = sub.add_parser(
+        "216-freeze-target",
+        help="freeze the 001k campaign target identity and floors (#216)",
+    )
+    command.add_argument(
+        "--campaign-tooling-repo-sha",
+        required=True,
+        help="tooling revision that generates this freeze (campaign provenance only)",
+    )
+    _add_config_source_args(command)
+    command.add_argument("--output", type=Path, required=True)
+    command.add_argument(
+        "--campaign-id",
+        default=None,
+        help="explicit campaign selection (default 001f; #216 uses 001k)",
+    )
+    command.set_defaults(func=cmd_216_freeze_target)
+
+    command = sub.add_parser(
+        "216-reuse-manifest",
+        help="derive + freeze the Phase-1 evidence-reuse boundary (#216)",
+    )
+    command.add_argument("--prior-protected-root", required=True)
+    command.add_argument("--protected-dir", required=True)
+    command.add_argument("--public-manifest", type=Path, required=True)
+    command.add_argument(
+        "--campaign-id",
+        default=None,
+        help="explicit campaign selection (default 001f; #216 uses 001k)",
+    )
+    command.set_defaults(func=cmd_216_reuse_manifest)
+
+    command = sub.add_parser(
+        "216-dev-packet",
+        help="emit the Stage-A DEV-only (102 fresh dev cases) reviewer packet (#216)",
+    )
+    command.add_argument("--prior-protected-root", required=True)
+    command.add_argument("--protected-dir", required=True)
+    command.add_argument(
+        "--campaign-id",
+        default=None,
+        help="explicit campaign selection (default 001f; #216 uses 001k)",
+    )
+    command.set_defaults(func=cmd_216_fresh_packet)
+
     command = sub.add_parser("freeze-target")
     command.add_argument(
         "--campaign-tooling-repo-sha",
@@ -807,18 +1093,33 @@ def main() -> int:
         help="derive config identity from the deployed runtime via the production helper",
     )
     command.add_argument("--output", type=Path, required=True)
+    command.add_argument(
+        "--campaign-id",
+        default=None,
+        help="explicit campaign selection (default 001f; #216 uses 001k)",
+    )
     command.set_defaults(func=cmd_freeze_target)
 
     command = sub.add_parser("sample")
     command.add_argument("--frame", required=True)
     command.add_argument("--manifest", type=Path, required=True, help="public aggregate summary")
     command.add_argument("--protected-dir", required=True)
+    command.add_argument(
+        "--campaign-id",
+        default=None,
+        help="explicit campaign selection (default 001f; #216 uses 001k)",
+    )
     command.set_defaults(func=cmd_sample)
 
     command = sub.add_parser("packets")
     command.add_argument("--sampling-manifest", required=True)
     command.add_argument("--samples", required=True)
     command.add_argument("--protected-dir", required=True)
+    command.add_argument(
+        "--campaign-id",
+        default=None,
+        help="explicit campaign selection (default 001f; #216 uses 001k)",
+    )
     command.set_defaults(func=cmd_packets)
 
     command = sub.add_parser(
@@ -826,6 +1127,11 @@ def main() -> int:
     )
     command.add_argument("--blind-packet", required=True)
     command.add_argument("--protected-dir", required=True)
+    command.add_argument(
+        "--campaign-id",
+        default=None,
+        help="explicit campaign selection (default 001f; #216 uses 001k)",
+    )
     command.set_defaults(func=cmd_model_packet)
 
     command = sub.add_parser("freeze-model-lane", help="freeze one completed reviewer lane (#206)")
@@ -833,6 +1139,11 @@ def main() -> int:
     command.add_argument("--reviewer-identity", required=True)
     command.add_argument("--source-packet-digest", required=True)
     command.add_argument("--protected-dir", required=True)
+    command.add_argument(
+        "--campaign-id",
+        default=None,
+        help="explicit campaign selection (default 001f; #216 uses 001k)",
+    )
     command.set_defaults(func=cmd_freeze_model_lane)
 
     command = sub.add_parser(
@@ -850,6 +1161,11 @@ def main() -> int:
         help="protected frame.json (MANDATORY: frozen marginal-coverage audit selection)",
     )
     command.add_argument("--report", type=Path, required=True, help="public aggregate report")
+    command.add_argument(
+        "--campaign-id",
+        default=None,
+        help="explicit campaign selection (default 001f; #216 uses 001k)",
+    )
     command.set_defaults(func=cmd_model_report)
 
     command = sub.add_parser(
@@ -866,6 +1182,11 @@ def main() -> int:
         "--frame",
         required=True,
         help="protected frame.json (MANDATORY: frozen marginal-coverage audit selection)",
+    )
+    command.add_argument(
+        "--campaign-id",
+        default=None,
+        help="explicit campaign selection (default 001f; #216 uses 001k)",
     )
     command.set_defaults(func=cmd_human_queue)
 
@@ -887,6 +1208,11 @@ def main() -> int:
         help="independently retained neutral-packet-manifest.json",
     )
     command.add_argument("--protected-dir", required=True)
+    command.add_argument(
+        "--campaign-id",
+        default=None,
+        help="explicit campaign selection (default 001f; #216 uses 001k)",
+    )
     command.set_defaults(func=cmd_model_lane_init)
 
     command = sub.add_parser(
@@ -901,6 +1227,11 @@ def main() -> int:
     )
     command.add_argument("--source-packet-digest", required=True)
     command.add_argument("--protected-dir", required=True)
+    command.add_argument(
+        "--campaign-id",
+        default=None,
+        help="explicit campaign selection (default 001f; #216 uses 001k)",
+    )
     command.set_defaults(func=cmd_model_lane_request)
 
     command = sub.add_parser(
@@ -911,6 +1242,11 @@ def main() -> int:
     command.add_argument("--responses", required=True, help="JSONL of response objects")
     command.add_argument("--source-packet-digest", required=True)
     command.add_argument("--protected-dir", required=True)
+    command.add_argument(
+        "--campaign-id",
+        default=None,
+        help="explicit campaign selection (default 001f; #216 uses 001k)",
+    )
     command.set_defaults(func=cmd_model_lane_ingest)
 
     command = sub.add_parser(
@@ -920,6 +1256,11 @@ def main() -> int:
     command.add_argument("--reviewer-slot", required=True, choices=list(REVIEWER_SLOTS))
     command.add_argument("--source-packet-digest", required=True)
     command.add_argument("--protected-dir", required=True)
+    command.add_argument(
+        "--campaign-id",
+        default=None,
+        help="explicit campaign selection (default 001f; #216 uses 001k)",
+    )
     command.set_defaults(func=cmd_model_lane_status)
 
     # -- #209 subscription-UI lanes ---------------------------------------------
@@ -948,6 +1289,11 @@ def main() -> int:
         required=True,
         help="operator reference attesting the execution and the frozen model selection",
     )
+    command.add_argument(
+        "--campaign-id",
+        default=None,
+        help="campaign the lane belongs to (default 001f; #216 uses 001k)",
+    )
     command.add_argument("--protected-dir", required=True)
     command.set_defaults(func=cmd_sub_lane_init)
 
@@ -961,6 +1307,11 @@ def main() -> int:
     command.add_argument("--neutral-packet-manifest", required=True)
     command.add_argument("--source-packet-digest", required=True)
     command.add_argument("--protected-dir", required=True)
+    command.add_argument(
+        "--campaign-id",
+        default=None,
+        help="explicit campaign selection (default 001f; #216 uses 001k)",
+    )
     command.set_defaults(func=cmd_sub_prepare)
 
     command = sub.add_parser(
@@ -971,6 +1322,11 @@ def main() -> int:
     command.add_argument("--neutral-packet", required=True)
     command.add_argument("--neutral-packet-manifest", required=True)
     command.add_argument("--source-packet-digest", required=True)
+    command.add_argument(
+        "--campaign-id",
+        default=None,
+        help="campaign the batches belong to (default 001f; #216 uses 001k)",
+    )
     command.add_argument("--protected-dir", required=True)
     command.set_defaults(func=cmd_sub_batches)
 
@@ -982,6 +1338,11 @@ def main() -> int:
     command.add_argument("--source-packet-digest", required=True)
     command.add_argument("--protected-dir", required=True)
     command.add_argument("--batch-id", required=True)
+    command.add_argument(
+        "--campaign-id",
+        default=None,
+        help="explicit campaign selection (default 001f; #216 uses 001k)",
+    )
     command.set_defaults(func=cmd_sub_batch_show)
 
     command = sub.add_parser(
@@ -1006,6 +1367,11 @@ def main() -> int:
         help="verified against the frozen campaign authority during import (#209 FIX-4)",
     )
     command.add_argument("--protected-dir", required=True)
+    command.add_argument(
+        "--campaign-id",
+        default=None,
+        help="explicit campaign selection (default 001f; #216 uses 001k)",
+    )
     command.set_defaults(func=cmd_sub_import)
 
     # -- human queue operation (FIX-R3-9) -------------------------------------
@@ -1024,6 +1390,11 @@ def main() -> int:
 
     command = sub.add_parser("queue-status", help="human queue progress counts (#206 FIX-R3-9)")
     command.add_argument("--queue-dir", required=True)
+    command.add_argument(
+        "--campaign-id",
+        default=None,
+        help="explicit campaign selection (default 001f; #216 uses 001k)",
+    )
     command.set_defaults(func=cmd_queue_status)
 
     command = sub.add_parser(
@@ -1034,6 +1405,11 @@ def main() -> int:
     command.add_argument("--neutral-packet", required=True)
     command.add_argument("--neutral-packet-manifest")
     command.add_argument("--show-votes", action="store_true")
+    command.add_argument(
+        "--campaign-id",
+        default=None,
+        help="explicit campaign selection (default 001f; #216 uses 001k)",
+    )
     command.set_defaults(func=cmd_queue_case)
 
     command = sub.add_parser(
@@ -1044,6 +1420,11 @@ def main() -> int:
     command.add_argument("--critical", required=True, help="JSON file of five critical fields")
     command.add_argument("--adjudicator", required=True)
     command.add_argument("--confidence", choices=["low", "medium", "high"], default="medium")
+    command.add_argument(
+        "--campaign-id",
+        default=None,
+        help="explicit campaign selection (default 001f; #216 uses 001k)",
+    )
     command.set_defaults(func=cmd_queue_initial)
 
     command = sub.add_parser(
@@ -1051,6 +1432,11 @@ def main() -> int:
     )
     _add_queue_common(command)
     command.add_argument("--sample-id", required=True)
+    command.add_argument(
+        "--campaign-id",
+        default=None,
+        help="explicit campaign selection (default 001f; #216 uses 001k)",
+    )
     command.set_defaults(func=cmd_queue_reveal)
 
     command = sub.add_parser("queue-resolve", help="record the final resolution (#206 FIX-R3-9)")
@@ -1061,6 +1447,11 @@ def main() -> int:
         "--confidence", choices=["low", "medium", "high", "unknown"], default="high"
     )
     command.add_argument("--note")
+    command.add_argument(
+        "--campaign-id",
+        default=None,
+        help="explicit campaign selection (default 001f; #216 uses 001k)",
+    )
     command.set_defaults(func=cmd_queue_resolve)
 
     command = sub.add_parser(
@@ -1068,6 +1459,11 @@ def main() -> int:
         help="materialize the audit-escalation full-human expansion (#206 FIX-R3-9)",
     )
     _add_queue_common(command)
+    command.add_argument(
+        "--campaign-id",
+        default=None,
+        help="explicit campaign selection (default 001f; #216 uses 001k)",
+    )
     command.set_defaults(func=cmd_queue_escalate)
 
     args = parser.parse_args()

@@ -49,6 +49,7 @@ from evals.calibration.freeze import (
     FrameRow,
     SamplingManifest,
     SplitManifest,
+    TargetIdentity,
     protected_frame_digest,
 )
 
@@ -579,37 +580,118 @@ def build_split_001k(
 # ---------------------------------------------------------------------------
 
 
-def build_fresh_sampling_manifest(
-    sampling: SamplingManifest, reuse: ReuseManifest, stratum_counts: dict[str, int]
-) -> SamplingManifest:
-    """Project the 001f sampling manifest onto the fresh 202 population.
+def load_001k_target_identity_digest(protected_root: Path) -> str:
+    """Load the EXACT frozen 001k target identity digest from the protected
+    identity artifact (never hardcoded from a report)."""
+    payload = json.loads((protected_root / "identity-frozen.json").read_text())
+    digest_value = str(payload["target_identity_digest"])
+    if not re.fullmatch(r"[0-9a-f]{64}", digest_value):
+        raise ValueError("identity_artifact_malformed_digest")
+    identity = TargetIdentity.model_validate(payload["target_identity"])
+    if not hmac.compare_digest(identity.identity_digest(), digest_value):
+        raise ValueError("identity_artifact_digest_mismatch")
+    return digest_value
 
-    Same frozen frame/snapshot/identity bindings; membership is the fresh 202
-    so #209 lane tooling (records == sample_ids) enforces fresh-only lanes.
+
+def _stage_sampling_manifest(
+    sampling: SamplingManifest,
+    *,
+    stage: Literal["dev", "holdout"],
+    member_ids: tuple[str, ...],
+    expected_population: set[str],
+    stratum_counts: dict[str, int],
+    target_identity_digest: str,
+) -> SamplingManifest:
+    """One stage-scoped reviewer sampling authority (FIX-217-2/FIX-217-3).
+
+    Membership is EXACTLY the frozen stage membership; the target identity is
+    the NEW 001k digest (never the historical 001f one); prior frame/snapshot
+    provenance stays separately recorded via the unchanged frame/snapshot
+    digests of the reused population.
     """
-    fresh = sorted(
-        set(reuse.forced_dev_fresh_ids) | set(reuse.dev_fresh_ids) | set(reuse.holdout_ids)
-    )
-    if set(fresh) != set(sampling.sample_ids[EXECUTED_PREFIX:]):
-        raise ValueError("fresh_projection_membership_mismatch")
-    if sum(stratum_counts.values()) != len(fresh):
-        raise ValueError("fresh_projection_stratum_count_mismatch")
+    members = tuple(sorted(set(member_ids)))
+    if set(members) != expected_population:
+        raise ValueError(f"stage_{stage}_membership_mismatch")
+    if not members:
+        raise ValueError(f"stage_{stage}_empty")
+    if sum(stratum_counts.values()) != len(members):
+        raise ValueError(f"stage_{stage}_stratum_count_mismatch")
+    if target_identity_digest == sampling.target_identity_digest:
+        # The 001f population manifest carries the OLD target digest; a stage
+        # authority must never inherit it (FIX-217-3).
+        raise ValueError("stage_authority_must_bind_new_target_identity")
+    if not re.fullmatch(r"[0-9a-f]{64}", target_identity_digest):
+        raise ValueError("stage_authority_target_identity_malformed")
     by_id = dict(zip(sampling.sample_ids, sampling.sample_hashes, strict=True))
     return SamplingManifest(
         campaign_id=CAMPAIGN_ID_001K,
-        target_identity_digest=sampling.target_identity_digest,
+        target_identity_digest=target_identity_digest,
         frame_digest=sampling.frame_digest,
         snapshot_sha256=sampling.snapshot_sha256,
         snapshot_as_of=sampling.snapshot_as_of,
-        sampling_seed="216-fresh-v1",
+        sampling_seed=f"216-{stage}-v1",
         inclusion_rules=sampling.inclusion_rules
-        + ("216 fresh projection: positions 201-402 of the frozen 001f sample order",),
+        + (
+            f"216 {stage} reviewer authority: positions 201-402 of the frozen "
+            "001f sample order restricted to the frozen 001k "
+            f"{stage} membership",
+        ),
         exclusion_rules=sampling.exclusion_rules,
-        source_row_counts={**sampling.source_row_counts, "fresh_projection": len(fresh)},
+        source_row_counts={
+            **sampling.source_row_counts,
+            f"stage_{stage}": len(members),
+        },
         stratum_counts=stratum_counts,
         coverage_dimensions=sampling.coverage_dimensions,
-        sample_ids=tuple(fresh),
-        sample_hashes=tuple(by_id[sid] for sid in fresh),
+        sample_ids=members,
+        sample_hashes=tuple(by_id[sid] for sid in members),
+    )
+
+
+def fresh_dev_ids(reuse: ReuseManifest) -> tuple[str, ...]:
+    """The 102 fresh development reviewer population (FIX-217-2 Stage A)."""
+    return reuse.dev_ids(())
+
+
+def build_dev_sampling_manifest(
+    sampling: SamplingManifest,
+    reuse: ReuseManifest,
+    *,
+    stratum_counts: dict[str, int],
+    target_identity_digest: str,
+) -> SamplingManifest:
+    """Stage-A authority: exactly forced_dev_fresh + dev_fresh (102 cases),
+    zero holdout IDs."""
+    members = fresh_dev_ids(reuse)
+    expected = set(reuse.forced_dev_fresh_ids) | set(reuse.dev_fresh_ids)
+    manifest = _stage_sampling_manifest(
+        sampling,
+        stage="dev",
+        member_ids=members,
+        expected_population=expected,
+        stratum_counts=stratum_counts,
+        target_identity_digest=target_identity_digest,
+    )
+    if set(manifest.sample_ids) & set(reuse.holdout_ids):
+        raise ValueError("dev_authority_holdout_leakage")
+    return manifest
+
+
+def build_holdout_sampling_manifest(
+    sampling: SamplingManifest,
+    reuse: ReuseManifest,
+    *,
+    stratum_counts: dict[str, int],
+    target_identity_digest: str,
+) -> SamplingManifest:
+    """Stage-C authority: exactly the frozen 100 holdout cases."""
+    return _stage_sampling_manifest(
+        sampling,
+        stage="holdout",
+        member_ids=reuse.holdout_ids,
+        expected_population=set(reuse.holdout_ids),
+        stratum_counts=stratum_counts,
+        target_identity_digest=target_identity_digest,
     )
 
 
