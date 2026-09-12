@@ -88,12 +88,22 @@ def _sampling(ids: tuple[str, ...]) -> SamplingManifest:
     )
 
 
-def _reviewer(slot: str) -> ReviewerIdentity:
-    families = dict(zip(REVIEWER_SLOTS, ("claude-opus", "gpt-astra", "glm-5-3-max"), strict=True))
+def _reviewer(slot: str, *, campaign_id: str = "legacy") -> ReviewerIdentity:
+    if campaign_id == "eng-calibration-001k":
+        from evals.calibration.consensus import CAMPAIGN_216_FAMILY_BY_SLOT
+
+        families = CAMPAIGN_216_FAMILY_BY_SLOT
+        identity_campaign_id = campaign_id
+    else:
+        families = dict(
+            zip(REVIEWER_SLOTS, ("claude-opus", "gpt-astra", "glm-5-3-max"), strict=True)
+        )
+        identity_campaign_id = "legacy"
     family = families[slot]
     return ReviewerIdentity(
         reviewer_slot=slot,  # type: ignore[arg-type]
         reviewer_family=family,
+        campaign_id=identity_campaign_id,
         provider_model_identifier=f"{family}-exact-2026-09",
         reviewer_config_digest="a" * 64,
         prompt_digest=labeling_instructions_digest(),
@@ -117,7 +127,13 @@ def _raw_refusal(sample_id: str) -> str:
     return json.dumps({"sample_id": sample_id, "outcome": "refused", "error_code": "refusal"})
 
 
-def _setup_lane(tmp_path: Path, *, slot: str = "model_a"):
+def _setup_lane(
+    tmp_path: Path,
+    *,
+    slot: str = "model_a",
+    campaign_id: str = "campaign",
+    provenance_mode: str = "provider_metadata",
+):
     """Init one lane + emit generation-1 requests for all samples."""
     sampling = _sampling(IDS)
     cases = [
@@ -160,12 +176,13 @@ def _setup_lane(tmp_path: Path, *, slot: str = "model_a"):
     write_protected_file(manifest_path, manifest_payload)
     session = LaneSession.init(
         tmp_path,
-        reviewer=_reviewer(slot),
-        campaign_id="campaign",
+        reviewer=_reviewer(slot, campaign_id=campaign_id),
+        campaign_id=campaign_id,
         sampling=sampling,
         source_packet_digest="f" * 64,
         neutral_packet_path=packet_path,
         neutral_packet_manifest=manifest_path,
+        provenance_mode=provenance_mode,  # type: ignore[arg-type]
     )
     session.emit_requests(packet_path, sampling=sampling, manifest_path=manifest_path)
     return session, sampling, packet_path, manifest_path

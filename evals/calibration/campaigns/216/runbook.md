@@ -147,6 +147,31 @@ rather than self-referentially inside this commit.
 
 STOP: reviewer batches remain unexecuted; no consensus, Phase-5 fit, candidate freeze, HOLDOUT unlock, or HOLDOUT evaluation occurred.
 
+## FIX5 replacement: machine-orchestrated DEV review
+
+The maintainer has abandoned `sub-review-001` and the #209 operator-attested
+subscription-UI workflow for #216. No further UI responses or paste/import
+operations are authorized. Existing subscription material remains immutable
+under `protected/quarantined-202-batches-20260912/` and is excluded from every
+new lane, ledger, and label authority.
+
+The replacement execution mode is `machine_executor_provenance`, available only
+for `eng-calibration-001k`. `216-machine-dev-review --protected-dir <root>`
+preflights three isolated Hermes processes, freezes lane authority before model
+output, runs the exact DEV-102 packet per lane, preserves every batch attempt,
+retries structural output failures, ingests accepted records through the #206
+path, and freezes lanes. It does not execute HOLDOUT, fit, candidate freeze, or
+Phase 5.
+
+Frozen requested runtime routes are OpenRouter `anthropic/claude-sonnet-5`,
+OpenAI Codex `gpt-5.6-sol`, and z.ai `glm-5.3`. The command rejects an actual
+resolved provider/model route that differs. Fresh execution artifacts must be
+created only after the exact functional SHA target has been frozen; all FIX4
+artifacts remain superseded and quarantined.
+
+STOP: after DEV lanes, consensus preparation, and human-queue production, stop
+before Phase 5.
+
 ## Deferred pre-Phase-5 proof
 
 `DEFERRED_PRE_PHASE5_REAL_LEDGER_PROOF`: the earlier real-shaped synthetic-label

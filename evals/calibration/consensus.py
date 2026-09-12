@@ -100,6 +100,31 @@ NON_CONSENSUS_VALUES: dict[str, frozenset[str]] = {
 REVIEWER_FAMILIES: tuple[str, ...] = ("claude-opus", "gpt-astra", "glm-5-3-max")
 REVIEWER_SLOTS: tuple[str, ...] = ("model_a", "model_b", "model_c")
 FAMILY_BY_SLOT: dict[str, str] = dict(zip(REVIEWER_SLOTS, REVIEWER_FAMILIES, strict=True))
+# #216 is a distinct campaign execution identity. Keep historical #206/#209
+# names unchanged while identifying the actual machine models accurately.
+CAMPAIGN_216_FAMILY_BY_SLOT: dict[str, str] = {
+    "model_a": "claude-sonnet-5",
+    "model_b": "gpt-5-6-sol",
+    "model_c": "glm-5-3",
+}
+
+
+def reviewer_family_allowed(
+    reviewer_slot: str, reviewer_family: str, campaign_id: str | None = None
+) -> bool:
+    """Allow legacy evidence while reserving exact families for #216 machine lanes.
+
+    #216's prior artifacts retain the historical #206 slot families under the
+    same campaign ID, so parsing them must stay possible while they are kept
+    quarantined. New machine lanes are separately forced to the exact #216
+    mapping by ``MachineReviewerAuthority`` and its provenance verifier.
+    """
+    legacy = FAMILY_BY_SLOT.get(reviewer_slot)
+    if campaign_id == "eng-calibration-001k":
+        return reviewer_family in {legacy, CAMPAIGN_216_FAMILY_BY_SLOT.get(reviewer_slot)}
+    return reviewer_family == legacy
+
+
 SlotName = Literal["model_a", "model_b", "model_c"]
 ModelIdentifier = Annotated[str, Field(min_length=1, max_length=256)]
 # Orthogonal failure semantics (FIX-6):
@@ -146,7 +171,10 @@ CriticalFieldVocabulary: dict[str, set[str]] = {
 #   ``SubscriptionReviewAttestation``; freezable ONLY under the explicit
 #   campaign opt-in (see evals.calibration.subscription_ui).
 IdentitySource = Literal[
-    "provider_metadata", "executor_attestation", "operator_attested_subscription_ui"
+    "provider_metadata",
+    "executor_attestation",
+    "operator_attested_subscription_ui",
+    "machine_executor_provenance",
 ]
 # Every Dimensions field that is not consensus-critical is diagnostic-only:
 # reviewers MAY return these fields, and disagreement on them NEVER creates a
@@ -213,6 +241,7 @@ class ReviewerIdentity(Record):
 
     reviewer_slot: SlotName
     reviewer_family: str
+    campaign_id: str = "legacy"
     provider_model_identifier: ModelIdentifier
     reviewer_config_digest: Digest
     prompt_digest: Digest
@@ -220,7 +249,7 @@ class ReviewerIdentity(Record):
 
     @model_validator(mode="after")
     def family_matches_slot(self) -> Self:
-        if FAMILY_BY_SLOT[self.reviewer_slot] != self.reviewer_family:
+        if not reviewer_family_allowed(self.reviewer_slot, self.reviewer_family, self.campaign_id):
             raise ValueError("reviewer_family_does_not_match_frozen_slot")
         return self
 
@@ -313,35 +342,73 @@ class ExecutionEvidence(Record):
     # impossible for the other two sources (None), so a subscription-UI
     # record can never validate as provider metadata and vice versa.
     subscription_attestation: dict[str, Any] | None = None
+    # #216: provider metadata remains its own stricter mode. Hermes command
+    # execution instead carries a receipt bound to frozen authority/attempt bytes.
+    machine_executor_provenance: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def evidence_contract(self) -> Self:
-        if FAMILY_BY_SLOT[self.actual_reviewer_slot] != self.actual_reviewer_family:
+        if not reviewer_family_allowed(
+            self.actual_reviewer_slot, self.actual_reviewer_family, self.campaign_id
+        ):
             raise ValueError("actual_family_does_not_match_attested_slot")
         if self.identity_source == "provider_metadata":
             if not (self.provider_request_id and self.provider_response_id):
                 raise ValueError("provider_metadata_identity_requires_provider_ids")
-            # FIX-R6-2: a provider-metadata LABEL is not provider-metadata
-            # VERIFICATION — the embedded artifact must digest-bind its raw
-            # metadata and mechanically derive the claimed identity.
             verify_evidence_against_artifact(self)
             if self.subscription_attestation is not None:
                 raise ValueError("provider_metadata_must_not_claim_subscription_attestation")
+            if self.machine_executor_provenance is not None:
+                raise ValueError("provider_metadata_must_not_claim_machine_executor_provenance")
         elif self.identity_source == "operator_attested_subscription_ui":
             if self.provider_metadata is not None:
                 raise ValueError("subscription_ui_must_not_claim_provider_metadata")
             if self.provider_request_id is not None or self.provider_response_id is not None:
                 raise ValueError("subscription_ui_must_not_claim_provider_ids")
-            from evals.calibration.subscription_ui import (
-                verify_evidence_subscription_attestation,
-            )
+            from evals.calibration.subscription_ui import verify_evidence_subscription_attestation
 
             verify_evidence_subscription_attestation(self)
+            if self.machine_executor_provenance is not None:
+                raise ValueError("subscription_ui_must_not_claim_machine_executor_provenance")
+        elif self.identity_source == "machine_executor_provenance":
+            if self.provider_metadata is not None or self.subscription_attestation is not None:
+                raise ValueError("machine_executor_provenance_must_not_claim_other_identity_source")
+            proof = self.machine_executor_provenance
+            required = {
+                "authority_digest",
+                "attempt_digest",
+                "raw_stdout_digest",
+                "exit_code",
+                "batch_attempt_receipt_digest",
+                "batch_stdout_digest",
+                "extraction_index",
+                "canonical_element_digest",
+            }
+            if not isinstance(proof, dict) or set(proof) != required:
+                raise ValueError("machine_executor_provenance_requires_bound_receipt")
+            base = {"authority_digest", "attempt_digest", "raw_stdout_digest"}
+            if not all(
+                isinstance(proof[key], str) and proof[key] for key in base
+            ) or not isinstance(proof["exit_code"], int):
+                raise ValueError("machine_executor_provenance_requires_bound_receipt")
+            batch_keys = required - base - {"exit_code"}
+            batch_values = [proof[key] for key in batch_keys]
+            if any(value is not None for value in batch_values) and not (
+                isinstance(proof["batch_attempt_receipt_digest"], str)
+                and isinstance(proof["batch_stdout_digest"], str)
+                and isinstance(proof["canonical_element_digest"], str)
+                and isinstance(proof["extraction_index"], int)
+            ):
+                raise ValueError("machine_executor_provenance_requires_bound_receipt")
+            if self.provider_request_id is not None or self.provider_response_id is not None:
+                raise ValueError("machine_executor_provenance_must_not_claim_provider_ids")
         else:
             if self.provider_metadata is not None:
                 raise ValueError("executor_attestation_must_not_claim_provider_metadata")
             if self.subscription_attestation is not None:
                 raise ValueError("executor_attestation_must_not_claim_subscription_attestation")
+            if self.machine_executor_provenance is not None:
+                raise ValueError("executor_attestation_must_not_claim_machine_executor_provenance")
         if not self.executor_identity:
             raise ValueError("execution_evidence_requires_executor_identity")
         return self
@@ -394,6 +461,7 @@ class ExecutionReceipt(Record):
     provider_metadata: dict[str, Any] | None = None
     # #209: carried verbatim from the evidence for subscription-UI records.
     subscription_attestation: dict[str, Any] | None = None
+    machine_executor_provenance: dict[str, Any] | None = None
     evidence: ExecutionEvidence
     evidence_digest: Digest
 
@@ -417,6 +485,7 @@ class ExecutionReceipt(Record):
             and self.provider_response_id == evidence.provider_response_id
             and self.provider_metadata == evidence.provider_metadata
             and self.subscription_attestation == evidence.subscription_attestation
+            and self.machine_executor_provenance == evidence.machine_executor_provenance
         )
         if not derived_fields:
             raise ValueError("execution_receipt_not_derived_from_its_evidence")
@@ -444,6 +513,7 @@ class ExecutionReceipt(Record):
             provider_response_id=evidence.provider_response_id,
             provider_metadata=evidence.provider_metadata,
             subscription_attestation=evidence.subscription_attestation,
+            machine_executor_provenance=evidence.machine_executor_provenance,
             evidence=evidence,
             evidence_digest=evidence.evidence_digest(),
         )
@@ -524,7 +594,7 @@ class ModelReviewRecord(Record):
     def status_contract(self) -> Self:
         if self.protocol_version != CONSENSUS_PROTOCOL_VERSION:
             raise ValueError("protocol_version_mismatch")
-        if FAMILY_BY_SLOT[self.reviewer_slot] != self.reviewer_family:
+        if not reviewer_family_allowed(self.reviewer_slot, self.reviewer_family, self.campaign_id):
             raise ValueError("reviewer_family_does_not_match_frozen_slot")
         if self.label_guide_version != LABEL_GUIDE_VERSION:
             raise ValueError("label_guide_version_mismatch")

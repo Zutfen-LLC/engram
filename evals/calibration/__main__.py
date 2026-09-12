@@ -987,6 +987,15 @@ def cmd_216_fresh_packet(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_216_machine_dev_review(args: argparse.Namespace) -> int:
+    """Run the sole #216 machine DEV campaign path; no consensus/Phase 5."""
+    from evals.calibration.machine_dev_review_216 import run_machine_dev_review
+
+    report = run_machine_dev_review(Path(args.protected_dir), dry_run=args.dry_run)
+    print(json.dumps(report, sort_keys=True))
+    return 0
+
+
 def _require_216_stage_barrier(
     args: argparse.Namespace,
     sampling: SamplingManifest,
@@ -1144,6 +1153,16 @@ def main() -> int:
         help="explicit campaign selection (default 001f; #216 uses 001k)",
     )
     command.set_defaults(func=cmd_216_fresh_packet)
+
+    command = sub.add_parser(
+        "216-machine-dev-review",
+        help="execute exactly the frozen DEV-102 machine lanes (#216; no consensus/Phase 5)",
+    )
+    command.add_argument("--protected-dir", required=True)
+    command.add_argument(
+        "--dry-run", action="store_true", help="verify DEV authority and show planned lanes only"
+    )
+    command.set_defaults(func=cmd_216_machine_dev_review)
 
     command = sub.add_parser("freeze-target")
     command.add_argument(

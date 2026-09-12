@@ -251,9 +251,8 @@ def freeze_lane(
         require_machine_verified_execution_identity,
     )
 
-    if lane_provenance_mode(lane_directory(protected_root, reviewer.reviewer_slot)) == (
-        "operator_attested_subscription_ui"
-    ):
+    mode = lane_provenance_mode(lane_directory(protected_root, reviewer.reviewer_slot))
+    if mode == "operator_attested_subscription_ui":
         from evals.calibration.subscription_ui import (
             require_subscription_attested_identity,
         )
@@ -264,6 +263,36 @@ def freeze_lane(
             protected_root=protected_root,
             sampling=sampling,
         )
+    elif mode == "machine_executor_provenance":
+        from evals.calibration.ingestion import require_machine_executor_provenance
+
+        require_machine_executor_provenance(
+            records, lane_root=lane_directory(protected_root, reviewer.reviewer_slot)
+        )
+        from evals.calibration.campaign_001k_stage_authority import verify_stage_authority
+        from evals.calibration.machine_reviewer_216 import MachineReviewerAuthority
+
+        stage = verify_stage_authority(
+            protected_root=protected_root,
+            sampling=sampling,
+            source_packet_digest=source_packet_digest,
+        )
+        authority = MachineReviewerAuthority.model_validate(
+            json.loads(
+                (
+                    lane_directory(protected_root, reviewer.reviewer_slot)
+                    / "machine-reviewer"
+                    / "authority.json"
+                ).read_text()
+            )
+        )
+        if (
+            authority.target_identity_digest != stage.target_identity_digest
+            or authority.membership_digest != stage.membership_digest
+            or authority.source_packet_digest != source_packet_digest
+            or authority.reviewer != reviewer
+        ):
+            raise ValueError("machine_reviewer_stage_authority_drift")
     else:
         require_machine_verified_execution_identity(
             records, lane_root=lane_directory(protected_root, reviewer.reviewer_slot)
@@ -352,9 +381,8 @@ def _load_one_frozen_lane(
         require_machine_verified_execution_identity,
     )
 
-    if lane_provenance_mode(lane_directory(protected_root, reviewer.reviewer_slot)) == (
-        "operator_attested_subscription_ui"
-    ):
+    mode = lane_provenance_mode(lane_directory(protected_root, reviewer.reviewer_slot))
+    if mode == "operator_attested_subscription_ui":
         from evals.calibration.subscription_ui import require_subscription_attested_identity
 
         require_subscription_attested_identity(
@@ -363,6 +391,36 @@ def _load_one_frozen_lane(
             protected_root=protected_root,
             sampling=sampling,
         )
+    elif mode == "machine_executor_provenance":
+        from evals.calibration.ingestion import require_machine_executor_provenance
+
+        require_machine_executor_provenance(
+            records, lane_root=lane_directory(protected_root, reviewer.reviewer_slot)
+        )
+        from evals.calibration.campaign_001k_stage_authority import verify_stage_authority
+        from evals.calibration.machine_reviewer_216 import MachineReviewerAuthority
+
+        stage = verify_stage_authority(
+            protected_root=protected_root,
+            sampling=sampling,
+            source_packet_digest=source_packet_digest,
+        )
+        authority = MachineReviewerAuthority.model_validate(
+            json.loads(
+                (
+                    lane_directory(protected_root, reviewer.reviewer_slot)
+                    / "machine-reviewer"
+                    / "authority.json"
+                ).read_text()
+            )
+        )
+        if (
+            authority.target_identity_digest != stage.target_identity_digest
+            or authority.membership_digest != stage.membership_digest
+            or authority.source_packet_digest != source_packet_digest
+            or authority.reviewer != reviewer
+        ):
+            raise ValueError("machine_reviewer_stage_authority_drift")
     else:
         require_machine_verified_execution_identity(
             records, lane_root=lane_directory(protected_root, reviewer.reviewer_slot)
