@@ -43,7 +43,13 @@ class StrictModel(BaseModel):
 
 class AssessmentContract(StrictModel):
     schema_version: Literal["engram.assessment.v1"] = "engram.assessment.v1"
-    prompt_version: Literal["engram.assess.1"] = "engram.assess.1"
+    # engram.assess.3 — #214 taxonomy-semantics correction (supersedes
+    # engram.assess.2, which supersedes engram.assess.1; see
+    # engram/assessment_provider.py). Historical assessments recorded under
+    # either superseded identity remain valid, representable evidence.
+    prompt_version: Literal["engram.assess.1", "engram.assess.2", "engram.assess.3"] = (
+        "engram.assess.3"
+    )
     code_version: Literal["assessment-engine-v1"] = "assessment-engine-v1"
     provider: str = Field(max_length=128)
     model: str = Field(max_length=256)

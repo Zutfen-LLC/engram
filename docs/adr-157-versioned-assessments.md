@@ -11,7 +11,41 @@ Keep `classification_runs` and the existing promotion evaluator for compatibilit
 Reassessment does not update memory content, governed kind, source prior, or
 legacy classification receipts.
 
-The contract is `engram.assessment.v1`. Its prompt is `engram.assess.1`.
+The contract is `engram.assessment.v1`. Its current provider prompt is
+`engram.assess.3` (#214, taxonomy-semantics correction). The identity
+history:
+
+- `engram.assess.1` embedded the raw ProviderValues JSON schema in the
+  system prompt. The #213 diagnostic showed this caused deterministic
+  schema-echo output (70/200 frozen inputs) and systematic abstention
+  (suggested_kind null on 125/130 evaluable cases).
+- `engram.assess.2` (maintainer round 2) replaced the schema dump with a
+  compact prose value contract, restored the explicit untrusted-content
+  instruction boundary, pinned the closed canonical suggested_kind
+  vocabulary, and enforced key presence, vocabulary, and score/judgment
+  coupling fail-closed on provider output. The protected #214 replay against
+  the frozen #213 200-case population confirmed the structural/abstention
+  fixes held (99.5% structural completion, 0/70 schema echoes, 100%
+  taxonomy/retention coverage, 0.9196 retention accuracy, 0 high-consequence
+  false-retains) but answered taxonomy accuracy was only 0.6332, below the
+  frozen `>=0.70` correction gate — a taxonomy-definition problem, not a
+  structural one.
+- `engram.assess.3` keeps every `engram.assess.2` fix unchanged and adds,
+  per suggested_kind, the pre-existing frozen #206 reviewer semantic
+  definition (`evals/calibration/reviewer_instructions.py`
+  `CANONICAL_SEMANTIC_BUNDLE`, frozen before this replay) plus a short
+  decision-boundary clause for the kind pairs content most often confuses:
+  fact vs. procedure, doctrine vs. procedure, decision vs. procedure,
+  invariant vs. doctrine, and observation vs. fact. It adds no new
+  categories, no epistemic/risk fields, and was authored without inspecting
+  the protected replay's per-case labels.
+
+Historical assessments recorded under `engram.assess.1` or `engram.assess.2`
+remain valid historical evidence and are not rewritten or invalidated by a
+later provider-prompt correction; calibration tooling continues to fail
+closed on prompt-identity mismatch across every correction, and no
+`engram.assess.1` or `engram.assess.2` calibration/profile state is reused
+for `engram.assess.3`.
 Its code contract is `assessment-engine-v1`. A request pins the provider,
 model, prompt, schema, inference configuration, and calibration artifact.
 An unsupported target is rejected. A worker with a different deployed contract

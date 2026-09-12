@@ -72,7 +72,7 @@ def _identity() -> TargetIdentity:
         campaign_tooling_repo_sha="a" * 40,
         assessment_schema_version="engram.assessment.v1",
         assessment_code_version="assessment-engine-v1",
-        prompt_version="engram.assess.1",
+        prompt_version="engram.assess.2",  # corrected #214 identity
         provider_adapter="openai",
         provider_model="test-model",
         provider_config_digest=_production_config_version(),

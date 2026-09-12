@@ -43,7 +43,9 @@ class StrictModel(BaseModel):
 
 class AssessmentContract(StrictModel):
     schema_version: Literal["engram.assessment.v1"] = "engram.assessment.v1"
-    prompt_version: Literal["engram.assess.1"] = "engram.assess.1"
+    prompt_version: Literal["engram.assess.1", "engram.assess.2", "engram.assess.3"] = (
+        "engram.assess.3"
+    )
     code_version: Literal["assessment-engine-v1"] = "assessment-engine-v1"
     provider: str = Field(max_length=128)
     model: str = Field(max_length=256)

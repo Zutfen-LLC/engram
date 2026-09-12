@@ -86,7 +86,7 @@ def _identity() -> TargetIdentity:
         campaign_tooling_repo_sha="a" * 40,
         assessment_schema_version="engram.assessment.v1",
         assessment_code_version="assessment-engine-v1",
-        prompt_version="engram.assess.1",
+        prompt_version="engram.assess.2",
         provider_adapter="openai",
         provider_model="model",
         provider_config_digest=_production_config_version(),
@@ -704,6 +704,10 @@ def _contract() -> AssessmentContract:
         model="model",
         config_version=_production_config_version(),
         calibration_version="dataset-v2",
+        # Matches _identity()'s pinned prompt_version -- fixed independent of
+        # the production default so this fixture pair stays stable across
+        # future engram.assess.N bumps.
+        prompt_version="engram.assess.2",
     )
 
 
@@ -2039,13 +2043,16 @@ def test_campaign_tooling_sha_is_not_a_runtime_trust_signal(tmp_path: Path) -> N
     fixture = _gate_fixture(tmp_path, deployed_repo_sha="b" * 40)
     kwargs = fixture["kwargs"]
     drifted = kwargs["deployed_contract"].model_copy(update={"prompt_version": "engram.assess.1"})
-    # Same prompt version: still identical, so still passes.
+    # The gate fixture pins a fixed identity (engram.assess.2), so drifting
+    # to the superseded engram.assess.1 is real contract drift and must fail
+    # closed, exactly like any other identity divergence -- independent of
+    # which prompt version is current production default.
     assert (
         gate_checks(
             **{**kwargs, "deployed_contract": drifted},
             authoritative_recall_evidence_path=fixture["proof_path"],
         )["recommendation"]
-        == "ENABLE_DOGFOOD_SHADOW_SELECTION"
+        == "KEEP_DISABLED"
     )
     # Any real contract drift on that newer SHA fails closed.
     for update in (
