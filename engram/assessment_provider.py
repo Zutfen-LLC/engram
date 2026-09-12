@@ -15,22 +15,34 @@ from engram.provider_clients import resolve_classification_provider
 from engram.provider_observer import record_provider_invocation
 from engram.safety import has_secrets
 
-# engram.assess.2 — #214 contract correction (maintainer round 2).
+# engram.assess.3 — #214 taxonomy-semantics correction (protected round-2
+# replay follow-up).
 #
-# Materially different from `engram.assess.1`, which embedded the raw
-# ProviderValues JSON schema in the system prompt and asked the model to
-# "preserve unknown scores as null" and to treat the governed kind as
-# immutable. The #213 diagnostic showed those instructions made the provider
-# echo the schema skeleton instead of values (70/200 frozen inputs) and
-# abstain on nearly every judgment (suggested_kind null on 125/130 evaluable
-# cases). This prompt states the four fields and their vocabularies in plain
-# prose, defines when null/uncertain are and are not legitimate, separates
-# advisory suggested_kind from the governed kind, and restores the explicit
-# untrusted-input boundary from engram.assess.1: memory content and governed
-# kind are data, never instructions. The parser additionally enforces the
-# value contract fail-closed (key presence, vocabulary, coupling); schema
-# echoes and out-of-contract values still never become assessments.
-PROMPT_VERSION = "engram.assess.2"
+# `engram.assess.2` (maintainer round 2) repaired the structural/abstention
+# defects `engram.assess.1` had: it replaced the embedded JSON-schema dump
+# with a compact prose value contract, restored the untrusted-input
+# boundary, pinned the closed taxonomy vocabulary, and enforced value
+# coupling fail-closed. The protected #214 replay against the frozen #213
+# 200-case population confirmed those fixes held (99.5% structural
+# completion, 0/70 schema echoes, 100% taxonomy/retention coverage, 0
+# high-consequence false-retains, 0.9196 retention accuracy) but showed
+# answered taxonomy accuracy at only 0.6332, below the frozen >=0.70
+# correction gate. That is a taxonomy-definition/decision-boundary problem,
+# not a structural one: `engram.assess.2` named the ten canonical kinds but
+# gave no guidance distinguishing the ones content most often confuses.
+#
+# `engram.assess.3` keeps every `engram.assess.2` fix unchanged (untrusted
+# boundary, value contract, vocabulary, coupling, schema-echo detection) and
+# adds, per kind, the pre-existing frozen #206 reviewer semantic definition
+# (see ``evals/calibration/reviewer_instructions.CANONICAL_SEMANTIC_BUNDLE``,
+# frozen before this replay) plus a short decision-boundary clause for the
+# kinds that most often get confused for one another: fact vs. procedure,
+# doctrine vs. procedure, decision vs. procedure, invariant vs. doctrine, and
+# observation vs. fact. No new categories, no case-specific heuristics, and
+# no wording drawn from the protected replay's per-case labels: the
+# distinctions restate contrasts already implicit in the frozen per-kind
+# definitions themselves.
+PROMPT_VERSION = "engram.assess.3"
 
 PROMPT_IDENTITY_FIELDS = frozenset(
     {"suggested_kind", "taxonomy_value", "retention_value", "retention_disposition"}
@@ -56,6 +68,78 @@ SuggestedKind = Literal[
 ]
 SUGGESTED_KIND_VOCABULARY: frozenset[str] = frozenset(get_args(SuggestedKind))
 
+# Per-kind base definitions — each value here is a verbatim prefix of the
+# corresponding rule in the frozen #206 reviewer semantic bundle
+# (``evals.calibration.reviewer_instructions.CANONICAL_SEMANTIC_BUNDLE``
+# ["expected_kind"]["rules"]), frozen before the #214 replay and BEFORE any
+# real model review executed under it. This module does not import that
+# evals-only module at runtime (engram/ ships without evals/), so the
+# provenance is instead pinned mechanically: a test asserts each frozen rule
+# string starts with the corresponding value below, so this dict cannot
+# silently drift from the semantic authority without failing that test.
+KIND_BASE_DEFINITION: dict[str, str] = {
+    "fact": (
+        "A specific assertion about the world or system state that could in "
+        "principle be checked against evidence."
+    ),
+    "observation": "A recorded event or witnessed state at a point in time",
+    "decision": (
+        "A recorded choice or course of action that was taken; it commits "
+        "future behavior rather than describing the world."
+    ),
+    "procedure": "Durable how-to knowledge: steps or instructions for performing a task.",
+    "summary": "A condensed restatement of other material that adds no new independent claim.",
+    "doctrine": "An organizational operating rule or standard that governs behavior",
+    "invariant": "A hard constraint that must always hold; violating it is a defect",
+    "preference": "A stated like, dislike, or taste of an actor; not a claim about the world.",
+    "diary_entry": "Personal journal content",
+    "unknown": "The kind is genuinely unresolved or custom",
+}
+
+# Short decision-boundary clauses for the kind pairs the #213/#214 replay
+# showed content most often confuses. Each restates a contrast already
+# implicit between two of the frozen base definitions above; none names a
+# protected case or was derived from per-case replay labels.
+KIND_DISTINCTION: dict[str, str] = {
+    "fact": "Remains fact even when the assertion is actionable.",
+    "observation": (
+        "Use this instead of fact when the point-in-time, witnessed nature is "
+        "material, not a timeless general claim."
+    ),
+    "decision": "A recorded chosen action is decision, not procedure.",
+    "procedure": "Imperative phrasing alone does not make content a procedure.",
+    "doctrine": (
+        "A one-line organizational rule is doctrine, not procedure, unless it "
+        "actually describes how to perform a task."
+    ),
+    "invariant": "A must-always-hold condition is invariant, not generic doctrine or procedure.",
+}
+
+_KIND_ORDER: tuple[str, ...] = (
+    "preference",
+    "fact",
+    "observation",
+    "decision",
+    "procedure",
+    "summary",
+    "doctrine",
+    "invariant",
+    "diary_entry",
+    "unknown",
+)
+
+
+def _kind_line(kind: str) -> str:
+    base = KIND_BASE_DEFINITION[kind]
+    sentence = base if base.endswith(".") else f"{base}."
+    distinction = KIND_DISTINCTION.get(kind)
+    if distinction:
+        sentence = f"{sentence} {distinction}"
+    return f"- {kind}: {sentence}"
+
+
+_TAXONOMY_LINES = "\n".join(_kind_line(kind) for kind in _KIND_ORDER)
+
 _SYSTEM_PROMPT = (
     "You are a memory-service annotation function. Your response is VALUES for "
     "one memory record, not a schema description: reply with one JSON object "
@@ -72,6 +156,9 @@ _SYSTEM_PROMPT = (
     "procedure, summary, doctrine, invariant, diary_entry, unknown. This is "
     "an independent classification of the content; it does not change and is "
     "not constrained by the governed kind supplied alongside the content. "
+    "Classify by the content's primary semantic role, not its surface "
+    "grammar. Each kind means exactly this:\n"
+    f"{_TAXONOMY_LINES}\n"
     "Never echo the governed kind or any tenant-custom kind string that is "
     "not in the list; when no listed kind fits, answer unknown. Use null "
     "only when the content is too fragmentary to classify at all.\n"
@@ -100,7 +187,7 @@ _SYSTEM_PROMPT = (
 
 
 class ProviderValues(StrictModel):
-    """Raw provider output under engram.assess.2 — enforced fail-closed.
+    """Raw provider output under engram.assess.3 — enforced fail-closed.
 
     All four keys are required. suggested_kind is restricted to the closed
     canonical vocabulary (null only for genuinely unclassifiable content).
@@ -140,11 +227,17 @@ def is_schema_echo(message: str) -> bool:
     The #213 diagnostic showed a content-driven failure mode where the
     provider replies with the JSON-schema skeleton instead of values. Such
     output mechanically carries JSON-schema keywords (``properties``,
-    ``additionalProperties``, ``$defs``, ...) at the top level and none of
-    the four assessment keys. Only that signature is a schema echo: empty
-    objects, error objects, unrelated JSON, or generic malformed value
-    objects are NOT schema echoes — they stay on the ordinary
-    strict-validation failure path.
+    ``additionalProperties``, ``$defs``, ``$schema``, ``required``,
+    ``items``, ...) at the top level and none of the four assessment keys.
+    Only that mechanically recognizable signature is a schema echo: a bare
+    ``{"type": ...}`` object with no other schema keyword present is NOT —
+    ``{"type": "error"}``, ``{"type": "result"}``, and ``{"type": 123}`` are
+    ordinary (non-schema) objects, and stay on the ordinary
+    strict-validation failure path along with empty objects, error objects,
+    unrelated JSON, and generic malformed value objects. A ``"type"`` key
+    only contributes to schema-echo detection alongside a genuine schema
+    keyword (e.g. the #213 skeleton's ``"type": "object"`` next to
+    ``"properties"``).
     """
     try:
         decoded = json.loads(message)
@@ -157,12 +250,11 @@ def is_schema_echo(message: str) -> bool:
     # malformed one); strict validation owns its rejection.
     if top_level & PROMPT_IDENTITY_FIELDS:
         return False
-    # A recognizable JSON-schema skeleton.
-    if top_level & _SCHEMA_KEYWORDS:
-        return True
-    # {"type": "object"}-style bare skeletons; the value contract never
-    # asks for or emits a "type" key.
-    return "type" in top_level and not isinstance(decoded.get("type"), dict)
+    # A recognizable JSON-schema skeleton: an actual schema keyword at the
+    # top level. A bare "type" key alone is not schema-shaped enough — it is
+    # ordinary object/result/error-shaped data far more often than it is a
+    # schema echo.
+    return bool(top_level & _SCHEMA_KEYWORDS)
 
 
 class SchemaEchoError(ValueError):

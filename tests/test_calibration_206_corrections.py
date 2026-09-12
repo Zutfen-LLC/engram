@@ -1203,6 +1203,7 @@ class TestFix4VerifiedLedger:
             model="model",
             config_version="sha256:" + "9" * 64,
             calibration_version="dataset-v2",
+            prompt_version="engram.assess.2",
         )
         # FIX-R4-5: the evidence frame must BE the campaign's frozen frame.
         frame = list(campaign["frame_rows"].values())

@@ -788,6 +788,7 @@ class TestFloorsConsumeOnlyFinalLabels:
             model="model",
             config_version="sha256:" + "9" * 64,
             calibration_version="dataset-v2",
+            prompt_version="engram.assess.2",
         )
         from tests.test_calibration_206_helpers import build_identity
 
@@ -887,6 +888,7 @@ class TestFloorsConsumeOnlyFinalLabels:
             model="model",
             config_version="sha256:" + "9" * 64,
             calibration_version="dataset-v2",
+            prompt_version="engram.assess.2",
         )
         identity = build_identity()
         import datetime as _dt

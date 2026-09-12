@@ -118,7 +118,7 @@ def cmd_freeze_target(args: argparse.Namespace) -> int:
         campaign_tooling_repo_sha=args.campaign_tooling_repo_sha,
         assessment_schema_version="engram.assessment.v1",
         assessment_code_version="assessment-engine-v1",
-        prompt_version="engram.assess.2",
+        prompt_version="engram.assess.3",
         provider_adapter="openai",
         provider_model="deepseek-ai/DeepSeek-V4-Flash",
         provider_config_digest=_resolve_provider_config_digest(args),

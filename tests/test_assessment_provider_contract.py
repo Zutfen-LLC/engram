@@ -1,11 +1,11 @@
 """#214 deterministic provider-contract correction tests.
 
-Proves the corrected engram.assess.2 request contract emits values instead of
+Proves the corrected engram.assess.3 request contract emits values instead of
 schema echoes, enforces the untrusted-input boundary, pins the closed taxonomy
-vocabulary, makes the provider-output parser enforce the full value contract
-fail-closed, and narrows schema-echo detection — all against a mocked
-OpenAI-compatible transport. No labels, no calibration state, no
-serving/selection changes.
+vocabulary with distinguishing per-kind semantics, makes the provider-output
+parser enforce the full value contract fail-closed, and narrows schema-echo
+detection — all against a mocked OpenAI-compatible transport. No labels, no
+calibration state, no serving/selection changes.
 """
 
 from __future__ import annotations
@@ -136,7 +136,7 @@ async def test_prompt_contract_is_value_contract_not_schema_dump(monkeypatch) ->
     captured = ok_transport(monkeypatch, values_object())
     await assess_content("Keep the deployment audit records.", "fact")
     system = system_prompt(captured)
-    assert system.startswith("engram.assess.2")
+    assert system.startswith("engram.assess.3")
     assert "additionalProperties" not in system
     assert "properties" not in system
     assert "Return only this JSON schema" not in system
@@ -266,7 +266,7 @@ def test_every_vocabulary_kind_parses_and_null_still_allowed() -> None:
 
 
 # ------------------------------------------------------------------
-# 3. Parser enforces engram.assess.2 fail-closed (maintainer finding 3)
+# 3. Parser enforces engram.assess.3 fail-closed (unchanged from engram.assess.2)
 # ------------------------------------------------------------------
 
 
@@ -622,13 +622,14 @@ async def test_missing_key_provider_output_remains_fail_closed(monkeypatch) -> N
     assert not isinstance(excinfo.value, SchemaEchoError)
 
 
-def test_prompt_identity_bumped_and_old_identity_still_parses() -> None:
-    """The corrected contract identity is material and old identities stay distinguishable."""
-    assert PROMPT_VERSION == "engram.assess.2"
-    assert PROMPT_VERSION != "engram.assess.1"
+def test_prompt_identity_bumped_and_old_identities_stay_distinguishable() -> None:
+    """The corrected contract identity is material and every prior identity stays
+    distinguishable and representable as historical evidence."""
+    assert PROMPT_VERSION == "engram.assess.3"
+    assert PROMPT_VERSION not in ("engram.assess.1", "engram.assess.2")
     current = AssessmentContract(provider="openai", model="m", config_version="sha256:" + "0" * 64)
-    assert current.prompt_version == "engram.assess.2"
-    legacy = current.model_copy(update={"prompt_version": "engram.assess.1"})
-    assert legacy.prompt_version != current.prompt_version
-    # Legacy assessments remain representable as historical evidence.
-    assert legacy.model_dump(mode="json")["prompt_version"] == "engram.assess.1"
+    assert current.prompt_version == "engram.assess.3"
+    for legacy_version in ("engram.assess.1", "engram.assess.2"):
+        legacy = current.model_copy(update={"prompt_version": legacy_version})
+        assert legacy.prompt_version != current.prompt_version
+        assert legacy.model_dump(mode="json")["prompt_version"] == legacy_version

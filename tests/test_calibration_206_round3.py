@@ -1577,6 +1577,7 @@ def _contract():
         model="model",
         config_version="sha256:" + "9" * 64,
         calibration_version="dataset-v2",
+        prompt_version="engram.assess.2",
     )
 
 
