@@ -297,6 +297,7 @@ def freeze_lane(
         from evals.calibration.api_reviewer_216 import (
             DirectReviewerAuthority216,
             require_direct_api_provenance,
+            verify_direct_reviewer_authority_216,
         )
         from evals.calibration.campaign_001k_stage_authority import verify_stage_authority
 
@@ -317,14 +318,13 @@ def freeze_lane(
                 ).read_text()
             )
         )
-        if (
-            direct_authority.target_identity_digest != stage.target_identity_digest
-            or direct_authority.sampling_manifest_digest != stage.sampling_manifest_digest
-            or direct_authority.membership_digest != stage.membership_digest
-            or direct_authority.source_packet_digest != source_packet_digest
-            or direct_authority.reviewer != reviewer
-        ):
-            raise ValueError("direct_api_reviewer_stage_authority_drift")
+        verify_direct_reviewer_authority_216(
+            direct_authority,
+            sampling=sampling,
+            stage=stage,
+            source_packet_digest=source_packet_digest,
+            reviewer=reviewer,
+        )
     else:
         require_machine_verified_execution_identity(
             records, lane_root=lane_directory(protected_root, reviewer.reviewer_slot)
@@ -457,6 +457,7 @@ def _load_one_frozen_lane(
         from evals.calibration.api_reviewer_216 import (
             DirectReviewerAuthority216,
             require_direct_api_provenance,
+            verify_direct_reviewer_authority_216,
         )
         from evals.calibration.campaign_001k_stage_authority import verify_stage_authority
 
@@ -477,14 +478,13 @@ def _load_one_frozen_lane(
                 ).read_text()
             )
         )
-        if (
-            direct_authority.target_identity_digest != stage.target_identity_digest
-            or direct_authority.sampling_manifest_digest != stage.sampling_manifest_digest
-            or direct_authority.membership_digest != stage.membership_digest
-            or direct_authority.source_packet_digest != source_packet_digest
-            or direct_authority.reviewer != reviewer
-        ):
-            raise ValueError("direct_api_reviewer_stage_authority_drift")
+        verify_direct_reviewer_authority_216(
+            direct_authority,
+            sampling=sampling,
+            stage=stage,
+            source_packet_digest=source_packet_digest,
+            reviewer=reviewer,
+        )
     else:
         require_machine_verified_execution_identity(
             records, lane_root=lane_directory(protected_root, reviewer.reviewer_slot)

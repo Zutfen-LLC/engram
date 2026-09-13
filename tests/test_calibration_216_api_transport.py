@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from threading import Thread
 
 import pytest
 
 from evals.calibration.api_reviewer_216 import (
     HTTPResponseCapture,
+    HTTPSDirectTransport,
     ReviewerRoute216,
     extract_response_216,
     reviewer_routes_216,
@@ -54,3 +57,39 @@ def test_extractor_requires_expected_model_and_rejects_tool_only_response() -> N
     ).encode()
     with pytest.raises(ValueError, match="direct_api_response_content_invalid"):
         extract_response_216(route, raw, {})
+
+
+def test_redirect_is_not_followed_and_authorization_cannot_reach_destination() -> None:
+    """The production opener returns the original 302 and makes no Location request."""
+    calls: list[tuple[str, str | None]] = []
+
+    class RedirectingHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            calls.append((self.path, self.headers.get("Authorization")))
+            self.send_response(302)
+            self.send_header("Location", "/evil")
+            self.send_header("x-request-id", "canonical")
+            self.end_headers()
+            self.wfile.write(b"redirect body\x00\xff")
+
+        def log_message(self, format: str, *_args: object) -> None:
+            del format
+            return None
+
+    server = HTTPServer(("127.0.0.1", 0), RedirectingHandler)
+    worker = Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/canonical"
+        capture = HTTPSDirectTransport().post(
+            url=url, headers={"Authorization": "Bearer never-forward"}, body=b"{}"
+        )
+    finally:
+        server.shutdown()
+        worker.join(timeout=5)
+        server.server_close()
+
+    assert calls == [("/canonical", "Bearer never-forward")]
+    assert capture.status == 302
+    assert capture.body == b"redirect body\x00\xff"
+    assert capture.safe_headers == {"location": "/evil", "x-request-id": "canonical"}

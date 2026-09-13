@@ -11,12 +11,10 @@ from typing import Any
 
 from evals.calibration.api_reviewer_216 import (
     TRANSPORT_ENVELOPE,
-    APIReviewer216,
     DirectReviewerAuthority216,
     DirectReviewerRunner216,
-    HTTPSDirectTransport,
-    Transport,
     reviewer_routes_216,
+    verify_direct_reviewer_authority_216,
 )
 from evals.calibration.campaign_001k import CAMPAIGN_ID_001K
 from evals.calibration.campaign_001k_stage_authority import verify_stage_authority
@@ -98,7 +96,6 @@ def run_api_dev_review(
     protected_root: Path,
     *,
     dry_run: bool = False,
-    transport: Transport | None = None,
     credentials: dict[str, str] | None = None,
 ) -> dict[str, object]:
     """Execute only canonical pending DEV requests; dry run transmits zero bytes."""
@@ -130,7 +127,6 @@ def run_api_dev_review(
     }
     if dry_run:
         return report
-    client = APIReviewer216(transport=transport or HTTPSDirectTransport(), credentials=supplied)
     neutral = protected_root / f"{CAMPAIGN_ID_001K}-dev-v1.neutral.json"
     manifest = protected_root / "neutral-packet-manifest.json"
     sessions: dict[str, LaneSession] = {}
@@ -149,15 +145,19 @@ def run_api_dev_review(
             provenance_mode="direct_api_provenance",
         )
         sessions[slot] = session
-        runners[slot] = DirectReviewerRunner216(
+        authority = _authority(
             session,
-            _authority(
-                session,
-                target_digest=stage.target_identity_digest,
-                membership_digest=stage.membership_digest,
-            ),
-            reviewer=client,
+            target_digest=stage.target_identity_digest,
+            membership_digest=stage.membership_digest,
         )
+        verify_direct_reviewer_authority_216(
+            authority,
+            sampling=sampling,
+            stage=stage,
+            source_packet_digest=source_digest,
+            reviewer=reviewer,
+        )
+        runners[slot] = DirectReviewerRunner216(session, authority, credentials=supplied)
         batches[slot] = session.emit_requests(neutral, sampling=sampling, manifest_path=manifest)
 
     def execute(slot: str) -> tuple[str, int]:
@@ -175,6 +175,39 @@ def run_api_dev_review(
 
     with ThreadPoolExecutor(max_workers=3) as pool:
         result = dict(pool.map(execute, REVIEWER_SLOTS))
-    report["transmitted_requests"] = 306
+    attempts_root = protected_root / "lanes"
+    receipts = list(attempts_root.glob("*/api-reviewer/attempts/*/attempt-*/attempt.json"))
+    receipt_values = [json.loads(path.read_text()) for path in receipts]
+    report["transmitted_requests"] = len(receipt_values)
+    report["pre_response_transport_failures"] = sum(
+        receipt.get("failure_class") == "transport_pre_response" for receipt in receipt_values
+    )
+    report["http_non_2xx_attempts"] = sum(
+        receipt.get("http_response_received") and not 200 <= int(receipt["http_status"]) < 300
+        for receipt in receipt_values
+    )
+    report["retryable_http_attempts"] = sum(
+        receipt.get("failure_class") == "retryable_http" for receipt in receipt_values
+    )
+    report["non_retryable_http_attempts"] = sum(
+        receipt.get("failure_class") == "non_retryable_http" for receipt in receipt_values
+    )
+    report["mechanical_retry_attempts"] = report["pre_response_transport_failures"]
+    report["structural_retry_attempts"] = sum(
+        receipt.get("failure_class") == "structural_format" for receipt in receipt_values
+    )
+    accepted_judged = sum(
+        receipt.get("accepted") and receipt["attempt"]["outcome_status"] == "judged"
+        for receipt in receipt_values
+    )
+    accepted_refused = sum(
+        receipt.get("accepted") and receipt["attempt"]["outcome_status"] == "refused"
+        for receipt in receipt_values
+    )
+    report["accepted_judged"] = accepted_judged
+    report["accepted_refused"] = accepted_refused
+    report["unresolved_samples"] = 306 - accepted_judged - accepted_refused
+
+    report["completed_logical_reviews"] = sum(result.values())
     report["lanes"] = {slot: {"accepted": result[slot], "frozen": True} for slot in REVIEWER_SLOTS}
     return report

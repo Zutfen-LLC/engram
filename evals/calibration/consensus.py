@@ -369,13 +369,13 @@ class ExecutionEvidence(Record):
             if not (self.provider_request_id and self.provider_response_id):
                 raise ValueError("provider_metadata_identity_requires_provider_ids")
             verify_evidence_against_artifact(self)
-            if self.subscription_attestation is not None:
-                raise ValueError("provider_metadata_must_not_claim_subscription_attestation")
+            if self.subscription_attestation is not None or self.direct_api_provenance is not None:
+                raise ValueError("provider_metadata_must_not_claim_other_identity_source")
             if self.machine_executor_provenance is not None:
                 raise ValueError("provider_metadata_must_not_claim_machine_executor_provenance")
         elif self.identity_source == "operator_attested_subscription_ui":
-            if self.provider_metadata is not None:
-                raise ValueError("subscription_ui_must_not_claim_provider_metadata")
+            if self.provider_metadata is not None or self.direct_api_provenance is not None:
+                raise ValueError("subscription_ui_must_not_claim_other_identity_source")
             if self.provider_request_id is not None or self.provider_response_id is not None:
                 raise ValueError("subscription_ui_must_not_claim_provider_ids")
             from evals.calibration.subscription_ui import verify_evidence_subscription_attestation
@@ -384,7 +384,11 @@ class ExecutionEvidence(Record):
             if self.machine_executor_provenance is not None:
                 raise ValueError("subscription_ui_must_not_claim_machine_executor_provenance")
         elif self.identity_source == "machine_executor_provenance":
-            if self.provider_metadata is not None or self.subscription_attestation is not None:
+            if (
+                self.provider_metadata is not None
+                or self.subscription_attestation is not None
+                or self.direct_api_provenance is not None
+            ):
                 raise ValueError("machine_executor_provenance_must_not_claim_other_identity_source")
             proof = self.machine_executor_provenance
             required = {
@@ -425,6 +429,9 @@ class ExecutionEvidence(Record):
             proof = self.direct_api_provenance
             required = {
                 "authority_digest",
+                "attempt_chain_digest",
+                "accepted_attempt_sequence",
+                "accepted_attempt_receipt_sha256",
                 "attempt_digest",
                 "request_sha256",
                 "response_sha256",
@@ -434,7 +441,11 @@ class ExecutionEvidence(Record):
             if (
                 not isinstance(proof, dict)
                 or set(proof) != required
-                or not all(isinstance(proof[key], str) and proof[key] for key in required)
+                or not isinstance(proof.get("accepted_attempt_sequence"), int)
+                or not all(
+                    isinstance(proof[key], str) and proof[key]
+                    for key in required - {"accepted_attempt_sequence"}
+                )
             ):
                 raise ValueError("direct_api_provenance_requires_bound_receipt")
         else:
@@ -442,8 +453,11 @@ class ExecutionEvidence(Record):
                 raise ValueError("executor_attestation_must_not_claim_provider_metadata")
             if self.subscription_attestation is not None:
                 raise ValueError("executor_attestation_must_not_claim_subscription_attestation")
-            if self.machine_executor_provenance is not None:
-                raise ValueError("executor_attestation_must_not_claim_machine_executor_provenance")
+            if (
+                self.machine_executor_provenance is not None
+                or self.direct_api_provenance is not None
+            ):
+                raise ValueError("executor_attestation_must_not_claim_executor_provenance")
         if not self.executor_identity:
             raise ValueError("execution_evidence_requires_executor_identity")
         return self

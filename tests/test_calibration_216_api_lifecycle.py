@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from pathlib import Path
 
+import pytest
+
+import evals.calibration.api_reviewer_216 as api_reviewer_216
 from evals.calibration.api_dev_review_216 import run_api_dev_review
 from evals.calibration.api_reviewer_216 import HTTPResponseCapture, TransportFailure
 from evals.calibration.consensus import CONSENSUS_PROTOCOL_VERSION
@@ -57,6 +61,8 @@ class _SyntheticTransport:
         self.calls.append((model, sample_id, body))
         if model == "openai/gpt-5.6-terra" and sample_id == _FRESH_DEV_102[1] and number == 1:
             raise TransportFailure("synthetic_transport_failure")
+        if model == "glm-5.3" and sample_id == _FRESH_DEV_102[4] and number == 1:
+            return HTTPResponseCapture(503, {"x-request-id": "fake-503"}, b'{"error":"busy"}', url)
         raw = _response(
             sample_id,
             refused=(model == "glm-5.3" and sample_id in _FRESH_DEV_102[2:4]),
@@ -117,22 +123,68 @@ def _prepare_canonical_synthetic_root(root: Path) -> None:
 
 
 def test_direct_api_102x3_lifecycle_uses_canonical_lanes_and_persists_retries(
-    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _prepare_canonical_synthetic_root(tmp_path)
     transport = _SyntheticTransport()
 
+    monkeypatch.setattr(api_reviewer_216, "_CONCRETE_TRANSPORT_TYPE", lambda: transport)
     report = run_api_dev_review(
         tmp_path,
-        transport=transport,
         credentials={"OPENROUTER_API_KEY": "fake", "ZAI_API_KEY": "fake"},
     )
 
     assert report["logical_cases"] == 102
     assert report["reviewer_lanes"] == 3
     assert report["planned_logical_calls"] == 306
-    assert report["transmitted_requests"] == 306
-    assert len(transport.calls) == 308
+    assert report["completed_logical_reviews"] == 306
+    assert report["transmitted_requests"] == 309
+    assert report["pre_response_transport_failures"] == 1
+    assert report["http_non_2xx_attempts"] == 1
+    assert report["retryable_http_attempts"] == 1
+    assert report["structural_retry_attempts"] == 1
+    malformed_root = (
+        tmp_path / "lanes" / "model_a" / "api-reviewer" / "attempts" / _FRESH_DEV_102[0]
+    )
+    mechanical_root = (
+        tmp_path / "lanes" / "model_b" / "api-reviewer" / "attempts" / _FRESH_DEV_102[1]
+    )
+    assert sorted(path.name for path in malformed_root.glob("attempt-*")) == [
+        "attempt-000001",
+        "attempt-000002",
+    ]
+    assert sorted(path.name for path in mechanical_root.glob("attempt-*")) == [
+        "attempt-000001",
+        "attempt-000002",
+    ]
+    assert (malformed_root / "attempt-000001" / "response.raw").is_file()
+    assert not (mechanical_root / "attempt-000001" / "response.raw").exists()
+    receipt = json.loads((mechanical_root / "attempt-000001" / "attempt.json").read_text())
+    assert receipt["http_response_received"] is False
+    assert receipt["raw_response_present"] is False
+    assert receipt["failure_class"] == "transport_pre_response"
+    assert receipt["attempt"]["raw_response"] == {
+        "encoding": "utf-8",
+        "data": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    }
+    pointer = json.loads(
+        (
+            tmp_path
+            / "lanes"
+            / "model_a"
+            / "api-reviewer"
+            / "accepted"
+            / f"{_FRESH_DEV_102[0]}.json"
+        ).read_text()
+    )
+    receipt = malformed_root / "attempt-000002" / "attempt.json"
+    assert pointer["accepted_attempt_sequence"] == 2
+    assert (
+        pointer["accepted_attempt_receipt_sha256"]
+        == hashlib.sha256(receipt.read_bytes()).hexdigest()
+    )
+    assert len(transport.calls) == 309
     assert len({(model, sid) for model, sid, _body in transport.calls}) == 306
 
     from evals.calibration.api_dev_review_216 import _reviewer
@@ -258,3 +310,14 @@ def test_direct_api_102x3_lifecycle_uses_canonical_lanes_and_persists_retries(
     assert len(ledger.ledger.wrappers) == 102
     assert {wrapper.sample_id for wrapper in ledger.ledger.wrappers} == set(_FRESH_DEV_102)
     assert any(wrapper.entered_human_queue for wrapper in ledger.ledger.wrappers)
+
+    # A later accepted record is invalid without every prior physical attempt.
+    shutil.rmtree(malformed_root / "attempt-000001")
+    with pytest.raises(ValueError, match="direct_api_attempt_chain_sequence_gap_or_duplicate"):
+        load_frozen_lanes(
+            tmp_path,
+            campaign_id="eng-calibration-001k",
+            sampling=sampling,
+            source_packet_digest=source_packet_digest,
+            reviewers=reviewers,
+        )

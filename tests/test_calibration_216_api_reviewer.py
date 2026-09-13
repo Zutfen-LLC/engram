@@ -8,15 +8,19 @@ retained as digest-bound evidence.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 
 import pytest
 
+import evals.calibration.api_reviewer_216 as api_reviewer_216
 from evals.calibration.api_reviewer_216 import (
     APIReviewer216,
     CredentialUnavailableError,
     DirectAPIReviewAttempt216,
+    HTTPResponseCapture,
+    Transport,
     reviewer_routes_216,
     verify_direct_api_attempt_216,
 )
@@ -54,8 +58,13 @@ def _chat_response(content: str) -> bytes:
     return json.dumps({"choices": [{"message": {"content": content}}]}).encode()
 
 
-def _reviewer(transport: FakeTransport, **credentials: str) -> APIReviewer216:
-    return APIReviewer216(transport=transport, credentials=credentials)
+def _reviewer(transport: Transport, **credentials: str) -> APIReviewer216:
+    patcher = pytest.MonkeyPatch()
+    patcher.setattr(api_reviewer_216, "_CONCRETE_TRANSPORT_TYPE", lambda: transport)
+    try:
+        return APIReviewer216(credentials=credentials)
+    finally:
+        patcher.undo()
 
 
 def test_routes_freeze_exact_openrouter_models_and_no_fallback_provider_choices() -> None:
@@ -99,7 +108,7 @@ def test_configuration_and_serialized_request_never_contain_credentials() -> Non
     reviewer = _reviewer(transport, openrouter=secret, zai=secret)
 
     serialized_config = reviewer.serialized_configuration()
-    accepted = reviewer.review("model_a", _SAMPLE, max_format_attempts=3)
+    accepted = reviewer.review("model_a", _SAMPLE)
     _url, headers, body = transport.calls[0]
 
     assert secret not in serialized_config.decode()
@@ -158,12 +167,44 @@ def test_raw_request_response_and_extracted_content_mutations_fail_closed(
         verify_direct_api_attempt_216(replace(attempt, **{field: replacement}))
 
 
+def test_http_non_2xx_is_retained_as_a_first_class_attempt() -> None:
+    raw_response = b'{"error":{"message":"busy"}}'
+
+    class HTTPFailureTransport:
+        def post(self, *, url: str, headers: dict[str, str], body: bytes) -> HTTPResponseCapture:
+            del headers, body
+            return HTTPResponseCapture(503, {"x-request-id": "retry-id"}, raw_response, url)
+
+    attempt = _reviewer(HTTPFailureTransport(), OPENROUTER_API_KEY="token").review(
+        "model_a", _SAMPLE
+    )
+
+    assert attempt.http_status == 503
+    assert attempt.raw_response == raw_response
+    assert attempt.response_safe_headers == {"x-request-id": "retry-id"}
+    assert attempt.outcome_status == "provider_error"
+    assert attempt.failure_class == "retryable_http"
+    assert attempt.retryable is True
+
+
+def test_redirect_capture_is_terminal_authority_failure() -> None:
+    class RedirectTransport:
+        def post(self, *, url: str, headers: dict[str, str], body: bytes) -> HTTPResponseCapture:
+            del headers, body
+            return HTTPResponseCapture(302, {"location": "https://evil.invalid/"}, b"redirect", url)
+
+    attempt = _reviewer(RedirectTransport(), OPENROUTER_API_KEY="token").review("model_a", _SAMPLE)
+
+    assert attempt.http_status == 302
+    assert attempt.failure_class == "authority_route_redirect"
+    assert attempt.retryable is False
+    assert attempt.outcome_status == "provider_error"
+
+
 def test_refusal_is_preserved_as_response_bytes_without_a_retry() -> None:
     refusal = '{"sample_id":"s0123456789abcdef01234567","outcome":"refused","error_code":"scope"}'
     transport = FakeTransport([_chat_response(refusal), _chat_response(_judged_content())])
-    attempt = _reviewer(transport, openrouter="token").review(
-        "model_a", _SAMPLE, max_format_attempts=3
-    )
+    attempt = _reviewer(transport, openrouter="token").review("model_a", _SAMPLE)
 
     assert attempt.parse_status == "malformed"
     assert attempt.outcome_status == "refused"
@@ -188,9 +229,47 @@ def test_accepted_response_never_retries_even_when_more_attempts_are_allowed() -
     transport = FakeTransport(
         [_chat_response(_judged_content()), _chat_response(_judged_content())]
     )
-    attempt = _reviewer(transport, openrouter="token").review(
-        "model_b", _SAMPLE, max_format_attempts=3
-    )
+    attempt = _reviewer(transport, openrouter="token").review("model_b", _SAMPLE)
 
     assert attempt.outcome_status == "judged"
     assert len(transport.calls) == 1
+
+
+@pytest.mark.parametrize("raw", [b"ordinary utf-8\x00", b"\xff\xfe\x00binary-error"])
+def test_raw_byte_envelopes_round_trip_losslessly(raw: bytes) -> None:
+    attempt = _reviewer(
+        FakeTransport([_chat_response(_judged_content())]), openrouter="token"
+    ).review("model_a", _SAMPLE)
+    serialized = replace(
+        attempt, raw_response=raw, raw_response_sha256=hashlib.sha256(raw).hexdigest()
+    ).model_dump()
+
+    restored = DirectAPIReviewAttempt216.from_dump(serialized)
+
+    assert restored.raw_response == raw
+    envelope = serialized["raw_response"]
+    assert envelope["sha256"] == hashlib.sha256(raw).hexdigest()
+    assert envelope["encoding"] == (
+        "utf-8" if raw.decode("utf-8", errors="ignore").encode() == raw else "base64"
+    )
+
+
+def test_byte_envelope_tampering_fails_closed() -> None:
+    raw = b"\xff\x00binary"
+    attempt = _reviewer(
+        FakeTransport([_chat_response(_judged_content())]), openrouter="token"
+    ).review("model_a", _SAMPLE)
+    serialized = replace(
+        attempt, raw_response=raw, raw_response_sha256=hashlib.sha256(raw).hexdigest()
+    ).model_dump()
+    envelope = serialized["raw_response"]
+    assert isinstance(envelope, dict)
+
+    for mutation in (
+        {**envelope, "data": envelope["data"] + "A"},
+        {**envelope, "encoding": "utf-8"},
+        {**envelope, "sha256": "0" * 64},
+    ):
+        tampered = {**serialized, "raw_response": mutation}
+        with pytest.raises(ValueError, match="direct_api_attempt_serialized_bytes"):
+            DirectAPIReviewAttempt216.from_dump(tampered)
