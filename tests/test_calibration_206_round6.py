@@ -127,6 +127,21 @@ def _raw_refusal(sample_id: str) -> str:
     return json.dumps({"sample_id": sample_id, "outcome": "refused", "error_code": "refusal"})
 
 
+def test_legacy_206_reviewer_identity_digest_matches_literal_pre_fix5_golden() -> None:
+    identity = ReviewerIdentity(
+        reviewer_slot="model_a",
+        reviewer_family="claude-opus",
+        campaign_id="legacy",
+        provider_model_identifier="claude-opus-exact-2026-09",
+        reviewer_config_digest="a" * 64,
+        prompt_digest=labeling_instructions_digest(),
+    )
+    assert (
+        identity.lane_identity_digest()
+        == "4049768143c798c727e391c50ba52e005f90a29d5064acf3ede30afb989ba46c"
+    )
+
+
 def _setup_lane(
     tmp_path: Path,
     *,

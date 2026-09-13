@@ -237,6 +237,12 @@ def validate_lane_provenance_with_raw(
         require_machine_executor_provenance(
             records, lane_root=lane_root_for(protected_root, lane.reviewer.reviewer_slot)
         )
+    elif mode == "direct_api_provenance":
+        from evals.calibration.api_reviewer_216 import require_direct_api_provenance
+
+        require_direct_api_provenance(
+            records, lane_root=lane_root_for(protected_root, lane.reviewer.reviewer_slot)
+        )
     else:
         require_machine_verified_execution_identity(
             records, lane_root=lane_root_for(protected_root, lane.reviewer.reviewer_slot)

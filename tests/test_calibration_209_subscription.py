@@ -233,6 +233,33 @@ def _import(campaign: dict, slot: str, entry: dict, raw: str, **kwargs):
     )
 
 
+def test_legacy_209_reviewer_identity_digest_matches_literal_pre_fix5_golden() -> None:
+    """The fixture bytes/digest were frozen under the pre-FIX5 identity domain."""
+    from evals.calibration.consensus import ReviewerIdentity
+
+    identity = ReviewerIdentity(
+        reviewer_slot="model_a",
+        reviewer_family="claude-opus",
+        campaign_id="legacy",
+        provider_model_identifier="Claude Opus 4.8",
+        reviewer_config_digest="a" * 64,
+        prompt_digest=labeling_instructions_digest(),
+    )
+    assert identity.model_dump(mode="json") == {
+        "reviewer_slot": "model_a",
+        "reviewer_family": "claude-opus",
+        "campaign_id": "legacy",
+        "provider_model_identifier": "Claude Opus 4.8",
+        "reviewer_config_digest": "a" * 64,
+        "prompt_digest": labeling_instructions_digest(),
+        "label_guide_version": "engram-calibration-guide-157-v1",
+    }
+    assert (
+        identity.lane_identity_digest()
+        == "853a117d4eed2fbc9ea9cbf3e3b7cef8fa97acdd8686d670c7ffd01a4fbda471"
+    )
+
+
 # =============================================================================
 # FIX-1 — frozen visible-model lane authority
 # =============================================================================

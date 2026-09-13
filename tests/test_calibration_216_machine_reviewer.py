@@ -81,6 +81,13 @@ def test_wrong_identity_is_rejected_before_any_command(tmp_path: Path) -> None:
         _authority(session, resolved_model_identifier="other-model")
 
 
+def test_default_hermes_reviewer_transport_is_disabled() -> None:
+    from evals.calibration.machine_reviewer_216 import _subprocess_command_runner
+
+    with pytest.raises(RuntimeError, match="hermes_reviewer_execution_disabled"):
+        _subprocess_command_runner(("hermes", "chat"), cwd=Path("."))
+
+
 def test_slots_use_isolated_raw_paths_and_fresh_oneshot_commands(tmp_path: Path) -> None:
     session_a, _sampling, _packet, _manifest = _setup_lane(
         tmp_path / "a",

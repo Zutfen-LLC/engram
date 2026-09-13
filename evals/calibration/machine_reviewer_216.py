@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -555,9 +554,12 @@ class MachineReviewerRunner:
 
 
 def _subprocess_command_runner(argv: tuple[str, ...], *, cwd: Path) -> CommandResult:
-    """Real runner retained for operators; tests must inject a fake runner."""
-    started_at = datetime.now(UTC)
-    completed = subprocess.run(argv, cwd=cwd, check=False, capture_output=True)
-    ended_at = datetime.now(UTC)
-    # stdout is retained byte-for-byte even when the CLI exits nonzero.
-    return CommandResult(completed.stdout, completed.returncode, started_at, ended_at)
+    """Disabled FIX5 transport; #216 must use direct HTTPS review transport.
+
+    Keeping this failure closed preserves historical parser fixtures without
+    permitting a future caller to re-enable Hermes reviewer execution by
+    accident. Tests exercise this legacy implementation only with injected
+    local fakes; no production command reaches this function.
+    """
+    del argv, cwd
+    raise RuntimeError("hermes_reviewer_execution_disabled_for_eng_calibration_001k")

@@ -104,7 +104,7 @@ FAMILY_BY_SLOT: dict[str, str] = dict(zip(REVIEWER_SLOTS, REVIEWER_FAMILIES, str
 # names unchanged while identifying the actual machine models accurately.
 CAMPAIGN_216_FAMILY_BY_SLOT: dict[str, str] = {
     "model_a": "claude-sonnet-5",
-    "model_b": "gpt-5-6-sol",
+    "model_b": "gpt-5-6-terra",
     "model_c": "glm-5-3",
 }
 
@@ -175,6 +175,7 @@ IdentitySource = Literal[
     "executor_attestation",
     "operator_attested_subscription_ui",
     "machine_executor_provenance",
+    "direct_api_provenance",
 ]
 # Every Dimensions field that is not consensus-critical is diagnostic-only:
 # reviewers MAY return these fields, and disagreement on them NEVER creates a
@@ -254,7 +255,16 @@ class ReviewerIdentity(Record):
         return self
 
     def lane_identity_digest(self) -> Digest:
-        return digest_of(self.model_dump(mode="json"))
+        """Digest the historical #206/#209 domain without FIX5 additions.
+
+        ``campaign_id`` was introduced after #206/#209 evidence had frozen.
+        It is execution authority for #216, not historical reviewer identity;
+        including it would silently invalidate protected legacy digests.
+        """
+        projection = self.model_dump(mode="json")
+        if self.campaign_id == "legacy":
+            projection.pop("campaign_id", None)
+        return digest_of(projection)
 
 
 class ModelJudgment(Record):
@@ -345,6 +355,9 @@ class ExecutionEvidence(Record):
     # #216: provider metadata remains its own stricter mode. Hermes command
     # execution instead carries a receipt bound to frozen authority/attempt bytes.
     machine_executor_provenance: dict[str, Any] | None = None
+    # #216 FIX6: direct HTTPS evidence, independently re-verified from the
+    # lane-local direct-api authority/attempt artifacts at every boundary.
+    direct_api_provenance: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def evidence_contract(self) -> Self:
@@ -402,6 +415,28 @@ class ExecutionEvidence(Record):
                 raise ValueError("machine_executor_provenance_requires_bound_receipt")
             if self.provider_request_id is not None or self.provider_response_id is not None:
                 raise ValueError("machine_executor_provenance_must_not_claim_provider_ids")
+        elif self.identity_source == "direct_api_provenance":
+            if (
+                self.provider_metadata is not None
+                or self.subscription_attestation is not None
+                or self.machine_executor_provenance is not None
+            ):
+                raise ValueError("direct_api_provenance_must_not_claim_other_identity_source")
+            proof = self.direct_api_provenance
+            required = {
+                "authority_digest",
+                "attempt_digest",
+                "request_sha256",
+                "response_sha256",
+                "extracted_sha256",
+                "extractor_version",
+            }
+            if (
+                not isinstance(proof, dict)
+                or set(proof) != required
+                or not all(isinstance(proof[key], str) and proof[key] for key in required)
+            ):
+                raise ValueError("direct_api_provenance_requires_bound_receipt")
         else:
             if self.provider_metadata is not None:
                 raise ValueError("executor_attestation_must_not_claim_provider_metadata")
@@ -462,6 +497,7 @@ class ExecutionReceipt(Record):
     # #209: carried verbatim from the evidence for subscription-UI records.
     subscription_attestation: dict[str, Any] | None = None
     machine_executor_provenance: dict[str, Any] | None = None
+    direct_api_provenance: dict[str, Any] | None = None
     evidence: ExecutionEvidence
     evidence_digest: Digest
 
@@ -486,6 +522,7 @@ class ExecutionReceipt(Record):
             and self.provider_metadata == evidence.provider_metadata
             and self.subscription_attestation == evidence.subscription_attestation
             and self.machine_executor_provenance == evidence.machine_executor_provenance
+            and self.direct_api_provenance == evidence.direct_api_provenance
         )
         if not derived_fields:
             raise ValueError("execution_receipt_not_derived_from_its_evidence")
@@ -514,6 +551,7 @@ class ExecutionReceipt(Record):
             provider_metadata=evidence.provider_metadata,
             subscription_attestation=evidence.subscription_attestation,
             machine_executor_provenance=evidence.machine_executor_provenance,
+            direct_api_provenance=evidence.direct_api_provenance,
             evidence=evidence,
             evidence_digest=evidence.evidence_digest(),
         )

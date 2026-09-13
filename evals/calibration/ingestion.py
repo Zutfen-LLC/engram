@@ -586,6 +586,7 @@ def lane_provenance_mode(lane_root: Path) -> str:
         "provider_metadata",
         "operator_attested_subscription_ui",
         "machine_executor_provenance",
+        "direct_api_provenance",
     ):
         raise ValueError("lane_unknown_provenance_mode")
     return str(mode)
@@ -855,7 +856,10 @@ class LaneAuthority(Record):
     # ``operator_attested_subscription_ui`` is settable ONLY at
     # subscription-lane init under the frozen campaign opt-in.
     provenance_mode: Literal[
-        "provider_metadata", "operator_attested_subscription_ui", "machine_executor_provenance"
+        "provider_metadata",
+        "operator_attested_subscription_ui",
+        "machine_executor_provenance",
+        "direct_api_provenance",
     ] = "provider_metadata"
 
     @model_validator(mode="after")
@@ -955,7 +959,10 @@ class LaneSession:
         neutral_packet_path: Path,
         neutral_packet_manifest: Path,
         provenance_mode: Literal[
-            "provider_metadata", "operator_attested_subscription_ui", "machine_executor_provenance"
+            "provider_metadata",
+            "operator_attested_subscription_ui",
+            "machine_executor_provenance",
+            "direct_api_provenance",
         ] = ("provider_metadata"),
     ) -> LaneSession:
         """Bind one lane to one frozen reviewer identity (exclusive-create).

@@ -987,6 +987,15 @@ def cmd_216_fresh_packet(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_216_api_dev_review(args: argparse.Namespace) -> int:
+    """Run the authoritative direct-HTTPS DEV-only #216 path."""
+    from evals.calibration.api_dev_review_216 import run_api_dev_review
+
+    report = run_api_dev_review(Path(args.protected_dir), dry_run=args.dry_run)
+    print(json.dumps(report, sort_keys=True))
+    return 0
+
+
 def cmd_216_machine_dev_review(args: argparse.Namespace) -> int:
     """Run the sole #216 machine DEV campaign path; no consensus/Phase 5."""
     from evals.calibration.machine_dev_review_216 import run_machine_dev_review
@@ -1163,6 +1172,16 @@ def main() -> int:
         "--dry-run", action="store_true", help="verify DEV authority and show planned lanes only"
     )
     command.set_defaults(func=cmd_216_machine_dev_review)
+
+    command = sub.add_parser(
+        "216-api-dev-review",
+        help="authoritative direct-HTTPS DEV-102 reviewer runner (#216; no Phase 5)",
+    )
+    command.add_argument("--protected-dir", required=True)
+    command.add_argument(
+        "--dry-run", action="store_true", help="verify all 306 canonical calls without transport"
+    )
+    command.set_defaults(func=cmd_216_api_dev_review)
 
     command = sub.add_parser("freeze-target")
     command.add_argument(

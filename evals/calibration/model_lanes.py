@@ -293,6 +293,38 @@ def freeze_lane(
             or authority.reviewer != reviewer
         ):
             raise ValueError("machine_reviewer_stage_authority_drift")
+    elif mode == "direct_api_provenance":
+        from evals.calibration.api_reviewer_216 import (
+            DirectReviewerAuthority216,
+            require_direct_api_provenance,
+        )
+        from evals.calibration.campaign_001k_stage_authority import verify_stage_authority
+
+        require_direct_api_provenance(
+            records, lane_root=lane_directory(protected_root, reviewer.reviewer_slot)
+        )
+        stage = verify_stage_authority(
+            protected_root=protected_root,
+            sampling=sampling,
+            source_packet_digest=source_packet_digest,
+        )
+        direct_authority = DirectReviewerAuthority216.model_validate(
+            json.loads(
+                (
+                    lane_directory(protected_root, reviewer.reviewer_slot)
+                    / "api-reviewer"
+                    / "authority.json"
+                ).read_text()
+            )
+        )
+        if (
+            direct_authority.target_identity_digest != stage.target_identity_digest
+            or direct_authority.sampling_manifest_digest != stage.sampling_manifest_digest
+            or direct_authority.membership_digest != stage.membership_digest
+            or direct_authority.source_packet_digest != source_packet_digest
+            or direct_authority.reviewer != reviewer
+        ):
+            raise ValueError("direct_api_reviewer_stage_authority_drift")
     else:
         require_machine_verified_execution_identity(
             records, lane_root=lane_directory(protected_root, reviewer.reviewer_slot)
@@ -421,6 +453,38 @@ def _load_one_frozen_lane(
             or authority.reviewer != reviewer
         ):
             raise ValueError("machine_reviewer_stage_authority_drift")
+    elif mode == "direct_api_provenance":
+        from evals.calibration.api_reviewer_216 import (
+            DirectReviewerAuthority216,
+            require_direct_api_provenance,
+        )
+        from evals.calibration.campaign_001k_stage_authority import verify_stage_authority
+
+        require_direct_api_provenance(
+            records, lane_root=lane_directory(protected_root, reviewer.reviewer_slot)
+        )
+        stage = verify_stage_authority(
+            protected_root=protected_root,
+            sampling=sampling,
+            source_packet_digest=source_packet_digest,
+        )
+        direct_authority = DirectReviewerAuthority216.model_validate(
+            json.loads(
+                (
+                    lane_directory(protected_root, reviewer.reviewer_slot)
+                    / "api-reviewer"
+                    / "authority.json"
+                ).read_text()
+            )
+        )
+        if (
+            direct_authority.target_identity_digest != stage.target_identity_digest
+            or direct_authority.sampling_manifest_digest != stage.sampling_manifest_digest
+            or direct_authority.membership_digest != stage.membership_digest
+            or direct_authority.source_packet_digest != source_packet_digest
+            or direct_authority.reviewer != reviewer
+        ):
+            raise ValueError("direct_api_reviewer_stage_authority_drift")
     else:
         require_machine_verified_execution_identity(
             records, lane_root=lane_directory(protected_root, reviewer.reviewer_slot)
