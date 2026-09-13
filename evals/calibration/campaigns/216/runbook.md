@@ -1,10 +1,87 @@
-# ENG-CALIBRATION-001K (#216) operator runbook — FIX3 pre-review stage
+# ENG-CALIBRATION-001K (#216) operator runbook — FIX7 direct-review authority
 
-Status: Stage-A DEV reviewer execution authorized. No reviewer response has
-been imported. Do not execute HOLDOUT, fit external labels, merge PR #217, or
+Status: FIX7 direct-review authority correction applied. TARGET NOT FROZEN.
+This round is another maintainer target-freeze candidate, not a campaign
+execution. Do not execute HOLDOUT, fit external labels, merge PR #217, or
 close #216.
 
-## FIX3 execution identities
+Current state:
+
+- TARGET FREEZE STATUS: NOT FROZEN (no new #216 target was frozen in FIX7);
+- live direct reviewer calls: 0 (`216-api-dev-review` was NOT executed
+  against live providers in this round);
+- HOLDOUT activity: 0;
+- real Phase-5 activity: 0 (no fitting, candidate artifact freeze,
+  Phase-5/HOLDOUT evaluation, serving selection, or deployment changes);
+- PR #217 remains open/unmerged.
+
+```text
+assessment_selection_enabled == false
+CERTIFIED_SERVING_PROFILES == {"legacy"}
+```
+
+## FIX7 — direct HTTPS is the ONE active reviewer authority
+
+Functional correction SHA: `13c15e6bd122cee715e8f6be4cdc484093a52185`
+(committed before this documentation update, so this section names it
+without self-reference).
+
+The subscription-UI workflow and the Hermes/machine executor are
+SUPERSEDED and QUARANTINE-ONLY for #216. They are prohibited for creating
+any new #216 reviewer evidence:
+
+- every `eng-calibration-001k` subscription initialization, preparation,
+  export, import, attestation, freeze, and load path fails closed with the
+  stable error `campaign_001k_subscription_ui_superseded`;
+- `216-machine-dev-review` and `run_machine_dev_review()` fail immediately
+  with `campaign_001k_machine_reviewer_superseded` before any lane creation
+  or model execution; `machine_executor_provenance` can no longer freeze or
+  reload as canonical 001k reviewer evidence;
+- historical/quarantined subscription and machine artifacts remain parseable
+  as historical evidence only — they can never satisfy current active lane,
+  consensus, ledger, fitting, candidate-freeze, or HOLDOUT authority.
+
+The campaign-level invariant `require_active_001k_provenance_mode` (wired at
+lane freeze, frozen-lane reload, and final-ledger provenance) enforces that
+`direct_api_provenance` is the only active 001k reviewer-executor mode; any
+future provenance mode fails closed with
+`campaign_001k_provenance_mode_not_active`.
+
+### Sole canonical DEV reviewer execution command
+
+```text
+python -m evals.calibration 216-api-dev-review --protected-dir <root> [--dry-run]
+```
+
+Direct reviewer evidence is verified mechanically from retained raw bytes:
+every HTTP-response attempt is re-extracted and re-parsed with the exact
+sample ID at verification; a structural retry is authorized only by bytes
+that mechanically fail extraction or re-parse; `request_identity_digest ==
+request_sha256 == sha256(raw_request)` is enforced with a stable error.
+
+### Direct reviewer panel (frozen; no fallback)
+
+| lane | transport | model | routing |
+| --- | --- | --- | --- |
+| `model_a` | OpenRouter | `anthropic/claude-sonnet-5` | Anthropic-only, no fallback |
+| `model_b` | OpenRouter | `openai/gpt-5.6-terra` | OpenAI-only, no fallback |
+| `model_c` | z.ai direct | `glm-5.3` | direct endpoint |
+
+Retry/evidence policy: `direct-api-retry-216-v2`; per-class ceiling 2
+(`transport_pre_response` / `retryable_http` / `structural_format`), global
+physical-attempt ceiling 6; raw-byte retention with byte envelopes and
+SHA-256 checks; immutable attempt receipts; attempt-chain digesting;
+accepted-pointer binding; canonical request reconstruction; direct
+provenance verification at freeze/load/ledger.
+
+## Historical sections (SUPERSEDED — not operator authority)
+
+Everything below this banner is historical record only. No instruction in
+the FIX3 / Stage-A / FIX4 / FIX5 sections is current operator authority;
+where they describe executing subscription-UI or machine-orchestrated
+review, that mode is superseded by the FIX7 section above.
+
+## FIX3 execution identities (SUPERSEDED — historical record)
 
 | Fact | Value |
 | --- | --- |
@@ -71,7 +148,8 @@ Current protected artifact: `216-assess3-dev102-results.json`.
   `dev_fit_observations()` with 204 dimension observations across 102 distinct
   DEV samples. No HOLDOUT provider case was created or loaded.
 
-## Stage A — DEV subscription authority and batches
+## Stage A — DEV subscription authority and batches (SUPERSEDED by FIX7 —
+subscription UI fails closed with `campaign_001k_subscription_ui_superseded`)
 
 - canonical stage: DEV, derived from target/reuse/split/membership; the
   sampling seed is metadata only;
@@ -119,7 +197,7 @@ HOLDOUT provider/reviewer/evaluation execution count is 0. The final
 PR/documentation head is intentionally recorded in the maintainer handoff
 rather than self-referentially inside this commit.
 
-## FIX4 remote DEV-102 execution
+## FIX4 remote DEV-102 execution (SUPERSEDED — historical record)
 
 - functional SHA / remote detached checkout: `4ae703e9219a7afd31f202c921e500b63537ce04`;
 - target digest / target-file SHA-256: `49a4ea3a9fd406139fbc8447766e7e50c91236b9d11de1ed809a9290cff01ed1` /
@@ -147,7 +225,8 @@ rather than self-referentially inside this commit.
 
 STOP: reviewer batches remain unexecuted; no consensus, Phase-5 fit, candidate freeze, HOLDOUT unlock, or HOLDOUT evaluation occurred.
 
-## FIX5 replacement: machine-orchestrated DEV review
+## FIX5 replacement: machine-orchestrated DEV review (SUPERSEDED by FIX7 —
+command fails closed with `campaign_001k_machine_reviewer_superseded`)
 
 The maintainer has abandoned `sub-review-001` and the #209 operator-attested
 subscription-UI workflow for #216. No further UI responses or paste/import
