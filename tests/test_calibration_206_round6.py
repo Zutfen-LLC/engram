@@ -148,6 +148,7 @@ def _setup_lane(
     slot: str = "model_a",
     campaign_id: str = "campaign",
     provenance_mode: str = "provider_metadata",
+    reviewer: ReviewerIdentity | None = None,
 ):
     """Init one lane + emit generation-1 requests for all samples."""
     sampling = _sampling(IDS)
@@ -191,7 +192,7 @@ def _setup_lane(
     write_protected_file(manifest_path, manifest_payload)
     session = LaneSession.init(
         tmp_path,
-        reviewer=_reviewer(slot, campaign_id=campaign_id),
+        reviewer=reviewer if reviewer is not None else _reviewer(slot, campaign_id=campaign_id),
         campaign_id=campaign_id,
         sampling=sampling,
         source_packet_digest="f" * 64,

@@ -22,6 +22,7 @@ import json
 from pathlib import Path
 from typing import Literal
 
+from evals.calibration.campaign_001k import CAMPAIGN_ID_001K
 from evals.calibration.consensus import (
     CONSENSUS_PROTOCOL_VERSION,
     REVIEWER_SLOTS,
@@ -252,6 +253,12 @@ def freeze_lane(
     )
 
     mode = lane_provenance_mode(lane_directory(protected_root, reviewer.reviewer_slot))
+    # FIX7 (#217): direct HTTPS is the ONE active 001k reviewer authority —
+    # superseded subscription/machine/generic modes fail closed at freeze.
+    if campaign_id == CAMPAIGN_ID_001K:
+        from evals.calibration.campaign_001k import require_active_001k_provenance_mode
+
+        require_active_001k_provenance_mode(mode)
     if mode == "operator_attested_subscription_ui":
         from evals.calibration.subscription_ui import (
             require_subscription_attested_identity,
@@ -414,6 +421,12 @@ def _load_one_frozen_lane(
     )
 
     mode = lane_provenance_mode(lane_directory(protected_root, reviewer.reviewer_slot))
+    # FIX7 (#217): direct HTTPS is the ONE active 001k reviewer authority —
+    # superseded subscription/machine/generic modes fail closed at reload.
+    if campaign_id == CAMPAIGN_ID_001K:
+        from evals.calibration.campaign_001k import require_active_001k_provenance_mode
+
+        require_active_001k_provenance_mode(mode)
     if mode == "operator_attested_subscription_ui":
         from evals.calibration.subscription_ui import require_subscription_attested_identity
 

@@ -277,15 +277,29 @@ def validate_visible_model_family(reviewer_family: str, user_visible_model_name:
 #: The COMPLETE campaign opt-in for the subscription-UI provenance mode:
 #: (campaign_id, consensus protocol version) pairs. Anything not listed can
 #: never initialize, ingest, freeze, or verify a subscription-UI lane. #208
-#: executes campaign ``eng-calibration-001f`` and #216 executes the fresh-202
-#: review of campaign ``eng-calibration-001k``, both under protocol
-#: ``eng-calibration-consensus-206-v1`` — and nothing else.
+#: executes campaign ``eng-calibration-001f`` under protocol
+#: ``eng-calibration-consensus-206-v1`` — and nothing else.  FIX7 (#217):
+#: ``eng-calibration-001k`` was REMOVED from this opt-in; direct HTTPS
+#: (``direct_api_provenance`` via ``216-api-dev-review``) is the ONE active
+#: reviewer authority for 001k.  The check runs at every subscription
+#: boundary (init, prepare, export, import, freeze, load), so removing the
+#: pair makes every active 001k subscription path fail closed with
+#: ``campaign_001k_subscription_ui_superseded`` while historical 001f
+#: semantics are untouched.
 SUBSCRIPTION_UI_OPTED_CAMPAIGNS: frozenset[tuple[str, str]] = frozenset(
     {
         ("eng-calibration-001f", "eng-calibration-consensus-206-v1"),
-        ("eng-calibration-001k", "eng-calibration-consensus-206-v1"),
     }
 )
+
+
+#: Campaigns whose subscription-UI mode is not merely un opted-in but
+#: actively SUPERSEDED by a newer reviewer authority.  These campaigns get
+#: the explicit stable ``campaign_001k_subscription_ui_superseded`` error
+#: (instead of the generic not-opted-in error) at every subscription
+#: boundary, so an operator cannot mistake the rejection for a missing
+#: opt-in that could be re-added.
+SUBSCRIPTION_UI_SUPERSEDED_CAMPAIGNS: frozenset[str] = frozenset({"eng-calibration-001k"})
 
 #: Deterministic logical-batch limits (#209 export requirements).
 BATCH_MAX_CASES: int = 50
@@ -348,6 +362,22 @@ _ERROR_CODE_PATTERN = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 def subscription_mode_permitted(campaign_id: str, protocol_version: str) -> bool:
     """The one opt-in check, re-run at every authority boundary."""
     return (campaign_id, protocol_version) in SUBSCRIPTION_UI_OPTED_CAMPAIGNS
+
+
+def require_subscription_mode_permitted(campaign_id: str, protocol_version: str) -> None:
+    """FIX7 (#217): fail-closed subscription boundary with a stable error.
+
+    Every subscription initialization/preparation/export/import/attestation
+    boundary calls this instead of the bare boolean so an active
+    ``eng-calibration-001k`` invocation fails with the explicit superseded
+    error ``campaign_001k_subscription_ui_superseded`` — direct HTTPS is the
+    one active 001k reviewer authority — while any other non-opted campaign
+    keeps the generic ``subscription_ui_mode_not_opted_in_for_campaign``.
+    """
+    if campaign_id in SUBSCRIPTION_UI_SUPERSEDED_CAMPAIGNS:
+        raise ValueError("campaign_001k_subscription_ui_superseded")
+    if not subscription_mode_permitted(campaign_id, protocol_version):
+        raise ValueError("subscription_ui_mode_not_opted_in_for_campaign")
 
 
 def subscription_reviewer_identity(
@@ -443,8 +473,7 @@ class SubscriptionLaneAuthority(Record):
             _authority_digest_payload(self.model_dump(mode="json")), self.authority_digest
         ):
             raise ValueError("subscription_authority_digest_mismatch")
-        if not subscription_mode_permitted(self.campaign_id, self.protocol_version):
-            raise ValueError("subscription_ui_mode_not_opted_in_for_campaign")
+        require_subscription_mode_permitted(self.campaign_id, self.protocol_version)
         return self
 
     def payload(self) -> dict[str, Any]:
@@ -661,8 +690,7 @@ def verify_evidence_subscription_attestation(evidence: Any) -> None:
         raise ValueError("subscription_attestation_family_mismatch")
     if attestation.campaign_id != evidence.campaign_id:
         raise ValueError("subscription_attestation_campaign_mismatch")
-    if not subscription_mode_permitted(attestation.campaign_id, attestation.protocol_version):
-        raise ValueError("subscription_ui_mode_not_opted_in_for_campaign")
+    require_subscription_mode_permitted(attestation.campaign_id, attestation.protocol_version)
 
 
 # --- Deterministic logical review-batch export (FIX-2) --------------------------
@@ -926,8 +954,7 @@ def export_review_batches(
 
     if max_cases < 1 or max_serialized_bytes < 1:
         raise ValueError("subscription_batch_limits_must_be_positive")
-    if not subscription_mode_permitted(campaign_id, CONSENSUS_PROTOCOL_VERSION):
-        raise ValueError("subscription_ui_mode_not_opted_in_for_campaign")
+    require_subscription_mode_permitted(campaign_id, CONSENSUS_PROTOCOL_VERSION)
     packet, packet_sha = load_neutral_packet_verified(
         neutral_packet_path, manifest_path=neutral_packet_manifest
     )
@@ -1113,8 +1140,7 @@ def verify_review_batches(
     campaign_id = str(prepare.get("campaign_id", ""))
     if prepare.get("protocol_version") != CONSENSUS_PROTOCOL_VERSION:
         raise ValueError("subscription_prepare_protocol_mismatch")
-    if not subscription_mode_permitted(campaign_id, str(prepare.get("protocol_version", ""))):
-        raise ValueError("subscription_ui_mode_not_opted_in_for_campaign")
+    require_subscription_mode_permitted(campaign_id, str(prepare.get("protocol_version", "")))
     if sampling is not None and (
         prepare.get("sampling_manifest_digest") != sampling.manifest_digest()
     ):
@@ -1221,8 +1247,7 @@ def prepare_subscription_campaign(
     """
     from evals.calibration.ingestion import LaneSession, lane_provenance_mode
 
-    if not subscription_mode_permitted(campaign_id, CONSENSUS_PROTOCOL_VERSION):
-        raise ValueError("subscription_ui_mode_not_opted_in_for_campaign")
+    require_subscription_mode_permitted(campaign_id, CONSENSUS_PROTOCOL_VERSION)
     lane_status: dict[str, dict[str, Any]] = {}
     for slot in REVIEWER_SLOTS:
         session = LaneSession(protected_root, slot)
@@ -1468,8 +1493,7 @@ class SubscriptionBatchAttempt(Record):
             raise ValueError("subscription_attempt_must_not_carry_failure_reason")
         if self.retry_of_attempt is not None and self.retry_of_attempt >= self.attempt:
             raise ValueError("subscription_attempt_retry_of_not_earlier")
-        if not subscription_mode_permitted(self.campaign_id, self.protocol_version):
-            raise ValueError("subscription_ui_mode_not_opted_in_for_campaign")
+        require_subscription_mode_permitted(self.campaign_id, self.protocol_version)
         return self
 
     def payload(self) -> dict[str, Any]:
@@ -2406,5 +2430,9 @@ def require_subscription_attested_identity(
             attempt_record.attestation_digest, attestation.attestation_digest
         ):
             raise ValueError(f"subscription_attempt_attestation_digest_mismatch:{sample_id}")
-        if not subscription_mode_permitted(attestation.campaign_id, attestation.protocol_version):
-            raise ValueError(f"subscription_ui_mode_not_opted_in_for_campaign:{sample_id}")
+        try:
+            require_subscription_mode_permitted(
+                attestation.campaign_id, attestation.protocol_version
+            )
+        except ValueError as exc:
+            raise ValueError(f"{exc}:{sample_id}") from None

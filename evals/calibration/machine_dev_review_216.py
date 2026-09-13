@@ -2,31 +2,32 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import shutil
 import subprocess
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
 from evals.calibration.campaign_001k import CAMPAIGN_ID_001K
-from evals.calibration.campaign_001k_stage_authority import verify_stage_authority
 from evals.calibration.consensus import (
     CAMPAIGN_216_FAMILY_BY_SLOT,
-    REVIEWER_SLOTS,
     ReviewerIdentity,
     digest_of,
 )
-from evals.calibration.freeze import SamplingManifest
 from evals.calibration.ingestion import LaneSession, labeling_instructions_digest
 from evals.calibration.machine_reviewer_216 import (
     CommandRunner,
     MachineReviewerAuthority,
-    MachineReviewerRunner,
 )
-from evals.calibration.model_lanes import freeze_lane
+
+#: FIX7 (#217): the stable, explicit superseded-mode error for the Hermes
+#: machine executor reviewer path.  ``216-machine-dev-review`` fails closed
+#: with this error before any lane creation or model execution, and
+#: ``run_machine_dev_review`` raises it on every call — direct HTTPS
+#: (``216-api-dev-review``, ``direct_api_provenance``) is the ONE active
+#: reviewer authority for ``eng-calibration-001k``.
+MACHINE_DEV_REVIEW_SUPERSEDED_ERROR = "campaign_001k_machine_reviewer_superseded"
 
 MACHINE_IDENTITIES_216: dict[str, tuple[str, str, str]] = {
     "model_a": (
@@ -140,100 +141,13 @@ def run_machine_dev_review(
     command_runner: CommandRunner | None = None,
     dry_run: bool = False,
 ) -> dict[str, object]:
-    """Run exactly the frozen DEV-102 population, never consensus or holdout.
+    """SUPERSEDED (FIX7, #217): can never create active 001k evidence.
 
-    The three runtime identities are captured and checked before creating any
-    lane. A non-dry run emits lane-local requests, runs one full 102-case batch
-    per lane concurrently, retains failed whole-batch attempts, ingests the
-    first accepted output per case, and freezes all three lanes.
+    Direct HTTPS (``216-api-dev-review`` / ``direct_api_provenance``) is the
+    ONE active reviewer authority for ``eng-calibration-001k``.  This Hermes
+    machine-executor path is superseded and fails closed immediately —
+    before any lane creation or model execution, wet or dry — with the
+    stable explicit error ``campaign_001k_machine_reviewer_superseded``.
     """
-    sampling = SamplingManifest.model_validate(
-        json.loads((protected_root / "dev-sampling-manifest.json").read_text())
-    )
-    source_packet = protected_root / f"{CAMPAIGN_ID_001K}-dev-v1.blind.json"
-    source_digest = hashlib.sha256(source_packet.read_bytes()).hexdigest()
-    stage = verify_stage_authority(
-        protected_root=protected_root, sampling=sampling, source_packet_digest=source_digest
-    )
-    stage.require_capability()
-    if stage.stage != "dev" or len(sampling.sample_ids) != 102:
-        raise ValueError("machine_reviewer_requires_exact_dev_102")
-    reuse = json.loads((protected_root / "reuse-manifest.json").read_text())
-    if set(sampling.sample_ids) & set(reuse["holdout_ids"]):
-        raise ValueError("machine_reviewer_holdout_leakage")
-
-    runtimes = {
-        slot: preflight(provider, model)
-        for slot, (provider, model, _auth) in MACHINE_IDENTITIES_216.items()
-    }
-    for slot, runtime in runtimes.items():
-        provider, model, _auth = MACHINE_IDENTITIES_216[slot]
-        if runtime.provider != provider or runtime.model != model:
-            raise ValueError("machine_reviewer_runtime_identity_mismatch")
-    report: dict[str, object] = {
-        "campaign_id": CAMPAIGN_ID_001K,
-        "stage": "dev",
-        "logical_cases": len(sampling.sample_ids),
-        "holdout": 0,
-        "identities": {
-            slot: {
-                "family": CAMPAIGN_216_FAMILY_BY_SLOT[slot],
-                "provider": runtime.provider,
-                "model": runtime.model,
-            }
-            for slot, runtime in runtimes.items()
-        },
-        "lanes": {},
-    }
-    if dry_run:
-        return report
-
-    neutral_packet = protected_root / f"{CAMPAIGN_ID_001K}-dev-v1.neutral.json"
-    neutral_manifest = protected_root / "neutral-packet-manifest.json"
-    sessions: dict[str, LaneSession] = {}
-    runners: dict[str, MachineReviewerRunner] = {}
-    batches: dict[str, Path] = {}
-    for slot in REVIEWER_SLOTS:
-        session = LaneSession.init(
-            protected_root,
-            reviewer=_reviewer(slot, runtimes[slot]),
-            campaign_id=CAMPAIGN_ID_001K,
-            sampling=sampling,
-            source_packet_digest=source_digest,
-            neutral_packet_path=neutral_packet,
-            neutral_packet_manifest=neutral_manifest,
-            provenance_mode="machine_executor_provenance",
-        )
-        sessions[slot] = session
-        runners[slot] = MachineReviewerRunner(
-            session,
-            _authority(
-                session, runtimes[slot], stage.target_identity_digest, stage.membership_digest
-            ),
-            command_runner=command_runner,
-        )
-        batches[slot] = session.emit_requests(
-            neutral_packet, sampling=sampling, manifest_path=neutral_manifest
-        )
-
-    def execute(slot: str) -> tuple[str, int]:
-        attempts = runners[slot].review_emitted_batch(
-            batches[slot], chunk_size=102, max_format_attempts=2
-        )
-        if len(attempts) != 102:
-            raise ValueError("machine_reviewer_batch_count_mismatch")
-        for line in batches[slot].read_text().splitlines():
-            runners[slot].ingest_accepted(line, sampling=sampling)
-        frozen = freeze_lane(
-            protected_root=protected_root,
-            reviewer=sessions[slot].reviewer,
-            campaign_id=CAMPAIGN_ID_001K,
-            sampling=sampling,
-            source_packet_digest=source_digest,
-        )
-        return slot, len(frozen.sample_ids)
-
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        results = list(pool.map(execute, REVIEWER_SLOTS))
-    report["lanes"] = {slot: {"accepted": count, "frozen": True} for slot, count in results}
-    return report
+    del protected_root, preflight, command_runner, dry_run
+    raise ValueError(MACHINE_DEV_REVIEW_SUPERSEDED_ERROR)

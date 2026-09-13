@@ -220,6 +220,13 @@ def validate_lane_provenance_with_raw(
     from evals.calibration.ingestion import lane_provenance_mode
 
     mode = lane_provenance_mode(lane_root_for(protected_root, lane.reviewer.reviewer_slot))
+    # FIX7 (#217): direct HTTPS is the ONE active 001k reviewer authority —
+    # superseded subscription/machine/generic modes fail closed at the final
+    # ledger's composed provenance boundary.
+    if campaign_id == "eng-calibration-001k":
+        from evals.calibration.campaign_001k import require_active_001k_provenance_mode
+
+        require_active_001k_provenance_mode(mode)
     if mode == "operator_attested_subscription_ui":
         # #209 opt-in: the operator-attested subscription gate replaces the
         # machine-verified identity gate at this final boundary too; every

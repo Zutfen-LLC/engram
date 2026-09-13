@@ -997,12 +997,11 @@ def cmd_216_api_dev_review(args: argparse.Namespace) -> int:
 
 
 def cmd_216_machine_dev_review(args: argparse.Namespace) -> int:
-    """Run the sole #216 machine DEV campaign path; no consensus/Phase 5."""
-    from evals.calibration.machine_dev_review_216 import run_machine_dev_review
+    """FIX7 (#217): superseded — fails closed before any lane or model run."""
+    del args
+    from evals.calibration.machine_dev_review_216 import MACHINE_DEV_REVIEW_SUPERSEDED_ERROR
 
-    report = run_machine_dev_review(Path(args.protected_dir), dry_run=args.dry_run)
-    print(json.dumps(report, sort_keys=True))
-    return 0
+    raise SystemExit(MACHINE_DEV_REVIEW_SUPERSEDED_ERROR)
 
 
 def _require_216_stage_barrier(

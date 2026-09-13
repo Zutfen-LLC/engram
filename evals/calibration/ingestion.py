@@ -622,13 +622,12 @@ def init_subscription_lane(
         SERVICE_BY_SLOT,
         SUBSCRIPTION_MODEL_BY_SLOT,
         build_subscription_lane_authority,
-        subscription_mode_permitted,
+        require_subscription_mode_permitted,
         validate_visible_model_family,
         write_subscription_lane_authority,
     )
 
-    if not subscription_mode_permitted(campaign_id, CONSENSUS_PROTOCOL_VERSION):
-        raise ValueError("subscription_ui_mode_not_opted_in_for_campaign")
+    require_subscription_mode_permitted(campaign_id, CONSENSUS_PROTOCOL_VERSION)
     if reviewer.provider_model_identifier != SUBSCRIPTION_MODEL_BY_SLOT.get(reviewer.reviewer_slot):
         raise ValueError("subscription_lane_requires_frozen_subscription_identity")
     if SERVICE_BY_SLOT.get(reviewer.reviewer_slot) is None:

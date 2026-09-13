@@ -1243,10 +1243,10 @@ class TestReusePartition:
 
 
 class TestSubscriptionOptIn:
-    def test_001k_opted_under_frozen_protocol(self) -> None:
+    def test_001k_subscription_mode_superseded(self) -> None:
         from evals.calibration.subscription_ui import subscription_mode_permitted
 
-        assert subscription_mode_permitted(
+        assert not subscription_mode_permitted(
             "eng-calibration-001k", "eng-calibration-consensus-206-v1"
         )
 
@@ -1307,49 +1307,31 @@ class TestCampaignConstants:
 
 
 class TestSubscriptionVerifiedLedger001k:
-    def test_synthetic_dev_subscription_workflow_projects_exact_102_ledger_labels(
-        self, tmp_path: Path
-    ) -> None:
-        """Exercise the real #209 lane lifecycle before issuing 001k labels.
+    def test_001k_subscription_ui_is_rejected_at_every_boundary(self, tmp_path: Path) -> None:
+        """FIX7 (#217): subscription-UI mode is SUPERSEDED for 001k.
 
-        The reviewer responses are deterministic synthetic bytes, but every
-        authority transition is production code: subscription lane init,
-        preparation/request emission, batch import, lane freeze, correlation
-        report, human queue/adjudication, consensus-ledger verification, then
-        FreshLabelAuthority216 projection.
+        Direct HTTPS (``216-api-dev-review`` / ``direct_api_provenance``) is
+        the ONE active 001k reviewer authority.  Every 001k subscription
+        boundary — opt-in check, lane init, campaign preparation, batch
+        import, lane freeze, and frozen-lane reload — must fail closed with
+        the stable explicit ``campaign_001k_subscription_ui_superseded``
+        error, while the historical 001f subscription behavior remains
+        intact (see tests/test_calibration_209_subscription.py).
         """
-        from evals.calibration.consensus import (
-            CONSENSUS_PROTOCOL_VERSION,
-            REVIEWER_SLOTS,
-            build_correlation_report,
-            select_audit_sample_with_coverage,
-        )
-        from evals.calibration.human_queue import (
-            HumanQueueJudgment,
-            HumanQueueManifest,
-            QueueEntry,
-            record_final_resolution,
-            reveal_model_votes,
-            save_initial_judgment,
-            write_queue,
-        )
+        from evals.calibration.consensus import CONSENSUS_PROTOCOL_VERSION
         from evals.calibration.ingestion import init_subscription_lane, labeling_instructions_digest
-        from evals.calibration.ledger import verify_consensus_ledger
-        from evals.calibration.model_lanes import NeutralModelPacket, freeze_lane, load_lane_records
+        from evals.calibration.model_lanes import NeutralModelPacket
         from evals.calibration.review import _packet_file_payload, write_protected_file
         from evals.calibration.subscription_ui import (
-            import_batch_response,
             prepare_subscription_campaign,
             subscription_mode_permitted,
             subscription_reviewer_identity,
-            verify_review_batches,
         )
 
         dev_ids = _FRESH_DEV_102
         sampling = _stage_sampling(dev_ids)
         source_digest = "f" * 64
-        assert subscription_mode_permitted(c216.CAMPAIGN_ID_001K, CONSENSUS_PROTOCOL_VERSION)
-        # Regression guard: #216's opt-in does not alter #001f's established mode.
+        assert not subscription_mode_permitted(c216.CAMPAIGN_ID_001K, CONSENSUS_PROTOCOL_VERSION)
         assert subscription_mode_permitted("eng-calibration-001f", CONSENSUS_PROTOCOL_VERSION)
 
         packet = NeutralModelPacket(
@@ -1394,12 +1376,10 @@ class TestSubscriptionVerifiedLedger001k:
             "model_b": "GPT-Astra 2.4",
             "model_c": "GLM-5.3-Max",
         }
-        reviewers = {}
-        for slot in REVIEWER_SLOTS:
-            reviewer = subscription_reviewer_identity(
-                slot, reviewer_config_digest="a" * 64, prompt_digest=labeling_instructions_digest()
-            )
-            reviewers[slot] = reviewer
+        reviewer = subscription_reviewer_identity(
+            "model_a", reviewer_config_digest="a" * 64, prompt_digest=labeling_instructions_digest()
+        )
+        with pytest.raises(ValueError, match="campaign_001k_subscription_ui_superseded"):
             init_subscription_lane(
                 tmp_path,
                 reviewer=reviewer,
@@ -1408,157 +1388,22 @@ class TestSubscriptionVerifiedLedger001k:
                 source_packet_digest=source_digest,
                 neutral_packet_path=packet_path,
                 neutral_packet_manifest=packet_manifest,
-                user_visible_model_name=visible_models[slot],
+                user_visible_model_name=visible_models["model_a"],
                 operator_reference="synthetic-test-operator",
             )
-        prepared = prepare_subscription_campaign(
-            tmp_path,
-            campaign_id=c216.CAMPAIGN_ID_001K,
-            sampling=sampling,
-            source_packet_digest=source_digest,
-            neutral_packet_path=packet_path,
-            neutral_packet_manifest=packet_manifest,
-        )
-        assert prepared["batches"]["total_cases"] == 102
-        batches = verify_review_batches(
-            tmp_path, sampling=sampling, source_packet_digest=source_digest
-        )["batches"]
-        for batch in batches:
-            for indent, slot in enumerate(REVIEWER_SLOTS, start=1):
-                # Response bytes must be lane-specific: #209 correctly rejects
-                # identical browser output replayed across subscription lanes.
-                response = json.dumps(
-                    {
-                        "results": [
-                            {"sample_id": sid, **_GOOD_CRITICAL, "reviewer_confidence": "medium"}
-                            for sid in batch["sample_ids"]
-                        ]
-                    },
-                    indent=indent,
-                )
-                imported = import_batch_response(
-                    tmp_path,
-                    reviewer_slot=slot,
-                    batch_id=str(batch["batch_id"]),
-                    raw_response=response,
-                    sampling=sampling,
-                    source_packet_digest=source_digest,
-                )
-                assert imported["accepted"] == batch["case_count"]
-
-        lanes = tuple(
-            freeze_lane(
-                protected_root=tmp_path,
-                reviewer=reviewers[slot],
+        with pytest.raises(ValueError, match="campaign_001k_subscription_ui_superseded"):
+            prepare_subscription_campaign(
+                tmp_path,
                 campaign_id=c216.CAMPAIGN_ID_001K,
                 sampling=sampling,
                 source_packet_digest=source_digest,
-                neutral_packet_sha256=hashlib.sha256(packet_bytes).hexdigest(),
+                neutral_packet_path=packet_path,
+                neutral_packet_manifest=packet_manifest,
             )
-            for slot in REVIEWER_SLOTS
-        )
-        records_by_lane = {slot: load_lane_records(tmp_path, slot) for slot in REVIEWER_SLOTS}
-        frame_rows = {
-            row.sample_id: row
-            for row in __import__(
-                "tests.test_calibration_206_helpers", fromlist=["build_frame_rows"]
-            ).build_frame_rows(tuple(dev_ids))
-        }
-        report = build_correlation_report(
-            campaign_id=c216.CAMPAIGN_ID_001K,
-            sampling=sampling,
-            source_packet_digest=source_digest,
-            lanes=lanes,
-            records_by_lane=records_by_lane,
-            frame_rows=frame_rows,
-        )
-        assert report.expected_cases == 102
+        # No lane state was ever created by the rejected initialization.
+        assert not (tmp_path / "lanes" / "model_a" / "lane.json").exists()
 
-        # Consensus audit cases still require the human queue.  The report is
-        # intentionally public-safe, so re-derive its protected audit IDs.
-        audit_ids = select_audit_sample_with_coverage(dev_ids, frame_rows).selected
-        entries = tuple(
-            QueueEntry(sample_id=sid, reasons=("audit_selected",), audit_only=True)
-            for sid in audit_ids
-        )
-        queue_dir = tmp_path / "queue"
-        write_queue(
-            HumanQueueManifest(
-                protocol_version=CONSENSUS_PROTOCOL_VERSION,
-                campaign_id=c216.CAMPAIGN_ID_001K,
-                sampling_manifest_digest=sampling.manifest_digest(),
-                source_packet_digest=source_digest,
-                entries=entries,
-            ),
-            queue_dir,
-        )
-        lane_digests = tuple(lane.lane_digest() for lane in lanes)
-        for entry in entries:
-            save_initial_judgment(
-                HumanQueueJudgment(
-                    protocol_version=CONSENSUS_PROTOCOL_VERSION,
-                    campaign_id=c216.CAMPAIGN_ID_001K,
-                    sampling_manifest_digest=sampling.manifest_digest(),
-                    source_packet_digest=source_digest,
-                    sample_id=entry.sample_id,
-                    adjudicator_ref="synthetic-human",
-                    queue_reasons=entry.reasons,
-                    audit_selected=True,
-                    initial_critical=dict(_GOOD_CRITICAL),
-                    initial_confidence="medium",
-                    initial_captured_at=datetime(2026, 9, 11, tzinfo=UTC).isoformat(),
-                ),
-                queue_dir,
-            )
-            current = {slot: records_by_lane[slot][entry.sample_id] for slot in REVIEWER_SLOTS}
-            reveal_model_votes(
-                queue_dir,
-                entry.sample_id,
-                current_records_by_slot=current,
-                lane_digests=lane_digests,
-                campaign_id=c216.CAMPAIGN_ID_001K,
-                sampling_manifest_digest=sampling.manifest_digest(),
-                source_packet_digest=source_digest,
-            )
-            record_final_resolution(
-                queue_dir,
-                entry.sample_id,
-                final_critical=dict(_GOOD_CRITICAL),
-                final_confidence="high",
-                current_records_by_slot=current,
-                lane_digests=lane_digests,
-                campaign_id=c216.CAMPAIGN_ID_001K,
-                sampling_manifest_digest=sampling.manifest_digest(),
-                source_packet_digest=source_digest,
-            )
-        verified = verify_consensus_ledger(
-            campaign_id=c216.CAMPAIGN_ID_001K,
-            sampling=sampling,
-            source_packet_digest=source_digest,
-            lanes=lanes,
-            records_by_lane=records_by_lane,
-            queue_dir=queue_dir,
-            frame_rows=frame_rows,
-            protected_root=tmp_path,
-        )
-        from evals.calibration.campaign_001k_fit import FreshLabelAuthority216
-
-        authority = FreshLabelAuthority216.from_verified_ledger(
-            verified,
-            stage="dev",
-            stage_sampling=sampling,
-            expected_membership=frozenset(dev_ids),
-            source_packet_digest=source_digest,
-        )
-        assert set(authority.labels_by_sample()) == set(dev_ids)
-        assert len(authority.labels) == 102
-
-
-class TestSubscriptionSeedSpoofRejection001k:
-    @pytest.mark.parametrize(
-        "command",
-        ("sub-lane-init", "sub-prepare", "sub-batch-show", "sub-import"),
-    )
+    @pytest.mark.parametrize("command", ("sub-lane-init", "sub-prepare", "sub-import"))
     def test_holdout_membership_with_dev_seed_has_zero_pre_freeze_authority(
         self, tmp_path: Path, command: str
     ) -> None:

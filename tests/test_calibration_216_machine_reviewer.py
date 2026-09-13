@@ -205,8 +205,10 @@ def test_command_error_preserves_raw_bytes_and_exit_state(tmp_path: Path) -> Non
 
 
 def test_accepted_machine_record_reaches_real_freeze_verifier(tmp_path: Path, monkeypatch) -> None:
-    """The accepted stdout is ingested through LaneSession, then the actual
-    freeze path re-checks its machine-executor receipt and raw attempt bytes."""
+    """FIX7 (#217): the machine-executor lane can build records, but every
+    active 001k boundary (freeze, final-ledger provenance) now rejects
+    ``machine_executor_provenance`` with the stable superseded error —
+    direct HTTPS is the one active 001k reviewer authority."""
     import evals.calibration.campaign_001k_stage_authority as stage_authority
     from evals.calibration.model_lanes import freeze_lane
 
@@ -237,26 +239,45 @@ def test_accepted_machine_record_reaches_real_freeze_verifier(tmp_path: Path, mo
         runner.review_request_line(line)
         record = runner.ingest_accepted(line, sampling=sampling)
         assert record.execution.identity_source == "machine_executor_provenance"
-    frozen = freeze_lane(
-        protected_root=tmp_path,
-        reviewer=session.reviewer,
-        campaign_id=CAMPAIGN_ID_001K,
-        sampling=sampling,
-        source_packet_digest=session.source_packet_digest,
-    )
-    assert frozen.sample_ids == sampling.sample_ids
-    # This is the final-ledger's composed provenance verifier, not a mock.
     from evals.calibration.model_lanes import load_lane_records
     from evals.calibration.raw_evidence import validate_lane_provenance_with_raw
 
-    validate_lane_provenance_with_raw(
-        frozen,
-        load_lane_records(tmp_path, session.reviewer.reviewer_slot),
+    records = load_lane_records(tmp_path, session.reviewer.reviewer_slot)
+    with pytest.raises(ValueError, match="campaign_001k_machine_reviewer_superseded"):
+        freeze_lane(
+            protected_root=tmp_path,
+            reviewer=session.reviewer,
+            campaign_id=CAMPAIGN_ID_001K,
+            sampling=sampling,
+            source_packet_digest=session.source_packet_digest,
+        )
+    # The final-ledger composed provenance boundary rejects the superseded
+    # mode too.  It needs a frozen lane object; build the minimal LaneFreeze
+    # this lane's own identity would carry (the gate fires on the lane's
+    # provenance mode before any freeze-state validation could matter).
+    from evals.calibration.consensus import CONSENSUS_PROTOCOL_VERSION, LaneFreeze
+
+    forged_freeze = LaneFreeze(
+        protocol_version=CONSENSUS_PROTOCOL_VERSION,
         campaign_id=CAMPAIGN_ID_001K,
-        sampling=sampling,
+        reviewer=session.reviewer,
+        sampling_manifest_digest=sampling.manifest_digest(),
         source_packet_digest=session.source_packet_digest,
-        protected_root=tmp_path,
+        neutral_packet_sha256=json.loads(
+            (tmp_path / "lanes" / session.reviewer.reviewer_slot / "lane.json").read_text()
+        )["neutral_packet_sha256"],
+        sample_ids=sampling.sample_ids,
+        record_digests=tuple(records[sid].record_digest() for sid in sampling.sample_ids),
     )
+    with pytest.raises(ValueError, match="campaign_001k_machine_reviewer_superseded"):
+        validate_lane_provenance_with_raw(
+            forged_freeze,
+            records,
+            campaign_id=CAMPAIGN_ID_001K,
+            sampling=sampling,
+            source_packet_digest=session.source_packet_digest,
+            protected_root=tmp_path,
+        )
 
 
 def test_canonical_batch_is_one_process_and_contains_only_its_lane(tmp_path: Path) -> None:
@@ -330,95 +351,3 @@ def test_216_exact_machine_families_do_not_relabel_sonnet_as_opus() -> None:
         prompt_digest=labeling_instructions_digest(),
     )
     assert identity.reviewer_family == "claude-sonnet-5"
-
-
-def test_216_machine_cli_dry_run_dispatches_without_provider_execution(monkeypatch, capsys) -> None:
-    import sys
-
-    import evals.calibration.__main__ as cli
-    import evals.calibration.machine_dev_review_216 as campaign
-
-    def dry_only(_root: Path, *, dry_run: bool, **_kwargs):
-        assert dry_run is True
-        return {"logical_cases": 102, "holdout": 0, "lanes": {}}
-
-    monkeypatch.setattr(campaign, "run_machine_dev_review", dry_only)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["calibration", "216-machine-dev-review", "--protected-dir", "/never-read", "--dry-run"],
-    )
-    assert cli.main() == 0
-    assert json.loads(capsys.readouterr().out) == {"holdout": 0, "lanes": {}, "logical_cases": 102}
-
-
-def test_machine_dev_dry_run_is_exactly_102_and_never_preflights_a_provider(
-    tmp_path: Path, monkeypatch
-) -> None:
-    from evals.calibration.machine_dev_review_216 import (
-        MACHINE_IDENTITIES_216,
-        RuntimeIdentity216,
-        run_machine_dev_review,
-    )
-    from tests.test_calibration_206_round6 import _sampling
-
-    sampling = _sampling(tuple(f"s{i:03d}" for i in range(102)))
-    (tmp_path / "dev-sampling-manifest.json").write_text(sampling.model_dump_json())
-    blind = tmp_path / f"{CAMPAIGN_ID_001K}-dev-v1.blind.json"
-    blind.write_bytes(b"frozen-dev-packet")
-    (tmp_path / "reuse-manifest.json").write_text(json.dumps({"holdout_ids": ["s-holdout"]}))
-
-    class Stage:
-        stage = "dev"
-        target_identity_digest = "a" * 64
-        membership_digest = "b" * 64
-
-        def require_capability(self) -> None:
-            return None
-
-    monkeypatch.setattr(
-        "evals.calibration.machine_dev_review_216.verify_stage_authority", lambda **_: Stage()
-    )
-    calls: list[tuple[str, str]] = []
-
-    def preflight(provider: str, model: str) -> RuntimeIdentity216:
-        calls.append((provider, model))
-        return RuntimeIdentity216("hermes-test", provider, model, "fake")
-
-    report = run_machine_dev_review(tmp_path, preflight=preflight, dry_run=True)
-    assert report["logical_cases"] == 102
-    assert report["holdout"] == 0
-    assert calls == [(value[0], value[1]) for value in MACHINE_IDENTITIES_216.values()]
-
-
-def test_machine_dev_rejects_wrong_provider_during_preflight_before_lane_creation(
-    tmp_path: Path, monkeypatch
-) -> None:
-    from evals.calibration.machine_dev_review_216 import RuntimeIdentity216, run_machine_dev_review
-    from tests.test_calibration_206_round6 import _sampling
-
-    sampling = _sampling(tuple(f"s{i:03d}" for i in range(102)))
-    (tmp_path / "dev-sampling-manifest.json").write_text(sampling.model_dump_json())
-    (tmp_path / f"{CAMPAIGN_ID_001K}-dev-v1.blind.json").write_bytes(b"frozen-dev-packet")
-    (tmp_path / "reuse-manifest.json").write_text(json.dumps({"holdout_ids": []}))
-
-    class Stage:
-        stage = "dev"
-        target_identity_digest = "a" * 64
-        membership_digest = "b" * 64
-
-        def require_capability(self) -> None:
-            return None
-
-    monkeypatch.setattr(
-        "evals.calibration.machine_dev_review_216.verify_stage_authority", lambda **_: Stage()
-    )
-    with pytest.raises(ValueError, match="machine_reviewer_runtime_identity_mismatch"):
-        run_machine_dev_review(
-            tmp_path,
-            dry_run=True,
-            preflight=lambda _provider, model: RuntimeIdentity216(
-                "hermes-test", "wrong", model, "fake"
-            ),
-        )
-    assert not (tmp_path / "lanes").exists()

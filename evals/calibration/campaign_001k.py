@@ -58,6 +58,57 @@ CAMPAIGN_ID_001K = "eng-calibration-001k"
 #: The frozen 001f campaign whose evidence this campaign reuses.
 PRIOR_CAMPAIGN_ID = "eng-calibration-001f"
 
+#: FIX7 (#217): the ONE provenance mode that may carry ACTIVE #216 reviewer
+#: executor authority for campaign 001k.  Every lane freeze / frozen-lane
+#: reload / final-ledger provenance boundary for 001k dispatches through
+#: ``require_active_001k_provenance_mode``, which enforces this — so a
+#: future provenance-mode addition cannot silently create another active
+#: 001k reviewer route (a new mode is rejected there, fail-closed, until
+#: this frozen set is deliberately revised).
+ACTIVE_001K_PROVENANCE_MODES: frozenset[str] = frozenset({"direct_api_provenance"})
+
+#: FIX7 (#217): the #216 reviewer-executor modes SUPERSEDED by the sealed
+#: direct HTTPS path.  They can never again create, ingest, freeze, reload,
+#: or satisfy active DEV reviewer evidence for 001k.
+SUPERSEDED_001K_REVIEWER_MODES: frozenset[str] = frozenset(
+    {"operator_attested_subscription_ui", "machine_executor_provenance"}
+)
+
+
+def require_active_001k_provenance_mode(mode: str) -> None:
+    """FIX7 (#217) campaign-level invariant for active 001k reviewer evidence.
+
+    ``direct_api_provenance`` (the sealed direct HTTPS ``216-api-dev-review``
+    path) is the ONLY reviewer-executor authority for
+    ``eng-calibration-001k``.  The superseded modes fail closed with stable
+    explicit errors:
+
+    - ``operator_attested_subscription_ui`` ->
+      ``campaign_001k_subscription_ui_superseded`` (quarantine/historical
+      parse only; can never satisfy current active lane, consensus,
+      ledger, fitting, candidate-freeze, or HOLDOUT authority);
+    - ``machine_executor_provenance`` ->
+      ``campaign_001k_machine_reviewer_superseded`` (same restriction).
+
+    Any OTHER mode outside ``ACTIVE_001K_PROVENANCE_MODES`` — including
+    every provenance mode added in the future — fails closed with
+    ``campaign_001k_provenance_mode_not_active``, so no new mode can
+    silently become an active 001k reviewer route.  The single exception is
+    the legacy generic ``provider_metadata`` baseline: it is not and never
+    was a #216 reviewer route (the #216 reviewers are bound to the frozen
+    direct panel identities), it has been forbidden for 001k at every
+    operator entry point since FIX2-217-7 (``campaign_001k_rejects_direct_model_lane``),
+    and it remains the library-level baseline that non-reviewer lane
+    machinery (e.g. synthetic consensus-ledger verification) is built on.
+    """
+    if mode == "operator_attested_subscription_ui":
+        raise ValueError("campaign_001k_subscription_ui_superseded")
+    if mode == "machine_executor_provenance":
+        raise ValueError("campaign_001k_machine_reviewer_superseded")
+    if mode not in ACTIVE_001K_PROVENANCE_MODES | {"provider_metadata"}:
+        raise ValueError("campaign_001k_provenance_mode_not_active")
+
+
 #: Cases executed under #208's intentional 200-case checkpoint = positions
 #: 0..199 of the frozen 001f sample order (mechanically proven: synthesis
 #: case IDs == first 200 of ``sampling.sample_ids``).

@@ -408,6 +408,11 @@ def verify_direct_api_attempt_216(attempt: DirectAPIReviewAttempt216) -> None:
         raise ValueError("direct_api_attempt_sequence_or_time_invalid")
     if _sha(attempt.raw_request) != attempt.request_sha256:
         raise ValueError("direct_api_request_digest_mismatch")
+    # FIX7 (#217): the request identity is mechanically bound — there is no
+    # second, independently mutable request-identity scheme.  The authority
+    # digest field must equal the byte digest must equal sha256(raw_request).
+    if not (attempt.request_identity_digest == attempt.request_sha256 == _sha(attempt.raw_request)):
+        raise ValueError("direct_api_request_identity_digest_mismatch")
     if _sha(attempt.raw_response) != attempt.raw_response_sha256:
         raise ValueError("direct_api_response_digest_mismatch")
     if _sha(attempt.extracted_content.encode()) != attempt.extracted_content_sha256:
@@ -453,17 +458,30 @@ def verify_direct_api_attempt_216(attempt: DirectAPIReviewAttempt216) -> None:
         return
     if attempt.http_status is None or not 200 <= attempt.http_status < 300:
         raise ValueError("direct_api_success_http_status_invalid")
-    if attempt.failure_class == "structural_format":
+    # FIX7 (#217): every HTTP-response attempt is classified MECHANICALLY from
+    # the retained raw evidence — the stored classification fields are never
+    # authority.  Extraction is re-run against the exact retained raw
+    # response bytes, then the extracted content is re-parsed with the exact
+    # expected sample ID; the stored fields must match what the bytes
+    # themselves derive.
+    try:
+        content, reported, provider_id = extract_response_216(route, attempt.raw_response, {})
+    except ValueError:
+        # The raw bytes cannot even yield a parser input: the mechanically
+        # derived structural-format failure.  A receipt may claim exactly
+        # ``structural_format`` (the only retry such bytes can authorize) —
+        # anything else fails closed.
+        if attempt.failure_class != "structural_format" or not attempt.retryable:
+            raise ValueError("direct_api_structural_classification_not_derived") from None
         if (
             attempt.outcome_status != "malformed"
             or attempt.parse_status != "malformed"
-            or not attempt.retryable
+            or attempt.extracted_content
+            or attempt.extracted_content_sha256 != _sha(b"")
+            or attempt.reported_model is not None
         ):
-            raise ValueError("direct_api_structural_failure_contract_invalid")
+            raise ValueError("direct_api_structural_failure_contract_invalid") from None
         return
-    if attempt.failure_class is not None or attempt.retryable:
-        raise ValueError("direct_api_terminal_attempt_failure_contract_invalid")
-    content, reported, provider_id = extract_response_216(route, attempt.raw_response, {})
     safe_headers = attempt.response_safe_headers or {}
     expected_provider_id = (
         provider_id or safe_headers.get("x-request-id") or safe_headers.get("request-id")
@@ -475,13 +493,38 @@ def verify_direct_api_attempt_216(attempt: DirectAPIReviewAttempt216) -> None:
     ):
         raise ValueError("direct_api_extraction_not_derived")
     parsed = parse_model_response(content.encode(), expected_sample_id=attempt.sample_id)
-    expected = (
-        ("parsed", "judged")
-        if parsed.classification == "judged"
-        else ("malformed", parsed.classification)
-    )
-    if (attempt.parse_status, attempt.outcome_status) != expected:
-        raise ValueError("direct_api_parser_classification_mismatch")
+    if parsed.classification in {"judged", "refused"}:
+        # The retained bytes mechanically re-parse as a terminal outcome: a
+        # structural retry authorization over such bytes is a forged
+        # classification and fails closed.
+        if attempt.failure_class == "structural_format" or attempt.retryable:
+            raise ValueError("direct_api_structural_classification_not_derived")
+        if parsed.classification == "judged":
+            expected_parse_outcome = ("parsed", "judged")
+            expected_judgment = (
+                parsed.judgment.model_dump(mode="json") if parsed.judgment is not None else None
+            )
+            expected_error_code: str | None = None
+        else:
+            expected_parse_outcome = ("malformed", "refused")
+            expected_judgment = None
+            expected_error_code = parsed.error_code
+        if (attempt.parse_status, attempt.outcome_status) != expected_parse_outcome:
+            raise ValueError("direct_api_parser_classification_mismatch")
+        if attempt.judgment != expected_judgment or attempt.error_code != expected_error_code:
+            raise ValueError("direct_api_parser_classification_mismatch")
+        return
+    # The extracted content is mechanically MALFORMED: only a genuinely
+    # malformed structural response may authorize a structural retry, and a
+    # receipt claiming terminal judged/refused for such bytes fails closed.
+    if (
+        attempt.failure_class != "structural_format"
+        or not attempt.retryable
+        or attempt.parse_status != "malformed"
+        or attempt.outcome_status != "malformed"
+        or attempt.judgment is not None
+    ):
+        raise ValueError("direct_api_structural_classification_not_derived")
 
 
 class APIReviewer216:
