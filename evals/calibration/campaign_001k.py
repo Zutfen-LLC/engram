@@ -91,21 +91,15 @@ def require_active_001k_provenance_mode(mode: str) -> None:
       ``campaign_001k_machine_reviewer_superseded`` (same restriction).
 
     Any OTHER mode outside ``ACTIVE_001K_PROVENANCE_MODES`` — including
-    every provenance mode added in the future — fails closed with
-    ``campaign_001k_provenance_mode_not_active``, so no new mode can
-    silently become an active 001k reviewer route.  The single exception is
-    the legacy generic ``provider_metadata`` baseline: it is not and never
-    was a #216 reviewer route (the #216 reviewers are bound to the frozen
-    direct panel identities), it has been forbidden for 001k at every
-    operator entry point since FIX2-217-7 (``campaign_001k_rejects_direct_model_lane``),
-    and it remains the library-level baseline that non-reviewer lane
-    machinery (e.g. synthetic consensus-ledger verification) is built on.
+    ``provider_metadata`` and every provenance mode added in the future —
+    fails closed with ``campaign_001k_provenance_mode_not_active``, so no
+    generic or future route can silently become active 001k reviewer authority.
     """
     if mode == "operator_attested_subscription_ui":
         raise ValueError("campaign_001k_subscription_ui_superseded")
     if mode == "machine_executor_provenance":
         raise ValueError("campaign_001k_machine_reviewer_superseded")
-    if mode not in ACTIVE_001K_PROVENANCE_MODES | {"provider_metadata"}:
+    if mode not in ACTIVE_001K_PROVENANCE_MODES:
         raise ValueError("campaign_001k_provenance_mode_not_active")
 
 

@@ -11,7 +11,12 @@ import pytest
 
 import evals.calibration.api_reviewer_216 as api_reviewer_216
 from evals.calibration.api_dev_review_216 import run_api_dev_review
-from evals.calibration.api_reviewer_216 import HTTPResponseCapture, TransportFailure
+from evals.calibration.api_reviewer_216 import (
+    DirectReviewerAuthority216,
+    HTTPResponseCapture,
+    TransportFailure,
+    verify_direct_attempt_chain_216,
+)
 from evals.calibration.consensus import CONSENSUS_PROTOCOL_VERSION
 from evals.calibration.model_lanes import NeutralModelPacket, write_neutral_packet
 from evals.calibration.review import BlindPacket, _packet_file_payload, write_protected_file
@@ -320,4 +325,99 @@ def test_direct_api_102x3_lifecycle_uses_canonical_lanes_and_persists_retries(
             sampling=sampling,
             source_packet_digest=source_packet_digest,
             reviewers=reviewers,
+        )
+
+
+@pytest.mark.parametrize(
+    ("fault", "expected_class", "expected_error"),
+    [
+        ("wrong_model", "authority_model_mismatch", "direct_api_response_model_mismatch"),
+        ("wrong_sample", "authority_sample_mismatch", "response_sample_id_mismatch"),
+    ],
+)
+def test_terminal_2xx_identity_failure_is_persisted_once_without_acceptance_or_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fault: str,
+    expected_class: str,
+    expected_error: str,
+) -> None:
+    _prepare_canonical_synthetic_root(tmp_path)
+    sample_id = _FRESH_DEV_102[0]
+
+    class _TerminalIdentityTransport:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, bytes]] = []
+
+        def post(self, *, url: str, headers: dict[str, str], body: bytes) -> HTTPResponseCapture:
+            del headers
+            payload = json.loads(body)
+            emitted_sample_id = json.loads(payload["messages"][1]["content"])["sample_id"]
+            model = payload["model"]
+            self.calls.append((model, emitted_sample_id, body))
+            content_sample_id = emitted_sample_id
+            raw_payload = json.loads(_response(content_sample_id))
+            if model == "anthropic/claude-sonnet-5" and emitted_sample_id == sample_id:
+                if fault == "wrong_sample":
+                    raw_payload = json.loads(_response("s99999999999999999999999"))
+                if fault == "wrong_model":
+                    raw_payload["model"] = "openai/gpt-5.6-terra"
+            return HTTPResponseCapture(
+                200,
+                {"x-request-id": "terminal-id"},
+                json.dumps(raw_payload).encode(),
+                url,
+            )
+
+    transport = _TerminalIdentityTransport()
+    monkeypatch.setattr(api_reviewer_216, "_CONCRETE_TRANSPORT_TYPE", lambda: transport)
+
+    with pytest.raises(
+        ValueError, match=f"direct_api_terminal_provider_failure:{expected_class}:{sample_id}"
+    ):
+        run_api_dev_review(
+            tmp_path,
+            credentials={"OPENROUTER_API_KEY": "fake", "ZAI_API_KEY": "fake"},
+        )
+
+    matching_calls = [
+        call for call in transport.calls if call[:2] == ("anthropic/claude-sonnet-5", sample_id)
+    ]
+    assert len(matching_calls) == 1
+    attempts_root = tmp_path / "lanes" / "model_a" / "api-reviewer" / "attempts" / sample_id
+    attempt_root = attempts_root / "attempt-000001"
+    receipt = json.loads((attempt_root / "attempt.json").read_text())
+    assert (attempt_root / "request.json").is_file()
+    assert (attempt_root / "response.raw").is_file()
+    assert (attempt_root / "extracted-response.json").is_file()
+    assert receipt["accepted"] is False
+    assert receipt["transmitted"] is True
+    assert receipt["http_response_received"] is True
+    assert receipt["raw_response_present"] is True
+    assert receipt["failure_class"] == expected_class
+    assert receipt["attempt"]["error_code"] == expected_error
+    assert receipt["retryable"] is False
+    assert not (
+        tmp_path / "lanes" / "model_a" / "api-reviewer" / "accepted" / f"{sample_id}.json"
+    ).exists()
+
+    authority = DirectReviewerAuthority216.model_validate(
+        json.loads((tmp_path / "lanes" / "model_a" / "api-reviewer" / "authority.json").read_text())
+    )
+    emitted = json.loads(
+        (tmp_path / "lanes" / "model_a" / "lane-requests-000001.jsonl").read_text().splitlines()[0]
+    )
+    verify_direct_attempt_chain_216(
+        attempts_root=attempts_root,
+        sample_id=sample_id,
+        emitted_request=emitted,
+        authority=authority,
+    )
+    (attempt_root / "response.raw").write_bytes(b"mutated wrong-sample response")
+    with pytest.raises(ValueError, match="direct_api_attempt_chain_raw_response_mismatch"):
+        verify_direct_attempt_chain_216(
+            attempts_root=attempts_root,
+            sample_id=sample_id,
+            emitted_request=emitted,
+            authority=authority,
         )

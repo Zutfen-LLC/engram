@@ -291,8 +291,8 @@ def extract_response_216(
     ):
         raise ValueError("direct_api_response_content_invalid")
     reported = decoded.get("model")
-    if reported is not None and (not isinstance(reported, str) or reported != route.model):
-        raise ValueError("direct_api_response_model_mismatch")
+    if reported is not None and not isinstance(reported, str):
+        raise ValueError("direct_api_response_model_invalid")
     provider_id = decoded.get("id")
     if provider_id is not None and not isinstance(provider_id, str):
         raise ValueError("direct_api_response_id_invalid")
@@ -368,6 +368,8 @@ class DirectAPIReviewAttempt216:
             "structural_format",
             "authority_route_redirect",
             "authority_route_mismatch",
+            "authority_model_mismatch",
+            "authority_sample_mismatch",
         ]
         | None
     ) = None
@@ -442,6 +444,45 @@ def verify_direct_api_attempt_216(attempt: DirectAPIReviewAttempt216) -> None:
             if attempt.http_status is None:
                 raise ValueError("direct_api_authority_route_response_missing")
             return
+        if attempt.failure_class in {"authority_model_mismatch", "authority_sample_mismatch"}:
+            if attempt.http_status is None or not 200 <= attempt.http_status < 300:
+                raise ValueError("direct_api_authority_identity_success_response_missing")
+            if (
+                attempt.parse_status != "absent"
+                or attempt.retryable
+                or attempt.judgment is not None
+            ):
+                raise ValueError("direct_api_authority_identity_failure_contract_invalid")
+            try:
+                content, reported, provider_id = extract_response_216(
+                    route, attempt.raw_response, {}
+                )
+            except ValueError as exc:
+                raise ValueError("direct_api_authority_identity_extraction_invalid") from exc
+            safe_headers = attempt.response_safe_headers or {}
+            expected_provider_id = (
+                provider_id or safe_headers.get("x-request-id") or safe_headers.get("request-id")
+            )
+            if (content, reported, expected_provider_id) != (
+                attempt.extracted_content,
+                attempt.reported_model,
+                attempt.provider_request_id,
+            ):
+                raise ValueError("direct_api_extraction_not_derived")
+            if attempt.failure_class == "authority_model_mismatch":
+                if (
+                    reported is None
+                    or reported == route.model
+                    or attempt.error_code != "direct_api_response_model_mismatch"
+                ):
+                    raise ValueError("direct_api_authority_model_mismatch_not_derived")
+                return
+            try:
+                parse_model_response(content.encode(), expected_sample_id=attempt.sample_id)
+            except ValueError as exc:
+                if str(exc) == "response_sample_id_mismatch" and attempt.error_code == str(exc):
+                    return
+            raise ValueError("direct_api_authority_sample_mismatch_not_derived")
         expected_failure = (
             "retryable_http"
             if attempt.http_status in RETRYABLE_HTTP_STATUSES
@@ -724,7 +765,78 @@ class APIReviewer216:
             )
             verify_direct_api_attempt_216(attempt)
             return attempt
-        parsed = parse_model_response(content.encode(), expected_sample_id=sample_id)
+        if reported_model is not None and reported_model != route.model:
+            attempt = DirectAPIReviewAttempt216(
+                DIRECT_API_REVIEWER_SCHEMA,
+                sample_id,
+                sequence,
+                route.transport,
+                route.endpoint,
+                route.model,
+                route.provider_preferences,
+                "environment",
+                route.credential_name,
+                request,
+                _sha(request),
+                _sha(request),
+                capture.body,
+                _sha(capture.body),
+                content,
+                _sha(content.encode()),
+                route.extractor_version,
+                reported_model,
+                response_id or capture.provider_request_id,
+                started.isoformat(),
+                ended.isoformat(),
+                capture.status,
+                "absent",
+                "provider_error",
+                "direct_api_response_model_mismatch",
+                None,
+                capture.safe_headers,
+                "authority_model_mismatch",
+                False,
+            )
+            verify_direct_api_attempt_216(attempt)
+            return attempt
+        try:
+            parsed = parse_model_response(content.encode(), expected_sample_id=sample_id)
+        except ValueError as exc:
+            if str(exc) != "response_sample_id_mismatch":
+                raise
+            attempt = DirectAPIReviewAttempt216(
+                DIRECT_API_REVIEWER_SCHEMA,
+                sample_id,
+                sequence,
+                route.transport,
+                route.endpoint,
+                route.model,
+                route.provider_preferences,
+                "environment",
+                route.credential_name,
+                request,
+                _sha(request),
+                _sha(request),
+                capture.body,
+                _sha(capture.body),
+                content,
+                _sha(content.encode()),
+                route.extractor_version,
+                reported_model,
+                response_id or capture.provider_request_id,
+                started.isoformat(),
+                ended.isoformat(),
+                capture.status,
+                "absent",
+                "provider_error",
+                str(exc),
+                None,
+                capture.safe_headers,
+                "authority_sample_mismatch",
+                False,
+            )
+            verify_direct_api_attempt_216(attempt)
+            return attempt
         if parsed.classification == "judged":
             parse_status, outcome, error, judgment = (
                 "parsed",
@@ -1198,10 +1310,14 @@ class DirectReviewerRunner216:
                     "Do not add prose or markdown."
                 )
                 continue
-            if attempt.outcome_status == "provider_error" and attempt.retryable:
-                if retry is not None:
-                    continue
-                raise ValueError(f"direct_api_mechanical_retry_exhausted:{sample_id}")
+            if attempt.outcome_status == "provider_error":
+                if attempt.retryable:
+                    if retry is not None:
+                        continue
+                    raise ValueError(f"direct_api_mechanical_retry_exhausted:{sample_id}")
+                raise ValueError(
+                    f"direct_api_terminal_provider_failure:{attempt.failure_class}:{sample_id}"
+                )
             if receipt["accepted"]:
                 chain_digest, final_receipt, final_attempt = verify_direct_attempt_chain_216(
                     attempts_root=attempts_root,

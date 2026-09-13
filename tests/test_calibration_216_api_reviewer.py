@@ -225,6 +225,54 @@ def test_malformed_response_is_preserved_with_no_extracted_judgment() -> None:
     verify_direct_api_attempt_216(attempt)
 
 
+@pytest.mark.parametrize(
+    ("raw_response", "expected_failure_class", "expected_error", "expected_reported_model"),
+    [
+        (
+            json.dumps(
+                {
+                    "model": "openai/gpt-5.6-terra",
+                    "choices": [{"message": {"content": _judged_content()}}],
+                }
+            ).encode(),
+            "authority_model_mismatch",
+            "direct_api_response_model_mismatch",
+            "openai/gpt-5.6-terra",
+        ),
+        (
+            _chat_response(
+                _judged_content().replace(_SAMPLE["sample_id"], "s99999999999999999999999")
+            ),
+            "authority_sample_mismatch",
+            "response_sample_id_mismatch",
+            None,
+        ),
+    ],
+)
+def test_2xx_identity_mismatches_are_durable_nonretryable_authority_failures(
+    raw_response: bytes,
+    expected_failure_class: str,
+    expected_error: str,
+    expected_reported_model: str | None,
+) -> None:
+    transport = FakeTransport([raw_response])
+
+    attempt = _reviewer(transport, openrouter="token").review("model_a", _SAMPLE)
+
+    assert len(transport.calls) == 1
+    assert attempt.raw_response == raw_response
+    assert attempt.http_status == 200
+    assert attempt.outcome_status == "provider_error"
+    assert attempt.parse_status == "absent"
+    assert attempt.failure_class == expected_failure_class
+    assert attempt.error_code == expected_error
+    assert attempt.reported_model == expected_reported_model
+    assert attempt.extracted_content
+    assert attempt.judgment is None
+    assert attempt.retryable is False
+    verify_direct_api_attempt_216(attempt)
+
+
 def test_accepted_response_never_retries_even_when_more_attempts_are_allowed() -> None:
     transport = FakeTransport(
         [_chat_response(_judged_content()), _chat_response(_judged_content())]

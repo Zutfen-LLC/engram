@@ -87,6 +87,8 @@ class TestCampaignProvenanceInvariant:
             require_active_001k_provenance_mode("operator_attested_subscription_ui")
         with pytest.raises(ValueError, match="campaign_001k_machine_reviewer_superseded"):
             require_active_001k_provenance_mode("machine_executor_provenance")
+        with pytest.raises(ValueError, match="campaign_001k_provenance_mode_not_active"):
+            require_active_001k_provenance_mode("provider_metadata")
 
     def test_future_mode_cannot_silently_become_active_001k_route(self) -> None:
         with pytest.raises(ValueError, match="campaign_001k_provenance_mode_not_active"):
@@ -164,6 +166,107 @@ def _complete_direct_lane(monkeypatch, tmp_path: Path) -> tuple[Any, Any, Any]:
         source_packet_digest=session.source_packet_digest,
     )
     return session, sampling, frozen
+
+
+def _complete_provider_metadata_001k_lane(tmp_path: Path) -> tuple[Any, Any, Any]:
+    """Build a mechanically complete generic lane under the 001k identity.
+
+    The fixture deliberately retains valid requests, raw judgments, execution
+    receipts, and exact frozen panel identity; only provenance mode is the
+    disallowed generic provider-metadata route.
+    """
+    from evals.calibration.api_dev_review_216 import _reviewer as _panel_reviewer
+    from tests.test_calibration_206_helpers import execution_receipt_for
+    from tests.test_calibration_206_round6 import _raw_judgment, _setup_lane
+
+    session, sampling, packet, manifest = _setup_lane(
+        tmp_path,
+        campaign_id=CAMPAIGN_ID_001K,
+        provenance_mode="provider_metadata",
+        reviewer=_panel_reviewer("model_a"),
+    )
+    for line in (
+        session.emit_requests(packet, sampling=sampling, manifest_path=manifest)
+        .read_text()
+        .splitlines()
+    ):
+        sample_id = json.loads(line)["sample_id"]
+        receipt = execution_receipt_for(
+            session.lane_root,
+            session.reviewer,
+            sample_id,
+            request_generation=1,
+            campaign_id=CAMPAIGN_ID_001K,
+        )
+        session.ingest_response(
+            {
+                "sample_id": sample_id,
+                "raw_response": _raw_judgment(sample_id),
+                "execution": receipt.model_dump(mode="json"),
+            },
+            sampling=sampling,
+        )
+    return session, sampling, manifest
+
+
+def test_complete_provider_metadata_001k_lane_fails_freeze_reload_and_final_provenance(
+    tmp_path: Path,
+) -> None:
+    """A complete generic lane cannot cross any active-001k authority boundary."""
+    from evals.calibration.consensus import CONSENSUS_PROTOCOL_VERSION
+    from evals.calibration.model_lanes import (
+        LaneFreeze,
+        _load_one_frozen_lane,
+        freeze_lane,
+        load_lane_records,
+    )
+    from evals.calibration.raw_evidence import validate_lane_provenance_with_raw
+    from evals.calibration.review import write_protected_file
+
+    session, sampling, _manifest = _complete_provider_metadata_001k_lane(tmp_path)
+    with pytest.raises(ValueError, match="campaign_001k_provenance_mode_not_active"):
+        freeze_lane(
+            protected_root=tmp_path,
+            reviewer=session.reviewer,
+            campaign_id=CAMPAIGN_ID_001K,
+            sampling=sampling,
+            source_packet_digest=session.source_packet_digest,
+        )
+
+    records = load_lane_records(tmp_path, session.reviewer.reviewer_slot)
+    lane = LaneFreeze(
+        protocol_version=CONSENSUS_PROTOCOL_VERSION,
+        campaign_id=CAMPAIGN_ID_001K,
+        reviewer=session.reviewer,
+        sampling_manifest_digest=sampling.manifest_digest(),
+        source_packet_digest=session.source_packet_digest,
+        neutral_packet_sha256=json.loads((session.lane_root / "lane.json").read_text())[
+            "neutral_packet_sha256"
+        ],
+        sample_ids=tuple(sampling.sample_ids),
+        record_digests=tuple(records[sid].record_digest() for sid in sampling.sample_ids),
+    )
+    write_protected_file(
+        session.lane_root / "lane-freeze.json",
+        (json.dumps(lane.model_dump(mode="json"), sort_keys=True) + "\n").encode(),
+    )
+    with pytest.raises(ValueError, match="campaign_001k_provenance_mode_not_active"):
+        _load_one_frozen_lane(
+            tmp_path,
+            session.reviewer,
+            CAMPAIGN_ID_001K,
+            sampling,
+            session.source_packet_digest,
+        )
+    with pytest.raises(ValueError, match="campaign_001k_provenance_mode_not_active"):
+        validate_lane_provenance_with_raw(
+            lane,
+            records,
+            campaign_id=CAMPAIGN_ID_001K,
+            sampling=sampling,
+            source_packet_digest=session.source_packet_digest,
+            protected_root=tmp_path,
+        )
 
 
 # ---------------------------------------------------------------------------
