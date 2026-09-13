@@ -219,9 +219,15 @@ def validate_lane_provenance_with_raw(
     )
     from evals.calibration.ingestion import lane_provenance_mode
 
-    if lane_provenance_mode(lane_root_for(protected_root, lane.reviewer.reviewer_slot)) == (
-        "operator_attested_subscription_ui"
-    ):
+    mode = lane_provenance_mode(lane_root_for(protected_root, lane.reviewer.reviewer_slot))
+    # FIX7 (#217): direct HTTPS is the ONE active 001k reviewer authority —
+    # superseded subscription/machine/generic modes fail closed at the final
+    # ledger's composed provenance boundary.
+    if campaign_id == "eng-calibration-001k":
+        from evals.calibration.campaign_001k import require_active_001k_provenance_mode
+
+        require_active_001k_provenance_mode(mode)
+    if mode == "operator_attested_subscription_ui":
         # #209 opt-in: the operator-attested subscription gate replaces the
         # machine-verified identity gate at this final boundary too; every
         # other check above is unchanged.
@@ -231,6 +237,18 @@ def validate_lane_provenance_with_raw(
             records,
             lane_root=lane_root_for(protected_root, lane.reviewer.reviewer_slot),
             protected_root=protected_root,
+        )
+    elif mode == "machine_executor_provenance":
+        from evals.calibration.ingestion import require_machine_executor_provenance
+
+        require_machine_executor_provenance(
+            records, lane_root=lane_root_for(protected_root, lane.reviewer.reviewer_slot)
+        )
+    elif mode == "direct_api_provenance":
+        from evals.calibration.api_reviewer_216 import require_direct_api_provenance
+
+        require_direct_api_provenance(
+            records, lane_root=lane_root_for(protected_root, lane.reviewer.reviewer_slot)
         )
     else:
         require_machine_verified_execution_identity(

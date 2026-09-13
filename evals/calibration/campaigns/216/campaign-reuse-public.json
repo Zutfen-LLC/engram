@@ -1,0 +1,26 @@
+{
+  "campaign_id": "eng-calibration-001k",
+  "dev_total": 302,
+  "executed_200": 200,
+  "forced_dev_fresh": 25,
+  "holdout": 100,
+  "leakage_checks": {
+    "cross_split_shared_hash_groups": 0,
+    "duplicate_groups": 27,
+    "sample_membership_count": 402
+  },
+  "leakage_safe_pool": 177,
+  "note": "public aggregates and digests only; exact membership is protected",
+  "reuse_manifest_digest": "2a8d3e3f23dacef04fe742e14d7373abc33f3b6806d679453c64ee58d7385fd3",
+  "reuse_rules": [
+    "first-200 executed cases are development-only and can never enter the 001k holdout (development contamination via #213/#214)",
+    "reused labels are derived exclusively from the digest-verified #213 reference synthesis preserved bytes; no free-form re-entry",
+    "reused label provenance distinguishes reviewer_majority vs source_adjudication per field; no label is upgraded to human truth",
+    "fresh cases require mechanical freshness proof: zero overlap with every executed/reviewed/replayed evidence corpus",
+    "fresh members of duplicate groups spanning the executed/fresh boundary are forced to the development side before holdout selection",
+    "holdout selection is deterministic, duplicate-group-constrained, and label/outcome-blind (campaign id + frozen seed + sample id only)",
+    "no sample moves between dev/holdout after fresh labels or provider results are observed"
+  ],
+  "reused_labels_digest": "bc2218d870703ab64a0a25cef683fd19d0c19b29b801e3a07bb6dc6df817c40a",
+  "split_manifest_001k_digest": "cb7434a5285536e540d9c8898ba446c35f25dfaaf22a1b3d8b323a40067bea37"
+}

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from engram.assessment_schema import AssessmentContract
 from evals.admission.schema import digest
@@ -13,6 +15,13 @@ from evals.calibration.fit import AssessmentExecutionReceipt
 from evals.calibration.freeze import FrameRow, SamplingManifest, SplitManifest, TargetIdentity
 
 NOW = datetime(2026, 9, 10, tzinfo=UTC)
+
+# Direct-API 001k evidence is intentionally expensive to construct because it
+# exercises every receipt, pointer, and attempt-chain binding. The resulting
+# verified ledger is an immutable value object, so identical synthetic fixture
+# requests may safely reuse a deep copy rather than re-transmit 102×3 fake
+# requests for every downstream fit/barrier assertion.
+_DIRECT_001K_LEDGER_CACHE: dict[str, Any] = {}
 
 
 def provider_metadata_for(
@@ -263,10 +272,12 @@ def build_verified_ledger(
     ids: tuple[str, ...],
     critical_by_id: dict[str, dict],
     origin: str = "cross_model_consensus",
+    campaign_id: str = "campaign",
     *,
     sampling: SamplingManifest | None = None,
     split: SplitManifest | None = None,
     expected_split_digest: str | None = None,
+    source_packet_digest: str = "f" * 64,
 ):
     """Genuine VerifiedConsensusLedger built through the REAL verifier.
 
@@ -277,6 +288,25 @@ def build_verified_ledger(
     case into the human queue (one lane disagrees) and resolves each with
     the caller's critical fields as the human final resolution.
     """
+    cache_key: str | None = None
+    if campaign_id == "eng-calibration-001k":
+        cache_key = json.dumps(
+            {
+                "ids": ids,
+                "critical_by_id": critical_by_id,
+                "origin": origin,
+                "sampling": sampling.model_dump(mode="json") if sampling is not None else None,
+                "split": split.model_dump(mode="json") if split is not None else None,
+                "expected_split_digest": expected_split_digest,
+                "source_packet_digest": source_packet_digest,
+            },
+            sort_keys=True,
+            default=str,
+        )
+        cached = _DIRECT_001K_LEDGER_CACHE.get(cache_key)
+        if cached is not None:
+            return deepcopy(cached)
+
     import tempfile
     from pathlib import Path
     from typing import cast
@@ -314,7 +344,7 @@ def build_verified_ledger(
     frame_rows_list = build_frame_rows(ids)
     if sampling is None:
         sampling = SamplingManifest(
-            campaign_id="campaign",
+            campaign_id=campaign_id,
             target_identity_digest="1" * 64,
             # FIX-R4-3: derived from the actual frame rows so the canonical
             # frozen-frame validator can verify them at the ledger boundary.
@@ -330,22 +360,32 @@ def build_verified_ledger(
             sample_ids=ids,
             sample_hashes=tuple(_digest(sid) for sid in ids),
         )
+    assert sampling is not None
     retained_split = split
     retained_expected_split = expected_split_digest
     frame_rows = {str(row.sample_id): row for row in frame_rows_list}
     adjudicate = origin != "cross_model_consensus"
     family_by_slot = dict(zip(REVIEWER_SLOTS, REVIEWER_FAMILIES, strict=True))
-    reviewers = {
-        slot: ReviewerIdentity(
-            reviewer_slot=slot,  # type: ignore[arg-type]
-            reviewer_family=family_by_slot[slot],
-            provider_model_identifier=f"{family_by_slot[slot]}-exact-2026-09",
-            reviewer_config_digest="a" * 64,
-            prompt_digest=prompt_digest,
-        )
-        for slot in REVIEWER_SLOTS
-    }
+    direct_001k = campaign_id == "eng-calibration-001k"
+    if direct_001k:
+        # FIX8: 001k fixtures must exercise the active sealed direct-HTTPS
+        # path. Generic provider metadata is deliberately rejected there.
+        from evals.calibration.api_dev_review_216 import _reviewer as direct_reviewer
+
+        reviewers = {slot: direct_reviewer(slot) for slot in REVIEWER_SLOTS}
+    else:
+        reviewers = {
+            slot: ReviewerIdentity(
+                reviewer_slot=slot,  # type: ignore[arg-type]
+                reviewer_family=family_by_slot[slot],
+                provider_model_identifier=f"{family_by_slot[slot]}-exact-2026-09",
+                reviewer_config_digest="a" * 64,
+                prompt_digest=prompt_digest,
+            )
+            for slot in REVIEWER_SLOTS
+        }
     records_by_lane: dict[str, dict[str, ModelReviewRecord]] = {slot: {} for slot in REVIEWER_SLOTS}
+    lanes: tuple[Any, ...]
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         # FIX-R4-1: emit immutable request batches first so every record can
@@ -377,7 +417,7 @@ def build_verified_ledger(
             guide_version="engram-calibration-guide-157-v1",
             reviewer_hint="neutral_model_review",
             cases=cases,
-            source_packet_digest="f" * 64,
+            source_packet_digest=source_packet_digest,
         )
         packet_dir = tmp_path / "packet"
         packet_dir.mkdir(parents=True, exist_ok=True)
@@ -396,75 +436,151 @@ def build_verified_ledger(
                 + "\n"
             ).encode(),
         )
+        sessions = {}
         for slot in REVIEWER_SLOTS:
             session = LaneSession.init(
                 tmp_path,
                 reviewer=reviewers[slot],
-                campaign_id="campaign",
+                campaign_id=campaign_id,
                 sampling=sampling,
-                source_packet_digest="f" * 64,
+                source_packet_digest=source_packet_digest,
                 neutral_packet_path=packet_path,
                 neutral_packet_manifest=packet_manifest,
+                provenance_mode="direct_api_provenance" if direct_001k else "provider_metadata",
             )
+            sessions[slot] = session
             session.emit_requests(packet_path, sampling=sampling, manifest_path=packet_manifest)
-        for slot in REVIEWER_SLOTS:
-            for sample_id in ids:
-                fields = dict(critical_by_id[sample_id])
-                if adjudicate and slot == "model_b":
-                    fields = dict(fields)
-                    fields["expected_kind"] = "decision"  # guaranteed disagreement
-                judgment = ModelJudgment(fields=fields, reviewer_confidence="medium")
-                import json as _json
+        if direct_001k:
+            from unittest.mock import patch
 
-                from evals.calibration.reviewer_instructions import RESPONSE_PARSER_VERSION
+            import evals.calibration.api_reviewer_216 as api_module
+            import evals.calibration.campaign_001k_stage_authority as stage_module
+            from evals.calibration.api_dev_review_216 import _authority
+            from evals.calibration.api_reviewer_216 import (
+                DirectReviewerRunner216,
+                HTTPResponseCapture,
+            )
 
-                raw = _json.dumps(
-                    {
-                        "sample_id": sample_id,
-                        "outcome": "judged",
-                        "judgment": {"fields": dict(fields), "reviewer_confidence": "medium"},
-                    }
-                ).encode()
-                from tests.test_calibration_206_helpers import execution_receipt_for
+            class _FixtureTransport:
+                def post(
+                    self, *, url: str, headers: dict[str, str], body: bytes
+                ) -> HTTPResponseCapture:
+                    del headers
+                    request = json.loads(body)
+                    sample_id = json.loads(request["messages"][1]["content"])["sample_id"]
+                    fields = dict(critical_by_id[sample_id])
+                    if adjudicate and request["model"] == "openai/gpt-5.6-terra":
+                        fields["expected_kind"] = "decision"
+                    content = json.dumps(
+                        {
+                            "sample_id": sample_id,
+                            "outcome": "judged",
+                            "judgment": {"fields": fields, "reviewer_confidence": "medium"},
+                        }
+                    )
+                    raw = json.dumps({"choices": [{"message": {"content": content}}]}).encode()
+                    return HTTPResponseCapture(200, {"x-request-id": "fixture"}, raw, url)
 
-                execution = cast(
-                    "ExecutionReceipt",
-                    execution_receipt_for(
-                        tmp_path / "lanes" / slot,
-                        reviewers[slot],
-                        sample_id,
-                        request_generation=1,
-                        campaign_id="campaign",
-                        executor_status="completed",
-                    ),
+            class _Stage:
+                stage = "dev"
+                target_identity_digest = sampling.target_identity_digest
+                membership_digest = hashlib.sha256(json.dumps(list(ids)).encode()).hexdigest()
+
+                def require_capability(self) -> None:
+                    return None
+
+            # The emitted requests above are the direct runner's immutable inputs.
+            with (
+                patch.object(api_module, "_CONCRETE_TRANSPORT_TYPE", _FixtureTransport),
+                patch.object(stage_module, "verify_stage_authority", lambda **_kw: _Stage()),
+            ):
+                for slot, session in sessions.items():
+                    runner = DirectReviewerRunner216(
+                        session,
+                        _authority(
+                            session,
+                            target_digest=_Stage.target_identity_digest,
+                            membership_digest=_Stage.membership_digest,
+                        ),
+                        credentials={"OPENROUTER_API_KEY": "fixture", "ZAI_API_KEY": "fixture"},
+                    )
+                    batch = next(session.lane_root.glob("lane-requests-*.jsonl"))
+                    for line in batch.read_text().splitlines():
+                        runner.review_request_line(line)
+                        record = runner.ingest_accepted(line, sampling=sampling)
+                        records_by_lane[slot][record.sample_id] = record
+                lanes = tuple(
+                    freeze_lane(
+                        protected_root=tmp_path,
+                        reviewer=reviewers[slot],
+                        campaign_id=campaign_id,
+                        sampling=sampling,
+                        source_packet_digest=source_packet_digest,
+                        neutral_packet_sha256=hashlib.sha256(packet_payload).hexdigest(),
+                    )
+                    for slot in REVIEWER_SLOTS
                 )
-                record = ModelReviewRecord(
-                    protocol_version=CONSENSUS_PROTOCOL_VERSION,
-                    campaign_id="campaign",
-                    sampling_manifest_digest=sampling.manifest_digest(),
-                    source_packet_digest="f" * 64,
-                    sample_id=sample_id,
-                    reviewer_slot=slot,  # type: ignore[arg-type]
-                    reviewer_family=family_by_slot[slot],
-                    provider_model_identifier=reviewers[slot].provider_model_identifier,
-                    reviewer_config_digest="a" * 64,
-                    prompt_digest=prompt_digest,
-                    label_guide_version="engram-calibration-guide-157-v1",
-                    captured_at=now,
-                    execution=execution,
-                    request_generation=execution.request_generation,
-                    request_item_digest=execution.request_item_digest,
-                    parser_version=RESPONSE_PARSER_VERSION,
-                    parse_status="parsed",
-                    outcome_status="judged",
-                    reviewer_confidence="medium",
-                    judgment=judgment,
-                    raw_response_digest=hashlib.sha256(raw).hexdigest(),
-                    error_code=None,
-                )
-                records_by_lane[slot][sample_id] = record
-                write_protected_file(tmp_path / "lanes" / slot / "raw" / f"{sample_id}.resp", raw)
-                append_review_record(record, tmp_path)
+        else:
+            for slot in REVIEWER_SLOTS:
+                for sample_id in ids:
+                    fields = dict(critical_by_id[sample_id])
+                    if adjudicate and slot == "model_b":
+                        fields = dict(fields)
+                        fields["expected_kind"] = "decision"  # guaranteed disagreement
+                    judgment = ModelJudgment(fields=fields, reviewer_confidence="medium")
+                    import json as _json
+
+                    from evals.calibration.reviewer_instructions import RESPONSE_PARSER_VERSION
+
+                    raw = _json.dumps(
+                        {
+                            "sample_id": sample_id,
+                            "outcome": "judged",
+                            "judgment": {"fields": dict(fields), "reviewer_confidence": "medium"},
+                        }
+                    ).encode()
+                    from tests.test_calibration_206_helpers import execution_receipt_for
+
+                    execution = cast(
+                        "ExecutionReceipt",
+                        execution_receipt_for(
+                            tmp_path / "lanes" / slot,
+                            reviewers[slot],
+                            sample_id,
+                            request_generation=1,
+                            campaign_id=campaign_id,
+                            executor_status="completed",
+                        ),
+                    )
+                    record = ModelReviewRecord(
+                        protocol_version=CONSENSUS_PROTOCOL_VERSION,
+                        campaign_id=campaign_id,
+                        sampling_manifest_digest=sampling.manifest_digest(),
+                        source_packet_digest=source_packet_digest,
+                        sample_id=sample_id,
+                        reviewer_slot=slot,  # type: ignore[arg-type]
+                        reviewer_family=family_by_slot[slot],
+                        provider_model_identifier=reviewers[slot].provider_model_identifier,
+                        reviewer_config_digest="a" * 64,
+                        prompt_digest=prompt_digest,
+                        label_guide_version="engram-calibration-guide-157-v1",
+                        captured_at=now,
+                        execution=execution,
+                        request_generation=execution.request_generation,
+                        request_item_digest=execution.request_item_digest,
+                        parser_version=RESPONSE_PARSER_VERSION,
+                        parse_status="parsed",
+                        outcome_status="judged",
+                        reviewer_confidence="medium",
+                        judgment=judgment,
+                        raw_response_digest=hashlib.sha256(raw).hexdigest(),
+                        error_code=None,
+                    )
+                    records_by_lane[slot][sample_id] = record
+                    write_protected_file(
+                        tmp_path / "lanes" / slot / "raw" / f"{sample_id}.resp", raw
+                    )
+                    append_review_record(record, tmp_path)
         classifications = {
             sid: classify_case({slot: records_by_lane[slot][sid] for slot in REVIEWER_SLOTS})
             for sid in ids
@@ -489,24 +605,25 @@ def build_verified_ledger(
         write_queue(
             HumanQueueManifest(
                 protocol_version=CONSENSUS_PROTOCOL_VERSION,
-                campaign_id="campaign",
+                campaign_id=campaign_id,
                 sampling_manifest_digest=sampling.manifest_digest(),
-                source_packet_digest="f" * 64,
+                source_packet_digest=source_packet_digest,
                 entries=tuple(entries),
             ),
             queue_dir,
         )
-        lanes = tuple(
-            freeze_lane(
-                protected_root=tmp_path,
-                reviewer=reviewers[slot],
-                campaign_id="campaign",
-                sampling=sampling,
-                source_packet_digest="f" * 64,
-                neutral_packet_sha256=hashlib.sha256(packet_payload).hexdigest(),
+        if not direct_001k:
+            lanes = tuple(
+                freeze_lane(
+                    protected_root=tmp_path,
+                    reviewer=reviewers[slot],
+                    campaign_id=campaign_id,
+                    sampling=sampling,
+                    source_packet_digest=source_packet_digest,
+                    neutral_packet_sha256=hashlib.sha256(packet_payload).hexdigest(),
+                )
+                for slot in REVIEWER_SLOTS
             )
-            for slot in REVIEWER_SLOTS
-        )
         lane_digests = tuple(lane.lane_digest() for lane in lanes)
         for entry in entries:
             sid = entry.sample_id
@@ -514,9 +631,9 @@ def build_verified_ledger(
                 HumanQueueJudgment.model_validate(
                     {
                         "protocol_version": CONSENSUS_PROTOCOL_VERSION,
-                        "campaign_id": "campaign",
+                        "campaign_id": campaign_id,
                         "sampling_manifest_digest": sampling.manifest_digest(),
-                        "source_packet_digest": "f" * 64,
+                        "source_packet_digest": source_packet_digest,
                         "sample_id": sid,
                         "adjudicator_ref": "human-1",
                         "queue_reasons": entry.reasons,
@@ -535,9 +652,9 @@ def build_verified_ledger(
                     slot: records_by_lane[slot][sid] for slot in REVIEWER_SLOTS
                 },
                 lane_digests=lane_digests,
-                campaign_id="campaign",
+                campaign_id=campaign_id,
                 sampling_manifest_digest=sampling.manifest_digest(),
-                source_packet_digest="f" * 64,
+                source_packet_digest=source_packet_digest,
             )
             record_final_resolution(
                 queue_dir,
@@ -548,16 +665,16 @@ def build_verified_ledger(
                     slot: records_by_lane[slot][sid] for slot in REVIEWER_SLOTS
                 },
                 lane_digests=lane_digests,
-                campaign_id="campaign",
+                campaign_id=campaign_id,
                 sampling_manifest_digest=sampling.manifest_digest(),
-                source_packet_digest="f" * 64,
+                source_packet_digest=source_packet_digest,
             )
         from evals.calibration.ledger import verify_consensus_ledger
 
-        return verify_consensus_ledger(
-            campaign_id="campaign",
+        verified = verify_consensus_ledger(
+            campaign_id=campaign_id,
             sampling=sampling,
-            source_packet_digest="f" * 64,
+            source_packet_digest=source_packet_digest,
             lanes=lanes,
             records_by_lane=records_by_lane,
             queue_dir=queue_dir,
@@ -566,3 +683,6 @@ def build_verified_ledger(
             split=retained_split,
             expected_split_digest=retained_expected_split,
         )
+        if cache_key is not None:
+            _DIRECT_001K_LEDGER_CACHE[cache_key] = deepcopy(verified)
+        return verified

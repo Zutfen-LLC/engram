@@ -48,6 +48,7 @@ from evals.calibration.consensus import (
     LaneFreeze,
     ModelReviewRecord,
     ReviewerIdentity,
+    digest_of,
 )
 from evals.calibration.freeze import LABEL_GUIDE_VERSION, SamplingManifest
 from evals.calibration.model_lanes import (
@@ -581,7 +582,12 @@ def lane_provenance_mode(lane_root: Path) -> str:
         return "provider_metadata"
     payload = json.loads(authority_path.read_text())
     mode = payload.get("provenance_mode", "provider_metadata")
-    if mode not in ("provider_metadata", "operator_attested_subscription_ui"):
+    if mode not in (
+        "provider_metadata",
+        "operator_attested_subscription_ui",
+        "machine_executor_provenance",
+        "direct_api_provenance",
+    ):
         raise ValueError("lane_unknown_provenance_mode")
     return str(mode)
 
@@ -616,13 +622,12 @@ def init_subscription_lane(
         SERVICE_BY_SLOT,
         SUBSCRIPTION_MODEL_BY_SLOT,
         build_subscription_lane_authority,
-        subscription_mode_permitted,
+        require_subscription_mode_permitted,
         validate_visible_model_family,
         write_subscription_lane_authority,
     )
 
-    if not subscription_mode_permitted(campaign_id, CONSENSUS_PROTOCOL_VERSION):
-        raise ValueError("subscription_ui_mode_not_opted_in_for_campaign")
+    require_subscription_mode_permitted(campaign_id, CONSENSUS_PROTOCOL_VERSION)
     if reviewer.provider_model_identifier != SUBSCRIPTION_MODEL_BY_SLOT.get(reviewer.reviewer_slot):
         raise ValueError("subscription_lane_requires_frozen_subscription_identity")
     if SERVICE_BY_SLOT.get(reviewer.reviewer_slot) is None:
@@ -767,6 +772,68 @@ def require_machine_verified_execution_identity(
             verify_execution_provider_metadata(execution.evidence, artifact=artifact)
 
 
+def require_machine_executor_provenance(
+    records: Mapping[str, ModelReviewRecord], *, lane_root: Path
+) -> None:
+    """#216 fail-closed verifier for the distinct Hermes executor mode."""
+    from evals.calibration.machine_reviewer_216 import (
+        MachineReviewerAttempt,
+        MachineReviewerAuthority,
+    )
+
+    authority_path = lane_root / "machine-reviewer" / "authority.json"
+    if not authority_path.is_file():
+        raise ValueError("machine_executor_provenance_authority_missing")
+    authority = MachineReviewerAuthority.model_validate(json.loads(authority_path.read_text()))
+    for sample_id, record in records.items():
+        execution = record.execution
+        if execution is None or execution.identity_source != "machine_executor_provenance":
+            raise ValueError(f"lane_freeze_requires_machine_executor_provenance:{sample_id}")
+        proof = execution.machine_executor_provenance
+        if (
+            not isinstance(proof, dict)
+            or proof.get("authority_digest") != authority.authority_digest()
+        ):
+            raise ValueError(f"machine_executor_provenance_authority_mismatch:{sample_id}")
+        attempt_path = lane_root / "machine-reviewer" / "accepted" / f"{sample_id}.json"
+        if not attempt_path.is_file():
+            raise ValueError(f"machine_executor_provenance_attempt_missing:{sample_id}")
+        attempt = MachineReviewerAttempt.model_validate(json.loads(attempt_path.read_text()))
+        if not attempt.accepted or proof.get("attempt_digest") != digest_of(
+            attempt.model_dump(mode="json")
+        ):
+            raise ValueError(f"machine_executor_provenance_attempt_mismatch:{sample_id}")
+        raw = Path(attempt.raw_stdout_path)
+        if not raw.is_file() or hashlib.sha256(raw.read_bytes()).hexdigest() != proof.get(
+            "raw_stdout_digest"
+        ):
+            raise ValueError(f"machine_executor_provenance_raw_mismatch:{sample_id}")
+        if proof.get("exit_code") != 0 or attempt.exit_code != 0:
+            raise ValueError(f"machine_executor_provenance_nonzero_exit:{sample_id}")
+        if attempt.extraction_index is not None:
+            receipt = Path(str(attempt.batch_attempt_receipt_path))
+            stdout = Path(str(attempt.batch_stdout_path))
+            if (
+                not receipt.is_file()
+                or not stdout.is_file()
+                or hashlib.sha256(receipt.read_bytes()).hexdigest()
+                != proof.get("batch_attempt_receipt_digest")
+                or hashlib.sha256(stdout.read_bytes()).hexdigest()
+                != proof.get("batch_stdout_digest")
+            ):
+                raise ValueError(f"machine_executor_provenance_batch_receipt_mismatch:{sample_id}")
+            decoded = json.loads(stdout.read_bytes())
+            if not isinstance(decoded, list) or attempt.extraction_index >= len(decoded):
+                raise ValueError(f"machine_executor_provenance_batch_index_mismatch:{sample_id}")
+            element = json.dumps(
+                decoded[attempt.extraction_index], sort_keys=True, separators=(",", ":")
+            ).encode()
+            if hashlib.sha256(element).hexdigest() != proof.get("canonical_element_digest"):
+                raise ValueError(f"machine_executor_provenance_batch_element_mismatch:{sample_id}")
+        if not execution.matches_reviewer_identity(authority.reviewer, authority.campaign_id):
+            raise ValueError(f"machine_executor_provenance_identity_mismatch:{sample_id}")
+
+
 class LaneAuthority(Record):
     """The immutable lane binding written by ``model-lane-init``."""
 
@@ -787,9 +854,12 @@ class LaneAuthority(Record):
     # meaning for every existing lane): machine-verified provider metadata.
     # ``operator_attested_subscription_ui`` is settable ONLY at
     # subscription-lane init under the frozen campaign opt-in.
-    provenance_mode: Literal["provider_metadata", "operator_attested_subscription_ui"] = (
-        "provider_metadata"
-    )
+    provenance_mode: Literal[
+        "provider_metadata",
+        "operator_attested_subscription_ui",
+        "machine_executor_provenance",
+        "direct_api_provenance",
+    ] = "provider_metadata"
 
     @model_validator(mode="after")
     def authority_contract(self) -> Self:
@@ -887,9 +957,12 @@ class LaneSession:
         source_packet_digest: str,
         neutral_packet_path: Path,
         neutral_packet_manifest: Path,
-        provenance_mode: Literal["provider_metadata", "operator_attested_subscription_ui"] = (
-            "provider_metadata"
-        ),
+        provenance_mode: Literal[
+            "provider_metadata",
+            "operator_attested_subscription_ui",
+            "machine_executor_provenance",
+            "direct_api_provenance",
+        ] = ("provider_metadata"),
     ) -> LaneSession:
         """Bind one lane to one frozen reviewer identity (exclusive-create).
 
